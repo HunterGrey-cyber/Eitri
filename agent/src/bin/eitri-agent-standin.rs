@@ -9,6 +9,7 @@
 //! - `{"stderr": "<text>"}`: the text and a newline on stderr.
 //! - `{"expect": "<regex>"}`: reads one line from stdin; exit 3 if it does not match.
 //! - `{"sleep_ms": N}`: does not read or write for that long.
+//! - `{"gate": "<directory>"}`: creates `ready`, waits for `release`, then removes the directory.
 //! - `{"ignore_eof": true}`: after the last step, never exit on its own and never notice stdin closing.
 //! - `{"exit": code}`: exits at once.
 //!
@@ -94,6 +95,17 @@ fn main() {
                 }
                 Err(e) => fail(4, &format!("stdin read failed: {e}")),
             }
+        } else if let Some(dir) = step.get("gate").and_then(Value::as_str) {
+            let dir = std::path::Path::new(dir);
+            std::fs::write(dir.join("ready"), b"").unwrap();
+            let deadline = std::time::Instant::now() + Duration::from_secs(60);
+            while !dir.join("release").exists() {
+                if std::time::Instant::now() >= deadline {
+                    fail(5, "gate was never released");
+                }
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            let _ = std::fs::remove_dir_all(dir);
         } else if let Some(ms) = step.get("sleep_ms").and_then(Value::as_u64) {
             std::thread::sleep(Duration::from_millis(ms));
         } else if step.get("ignore_eof").and_then(Value::as_bool) == Some(true) {

@@ -2800,9 +2800,9 @@ mod tests {
                 notice: None
             })
         );
-        std::thread::sleep(Duration::from_millis(50));
         assert!(gate.poll().is_empty());
         assert!(!fx.record_file().exists());
+        assert!(!gate.is_busy(), "the refused answer queued no work");
 
         command(&mut gate, "r2", TrustAction::Trust);
         let view = gate.show_command(A, "r2").unwrap();
@@ -3166,8 +3166,8 @@ mod tests {
         assert!(seen.contains(&GateEvent::Reask(A)), "{seen:?}");
         assert!(seen.contains(&GateEvent::Route(B, Route::Ask)));
         assert!(matches!(answer(&mut gate, &first, true), AnswerOutcome::Refused(_)));
-        std::thread::sleep(Duration::from_millis(100));
         assert!(gate.poll().is_empty(), "no record was queued");
+        assert!(!gate.is_busy(), "no record is in flight");
         assert!(!fx.record_file().exists());
         let second = gate.show(A, 2, &CLAUDE).unwrap();
         assert_ne!(second.fingerprint, first.fingerprint);
@@ -3340,8 +3340,8 @@ mod tests {
         hold.close();
         assert_eq!(answer(&mut gate, &view, true), AnswerOutcome::Recording);
         assert!(!hold.timed_out(), "the answer waited for the worker");
-        std::thread::sleep(Duration::from_millis(50));
         assert!(gate.poll().is_empty());
+        assert!(gate.is_busy(), "the queued record still waits on the held worker");
         assert!(!fx.record_file().exists());
         hold.open();
         drain(&mut gate, |seen| {
@@ -3659,7 +3659,6 @@ mod tests {
         gate.command("t".into(), TrustAction::Trust, A, &CLAUDE);
         gate.command("u".into(), TrustAction::Untrust, A, &CLAUDE);
         assert!(!hold.timed_out(), "the commands waited for the worker");
-        std::thread::sleep(Duration::from_millis(50));
         assert!(gate.poll().is_empty());
         hold.open();
         let seen = drain(&mut gate, |seen| {

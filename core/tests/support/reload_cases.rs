@@ -129,27 +129,19 @@ pub fn a_swap_file_left_by_another_nvim(nvim: &mut Embed, scratch: &Path, tick: 
     );
 }
 
-/// A buffer named for a FIFO: opening it would block. `tick` and one answer from nvim take about as long
-/// as they do on an ordinary file.
+/// With no FIFO writer, Embed's 5 s RPC deadline checks that the tick completes without a blocked read.
 pub fn a_fifo(nvim: &mut Embed, scratch: &Path, tick: Tick<'_>) {
-    let began = Instant::now();
-    tick(nvim);
-    nvim.eval("1");
-    let ordinary = began.elapsed();
-
     let fifo = scratch.join("pipe");
     let c_path = std::ffi::CString::new(fifo.to_str().unwrap()).unwrap();
     // SAFETY: `c_path` is a valid NUL-terminated path that outlives the call.
     assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) }, 0);
     nvim.command("enew");
     nvim.command(&format!("file {}", fifo.display()));
-    let began = Instant::now();
     tick(nvim);
-    nvim.eval("1");
-    let with_fifo = began.elapsed();
-    assert!(
-        with_fifo < 2 * ordinary,
-        "a buffer over a FIFO took {with_fifo:?}, an ordinary tick {ordinary:?}"
+    assert_eq!(
+        nvim.eval("1").as_i64(),
+        Some(1),
+        "Embed's 5 s RPC deadline bounds this reply after the tick, with no FIFO writer"
     );
     nvim.command("bwipeout!");
     the_next_key_reaches_nvim(nvim);

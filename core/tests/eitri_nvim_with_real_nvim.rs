@@ -1,5 +1,4 @@
 //! The optional nvim launcher against a real headless nvim and an argv-recording program.
-use std::os::unix::fs::PermissionsExt;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
@@ -22,9 +21,7 @@ fn check_with_nvim(case: &str, body: &str, nvim: &std::ffi::OsStr) {
     let scratch = Scratch(dir.clone());
     agent::private_fs::create_private_dir_all(&dir, &dir).unwrap();
     let stub = dir.join("eitri");
-    agent::private_fs::write_private(
-        &stub,
-        br##"#!/bin/sh
+    script_fixture::write_executable_script(&stub, br##"#!/bin/sh
 printf '%s\n' "$@" >> "$ARGV_LOG"
 if [ -n "$STDOUT_LOG" ]; then readlink "/proc/$$/fd/1" >> "$STDOUT_LOG"; fi
 if [ -n "$REFUSED_AFTER" ]; then
@@ -37,10 +34,7 @@ if [ "$1" = --version ]; then echo 'eitri 9.8.7'; exit 0; fi
 if [ "$2" = --list ]; then printf 'notes\npreview\n'; exit 0; fi
 if [ -n "$OPEN_REFUSAL" ]; then echo "earlier diagnostic" >&2; echo "$OPEN_REFUSAL" >&2; exit 64; fi
 if [ "$OLD_EITRI" = yes ]; then echo 'eitri: unknown option --nvim' >&2; exit 64; fi
-"##,
-    )
-    .unwrap();
-    std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o700)).unwrap();
+"##, 0o700).unwrap();
     let plugin = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .unwrap()
@@ -430,4 +424,9 @@ assert(vim.wait(3000, function() return #argv() == 8 end))
 assert(argv()[6] == 'open' and argv()[7] == '--nvim' and argv()[8] == vim.v.servername)
 "#,
     );
+}
+
+#[cfg(test)]
+mod script_fixture {
+    include!(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/support/executable.rs"));
 }

@@ -570,7 +570,20 @@ pub fn later(
     touch: &mut dyn FnMut(&Path) -> bool,
     until: Instant,
 ) -> (Vec<OsString>, Vec<(OsString, LinkKind)>) {
-    let until = until.min(Instant::now() + MARK_BUDGET);
+    later_with_clock(fs, dir, entries, near, mounts, touch, until, &Instant::now)
+}
+
+fn later_with_clock(
+    fs: &dyn Fs,
+    dir: &Path,
+    entries: &[Entry],
+    near: Option<&OsStr>,
+    mounts: &Mounts,
+    touch: &mut dyn FnMut(&Path) -> bool,
+    until: Instant,
+    now: &dyn Fn() -> Instant,
+) -> (Vec<OsString>, Vec<(OsString, LinkKind)>) {
+    let until = until.min(now() + MARK_BUDGET);
     let mut sorted: Vec<_> = entries.iter().collect();
     sorted.sort_by(|a, b| natural_cmp(&a.name, &b.name).then_with(|| a.raw.cmp(&b.raw)));
     let center = near
@@ -590,7 +603,7 @@ pub fn later(
     let mut calls = 0;
     let mut stopped = false;
     for index in order {
-        if Instant::now() >= until || stopped || calls >= MAX_FOLDERS {
+        if now() >= until || stopped || calls >= MAX_FOLDERS {
             break;
         }
         let Some(entry) = sorted.get(index) else { continue };
@@ -598,14 +611,14 @@ pub fn later(
         // Each permission is one call about to be made: it counts against the bound, and a wait inside
         // touch that outlasts the deadline cancels the call.
         let mut allowed = |mount: &Path| {
-            if Instant::now() >= until || calls >= MAX_FOLDERS {
+            if now() >= until || calls >= MAX_FOLDERS {
                 stopped = true;
                 return false;
             }
             if !mounts.local(mount) {
                 return false;
             }
-            let ok = touch(mount) && Instant::now() < until;
+            let ok = touch(mount) && now() < until;
             stopped |= !ok;
             if ok {
                 calls += 1;

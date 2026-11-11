@@ -1,6 +1,30 @@
 use super::*;
 use std::sync::mpsc::Receiver;
 
+thread_local! {
+    static CLOCK: std::cell::RefCell<Option<(Instant, Arc<std::sync::atomic::AtomicBool>, std::cell::Cell<u64>)>> = const { std::cell::RefCell::new(None) };
+}
+
+pub(super) fn clock_now() -> Option<Instant> {
+    CLOCK.with(|clock| {
+        let clock = clock.borrow();
+        let (base, advance, step) = clock.as_ref()?;
+        if advance.load(Ordering::SeqCst) {
+            assert!(step.get() < 10000, "the shell worker exceeded 10000 clock reads");
+            step.set(step.get() + 1);
+        }
+        Some(*base + Duration::from_millis(step.get() * 50))
+    })
+}
+
+fn until(what: &str, mut ready: impl FnMut() -> bool) {
+    let until = Instant::now() + Duration::from_secs(60);
+    while !ready() {
+        assert!(Instant::now() < until, "never happened: {what}");
+        std::thread::yield_now();
+    }
+}
+
 pub(super) struct ReaderCount(Arc<std::sync::atomic::AtomicUsize>);
 
 impl ReaderCount {
@@ -16,6 +40,92 @@ impl Drop for ReaderCount {
     }
 }
 
+pub(crate) struct GroupCleanup(Arc<Control>);
+
+impl GroupCleanup {
+    pub(crate) fn new(running: &Running) -> Self {
+        Self(running.control.clone())
+    }
+}
+
+impl Drop for GroupCleanup {
+    fn drop(&mut self) {
+        let group = self.0.group.lock().unwrap();
+        if let Some(pid) = *group {
+            if pid > 1 {
+                // The worker holds this lock until it reaps the leader, preventing PID reuse here.
+                unsafe {
+                    libc::kill(-pid, libc::SIGKILL);
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn the_cleanup_guard_kills_the_group_during_unwinding() {
+    let scratch = Scratch::new("panic-cleanup");
+    let (running, wake) = run_with(
+        request(
+            &scratch,
+            "trap '' TERM; touch ready; i=0; while [ $i -lt 100 ]; do i=$((i+1)); sleep 0.02; done; touch survived",
+        ),
+        "/bin/sh",
+    );
+    wait_for_file(&scratch.0.join("ready"));
+    let cleanup = GroupCleanup::new(&running);
+    let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+        let _cleanup = cleanup;
+        panic!("exercise unwinding with a live group");
+    }));
+    assert!(unwound.is_err());
+    finish(&running, &wake);
+    assert!(
+        !scratch.0.join("survived").exists(),
+        "unwinding must kill the group before its natural end"
+    );
+}
+
+fn complete_pid(path: &Path) -> Option<u32> {
+    std::fs::read_to_string(path)
+        .ok()
+        .filter(|s| s.ends_with('\n'))
+        .and_then(|s| s.trim().parse::<u32>().ok())
+        .filter(|p| *p > 1)
+}
+
+#[test]
+fn only_a_complete_pid_line_is_a_record() {
+    let scratch = Scratch::new("pid-record");
+    let path = scratch.0.join("pid");
+    for bytes in ["", "12", "1\n", "garbled\n"] {
+        std::fs::write(&path, bytes).unwrap();
+        assert_eq!(complete_pid(&path), None, "incomplete or invalid PID record {bytes:?}");
+    }
+    std::fs::write(&path, "123\n").unwrap();
+    assert_eq!(pid_record(&path), 123);
+}
+
+fn pid_record(path: &Path) -> u32 {
+    let mut pid = None;
+    until("a complete PID record", || {
+        pid = complete_pid(path);
+        pid.is_some()
+    });
+    pid.unwrap()
+}
+
+fn process_runs(pid: u32, start: u64) -> bool {
+    if crate::split::proc_start_time(pid) != Some(start) {
+        return false;
+    }
+    let result = std::process::Command::new("ps")
+        .args(["-p", &pid.to_string(), "-o", "stat="])
+        .output()
+        .expect("ps runs on Unix");
+    result.status.success() && !String::from_utf8_lossy(&result.stdout).trim_start().starts_with('Z')
+}
+
 fn wait_for_file(path: &Path) {
     let deadline = Instant::now() + Duration::from_secs(30);
     while !path.exists() {
@@ -28,8 +138,11 @@ fn wait_for_file(path: &Path) {
 fn a_background_writer_cannot_outlive_its_reader_or_create_a_late_spool() {
     let scratch = Scratch::new("late-output");
     // The background writer cannot print until the report has been taken.
-    let command = "(n=0; while [ ! -f release ] && [ $n -lt 1500 ]; do n=$((n+1)); sleep 0.02; done; seq 1 40000; touch attempted) & echo DONE";
-    let (running, wake) = run_with(request(&scratch, command), "/bin/sh");
+    let command = format!(
+        "(while [ ! -f release ] && [ -d '{}' ]; do sleep 0.02; done; seq 1 40000; touch attempted) & echo DONE",
+        scratch.0.display()
+    );
+    let (running, wake) = run_with(request(&scratch, &command), "/bin/sh");
     let done = finish(&running, &wake);
     let readers = running.control.readers.load(Ordering::SeqCst);
     std::fs::write(scratch.0.join("release"), b"").unwrap();
@@ -285,24 +398,14 @@ fn zsh_takes_the_same_script() {
 #[test]
 fn an_interrupt_stops_the_whole_group_and_says_so() {
     let scratch = Scratch::new("interrupt");
-    let marker = scratch.0.join("late");
-    let command = format!("echo PART; (sleep 5; touch {}) & sleep 5", marker.display());
+    let command = "echo PART; touch ready; sleep 300 & wait";
     let (running, wake) = run_with(request(&scratch, &command), "/bin/sh");
-    let began = Instant::now();
-    while !std::fs::read_dir(&scratch.0)
-        .unwrap()
-        .flatten()
-        .any(|e| e.path().extension().is_some_and(|x| x == "cwd"))
-    {
-        assert!(began.elapsed() < Duration::from_secs(5));
-        std::thread::sleep(Duration::from_millis(5));
-    }
-    std::thread::sleep(Duration::from_millis(100));
+    let _cleanup = GroupCleanup::new(&running);
+    wait_for_file(&scratch.0.join("ready"));
     running.interrupt();
     let done = finish(&running, &wake);
     assert_eq!(done.ending, Ending::Interrupted);
     assert!(done.output.starts_with("PART\n"), "{}", done.output);
-    assert!(began.elapsed() < Duration::from_secs(4));
 }
 
 #[test]
@@ -311,43 +414,83 @@ fn a_child_that_ignores_the_polite_signal_goes_with_the_shell() {
     let began_file = scratch.0.join("began");
     let marker = scratch.0.join("late");
     let command = format!(
-        "(trap '' TERM; touch {}; sleep 1; touch {}) & wait",
+        "(trap '' TERM; touch {}; i=0; while [ $i -lt 500 ]; do i=$((i+1)); sleep 0.02; done; touch survived) & echo $! > {}; wait",
         began_file.display(),
         marker.display()
     );
     let (running, wake) = run_with(request(&scratch, &command), "/bin/sh");
-    let began = Instant::now();
-    while !began_file.exists() {
-        assert!(began.elapsed() < Duration::from_secs(5));
-        std::thread::sleep(Duration::from_millis(5));
-    }
+    let _cleanup = GroupCleanup::new(&running);
+    let pid = pid_record(&marker);
+    wait_for_file(&began_file);
+    let start = crate::split::proc_start_time(pid).expect("the descendant has started");
+    assert!(
+        process_runs(pid, start),
+        "the portable liveness probe sees the live descendant"
+    );
     running.interrupt();
     assert_eq!(finish(&running, &wake).ending, Ending::Interrupted);
-    std::thread::sleep(Duration::from_millis(1300));
-    assert!(!marker.exists(), "it outlived the stop");
+    until("the descendant ends", || !process_runs(pid, start));
+    assert!(
+        !scratch.0.join("survived").exists(),
+        "the descendant ran to its natural end after interrupt"
+    );
 }
 
 #[test]
 fn the_limit_kills_what_ignores_the_polite_signal() {
     let scratch = Scratch::new("limit");
-    let mut asked = request(&scratch, "trap '' TERM; echo PART; sleep 30");
+    let mut asked = request(
+        &scratch,
+        "trap '' TERM; echo PART; touch ready; i=0; while [ $i -lt 500 ]; do i=$((i+1)); sleep 0.02; done; touch survived",
+    );
     asked.timeout = Duration::from_millis(100);
-    let began = Instant::now();
-    let (running, wake) = run_with(asked, "/bin/sh");
+    let advance = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let worker_advance = advance.clone();
+    let (woke, wake) = mpsc::channel();
+    let running = start_with_spawn(
+        asked,
+        Some("/bin/sh".into()),
+        move || {
+            let _ = woke.send(());
+        },
+        move |job| {
+            std::thread::spawn(move || {
+                CLOCK.with(|clock| {
+                    *clock.borrow_mut() = Some((Instant::now(), worker_advance, std::cell::Cell::new(0)))
+                });
+                job();
+            });
+            Ok(())
+        },
+    );
+    let _cleanup = GroupCleanup::new(&running);
+    wait_for_file(&scratch.0.join("ready"));
+    advance.store(true, Ordering::SeqCst);
     let done = finish(&running, &wake);
     assert_eq!(done.ending, Ending::TimedOut(Duration::from_millis(100)));
     assert_eq!(done.output, "PART\n");
-    assert!(began.elapsed() < Duration::from_secs(10));
+    assert!(
+        !scratch.0.join("survived").exists(),
+        "SIGKILL must end the TERM-ignoring shell before its natural end"
+    );
 }
 
 #[test]
 fn a_background_job_does_not_hold_the_line_open() {
     let scratch = Scratch::new("background");
-    let began = Instant::now();
-    let done = line(&scratch, "sleep 3 & echo DONE");
+    let done = line(
+        &scratch,
+        "(i=0; while [ ! -e release ] && [ $i -lt 500 ]; do i=$((i+1)); sleep 0.02; done; if [ ! -e release ]; then touch survived; fi; touch attempted) & echo DONE",
+    );
     assert_eq!(done.output, "DONE\n");
     assert_eq!(done.ending, Ending::Exited(0));
-    assert!(began.elapsed() < Duration::from_millis(2500));
+    assert!(done.output_loss.as_deref().unwrap().contains("drain deadline"));
+    std::fs::write(scratch.0.join("release"), b"").unwrap();
+    wait_for_file(&scratch.0.join("attempted"));
+    assert!(
+        !scratch.0.join("survived").exists(),
+        "the background job must end through its release gate"
+    );
 }
 
 #[test]
@@ -388,12 +531,22 @@ fn a_shell_that_is_not_there_says_so() {
 #[test]
 fn dropping_a_running_line_kills_it() {
     let scratch = Scratch::new("drop");
-    let marker = scratch.0.join("late");
-    let command = format!("sleep 1; touch {}", marker.display());
-    let (running, _wake) = run_with(request(&scratch, &command), "/bin/sh");
+    let (running, wake) = run_with(
+        request(
+            &scratch,
+            "touch ready; i=0; while [ $i -lt 500 ]; do i=$((i+1)); sleep 0.02; done; touch survived",
+        ),
+        "/bin/sh",
+    );
+    let _cleanup = GroupCleanup::new(&running);
+    wait_for_file(&scratch.0.join("ready"));
     drop(running);
-    std::thread::sleep(Duration::from_millis(1400));
-    assert!(!marker.exists());
+    wake.recv_timeout(Duration::from_secs(60))
+        .expect("the dropped line's worker reaped its child");
+    assert!(
+        !scratch.0.join("survived").exists(),
+        "Drop kills the line before its bounded natural end"
+    );
 }
 
 #[test]

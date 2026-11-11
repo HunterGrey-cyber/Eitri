@@ -1,5 +1,6 @@
 //! Non-blocking LSP requests and bounded, single-use collections.
 
+use crate::editor_tools::stamp::monotonic_now;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::ffi::OsStr;
 use std::os::unix::ffi::OsStrExt;
@@ -616,10 +617,59 @@ pub struct Budget {
     limit: Duration,
 }
 
+#[cfg(any(test, feature = "test-support"))]
+thread_local! {
+    static TEST_BUDGET_EXPIRED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static TEST_BUDGET_NOW: std::cell::Cell<Option<Instant>> = const { std::cell::Cell::new(None) };
+}
+
+#[cfg(any(test, feature = "test-support"))]
+pub fn reset_test_budget_expired() {
+    TEST_BUDGET_EXPIRED.set(false);
+}
+
+#[cfg(any(test, feature = "test-support"))]
+pub fn test_budget_expired() -> bool {
+    TEST_BUDGET_EXPIRED.get()
+}
+
+#[cfg(any(test, feature = "test-support"))]
+pub struct TestBudgetClock(Option<Instant>);
+
+#[cfg(any(test, feature = "test-support"))]
+impl TestBudgetClock {
+    pub fn new() -> Self {
+        Self(TEST_BUDGET_NOW.replace(Some(Instant::now())))
+    }
+}
+
+#[cfg(any(test, feature = "test-support"))]
+impl Drop for TestBudgetClock {
+    fn drop(&mut self) {
+        TEST_BUDGET_NOW.set(self.0);
+    }
+}
+
+#[cfg(any(test, feature = "test-support"))]
+pub fn advance_test_budget_clock(delta: Duration) -> Option<Instant> {
+    let now = TEST_BUDGET_NOW.get()? + delta;
+    TEST_BUDGET_NOW.set(Some(now));
+    Some(now)
+}
+
+fn budget_now() -> Instant {
+    #[cfg(any(test, feature = "test-support"))]
+    if let Some(now) = TEST_BUDGET_NOW.get() {
+        return now;
+    }
+    // The editor tools' own monotonic clock, which unit tests can also drive.
+    monotonic_now()
+}
+
 impl Budget {
     pub fn new(limit: Duration) -> Budget {
         Budget {
-            started: Instant::now(),
+            started: budget_now(),
             limit,
         }
     }
@@ -629,11 +679,18 @@ impl Budget {
     }
 
     fn left(&self) -> Duration {
-        self.limit.saturating_sub(self.started.elapsed())
+        let left = self
+            .limit
+            .saturating_sub(budget_now().saturating_duration_since(self.started));
+        #[cfg(any(test, feature = "test-support"))]
+        if left.is_zero() {
+            TEST_BUDGET_EXPIRED.set(true);
+        }
+        left
     }
 
     fn restart(&mut self) {
-        self.started = Instant::now();
+        self.started = budget_now();
     }
 }
 
@@ -906,8 +963,8 @@ impl AskCollect {
         if !self.loaded_now {
             return failed(format!("no language server is attached to {named}"));
         }
-        let since = *self.attach_since.get_or_insert_with(Instant::now);
-        if since.elapsed() >= ATTACH_WAIT || self.budget.spent() {
+        let since = *self.attach_since.get_or_insert_with(monotonic_now);
+        if monotonic_now().saturating_duration_since(since) >= ATTACH_WAIT || self.budget.spent() {
             return failed(format!("no language server attached to {named} within 5 s"));
         }
         self.stage = Stage::Attaching;
@@ -1666,7 +1723,7 @@ mod tests {
             Progress::Step(Step::PollAfter(wait)) if wait == ATTACH_POLL
         ));
         assert!(matches!(run.no_client(false), Progress::Step(Step::PollAfter(_))));
-        run.attach_since = Some(Instant::now() - ATTACH_WAIT);
+        run.attach_since = Some(monotonic_now() - ATTACH_WAIT);
         match run.no_client(false) {
             Progress::Failed(result) => {
                 assert_eq!(result.text, "no language server attached to the project within 5 s");
@@ -1685,12 +1742,10 @@ mod tests {
 
     #[test]
     fn a_collect_before_the_last_ends_with_the_budget() {
+        let _clock = crate::editor_tools::testing::clock::Clock::new();
         let mut run = AskCollect::new(AskArgs::default(), None, Budget::new(Duration::from_secs(2)));
         let held_to = the_budget_of(run.collect(false));
-        assert!(
-            held_to <= Duration::from_secs(2) && held_to > Duration::from_secs(1),
-            "what is left, or a held collect takes the last one's margin: {held_to:?}"
-        );
+        assert_eq!(held_to, Duration::from_secs(2));
         assert_eq!(the_budget_of(run.collect(true)), COLLECT_MARGIN);
         let mut early = AskCollect::new(AskArgs::default(), None, Budget::new(LSP_BUDGET));
         assert_eq!(the_budget_of(early.collect(false)), EDITOR_BUDGET);
@@ -1727,7 +1782,7 @@ mod tests {
         let (sender, answer) = mpsc::channel();
         let telling = Telling {
             answer,
-            since: Instant::now(),
+            since: monotonic_now(),
         };
         assert!(matches!(telling.step(), Step::PollAfter(wait) if wait == TELLING_POLL));
         let telling = Telling {

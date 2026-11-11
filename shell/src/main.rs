@@ -108,8 +108,6 @@ use gtk4::prelude::*;
 use gtk4::{Application, ApplicationWindow, EventControllerKey};
 
 use agent_panel::ViewId;
-#[cfg(test)]
-use eitri_core::attention::AgentPlace;
 use eitri_core::attention::Attention;
 use eitri_core::keymap::{Action, TabAction};
 use eitri_core::layout::rules::without_keys;

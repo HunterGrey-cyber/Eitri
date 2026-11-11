@@ -402,6 +402,7 @@ struct FakeWindow {
     lines: mpsc::Receiver<Value>,
     listener: Option<RvListener>,
     publisher: Option<Publisher>,
+    active: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl FakeWindow {
@@ -409,9 +410,16 @@ impl FakeWindow {
         let instance = new_instance();
         let (tx, lines) = mpsc::channel();
         let me = instance.clone();
+        let active = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let busy = active.clone();
         let listener = RvListener::bind(&world.control, &instance, move |stream| {
             let (tx, me) = (tx.clone(), me.clone());
-            std::thread::spawn(move || serve_fake(stream, &tx, &me));
+            busy.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let busy = busy.clone();
+            std::thread::spawn(move || {
+                serve_fake(stream, &tx, &me);
+                busy.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+            });
             true
         })
         .unwrap();
@@ -421,6 +429,7 @@ impl FakeWindow {
             lines,
             listener: Some(listener),
             publisher: Some(publisher),
+            active,
         }
     }
 
@@ -429,10 +438,17 @@ impl FakeWindow {
         drop(self.listener.take());
         let (tx, lines) = mpsc::channel();
         let me = self.instance.clone();
+        let busy = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        self.active = busy.clone();
         self.listener = Some(
             RvListener::bind(&world.control, &self.instance, move |stream| {
                 let (tx, me) = (tx.clone(), me.clone());
-                std::thread::spawn(move || serve_fake(stream, &tx, &me));
+                busy.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let busy = busy.clone();
+                std::thread::spawn(move || {
+                    serve_fake(stream, &tx, &me);
+                    busy.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                });
                 true
             })
             .unwrap(),
@@ -447,6 +463,42 @@ impl FakeWindow {
             .map(|(at, key)| row(&self.instance, key, at as u16 + 1))
             .collect();
         self.publisher.as_ref().unwrap().offer_now(rows);
+    }
+
+    fn no_act_before_pages(&self, phone: &mut Phone, key: &str) -> Result<(), String> {
+        for before_turn in 1..=20 {
+            phone.send(json!({ "kind": "more", "key": key, "generation": 1, "before_turn": before_turn }));
+            let deadline = Instant::now() + PATIENCE;
+            loop {
+                let line = self
+                    .lines
+                    .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+                    .map_err(|_| "the page marker never arrived")?;
+                check(line["kind"] != "act", || format!("an act reached the window: {line}"))?;
+                if line["kind"] == "more" && line["before_turn"] == before_turn {
+                    break;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn finish_report_connections(&self, world: &World) -> Result<(), String> {
+        let mut client =
+            RvClient::connect(&rv_socket_path(&world.control, &self.instance).unwrap()).map_err(|e| e.to_string())?;
+        client.send(&RvInbound::Ping { v: 1 }).map_err(|e| e.to_string())?;
+        let pong = client
+            .recv(PATIENCE)
+            .map_err(|e| e.to_string())?
+            .ok_or("no report marker pong")?;
+        check(pong.contains("pong"), || format!("the report marker answered {pong}"))?;
+        drop(client);
+        let deadline = Instant::now() + PATIENCE;
+        while self.active.load(std::sync::atomic::Ordering::SeqCst) != 0 {
+            check(Instant::now() < deadline, || "a report connection stayed busy".into())?;
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        Ok(())
     }
 
     /// The next line of `kind` that reached it, skipping others, within `within`.
@@ -799,28 +851,42 @@ fn hello_needs_a_known_token(dir: &Path) -> Result<(), String> {
 }
 
 fn hello_deadline_closes(dir: &Path) -> Result<(), String> {
+    use eitri_remote::serve::session::{HelloReadForTests, HelloWaitForTests};
+    let (wait, budgets, step) = HelloWaitForTests::new();
     let limits = Limits {
         hello_within: Duration::from_millis(300),
+        hello_wait_for_tests: Some(wait.clone()),
         ..Limits::default()
     };
     let world = World::new(dir, limits);
     let mut silent = world.phone();
-    let started = Instant::now();
+    check(
+        budgets.recv_timeout(PATIENCE).unwrap() == Duration::from_millis(300),
+        || "the initial hello budget changed".into(),
+    )?;
+    step.send(HelloReadForTests::Deadline).unwrap();
     let got = silent.bytes_until_closed(PATIENCE)?;
     check(got.is_empty(), || format!("{} bytes before the close", got.len()))?;
-    check(started.elapsed() >= Duration::from_millis(300), || {
-        format!("closed before the deadline, after {:?}", started.elapsed())
-    })?;
-    // A ping is not a hello: it keeps nothing open.
+
+    // Each ping is read while inside the same hello wait. The remaining budget shrinks and is never reset.
     let mut pinging = world.phone();
-    let started = Instant::now();
-    loop {
-        pinging.stream.write_all(&[0x89, 0x80, 1, 2, 3, 4]).ok();
-        if started.elapsed() > Duration::from_millis(600) {
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(50));
+    for remaining in [300, 200] {
+        check(
+            budgets.recv_timeout(PATIENCE).unwrap() == Duration::from_millis(remaining),
+            || "a ping reset the hello budget".into(),
+        )?;
+        pinging
+            .stream
+            .write_all(&[0x89, 0x80, 1, 2, 3, 4])
+            .map_err(|e| e.to_string())?;
+        wait.advance(Duration::from_millis(100));
+        step.send(HelloReadForTests::Read).unwrap();
     }
+    check(
+        budgets.recv_timeout(PATIENCE).unwrap() == Duration::from_millis(100),
+        || "the pings did not spend the hello budget".into(),
+    )?;
+    step.send(HelloReadForTests::Deadline).unwrap();
     let closed = pinging.bytes_until_closed(PATIENCE);
     check(closed.is_ok(), || format!("pings kept it open: {closed:?}"))
 }
@@ -885,9 +951,7 @@ fn act_from_watch_device_refused_twice(dir: &Path) -> Result<(), String> {
             || format!("serve's answer: {result}"),
         )?;
     }
-    check(stand_in.next_of("act", Duration::from_millis(500)).is_none(), || {
-        "a watch device's act reached the window".into()
-    })?;
+    stand_in.no_act_before_pages(&mut phone, other_key)?;
     // And the window refuses it too, to anyone who reaches its socket with that device's token.
     let mut direct = RvClient::connect(&rv_socket_path(&world.control, &window.instance).unwrap()).unwrap();
     direct
@@ -1258,7 +1322,13 @@ fn devices_connected_reaches_every_panel(dir: &Path) -> Result<(), String> {
 /// A window that opens while a phone is connected is told who is connected without waiting for another phone to come
 /// or go, and so is a window whose socket is bound again.
 fn a_window_opened_later_is_told_who_is_connected(dir: &Path) -> Result<(), String> {
-    let world = World::new(dir, Limits::default());
+    let world = World::new(
+        dir,
+        Limits {
+            report_interval_for_tests: Some(Duration::from_secs(86400)),
+            ..Limits::default()
+        },
+    );
     let first = FakeWindow::open(&world);
     let _phone = world.phone_as(WATCH);
     first.next_naming(PATIENCE).ok_or("the first window was never told")?;
@@ -1267,17 +1337,23 @@ fn a_window_opened_later_is_told_who_is_connected(dir: &Path) -> Result<(), Stri
         devices.len() == 1 && devices[0]["device"] == WATCH.0
     };
     let mut later = FakeWindow::open(&world);
+    world.hub.report_look_for_tests();
     let line = later
         .next_of("devices_connected", PATIENCE)
         .ok_or("a window opened after the phone connected was never told")?;
     check(names_the_phone(&line), || format!("{}: {line}", later.instance))?;
     // Told once: the next look does not tell it again.
-    check(
-        later.next_of("devices_connected", Duration::from_secs(3)).is_none(),
-        || format!("{} was told twice", later.instance),
-    )?;
+    for _ in 0..20 {
+        world.hub.report_look_for_tests();
+        later.finish_report_connections(&world)?;
+        check(
+            !later.lines.try_iter().any(|line| line["kind"] == "devices_connected"),
+            || format!("{} was told twice", later.instance),
+        )?;
+    }
     // The same window's socket bound again is a window to tell again.
     later.rebind(&world);
+    world.hub.report_look_for_tests();
     let line = later
         .next_of("devices_connected", PATIENCE)
         .ok_or("a socket bound again was never told")?;
@@ -1326,22 +1402,33 @@ fn a_refused_more_keeps_the_subscription(dir: &Path) -> Result<(), String> {
     phone.seqs_contiguous()
 }
 
-/// Reads what reaches the phone for `within`, turning `windows`.
-fn drain(phone: &mut Phone, windows: &[&Window], within: Duration) -> Result<Vec<Value>, String> {
-    let until = Instant::now() + within;
+/// Samples twenty advancing retry turns, each followed by the session's ordered pong.
+fn drain(phone: &mut Phone, windows: &[&Window], world: &World) -> Result<Vec<Value>, String> {
     let mut got = Vec::new();
-    while Instant::now() < until {
+    let now = Instant::now();
+    for turn in 1..=20 {
+        world.hub.tick_sessions_for_tests(now + Duration::from_secs(turn * 60));
         turn_all(windows);
-        while let Some(line) = phone.recv(Duration::from_millis(5))? {
-            got.push(line);
-        }
+        phone.send(json!({ "kind": "ping" }));
+        got.extend(
+            phone
+                .until(windows, "the retry turn's pong", |line| line["kind"] == "pong")?
+                .into_iter()
+                .filter(|line| line["kind"] != "pong"),
+        );
     }
     Ok(got)
 }
 
 fn a_window_that_turns_every_connection_away_is_tried_with_pauses(dir: &Path) -> Result<(), String> {
     use std::sync::atomic::{AtomicUsize, Ordering};
-    let world = World::new(dir, Limits::default());
+    let world = World::new(
+        dir,
+        Limits {
+            report_interval_for_tests: Some(Duration::from_secs(86400)),
+            ..Limits::default()
+        },
+    );
     let instance = new_instance();
     let accepted = Arc::new(AtomicUsize::new(0));
     let counted = accepted.clone();
@@ -1407,11 +1494,57 @@ fn a_full_panel_is_not_hammered(dir: &Path) -> Result<(), String> {
     check(lines.len() <= 3, || {
         format!("{} frames: {}", lines.len(), summary(&lines))
     })?;
-    let after = drain(&mut phone, &[&window], Duration::from_millis(500))?;
+    let after = drain(&mut phone, &[&window], &world)?;
     check(after.is_empty(), || format!("still coming: {}", summary(&after)))?;
     // Room again: the phone follows the tab.
     drop(held);
     drop(probe);
+    // An answered ping proves a reader slot has been released before the new subscription.
+    let deadline = Instant::now() + PATIENCE;
+    loop {
+        check(Instant::now() < deadline, || {
+            "the held readers never released their slots".into()
+        })?;
+        let mut marker = RvClient::connect(&socket).map_err(|e| e.to_string())?;
+        if marker.send(&RvInbound::Ping { v: 1 }).is_err() {
+            std::thread::sleep(Duration::from_millis(1));
+            continue;
+        }
+        let mut free = false;
+        loop {
+            check(Instant::now() < deadline, || {
+                "the slot marker was never answered".into()
+            })?;
+            window.turn();
+            match marker.recv(Duration::from_millis(5)) {
+                Ok(Some(line)) if line.contains("pong") => {
+                    free = true;
+                    break;
+                }
+                Ok(Some(_)) | Err(_) => break,
+                Ok(None) => {}
+            }
+        }
+        if free {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    // Dropping the marker closes its peer immediately, but only the server's reader releases the slot.
+    let deadline = Instant::now() + PATIENCE;
+    let mut released = false;
+    for _ in 0..10_000 {
+        check(Instant::now() < deadline, || {
+            "the marker reader never released its slot".into()
+        })?;
+        window.turn();
+        if window.socket.as_ref().unwrap().live_readers_for_host_test() == 0 {
+            released = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    check(released, || "the reader release exceeded its observation turns".into())?;
     phone.send(json!({ "kind": "subscribe", "key": key }));
     phone.until(&[&window], "the snapshot once there is room", |l| {
         l["kind"] == "snapshot" && l["key"] == key
@@ -1598,9 +1731,7 @@ fn watch_device_act_is_recorded_once(dir: &Path) -> Result<(), String> {
         !notice.to_string().contains(sentinel) && !notice.to_string().contains("w1"),
         || format!("the notice carries the command: {notice}"),
     )?;
-    check(stand_in.next_of("act", Duration::from_millis(300)).is_none(), || {
-        "the act reached the window".into()
-    })?;
+    stand_in.no_act_before_pages(&mut phone, key)?;
     let records = world.record_where("the refusal", |r| field(r, "reason") == "grant")?;
     let grants: Vec<&Record> = records.iter().filter(|r| field(r, "reason") == "grant").collect();
     check(grants.len() == 1, || {
@@ -1674,6 +1805,8 @@ fn audit_mine_returns_only_this_devices_records(dir: &Path) -> Result<(), String
             },
         })
         .map_err(|e| e.to_string())?;
+    let now = Instant::now();
+    world.hub.audit().set_mine_time_for_tests(now);
     let mut phone = world.phone_as(STEER);
     world.record_where("this phone's open", |r| {
         r.event == "conn_open" && field(r, "device") == STEER.0
@@ -1694,7 +1827,7 @@ fn audit_mine_returns_only_this_devices_records(dir: &Path) -> Result<(), String
         l["kind"] == "refused" || l["kind"] == "audit_mine"
     })?;
     check(lines.last().unwrap()["kind"] == "refused", || summary(&lines))?;
-    std::thread::sleep(Duration::from_millis(1100));
+    world.hub.audit().set_mine_time_for_tests(now + Duration::from_secs(1));
     phone.send(json!({ "kind": "audit_mine", "limit": 0 }));
     let lines = phone.until(&[], "no records", |l| l["kind"] == "audit_mine")?;
     check(lines.last().unwrap()["records"] == json!([]), || {
@@ -1730,16 +1863,72 @@ impl Posted {
 }
 
 /// Gives both of the world's devices a push endpoint and starts a notifier over its hub, posting to `posted`.
-fn notifier_over(world: &World, posted: &Posted) -> Result<(), String> {
+fn notifier_over(world: &World, posted: &Posted) -> Result<DrivenNotifier, String> {
     eitri_core::remote_devices::update(&world.store, |store| {
         for id in [STEER.0, WATCH.0] {
             store.get_mut(id).unwrap().push_endpoint = Some(format!("https://push.example/up/{id}"));
         }
     })
     .map_err(|e| format!("the store: {e}"))?;
+    let deadline = Instant::now() + PATIENCE;
+    while world.hub.push_targets().len() != 2 {
+        if Instant::now() >= deadline {
+            return Err("the hub never loaded both push targets".into());
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
     let sources = eitri_remote::serve::notifier::Sources::of_hub(&world.hub, &world.control);
-    eitri_remote::serve::notifier::start_with(&world.control, sources, posted.clone(), world.hub.audit().clone())
-        .map_err(|e| format!("the notifier: {e}"))
+    let (send, events) = mpsc::channel();
+    let reader = eitri_core::agents::Reader::start(&world.control, eitri_core::agents::SCHEMA_V, move |event| {
+        let _ = send.send(event);
+    })
+    .map_err(|e| e.to_string())?;
+    Ok(DrivenNotifier {
+        notifier: eitri_remote::serve::notifier::Notifier::new(sources, posted.clone(), world.hub.audit().clone()),
+        _reader: reader,
+        events,
+        now: Instant::now(),
+    })
+}
+
+struct DrivenNotifier {
+    notifier: eitri_remote::serve::notifier::Notifier<Posted>,
+    _reader: eitri_core::agents::Reader,
+    events: mpsc::Receiver<eitri_core::agents::ReaderEvent>,
+    now: Instant,
+}
+
+impl DrivenNotifier {
+    fn row(&mut self, key: &str, class: eitri_core::agents::Class) -> Result<(), String> {
+        let deadline = Instant::now() + PATIENCE;
+        loop {
+            let event = self
+                .events
+                .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+                .map_err(|e| format!("the notifier never read {key}: {e}"))?;
+            let eitri_core::agents::ReaderEvent::Change(change) = event else {
+                return Err(format!("{event:?}"));
+            };
+            let wanted = match &change {
+                eitri_core::agents::Change::Row { row } => row.key == key && row.class == class,
+                eitri_core::agents::Change::Reset { view } => {
+                    view.rows.iter().any(|row| row.key == key && row.class == class)
+                }
+                _ => false,
+            };
+            self.notifier.on_change(&change, self.now);
+            if wanted {
+                return Ok(());
+            }
+        }
+    }
+
+    fn turns(&mut self) {
+        for _ in 0..20 {
+            self.now += Duration::from_secs(1);
+            self.notifier.tick(self.now);
+        }
+    }
 }
 
 fn classed(instance: &str, key: &str, number: u16, class: eitri_core::agents::Class) -> Row {
@@ -1758,9 +1947,6 @@ fn wakes(posted: &Posted, count: usize, within: Duration) -> Vec<String> {
     posted.now()
 }
 
-/// Long enough for a change the notifier would act on to reach it: its reader is woken by the file's change.
-const NO_WAKE_WITHIN: Duration = Duration::from_millis(1500);
-
 fn finished_keys_wake_only_belled_tabs(dir: &Path) -> Result<(), String> {
     use eitri_core::agents::Class;
     let world = World::new(dir, Limits::default());
@@ -1772,7 +1958,8 @@ fn finished_keys_wake_only_belled_tabs(dir: &Path) -> Result<(), String> {
         classed(&instance, other, 2, Class::Working),
     ]);
     let posted = Posted::default();
-    notifier_over(&world, &posted)?;
+    let mut notifier = notifier_over(&world, &posted)?;
+    notifier.row(belled, Class::Working)?;
     // The phone bells one tab, then leaves: its wakes are for when it is not connected.
     let mut phone = world.phone_as(STEER);
     phone.send(json!({ "kind": "set_finished_keys", "keys": [belled] }));
@@ -1791,12 +1978,16 @@ fn finished_keys_wake_only_belled_tabs(dir: &Path) -> Result<(), String> {
         classed(&instance, belled, 1, Class::Working),
         classed(&instance, other, 2, Class::Quiet),
     ]);
-    let early = wakes(&posted, 1, NO_WAKE_WITHIN);
+    notifier.row(other, Class::Quiet)?;
+    notifier.turns();
+    let early = posted.now();
     check(early.is_empty(), || format!("an unbelled tab's end woke {early:?}"))?;
     rows.offer_now(vec![
         classed(&instance, belled, 1, Class::Quiet),
         classed(&instance, other, 2, Class::Quiet),
     ]);
+    notifier.row(belled, Class::Quiet)?;
+    notifier.turns();
     let got = wakes(&posted, 1, PATIENCE);
     check(got == ["https://push.example/up/d1"], || {
         format!("the belled tab's end woke {got:?}")
@@ -1820,7 +2011,8 @@ fn connected_device_is_not_woken(dir: &Path) -> Result<(), String> {
     let key = "k-00000000000000c1";
     rows.offer_now(vec![classed(&instance, key, 1, Class::Quiet)]);
     let posted = Posted::default();
-    notifier_over(&world, &posted)?;
+    let mut notifier = notifier_over(&world, &posted)?;
+    notifier.row(key, Class::Quiet)?;
     let mut phone = world.phone_as(STEER);
     phone.send(json!({ "kind": "ping" }));
     phone.until(&[], "the pong", |l| l["kind"] == "pong")?;
@@ -1828,9 +2020,10 @@ fn connected_device_is_not_woken(dir: &Path) -> Result<(), String> {
         "the steering phone is not counted as connected".to_owned()
     })?;
     rows.offer_now(vec![classed(&instance, key, 1, Class::Needs)]);
+    notifier.row(key, Class::Needs)?;
     let got = wakes(&posted, 1, PATIENCE);
     // Anything more would have come with the first.
-    std::thread::sleep(NO_WAKE_WITHIN);
+    notifier.turns();
     let got_later = posted.now();
     check(got == ["https://push.example/up/d2"] && got_later == got, || {
         format!("a needs-you woke {got_later:?}")

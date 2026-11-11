@@ -80,10 +80,11 @@ fn read_round(
     cap: usize,
     before_drop: &mut dyn FnMut(&[u8]),
     deadline: Instant,
+    clock: &mut dyn FnMut(Option<Duration>) -> Instant,
 ) -> Pipe {
     let mut chunk = [0u8; 4096];
     let mut read = 0;
-    while read < READ_PER_ROUND && Instant::now() < deadline {
+    while read < READ_PER_ROUND && clock(None) < deadline {
         match reader.read(&mut chunk) {
             Ok(0) => return Pipe::Closed,
             Ok(n) => {
@@ -140,6 +141,55 @@ fn path_from_command_waiting(
     budget: Duration,
     try_wait: &mut dyn FnMut(&mut std::process::Child) -> std::io::Result<Option<std::process::ExitStatus>>,
 ) -> Result<OsString, String> {
+    path_from_command_using(program, args, budget, try_wait, &mut real_clock)
+}
+
+/// The clock of a real read: it sleeps for the wait it is given and answers the time after it.
+fn real_clock(wait: Option<Duration>) -> Instant {
+    if let Some(wait) = wait {
+        std::thread::sleep(wait);
+    }
+    Instant::now()
+}
+
+/// Runs the normal reader while reporting its clock anchor and actual deadline to a test.
+#[cfg(any(test, feature = "test-support"))]
+pub fn path_from_command_observing_deadline(
+    program: &Path,
+    args: &[OsString],
+    budget: Duration,
+    observe: &mut dyn FnMut(Instant, Instant),
+) -> Result<OsString, String> {
+    path_from_command_observed(
+        program,
+        args,
+        budget,
+        &mut |child| child.try_wait(),
+        &mut real_clock,
+        observe,
+    )
+}
+
+/// [`path_from_command_waiting`] with the clock given: it is asked for the time with `None` and to wait with
+/// `Some`, so a test can run the timeout without real time passing.
+fn path_from_command_using(
+    program: &Path,
+    args: &[OsString],
+    budget: Duration,
+    try_wait: &mut dyn FnMut(&mut std::process::Child) -> std::io::Result<Option<std::process::ExitStatus>>,
+    clock: &mut dyn FnMut(Option<Duration>) -> Instant,
+) -> Result<OsString, String> {
+    path_from_command_observed(program, args, budget, try_wait, clock, &mut |_, _| {})
+}
+
+fn path_from_command_observed(
+    program: &Path,
+    args: &[OsString],
+    budget: Duration,
+    try_wait: &mut dyn FnMut(&mut std::process::Child) -> std::io::Result<Option<std::process::ExitStatus>>,
+    clock: &mut dyn FnMut(Option<Duration>) -> Instant,
+    observe: &mut dyn FnMut(Instant, Instant),
+) -> Result<OsString, String> {
     let spawned = Command::new(program)
         .args(args)
         .env(RESOLVING_VAR, "1")
@@ -155,7 +205,9 @@ fn path_from_command_waiting(
     // Read without blocking, so a shell that never ends is still timed out.
     set_nonblocking(&stdout);
     set_nonblocking(&stderr);
-    let deadline = Instant::now() + budget;
+    let start = clock(None);
+    let deadline = start + budget;
+    observe(start, deadline);
     let mut output = Vec::new();
     let mut errors = Vec::new();
     // The last PATH seen in output that has since been dropped; the kept output's own comes first.
@@ -169,25 +221,34 @@ fn path_from_command_waiting(
     let (mut out, mut err) = (Pipe::Empty, Pipe::Empty);
     let status = loop {
         if out != Pipe::Closed {
-            out = read_round(&mut stdout, &mut output, OUTPUT_CAP, &mut keep_path, deadline);
+            out = read_round(&mut stdout, &mut output, OUTPUT_CAP, &mut keep_path, deadline, clock);
         }
         if err != Pipe::Closed {
-            err = read_round(&mut stderr, &mut errors, ERROR_TAIL_BYTES, &mut nothing, deadline);
+            err = read_round(
+                &mut stderr,
+                &mut errors,
+                ERROR_TAIL_BYTES,
+                &mut nothing,
+                deadline,
+                clock,
+            );
         }
         match try_wait(&mut child) {
             Ok(Some(status)) => break status.to_string(),
-            Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(10)),
+            Ok(None) if clock(None) < deadline => {
+                clock(Some(Duration::from_millis(10)));
+            }
             // The shell cannot be waited for: it has ended and was reaped already (SIGCHLD ignored by whoever
             // started this window). What it printed decides, read until its pipe closes, its PATH has come (a job
             // its configuration left may hold the pipe open) or the budget ends.
             Err(e) => {
-                while out != Pipe::Closed && Instant::now() < deadline {
-                    out = read_round(&mut stdout, &mut output, OUTPUT_CAP, &mut keep_path, deadline);
+                while out != Pipe::Closed && clock(None) < deadline {
+                    out = read_round(&mut stdout, &mut output, OUTPUT_CAP, &mut keep_path, deadline, clock);
                     if path_from_output(&output).is_some() {
                         break;
                     }
                     if out == Pipe::Empty {
-                        std::thread::sleep(Duration::from_millis(10));
+                        clock(Some(Duration::from_millis(10)));
                     }
                 }
                 if let Some(path) = path_from_output(&output).or(dropped_path) {
@@ -213,14 +274,21 @@ fn path_from_command_waiting(
     };
     // What it wrote just before it ended, until the pipe is empty. A child it left behind may hold the pipe open
     // and keep writing; the reads still end at the budget.
-    while out != Pipe::Closed && Instant::now() < deadline {
-        out = read_round(&mut stdout, &mut output, OUTPUT_CAP, &mut keep_path, deadline);
+    while out != Pipe::Closed && clock(None) < deadline {
+        out = read_round(&mut stdout, &mut output, OUTPUT_CAP, &mut keep_path, deadline, clock);
         if out == Pipe::Empty {
             break;
         }
     }
-    while err != Pipe::Closed && Instant::now() < deadline {
-        err = read_round(&mut stderr, &mut errors, ERROR_TAIL_BYTES, &mut nothing, deadline);
+    while err != Pipe::Closed && clock(None) < deadline {
+        err = read_round(
+            &mut stderr,
+            &mut errors,
+            ERROR_TAIL_BYTES,
+            &mut nothing,
+            deadline,
+            clock,
+        );
         if err == Pipe::Empty {
             break;
         }
@@ -403,6 +471,153 @@ mod tests {
         }
     }
 
+    struct KillGroup(Option<libc::pid_t>);
+
+    impl KillGroup {
+        fn arm(&mut self, pid: libc::pid_t) {
+            self.0 = Self::safe_pid(pid);
+        }
+
+        fn safe_pid(pid: libc::pid_t) -> Option<libc::pid_t> {
+            if pid <= 1 {
+                #[cfg(debug_assertions)]
+                {
+                    use std::io::Write;
+                    let _ = writeln!(std::io::stderr(), "refusing fixture process group {pid}");
+                }
+                return None;
+            }
+            Some(pid)
+        }
+
+        fn kill_with(&mut self, mut signal: impl FnMut(libc::pid_t)) {
+            if let Some(pid) = self.0.take().and_then(Self::safe_pid) {
+                signal(pid);
+            }
+        }
+    }
+
+    impl Drop for KillGroup {
+        fn drop(&mut self) {
+            self.kill_with(|pid| {
+                // SAFETY: this child leads the fixture's process group; its FIFO-held jobs must end on unwind too.
+                unsafe { libc::kill(-pid, libc::SIGKILL) };
+            });
+        }
+    }
+
+    #[test]
+    fn fixture_cleanup_refuses_unsafe_pids_and_signals_only_once() {
+        for pid in [libc::pid_t::MIN, -1, 0, 1] {
+            let mut group = KillGroup(None);
+            group.arm(pid);
+            assert_eq!(group.0, None);
+            // Check Drop's defence too, without ever passing an unsafe pid to the kernel.
+            group.0 = Some(pid);
+            group.kill_with(|_| panic!("unsafe process group reached signal"));
+            assert_eq!(group.0, None);
+        }
+        let mut group = KillGroup(Some(42));
+        let mut signalled = Vec::new();
+        group.kill_with(|pid| signalled.push(pid));
+        group.kill_with(|pid| signalled.push(pid));
+        assert_eq!(signalled, vec![42]);
+    }
+
+    fn fake_run(
+        shell: &Path,
+        args: &[OsString],
+        budget: Duration,
+        try_wait: &mut dyn FnMut(&mut std::process::Child) -> std::io::Result<Option<std::process::ExitStatus>>,
+    ) -> (Result<OsString, String>, Duration) {
+        fake_run_observing_cleanup(shell, args, budget, try_wait, &mut |_| {})
+    }
+
+    fn fake_run_observing_cleanup(
+        shell: &Path,
+        args: &[OsString],
+        budget: Duration,
+        try_wait: &mut dyn FnMut(&mut std::process::Child) -> std::io::Result<Option<std::process::ExitStatus>>,
+        cleanup: &mut dyn FnMut(Option<libc::pid_t>),
+    ) -> (Result<OsString, String>, Duration) {
+        let began = Instant::now();
+        let mut now = began;
+        let mut turns = 0;
+        let mut group = KillGroup(None);
+        let mut running = false;
+        let result = path_from_command_using(
+            shell,
+            args,
+            budget,
+            &mut |child| {
+                group.arm(child.id() as libc::pid_t);
+                let status = try_wait(child);
+                running = matches!(status, Ok(None));
+                status
+            },
+            &mut |wait| {
+                turns += 1;
+                assert!(turns < 100_000, "login shell did not finish within 100,000 clock reads");
+                now += wait.unwrap_or(Duration::from_millis(1));
+                std::thread::yield_now();
+                now
+            },
+        );
+        if running {
+            // A return after an observed running child means the timeout path killed and reaped it.
+            // Its pid may now be reused, so the unwind guard must no longer signal it.
+            group.0 = None;
+        }
+        cleanup(group.0);
+        (result, now.duration_since(began))
+    }
+
+    fn fifo(scratch: &Scratch) -> PathBuf {
+        let path = scratch.0.join("hold");
+        let cpath = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+        // SAFETY: cpath is a valid NUL-terminated path inside this test's scratch directory.
+        assert_eq!(unsafe { libc::mkfifo(cpath.as_ptr(), 0o600) }, 0);
+        path
+    }
+
+    #[test]
+    fn a_panicking_shell_fixture_kills_its_group() {
+        let scratch = Scratch::new();
+        let hold = fifo(&scratch);
+        let shell = scratch.script("shell", &format!("#!/bin/sh\nread line < '{}'\n", hold.display()));
+        let mut pid = 0;
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = fake_run(&shell, &[], Duration::from_secs(10), &mut |child| {
+                pid = child.id() as libc::pid_t;
+                panic!("the fixture failed while its shell was held");
+            });
+        }));
+        assert!(panic.is_err());
+        assert!(pid > 1);
+        let until = Instant::now() + Duration::from_secs(60);
+        let mut status = 0;
+        let ended = loop {
+            // SAFETY: pid names the child just spawned; its Child was dropped during unwinding without a wait.
+            let waited = unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) };
+            if waited == pid {
+                break true;
+            }
+            assert_eq!(waited, 0, "could not wait for the fixture shell");
+            if Instant::now() >= until {
+                // SAFETY: this test still owns the unreaped child and its process group.
+                unsafe {
+                    libc::kill(-pid, libc::SIGKILL);
+                    libc::waitpid(pid, &mut status, 0);
+                }
+                break false;
+            }
+            std::thread::yield_now();
+        };
+        assert!(ended, "the fixture's process group survived its panic");
+        assert!(libc::WIFSIGNALED(status));
+        assert_eq!(libc::WTERMSIG(status), libc::SIGKILL);
+    }
+
     #[test]
     fn only_a_start_the_launcher_says_is_not_from_a_terminal_asks() {
         assert!(wanted(Some(OsStr::new("desktop")), None));
@@ -479,14 +694,38 @@ mod tests {
     #[test]
     fn a_shell_that_hangs_is_killed_at_the_budget_and_the_path_is_kept() {
         let scratch = Scratch::new();
-        let shell = scratch.script("shell", "#!/bin/sh\necho 'starting tmux'\nsleep 30 &\nsleep 30\n");
-        let started = Instant::now();
-        let got = ask_login_shell(Some(shell), Duration::from_millis(300), &path_from_command);
-        assert!(started.elapsed() < Duration::from_secs(5), "{:?}", started.elapsed());
-        assert!(
-            matches!(&got, LoginPath::Kept(why) if why.contains("no answer")),
-            "{got:?}"
+        let hold = fifo(&scratch);
+        let ready = scratch.0.join("ready");
+        let shell = scratch.script(
+            "shell",
+            &format!(
+                "#!/bin/sh\necho ready > '{}'\nread line < '{}'\n",
+                ready.display(),
+                hold.display()
+            ),
         );
+        let budget = Duration::from_millis(300);
+        let (got, took) = fake_run_observing_cleanup(
+            &shell,
+            &[],
+            budget,
+            &mut |child| {
+                let until = Instant::now() + Duration::from_secs(60);
+                while !ready.exists() {
+                    assert!(Instant::now() < until, "shell never reached its FIFO hold");
+                    std::thread::yield_now();
+                }
+                child.try_wait()
+            },
+            &mut |armed| assert_eq!(armed, None, "the reaped group must be disarmed"),
+        );
+        assert!(matches!(&got, Err(why) if why.contains("no answer")), "{got:?}");
+        assert!(
+            took >= budget && took <= budget + Duration::from_millis(15),
+            "timeout at {took:?}, expected {budget:?} plus at most one polling round"
+        );
+        let kept = ask_login_shell(Some(shell), Duration::ZERO, &|_, _, _| got.clone());
+        assert!(matches!(kept, LoginPath::Kept(_)));
     }
 
     #[test]
@@ -495,8 +734,8 @@ mod tests {
         let scratch = Scratch::new();
         let shell = stand_in(&scratch, "/opt/reaped/bin:/usr/bin");
         let args = linux_shell_command(&shell);
-        let got = path_from_command_waiting(&shell, &args, Duration::from_secs(10), &mut |_| {
-            std::thread::sleep(Duration::from_millis(20));
+        let got = path_from_command_waiting(&shell, &args, Duration::from_secs(10), &mut |child| {
+            child.wait().unwrap();
             Err(std::io::Error::from_raw_os_error(libc::ECHILD))
         });
         assert_eq!(got, Ok(OsString::from("/opt/reaped/bin:/usr/bin")));
@@ -514,32 +753,25 @@ mod tests {
     #[test]
     fn a_shell_that_cannot_be_waited_for_and_leaves_a_job_on_its_output_returns_at_its_path() {
         let scratch = Scratch::new();
-        let pidfile = scratch.0.join("job.pid");
+        let hold = fifo(&scratch);
         let shell = scratch.script(
             "shell",
             &format!(
-                "#!/bin/sh\nsleep 30 &\necho $! > '{}'\nshift 3\nPATH=/opt/job/bin:/usr/bin\nexport PATH\n\
+                "#!/bin/sh\n(read line < '{}') &\nshift 3\nPATH=/opt/job/bin:/usr/bin\nexport PATH\n\
                  eval \"$1\"\nexit 0\n",
-                pidfile.display()
+                hold.display()
             ),
         );
         let args = linux_shell_command(&shell);
-        let started = Instant::now();
-        let got = path_from_command_waiting(&shell, &args, Duration::from_secs(10), &mut |_| {
-            std::thread::sleep(Duration::from_millis(20));
+        let (got, took) = fake_run(&shell, &args, Duration::from_secs(10), &mut |child| {
+            child.wait().unwrap();
             Err(std::io::Error::from_raw_os_error(libc::ECHILD))
         });
-        let took = started.elapsed();
-        if let Ok(pid) = std::fs::read_to_string(&pidfile)
-            .unwrap_or_default()
-            .trim()
-            .parse::<libc::pid_t>()
-        {
-            // SAFETY: the pid the stand-in wrote of the `sleep` it started; this test ends only that one.
-            unsafe { libc::kill(pid, libc::SIGKILL) };
-        }
         assert_eq!(got, Ok(OsString::from("/opt/job/bin:/usr/bin")));
-        assert!(took < Duration::from_secs(3), "{took:?}");
+        assert!(
+            took < Duration::from_millis(100),
+            "did not return promptly on the logical clock: {took:?}"
+        );
     }
 
     #[test]
@@ -590,32 +822,26 @@ mod tests {
     #[test]
     fn a_shell_that_exits_with_a_child_holding_its_output_returns_at_once() {
         let scratch = Scratch::new();
-        let pidfile = scratch.0.join("child.pid");
+        let hold = fifo(&scratch);
         let shell = scratch.script(
             "shell",
             &format!(
-                "#!/bin/sh\nsleep 30 &\necho $! > '{}'\nshift 3\nPATH=/opt/held/bin:/usr/bin\nexport PATH\n\
+                "#!/bin/sh\n(read line < '{}') &\nshift 3\nPATH=/opt/held/bin:/usr/bin\nexport PATH\n\
                  eval \"$1\"\nexit 0\n",
-                pidfile.display()
+                hold.display()
             ),
         );
-        let started = Instant::now();
-        let got = ask_login_shell(Some(shell), Duration::from_secs(10), &path_from_command);
-        let took = started.elapsed();
-        if let Ok(pid) = std::fs::read_to_string(&pidfile)
-            .unwrap_or_default()
-            .trim()
-            .parse::<libc::pid_t>()
-        {
-            // SAFETY: the pid the stand-in wrote of the `sleep` it started; this test ends only that one.
-            unsafe { libc::kill(pid, libc::SIGKILL) };
-        }
-        assert!(took < Duration::from_secs(2), "{took:?}");
-        let want = OsString::from("/opt/held/bin:/usr/bin");
-        assert!(
-            matches!(&got, LoginPath::FromShell { path, .. } if path == &want),
-            "{got:?}"
+        let (got, took) = fake_run(
+            &shell,
+            &linux_shell_command(&shell),
+            Duration::from_secs(10),
+            &mut |child| child.wait().map(Some),
         );
+        assert!(
+            took < Duration::from_millis(100),
+            "did not return promptly on the logical clock: {took:?}"
+        );
+        assert_eq!(got, Ok(OsString::from("/opt/held/bin:/usr/bin")));
     }
 
     #[test]

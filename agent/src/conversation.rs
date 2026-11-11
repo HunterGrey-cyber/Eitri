@@ -412,17 +412,17 @@ fn spawn_provider_call<T: Send + 'static>(
     let done = Arc::new(std::sync::Mutex::new(Some(done)));
     let on_thread = Arc::clone(&done);
     let spawned = std::thread::Builder::new().name(name.to_owned()).spawn(move || {
+        // Declared first so the completion lock also outlives an unconsumed outcome.
+        let mut completion;
         let outcome = call();
-        if let Some(done) = on_thread
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .take()
-        {
+        completion = on_thread.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(done) = completion.take() {
             done(outcome);
         }
     });
     if let Err(e) = spawned {
-        if let Some(done) = done.lock().unwrap_or_else(std::sync::PoisonError::into_inner).take() {
+        let mut completion = done.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(done) = completion.take() {
             done(Err(ConversationError::Provider(ProviderError::Transport(format!(
                 "no thread for the call: {e}"
             )))));
@@ -1970,6 +1970,39 @@ mod tests {
     }
 
     #[test]
+    fn edition_drop_order_provider_completion() {
+        struct Trace(std::sync::mpsc::Sender<&'static str>, &'static str);
+        impl Drop for Trace {
+            fn drop(&mut self) {
+                self.0.send(self.1).unwrap();
+            }
+        }
+        let (tx, rx) = std::sync::mpsc::channel();
+        let outcome = Trace(tx.clone(), "outcome");
+        let callback = Trace(tx.clone(), "callback capture");
+        spawn_provider_call(
+            "completion-test",
+            move || Ok(outcome),
+            move |result| {
+                tx.send("callback").unwrap();
+                drop(result);
+                drop(callback);
+            },
+        );
+        let observed: Vec<_> = (0..3)
+            .map(|_| {
+                rx.recv_timeout(std::time::Duration::from_secs(30))
+                    .expect("the completion returned")
+            })
+            .collect();
+        assert_eq!(observed, ["callback", "outcome", "callback capture"]);
+        assert!(matches!(
+            rx.recv_timeout(std::time::Duration::from_secs(30)),
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected)
+        ));
+    }
+
+    #[test]
     fn display_eviction_and_saves_preserve_cli_records_and_send_only_driven_turns() {
         let root = crate::test_tmp::TmpDir::in_dir(
             &crate::state_dirs::test_workspace_dir("cli-record-preservation"),
@@ -2159,13 +2192,13 @@ mod tests {
         AgentConversation::create(Arc::new(Shared(fake)), dir, project)
     }
 
-    /// Whether the session's lease can be taken, asked again for up to a second while it looks held.
+    /// Whether the session's lease can be taken, asked again for up to five seconds while it looks held.
     /// A lock just let go can look held for a moment while another test thread starts a child
-    /// process (the child shares every descriptor until it execs); one that was never let go is
-    /// still held after the second. So what this checks is "released within a second", a little
+    /// process (the child shares every descriptor until it execs or exits); one that was never let go is
+    /// still held after the bound. So what this checks is "released within five seconds", a little
     /// weaker than "released when its holder was dropped".
     fn lease_comes_free(cwd: &str, session: &str) -> bool {
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         loop {
             match SessionLease::try_acquire(PROVIDER_NAME, cwd, session) {
                 Ok(_) => return true,
@@ -2297,8 +2330,7 @@ mod tests {
         fake.queue(session_opened());
         assert_eq!(adopted_record(&conversation).title.as_deref(), Some("the real subject"));
         conversation.note_title("after adoption");
-        // A rename would be written by the ingestion thread within a poll or two; give it several.
-        std::thread::sleep(std::time::Duration::from_millis(50));
+        conversation.ingest.stop();
         let record =
             crate::persistence::load_conversation_record(conversation.conversation_id(), "claude-uuid-abc").unwrap();
         assert_eq!(record.title.as_deref(), Some("the real subject"));
@@ -3390,9 +3422,79 @@ mod tests {
             "the provider was never asked"
         );
         assert!(
-            SessionLease::try_acquire(PROVIDER_NAME, &cwd, "claude-uuid-someone-else").is_ok(),
+            lease_comes_free(&cwd, "claude-uuid-someone-else"),
             "a refused lease is not kept"
         );
+    }
+
+    #[test]
+    fn a_refused_lease_can_remain_held_by_a_fork_until_it_exits() {
+        use std::os::fd::AsRawFd;
+
+        struct Child {
+            pid: libc::pid_t,
+            release: Option<std::io::PipeWriter>,
+        }
+        impl Drop for Child {
+            fn drop(&mut self) {
+                // Always reap, including when an assertion unwinds before the pipe is closed.
+                self.release.take();
+                unsafe {
+                    libc::kill(self.pid, libc::SIGKILL);
+                    while libc::waitpid(self.pid, std::ptr::null_mut(), 0) == -1
+                        && std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted
+                    {
+                    }
+                }
+            }
+        }
+
+        let dir = unique_dir();
+        let cwd = dir.to_string_lossy().to_string();
+        let session = "claude-uuid-forked";
+        let lease = SessionLease::try_acquire(PROVIDER_NAME, &cwd, session).unwrap();
+        let (reader, writer) = std::io::pipe().unwrap();
+        let read_fd = reader.as_raw_fd();
+        let write_fd = writer.as_raw_fd();
+        // SAFETY: the child calls only async-signal-safe functions and never returns to Rust.
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0, "{}", std::io::Error::last_os_error());
+        if pid == 0 {
+            unsafe {
+                libc::close(write_fd);
+                let mut byte = 0u8;
+                while libc::read(read_fd, (&mut byte as *mut u8).cast(), 1) == -1 {
+                    // A signal can interrupt the pipe read; EOF releases the child.
+                }
+                libc::_exit(0);
+            }
+        }
+        let mut child = Child {
+            pid,
+            release: Some(writer),
+        };
+        drop(reader);
+
+        let provider = AcceptingResume::attaching_to("claude-uuid-asked-for");
+        let result = AgentConversation::resume_holding(
+            provider.clone(),
+            &dir,
+            "claude-uuid-asked-for",
+            Some(lease),
+            ProjectTrust::Untrusted,
+        );
+        assert!(matches!(result, Err(ConversationError::Lease(_))));
+        assert!(provider.asked.lock().unwrap().is_empty());
+        assert!(
+            matches!(
+                SessionLease::try_acquire(PROVIDER_NAME, &cwd, session),
+                Err(LeaseError::AlreadyHeld)
+            ),
+            "the fork holds the open file even after the refusal dropped the parent's lease"
+        );
+        // A byte releases this child even if another concurrent fork copied the pipe's writer.
+        std::io::Write::write_all(child.release.as_mut().unwrap(), &[1]).unwrap();
+        assert!(lease_comes_free(&cwd, session), "the child's exit releases its copy");
     }
 
     /// A resume that fails gives its handed lease back, as one that took its own always did.
@@ -3718,9 +3820,14 @@ mod tests {
             permission_id: "perm-2".into(),
             outcome: crate::PermissionOutcome::Allowed,
         });
-        std::thread::sleep(std::time::Duration::from_millis(50));
+        let checkpoint = crate::ingestion::idle_wakeups::IdleProbe::new(source.conversation_id());
+        // A frozen worker reaches its next idle boundary without taking queued events.
+        checkpoint.parked();
+        checkpoint.resume();
+        checkpoint.parked();
         assert_eq!(source.ingest_stats().events_ingested, 8, "nothing folded while frozen");
         assert_eq!(fake.queued_events.lock().unwrap().len(), 1);
+        drop(checkpoint);
     }
 
     #[test]

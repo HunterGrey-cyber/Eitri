@@ -81,11 +81,9 @@ fn a_hang_up_ends_nvim_while_the_connection_lives() {
 /// handshake would leave both sides waiting.
 #[test]
 fn a_launcher_that_fails_the_handshake_is_let_go() {
-    use std::os::unix::fs::PermissionsExt;
     let dir = scratch("handshake");
     let launcher = dir.join("launcher");
-    std::fs::write(&launcher, "#!/bin/sh\nexec 1>&-\ncat >/dev/null\n").expect("write the launcher");
-    std::fs::set_permissions(&launcher, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+    script_fixture::write_executable_script(&launcher, "#!/bin/sh\nexec 1>&-\ncat >/dev/null\n", 0o755).expect("chmod");
     let (tx, rx) = mpsc::channel();
     let instance = embedded(&launcher, &[], &dir);
     std::thread::spawn(move || {
@@ -169,4 +167,9 @@ fn a_hang_up_on_a_server_session_closes_the_servers_channel() {
         after, 1,
         "the session's channel closed: the server saw the client leave"
     );
+}
+
+#[cfg(test)]
+mod script_fixture {
+    include!(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/support/executable.rs"));
 }

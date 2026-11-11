@@ -477,6 +477,18 @@ impl AcpProvider {
     }
 
     /// The child's pid, captured at spawn.
+    #[cfg(feature = "test-support")]
+    pub fn lines_read_for_tests(&self) -> u64 {
+        lock(&self.link).as_ref().map_or(0, JsonRpcLink::lines_read_for_tests)
+    }
+
+    #[cfg(feature = "test-support")]
+    pub fn reader_waiting_for_tests(&self) -> bool {
+        lock(&self.link)
+            .as_ref()
+            .is_some_and(JsonRpcLink::reader_waiting_for_tests)
+    }
+
     pub fn pid(&self) -> u32 {
         self.pid
     }
@@ -1534,15 +1546,32 @@ impl AcpProvider {
     /// The provider stays locked while the link stops, so that nothing is pumped from a half-stopped
     /// link: its other calls wait for up to those 2 s, and a caller on a UI thread freezes from another.
     pub fn freeze_for_move(&self) -> Result<(AcpProviderHandoff, LinkHandoff, [OwnedFd; 3]), MoveRefusedWhy> {
-        let deadline = Instant::now() + START_WAIT;
+        self.freeze_with_clock(Instant::now, std::thread::sleep)
+    }
+
+    #[cfg(feature = "test-support")]
+    pub fn freeze_with_clock_for_tests(
+        &self,
+        now: impl Fn() -> Instant,
+        pause: impl Fn(Duration),
+    ) -> Result<(AcpProviderHandoff, LinkHandoff, [OwnedFd; 3]), MoveRefusedWhy> {
+        self.freeze_with_clock(now, pause)
+    }
+
+    fn freeze_with_clock(
+        &self,
+        now: impl Fn() -> Instant,
+        pause: impl Fn(Duration),
+    ) -> Result<(AcpProviderHandoff, LinkHandoff, [OwnedFd; 3]), MoveRefusedWhy> {
+        let deadline = now() + START_WAIT;
         let mut st = loop {
             let st = lock(&self.state);
             match self.move_blocker(&st) {
                 None => break st,
                 // The start's caller waits outside this lock and takes it again once its answer comes.
-                Some(MoveRefusedWhy::Starting) if Instant::now() < deadline => {
+                Some(MoveRefusedWhy::Starting) if now() < deadline => {
                     drop(st);
-                    std::thread::sleep(Duration::from_millis(10));
+                    pause(Duration::from_millis(10));
                 }
                 Some(why) => return Err(why),
             }

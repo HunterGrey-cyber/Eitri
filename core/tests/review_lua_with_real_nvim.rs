@@ -2386,7 +2386,7 @@ fn a_whole_buffer_replacement_that_moves_the_text_is_searched_for_the_hunk() {
         vec![],
     );
     fx.nvim.flush_scheduled();
-    std::thread::sleep(std::time::Duration::from_millis(300));
+    fx.nvim.flush_scheduled();
     assert!(fx.events().is_empty());
     assert!(fx.marks().trackers.is_empty());
     fx.nvim.quit();
@@ -2398,7 +2398,7 @@ fn a_whole_buffer_replacement_that_moves_the_text_is_searched_for_the_hunk() {
         vec![],
     );
     fx.nvim.flush_scheduled();
-    std::thread::sleep(std::time::Duration::from_millis(300));
+    fx.nvim.flush_scheduled();
     assert!(fx.events().is_empty());
     fx.nvim.quit();
 }
@@ -3549,7 +3549,7 @@ fn a_message_wider_than_the_command_line_is_cut_to_fit_and_stops_nothing() {
     draw_running(&mut fx, &path, &two.hunks);
     fx.nvim.command("messages clear");
     fx.nvim.input(",d");
-    std::thread::sleep(std::time::Duration::from_millis(300));
+    fx.nvim.flush_scheduled();
     let mode = fx.nvim.request("nvim_get_mode", vec![]);
     assert_eq!(get(&mode, "mode"), &Value::from("n"), "{mode:?}");
     assert_eq!(get(&mode, "blocking"), &Value::from(false), "{mode:?}");
@@ -3588,7 +3588,7 @@ fn a_callable_table_notify_gets_the_whole_line() {
     let (path, two) = live_two(&mut fx);
     draw_running(&mut fx, &path, &two.hunks);
     fx.nvim.input(",d");
-    std::thread::sleep(std::time::Duration::from_millis(300));
+    fx.nvim.flush_scheduled();
     let mode = fx.nvim.request("nvim_get_mode", vec![]);
     assert_eq!(get(&mode, "mode"), &Value::from("n"), "{mode:?}");
     assert_eq!(

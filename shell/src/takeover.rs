@@ -631,9 +631,13 @@ impl Held {
     /// Waits, at most `within`, for a detach under way to end.
     fn wait_detached(&self, within: Duration) {
         let state = lock(&self.detach);
-        let _ = self
+        let _wait = self
             .detach_done
             .wait_timeout_while(state, within, |state| *state == Detach::Running);
+        #[cfg(any(test, feature = "probe"))]
+        if _wait.unwrap_or_else(|error| error.into_inner()).1.timed_out() {
+            println!("[takeover] detach completion timed out within {within:?}");
+        }
     }
 
     /// What a close asks about: whether nvim waits for a key, and the drafts and proposals that end with the window.

@@ -161,6 +161,12 @@ pub struct Host {
 }
 
 impl Host {
+    /// Whether the panel has a timer armed, including its fallback steady timer.
+    #[cfg(any(test, debug_assertions, feature = "test-support"))]
+    pub fn panel_timer_armed(&self) -> bool {
+        self.panel_tick.borrow().as_ref().is_some_and(|tick| tick.timer_armed())
+    }
+
     /// The host and its web view, before the window exists: the panel can be assembled with [`Host::page`]
     /// and attached right away; the view joins the window in `window_created`.
     pub fn new(mtm: MainThreadMarker) -> Rc<Host> {

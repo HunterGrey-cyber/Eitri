@@ -1,7 +1,7 @@
 //! `eitri-editor-bridge` between an MCP client and a window: the test is the client on the bridge's stdio and the
 //! host on a socket of its own, so every promise here is about bytes the real binary read and wrote.
 
-use std::io::{BufRead, BufReader, ErrorKind, Write};
+use std::io::{BufRead, BufReader, ErrorKind, Read, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, ExitStatus, Stdio};
@@ -130,7 +130,7 @@ impl Bridge {
             .arg(key)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
+            .stderr(Stdio::piped())
             .spawn()
             .expect("the bridge starts");
         let stdin = child.stdin.take();
@@ -177,6 +177,25 @@ impl Bridge {
 
     fn call(&mut self, id: u64, name: &str) {
         self.say(&call_request(id, name, json!({"path": "a"})));
+    }
+
+    fn assert_reconnect_budget_exhausted(&mut self, socket: &Path) {
+        assert_eq!(self.wait().code(), Some(1));
+        let mut stderr = String::new();
+        self.child.stderr.take().unwrap().read_to_string(&mut stderr).unwrap();
+        assert!(
+            stderr
+                .lines()
+                .any(|line| line == format!("eitri-editor-bridge: no host at {}", socket.display())),
+            "missing no-host diagnostic: {stderr}"
+        );
+        #[cfg(feature = "probe")]
+        assert!(
+            stderr
+                .lines()
+                .any(|line| line == "eitri-editor-bridge: reconnect budget 5s exhausted"),
+            "missing reconnect-budget diagnostic: {stderr}"
+        );
     }
 
     fn wait(&mut self) -> ExitStatus {
@@ -574,35 +593,21 @@ fn a_frame_out_of_shape_from_the_host_counts_as_a_drop() {
 }
 
 #[test]
-fn no_host_for_5_s_exits_1() {
+fn no_host_exhausts_the_reconnect_budget_and_exits_1() {
     let scratch = Scratch::new();
-    let start = Instant::now();
     let mut bridge = Bridge::start(&scratch.socket(), KEY);
-    let status = bridge.wait();
-    assert!(
-        start.elapsed() >= Duration::from_secs(5),
-        "gave up after {:?}",
-        start.elapsed()
-    );
-    assert_eq!(status.code(), Some(1));
+    bridge.assert_reconnect_budget_exhausted(&scratch.socket());
 }
 
 #[test]
-fn a_host_gone_for_5_s_exits_1() {
+fn a_dropped_host_exhausts_the_reconnect_budget_and_exits_1() {
     let scratch = Scratch::new();
     let (mut bridge, host, link) = connected(&scratch);
     // A ping answered after the welcome shows nothing of the connection is in doubt when it goes.
     bridge.nothing_else_came();
     drop(link);
     host.unbind();
-    let start = Instant::now();
-    let status = bridge.wait();
-    assert_eq!(status.code(), Some(1));
-    assert!(
-        start.elapsed() >= Duration::from_secs(4),
-        "gave up after {:?}",
-        start.elapsed()
-    );
+    bridge.assert_reconnect_budget_exhausted(&scratch.socket());
 }
 
 #[test]

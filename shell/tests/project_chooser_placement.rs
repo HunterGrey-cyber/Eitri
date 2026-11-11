@@ -4,7 +4,7 @@ use std::cell::RefCell;
 use std::process::Command;
 use std::rc::Rc;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use eitri_core::project_chooser::{ChooserView, LineEv, RowKind, RowView};
 use gtk4::prelude::*;
@@ -16,13 +16,11 @@ mod own_x_server;
 mod project_chooser;
 use project_chooser::{ChooserReport, ProjectChooserView};
 
+#[path = "support/frame_turns.rs"]
+mod frame_turns;
+
 fn pump() {
-    let end = Instant::now() + Duration::from_millis(150);
-    let context = gtk4::glib::MainContext::default();
-    while Instant::now() < end {
-        while context.iteration(false) {}
-        std::thread::sleep(Duration::from_millis(2));
-    }
+    frame_turns::settle();
 }
 
 fn view() -> ChooserView {
@@ -419,21 +417,28 @@ fn the_list_reports_plain_keys_and_the_line_takes_text(display: &str) {
         .any(|r| matches!(r, ChooserReport::Line(LineEv::DeleteSegment))));
 }
 
-fn updates_over(stage: &Stage, millis: u64) -> u32 {
-    let clock = stage.window.frame_clock().unwrap();
-    let count = Rc::new(std::cell::Cell::new(0u32));
-    let id = clock.connect_update({
-        let count = count.clone();
-        move |_| count.set(count.get() + 1)
-    });
-    let end = Instant::now() + Duration::from_millis(millis);
-    let context = gtk4::glib::MainContext::default();
-    while Instant::now() < end {
-        while context.iteration(false) {}
-        std::thread::sleep(Duration::from_millis(2));
+fn updates_over(stage: &Stage, turns: u64) -> u32 {
+    let updates = Rc::new(std::cell::Cell::new(0));
+    let observed = updates.clone();
+    let clock = stage.window.frame_clock().expect("a mapped window's frame clock");
+    let handler = clock.connect_update(move |_| observed.set(observed.get() + 1));
+    for _ in 0..turns {
+        let done = Rc::new(std::cell::Cell::new(false));
+        let elapsed = done.clone();
+        gtk4::glib::timeout_add_local_once(Duration::from_millis(16), move || elapsed.set(true));
+        frame_turns::until("the idle observation turn", || done.get());
     }
-    clock.disconnect(id);
-    count.get()
+    clock.disconnect(handler);
+    updates.get()
+}
+
+fn wait_for_updates(stage: &Stage, count: u32) {
+    let updates = Rc::new(std::cell::Cell::new(0));
+    let observed = updates.clone();
+    let clock = stage.window.frame_clock().expect("a mapped window's frame clock");
+    let handler = clock.connect_update(move |_| observed.set(observed.get() + 1));
+    frame_turns::until("the chooser's frame updates", || updates.get() >= count);
+    clock.disconnect(handler);
 }
 
 fn the_frame_tick_runs_only_while_the_chooser_is_up() {
@@ -442,20 +447,17 @@ fn the_frame_tick_runs_only_while_the_chooser_is_up() {
     }
     let stage = Stage::new();
     pump();
-    assert_eq!(updates_over(&stage, 400), 0, "a window with no chooser is idle");
+    assert_eq!(updates_over(&stage, 20), 0, "a window with no chooser is idle");
     stage.show();
     pump();
-    assert!(
-        updates_over(&stage, 400) >= 5,
-        "the chooser fits itself by frames while it is up"
-    );
+    wait_for_updates(&stage, 5);
     stage.chooser.show(None);
     pump();
     pump();
-    assert_eq!(updates_over(&stage, 400), 0, "a hidden chooser wakes nothing");
+    assert_eq!(updates_over(&stage, 20), 0, "a hidden chooser wakes nothing");
     stage.chooser.focus();
     stage.chooser.show(Some(&view()));
-    assert!(updates_over(&stage, 400) >= 5, "it comes back when it is shown again");
+    wait_for_updates(&stage, 5);
 }
 
 fn a_long_message_does_not_widen_the_panel() {
@@ -571,9 +573,45 @@ fn a_2000_row_view_keeps_its_row_widgets_bounded() {
     assert!(!panel.has_css_class("browsing"));
 }
 
+fn clicks(stage: &Stage) -> Vec<gtk4::GestureClick> {
+    stage
+        .widgets()
+        .iter()
+        .flat_map(|widget| {
+            widget
+                .observe_controllers()
+                .into_iter()
+                .filter_map(|controller| controller.ok()?.downcast::<gtk4::GestureClick>().ok())
+                .collect::<Vec<_>>()
+        })
+        .collect()
+}
+
+struct DoubleClickTime(gtk4::Settings, i32);
+impl DoubleClickTime {
+    fn hold() -> Self {
+        let settings = gtk4::Settings::default().unwrap();
+        let previous = settings.gtk_double_click_time();
+        settings.set_gtk_double_click_time(i32::MAX);
+        Self(settings, previous)
+    }
+}
+impl Drop for DoubleClickTime {
+    fn drop(&mut self) {
+        self.0.set_gtk_double_click_time(self.1);
+    }
+}
+
+fn reset_clicks(stage: &Stage) {
+    for gesture in clicks(stage) {
+        gesture.reset();
+    }
+}
+
 /// A double-click carries the revision its first press saw: when that press changed the rows (a redraw in the same
 /// turn), the second press must not act on the new rows.
 fn a_double_click_reports_pick_twice_with_its_first_press_rev(display: &str) {
+    let _double_click_time = DoubleClickTime::hold();
     let stage = Stage::sized(720);
     stage.overlay.add_overlay(stage.chooser.widget());
     stage.chooser.focus();
@@ -584,8 +622,7 @@ fn a_double_click_reports_pick_twice_with_its_first_press_rev(display: &str) {
     let bounds = row.compute_bounds(&stage.window).unwrap();
     let (x, y) = ((bounds.x() + 8.0) as i32, (bounds.y() + bounds.height() / 2.0) as i32);
     let double = |stage: &Stage| {
-        // Clicks closer together than the double-click time count on from the last ones: let the last ones end.
-        std::thread::sleep(Duration::from_millis(800));
+        reset_clicks(stage);
         pump();
         let xid = xdo(
             display,
@@ -655,8 +692,7 @@ fn a_press_let_go_off_its_row_picks_nothing(display: &str) {
         ((bounds.x() + dx) as i32, (bounds.y() + bounds.height() / 2.0) as i32)
     };
     let press = |from: (i32, i32), to: (i32, i32), hold: u64| {
-        // Presses closer together than the double-click time count on from the last ones: let the last ones end.
-        std::thread::sleep(Duration::from_millis(800));
+        reset_clicks(&stage);
         pump();
         let xid = xdo(
             display,
@@ -671,13 +707,36 @@ fn a_press_let_go_off_its_row_picks_nothing(display: &str) {
             pump();
         };
         to_point(from);
+        let stopped = Rc::new(std::cell::Cell::new(0));
+        let handlers: Vec<_> = clicks(&stage)
+            .into_iter()
+            .map(|gesture| {
+                let observed = stopped.clone();
+                let id = gesture.connect_stopped(move |_| observed.set(observed.get() + 1));
+                (gesture, id)
+            })
+            .collect();
+        let timers = frame_turns::TimerMark::now();
+        let before = stopped.get();
         xdo(display, &["mousedown", "1"]);
         pump();
         to_point(to);
-        std::thread::sleep(Duration::from_millis(hold));
+        if hold > 0 {
+            for _ in 0..20 {
+                timers.expire();
+                pump();
+                if stopped.get() > before {
+                    break;
+                }
+            }
+            assert!(stopped.get() > before, "the gesture's click timer never expired");
+        }
         pump();
         xdo(display, &["mouseup", "1"]);
         pump();
+        for (gesture, id) in handlers {
+            gesture.disconnect(id);
+        }
         picks_of(&stage)
     };
     assert_eq!(
@@ -714,7 +773,7 @@ fn a_click_in_a_rows_padding_picks_it(display: &str) {
         outer.x(),
         inner.x()
     );
-    std::thread::sleep(Duration::from_millis(800));
+    reset_clicks(&stage);
     pump();
     stage.reports.borrow_mut().clear();
     click(

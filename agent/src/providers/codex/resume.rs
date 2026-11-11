@@ -102,13 +102,22 @@ fn history_gap(kept: bool, problem: &str) -> Vec<AgentDomainEvent> {
 /// followed again. Turns are read newest first so the budget leaves older history out, then their event
 /// groups are reversed into chronological order with any missing-history note before them.
 pub fn page_history(thread_id: &str, deadline: Instant, ask: &mut Ask<'_>) -> Vec<AgentDomainEvent> {
+    page_history_with_clock(thread_id, deadline, ask, &Instant::now)
+}
+
+fn page_history_with_clock(
+    thread_id: &str,
+    deadline: Instant,
+    ask: &mut Ask<'_>,
+    now: &dyn Fn() -> Instant,
+) -> Vec<AgentDomainEvent> {
     let mut events = Vec::new();
     let mut turn_groups = Vec::new();
     let mut cursor: Option<String> = None;
     let mut cursors_seen: HashSet<String> = HashSet::new();
     let mut turns_seen: HashSet<String> = HashSet::new();
     'pages: loop {
-        if Instant::now() >= deadline {
+        if now() >= deadline {
             events.extend(Stop::Slow.note(!turn_groups.is_empty()));
             break;
         }
@@ -147,7 +156,7 @@ pub fn page_history(thread_id: &str, deadline: Instant, ask: &mut Ask<'_>) -> Ve
                 eprintln!("agent: Codex listed a turn of the history twice; shown once");
                 continue;
             }
-            let (items, complete) = load_items(thread_id, turn, deadline, ask);
+            let (items, complete) = load_items(thread_id, turn, deadline, ask, now);
             if let Complete::Stopped(stop) = complete {
                 // A turn that stopped before any of its items arrived would show as an empty turn; it is left
                 // out and the note covers it. One with items that is the last turn Codex has is the oldest and
@@ -174,13 +183,19 @@ pub fn page_history(thread_id: &str, deadline: Instant, ask: &mut Ask<'_>) -> Ve
 }
 
 /// How a turn's items were read: what arrived, and whether every page did.
-fn load_items(thread_id: &str, turn: &Turn, deadline: Instant, ask: &mut Ask<'_>) -> (Vec<ThreadItem>, Complete) {
+fn load_items(
+    thread_id: &str,
+    turn: &Turn,
+    deadline: Instant,
+    ask: &mut Ask<'_>,
+    now: &dyn Fn() -> Instant,
+) -> (Vec<ThreadItem>, Complete) {
     let mut items = Vec::new();
     let mut cursor: Option<String> = None;
     let mut cursors_seen: HashSet<String> = HashSet::new();
     let mut pages = 0;
     loop {
-        if Instant::now() >= deadline {
+        if now() >= deadline {
             return (items, Complete::Stopped(Stop::Slow));
         }
         if pages >= ITEM_PAGES_MAX || items.len() >= ITEMS_MAX {
@@ -691,7 +706,8 @@ mod tests {
     /// asserts what was read and asked, never how long it took.
     #[test]
     fn the_deadline_holds_inside_a_turns_items() {
-        let deadline = Instant::now() + Duration::from_millis(200);
+        let clock = std::cell::Cell::new(Instant::now());
+        let deadline = clock.get() + Duration::from_millis(200);
         let mut item_asks = 0;
         let mut ask = |name: &str, _: Value| -> Result<Value, AskError> {
             if name == method::THREAD_TURNS_LIST {
@@ -701,14 +717,14 @@ mod tests {
             if item_asks > 100 {
                 return Err(LinkError::Closed.into());
             }
-            std::thread::sleep(Duration::from_millis(50));
+            clock.set(clock.get() + Duration::from_millis(50));
             Ok(items_page(
                 "t1",
                 &format!("i{item_asks}"),
                 Some(&format!("c{item_asks}")),
             ))
         };
-        let events = page_history("th", deadline, &mut ask);
+        let events = page_history_with_clock("th", deadline, &mut ask, &|| clock.get());
         assert!(
             notes(&events)
                 .iter()
@@ -721,10 +737,8 @@ mod tests {
             "the only turn is the oldest, so no turns before it are missing: {:#?}",
             notes(&events)
         );
-        assert!(
-            item_asks < 100,
-            "the cap ended it, not the deadline: {item_asks} item asks"
-        );
+        assert_eq!(item_asks, 4, "the deadline ends paging after four clock advances");
+        assert_eq!(clock.get(), deadline);
         assert!(
             events
                 .iter()
@@ -849,16 +863,17 @@ mod tests {
     /// empty turn marked partial; only the note stands for it.
     #[test]
     fn a_turn_the_deadline_reached_before_its_items_is_left_out() {
-        let deadline = Instant::now() + Duration::from_millis(100);
+        let clock = std::cell::Cell::new(Instant::now());
+        let deadline = clock.get() + Duration::from_millis(100);
         let mut ask = |name: &str, _: Value| -> Result<Value, AskError> {
             if name == method::THREAD_TURNS_LIST {
                 return Ok(turns_page(&["t2", "t1"], None));
             }
             // Answering takes longer than the budget left.
-            std::thread::sleep(Duration::from_millis(250));
+            clock.set(clock.get() + Duration::from_millis(250));
             Ok(items_page("t2", "t2-only", None))
         };
-        let events = page_history("th", deadline, &mut ask);
+        let events = page_history_with_clock("th", deadline, &mut ask, &|| clock.get());
         assert_eq!(started(&events), [NOTE_TURN, "t2"]);
         assert_eq!(
             notes(&events),

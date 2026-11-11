@@ -88,6 +88,8 @@ struct Bridge {
     /// Set for good by `PanelView::disconnect`: from then on every navigation is cancelled, a link click
     /// included, and nothing reaches the panel.
     disconnected: Cell<bool>,
+    #[cfg(any(test, debug_assertions, feature = "test-support"))]
+    navigation_cancellations: Cell<u64>,
 }
 
 impl Bridge {
@@ -456,7 +458,7 @@ define_class!(
                 )
             };
             if self.ivars().disconnected.get() {
-                decision_handler.call((WKNavigationActionPolicy::Cancel,));
+                self.answer_navigation(decision_handler, WKNavigationActionPolicy::Cancel);
                 return;
             }
             let decision = {
@@ -468,11 +470,11 @@ define_class!(
                 events.navigation_decided(kind, url.as_deref(), &decision);
             }
             match decision {
-                NavDecision::Allow => decision_handler.call((WKNavigationActionPolicy::Allow,)),
-                NavDecision::Cancel => decision_handler.call((WKNavigationActionPolicy::Cancel,)),
+                NavDecision::Allow => self.answer_navigation(decision_handler, WKNavigationActionPolicy::Allow),
+                NavDecision::Cancel => self.answer_navigation(decision_handler, WKNavigationActionPolicy::Cancel),
                 NavDecision::LinkClick(url) => {
                     // Answered first: the panel may open the link in another app, and WebKit need not wait.
-                    decision_handler.call((WKNavigationActionPolicy::Cancel,));
+                    self.answer_navigation(decision_handler, WKNavigationActionPolicy::Cancel);
                     if let Some(events) = events {
                         events.link_clicked(url.as_deref());
                     }
@@ -512,6 +514,22 @@ define_class!(
         }
     }
 );
+
+impl PanelDelegate {
+    fn answer_navigation(
+        &self,
+        handler: &block2::DynBlock<dyn Fn(WKNavigationActionPolicy)>,
+        policy: WKNavigationActionPolicy,
+    ) {
+        #[cfg(any(test, debug_assertions, feature = "test-support"))]
+        if policy == WKNavigationActionPolicy::Cancel {
+            self.ivars()
+                .navigation_cancellations
+                .set(self.ivars().navigation_cancellations.get() + 1);
+        }
+        handler.call((policy,));
+    }
+}
 
 /// The view, and what the window and the panel need of it.
 pub struct PanelView {
@@ -578,6 +596,18 @@ impl PanelView {
     /// Where the page's unhandled keys stop (the view's next responder while it is in a window).
     pub fn key_sink(&self) -> &KeySink {
         &self.view.ivars().sink
+    }
+
+    /// How many navigation actions the delegate has cancelled, including after disconnect.
+    #[cfg(any(test, debug_assertions, feature = "test-support"))]
+    pub fn navigation_cancellations(&self) -> u64 {
+        self.bridge.navigation_cancellations.get()
+    }
+
+    /// Whether the newest document load still awaits its finish or failure callback.
+    #[cfg(any(test, debug_assertions, feature = "test-support"))]
+    pub fn document_loading(&self) -> bool {
+        self.bridge.latest_load.borrow().is_some()
     }
 
     /// What the window sets when it moves the keys.

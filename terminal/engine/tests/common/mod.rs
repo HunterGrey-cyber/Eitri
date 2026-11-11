@@ -295,3 +295,49 @@ impl Raster {
         n
     }
 }
+
+pub struct ChildGate(std::path::PathBuf);
+impl ChildGate {
+    pub fn new() -> Self {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static NEXT: AtomicUsize = AtomicUsize::new(0);
+        let path = std::env::temp_dir().join(format!(
+            "term-gate-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        let name = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+        Self(path)
+    }
+    pub fn path(&self) -> String {
+        format!("'{}'", self.0.display().to_string().replace('\'', "'\\''"))
+    }
+    pub fn release(&self) {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        let deadline = Instant::now() + Duration::from_secs(60);
+        loop {
+            match std::fs::OpenOptions::new()
+                .write(true)
+                .custom_flags(libc::O_NONBLOCK)
+                .open(&self.0)
+            {
+                Ok(mut f) => {
+                    f.write_all(b"go\n").unwrap();
+                    return;
+                }
+                Err(e) if e.raw_os_error() == Some(libc::ENXIO) => {
+                    assert!(Instant::now() < deadline, "child never waited at the gate");
+                    std::thread::yield_now();
+                }
+                Err(e) => panic!("open child gate: {e}"),
+            }
+        }
+    }
+}
+impl Drop for ChildGate {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}

@@ -82,8 +82,21 @@ impl Sequencer {
     }
 }
 
+/// The monotonic clock, with a scoped override for synchronous unit tests.
+pub(crate) fn monotonic_now() -> std::time::Instant {
+    #[cfg(test)]
+    if let Some(now) = super::testing::clock::now() {
+        return now;
+    }
+    std::time::Instant::now()
+}
+
 /// The wall clock in milliseconds since the epoch, the clock `prelude.lua` reads.
 pub fn wall_ms() -> u64 {
+    #[cfg(test)]
+    if let Some(now) = super::testing::clock::wall_ms() {
+        return now;
+    }
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|since| since.as_millis() as u64)

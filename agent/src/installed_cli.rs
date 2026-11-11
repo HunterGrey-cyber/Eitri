@@ -458,13 +458,23 @@ pub(crate) mod tests {
     use std::collections::HashMap;
     use std::ffi::OsStr;
 
-    fn env_of(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<OsString> {
+    fn env_of(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<OsString> + use<> {
         let owned: Vec<(String, String)> = pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();
         move |name| owned.iter().find(|(k, _)| k == name).map(|(_, v)| OsString::from(v))
     }
 
     fn no_file(_: &Path) -> Option<String> {
         None
+    }
+
+    #[test]
+    fn rpit_capture_contracts() {
+        let env = {
+            let key = String::from("HOME");
+            let value = String::from("/owned");
+            env_of(&[(&key, &value)])
+        };
+        assert_eq!(env("HOME"), Some(OsString::from("/owned")));
     }
 
     #[test]
@@ -568,11 +578,9 @@ pub(crate) mod tests {
         let c = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
         // SAFETY: `c` is a NUL-terminated path that outlives the call.
         assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
-        let started = std::time::Instant::now();
-        assert_eq!(read_user_file(&fifo, NPMRC_CAP), None);
-        assert!(
-            started.elapsed() < std::time::Duration::from_secs(5),
-            "a FIFO must not block the read"
+        assert_eq!(
+            crate::test_tmp::completed(move || read_user_file(&fifo, NPMRC_CAP)),
+            None
         );
         let big = root.join("big");
         std::fs::write(&big, vec![b'#'; NPMRC_CAP as usize + 1]).unwrap();

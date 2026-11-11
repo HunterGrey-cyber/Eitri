@@ -170,6 +170,11 @@ impl RecordingProvider {
     pub fn stopped_tasks(&self) -> Vec<String> {
         self.stopped_tasks.lock().unwrap().clone()
     }
+    /// A subsequent pump starts only after ingestion folded the previous batch.
+    pub fn pump_count(&self) -> usize {
+        self.pumps.load(Ordering::SeqCst)
+    }
+
     pub fn queue(&self, event: AgentDomainEvent) {
         self.queued.lock().unwrap().push(event);
     }
@@ -198,6 +203,19 @@ impl RecordingProvider {
         *self.held_pump.lock().unwrap() = Some((inside, held));
         (entered, release)
     }
+    /// Waits until ingestion has folded every event already queued, including a batch in flight.
+    pub fn wait_until_folded(&self) {
+        let target = self.pumps.load(Ordering::SeqCst) + 2;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        while self.pumps.load(Ordering::SeqCst) < target {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "ingestion did not cross the queued batch"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+    }
+
     pub fn resolutions(&self) -> Vec<(String, bool)> {
         self.resolved.lock().unwrap().clone()
     }

@@ -15,6 +15,14 @@ pub struct EmbedNvim {
 }
 
 impl EmbedNvim {
+    pub fn manual_timers(&self) {
+        self.exec_lua(include_str!("manual_timers.lua"), vec![]);
+    }
+
+    pub fn advance_timers(&self, ms: u64) {
+        self.exec_lua("test_timers.advance(...)", vec![Value::from(ms)]);
+    }
+
     pub fn start() -> Self {
         let dir = std::env::temp_dir().join(format!("es-{}", uuid::Uuid::new_v4().simple()));
         agent::private_fs::create_private_dir_all(&dir, &dir).unwrap();

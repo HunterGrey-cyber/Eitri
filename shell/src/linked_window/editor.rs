@@ -1789,11 +1789,13 @@ impl Window2Editor {
 
     /// The panel's request for nvim, sent to window 1 as an editor request with `token` (an activation token, so
     /// window 1 may come forward). `Err` says why it was not sent, for the panel to show.
+    #[cfg(test)]
     pub fn request(&self, request: &ScratchRequest, token: &dyn Fn() -> Option<String>) -> Result<(), String> {
         self.ask(request, token, false).map(|_| ())
     }
 
-    /// [`request`](Self::request), with a view's outcome to come: `Ok(Some(later))` hears window 1's answer once it
+    /// Sends the panel's request to window 1 with its activation token, with a view's outcome to come:
+    /// `Ok(Some(later))` hears window 1's answer once it
     /// has written the view and handed it to its editor, or why the view never got there. Every other request is
     /// `Ok(None)` once sent.
     pub fn request_answered(
@@ -2128,16 +2130,6 @@ mod tests {
         false
     }
 
-    /// Pumps both ends for a while, for checking that nothing arrives.
-    fn pump_a_while(one: &LinkDriver, two: &LinkDriver, steps: &Steps) {
-        for _ in 0..20 {
-            one.pump();
-            two.pump();
-            steps.run();
-            std::thread::sleep(Duration::from_millis(5));
-        }
-    }
-
     fn context(file: &str) -> EditorContext {
         EditorContext {
             file: file.into(),
@@ -2217,7 +2209,17 @@ mod tests {
         }
 
         fn pump_a_while(&self) {
-            pump_a_while(&self.one_link, &self.two_link, &self.steps);
+            for _ in 0..20 {
+                self.one_link.read_through_for_test(&self.two_link);
+                self.two_link.read_through_for_test(&self.one_link);
+                self.one_link.pump();
+                self.two_link.pump();
+                self.steps.run();
+                assert!(
+                    self.settle(|| { self.one.views.borrow().is_empty() && self.two.views.borrow().is_empty() }),
+                    "view workers did not become idle"
+                );
+            }
         }
     }
 
@@ -4058,8 +4060,15 @@ mod tests {
         /// Runs everything a while, for checking that nothing more arrives.
         fn pump_a_while(&self, windows: &[&Linked]) {
             for _ in 0..20 {
+                for window in windows {
+                    window.ours.read_through_for_test(&window.far);
+                    window.far.read_through_for_test(&window.ours);
+                }
                 self.step(windows);
-                std::thread::sleep(Duration::from_millis(5));
+                assert!(
+                    self.settle(windows, || self.one.views.borrow().is_empty()),
+                    "view writers did not become idle"
+                );
             }
         }
 

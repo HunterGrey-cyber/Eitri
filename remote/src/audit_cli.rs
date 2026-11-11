@@ -1234,7 +1234,6 @@ mod tests {
 
     #[test]
     fn one_failed_journal_reading_is_incomplete_not_clean() {
-        use std::os::unix::fs::PermissionsExt;
         let dir = scratch("verify-partial");
         let mut log = open(&dir);
         log.record(conn_open("d1", "phone")).unwrap();
@@ -1249,15 +1248,10 @@ mod tests {
             .collect();
         std::fs::write(&entries, text).unwrap();
         let bin = base.join("journalctl");
-        std::fs::write(
-            &bin,
-            format!(
+        script_fixture::write_executable_script(&bin, format!(
                 "#!/bin/sh\ncase \"$*\" in *--user*) echo 'No journal files were opened' >&2; exit 1;; esac\ncat '{}'\n",
                 entries.display()
-            ),
-        )
-        .unwrap();
-        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+            ), 0o755).unwrap();
         let journal = Journalctl::at(Some(bin));
         let (code, out, err) = run(&dir, &["--verify"], &journal);
         assert_eq!(code, VERIFY_INCOMPLETE, "{out}{err}");
@@ -1464,4 +1458,9 @@ mod tests {
             assert!(!hook_uses(text).contains(&HookUse::Elsewhere), "refused: {text}");
         }
     }
+}
+
+#[cfg(test)]
+mod script_fixture {
+    include!(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/support/executable.rs"));
 }

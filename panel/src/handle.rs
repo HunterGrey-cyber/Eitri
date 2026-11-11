@@ -937,7 +937,7 @@ impl AgentPanelHandle {
             let paced = page
                 .pacer()
                 .borrow()
-                .next_deadline(std::time::Instant::now(), state.ready(view))
+                .next_deadline(crate::panel_pacer::now(), state.ready(view))
                 .map(after_now);
             next = earliest(next, paced);
         }
@@ -1000,7 +1000,7 @@ impl AgentPanelHandle {
             {
                 let sink = page.sink();
                 let mut pacer = page.pacer().borrow_mut();
-                let now = std::time::Instant::now();
+                let now = crate::panel_pacer::now();
                 for (_, (payload, first_text, class)) in pumped.streams.iter().filter(|(to, _)| to == view) {
                     let class = if page_ready {
                         *class
@@ -1434,7 +1434,7 @@ impl AgentPanelHandle {
     /// Wakes the tick only when the key began a typing window: a key inside one moves only the window's
     /// end, which the tick already waits for, and a wake per keystroke would cost a tick per keystroke.
     pub fn note_editor_key(&self) {
-        let now = std::time::Instant::now();
+        let now = crate::panel_pacer::now();
         let mut began = false;
         for page in self.pages.every() {
             began |= page.pacer().borrow_mut().note_editor_key(now);

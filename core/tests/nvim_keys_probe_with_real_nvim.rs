@@ -9,7 +9,7 @@
 //! The stand-ins have the shape of the real plugins as far as the probe can see them: which module
 //! lands in `package.loaded`, which global is set, when the mappings appear, and what script a mapping
 //! was defined by. `-c` commands run before `VimEnter`, so each test drives `FocusLost` (one of the
-//! feed's own re-read events) by hand and lets the debounce fire with `:sleep`.
+//! feed's own re-read events) by hand and advances the debounce clock explicitly.
 //!
 //! Run: `cargo test -p eitri-core --test nvim_keys_probe_with_real_nvim -- --ignored`
 
@@ -84,6 +84,15 @@ impl Rig {
         let listener = feed.take_listener().unwrap();
         let mut command = std::process::Command::new("timeout");
         command.args(["60", "nvim", "--headless", "-i", "NONE"]);
+        let timers = self.dir.join("timers.lua");
+        self.write(&timers, &format!("{}\nlocal new_pipe = vim.uv.new_pipe; test_pipes = {{}}; vim.uv.new_pipe = function(...) local p = new_pipe(...); test_pipes[#test_pipes+1] = p; return p end", include_str!("support/manual_timers.lua")));
+        command.args([
+            "--cmd",
+            &format!(
+                "lua dofile({})",
+                serde_json::to_string(timers.to_str().unwrap()).unwrap()
+            ),
+        ]);
         for arg in feed.nvim_args() {
             command.arg(arg);
         }
@@ -156,9 +165,9 @@ fn blink_cmp_maps_on_insert_enter_are_seen_only_at_the_next_reread() {
     );
     let before = rig.run(&[
         "doautocmd FocusLost",
-        "sleep 400m",
+        "lua test_timers.advance(400); assert(vim.wait(60000, function() for _,p in ipairs(test_pipes) do if not p:is_closing() then return false end end return true end, 1))",
         "doautocmd InsertEnter",
-        "sleep 400m",
+        "lua test_timers.advance(400); assert(vim.wait(60000, function() for _,p in ipairs(test_pipes) do if not p:is_closing() then return false end end return true end, 1))",
     ]);
     assert_eq!(before.len(), 1, "InsertEnter alone must send nothing");
     let first = probe(&before[0]);
@@ -170,11 +179,11 @@ fn blink_cmp_maps_on_insert_enter_are_seen_only_at_the_next_reread() {
 
     let after = rig.run(&[
         "doautocmd FocusLost",
-        "sleep 400m",
+        "lua test_timers.advance(400); assert(vim.wait(60000, function() for _,p in ipairs(test_pipes) do if not p:is_closing() then return false end end return true end, 1))",
         "doautocmd InsertEnter",
-        "sleep 400m",
+        "lua test_timers.advance(400); assert(vim.wait(60000, function() for _,p in ipairs(test_pipes) do if not p:is_closing() then return false end end return true end, 1))",
         "doautocmd FocusLost",
-        "sleep 400m",
+        "lua test_timers.advance(400); assert(vim.wait(60000, function() for _,p in ipairs(test_pipes) do if not p:is_closing() then return false end end return true end, 1))",
     ]);
     assert_eq!(after.len(), 2, "one report before InsertEnter, one at the next re-read");
     let seen = keys(probe(&after[1]), "i", "<C-b>");
@@ -199,7 +208,7 @@ fn vim_tmux_navigator_is_loaded_and_its_four_maps_come_from_its_directory() {
          nnoremap <silent> <c-k> :<C-U>TmuxNavigateLeft<cr>\n\
          nnoremap <silent> <c-l> :<C-U>TmuxNavigateLeft<cr>\n",
     );
-    let reports = rig.run(&["doautocmd FocusLost", "sleep 400m"]);
+    let reports = rig.run(&["doautocmd FocusLost", "lua test_timers.advance(400); assert(vim.wait(60000, function() for _,p in ipairs(test_pipes) do if not p:is_closing() then return false end end return true end, 1))"]);
     let seen = probe(reports.last().unwrap());
     assert_eq!(seen.plugins.get("vim-tmux-navigator"), Some(&PluginState::Loaded));
     assert_eq!(seen.plugins.len(), 1, "{:?}", seen.plugins);
@@ -226,7 +235,7 @@ fn smart_splits_is_loaded_when_its_module_is() {
         "lua/smart-splits/init.lua",
         "return { move_cursor_left = function() end }\n",
     );
-    let reports = rig.run(&["doautocmd FocusLost", "sleep 400m"]);
+    let reports = rig.run(&["doautocmd FocusLost", "lua test_timers.advance(400); assert(vim.wait(60000, function() for _,p in ipairs(test_pipes) do if not p:is_closing() then return false end end return true end, 1))"]);
     let plugins = &probe(reports.last().unwrap()).plugins;
     assert_eq!(plugins.get("smart-splits.nvim"), Some(&PluginState::Loaded));
     assert_eq!(plugins.len(), 1, "{plugins:?}");
@@ -244,7 +253,7 @@ fn a_loaded_lazy_lists_the_plugins_it_will_load_later_as_declared() {
          \x20   { name = 'some-other-plugin.nvim' }, 'not a table' }\n\
          end }\n",
     );
-    let reports = rig.run(&["doautocmd FocusLost", "sleep 400m"]);
+    let reports = rig.run(&["doautocmd FocusLost", "lua test_timers.advance(400); assert(vim.wait(60000, function() for _,p in ipairs(test_pipes) do if not p:is_closing() then return false end end return true end, 1))"]);
     let plugins = &probe(reports.last().unwrap()).plugins;
     assert_eq!(plugins.get("lazy.nvim"), Some(&PluginState::Loaded));
     assert_eq!(plugins.get("smart-splits.nvim"), Some(&PluginState::Declared));
@@ -270,7 +279,7 @@ fn a_lazy_whose_plugins_call_fails_still_reports_everything_else() {
         "package.loaded.lazy = { plugins = function() error('lazy is not ready') end }\n\
          vim.keymap.set('n', '<C-a>', '<Nop>', { desc = 'mine' })\n",
     );
-    let reports = rig.run(&["doautocmd FocusLost", "sleep 400m"]);
+    let reports = rig.run(&["doautocmd FocusLost", "lua test_timers.advance(400); assert(vim.wait(60000, function() for _,p in ipairs(test_pipes) do if not p:is_closing() then return false end end return true end, 1))"]);
     let seen = probe(reports.last().unwrap());
     assert_eq!(seen.plugins.len(), 1, "{:?}", seen.plugins);
     assert_eq!(seen.plugins.get("lazy.nvim"), Some(&PluginState::Loaded));
@@ -292,7 +301,7 @@ fn lazy_is_never_required_when_it_is_not_loaded() {
             marker.display()
         ),
     );
-    let reports = rig.run(&["doautocmd FocusLost", "sleep 400m"]);
+    let reports = rig.run(&["doautocmd FocusLost", "lua test_timers.advance(400); assert(vim.wait(60000, function() for _,p in ipairs(test_pipes) do if not p:is_closing() then return false end end return true end, 1))"]);
     assert!(!reports.is_empty());
     for report in &reports {
         assert!(probe(report).plugins.is_empty(), "{:?}", probe(report).plugins);
@@ -309,7 +318,7 @@ fn a_chord_set_from_the_config_with_a_desc_is_reported_with_it() {
         "vim.keymap.set('n', '<C-b>', function() end, { desc = 'My own prefix' })\n\
          vim.keymap.set('i', '<C-Space>', '<Nop>', { desc = 'complete' })\n",
     );
-    let reports = rig.run(&["doautocmd FocusLost", "sleep 400m"]);
+    let reports = rig.run(&["doautocmd FocusLost", "lua test_timers.advance(400); assert(vim.wait(60000, function() for _,p in ipairs(test_pipes) do if not p:is_closing() then return false end end return true end, 1))"]);
     let seen = probe(reports.last().unwrap());
     let prefix = keys(seen, "n", "<C-b>");
     assert_eq!(prefix.len(), 1, "{:?}", seen.keys);
@@ -340,7 +349,7 @@ fn origin_is_a_directory_name_or_config_and_never_a_path() {
             config_script.display()
         ),
     );
-    let reports = rig.run(&["doautocmd FocusLost", "sleep 400m"]);
+    let reports = rig.run(&["doautocmd FocusLost", "lua test_timers.advance(400); assert(vim.wait(60000, function() for _,p in ipairs(test_pipes) do if not p:is_closing() then return false end end return true end, 1))"]);
     let seen = probe(reports.last().unwrap());
     let origin = |mode: &str, chord: &str| {
         let found = keys(seen, mode, chord);
@@ -368,7 +377,7 @@ fn over_two_thousand_global_maps_the_probe_still_holds_its_chords() {
          vim.keymap.set('n', '<C-b>', '<Nop>', { desc = 'after the flood' })\n\
          vim.keymap.set('t', '<C-h>', '<Nop>')\n",
     );
-    let reports = rig.run(&["doautocmd FocusLost", "sleep 400m"]);
+    let reports = rig.run(&["doautocmd FocusLost", "lua test_timers.advance(400); assert(vim.wait(60000, function() for _,p in ipairs(test_pipes) do if not p:is_closing() then return false end end return true end, 1))"]);
     let report = reports.last().unwrap();
     assert_eq!(report.maps.len(), 2000, "the Normal-mode list stays capped");
     let seen = probe(report);
@@ -386,14 +395,14 @@ fn text_is_cut_to_two_hundred_characters_and_a_plain_config_still_reports_a_prob
         "init.lua",
         "vim.keymap.set('n', '<C-l>', 'x', { desc = string.rep('d', 300) })\n",
     );
-    let reports = rig.run(&["doautocmd FocusLost", "sleep 400m"]);
+    let reports = rig.run(&["doautocmd FocusLost", "lua test_timers.advance(400); assert(vim.wait(60000, function() for _,p in ipairs(test_pipes) do if not p:is_closing() then return false end end return true end, 1))"]);
     let seen = probe(reports.last().unwrap());
     let found = keys(seen, "n", "<C-l>");
     assert_eq!(found.len(), 1, "{:?}", seen.keys);
     assert_eq!(found[0].desc.as_deref().unwrap().chars().count(), 200);
 
     let bare = Rig::new("bare");
-    let reports = bare.run(&["doautocmd FocusLost", "sleep 400m"]);
+    let reports = bare.run(&["doautocmd FocusLost", "lua test_timers.advance(400); assert(vim.wait(60000, function() for _,p in ipairs(test_pipes) do if not p:is_closing() then return false end end return true end, 1))"]);
     let seen = probe(reports.last().unwrap());
     assert!(seen.plugins.is_empty(), "{:?}", seen.plugins);
 }
@@ -407,7 +416,7 @@ fn a_desc_that_is_not_utf8_does_not_lose_the_report() {
         "vim.keymap.set('n', '<C-k>', 'x', { desc = 'bad \\255 byte' })\n\
          vim.keymap.set('n', '<Leader>q', 'x', { desc = 'other \\255 byte' })\n",
     );
-    let reports = rig.run(&["doautocmd FocusLost", "sleep 400m"]);
+    let reports = rig.run(&["doautocmd FocusLost", "lua test_timers.advance(400); assert(vim.wait(60000, function() for _,p in ipairs(test_pipes) do if not p:is_closing() then return false end end return true end, 1))"]);
     let report = reports.last().expect("a report is sent");
     let found = keys(probe(report), "n", "<C-k>");
     assert_eq!(found.len(), 1, "{:?}", probe(report).keys);
@@ -428,13 +437,13 @@ fn a_rescan_sends_a_report_that_has_not_changed_and_a_source_post_does_not() {
     rig.config("init.lua", "vim.keymap.set('n', '<C-l>', 'x', { desc = 'mine' })\n");
     let reports = rig.run(&[
         "doautocmd FocusLost",
-        "sleep 400m",
+        "lua test_timers.advance(400); assert(vim.wait(60000, function() for _,p in ipairs(test_pipes) do if not p:is_closing() then return false end end return true end, 1))",
         "doautocmd SourcePost",
-        "sleep 400m",
+        "lua test_timers.advance(400); assert(vim.wait(60000, function() for _,p in ipairs(test_pipes) do if not p:is_closing() then return false end end return true end, 1))",
         "lua __eitri_keys_rescan({})",
-        "sleep 400m",
+        "lua test_timers.advance(400); assert(vim.wait(60000, function() for _,p in ipairs(test_pipes) do if not p:is_closing() then return false end end return true end, 1))",
         "doautocmd SourcePost",
-        "sleep 400m",
+        "lua test_timers.advance(400); assert(vim.wait(60000, function() for _,p in ipairs(test_pipes) do if not p:is_closing() then return false end end return true end, 1))",
     ]);
     assert_eq!(
         reports.len(),
@@ -450,10 +459,10 @@ fn a_rescan_made_while_a_debounce_waits_still_sends() {
     let rig = Rig::new("rescan-pending");
     let reports = rig.run(&[
         "doautocmd FocusLost",
-        "sleep 400m",
+        "lua test_timers.advance(400); assert(vim.wait(60000, function() for _,p in ipairs(test_pipes) do if not p:is_closing() then return false end end return true end, 1))",
         "doautocmd FocusLost",
         "lua __eitri_keys_rescan({})",
-        "sleep 400m",
+        "lua test_timers.advance(400); assert(vim.wait(60000, function() for _,p in ipairs(test_pipes) do if not p:is_closing() then return false end end return true end, 1))",
     ]);
     assert_eq!(
         reports.len(),
@@ -473,13 +482,13 @@ fn the_extra_chords_are_probed_in_that_report_only() {
     );
     let reports = rig.run(&[
         "doautocmd FocusLost",
-        "sleep 400m",
+        "lua test_timers.advance(400); assert(vim.wait(60000, function() for _,p in ipairs(test_pipes) do if not p:is_closing() then return false end end return true end, 1))",
         "lua __eitri_keys_rescan({'<C-o>', 'C-o', '<M-T>'})",
-        "sleep 400m",
+        "lua test_timers.advance(400); assert(vim.wait(60000, function() for _,p in ipairs(test_pipes) do if not p:is_closing() then return false end end return true end, 1))",
         "doautocmd SourcePost",
-        "sleep 400m",
+        "lua test_timers.advance(400); assert(vim.wait(60000, function() for _,p in ipairs(test_pipes) do if not p:is_closing() then return false end end return true end, 1))",
         "lua __eitri_keys_rescan({})",
-        "sleep 400m",
+        "lua test_timers.advance(400); assert(vim.wait(60000, function() for _,p in ipairs(test_pipes) do if not p:is_closing() then return false end end return true end, 1))",
     ]);
     assert_eq!(
         reports.len(),
@@ -511,9 +520,9 @@ fn an_extra_chord_not_in_angle_notation_probes_nothing() {
     rig.config("init.lua", "vim.keymap.set('n', '<C-o>', 'x', { desc = 'jump' })\n");
     let reports = rig.run(&[
         "doautocmd FocusLost",
-        "sleep 400m",
+        "lua test_timers.advance(400); assert(vim.wait(60000, function() for _,p in ipairs(test_pipes) do if not p:is_closing() then return false end end return true end, 1))",
         "lua __eitri_keys_rescan({'C-o', '<>', 7, {}, '<C-o'})",
-        "sleep 400m",
+        "lua test_timers.advance(400); assert(vim.wait(60000, function() for _,p in ipairs(test_pipes) do if not p:is_closing() then return false end end return true end, 1))",
     ]);
     assert_eq!(reports.len(), 2);
     assert!(
@@ -529,11 +538,11 @@ fn a_rescan_reports_a_buffer_map_that_no_event_announced() {
     let rig = Rig::new("rescan-stale");
     let reports = rig.run(&[
         "doautocmd FocusLost",
-        "sleep 400m",
+        "lua test_timers.advance(400); assert(vim.wait(60000, function() for _,p in ipairs(test_pipes) do if not p:is_closing() then return false end end return true end, 1))",
         "lua vim.keymap.set('i', '<C-b>', function() end, { buffer = true, desc = 'Scroll documentation up' })",
-        "sleep 400m",
+        "lua test_timers.advance(400); assert(vim.wait(60000, function() for _,p in ipairs(test_pipes) do if not p:is_closing() then return false end end return true end, 1))",
         "lua __eitri_keys_rescan({})",
-        "sleep 400m",
+        "lua test_timers.advance(400); assert(vim.wait(60000, function() for _,p in ipairs(test_pipes) do if not p:is_closing() then return false end end return true end, 1))",
     ]);
     assert_eq!(reports.len(), 2, "making the map sends nothing by itself");
     assert!(keys(probe(&reports[0]), "i", "<C-b>").is_empty());

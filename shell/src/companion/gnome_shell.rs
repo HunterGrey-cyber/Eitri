@@ -125,6 +125,12 @@ struct Inner {
     methods: RefCell<HashMap<&'static str, bool>>,
     /// Ends the watch on the name.
     unwatch: RefCell<Option<Box<dyn FnOnce()>>>,
+    #[cfg(test)]
+    completed_calls: RefCell<HashMap<String, (i32, bool)>>,
+    #[cfg(test)]
+    started_calls: RefCell<HashMap<String, usize>>,
+    #[cfg(test)]
+    on_call_completed: RefCell<Option<Box<dyn Fn(&str)>>>,
 }
 
 impl Drop for Inner {
@@ -136,6 +142,24 @@ impl Drop for Inner {
 }
 
 impl GnomeShell {
+    #[cfg(test)]
+    #[allow(dead_code, reason = "called by the integration test that includes this module")]
+    pub(crate) fn completed_call_for_tests(&self, method: &str) -> Option<(i32, bool)> {
+        self.inner.completed_calls.borrow().get(method).copied()
+    }
+
+    #[cfg(test)]
+    #[allow(dead_code, reason = "called by the integration test that includes this module")]
+    pub(crate) fn started_calls_for_tests(&self, method: &str) -> usize {
+        self.inner.started_calls.borrow().get(method).copied().unwrap_or(0)
+    }
+
+    #[cfg(test)]
+    #[allow(dead_code, reason = "called by the integration test that includes this module")]
+    pub(crate) fn on_call_completed_for_tests(&self, observe: Box<dyn Fn(&str)>) {
+        *self.inner.on_call_completed.borrow_mut() = Some(observe);
+    }
+
     /// Over the session bus. gio shares one session connection per process, which is also the one
     /// the rest of the shell uses.
     pub(crate) fn new() -> Rc<GnomeShell> {
@@ -158,6 +182,12 @@ impl GnomeShell {
                 refused: RefCell::new(None),
                 methods: RefCell::new(HashMap::new()),
                 unwatch: RefCell::new(None),
+                #[cfg(test)]
+                completed_calls: RefCell::default(),
+                #[cfg(test)]
+                started_calls: RefCell::default(),
+                #[cfg(test)]
+                on_call_completed: RefCell::default(),
             }),
         })
     }
@@ -416,6 +446,11 @@ impl Inner {
             }
         };
         let reply_type = VariantTy::new(reply).expect("a reply type written in this file");
+        let timeout = CALL_TIMEOUT_MS;
+        #[cfg(test)]
+        {
+            *self.started_calls.borrow_mut().entry(method.to_owned()).or_default() += 1;
+        }
         let result = connection
             .call_future(
                 Some(&destination),
@@ -425,9 +460,23 @@ impl Inner {
                 args.as_ref(),
                 Some(reply_type),
                 DBusCallFlags::NONE,
-                CALL_TIMEOUT_MS,
+                timeout,
             )
             .await;
+        #[cfg(test)]
+        self.completed_calls.borrow_mut().insert(
+            method.to_owned(),
+            (
+                timeout,
+                result
+                    .as_ref()
+                    .is_err_and(|err| err.matches(gio::IOErrorEnum::TimedOut)),
+            ),
+        );
+        #[cfg(test)]
+        if let Some(observe) = self.on_call_completed.borrow().as_ref() {
+            observe(method);
+        }
         match &result {
             Ok(_) => {
                 self.ever_owned.set(true);

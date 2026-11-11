@@ -98,11 +98,12 @@ fn x_tool(tool: &str, display: &str, args: &[&str]) -> Result<String, String> {
 }
 
 fn pump(ms: u64) {
-    let context = glib::MainContext::default();
-    let end = Instant::now() + Duration::from_millis(ms);
-    while Instant::now() < end {
-        while context.iteration(false) {}
-        std::thread::sleep(Duration::from_millis(1));
+    let context = gtk4::glib::MainContext::default();
+    let done = Rc::new(std::cell::Cell::new(false));
+    let elapsed = done.clone();
+    gtk4::glib::timeout_add_local_once(Duration::from_millis(ms), move || elapsed.set(true));
+    while !done.get() {
+        context.iteration(true);
     }
 }
 
@@ -285,6 +286,33 @@ impl Harness {
             pump(ms / 2);
         } else {
             pump(ms);
+        }
+        let logged_key = match key {
+            "Down" => "ArrowDown",
+            "Up" => "ArrowUp",
+            other => other,
+        };
+        let deadline = Instant::now() + Duration::from_secs(60);
+        for turn in 0..10_000 {
+            let enough = self.eval(
+                &format!(
+                    r#"JSON.stringify((() => {{
+                const log = window.__jkh;
+                if (!log) return true;
+                const first = log.keys.find(k => k[1] === {logged_key:?} && k[2]);
+                return Boolean(first && log.frames.filter(f => f[0] >= first[0] + 300).length >= 20);
+            }})())"#
+                ),
+                5000,
+            )?;
+            if enough == Value::Bool(true) {
+                break;
+            }
+            if turn == 9_999 || Instant::now() >= deadline {
+                x_tool("xdotool", &self.display, &["keyup", key])?;
+                return Err("the hold never produced twenty steady frames after its first repeat".into());
+            }
+            pump(33);
         }
         x_tool("xdotool", &self.display, &["keyup", key]).map(|_| ())
     }
@@ -605,12 +633,17 @@ fn measure_panel(
             h.key("g")?;
             h.key("g")?;
             pump(400);
-            h.record(dir, &format!("{label}-j"), "j", 3000)?;
-            h.record(dir, &format!("{label}-k"), "k", 3000)?;
+            for key in ["j", "k"] {
+                h.eval(&start_log_js(list), 2000)?;
+                h.record(dir, &format!("{label}-{key}"), key, 3000)?;
+                h.eval(STOP_LOG_JS, 5000)?;
+            }
         }
         for key in ["j", "k"] {
             let shot = dir.join(format!("{label}-{key}-mid-hold.png"));
+            h.eval(&start_log_js(list), 2000)?;
             h.hold(key, 1600, Some(&shot))?;
+            h.eval(STOP_LOG_JS, 5000)?;
             pump(600);
             let _ = x_tool(
                 "import",
@@ -641,7 +674,9 @@ fn measure_plain(display: &str, out: Option<&PathBuf>) -> Result<Metrics, String
     if let (Some(dir), true) = (out, std::env::var("JKH_RECORD").is_ok()) {
         h.key("Home")?;
         pump(500);
+        h.eval(&start_log_js("document.scrollingElement"), 2000)?;
         h.record(dir, "webkit-arrow", "Down", 3000)?;
+        h.eval(STOP_LOG_JS, 5000)?;
     }
     h.close();
     analyse(&log, "ArrowDown", true)

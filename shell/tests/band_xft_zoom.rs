@@ -70,13 +70,12 @@ const PROBE: &str = r#"JSON.stringify({
   bottom: document.querySelector('.status-band').getBoundingClientRect().bottom
 })"#;
 
-fn pump(ms: u64) {
-    let context = gtk4::glib::MainContext::default();
-    let end = Instant::now() + Duration::from_millis(ms);
-    while Instant::now() < end {
-        while context.iteration(false) {}
-        std::thread::sleep(Duration::from_millis(2));
-    }
+#[allow(dead_code)]
+#[path = "support/frame_turns.rs"]
+mod frame_turns;
+
+fn pump(_turns: u64) {
+    frame_turns::settle();
 }
 
 fn eval(webview: &WebView, script: &str) -> Result<String, String> {
@@ -134,7 +133,9 @@ fn step(
         eval(webview, &js)?;
     }
     // Long enough for a zoom WebKit should NOT apply (the 2% step below) to have arrived if it would.
-    pump(400);
+    for _ in 0..20 {
+        pump(1);
+    }
     let end = Instant::now() + Duration::from_secs(10);
     let r = loop {
         let r = read(webview)?;

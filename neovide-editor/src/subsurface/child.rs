@@ -967,6 +967,7 @@ impl<R: ChildRequests> Child<R> {
 
     /// True from `set_sync` until `after_paint`: the child's commits are cached until the parent commits, so the
     /// caller must make sure GTK paints and commits the parent in this frame.
+    #[cfg(test)]
     pub(crate) fn in_transaction(&self) -> bool {
         self.transaction
     }

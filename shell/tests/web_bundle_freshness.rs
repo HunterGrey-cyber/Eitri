@@ -14,9 +14,7 @@ include!("../build_web.rs");
 // `fs` comes from `build_web.rs`'s own `use std::fs;` above (`include!` splices it into this same
 // module scope, and item resolution in a module is not order-dependent) -- a second `use std::fs;`
 // here would be the same duplicate-import error (E0252) `build_web.rs`'s own doc comment explains.
-use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 /// A scratch directory under Cargo's own per-target-dir tmp (`CARGO_TARGET_TMPDIR`, rooted inside
 /// this worktree's own `target/` -- never `/tmp`), named for the test that owns it so parallel
@@ -74,16 +72,10 @@ fn write_fixture(web_dir: &Path) {
 /// `ensure_web_bundle_built` ever makes would have in its cwd: `ci` creates `node_modules/`, `run
 /// build` writes `dist/index.html`. Never a real npm, no network.
 ///
-/// **Written once, before any test can spawn it, and never written again.** An earlier revision
-/// wrote a fresh stub per test and exec'd it straight away, which failed with `Text file busy (os
-/// error 26)` in 13 of 200 parallel runs of this binary, each time in a different test: another
-/// test thread's `Command::spawn` could fork while this thread still held its stub open for
-/// writing, and `execve` of a file that any process holds open for writing is `ETXTBSY` until that
-/// child execs and its inherited copy of the descriptor closes. Every spawn in this binary goes
-/// through this function first, and the `OnceLock` holds them all until the write is closed, so no
-/// child of this process can inherit it. (The rename only keeps a leftover `npm` from an earlier
-/// run from ever being seen half-rewritten; two concurrent runs of this binary are not supported
-/// anyway, since [`ScratchDir`]s are named per test.)
+/// Written once before any test can spawn it, and never written again.
+/// The writer runs in a child so no test thread can fork with the script open for writing.
+/// The rename keeps an earlier run's stub from being seen half-rewritten; concurrent runs of this
+/// binary are not supported because its scratch directories are named per test.
 fn npm_stub_dir() -> &'static Path {
     static DIR: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
     DIR.get_or_init(|| {
@@ -97,8 +89,7 @@ case "$1" in
 esac
 "#;
         let staged = dir.join(format!("npm.{}.tmp", std::process::id()));
-        fs::write(&staged, script).unwrap();
-        fs::set_permissions(&staged, fs::Permissions::from_mode(0o755)).unwrap();
+        script_fixture::write_executable_script(&staged, script, 0o755).unwrap();
         fs::rename(&staged, dir.join("npm")).unwrap();
         dir
     })
@@ -285,7 +276,7 @@ fn a_bundling_script_is_a_build_input_and_the_output_file_is_the_callers_choice(
     append(&fixture.web_dir.join("build.mjs"), "// changed\n");
     assert_ne!(compute_fingerprint(&fixture.web_dir).unwrap(), before);
     assert_eq!(run(false), vec!["run build".to_string()]);
-    assert!(web_build_watch_paths(&fixture.web_dir).contains(&fixture.web_dir.join("build.mjs")));
+    assert!(web_build_watch_paths(&fixture.web_dir, "dist/keys.js").contains(&fixture.web_dir.join("build.mjs")));
     // The bundle current and `node_modules` gone is the source asset's state: no npm at all.
     fs::remove_dir_all(fixture.web_dir.join("node_modules")).unwrap();
     assert_eq!(run(false), Vec::<String>::new());
@@ -301,11 +292,13 @@ fn a_build_that_leaves_the_named_output_missing_panics() {
 /// `build.rs`'s own `cargo:rerun-if-changed` list, over this fixture: the `src` directory itself
 /// (covering every file under it in one watch, additions and removals included, so no file under
 /// `src/` is separately listed) plus every top-level input the fingerprint also covers -- and
-/// nothing else, `vitest.config.ts` included (see `vitest_config_is_not_a_watched_input` above).
+/// the required output and fingerprint, but no unrelated configs or generated directories.
 #[test]
-fn watch_paths_cover_every_top_level_input_and_the_src_directory_only() {
+fn watch_paths_cover_inputs_and_required_output_files_only() {
     let fixture = Fixture::new("watch-paths");
-    let watched: std::collections::BTreeSet<PathBuf> = web_build_watch_paths(&fixture.web_dir).into_iter().collect();
+    let watched: std::collections::BTreeSet<PathBuf> = web_build_watch_paths(&fixture.web_dir, "dist/keys.js")
+        .into_iter()
+        .collect();
     assert!(watched.contains(&fixture.web_dir.join("src")));
     for name in [
         "package.json",
@@ -319,12 +312,79 @@ fn watch_paths_cover_every_top_level_input_and_the_src_directory_only() {
             "missing {name} from the watch list"
         );
     }
-    assert!(!watched.contains(&fixture.web_dir.join("vitest.config.ts")));
+    for name in ["dist/keys.js", FINGERPRINT_REL] {
+        assert!(watched.contains(&fixture.web_dir.join(name)), "missing {name}");
+    }
+    for name in ["vitest.config.ts", "dist", "node_modules", LOCK_SHA_REL] {
+        assert!(!watched.contains(&fixture.web_dir.join(name)), "unexpected {name}");
+    }
+    assert_eq!(watched.len(), 8);
     let src_dir = fixture.web_dir.join("src");
     assert!(
         !watched.iter().any(|p| *p != src_dir && p.starts_with(&src_dir)),
         "a file under src/ was listed individually: {watched:?}"
     );
+}
+
+/// Required files must be watched before their first build too, without recursively watching dist.
+#[test]
+fn missing_outputs_and_fingerprints_are_watched_for_each_bundle_kind() {
+    let fixture = Fixture::new("missing-output-watches");
+    for output in ["dist/index.html", "dist/keys.js", "dist/agents.js"] {
+        let watched = web_build_watch_paths(&fixture.web_dir, output);
+        assert!(!fixture.web_dir.join(output).exists());
+        assert!(!fixture.web_dir.join(FINGERPRINT_REL).exists());
+        assert!(watched.contains(&fixture.web_dir.join(output)));
+        assert!(watched.contains(&fixture.web_dir.join(FINGERPRINT_REL)));
+        assert!(!watched.contains(&fixture.web_dir.join("dist")));
+        assert!(!watched.contains(&fixture.web_dir.join("node_modules")));
+    }
+}
+
+#[test]
+fn missing_required_files_rebuild_once_then_leave_watched_files_untouched() {
+    for missing in ["dist/index.html", "dist/keys.js", FINGERPRINT_REL, "dist"] {
+        let fixture = Fixture::installed(&format!("missing-{}", missing.replace('/', "-")));
+        let path = fixture.web_dir.join(missing);
+        if path.is_dir() {
+            fs::remove_dir_all(path).unwrap();
+        } else {
+            fs::remove_file(path).unwrap();
+        }
+        let output = if missing == "dist/keys.js" {
+            missing
+        } else {
+            "dist/index.html"
+        };
+        let run = || {
+            let _ = fs::remove_file(&fixture.log_path);
+            ensure_web_bundle_built(&fixture.web_dir, output, Some(npm_stub_dir()), false);
+            fs::read_to_string(&fixture.log_path).unwrap_or_default()
+        };
+        assert_eq!(run(), "run build\n", "missing {missing}");
+        // Give both watched files a fixed old mtime so even a same-tick rewrite is observable.
+        let watched = [fixture.web_dir.join(output), fixture.web_dir.join(FINGERPRINT_REL)];
+        let times = fs::FileTimes::new().set_modified(std::time::SystemTime::UNIX_EPOCH);
+        let contents: Vec<_> = watched.iter().map(|p| fs::read(p).unwrap()).collect();
+        for path in &watched {
+            fs::File::options()
+                .write(true)
+                .open(path)
+                .unwrap()
+                .set_times(times)
+                .unwrap();
+        }
+        for _ in 0..2 {
+            assert_eq!(run(), "");
+            for (path, content) in watched.iter().zip(&contents) {
+                assert_eq!(fs::read(path).unwrap(), *content);
+                assert_eq!(
+                    fs::metadata(path).unwrap().modified().unwrap(),
+                    std::time::SystemTime::UNIX_EPOCH
+                );
+            }
+        }
+    }
 }
 
 /// Pins one literal sha256 for `compute_fingerprint` over a minimal, fixed fixture (a single
@@ -377,14 +437,14 @@ fn the_build_script_builds_the_plugin_page_third_with_its_watch_paths() {
         .expect("the plugin page");
     assert!(panel < kit && kit < page);
     assert!(build.contains("join(\"../plugins/markdown/web\")"));
-    assert!(build.contains("web_build_watch_paths(&markdown_dir)"));
+    assert!(build.contains("web_build_watch_paths(&markdown_dir, \"dist/index.html\")"));
 }
 
 /// The real plugin page project: every input its fingerprint reads is watched.
 #[test]
 fn the_plugin_page_project_watches_its_sources_and_build_files() {
     let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../plugins/markdown/web");
-    let watched = web_build_watch_paths(&dir);
+    let watched = web_build_watch_paths(&dir, "dist/index.html");
     for name in [
         "src",
         "package.json",
@@ -396,4 +456,9 @@ fn the_plugin_page_project_watches_its_sources_and_build_files() {
         assert!(watched.contains(&dir.join(name)), "{name} is not watched");
     }
     assert!(!watched.contains(&dir.join("vitest.config.ts")));
+}
+
+#[cfg(test)]
+mod script_fixture {
+    include!(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/support/executable.rs"));
 }

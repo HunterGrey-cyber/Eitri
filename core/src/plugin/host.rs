@@ -325,6 +325,8 @@ fn line_fragment(fragment: &str) -> Option<u32> {
 /// One worker thread per plugin, started at the first check. Checks run in order; one stalled on the
 /// filesystem holds the ones behind it, which then run out their deadlines rather than piling up threads.
 struct PathChecker {
+    #[cfg(any(test, feature = "test-support"))]
+    progress: std::sync::Arc<(std::sync::atomic::AtomicUsize, std::sync::atomic::AtomicUsize)>,
     tx: mpsc::SyncSender<PathJob>,
     rx: mpsc::Receiver<(u64, Checked)>,
 }
@@ -339,8 +341,26 @@ impl PathChecker {
     fn spawn(plugin: LoadedPlugin, wake: agent::UiWake, gate: Option<mpsc::Receiver<()>>) -> std::io::Result<Self> {
         let (tx, jobs) = job_queue();
         let (done, rx) = mpsc::sync_channel(MAX_PATH_JOBS);
+        #[cfg(any(test, feature = "test-support"))]
+        let progress = std::sync::Arc::new((
+            std::sync::atomic::AtomicUsize::new(0),
+            std::sync::atomic::AtomicUsize::new(0),
+        ));
+        #[cfg(any(test, feature = "test-support"))]
+        let worker_progress = progress.clone();
         std::thread::Builder::new().name("plugin-paths".into()).spawn(move || {
             for (ticket, deadline, job) in jobs {
+                #[cfg(any(test, feature = "test-support"))]
+                let _completed = {
+                    struct Completed(std::sync::Arc<(std::sync::atomic::AtomicUsize, std::sync::atomic::AtomicUsize)>);
+                    impl Drop for Completed {
+                        fn drop(&mut self) {
+                            self.0 .1.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        }
+                    }
+                    worker_progress.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    Completed(worker_progress.clone())
+                };
                 if let Some(gate) = &gate {
                     // A closed gate lets everything through.
                     let _ = gate.recv();
@@ -392,7 +412,12 @@ impl PathChecker {
                 wake();
             }
         })?;
-        Ok(PathChecker { tx, rx })
+        Ok(PathChecker {
+            tx,
+            rx,
+            #[cfg(any(test, feature = "test-support"))]
+            progress,
+        })
     }
 }
 
@@ -958,6 +983,16 @@ impl PluginHost {
     fn send_focus(&self) {
         let has_keys = self.state.borrow().has_keys;
         self.page.send(&protocol::event_text("focus", &FocusEvent { has_keys }));
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn path_check_progress(&self) -> (usize, usize) {
+        self.state.borrow().checker.as_ref().map_or((0, 0), |checker| {
+            (
+                checker.progress.0.load(std::sync::atomic::Ordering::SeqCst),
+                checker.progress.1.load(std::sync::atomic::Ordering::SeqCst),
+            )
+        })
     }
 
     /// Holds every path check until the returned sender sends one message for it, so a test can stand in for
@@ -3753,7 +3788,11 @@ mod tests {
         // Keep the receiver idle so admission is independent of worker scheduling.
         let (tx, _jobs) = job_queue();
         let (_done, rx) = mpsc::channel();
-        r.host.state.borrow_mut().checker = Some(PathChecker { tx, rx });
+        r.host.state.borrow_mut().checker = Some(PathChecker {
+            tx,
+            rx,
+            progress: Default::default(),
+        });
         for id in 0..64 {
             assert!(r
                 .host
@@ -3908,10 +3947,8 @@ mod tests {
         r.send_at(now, 2, "editor.modified", buffer_args(&r, "editor.modified"));
         r.host.forget_moved();
         gate.send(()).unwrap();
-        for _ in 0..5 {
-            r.host.pump(now);
-            std::thread::sleep(Duration::from_millis(1));
-        }
+        pump_until(&r, now, || r.host.path_check_progress().1 >= 2);
+        r.host.pump(now);
         let calls = editor.calls.borrow();
         assert_eq!(calls.last().unwrap().1[0], rmpv::Value::from("wipe_preload"));
         assert_eq!(calls.len(), 2, "no buffer operation follows the wipe");

@@ -694,51 +694,59 @@ struct Worker {
 impl Worker {
     fn run(mut self) {
         let mut chunk = vec![0u8; READ_CHUNK];
-        loop {
-            let now = Instant::now();
-            // Cleared before the queue is read, so a command sent after the last read leaves it readable.
-            clear(self.commands_ready.as_fd());
-            while let Ok(command) = self.commands.try_recv() {
-                self.obey(command, now);
-            }
-            self.connections
-                .retain(|connection| connection.deadline().is_none_or(|by| by > now));
-            for listener in &mut self.listeners {
-                listener.rest_until = listener.rest_until.filter(|until| *until > now);
-            }
-            if self.stopping && self.connections.is_empty() {
-                return;
-            }
+        while self.turn(Instant::now(), &mut chunk, poll, Instant::now) {}
+    }
 
-            let reading = self.pending.load(Ordering::Relaxed) < MAX_NEWS;
-            let mut polled = Vec::with_capacity(1 + self.listeners.len() + self.connections.len());
-            polled.push(pollfd(self.commands_ready.as_fd(), libc::POLLIN));
-            for listener in &self.listeners {
-                let events = if listener.rest_until.is_some() { 0 } else { libc::POLLIN };
-                polled.push(pollfd(listener.fd.as_fd(), events));
-            }
-            for connection in &self.connections {
-                polled.push(pollfd(connection.stream.as_fd(), connection.interest(reading)));
-            }
-            if let Err(error) = poll(&mut polled, self.timeout_ms(now)) {
-                eprintln!("[editor bridge] the worker stopped: {error}");
-                return;
-            }
+    fn turn(
+        &mut self,
+        now: Instant,
+        chunk: &mut [u8],
+        polling: impl FnOnce(&mut [libc::pollfd], libc::c_int) -> io::Result<()>,
+        accepted_now: impl Fn() -> Instant,
+    ) -> bool {
+        // Cleared before the queue is read, so a command sent after the last read leaves it readable.
+        clear(self.commands_ready.as_fd());
+        while let Ok(command) = self.commands.try_recv() {
+            self.obey(command, now);
+        }
+        self.connections
+            .retain(|connection| connection.deadline().is_none_or(|by| by > now));
+        for listener in &mut self.listeners {
+            listener.rest_until = listener.rest_until.filter(|until| *until > now);
+        }
+        if self.stopping && self.connections.is_empty() {
+            return false;
+        }
 
-            let (listeners, connections) = polled[1..].split_at(self.listeners.len());
-            let mut news = Vec::new();
-            let mut ready = connections.iter().map(|polled| polled.revents);
-            self.connections.retain_mut(|connection| {
-                let revents = ready.next().unwrap_or(0);
-                connection.on_ready(revents, &mut chunk, &mut news)
-            });
-            self.publish(news);
-            for (index, polled) in listeners.iter().enumerate() {
-                if polled.revents & libc::POLLIN != 0 {
-                    self.accept(index, Instant::now());
-                }
+        let reading = self.pending.load(Ordering::Relaxed) < MAX_NEWS;
+        let mut polled = Vec::with_capacity(1 + self.listeners.len() + self.connections.len());
+        polled.push(pollfd(self.commands_ready.as_fd(), libc::POLLIN));
+        for listener in &self.listeners {
+            let events = if listener.rest_until.is_some() { 0 } else { libc::POLLIN };
+            polled.push(pollfd(listener.fd.as_fd(), events));
+        }
+        for connection in &self.connections {
+            polled.push(pollfd(connection.stream.as_fd(), connection.interest(reading)));
+        }
+        if let Err(error) = polling(&mut polled, self.timeout_ms(now)) {
+            eprintln!("[editor bridge] the worker stopped: {error}");
+            return false;
+        }
+
+        let (listeners, connections) = polled[1..].split_at(self.listeners.len());
+        let mut news = Vec::new();
+        let mut ready = connections.iter().map(|polled| polled.revents);
+        self.connections.retain_mut(|connection| {
+            let revents = ready.next().unwrap_or(0);
+            connection.on_ready(revents, chunk, &mut news)
+        });
+        self.publish(news);
+        for (index, polled) in listeners.iter().enumerate() {
+            if polled.revents & libc::POLLIN != 0 {
+                self.accept(index, accepted_now());
             }
         }
+        true
     }
 
     fn obey(&mut self, command: Command, now: Instant) {
@@ -1026,6 +1034,118 @@ mod tests {
         }
     }
 
+    /// The real worker, driven on this thread with nonblocking polls and a logical clock.
+    struct Driven {
+        host: BridgeHost,
+        worker: Worker,
+        now: Instant,
+        chunk: Vec<u8>,
+        turn_count: usize,
+    }
+
+    impl std::ops::Deref for Driven {
+        type Target = BridgeHost;
+        fn deref(&self) -> &BridgeHost {
+            &self.host
+        }
+    }
+
+    impl Driven {
+        fn new(scratch: &Scratch) -> Self {
+            let (commands, command_queue) = channel();
+            let (news_sender, news) = channel();
+            let commands_ready = Arc::new(eventfd().unwrap());
+            let pending = Arc::new(AtomicUsize::new(0));
+            let host = BridgeHost {
+                dir: scratch.control(),
+                commands,
+                commands_ready: commands_ready.clone(),
+                news,
+                pending: pending.clone(),
+                bound: RefCell::new(HashMap::new()),
+            };
+            let worker = Worker {
+                commands: command_queue,
+                commands_ready,
+                uid: panel_control::euid(),
+                listeners: Vec::new(),
+                connections: Vec::new(),
+                connections_made: 0,
+                news: news_sender,
+                pending,
+                wake: Arc::new(|| {}),
+                stopping: false,
+            };
+            Self {
+                host,
+                worker,
+                now: Instant::now(),
+                chunk: vec![0; READ_CHUNK],
+                turn_count: 0,
+            }
+        }
+
+        fn turn(&mut self) {
+            self.turn_at(self.now + Duration::from_micros(1));
+        }
+
+        fn turn_at(&mut self, now: Instant) {
+            self.turn_count += 1;
+            assert!(
+                self.turn_count <= 1_000_000,
+                "bridge did not finish within 1,000,000 turns"
+            );
+            self.now = now;
+            assert!(self.worker.turn(now, &mut self.chunk, |fds, _| poll(fds, 0), || now));
+        }
+
+        fn turns(&mut self, n: usize) {
+            for _ in 0..n {
+                self.turn();
+            }
+        }
+
+        fn welcomed(&mut self, path: &Path, key: &str) -> UnixStream {
+            let mut stream = connect(path);
+            say(
+                &mut stream,
+                Message::Hello {
+                    v: PROTOCOL,
+                    key: key.to_owned(),
+                },
+            );
+            self.turns(4);
+            assert!(matches!(hear(&mut stream), Message::Welcome { .. }));
+            stream
+        }
+
+        fn one_call(&mut self) -> (UnixStream, BridgeCallId) {
+            let (name, path) = self.open(1, tools()).unwrap();
+            self.turn();
+            let mut stream = self.welcomed(&path, &name.key);
+            let size: libc::c_int = 4096;
+            // SAFETY: the socket is owned here and size is a valid integer option value.
+            assert_eq!(
+                unsafe {
+                    libc::setsockopt(
+                        self.worker.connections[0].stream.as_raw_fd(),
+                        libc::SOL_SOCKET,
+                        libc::SO_SNDBUF,
+                        (&size as *const libc::c_int).cast(),
+                        std::mem::size_of_val(&size) as libc::socklen_t,
+                    )
+                },
+                0
+            );
+            say(&mut stream, call(1, Value::Null));
+            self.turn();
+            let BridgeNews::Call { id, .. } = self.take_news().remove(0) else {
+                panic!("not a call")
+            };
+            (stream, id)
+        }
+    }
+
     #[test]
     fn the_socket_is_0600_in_a_private_directory() {
         let scratch = Scratch::new();
@@ -1120,18 +1240,26 @@ mod tests {
     fn no_hello_within_5_s_closes_it() {
         assert_eq!(HELLO_WITHIN, Duration::from_secs(5));
         let scratch = Scratch::new();
-        let host = host(&scratch);
+        let mut host = Driven::new(&scratch);
         let (_, path) = host.open(1, tools()).expect("opens");
-        let started = Instant::now();
+        host.turn();
         let mut stream = connect(&path);
-        // Part of a frame is not a hello, and does not buy more time.
         stream.write_all(&[0, 0]).expect("writes");
-        closes_unanswered(&mut stream);
-        assert!(
-            started.elapsed() >= HELLO_WITHIN,
-            "closed after {:?}",
-            started.elapsed()
+        host.turn();
+        let accepted = host.now;
+        host.turn();
+        let by = host.worker.connections[0].deadline().unwrap();
+        assert_eq!(by, accepted + HELLO_WITHIN);
+        stream.write_all(&[0]).expect("another partial byte");
+        host.turn_at(by - Duration::from_millis(1));
+        assert_eq!(
+            host.worker.connections.len(),
+            1,
+            "a partial hello stays until its deadline"
         );
+        host.turn_at(by);
+        assert!(host.worker.connections.is_empty());
+        closes_unanswered(&mut stream);
     }
 
     #[test]
@@ -1326,35 +1454,103 @@ mod tests {
     #[test]
     fn close_writes_what_is_queued_first() {
         let scratch = Scratch::new();
-        let host = host(&scratch);
-        let (mut stream, id) = one_call(&host, 1);
-        // Far over what a socket buffer holds, so part of it is still queued in the worker when the close comes.
+        let mut host = Driven::new(&scratch);
+        let (mut stream, worker_stream) = UnixStream::pair().unwrap();
+        worker_stream.set_nonblocking(true).unwrap();
+        // Keep the same extra reference a concurrent fork can retain until its exec.
+        let inherited = worker_stream.try_clone().unwrap();
+        host.worker.connections.push(Connection {
+            id: 1,
+            door: Arc::new(Door {
+                tab: 1,
+                hex: name().hex,
+                key: name().key,
+                welcome: Vec::new(),
+            }),
+            stream: worker_stream,
+            frames: FrameBuf::new(),
+            out: Vec::new(),
+            sent: 0,
+            stage: Stage::Serving,
+        });
+        let id = BridgeCallId {
+            tab: 1,
+            connection: 1,
+            call: 1,
+        };
         let result = ToolResult {
             text: "x".repeat(900 * 1024),
             is_error: false,
         };
         host.answer(&id, &result);
-        host.close(1);
-        let Message::Result { text, .. } = hear(&mut stream) else {
-            panic!("not a result");
+        host.command(Command::Close { tab: 1 });
+        stream.set_nonblocking(true).unwrap();
+        let mut bytes = Vec::new();
+        for _ in 0..10_000 {
+            host.turn();
+            match stream.read_to_end(&mut bytes) {
+                Ok(_) => {}
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
+                Err(error) => panic!("reading queued output: {error}"),
+            }
+            if host.worker.connections.is_empty() {
+                break;
+            }
+        }
+        assert!(
+            host.worker.connections.is_empty(),
+            "queued output never drained within 10,000 turns"
+        );
+        drop(inherited);
+        // A concurrent fork can hold the closed socket until exec, after the worker has drained it.
+        let until = Instant::now() + Duration::from_secs(60);
+        loop {
+            match stream.read_to_end(&mut bytes) {
+                Ok(_) => break,
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                    assert!(Instant::now() < until, "the drained socket never reached EOF");
+                    std::thread::yield_now();
+                }
+                Err(error) => panic!("reading drained output: {error}"),
+            }
+        }
+        let expected = Message::Result {
+            id: 1,
+            text: result.text,
+            is_error: false,
         };
-        assert!(text == result.text, "the answer came whole");
-        closes_unanswered(&mut stream);
+        assert_eq!(bytes, encode_frame(&expected.into_value()).unwrap());
     }
 
     #[test]
     fn close_does_not_wait_for_ever_for_a_peer_that_never_reads() {
         let scratch = Scratch::new();
-        let host = host(&scratch);
-        let (mut stream, id) = one_call(&host, 1);
+        let mut host = Driven::new(&scratch);
+        let (mut stream, id) = host.one_call();
         let frame_text = 900 * 1024;
-        let result = ToolResult {
-            text: "x".repeat(frame_text),
-            is_error: false,
-        };
-        host.answer(&id, &result);
+        host.answer(
+            &id,
+            &ToolResult {
+                text: "x".repeat(frame_text),
+                is_error: false,
+            },
+        );
         host.close(1);
-        std::thread::sleep(CLOSE_WITHIN + Duration::from_secs(1));
+        host.turn();
+        assert_eq!(
+            host.worker.connections.len(),
+            1,
+            "output is still queued for the nonreader"
+        );
+        let by = host.worker.connections[0].deadline().unwrap();
+        assert_eq!(by, host.now + CLOSE_WITHIN);
+        host.turn_at(by - Duration::from_millis(1));
+        assert_eq!(host.worker.connections.len(), 1, "the grace period has not ended");
+        host.turn_at(by);
+        assert!(
+            host.worker.connections.is_empty(),
+            "the close deadline frees the connection"
+        );
         assert!(read_to_the_end(&mut stream) < frame_text);
     }
 
@@ -1594,25 +1790,24 @@ mod tests {
     #[test]
     fn a_new_connection_is_not_read_past_what_the_news_can_hold() {
         let scratch = Scratch::new();
-        let host = host(&scratch);
+        let mut host = Driven::new(&scratch);
         let (name, path) = host.open(1, tools()).expect("opens");
-        let mut filler = welcomed(&path, &name.key);
+        host.turn();
+        let mut filler = host.welcomed(&path, &name.key);
         for id in 0..MAX_NEWS as u64 {
             say(&mut filler, call(id, Value::Null));
         }
-        let until = Instant::now() + PATIENCE;
-        while host.pending.load(Ordering::Relaxed) < MAX_NEWS {
-            assert!(Instant::now() < until, "the news did not fill");
-            std::thread::sleep(Duration::from_millis(2));
-        }
+        host.turns(64);
+        assert_eq!(host.pending.load(Ordering::Relaxed), MAX_NEWS);
 
         for _ in 0..8 {
             let mut stream = connect(&path);
             stream.write_all(&hello_calls_and_an_end(&name.key, 8)).expect("writes");
         }
-        // Time for a reader that reads a greeting anyway to run through all eight.
-        std::thread::sleep(Duration::from_millis(100));
-        assert_eq!(host.pending.load(Ordering::Relaxed), MAX_NEWS);
+        for _ in 0..64 {
+            host.turn();
+            assert_eq!(host.pending.load(Ordering::Relaxed), MAX_NEWS);
+        }
 
         let mut waiting = connect(&path);
         let hello = Message::Hello {
@@ -1620,8 +1815,15 @@ mod tests {
             key: name.key.clone(),
         };
         say(&mut waiting, hello);
-        std::thread::sleep(Duration::from_millis(50));
+        for _ in 0..64 {
+            host.turn();
+            assert_eq!(host.pending.load(Ordering::Relaxed), MAX_NEWS);
+        }
+        waiting.set_nonblocking(true).unwrap();
+        assert_eq!(waiting.read(&mut [0]).unwrap_err().kind(), io::ErrorKind::WouldBlock);
+        waiting.set_nonblocking(false).unwrap();
         assert_eq!(host.take_news().len(), MAX_NEWS);
+        host.turns(64);
         assert!(
             matches!(hear(&mut waiting), Message::Welcome { .. }),
             "taken, the rest are read"
@@ -1631,28 +1833,43 @@ mod tests {
     #[test]
     fn calls_are_not_read_past_what_the_news_can_hold() {
         let scratch = Scratch::new();
-        let host = host(&scratch);
-        let (name, path) = host.open(1, tools()).expect("opens");
-        let mut stream = welcomed(&path, &name.key);
-        let frame = encode_frame(&call(u64::MAX, Value::Null).into_value()).expect("encodes");
-        let per_read = READ_CHUNK / (frame.len() / 2);
-        let calls = 4 * MAX_NEWS + 4 * per_read;
-        let writer = std::thread::spawn(move || {
-            for id in 0..calls {
-                say(&mut stream, call(id as u64, Value::Null));
-            }
-            stream
+        let mut host = Driven::new(&scratch);
+        let (mut stream, worker_stream) = UnixStream::pair().unwrap();
+        worker_stream.set_nonblocking(true).unwrap();
+        host.worker.connections.push(Connection {
+            id: 1,
+            door: Arc::new(Door {
+                tab: 1,
+                hex: name().hex,
+                key: name().key,
+                welcome: Vec::new(),
+            }),
+            stream: worker_stream,
+            frames: FrameBuf::new(),
+            out: Vec::new(),
+            sent: 0,
+            stage: Stage::Serving,
         });
-        let until = Instant::now() + PATIENCE;
-        let mut taken = 0;
-        while taken < calls {
-            assert!(Instant::now() < until, "{taken} of {calls} calls came");
-            // Time for an unbounded reader to run far past the bound.
-            std::thread::sleep(Duration::from_millis(50));
-            let news = host.take_news();
-            assert!(news.len() < MAX_NEWS + per_read, "{} news at once", news.len());
-            taken += news.len();
+        // Feed one frame per turn so the queue reaches the exact limit without a read-chunk overshoot.
+        for id in 0..MAX_NEWS {
+            say(&mut stream, call(id as u64, Value::Null));
+            host.turn();
+            assert_eq!(host.pending.load(Ordering::Relaxed), id + 1);
         }
-        drop(writer.join().expect("the writer ended"));
+        say(&mut stream, call(MAX_NEWS as u64, Value::Null));
+        let mut ready = [pollfd(host.worker.connections[0].stream.as_fd(), libc::POLLIN)];
+        poll(&mut ready, 0).unwrap();
+        assert_ne!(ready[0].revents & libc::POLLIN, 0, "another call is on the socket");
+        for _ in 0..64 {
+            host.turn();
+            assert_eq!(host.pending.load(Ordering::Relaxed), MAX_NEWS);
+            assert_eq!(host.worker.connections.len(), 1);
+            assert_eq!(host.worker.connections[0].interest(false) & libc::POLLIN, 0);
+        }
+        assert_eq!(host.take_news().len(), MAX_NEWS);
+        host.turns(64);
+        let news = host.take_news();
+        assert_eq!(news.len(), 1, "draining lets the waiting call through");
+        assert_eq!(call_id(&news[0]).call, MAX_NEWS as u64);
     }
 }

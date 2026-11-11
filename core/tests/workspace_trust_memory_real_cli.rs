@@ -542,9 +542,18 @@ fn run_arm(trust: ProjectTrust, fx: &Fixture, label: &str) -> (BTreeMap<&'static
             (*place, when)
         })
         .collect();
+    if trust == ProjectTrust::Trusted {
+        let deadline = Instant::now() + Duration::from_secs(120);
+        while !MARKERS_TRUSTED.iter().all(|name| fx.markers.join(name).exists()) {
+            assert!(
+                Instant::now() < deadline,
+                "the trusted hooks and servers never reported their starts"
+            );
+            std::thread::yield_now();
+        }
+    }
+    // Shutdown reaps the CLI before the final negative checks of its hooks and server starts.
     drop(live);
-    // A hook or a server runs on the CLI's own schedule; give it time to leave its mark.
-    std::thread::sleep(Duration::from_secs(10));
     let markers = MARKERS
         .into_iter()
         .filter(|name| fx.markers.join(name).exists())

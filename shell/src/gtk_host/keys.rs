@@ -17,7 +17,7 @@
 //! key the page did not handle back to GTK once more, starting at the window ([`LetThrough`]), and asking the
 //! controller again would move the keys twice.
 
-use std::cell::{Cell, RefCell};
+use std::cell::RefCell;
 use std::rc::{Rc, Weak};
 
 use eitri_core::keymap::{key::keysym_name, prefix::Press, Chord, KeyName, KeySpec};
@@ -758,6 +758,8 @@ mod tests {
 
     #[test]
     fn a_second_delivery_never_reaches_the_controller() {
+        use std::cell::Cell;
+
         let seen = RefCell::new(LetThrough::new());
         seen.borrow_mut().let_through(7u32);
         let asked = Cell::new(false);

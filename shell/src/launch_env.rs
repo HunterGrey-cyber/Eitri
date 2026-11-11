@@ -142,11 +142,11 @@ pub(crate) fn window_up() {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use std::ffi::OsStr;
-
     #[test]
     fn the_ready_descriptor_is_a_number_past_the_standard_three() {
+        use super::*;
+        use std::ffi::OsStr;
+
         assert_eq!(ready_fd(Some(OsStr::new("3"))), Some(3));
         assert_eq!(ready_fd(Some(OsStr::new("17"))), Some(17));
         for bad in ["0", "1", "2", "-4", "x", "", " 3"] {
@@ -157,6 +157,9 @@ mod tests {
 
     #[test]
     fn the_launchers_note_is_one_bounded_line() {
+        use super::*;
+        use std::ffi::OsStr;
+
         assert_eq!(note_line(None), None);
         assert_eq!(note_line(Some(OsStr::new("  \n "))), None);
         assert_eq!(
@@ -172,6 +175,9 @@ mod tests {
 
     #[test]
     fn the_subcommands_that_take_inherited_descriptors_first_are_left_alone() {
+        use super::*;
+        use std::ffi::OsStr;
+
         assert!(!adopts(Some(OsStr::new(eitri_core::window_link::start::SUBCOMMAND))));
         assert!(!adopts(Some(OsStr::new(eitri_core::run_guard::SUBCOMMAND))));
         assert!(!adopts(Some(OsStr::new("linked-window"))));

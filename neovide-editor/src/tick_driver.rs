@@ -90,7 +90,7 @@ impl TickDriver {
         self.area.borrow().as_ref().and_then(glib::WeakRef::upgrade)
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn is_active(&self) -> bool {
         self.active.get()
     }

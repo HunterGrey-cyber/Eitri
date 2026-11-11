@@ -138,6 +138,8 @@ pub struct Editor {
     shut: Cell<bool>,
     /// While set and in the future, a failed attach is tried again instead of reported.
     retry_until: Cell<Option<Instant>>,
+    #[cfg(any(test, debug_assertions, feature = "test-support"))]
+    attach_attempts: Cell<u64>,
     /// Read end of the link's wake: a byte arrives each time a link thread has news for `poll`. `None` when the
     /// pair could not be made; then the host keeps ticking.
     link_wake: Option<UnixStream>,
@@ -241,6 +243,8 @@ impl Editor {
             next_link_poll: Cell::new(None),
             shut: Cell::new(false),
             retry_until: Cell::new(None),
+            #[cfg(any(test, debug_assertions, feature = "test-support"))]
+            attach_attempts: Cell::new(0),
             link_wake,
             polls: Cell::new(0),
         })
@@ -249,8 +253,26 @@ impl Editor {
     /// Aim the link at the nvim Neovide started with `--listen`. A connect that fails in the first
     /// [`ATTACH_RETRY_FOR`] is tried again (the socket may exist a moment before nvim listens).
     pub fn attach(&self) {
-        self.retry_until.set(Some(Instant::now() + ATTACH_RETRY_FOR));
+        self.begin_attach(Instant::now());
+    }
+
+    /// Starts an attach with an explicit retry-window origin, on the clock passed to `poll`.
+    #[cfg(any(test, debug_assertions, feature = "test-support"))]
+    pub fn attach_at(&self, now: Instant) {
+        self.begin_attach(now);
+    }
+
+    fn begin_attach(&self, now: Instant) {
+        self.retry_until.set(Some(now + ATTACH_RETRY_FOR));
+        #[cfg(any(test, debug_assertions, feature = "test-support"))]
+        self.attach_attempts.set(1);
         self.link.attach(self.nvim_listen.clone());
+    }
+
+    /// How many attempts the current attach has made, including retries.
+    #[cfg(any(test, debug_assertions, feature = "test-support"))]
+    pub fn attach_attempts(&self) -> u64 {
+        self.attach_attempts.get()
     }
 
     /// The feeds every [`TICK`], the link every [`CompanionLink::POLL_INTERVAL`]. Empty once shut down.
@@ -363,6 +385,8 @@ impl Editor {
             match &state {
                 LinkState::Failed { addr, why } if self.retry_until.get().is_some_and(|until| now < until) => {
                     crate::log_line!("[editor] attach failed ({why}); trying again");
+                    #[cfg(any(test, debug_assertions, feature = "test-support"))]
+                    self.attach_attempts.set(self.attach_attempts.get() + 1);
                     self.link.attach(addr.clone());
                 }
                 _ => events.push(EditorEvent::LinkChanged(band)),
@@ -511,8 +535,11 @@ mod tests {
             .expect("write");
         drop(stream);
         let mut said = 0;
-        for step in 1..=40u32 {
-            let events = editor.poll(start + Duration::from_millis(100) * step);
+        let guard = Instant::now() + Duration::from_secs(60);
+        let mut now = start;
+        loop {
+            now += TICK;
+            let events = editor.poll(now);
             said += events
                 .iter()
                 .filter(|e| matches!(e, EditorEvent::ContextChanged))
@@ -520,7 +547,8 @@ mod tests {
             if said > 0 {
                 break;
             }
-            std::thread::sleep(Duration::from_millis(5));
+            assert!(Instant::now() < guard, "the feed never became ready");
+            std::thread::yield_now();
         }
         assert_eq!(said, 1, "the new context was said once");
         assert!((editor.context())().is_none(), "no editor is attached");
@@ -567,13 +595,15 @@ mod tests {
         assert_eq!(editor.wait(start), EditorWait::Tick, "a connection is waiting");
         drop(stream);
         let mut now = start;
-        for _ in 0..40 {
+        let guard = Instant::now() + Duration::from_secs(60);
+        loop {
             now += TICK;
             editor.poll(now);
             if editor.wait(now) == EditorWait::Sockets {
                 break;
             }
-            std::thread::sleep(Duration::from_millis(5));
+            assert!(Instant::now() < guard, "the feed never became ready");
+            std::thread::yield_now();
         }
         assert_eq!(editor.wait(now), EditorWait::Sockets, "read, and quiet again");
 

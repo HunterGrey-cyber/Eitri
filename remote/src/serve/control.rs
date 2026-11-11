@@ -113,20 +113,29 @@ fn read_request(stream: &UnixStream) -> Result<RvInbound, &'static str> {
 /// [`read_request`], the whole line due within `within` of the first read: each read waits only what is left, so a
 /// peer that sends a byte now and then cannot hold the request open.
 fn read_request_within(stream: &UnixStream, within: Duration) -> Result<RvInbound, &'static str> {
-    let until = Instant::now() + within;
-    let mut line = Vec::new();
-    let mut chunk = [0u8; 4096];
-    while line.last() != Some(&b'\n') {
-        let left = until.saturating_duration_since(Instant::now());
-        if left.is_zero() {
-            return Err("no request came in time");
-        }
-        // A zero timeout means none at all.
+    read_request_with(within, Instant::now, |chunk, left| {
         stream
             .set_read_timeout(Some(left.max(Duration::from_millis(1))))
             .map_err(|_| "the request could not be read")?;
+        Ok((&*stream).read(chunk))
+    })
+}
+
+fn read_request_with(
+    within: Duration,
+    mut now: impl FnMut() -> Instant,
+    mut read: impl FnMut(&mut [u8], Duration) -> Result<io::Result<usize>, &'static str>,
+) -> Result<RvInbound, &'static str> {
+    let until = now() + within;
+    let mut line = Vec::new();
+    let mut chunk = [0u8; 4096];
+    while line.last() != Some(&b'\n') {
+        let left = until.saturating_duration_since(now());
+        if left.is_zero() {
+            return Err("no request came in time");
+        }
         let room = (RV_MAX_LINE + 1 - line.len()).min(chunk.len());
-        match (&*stream).read(&mut chunk[..room]) {
+        match read(&mut chunk[..room], left)? {
             Ok(0) => break,
             Ok(n) => {
                 // One line per connection: anything after its newline is not read.
@@ -232,30 +241,22 @@ mod tests {
 
     #[test]
     fn a_request_sent_a_byte_at_a_time_ends_at_its_deadline() {
-        let (reader, mut writer) = UnixStream::pair().unwrap();
+        let clock = std::cell::Cell::new(Instant::now());
         let within = Duration::from_millis(400);
-        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let dripping = {
-            let stop = stop.clone();
-            std::thread::spawn(move || {
-                // Each byte well inside the deadline, and never a newline.
-                let started = Instant::now();
-                while !stop.load(Ordering::SeqCst) && started.elapsed() < Duration::from_secs(20) {
-                    if writer.write_all(b"x").is_err() {
-                        return;
-                    }
-                    std::thread::sleep(within / 4);
-                }
-            })
-        };
-        let started = Instant::now();
-        let read = read_request_within(&reader, within);
-        let took = started.elapsed();
-        stop.store(true, Ordering::SeqCst);
-        dripping.join().unwrap();
-        assert!(read.is_err());
-        // Ten deadlines: far more than one, and far less than the drip runs.
-        assert!(took < within * 10, "a dripped request was read for {took:?}");
+        let mut waits = Vec::new();
+        let read = read_request_with(
+            within,
+            || clock.get(),
+            |chunk, left| {
+                waits.push(left);
+                assert!(waits.len() <= 4, "the request deadline must not restart per byte");
+                chunk[0] = b'x';
+                clock.set(clock.get() + within / 4);
+                Ok(Ok(1))
+            },
+        );
+        assert_eq!(read.unwrap_err(), "no request came in time");
+        assert_eq!(waits, [within, within * 3 / 4, within / 2, within / 4]);
     }
 
     #[test]

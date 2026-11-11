@@ -116,7 +116,7 @@ fn codex_takes_a_message_during_a_gated_call_and_reads_it_at_the_next_step() {
         Some(turn.as_str()),
         "the same turn goes on"
     );
-    peer.pump_for(Duration::from_secs(1));
+    peer.pump();
     assert!(user_messages(&peer, "c2").is_empty(), "not read while the call waits");
     assert_eq!(model.requests().len(), before, "and the model was not asked meanwhile");
 
@@ -323,8 +323,12 @@ fn the_provider_delivers_a_message_read_and_drops_one_an_interrupt_lost() {
         the_card(e).is_some()
     });
     steer(&provider, &thread, &turn, "m2", "STEER-LOST").expect("sent");
-    // Long enough for Codex's answer to be read: the message was taken, and is then forgotten.
-    std::thread::sleep(Duration::from_millis(500));
+    let until = Instant::now() + TURN_BUDGET;
+    while !provider.steer_accepted_for_tests("m2") {
+        assert!(Instant::now() < until, "Codex never accepted the message");
+        events.extend(provider.pump());
+        std::thread::yield_now();
+    }
     provider
         .interrupt_turn(InterruptTurnRequest {
             session_id: thread.clone(),
@@ -361,7 +365,7 @@ fn the_provider_delivers_a_message_read_and_drops_one_an_interrupt_lost() {
 }
 
 /// A message that arrives after the model's last reply, while the turn is finishing (a user `Stop` hook that
-/// sleeps holds it there): Codex takes it, reads it (`userMessage` with our id) and asks the model again with
+/// holds a file gate there): Codex takes it, reads it (`userMessage` with our id) and asks the model again with
 /// it before the turn ends, so it is answered in that turn, not read and left unanswered (measured on 0.162.1).
 #[test]
 #[ignore = "runs the real codex (on PATH) against the scripted model; no login, no network"]
@@ -373,12 +377,13 @@ fn a_message_at_the_turns_end_window() {
     let project = s.dir("proj");
     write_project(&project, "");
     let stopping = s.path("stop-hook-running");
+    let release = s.path("stop-hook-release");
     write_file(
         &home.join("hooks.json"),
         &json!({"hooks": {"Stop": [{"hooks": [{
             "type": "command",
-            "command": format!("/bin/sh -c 'touch {}; sleep 3'", text_of(&stopping)),
-            "timeout": 10,
+            "command": format!("/bin/sh -c 'touch {}; while [ ! -f {} ]; do sleep 0.01; done'", text_of(&stopping), text_of(&release)),
+            "timeout": 180,
         }]}]}})
         .to_string(),
     );
@@ -401,9 +406,10 @@ fn a_message_at_the_turns_end_window() {
     assert!(appears(&stopping, Duration::from_secs(30)), "the Stop hook never ran");
     let before = model.requests().len();
     let answer = peer.call("turn/steer", steer_params(&thread.id, "late", "LATE-STEER", &turn));
+    std::fs::write(&release, b"").unwrap();
     eprintln!("MEASURED turn/steer while the Stop hook runs: {answer:?}");
     let status = peer.wait_turn(&thread.id, &turn, TURN_BUDGET);
-    peer.pump_for(Duration::from_secs(1));
+    peer.pump();
     let read = user_messages(&peer, "late");
     let item = note_index(&peer, |n| json_str(&n.params, "/item/clientId") == Some("late"));
     let reply_after = item.is_some_and(|at| {

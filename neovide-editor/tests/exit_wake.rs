@@ -10,7 +10,7 @@ use std::rc::Rc;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-use neovide_editor::exit_wake::{Wake, EXIT_POLL};
+use neovide_editor::exit_wake::Wake;
 
 /// One test at a time owns the default main context.
 static CONTEXT: Mutex<()> = Mutex::new(());
@@ -28,6 +28,12 @@ fn run_until(within: Duration, done: impl Fn() -> bool) -> bool {
         }
     }
     true
+}
+
+fn turns() {
+    for _ in 0..100 {
+        glib::MainContext::default().iteration(false);
+    }
 }
 
 /// A child that runs until it is killed, and a pidfd on it.
@@ -58,12 +64,13 @@ fn a_wake_on_a_pidfd_fires_once_when_the_process_exits() {
         || panic!("a watched pidfd is not polled"),
         fire,
     );
-    let early = run_until(Duration::from_millis(200), || fired.get() > 0);
+    turns();
+    let early = fired.get() > 0;
     let pending_while_running = wake.pending();
     child.kill().expect("kill");
     // Not reaped yet: an exited process's pidfd is readable before its parent waits for it.
-    let fired_on_exit = run_until(Duration::from_secs(5), || fired.get() > 0);
-    run_until(Duration::from_millis(200), || false);
+    let fired_on_exit = run_until(Duration::from_secs(60), || fired.get() > 0);
+    turns();
     let _ = child.wait();
     assert!(!early && pending_while_running, "nothing while the process runs");
     assert!(fired_on_exit, "its exit fires the wake");
@@ -84,15 +91,15 @@ fn a_wake_dropped_before_it_fired_never_fires() {
     drop(wake);
     child.kill().expect("kill");
     let _ = child.wait();
-    run_until(Duration::from_millis(300), || false);
+    turns();
     // The source was removed with the wake, before the fd closes (`fd_watch`'s contract).
     drop(pidfd);
-    run_until(Duration::from_millis(100), || false);
+    turns();
     assert_eq!(fired.get(), 0);
 
     let (fired, fire) = counter();
-    drop(Wake::after(Duration::from_millis(20), fire));
-    run_until(Duration::from_millis(200), || false);
+    drop(Wake::after(Duration::ZERO, fire));
+    turns();
     assert_eq!(fired.get(), 0, "a delayed wake dropped first never fires either");
 }
 
@@ -116,11 +123,11 @@ fn with_no_pidfd_the_wake_polls_until_the_process_is_gone() {
         )
     };
     // A few polls go by while it lives.
-    let polled = run_until(EXIT_POLL * 10, || asked.get() >= 2);
+    let polled = run_until(Duration::from_secs(60), || asked.get() >= 20);
     let fired_while_alive = fired.get();
     alive.set(false);
-    let fired_once_gone = run_until(Duration::from_secs(5), || fired.get() > 0);
-    run_until(EXIT_POLL * 3, || false);
+    let fired_once_gone = run_until(Duration::from_secs(60), || fired.get() > 0);
+    turns();
     assert!(polled, "it asks again and again");
     assert_eq!(fired_while_alive, 0);
     assert!(fired_once_gone);
@@ -138,14 +145,14 @@ fn a_delayed_wake_fires_once_and_may_drop_itself() {
     let fired = Rc::new(Cell::new(0u32));
     let wake = {
         let (held, fired) = (held.clone(), fired.clone());
-        Wake::after(Duration::from_millis(20), move || {
+        Wake::after(Duration::ZERO, move || {
             fired.set(fired.get() + 1);
             drop(held.borrow_mut().take());
         })
     };
     *held.borrow_mut() = Some(wake);
-    assert!(run_until(Duration::from_secs(5), || fired.get() > 0));
-    run_until(Duration::from_millis(100), || false);
+    assert!(run_until(Duration::from_secs(60), || fired.get() > 0));
+    turns();
     assert_eq!(fired.get(), 1);
     assert!(
         held.borrow().is_none(),

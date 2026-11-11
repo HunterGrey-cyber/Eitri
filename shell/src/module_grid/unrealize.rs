@@ -28,10 +28,10 @@ pub(crate) fn line(id: &dyn std::fmt::Display, nth: u32, closing: bool) -> Strin
 
 #[cfg(test)]
 mod tests {
-    use super::line;
-
     #[test]
     fn the_close_s_line_is_quiet_and_any_other_names_the_fault() {
+        use super::line;
+
         let closing = line(&"editor", 1, true);
         assert_eq!(
             closing,

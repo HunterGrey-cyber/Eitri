@@ -219,10 +219,15 @@ fn an_error_answer_to_the_move_quits_the_room_and_exits_one() {
 fn an_unanswered_move_then_eitri_gone_then_the_queued_move_sends_the_tui_back() {
     let c = Case::start();
     let p = c.prepared();
-    c.lua("local connect = vim.cmd.connect; vim.cmd.connect = function(...) vim.fn.system({'sleep','3'}); return connect(...) end; return true");
+    let fifo = c.tui.dir.join("move-release");
+    let name = std::ffi::CString::new(fifo.to_str().unwrap()).unwrap();
+    // SAFETY: the path is NUL-terminated and remains live for the call.
+    assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+    c.lua(&format!("local connect = vim.cmd.connect; vim.cmd.connect = function(...) vim.fn.readfile('{}'); return connect(...) end; return true", fifo.display()));
     error(move_tui(&p), StepError::MoveUnanswered);
     let socket = p.dir.socket().to_owned();
     drop(p);
+    std::fs::write(&fifo, b"").unwrap();
     wait_until(|| !socket.exists());
     c.home();
 }
@@ -370,13 +375,21 @@ impl Busy {
         match self {
             Self::Find => "f",
             Self::HitEnter => r#":echo join(repeat(['takeover prompt'], 80), "\n")"#,
-            Self::Shell => ":!sleep 4",
+            Self::Shell => ":!read",
             Self::Confirm => ":call confirm('takeover confirm', \"&Yes\\n&No\", 2)",
         }
     }
     fn enter(self, c: &Case) {
         // Input must come from the terminal UI: nvim uses the last input channel for connect.
-        c.tui.send_keys(self.keys());
+        if matches!(self, Self::Shell) {
+            let fifo = c.tui.dir.join("shell-release");
+            let name = std::ffi::CString::new(fifo.to_str().unwrap()).unwrap();
+            // SAFETY: the path is NUL-terminated and remains live for the call.
+            assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+            c.tui.send_keys(&format!(":!read ignored < '{}'", fifo.display()));
+        } else {
+            c.tui.send_keys(self.keys());
+        }
         if self.keys().starts_with(':') {
             c.tui.send_keys("Enter");
         }
@@ -384,7 +397,7 @@ impl Busy {
     }
     fn answer(self, c: &Case) {
         if matches!(self, Self::Shell) {
-            std::thread::sleep(Duration::from_secs(4));
+            std::fs::write(c.tui.dir.join("shell-release"), b"release\n").unwrap();
         }
         c.tui
             .send_keys(if matches!(self, Self::Confirm) { "n" } else { "Escape" });
@@ -489,10 +502,12 @@ fn a_move_without_the_ui_notice_attaches_with_the_terminal_warning() {
 fn a_late_install_answer_stops_the_room_without_moving_the_terminal() {
     let c = Case::start();
     let origin = check(&c.checks()).unwrap();
-    let result = prepare(origin, &c.tui.dir, &|o| {
-        std::thread::sleep(Duration::from_millis(2050));
-        Ok(GlueHandle { link_chan: o.chan() })
-    });
+    let result = eitri_core::takeover::sequence::prepare_with_elapsed_for_tests(
+        origin,
+        &c.tui.dir,
+        &|o| Ok(GlueHandle { link_chan: o.chan() }),
+        Duration::from_millis(2050),
+    );
     let error = result.err().expect("a late install must fail");
     assert!(matches!(error, StepError::Install(_)));
     assert_eq!(error.exit_code(), 1);

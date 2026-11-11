@@ -250,12 +250,12 @@ mod tests {
     use super::*;
     use std::collections::{HashMap, HashSet};
 
-    fn env_of(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<OsString> {
+    fn env_of(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<OsString> + use<> {
         let owned: Vec<(String, String)> = pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();
         move |name| owned.iter().find(|(k, _)| k == name).map(|(_, v)| OsString::from(v))
     }
 
-    fn files(list: &[&str]) -> impl Fn(&Path) -> bool {
+    fn files(list: &[&str]) -> impl Fn(&Path) -> bool + use<> {
         let set: HashSet<PathBuf> = list.iter().map(PathBuf::from).collect();
         move |p| set.contains(p)
     }
@@ -274,6 +274,23 @@ mod tests {
             locate_claude(env, runnable, &nothing_installed, &no_file),
             ClaudeCli::Missing { .. }
         )
+    }
+
+    #[test]
+    fn rpit_capture_contracts() {
+        let (env, is_file, inspect) = {
+            let key = String::from("HOME");
+            let value = String::from("/owned");
+            let path = String::from("/owned/claude");
+            (
+                env_of(&[(&key, &value)]),
+                files(&[&path]),
+                installed(&[(&path, Inspected::Absent)]),
+            )
+        };
+        assert_eq!(env("HOME"), Some(OsString::from("/owned")));
+        assert!(is_file(Path::new("/owned/claude")));
+        assert!(matches!(inspect(Path::new("/owned/claude")), Inspected::Absent));
     }
 
     #[test]
@@ -352,7 +369,7 @@ mod tests {
     }
 
     /// Answers `inspect` from a fixed table: what is not in it is absent.
-    fn installed(table: &[(&str, Inspected)]) -> impl Fn(&Path) -> Inspected {
+    fn installed(table: &[(&str, Inspected)]) -> impl Fn(&Path) -> Inspected + use<> {
         let table: HashMap<PathBuf, Inspected> = table.iter().map(|(p, i)| (PathBuf::from(p), i.clone())).collect();
         move |p| table.get(p).cloned().unwrap_or(Inspected::Absent)
     }
@@ -502,8 +519,7 @@ mod tests {
             std::fs::create_dir_all(p.parent().unwrap()).unwrap();
             match mode {
                 Some(mode) => {
-                    std::fs::write(&p, "#!/bin/sh\nexit 0\n").unwrap();
-                    std::fs::set_permissions(&p, std::fs::Permissions::from_mode(mode)).unwrap();
+                    script_fixture::write_executable_script(&p, "#!/bin/sh\nexit 0\n", mode).unwrap();
                 }
                 None => std::fs::create_dir_all(&p).unwrap(),
             }
@@ -533,13 +549,19 @@ mod tests {
         make("noexec/.local/bin/claude", Some(0o644));
         // Scripts whose first line asks `env` for a program: one the PATH lacks, one a PATH directory holds.
         make("envmissing/.local/bin/claude", Some(0o755));
-        std::fs::write(
+        script_fixture::write_executable_script(
             root.join("envmissing/.local/bin/claude"),
             "#!/usr/bin/env eitri-missing-interpreter\nexit 0\n",
+            0o755,
         )
         .unwrap();
         make("envfound/.local/bin/claude", Some(0o755));
-        std::fs::write(root.join("envfound/.local/bin/claude"), "#!/usr/bin/env sh\nexit 0\n").unwrap();
+        script_fixture::write_executable_script(
+            root.join("envfound/.local/bin/claude"),
+            "#!/usr/bin/env sh\nexit 0\n",
+            0o755,
+        )
+        .unwrap();
         std::fs::create_dir_all(root.join("interp")).unwrap();
         std::os::unix::fs::symlink("/bin/sh", root.join("interp/sh")).unwrap();
         let d = |rel: &str| root.join(rel).display().to_string();
@@ -816,4 +838,9 @@ mod tests {
         // The four usable install layouts were handed over, and nothing else was.
         assert_eq!(handed_over, 4);
     }
+}
+
+#[cfg(test)]
+mod script_fixture {
+    include!(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/support/executable.rs"));
 }

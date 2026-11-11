@@ -4,6 +4,7 @@ use super::*;
 use crate::agent_panel::tests::*;
 use eitri_core::remote_devices::token_hash_hex;
 use eitri_core::remote_rv::{rv_socket_path, RvClient};
+use std::net::Shutdown;
 use std::os::unix::fs::DirBuilderExt;
 use std::rc::Rc;
 use std::sync::atomic::AtomicU32;
@@ -521,7 +522,12 @@ fn inbound_line_raises_the_wake() {
     let rig = Rig::new("remote-wake");
     let (_tab, _provider, key) = rig.tab();
     let mut client = rig.connect();
-    std::thread::sleep(Duration::from_millis(50));
+    let deadline = Instant::now() + PATIENCE;
+    while rig.socket().conns.borrow().is_empty() {
+        assert!(Instant::now() < deadline, "the connection was never opened");
+        rig.turn();
+        std::thread::yield_now();
+    }
     rig.wake.take();
     rig.subscribe(&mut client, &key);
     let deadline = Instant::now() + PATIENCE;
@@ -672,10 +678,12 @@ fn a_half_closed_peer_frees_its_writer() {
             break gauge;
         }
     };
-    std::thread::sleep(Duration::from_millis(100));
+    raw.set_read_timeout(Some(PATIENCE)).unwrap();
+    raw.read_exact(&mut [0u8; 1])
+        .expect("the writer entered its snapshot write");
     assert!(
         gauge.bytes.load(Ordering::SeqCst) > 0,
-        "the writer is held in its write"
+        "the snapshot cannot fit in the unread socket"
     );
 
     // The peer stops sending but keeps its receiving side open and never reads.
@@ -813,51 +821,66 @@ fn control_lines_count_against_the_byte_gauge() {
 #[test]
 fn idle_peer_is_closed_after_the_deadline() {
     let idle = Duration::from_millis(300);
-    let rig = Rig::with_deadlines("remote-idle", deadlines(idle, RV_WRITE_STALL));
-    let opened = Instant::now();
-    let mut client = rig.connect();
-    rig.until_closed(&mut client, "the idle close");
-    assert!(
-        opened.elapsed() >= idle,
-        "not before the deadline: {:?}",
-        opened.elapsed()
+    let clock = std::cell::Cell::new(Instant::now());
+    let mut waits = Vec::new();
+    let mut closes = 0;
+    let why = conn::read_loop_with(
+        idle,
+        || clock.get(),
+        |_, left| {
+            assert!(waits.len() < 4, "the idle reader kept restarting its deadline");
+            waits.push(left);
+            clock.set(clock.get() + left);
+            Ok(Err(io::ErrorKind::TimedOut.into()))
+        },
+        |_| panic!("an idle connection has no line"),
+        || closes += 1,
     );
-    let deadline = Instant::now() + PATIENCE;
-    while rig.closes().is_empty() {
-        assert!(Instant::now() < deadline, "the close never reached the tick");
-        rig.turn();
-    }
-    assert_eq!(rig.closes(), [CloseWhy::Idle]);
+    assert_eq!(why, CloseWhy::Idle);
+    assert_eq!(waits, [idle]);
+    assert_eq!(closes, 1);
 }
 
 #[test]
 fn ping_keeps_an_idle_connection() {
     let idle = Duration::from_millis(400);
-    let rig = Rig::with_deadlines("remote-ping", deadlines(idle, RV_WRITE_STALL));
-    let mut client = rig.connect();
-    let until = Instant::now() + idle * 4;
-    let mut pongs = 0;
-    while Instant::now() < until {
-        client
-            .send(&RvInbound::Ping { v: 1 })
-            .expect("the connection stays open");
-        let next = Instant::now() + Duration::from_millis(100);
-        while Instant::now() < next {
-            rig.turn();
-            if let Some(line) = client
-                .recv(Duration::from_millis(5))
-                .expect("the connection stays open")
-            {
-                let line: serde_json::Value = serde_json::from_str(&line).unwrap();
-                assert_eq!(line, serde_json::json!({ "v": 1, "kind": "pong" }));
-                pongs += 1;
+    let clock = std::cell::Cell::new(Instant::now());
+    let mut pings = 0;
+    let mut reads = 0;
+    let mut closes = 0;
+    let why = conn::read_loop_with(
+        idle,
+        || clock.get(),
+        |buf, left| {
+            reads += 1;
+            assert!(reads <= 7, "the idle reader never closed");
+            if reads <= 4 {
+                assert_eq!(left, idle, "each complete ping renews the idle deadline");
+                clock.set(clock.get() + idle * 3 / 4);
+                let ping = b"{\"v\":1,\"kind\":\"ping\"}\n";
+                buf[..ping.len()].copy_from_slice(ping);
+                return Ok(Ok(ping.len()));
             }
-        }
-    }
-    assert!(pongs >= 4, "each ping is answered: {pongs}");
-    assert!(rig.closes().is_empty(), "nothing was closed: {:?}", rig.closes());
-    // Once the pings stop, the deadline closes it.
-    rig.until_closed(&mut client, "the idle close");
+            // A premature timeout must not close the connection before the full idle interval.
+            let step = if reads == 5 {
+                idle - Duration::from_millis(1)
+            } else {
+                Duration::from_millis(1)
+            };
+            clock.set(clock.get() + step);
+            Ok(Err(io::ErrorKind::TimedOut.into()))
+        },
+        |line| {
+            assert!(matches!(parse_rv_line(line), Ok(RvInbound::Ping { .. })));
+            pings += 1;
+            true
+        },
+        || closes += 1,
+    );
+    assert_eq!(why, CloseWhy::Idle);
+    assert_eq!(pings, 4);
+    assert_eq!(reads, 6);
+    assert_eq!(closes, 1);
 }
 
 #[test]
@@ -903,36 +926,25 @@ fn stalled_writer_is_closed_after_the_deadline() {
 #[test]
 fn a_write_cut_short_by_the_deadline_is_the_stall() {
     let stall = Duration::from_millis(1500);
-    let rig = Rig::with_deadlines("remote-write-short", deadlines(Duration::from_secs(3600), stall));
-    let (tab, provider, key) = rig.tab();
-    rig.start_turn(tab, &provider, "t1");
-    // A snapshot of about 0.9 MB: the first write moves what the socket holds unread at once, then waits.
-    let text = "x".repeat(1024);
-    for _ in 0..9 {
-        rig.fold(tab, &provider, 100, &text);
-    }
-    let mut raw = UnixStream::connect(&rig.path).unwrap();
-    let subscribe = RvInbound::Subscribe {
-        v: 1,
-        key: key.to_string(),
-    };
-    let asked = Instant::now();
-    raw.write_all(format!("{}\n", serde_json::to_string(&subscribe).unwrap()).as_bytes())
-        .unwrap();
-    // The peer never reads, so no byte moves after the first write's: one deadline from then closes it, not two.
-    let deadline = Instant::now() + PATIENCE;
-    while !rig.closes().contains(&CloseWhy::WriteStall) {
-        assert!(Instant::now() < deadline, "never closed: {:?}", rig.closes());
-        rig.turn();
-        std::thread::sleep(Duration::from_millis(5));
-    }
-    let took = asked.elapsed();
-    assert!(took >= stall - stall / 10, "not before the deadline: {took:?}");
-    assert!(
-        took < stall + stall / 2,
-        "closed one deadline after the last byte moved, not after a second whole deadline: {took:?}"
-    );
-    drop(raw);
+    let clock = std::cell::Cell::new(Instant::now());
+    let mut writes = 0;
+    let error = conn::write_whole_with(
+        b"abcdefgh",
+        stall,
+        |bytes| {
+            writes += 1;
+            assert!(writes <= 2, "a timed-out short write must not start another deadline");
+            if writes == 2 {
+                clock.set(clock.get() + stall);
+            }
+            assert_eq!(bytes.len(), 9 - writes);
+            Ok(1)
+        },
+        || clock.get(),
+    )
+    .unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+    assert_eq!(writes, 2, "an immediate short write continues; a stalled one ends");
 }
 
 #[test]

@@ -579,11 +579,25 @@ fn lock(
     path: &Path,
     shared: bool,
 ) -> io::Result<(agent::private_fs::PrivateLock, Option<agent::private_fs::PrivateLock>)> {
-    let deadline = Instant::now() + LOCK_WITHIN;
+    let deadline = Instant::now() + lock_patience();
     let priority = lock_until(&path.with_extension("wlock"), shared, deadline)?;
+    #[cfg(test)]
+    if !shared {
+        if let Some(hook) = tests::PRIORITY_TAKEN.with(|slot| slot.borrow_mut().take()) {
+            hook();
+        }
+    }
     let store = lock_until(&lock_path(path), shared, deadline)?;
     let writer = if shared { None } else { Some(priority) };
     Ok((store, writer))
+}
+
+fn lock_patience() -> Duration {
+    #[cfg(test)]
+    if tests::LONG_WAIT.get() {
+        return Duration::from_secs(60);
+    }
+    LOCK_WITHIN
 }
 
 /// Both acquisitions use one deadline; each flock attempt is non-blocking.
@@ -596,6 +610,10 @@ fn lock_until(path: &Path, shared: bool, deadline: Instant) -> io::Result<agent:
             lock.try_lock()?
         } {
             return Ok(lock);
+        }
+        #[cfg(test)]
+        if let Some(hook) = tests::CONTENDED.with(|slot| slot.borrow_mut().take()) {
+            hook();
         }
         if Instant::now() >= deadline {
             return Err(io::Error::new(
@@ -709,6 +727,12 @@ pub fn push_endpoint_ok(url: &str) -> Result<(), &'static str> {
 
 #[cfg(test)]
 mod tests {
+    thread_local! {
+        pub(super) static PRIORITY_TAKEN: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
+        pub(super) static CONTENDED: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
+        pub(super) static LONG_WAIT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+
     #[test]
     fn a_stamp_whose_worker_cannot_start_is_withdrawn() {
         let stamp = super::AuthorizationStamp::reopen(
@@ -794,29 +818,32 @@ mod tests {
 
     #[test]
     fn a_withdrawal_finishes_while_readers_keep_overlapping() {
-        use std::sync::{atomic::AtomicBool, Barrier};
         let path = store_file("writer-priority", &one_device("watch+steer"), 0o600);
-        let stop = AtomicBool::new(false);
-        let ready = Barrier::new(9);
-        std::thread::scope(|scope| {
-            for reader in 0..8 {
-                let (path, stop, ready) = (&path, &stop, &ready);
-                scope.spawn(move || {
-                    let mut held = lock(path, true).unwrap();
-                    ready.wait();
-                    while !stop.load(Ordering::SeqCst) {
-                        std::thread::sleep(LOCK_PAUSE * (reader + 3));
-                        drop(held);
-                        held = lock(path, true).unwrap();
-                    }
-                });
-            }
-            ready.wait();
-            // update's own LOCK_WITHIN deadline decides success; this is not a speed assertion.
-            let result = update(&path, |store| store.remove("d1"));
-            stop.store(true, Ordering::SeqCst);
-            assert!(result.unwrap().is_some(), "revocation must survive ongoing readers");
+        let readers: Vec<_> = (0..8).map(|_| lock(&path, true).unwrap()).collect();
+        let (taken, waiting) = std::sync::mpsc::channel();
+        let (release, gate) = std::sync::mpsc::channel();
+        let writer_path = path.clone();
+        let writer = std::thread::spawn(move || {
+            LONG_WAIT.set(true);
+            PRIORITY_TAKEN.with(|slot| {
+                *slot.borrow_mut() = Some(Box::new(move || {
+                    taken.send(()).unwrap();
+                    gate.recv_timeout(std::time::Duration::from_secs(60)).unwrap();
+                }))
+            });
+            update(&writer_path, |store| store.remove("d1"))
         });
+        waiting
+            .recv_timeout(std::time::Duration::from_secs(60))
+            .expect("the writer took admission priority");
+        let newcomer = agent::private_fs::PrivateLock::open(&path.with_extension("wlock")).unwrap();
+        assert!(
+            !newcomer.try_lock_shared().unwrap(),
+            "new readers cannot prolong an admitted writer's wait"
+        );
+        drop(readers);
+        release.send(()).unwrap();
+        assert!(writer.join().unwrap().unwrap().is_some());
         assert!(DeviceStore::load(&path).unwrap().devices().is_empty());
     }
 
@@ -1105,23 +1132,39 @@ mod tests {
     fn interleaved_revoke_and_add_keep_the_revoke() {
         let path = store_file("remote-devices-interleaved", &one_device("watch+steer"), 0o600);
         let (inside, entered) = std::sync::mpsc::channel();
+        let (release_revoke, revoke_gate) = std::sync::mpsc::channel();
         let revoking = {
             let path = path.clone();
             std::thread::spawn(move || {
                 update(&path, |store| {
                     inside.send(()).unwrap();
-                    // The other writer starts now and must wait for this one's write.
-                    std::thread::sleep(std::time::Duration::from_millis(300));
+                    revoke_gate.recv_timeout(std::time::Duration::from_secs(60)).unwrap();
                     store.remove("d1")
                 })
             })
         };
-        entered.recv().unwrap();
+        entered.recv_timeout(std::time::Duration::from_secs(60)).unwrap();
+        let (waiting, contended) = std::sync::mpsc::channel();
+        let (release_add, add_gate) = std::sync::mpsc::channel();
         let adding = {
             let path = path.clone();
-            std::thread::spawn(move || update(&path, |store| store.insert(device("d2", "tok2"))))
+            std::thread::spawn(move || {
+                LONG_WAIT.set(true);
+                CONTENDED.with(|slot| {
+                    *slot.borrow_mut() = Some(Box::new(move || {
+                        waiting.send(()).unwrap();
+                        add_gate.recv_timeout(std::time::Duration::from_secs(60)).unwrap();
+                    }))
+                });
+                update(&path, |store| store.insert(device("d2", "tok2")))
+            })
         };
+        contended
+            .recv_timeout(std::time::Duration::from_secs(60))
+            .expect("the adder encountered the held writer lock");
+        release_revoke.send(()).unwrap();
         assert!(revoking.join().unwrap().unwrap().is_some(), "d1 was there to revoke");
+        release_add.send(()).unwrap();
         assert!(adding.join().unwrap().unwrap(), "d2 was added");
         let store = DeviceStore::load(&path).unwrap();
         assert!(store.get("d1").is_none(), "the revoke survives the add");

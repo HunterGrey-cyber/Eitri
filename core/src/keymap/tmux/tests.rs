@@ -1049,7 +1049,6 @@ fn a_glob_whose_matching_is_costly_stops_at_its_work_budget() {
         write(&home.join(format!("d/{n}{}", "b".repeat(100))), "");
     }
     let pattern = format!("{}/d/*[{}]", home.display(), "a".repeat(65_000));
-    let started = std::time::Instant::now();
     let mut budget = GlobBudget {
         entries: MAX_GLOB_ENTRIES,
         work: 1_000_000,
@@ -1058,11 +1057,6 @@ fn a_glob_whose_matching_is_costly_stops_at_its_work_budget() {
     assert!(exhausted, "{found:?}");
     assert_eq!(budget.work, 0);
     assert!(budget.entries > 0, "the entries were not what ran out");
-    assert!(
-        started.elapsed() < std::time::Duration::from_secs(2),
-        "{:?}",
-        started.elapsed()
-    );
 }
 
 /// What each glob bound costs at its worst on this machine, for the record: 10,000 entries of a

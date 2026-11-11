@@ -108,6 +108,8 @@ struct Shared {
 /// A request on a [`CallLine`], watched by a thread of its own until it is done or this is dropped.
 pub(crate) struct WatchedCall {
     shared: Arc<Shared>,
+    #[cfg(test)]
+    watcher: Option<std::thread::JoinHandle<()>>,
 }
 
 impl WatchedCall {
@@ -116,11 +118,27 @@ impl WatchedCall {
     /// it ([`CallWatch::returned`]). `probe` resolves to `nvim_get_mode`'s `(mode, blocking)`, or
     /// `None` when nvim is gone, which ends the watch. An `Err` sent nothing: the watch's thread
     /// could not start, or the line's thread is gone.
-    pub(crate) fn start<CF, P, PF>(line: &CallLine, name: &str, call: CF, mut probe: P) -> io::Result<WatchedCall>
+    pub(crate) fn start<CF, P, PF>(line: &CallLine, name: &str, call: CF, probe: P) -> io::Result<WatchedCall>
     where
         CF: Future<Output = bool> + Send + 'static,
         P: FnMut() -> PF + Send + 'static,
         PF: Future<Output = Option<(String, bool)>>,
+    {
+        Self::start_with_wait(line, name, call, probe, || std::thread::sleep(HEARTBEAT))
+    }
+
+    fn start_with_wait<CF, P, PF, W>(
+        line: &CallLine,
+        name: &str,
+        call: CF,
+        mut probe: P,
+        mut wait: W,
+    ) -> io::Result<WatchedCall>
+    where
+        CF: Future<Output = bool> + Send + 'static,
+        P: FnMut() -> PF + Send + 'static,
+        PF: Future<Output = Option<(String, bool)>>,
+        W: FnMut() + Send + 'static,
     {
         let shared = Arc::new(Shared {
             sent_at: Instant::now(),
@@ -129,8 +147,7 @@ impl WatchedCall {
             stopped: AtomicBool::new(false),
             last_answer: Mutex::new(None),
         });
-        let watched = WatchedCall { shared: shared.clone() };
-        {
+        let watcher = {
             let shared = shared.clone();
             std::thread::Builder::new()
                 .name(format!("nvim-rpc {name} watch"))
@@ -144,10 +161,17 @@ impl WatchedCall {
                             mode,
                             blocking,
                         });
-                        std::thread::sleep(HEARTBEAT);
+                        wait();
                     }
-                })?;
-        }
+                })?
+        };
+        let watched = WatchedCall {
+            shared: shared.clone(),
+            #[cfg(test)]
+            watcher: Some(watcher),
+        };
+        #[cfg(not(test))]
+        drop(watcher);
         // The watch first: a call handed over is sent, so nothing may fail after it.
         let handed = line.push(Box::pin(async move {
             let answered = call.await;
@@ -185,13 +209,17 @@ impl WatchedCall {
     /// has already resolved the request, this returns within microseconds; a request still
     /// outstanding at the bound comes back with `done == false`.
     pub(crate) fn settled(&self, within: Duration) -> CallWatch {
-        let deadline = Instant::now() + within;
+        self.settled_with(within, Instant::now, || std::thread::sleep(Duration::from_millis(1)))
+    }
+
+    fn settled_with(&self, within: Duration, mut now: impl FnMut() -> Instant, mut wait: impl FnMut()) -> CallWatch {
+        let deadline = now() + within;
         loop {
             let watch = self.watch();
-            if watch.done || Instant::now() >= deadline {
+            if watch.done || now() >= deadline {
                 return watch;
             }
-            std::thread::sleep(Duration::from_millis(1));
+            wait();
         }
     }
 }
@@ -319,6 +347,39 @@ pub(crate) fn block_on<F: Future>(future: F) -> F::Output {
 mod tests {
     use super::*;
 
+    fn wait_for_stopped_child(pid: libc::pid_t) {
+        assert!(pid > 1, "the fixture owns a child pid");
+        let deadline = Instant::now() + Duration::from_secs(60);
+        loop {
+            let mut status = 0;
+            let rc = unsafe { libc::waitpid(pid, &mut status, libc::WUNTRACED | libc::WNOHANG) };
+            if rc == pid {
+                assert!(
+                    libc::WIFSTOPPED(status),
+                    "nvim exited instead of stopping (status {status})"
+                );
+                return;
+            }
+            assert!(rc >= 0, "waitpid: {}", io::Error::last_os_error());
+            assert!(Instant::now() < deadline, "nvim never stopped");
+            std::thread::yield_now();
+        }
+    }
+
+    #[test]
+    fn a_child_exiting_instead_of_stopping_fails_before_any_later_signal() {
+        let child = std::process::Command::new("sh")
+            .args(["-c", "exit 17"])
+            .spawn()
+            .unwrap();
+        let pid = child.id() as libc::pid_t;
+        let error = std::panic::catch_unwind(|| wait_for_stopped_child(pid)).expect_err("an exit is not a stop");
+        let message = error.downcast_ref::<String>().expect("an assertion message");
+        assert!(message.contains("exited instead of stopping"), "{message}");
+        assert_eq!(unsafe { libc::waitpid(pid, std::ptr::null_mut(), libc::WNOHANG) }, -1);
+        assert_eq!(io::Error::last_os_error().raw_os_error(), Some(libc::ECHILD));
+    }
+
     fn wait_until(what: &str, mut condition: impl FnMut() -> bool) {
         let deadline = Instant::now() + Duration::from_secs(5);
         while !condition() {
@@ -365,9 +426,11 @@ mod tests {
         let release = Arc::new(AtomicBool::new(false));
         let finished = Arc::new(AtomicBool::new(false));
         let replied = Arc::new(AtomicBool::new(false));
+        let (entered, entry) = mpsc::channel();
         let call = {
             let (release, finished) = (release.clone(), finished.clone());
             async move {
+                entered.send(()).unwrap();
                 while !release.load(Ordering::SeqCst) {
                     std::thread::sleep(Duration::from_millis(5));
                 }
@@ -383,7 +446,9 @@ mod tests {
             })
         };
         assert!(line("test").submit(call, reply));
-        std::thread::sleep(Duration::from_millis(30));
+        entry
+            .recv_timeout(Duration::from_secs(60))
+            .expect("the future entered its wait");
         assert!(!finished.load(Ordering::SeqCst), "still waiting for its release");
         release.store(true, Ordering::SeqCst);
         wait_until("the future to finish", || finished.load(Ordering::SeqCst));
@@ -408,9 +473,11 @@ mod tests {
     #[test]
     fn the_line_thread_ends_once_dropped_and_its_last_call_is_done() {
         let release = Arc::new(AtomicBool::new(false));
+        let (entered, entry) = mpsc::channel();
         let call = {
             let release = release.clone();
             async move {
+                entered.send(()).unwrap();
                 while !release.load(Ordering::SeqCst) {
                     std::thread::sleep(Duration::from_millis(5));
                 }
@@ -420,7 +487,9 @@ mod tests {
         let calls = line("line-ends");
         assert!(calls.submit(call, Box::new(|_| {})));
         drop(calls);
-        std::thread::sleep(Duration::from_millis(30));
+        entry
+            .recv_timeout(Duration::from_secs(60))
+            .expect("the future entered its wait");
         assert_eq!(threads_named("nvim-rpc line-ends"), 1, "still carrying its call");
         release.store(true, Ordering::SeqCst);
         wait_until("the line's thread to end", || threads_named("nvim-rpc line-ends") == 0);
@@ -431,10 +500,13 @@ mod tests {
     #[test]
     fn block_on_resumes_on_a_wake_from_another_thread() {
         let slot: Arc<Mutex<(Option<u32>, Option<Waker>)>> = Arc::default();
+        let (polled, pending) = mpsc::channel();
         {
             let slot = slot.clone();
             std::thread::spawn(move || {
-                std::thread::sleep(Duration::from_millis(50));
+                pending
+                    .recv_timeout(Duration::from_secs(60))
+                    .expect("the future parked");
                 let mut slot = slot.lock().unwrap();
                 slot.0 = Some(7);
                 if let Some(waker) = slot.1.take() {
@@ -448,6 +520,7 @@ mod tests {
                 Some(value) => Poll::Ready(value),
                 None => {
                     slot.1 = Some(cx.waker().clone());
+                    polled.send(()).unwrap();
                     Poll::Pending
                 }
             }
@@ -477,7 +550,13 @@ mod tests {
                 async { Some(("r?".to_string(), false)) }
             }
         };
-        let watched = WatchedCall::start(&line("test"), "test", call, probe).unwrap();
+        let (tick, ticks) = mpsc::channel();
+        let (waiting, waits) = mpsc::channel();
+        let mut watched = WatchedCall::start_with_wait(&line("test"), "test", call, probe, move || {
+            waiting.send(()).unwrap();
+            ticks.recv_timeout(Duration::from_secs(60)).expect("advance heartbeat");
+        })
+        .unwrap();
         wait_until("a first answer", || watched.watch().last_answer.is_some());
         let watch = watched.watch();
         assert!(!watch.done);
@@ -488,25 +567,70 @@ mod tests {
         release.store(true, Ordering::SeqCst);
         wait_until("the call to finish", || watched.watch().done);
         assert!(watched.watch().returned, "it came back with an answer");
-        std::thread::sleep(HEARTBEAT * 2);
+        waits
+            .recv_timeout(Duration::from_secs(60))
+            .expect("watch is inside heartbeat wait");
         let settled = *probes.lock().unwrap();
-        std::thread::sleep(HEARTBEAT * 3);
-        assert_eq!(*probes.lock().unwrap(), settled, "no probe after the call is done");
+        tick.send(()).unwrap();
+        wait_until("watch thread to stop", || {
+            watched.watcher.as_ref().unwrap().is_finished()
+        });
+        watched.watcher.take().unwrap().join().unwrap();
+        assert_eq!(*probes.lock().unwrap(), settled, "no probe after completion");
     }
 
     /// A probe that never resolves (nvim's loop is stuck): no answer is ever recorded, so the watch
     /// reports nvim alive only as of the send.
     #[test]
     fn a_probe_that_never_answers_leaves_the_last_sign_of_life_at_the_send() {
-        let call = std::future::pending::<bool>();
-        let probe = || std::future::pending::<Option<(String, bool)>>();
-        let watched = WatchedCall::start(&line("stuck"), "stuck", call, probe).unwrap();
-        std::thread::sleep(HEARTBEAT * 2);
-        let watch = watched.watch();
-        assert!(!watch.done);
-        assert!(!watch.returned);
-        assert_eq!(watch.last_answer, None);
-        assert_eq!(watch.last_alive(), watch.sent_at);
+        let (polled, polls) = mpsc::channel();
+        let (tick, ticks) = mpsc::channel();
+        let ticks = Arc::new(Mutex::new(ticks));
+        let finish = Arc::new(AtomicBool::new(false));
+        let probe = {
+            let (ticks, finish) = (ticks.clone(), finish.clone());
+            move || {
+                let (ticks, finish, polled) = (ticks.clone(), finish.clone(), polled.clone());
+                std::future::poll_fn(move |cx| {
+                    if finish.load(Ordering::SeqCst) {
+                        return Poll::Ready(None);
+                    }
+                    polled.send(()).unwrap();
+                    ticks
+                        .lock()
+                        .unwrap()
+                        .recv_timeout(Duration::from_secs(60))
+                        .expect("release this probe poll");
+                    cx.waker().wake_by_ref();
+                    Poll::Pending
+                })
+            }
+        };
+        let (release, released) = mpsc::channel();
+        let call = async move {
+            released
+                .recv_timeout(Duration::from_secs(60))
+                .expect("release the call");
+            false
+        };
+        let mut watched = WatchedCall::start(&line("stuck"), "stuck", call, probe).unwrap();
+        for turn in 0..100 {
+            polls.recv_timeout(Duration::from_secs(60)).expect("probe is pending");
+            let watch = watched.watch();
+            assert!(!watch.done && !watch.returned, "turn {turn}");
+            assert_eq!(watch.last_answer, None);
+            assert_eq!(watch.last_alive(), watch.sent_at);
+            if turn == 99 {
+                finish.store(true, Ordering::SeqCst);
+            }
+            tick.send(()).unwrap();
+        }
+        wait_until("watch thread to end", || {
+            watched.watcher.as_ref().unwrap().is_finished()
+        });
+        watched.watcher.take().unwrap().join().unwrap();
+        release.send(()).unwrap();
+        wait_until("call to finish", || watched.watch().done);
     }
 
     /// Nvim's answer reaches the worker through a oneshot, and the worker
@@ -515,21 +639,47 @@ mod tests {
     /// outstanding.
     #[test]
     fn settled_waits_for_the_worker_to_publish() {
-        let call = async {
-            std::thread::sleep(Duration::from_millis(150));
+        let (release, released) = mpsc::channel();
+        let call = async move {
+            released
+                .recv_timeout(Duration::from_secs(60))
+                .expect("release the reply");
             true
         };
         let probe = || async { None::<(String, bool)> };
         let watched = WatchedCall::start(&line("late"), "late", call, probe).unwrap();
-        assert!(!watched.watch().done, "the case: not published yet");
-        let settled = watched.settled(Duration::from_secs(2));
+        assert!(!watched.watch().done);
+        let now = std::cell::Cell::new(Instant::now());
+        let mut release = Some(release);
+        let settled = watched.settled_with(
+            Duration::from_secs(2),
+            || now.get(),
+            || {
+                release.take().unwrap().send(()).unwrap();
+                wait_until("publication", || watched.watch().done);
+                now.set(now.get() + Duration::from_millis(1));
+            },
+        );
         assert!(settled.done && settled.returned, "{settled:?}");
-
         let pending = WatchedCall::start(&line("never"), "never", std::future::pending::<bool>(), probe).unwrap();
-        let started = Instant::now();
-        let unsettled = pending.settled(Duration::from_millis(100));
+        let start = now.get();
+        let unsettled = pending.settled_with(
+            Duration::from_millis(100),
+            || now.get(),
+            || {
+                assert!(
+                    now.get() < start + Duration::from_millis(101),
+                    "settled ignored its deadline"
+                );
+                now.set(now.get() + Duration::from_millis(1));
+            },
+        );
         assert!(!unsettled.done);
-        assert!(started.elapsed() >= Duration::from_millis(100), "it waited the bound");
+        assert_eq!(
+            now.get() - start,
+            Duration::from_millis(100),
+            "waited the complete bound"
+        );
     }
 
     /// A request that ended without nvim's answer (nvim went away) is
@@ -617,12 +767,6 @@ mod tests {
                 self.requests
                     .recv_timeout(HANG_GUARD)
                     .expect("a request reaches the stand-in")
-            }
-
-            /// Nothing more was written within a moment. A check that something did not happen,
-            /// never the proof that something did.
-            fn nothing_more_written(&self) -> bool {
-                self.requests.recv_timeout(Duration::from_millis(100)).is_err()
             }
 
             fn answer(&self, msgid: u64, value: &str) {
@@ -726,7 +870,6 @@ mod tests {
                 answers.recv_timeout(HANG_GUARD).expect("an answer"),
                 ("return 'next'", Ok(rmpv::Value::from("next")))
             );
-            assert!(fake.nothing_more_written());
             // Its late answer reaches nobody and ends nothing: the connection still carries calls.
             fake.answer(given_up_id, "late");
             ask(&calls, &nvim, "return 'after'", answers_tx);
@@ -765,6 +908,14 @@ mod tests {
         }
 
         fn watched(nvim: &Nvim) -> WatchedCall {
+            watched_with_steps(nvim, || std::thread::sleep(HEARTBEAT), None)
+        }
+
+        fn watched_with_steps(
+            nvim: &Nvim,
+            wait: impl FnMut() + Send + 'static,
+            pending: Option<Arc<dyn Fn() -> bool + Send + Sync>>,
+        ) -> WatchedCall {
             let call = {
                 let nvim = nvim.clone();
                 async move { nvim.exec_lua(LUA, vec![]).await.is_ok() }
@@ -773,8 +924,23 @@ mod tests {
                 let nvim = nvim.clone();
                 move || {
                     let nvim = nvim.clone();
+                    let pending = pending.clone();
                     async move {
-                        let pairs = nvim.get_mode().await.ok()?;
+                        let mode = nvim.get_mode();
+                        let mut mode = std::pin::pin!(mode);
+                        let pairs = std::future::poll_fn(|cx| {
+                            let result = mode.as_mut().poll(cx);
+                            if result.is_pending() {
+                                if let Some(pending) = &pending {
+                                    if pending() {
+                                        cx.waker().wake_by_ref();
+                                    }
+                                }
+                            }
+                            result
+                        })
+                        .await
+                        .ok()?;
                         let field = |name: &str| pairs.iter().find(|(k, _)| k.as_str() == Some(name)).map(|(_, v)| v);
                         Some((
                             field("mode").and_then(|v| v.as_str()).unwrap_or_default().to_string(),
@@ -783,11 +949,12 @@ mod tests {
                     }
                 }
             };
-            WatchedCall::start(
+            WatchedCall::start_with_wait(
                 &CallLine::start("test quit").expect("the line's thread"),
                 "test quit",
                 call,
                 probe,
+                wait,
             )
             .expect("threads")
         }
@@ -805,7 +972,9 @@ mod tests {
             let (nvim, _io, mut child) = runtime
                 .block_on(async {
                     nvim_rs::create::tokio::new_child_cmd(
-                        tokio::process::Command::new("nvim").args(["--clean", "--embed", "-n"]),
+                        tokio::process::Command::new("nvim")
+                            .args(["--clean", "--embed", "-n"])
+                            .kill_on_drop(true),
                         Dummy::new(),
                     )
                     .await
@@ -842,7 +1011,6 @@ mod tests {
 
             let quit = watched(&nvim);
             wait_for("an answer while f waits", || quit.watch().last_answer.is_some());
-            std::thread::sleep(HEARTBEAT * 2);
             let watch = quit.watch();
             let answer = watch.last_answer.clone().unwrap();
             assert_eq!((answer.mode.as_str(), answer.blocking), ("n", true), "held behind f");
@@ -870,21 +1038,91 @@ mod tests {
             );
 
             // A stopped nvim: the watch's last sign of life stays where it was.
-            let stuck = watched(&nvim);
-            wait_for("the second dialog", || {
-                stuck.watch().last_answer.is_some_and(|a| a.mode == dialog_mode)
-            });
+            let (tick, ticks) = mpsc::channel();
+            let (waiting, waits) = mpsc::channel();
+            let (pending, polls) = mpsc::channel();
+            let (advance, advances) = mpsc::channel();
+            let advances = Mutex::new(advances);
+            let stepping = Arc::new(AtomicBool::new(false));
+            let mut stuck = watched_with_steps(
+                &nvim,
+                move || {
+                    waiting.send(()).unwrap();
+                    ticks.recv_timeout(Duration::from_secs(60)).expect("advance heartbeat");
+                },
+                Some(Arc::new({
+                    let stepping = stepping.clone();
+                    move || {
+                        if stepping.load(Ordering::SeqCst) {
+                            pending.send(()).unwrap();
+                            advances
+                                .lock()
+                                .unwrap()
+                                .recv_timeout(Duration::from_secs(60))
+                                .expect("advance the watch's pending probe");
+                            true
+                        } else {
+                            false
+                        }
+                    }
+                })),
+            );
+            let mut frozen = None;
+            for _ in 0..100 {
+                waits
+                    .recv_timeout(Duration::from_secs(60))
+                    .expect("the dialog heartbeat");
+                let watch = stuck.watch();
+                if watch
+                    .last_answer
+                    .as_ref()
+                    .is_some_and(|answer| answer.mode == dialog_mode)
+                {
+                    frozen = Some(watch);
+                    break;
+                }
+                tick.send(()).unwrap();
+            }
+            let frozen = frozen.expect("the watch reached the second dialog");
             let pid = child.id().expect("pid") as libc::pid_t;
+            assert!(pid > 1, "the fixture owns a child pid");
             // SAFETY: a signal to the child this test spawned and still holds.
             unsafe { libc::kill(pid, libc::SIGSTOP) };
-            std::thread::sleep(HEARTBEAT * 2);
-            let frozen = stuck.watch().last_alive();
-            std::thread::sleep(Duration::from_millis(1500));
-            assert_eq!(stuck.watch().last_alive(), frozen, "a stopped nvim does not answer");
-            assert!(!stuck.watch().done);
+            super::wait_for_stopped_child(pid);
+            // The previous answer is published and the watch is parked at its heartbeat.
+            // Drive that watch's own pending probe, so no unrelated request supplies the evidence.
+            stepping.store(true, Ordering::SeqCst);
+            tick.send(()).unwrap();
+            for turn in 0..100 {
+                polls
+                    .recv_timeout(Duration::from_secs(60))
+                    .expect("the watch probe is pending");
+                let stopped = stuck.watch();
+                assert_eq!(
+                    stopped.last_answer, frozen.last_answer,
+                    "stopped heartbeat, turn {turn}"
+                );
+                assert_eq!(
+                    stopped.last_alive(),
+                    frozen.last_alive(),
+                    "stopped timestamp, turn {turn}"
+                );
+                assert!(!stopped.done);
+                if turn < 99 {
+                    advance.send(()).unwrap();
+                }
+            }
             // SAFETY: as above.
             unsafe { libc::kill(pid, libc::SIGCONT) };
-            wait_for("answers again", || stuck.watch().last_alive() > frozen);
+            stepping.store(false, Ordering::SeqCst);
+            advance.send(()).unwrap();
+            waits
+                .recv_timeout(Duration::from_secs(60))
+                .expect("the resumed heartbeat");
+            assert!(
+                stuck.watch().last_alive() > frozen.last_alive(),
+                "the watch answers again"
+            );
 
             // SAFETY: as above; the dialog is up, so end it outright.
             unsafe { libc::kill(pid, libc::SIGKILL) };
@@ -894,6 +1132,9 @@ mod tests {
                 "an nvim that went away never answered the quit"
             );
             let _ = runtime.block_on(child.wait());
+            tick.send(()).unwrap();
+            wait_for("the watch to stop", || stuck.watcher.as_ref().unwrap().is_finished());
+            stuck.watcher.take().unwrap().join().unwrap();
         }
     }
 }

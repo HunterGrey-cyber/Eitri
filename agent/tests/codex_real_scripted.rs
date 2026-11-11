@@ -74,10 +74,22 @@ fn dotted_key_would_fail_open_nested_does_not() {
             .unwrap_or_default()
             .to_string();
         run_turn(&mut peer, &thread.id, "probe");
-        peer.pump_for(Duration::from_secs(3));
-        let ran_now = appears(&ran, Duration::from_secs(5));
+        assert!(
+            peer.notes.iter().any(|note| note.method == method::TURN_COMPLETED
+                && json_str(&note.params, "/threadId") == Some(thread.id.as_str())),
+            "the session must finish a turn after tool-server startup"
+        );
+        peer.pump();
+        assert!(
+            peer.close_on_eof_for_tests(),
+            "the CLI must end on EOF before checking the server marker"
+        );
+        let ran_now = if dotted {
+            appears(&ran, TURN_BUDGET)
+        } else {
+            ran.exists()
+        };
         let written = std::fs::read_to_string(home.join("config.toml")).unwrap_or_default();
-        peer.close();
 
         if dotted {
             assert!(
@@ -144,10 +156,7 @@ fn untrusted_start_and_resume_load_nothing() {
     assert_none_seen(&model, 0, "start");
     let after_start = model.requests().len();
     // EOF on an idle server: it goes at once.
-    assert!(
-        peer.close() < Duration::from_secs(3),
-        "the server did not exit on stdin EOF"
-    );
+    assert!(peer.close_on_eof_for_tests(), "the server exits on stdin EOF");
 
     // The resume in a new process.
     let mut peer = Peer::start(&codex, &home, &project, decline_all());
@@ -550,7 +559,8 @@ fn hook_run(codex: &Path, tag: &str, trust: DirTrust, hook_trusted_by_user: bool
     let mut peer = Peer::start(codex, &home, &project, decline_all());
     let thread = start_thread(&mut peer, start_params(&project, trust));
     let status = run_turn(&mut peer, &thread.id, "probe");
-    peer.pump_for(Duration::from_secs(1));
+
+    peer.pump();
     let started = peer
         .notes
         .iter()
@@ -857,14 +867,20 @@ fn interrupt_waiting_approval_and_double_interrupt() {
     let s = Scratch::new("i10");
     let outside = s.dir("outside");
     let late = outside.join("late-accept");
-    let hang_for = Duration::from_secs(60);
     let model = ScriptedModel::start(vec![
+        Step::exec(
+            "fourth-gated",
+            "touch stale-ready; while [ ! -f stale-release ]; do sleep 0.01; done",
+            false,
+        )
+        .when_body_has("PROMPT-FOUR")
+        .unless_body_has("\"fourth-gated\""),
         // Turn 1: the model stalls. Turn 2: an approval nobody answers. Turn 3: stalls. Turn 4 (and
         // later turns): the default one-line answer.
         Step::events(vec![json!({"type": "response.created", "response": {"id": "{RID}"}})])
             .when_body_has("PROMPT-ONE")
             .unless_body_has("PROMPT-TWO")
-            .then_hang(hang_for),
+            .then_hold(),
         Step::exec("e1", &format!("touch {}", text_of(&late)), true)
             .when_body_has("PROMPT-TWO")
             .unless_body_has("\"e1\"")
@@ -872,7 +888,7 @@ fn interrupt_waiting_approval_and_double_interrupt() {
         Step::events(vec![json!({"type": "response.created", "response": {"id": "{RID}"}})])
             .when_body_has("PROMPT-THREE")
             .unless_body_has("PROMPT-FOUR")
-            .then_hang(hang_for),
+            .then_hold(),
     ])
     .expect("model");
     let home = s.dir("home");
@@ -887,8 +903,8 @@ fn interrupt_waiting_approval_and_double_interrupt() {
     // A running turn.
     let turn1 = send_turn(&mut peer, &thread.id, "PROMPT-ONE");
     assert!(peer.wait_for(Duration::from_secs(20), |p| p.turn_started(&thread.id)));
-    peer.pump_for(Duration::from_secs(1));
-    let at = Instant::now();
+
+    peer.pump();
     let answer = peer
         .call(method::TURN_INTERRUPT, json!({"threadId": thread.id, "turnId": turn1}))
         .expect("turn/interrupt");
@@ -897,13 +913,8 @@ fn interrupt_waiting_approval_and_double_interrupt() {
         peer.wait_turn(&thread.id, &turn1, Duration::from_secs(20)).as_deref(),
         Some("interrupted")
     );
-    assert!(
-        at.elapsed() < Duration::from_secs(10),
-        "the interrupt took {:?}",
-        at.elapsed()
-    );
 
-    peer.pump_for(Duration::from_secs(1));
+    peer.pump();
     // An interrupt that names another turn than the active one is an error, at once.
     let error = peer
         .call(
@@ -934,21 +945,26 @@ fn interrupt_waiting_approval_and_double_interrupt() {
         peer.wait_turn(&thread.id, &turn2, Duration::from_secs(20)).as_deref(),
         Some("interrupted")
     );
-    peer.pump_for(Duration::from_secs(1));
+
     assert!(
-        peer.note(method::SERVER_REQUEST_RESOLVED).is_some(),
+        peer.wait_for(TURN_BUDGET, |p| p.note(method::SERVER_REQUEST_RESOLVED).is_some()),
         "the interrupt did not resolve the waiting request"
     );
     // A late accept runs nothing.
     peer.link.respond(request.id, json!({"decision": "accept"}));
-    peer.pump_for(Duration::from_secs(2));
-    assert!(!late.exists(), "a late accept ran the command");
 
-    // A second interrupt of an interrupted turn is not answered until the next turn ends.
+    // The next turn's start is received after the queued acceptance on the same input stream.
     let turn3 = send_turn(&mut peer, &thread.id, "PROMPT-THREE");
-    assert!(peer.wait_for(Duration::from_secs(20), |p| p.turn_started(&thread.id)
-        && p.notes.len() > 4));
-    peer.pump_for(Duration::from_secs(1));
+    assert!(
+        peer.wait_for(TURN_BUDGET, |p| p.notes.iter().any(|n| {
+            n.method == method::TURN_STARTED
+                && json_str(&n.params, "/threadId") == Some(thread.id.as_str())
+                && json_str(&n.params, "/turn/id") == Some(turn3.as_str())
+        })),
+        "the turn after the late acceptance never started"
+    );
+    // A second interrupt of an interrupted turn is not answered until the next turn ends.
+    peer.pump();
     let first = peer
         .call(method::TURN_INTERRUPT, json!({"threadId": thread.id, "turnId": turn3}))
         .expect("the first interrupt");
@@ -957,29 +973,30 @@ fn interrupt_waiting_approval_and_double_interrupt() {
         peer.wait_turn(&thread.id, &turn3, Duration::from_secs(20)).as_deref(),
         Some("interrupted")
     );
+    assert!(
+        !late.exists(),
+        "a late accept ran the command before the following turn ended"
+    );
     let mut stale = peer
         .link
         .request(method::TURN_INTERRUPT, json!({"threadId": thread.id, "turnId": turn3}));
     let mut answered = None;
-    let end = Instant::now() + Duration::from_secs(3);
-    while Instant::now() < end {
-        peer.pump();
-        if let Some(a) = stale.try_take() {
-            answered = Some(a);
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(20));
-    }
-    assert!(
-        answered.is_none(),
-        "a second interrupt was answered at once: {answered:?}"
-    );
     let turn4 = send_turn(&mut peer, &thread.id, "PROMPT-FOUR");
+    assert!(
+        appears(&project.join("stale-ready"), TURN_BUDGET),
+        "the fourth turn never reached its gate"
+    );
+    assert!(
+        stale.try_take().is_none(),
+        "the stale interrupt waits for the next turn's end"
+    );
+    std::fs::write(project.join("stale-release"), b"").unwrap();
     assert_eq!(
         peer.wait_turn(&thread.id, &turn4, TURN_BUDGET).as_deref(),
         Some("completed")
     );
-    peer.pump_for(Duration::from_secs(1));
+
+    peer.pump();
     let end = Instant::now() + Duration::from_secs(5);
     while answered.is_none() && Instant::now() < end {
         peer.pump();
@@ -997,7 +1014,11 @@ fn interrupt_waiting_approval_and_double_interrupt() {
         .call(method::TURN_INTERRUPT, json!({"threadId": thread.id, "turnId": turn4}))
         .expect_err("a finished turn");
     assert!(error.contains("no active turn to interrupt"), "{error}");
-    peer.close();
+    assert!(
+        peer.close_on_eof_for_tests(),
+        "the CLI exits on EOF before grace expires"
+    );
+    assert!(!late.exists(), "a late accept ran the command before the CLI exited");
 }
 
 // ------------------------------------------------------------------------------------ closing the server
@@ -1017,7 +1038,7 @@ fn eof_and_sigkill_shutdown() {
     let model = ScriptedModel::start(vec![Step::events(vec![
         json!({"type": "response.created", "response": {"id": "{RID}"}}),
     ])
-    .then_hang(Duration::from_secs(60))])
+    .then_hold()])
     .expect("model");
     let home = s.dir("home");
     write_home(&home, &model, "");
@@ -1036,11 +1057,7 @@ fn eof_and_sigkill_shutdown() {
         "the model never received the turn's request"
     );
     let sleeper = pid_in(&pid_file).expect("the tool server's pid");
-    let took = peer.close();
-    assert!(
-        took < Duration::from_secs(3),
-        "the server took {took:?} to exit on stdin EOF mid-turn"
-    );
+    assert!(peer.close_on_eof_for_tests(), "the server exits on stdin EOF");
     let end = Instant::now() + Duration::from_secs(3);
     while process_alive(sleeper) && Instant::now() < end {
         std::thread::sleep(Duration::from_millis(50));
@@ -1057,7 +1074,7 @@ fn eof_and_sigkill_shutdown() {
     let model = ScriptedModel::start(vec![Step::events(vec![
         json!({"type": "response.created", "response": {"id": "{RID}"}}),
     ])
-    .then_hang(Duration::from_secs(60))])
+    .then_hold()])
     .expect("model");
     let home = s.dir("home");
     write_home(&home, &model, "");
@@ -1075,7 +1092,8 @@ fn eof_and_sigkill_shutdown() {
         model_has_requests(&model, 1, Duration::from_secs(15)),
         "the model never received the turn's request"
     );
-    peer.pump_for(Duration::from_secs(1));
+
+    peer.pump();
     let locks: Vec<String> = std::fs::read_dir(home.join("thread-writer-locks"))
         .map(|d| {
             d.flatten()
@@ -1195,8 +1213,7 @@ fn family_run(codex: &Path, s: &Scratch, trust: DirTrust) -> FamilyRun {
         "the parent's turn did not end; stderr: {}",
         peer.stderr_tail()
     );
-    // The child's turn may end after the parent's; let everything settle.
-    peer.pump_for(Duration::from_secs(5));
+    assert!(peer.wait_for(TURN_BUDGET, family_is_idle), "the family never ended");
     FamilyRun {
         parent: thread.id,
         peer,
@@ -1205,6 +1222,16 @@ fn family_run(codex: &Path, s: &Scratch, trust: DirTrust) -> FamilyRun {
         project,
         ran,
     }
+}
+
+fn family_is_idle(peer: &Peer) -> bool {
+    let children = peer.announced_children();
+    !children.is_empty()
+        && children.iter().all(|(_, child)| {
+            peer.notes.iter().any(|note| {
+                note.method == method::TURN_COMPLETED && json_str(&note.params, "/threadId") == Some(child.as_str())
+            })
+        })
 }
 
 /// A child inherits its parent's trust and sandbox: it has its own thread id on everything it does, and
@@ -1307,7 +1334,20 @@ fn child_inherits_and_has_its_own_thread_id() {
         );
 
         let rule_applied = run.outside.join("child-rule").exists();
-        let tool_server_ran = appears(&run.ran, Duration::from_secs(2));
+        assert!(
+            run.peer.notes.iter().any(|note| note.method == method::TURN_COMPLETED
+                && json_str(&note.params, "/threadId") == Some(child.as_str())),
+            "the child must finish its turn after tool-server startup"
+        );
+        assert!(
+            run.peer.close_on_eof_for_tests(),
+            "the family CLI must end on EOF before checking the server marker"
+        );
+        let tool_server_ran = if trusted {
+            appears(&run.ran, TURN_BUDGET)
+        } else {
+            run.ran.exists()
+        };
         if trusted {
             assert_eq!(
                 effort, "minimal",
@@ -1338,7 +1378,6 @@ fn child_inherits_and_has_its_own_thread_id() {
             assert!(!rule_applied, "untrusted: the project's rule applied to the child");
         }
         let _ = &run.project;
-        run.peer.close();
     }
 }
 
@@ -1392,8 +1431,13 @@ fn child_outlives_parent_turn_and_family_holds_the_turn() {
         spawn_step("sp1", "child", CHILD_TASK)
             .when_body_has(PARENT_PROMPT)
             .unless_body_has("\"sp1\""),
-        // The child: a command that finishes five seconds from now, then a grandchild.
-        for_child(Step::exec("cs1", "sleep 5; touch child-late-write", false)).unless_body_has("\"cs1\""),
+        // The command cannot write until the test observes the parent's end.
+        for_child(Step::exec(
+            "cs1",
+            "while [ ! -f child-release ]; do sleep 0.01; done; touch child-late-write",
+            false,
+        ))
+        .unless_body_has("\"cs1\""),
         for_child(spawn_step("gs1", "grand", GRAND_TASK))
             .when_body_has("\"cs1\"")
             .unless_body_has("\"gs1\""),
@@ -1413,10 +1457,14 @@ fn child_outlives_parent_turn_and_family_holds_the_turn() {
     let status = peer
         .wait_turn(&thread.id, &turn, TURN_BUDGET)
         .expect("the parent's turn ended");
-    let parent_ended = Instant::now();
+    let before_release = peer.notes.len();
     let late_file = project.join("child-late-write");
     let late_before = late_file.exists();
-    peer.pump_for(Duration::from_secs(15));
+    std::fs::write(project.join("child-release"), b"").unwrap();
+    assert!(
+        peer.wait_for(TURN_BUDGET, |p| family_is_idle(p) && late_file.exists()),
+        "the child never finished"
+    );
 
     assert_eq!(status, "completed");
     assert!(
@@ -1463,17 +1511,28 @@ fn child_outlives_parent_turn_and_family_holds_the_turn() {
     let closed: Vec<&(Instant, String, FamilyEdge)> =
         edges.iter().filter(|(_, _, e)| *e == FamilyEdge::Closed).collect();
     assert_eq!(closed.len(), 1, "the tab's turn should close once: {edges:?}");
+    let mut before = Family::new(thread.id.clone());
+    let early_edges = feed_family(&mut before, &peer.notes[..before_release]);
     assert!(
-        closed[0].0 >= parent_ended + Duration::from_secs(2),
-        "the tab's turn closed {:?} after the parent's, before the child could have finished",
-        closed[0].0.duration_since(parent_ended)
+        !early_edges.iter().any(|(_, _, edge)| *edge == FamilyEdge::Closed),
+        "the held child keeps the family open"
+    );
+    assert!(
+        edges
+            .iter()
+            .position(|(_, _, edge)| *edge == FamilyEdge::Closed)
+            .unwrap()
+            > edges
+                .iter()
+                .position(|(_, what, _)| *what == format!("end {}", thread.id))
+                .unwrap()
     );
     assert!(family.running_turns().is_empty());
     peer.close();
 }
 
 /// Scripts a parent that waits on a child whose model request hangs.
-fn waiting_family(hang: Duration) -> Vec<Step> {
+fn waiting_family() -> Vec<Step> {
     vec![
         spawn_step("sp1", "child", CHILD_TASK)
             .when_body_has(PARENT_PROMPT)
@@ -1484,7 +1543,7 @@ fn waiting_family(hang: Duration) -> Vec<Step> {
         Step::events(vec![json!({"type": "response.created", "response": {"id": "{RID}"}})])
             .when_body_has(CHILD_TASK)
             .unless_body_has(PARENT_PROMPT)
-            .then_hang(hang),
+            .then_hold(),
     ]
 }
 
@@ -1500,7 +1559,7 @@ fn interrupting_the_family_stops_the_child() {
         } else {
             "child-outlives-b"
         });
-        let model = ScriptedModel::start(waiting_family(Duration::from_secs(40))).expect("model");
+        let model = ScriptedModel::start(waiting_family()).expect("model");
         let home = s.dir("home");
         write_home(&home, &model, "");
         let project = s.dir("proj");
@@ -1518,7 +1577,8 @@ fn interrupting_the_family_stops_the_child() {
             "the child's turn never started; stderr: {}",
             peer.stderr_tail()
         );
-        peer.pump_for(Duration::from_secs(1));
+
+        peer.pump();
         let child_start = peer
             .notes
             .iter()
@@ -1555,7 +1615,8 @@ fn interrupting_the_family_stops_the_child() {
                     .as_deref(),
                 Some("interrupted")
             );
-            peer.pump_for(Duration::from_secs(8));
+
+            peer.pump();
             assert!(
                 peer.turn_status(&child, &child_turn).is_none(),
                 "the parent's interrupt was expected to leave the child's turn running"
@@ -1595,7 +1656,8 @@ fn over_cap_line_mid_stream_is_skipped() {
         p.turn_status(&thread_id, &turn).is_some()
             || p.skipped.iter().any(|s| matches!(s, Skipped::TurnTooLarge { .. }))
     });
-    peer.pump_for(Duration::from_secs(1));
+
+    peer.pump();
     eprintln!("skipped: {:?}", peer.skipped);
     assert!(
         peer.skipped.iter().any(|s| matches!(
@@ -1894,15 +1956,12 @@ fn count_lines(path: &Path) -> usize {
 /// how many lines the loop had written when the turn ended and a while later.
 struct InterruptRun {
     events: Vec<agent::AgentDomainEvent>,
-    turn_ended_after: Duration,
     lines_at_end: usize,
     lines_later: usize,
 }
 
-/// Starts a session on `project`, sends `prompt`, waits until `loop_file` has two lines, presses interrupt,
-/// and pumps until the tab's turn has ended and `settle_more` has passed. Each command first sleeps half a
-/// second: an interrupt that comes before Codex has announced the command stops it with the turn (and no
-/// item is ever announced), which is not the case under test.
+/// Interrupts an announced command held behind a file gate. A paused provider clock decides
+/// whether the command is released before its deadline or the whole process group is stopped.
 fn interrupt_a_loop(
     codex: &Path,
     s: &Scratch,
@@ -1910,7 +1969,7 @@ fn interrupt_a_loop(
     project: &Path,
     prompt: &str,
     loop_file: &Path,
-    settle_more: Duration,
+    stop_at_deadline: bool,
 ) -> InterruptRun {
     use agent::{AgentDomainEvent, AgentProvider, ExternalProvider, ExternalStart, InterruptTurnRequest, Reviewer};
     use agent::{SendTurnRequest, TurnPolicy};
@@ -1948,38 +2007,65 @@ fn interrupt_a_loop(
         events.extend(provider.pump());
         std::thread::sleep(Duration::from_millis(20));
     }
-    let pressed = Instant::now();
+    while !events
+        .iter()
+        .any(|e| matches!(e, AgentDomainEvent::ToolCallStarted { .. }))
+    {
+        assert!(Instant::now() < until, "the command was never announced");
+        events.extend(provider.pump());
+        std::thread::yield_now();
+    }
+    provider.pause_time_for_tests();
     provider
         .interrupt_turn(InterruptTurnRequest {
             session_id: thread.clone(),
         })
         .expect("the interrupt is accepted");
-    let mut ended = None;
-    let until = Instant::now() + Duration::from_secs(30);
-    loop {
-        events.extend(provider.pump());
-        if ended.is_none()
-            && events
-                .iter()
-                .any(|e| matches!(e, AgentDomainEvent::TurnCompleted { .. }))
-        {
-            ended = Some((pressed.elapsed(), count_lines(loop_file)));
+    let until = Instant::now() + TURN_BUDGET;
+    if stop_at_deadline {
+        while !provider.settling_for_tests() {
+            assert!(
+                Instant::now() < until,
+                "the interrupted turn never began settling: {events:#?}"
+            );
+            events.extend(provider.pump());
+            assert!(
+                !events
+                    .iter()
+                    .any(|e| matches!(e, AgentDomainEvent::TurnCompleted { .. })),
+                "the held command still runs"
+            );
+            std::thread::yield_now();
         }
-        if let Some((after, _)) = ended {
-            if pressed.elapsed() >= after + settle_more {
-                break;
-            }
-        }
-        assert!(Instant::now() < until, "the turn did not end: {events:#?}");
-        std::thread::sleep(Duration::from_millis(5));
+        provider.advance_time_for_tests(agent::providers::codex::provider::INTERRUPT_SETTLE);
+    } else {
+        std::fs::write(loop_file.with_extension("release"), b"").unwrap();
     }
-    let (turn_ended_after, lines_at_end) = ended.expect("ended");
+    while !events
+        .iter()
+        .any(|e| matches!(e, AgentDomainEvent::TurnCompleted { .. }))
+    {
+        assert!(Instant::now() < until, "the turn did not end: {events:#?}");
+        events.extend(provider.pump());
+        std::thread::yield_now();
+    }
+    let lines_at_end = count_lines(loop_file);
+    let pid = pid_in(&loop_file.with_extension("pid")).expect("the command recorded its pid");
+    let state = std::process::Command::new("ps")
+        .args(["-o", "stat=", "-p", &pid.to_string()])
+        .output()
+        .expect("read the command's process state");
+    let state = String::from_utf8_lossy(&state.stdout);
+    assert!(
+        (!process_alive(pid) && state.trim().is_empty()) || state.trim().starts_with('Z'),
+        "the command outlived the turn's end: {state}"
+    );
+    let lines_later = count_lines(loop_file);
     let _ = provider.close_session(agent::CloseSessionRequest { session_id: thread });
     InterruptRun {
         events,
-        turn_ended_after,
         lines_at_end,
-        lines_later: count_lines(loop_file),
+        lines_later,
     }
 }
 
@@ -2001,11 +2087,11 @@ const STOPPED: &str =
 #[ignore = "runs the real codex (on PATH) against the scripted model; no login, no network"]
 fn an_interrupt_stops_a_command_codex_keeps_running() {
     let codex = real_codex();
-    // A loop of 40 writes, 10 s in all, interrupted after two: stopped.
+    // The held command has written two lines when interrupted.
     let s = Scratch::new("int-loop");
     let model = ScriptedModel::start(vec![Step::exec(
         "loop1",
-        "sleep 0.5; for i in $(seq 1 40); do echo $i >> loop.txt; sleep 0.25; done",
+        "echo $$ > loop.pid; printf '1\n2\n' >> loop.txt; while [ ! -f loop.release ]; do sleep 0.01; done; echo done >> loop.txt",
         false,
     )
     .when_body_has("PROMPT-LOOP")
@@ -2020,12 +2106,7 @@ fn an_interrupt_stops_a_command_codex_keeps_running() {
         &project,
         "PROMPT-LOOP",
         &project.join("loop.txt"),
-        Duration::from_secs(3),
-    );
-    assert!(
-        run.turn_ended_after >= agent::providers::codex::provider::INTERRUPT_SETTLE,
-        "the turn ended {:?} after the key, before the settle time",
-        run.turn_ended_after
+        true,
     );
     assert!(
         run.lines_at_end < 40,
@@ -2042,7 +2123,7 @@ fn an_interrupt_stops_a_command_codex_keeps_running() {
     let s = Scratch::new("int-short");
     let model = ScriptedModel::start(vec![Step::exec(
         "short1",
-        "sleep 0.5; echo 1 >> loop.txt; echo 2 >> loop.txt; sleep 1.5; echo done >> loop.txt",
+        "echo $$ > loop.pid; printf '1\n2\n' >> loop.txt; while [ ! -f loop.release ]; do sleep 0.01; done; echo done >> loop.txt",
         false,
     )
     .when_body_has("PROMPT-SHORT")
@@ -2057,12 +2138,12 @@ fn an_interrupt_stops_a_command_codex_keeps_running() {
         &project,
         "PROMPT-SHORT",
         &project.join("loop.txt"),
-        Duration::from_secs(1),
+        false,
     );
     assert_eq!(
         run.lines_at_end, 3,
-        "the turn ended before the command did ({:?} after the key, {} lines later): {:#?}",
-        run.turn_ended_after, run.lines_later, run.events
+        "the turn ended before the command did ({} lines later): {:#?}",
+        run.lines_later, run.events
     );
     assert_eq!(
         session_lost(&run.events),
@@ -2088,7 +2169,7 @@ fn an_interrupt_stops_a_subagents_command() {
             .unless_body_has("\"wa1\""),
         for_child(Step::exec(
             "cl1",
-            "sleep 0.5; for i in $(seq 1 40); do echo $i >> child-loop.txt; sleep 0.25; done",
+            "echo $$ > child-loop.pid; printf '1\n2\n' >> child-loop.txt; while [ ! -f child-loop.release ]; do sleep 0.01; done; echo done >> child-loop.txt",
             false,
         ))
         .unless_body_has("\"cl1\""),
@@ -2103,9 +2184,8 @@ fn an_interrupt_stops_a_subagents_command() {
         &project,
         PARENT_PROMPT,
         &project.join("child-loop.txt"),
-        Duration::from_secs(3),
+        true,
     );
-    assert!(run.turn_ended_after >= agent::providers::codex::provider::INTERRUPT_SETTLE);
     assert!(run.lines_at_end < 40, "the child's loop ran to its end");
     assert_eq!(
         run.lines_later, run.lines_at_end,
@@ -2186,13 +2266,8 @@ fn an_interrupt_with_a_command_card_waiting_does_not_stop_the_session() {
         events.extend(provider.pump());
         std::thread::sleep(Duration::from_millis(5));
     }
-    let ended = pressed.elapsed();
     events.extend(provider.pump());
     assert!(session_lost(&events).is_none(), "the session was stopped: {events:#?}");
-    assert!(
-        ended < Duration::from_secs(2),
-        "the turn waited {ended:?} for a command that never ran"
-    );
     assert!(!outside.join("escalated").exists(), "the cancelled command ran");
     let _ = provider.close_session(agent::CloseSessionRequest { session_id: thread });
 }
@@ -2213,7 +2288,7 @@ fn an_interrupt_the_moment_a_turn_starts_ends_it() {
             json!({"type": "response.created", "response": {"id": "{RID}"}}),
         ])
         .when_body_has("PROMPT-AT-START")
-        .then_hang(Duration::from_secs(60))])
+        .then_hold()])
         .expect("model");
         let home = s.dir("home");
         write_home(&home, &model, "");

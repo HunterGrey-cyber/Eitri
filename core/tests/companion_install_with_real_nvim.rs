@@ -79,6 +79,7 @@ impl Nvim {
         poll("nvim finishing its start", Duration::from_secs(5), || {
             (ask(&probe, "nvim_eval", vec![Value::from("v:vim_did_enter")]).as_i64() == Some(1)).then_some(())
         });
+        lua(&probe, include_str!("support/manual_timers.lua"), vec![]);
         probe.close();
         nvim
     }
@@ -257,30 +258,17 @@ fn footprint(link: &NvimLink) -> Footprint {
     read_footprint(&lua(link, FOOTPRINT_LUA, footprint_args()))
 }
 
-/// The footprint once it stops changing: the editor-context and keys snippets keep a timer for a
-/// moment after they are loaded, and a footprint read in that moment is not what stays.
+/// Dispatches the installed one-shot timers before reading their remaining handles.
 fn settled_footprint(link: &NvimLink) -> Footprint {
-    let mut before = footprint(link);
-    let deadline = Instant::now() + Duration::from_secs(3);
-    loop {
-        std::thread::sleep(Duration::from_millis(250));
-        let now = footprint(link);
-        if now == before {
-            return now;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "the footprint never settled: {before:?} then {now:?}"
-        );
-        before = now;
-    }
+    lua(link, "test_timers.advance(500)", vec![]);
+    footprint(link)
 }
 
 /// Poll until the footprint is `want`: a debounce timer can stay active for 100 ms after a teardown.
 fn footprint_becomes(link: &NvimLink, want: &Footprint, within: Duration, what: &str) {
     let deadline = Instant::now() + within;
     loop {
-        let now = footprint(link);
+        let now = settled_footprint(link);
         if now == *want {
             return;
         }
@@ -463,9 +451,18 @@ fn a_second_install_on_the_same_channel_is_idempotent() {
     footprint_becomes(&obs, &once, TEARDOWN_WITHIN, "one install's footprint after the second");
 
     // The same channel is not "another panel": it is never told it was replaced.
-    while let Ok(event) = panel.events.recv_timeout(Duration::from_millis(500)) {
-        if let LinkEvent::Notification { method, .. } = event {
-            assert_ne!(method, REPLACED_METHOD, "a panel was told it replaced itself");
+    lua(
+        &panel.link,
+        "vim.rpcnotify(..., 'test_barrier')",
+        vec![panel.chan.into()],
+    );
+    loop {
+        match panel.events.recv_timeout(Duration::from_secs(60)).unwrap() {
+            LinkEvent::Notification { method, .. } if method == "test_barrier" => break,
+            LinkEvent::Notification { method, .. } => {
+                assert_ne!(method, REPLACED_METHOD, "a panel was told it replaced itself")
+            }
+            LinkEvent::Closed => panic!("the installed panel closed"),
         }
     }
     let torn = lua(&obs, TEARDOWN_LUA, vec![Value::from(panel.chan)]);
@@ -615,8 +612,12 @@ fn install_in_each_blocking_state() {
         let ui = Ui::attach(&nvim);
         if state.name == "getchar" {
             // No mode shows it: nothing to poll for but the callback running.
-            lua(&ui.link, "vim.defer_fn(function() vim.fn.getchar() end, 10)", vec![]);
-            std::thread::sleep(Duration::from_millis(500));
+            let (notice, events) = nvim.connect();
+            lua(&ui.link, "local chan = ...; vim.defer_fn(function() vim.rpcnotify(chan, 'getchar_entered'); vim.fn.getchar() end, 10)", vec![notice.channel_id().into()]);
+            let _dispatch = ui.link.exec_lua("test_timers.advance(10)", vec![]);
+            assert!(
+                matches!(events.recv_timeout(Duration::from_secs(60)).unwrap(), LinkEvent::Notification { method, .. } if method == "getchar_entered")
+            );
         } else {
             ui.keys(state.keys);
             poll(
@@ -633,11 +634,14 @@ fn install_in_each_blocking_state() {
 
         let panel = Panel::start(&nvim, &nvim.sockets());
         if state.blocking {
-            assert!(
-                panel.install.wait(Duration::from_secs(1)).is_none(),
-                "{}: the install was answered while nvim waited for a key",
-                state.name
-            );
+            for _ in 0..20 {
+                assert!(is_blocking(&obs), "{}: nvim stopped blocking by itself", state.name);
+                assert!(
+                    panel.install.try_take().is_none(),
+                    "{}: install answered during the key wait",
+                    state.name
+                );
+            }
             assert!(is_blocking(&obs), "{}: nvim stopped blocking by itself", state.name);
             ui.keys(state.release);
         }
@@ -666,14 +670,12 @@ fn teardown_waits_for_the_answer_in_a_char_wait_and_then_runs() {
     // Nothing can read the footprint now: `exec_lua` is not answered while nvim waits for a key, and
     // the teardown runs from a scheduled callback that cannot run either.
     let queued = obs.exec_lua(FOOTPRINT_LUA, footprint_args());
-    let until = Instant::now() + Duration::from_secs(1);
-    while Instant::now() < until {
+    for _ in 0..20 {
         assert!(is_blocking(&obs), "nvim stopped waiting by itself");
         assert!(
             queued.try_take().is_none(),
             "a request was answered during the char-wait"
         );
-        std::thread::sleep(Duration::from_millis(100));
     }
 
     ui.keys("x");
@@ -722,8 +724,14 @@ fn install_is_served_while_a_getchar_called_over_rpc_waits() {
     let nvim = Nvim::start("rpcgc");
     let (obs, _obs_events) = nvim.connect();
     let ui = Ui::attach(&nvim);
-    let _waiting = ui.link.exec_lua("return vim.fn.getchar()", vec![]);
-    std::thread::sleep(Duration::from_millis(500));
+    let (notice, events) = nvim.connect();
+    let _waiting = ui.link.exec_lua(
+        "vim.rpcnotify(..., 'getchar_entered'); return vim.fn.getchar()",
+        vec![notice.channel_id().into()],
+    );
+    assert!(
+        matches!(events.recv_timeout(Duration::from_secs(60)).unwrap(), LinkEvent::Notification { method, .. } if method == "getchar_entered")
+    );
     assert!(!is_blocking(&obs));
     let panel = Panel::start(&nvim, &nvim.sockets());
     let report = panel.report(Duration::from_secs(1));

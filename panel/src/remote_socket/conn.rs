@@ -8,6 +8,7 @@
 //! also frees a writer held in a write the peer never reads, and the tick forgets the connection and its observers.
 
 use super::*;
+pub(super) use eitri_core::remote_rv::shut_both_ways;
 
 /// The bytes one connection's writer may hold before its observers' frames wait in the tab set.
 pub const WRITER_BYTES: usize = 1024 * 1024;
@@ -202,21 +203,6 @@ pub(super) fn start_connection(stream: UnixStream, shared: &Arc<Shared>) -> bool
     true
 }
 
-/// Shuts both directions of `stream`, which frees a writer held in a write the peer never reads (its write fails).
-/// macOS refuses `SHUT_RDWR` with ENOTCONN once the peer has shut its own writing side, and then shuts nothing, so the
-/// writer stayed held; there the writing side is shut first, alone, which macOS always does, and then the reading side.
-pub(super) fn shut_both_ways(stream: &UnixStream) {
-    #[cfg(target_os = "macos")]
-    {
-        let _ = stream.shutdown(Shutdown::Write);
-        let _ = stream.shutdown(Shutdown::Read);
-    }
-    #[cfg(not(target_os = "macos"))]
-    {
-        let _ = stream.shutdown(Shutdown::Both);
-    }
-}
-
 /// A connection ended: the tick forgets it and its observers, and the cap has room for one more.
 fn closed(shared: &Shared, conn: u64, why: CloseWhy) {
     let _ = shared.inbound.send(Inbound::Closed { conn, why });
@@ -253,12 +239,21 @@ fn write_loop(stream: &UnixStream, lines: &Receiver<Out>, gauge: &Gauge, wake: &
 /// count, not an error; sending the rest would wait a whole deadline more for a peer that reads nothing. So a short
 /// send that lasted the deadline is the stall. (A slack of a tenth covers the kernel rounding the timeout to its
 /// clock ticks.) A short send cut by a signal instead is carried on.
-fn write_whole(stream: &UnixStream, mut bytes: &[u8], stall: Duration) -> io::Result<()> {
+fn write_whole(stream: &UnixStream, bytes: &[u8], stall: Duration) -> io::Result<()> {
+    write_whole_with(bytes, stall, |bytes| (&*stream).write(bytes), Instant::now)
+}
+
+pub(super) fn write_whole_with(
+    mut bytes: &[u8],
+    stall: Duration,
+    mut write: impl FnMut(&[u8]) -> io::Result<usize>,
+    mut now: impl FnMut() -> Instant,
+) -> io::Result<()> {
     while !bytes.is_empty() {
-        let began = Instant::now();
-        match (&*stream).write(bytes) {
+        let began = now();
+        match write(bytes) {
             Ok(0) => return Err(io::ErrorKind::WriteZero.into()),
-            Ok(n) if n < bytes.len() && began.elapsed() >= stall - stall / 10 => {
+            Ok(n) if n < bytes.len() && now().saturating_duration_since(began) >= stall - stall / 10 => {
                 return Err(io::ErrorKind::TimedOut.into());
             }
             Ok(n) => bytes = &bytes[n..],
@@ -273,6 +268,27 @@ fn write_whole(stream: &UnixStream, mut bytes: &[u8], stall: Duration) -> io::Re
 /// or breaks a rule (a line over [`RV_MAX_LINE`], one not finished within [`RV_LINE_WITHIN`], another protocol
 /// version, anything that does not parse), which closes the connection. Why it ended.
 fn read_loop(stream: &UnixStream, conn: u64, shared: &Shared) -> CloseWhy {
+    read_loop_with(
+        shared.deadlines.idle,
+        Instant::now,
+        |chunk, left| {
+            stream
+                .set_read_timeout(Some(left.max(Duration::from_millis(1))))
+                .map_err(|_| ())?;
+            Ok((&*stream).read(chunk))
+        },
+        |line| hand_on(line, conn, shared),
+        || shut_both_ways(stream),
+    )
+}
+
+pub(super) fn read_loop_with(
+    idle: Duration,
+    mut now: impl FnMut() -> Instant,
+    mut read: impl FnMut(&mut [u8], Duration) -> Result<io::Result<usize>, ()>,
+    mut hand_on: impl FnMut(&[u8]) -> bool,
+    mut close: impl FnMut(),
+) -> CloseWhy {
     let mut buf: Vec<u8> = Vec::new();
     let mut chunk = vec![0u8; 64 * 1024];
     // How much of `buf` is known to hold no newline, so a long line is searched once, not once per read.
@@ -280,48 +296,45 @@ fn read_loop(stream: &UnixStream, conn: u64, shared: &Shared) -> CloseWhy {
     // When the first byte of the line now in `buf` came.
     let mut started: Option<Instant> = None;
     // When the last whole line ended, or the connection opened.
-    let mut last_line = Instant::now();
+    let mut last_line = now();
     loop {
         while let Some(at) = buf[scanned..].iter().position(|&b| b == b'\n') {
             let end = scanned + at;
             scanned = 0;
             let line: Vec<u8> = buf.drain(..=end).collect();
             let line = &line[..line.len() - 1];
-            if line.len() > RV_MAX_LINE || !hand_on(line, conn, shared) {
-                shut_both_ways(stream);
+            if line.len() > RV_MAX_LINE || !hand_on(line) {
+                close();
                 return CloseWhy::Rule;
             }
-            last_line = Instant::now();
-            started = (!buf.is_empty()).then(Instant::now);
+            last_line = now();
+            started = (!buf.is_empty()).then(&mut now);
         }
         scanned = buf.len();
         if buf.len() > RV_MAX_LINE {
-            shut_both_ways(stream);
+            close();
             return CloseWhy::Rule;
         }
         // A line begun must end within its own deadline; between lines, the idle deadline runs.
         let (until, why) = match started {
             Some(at) => (at + RV_LINE_WITHIN, CloseWhy::Rule),
-            None => (last_line + shared.deadlines.idle, CloseWhy::Idle),
+            None => (last_line + idle, CloseWhy::Idle),
         };
-        let left = until.saturating_duration_since(Instant::now());
+        let left = until.saturating_duration_since(now());
         if left.is_zero() {
-            shut_both_ways(stream);
+            close();
             return why;
         }
         // A zero timeout is an error to set, and means "no timeout" to some platforms.
-        if stream
-            .set_read_timeout(Some(left.max(Duration::from_millis(1))))
-            .is_err()
-        {
-            shut_both_ways(stream);
+        let Ok(read) = read(&mut chunk, left) else {
+            close();
             return CloseWhy::Peer;
-        }
-        match (&*stream).read(&mut chunk) {
+        };
+        match read {
             Ok(0) => return CloseWhy::Peer,
             Ok(n) => {
                 if buf.is_empty() {
-                    started = Some(Instant::now());
+                    started = Some(now());
                 }
                 buf.extend_from_slice(&chunk[..n]);
             }

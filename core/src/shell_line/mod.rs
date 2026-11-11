@@ -406,6 +406,14 @@ fn start_with_spawn(
     }
 }
 
+fn child_now() -> Instant {
+    #[cfg(test)]
+    if let Some(now) = tests::clock_now() {
+        return now;
+    }
+    Instant::now()
+}
+
 fn run_child(request: &Request, shell: Option<&Path>, control: &Control) -> Result<Finished, String> {
     let chosen = shell.map(Path::to_path_buf).or_else(|| {
         let env_shell = std::env::var_os("SHELL");
@@ -441,7 +449,7 @@ fn run_child(request: &Request, shell: Option<&Path>, control: &Control) -> Resu
     let group = child.id() as i32;
     *control.group.lock().unwrap() = Some(group);
 
-    let began = Instant::now();
+    let began = child_now();
     let mut asked_to_stop: Option<Instant> = None;
     let mut timed_out = false;
     let status = loop {
@@ -456,16 +464,16 @@ fn run_child(request: &Request, shell: Option<&Path>, control: &Control) -> Resu
             *held = None;
             break child.wait().ok();
         }
-        if !timed_out && !interrupted && began.elapsed() >= request.timeout {
+        if !timed_out && !interrupted && child_now().saturating_duration_since(began) >= request.timeout {
             timed_out = true;
         }
         if timed_out || interrupted {
             // Asked here too: an interrupt may have come before the group was known.
             let since = *asked_to_stop.get_or_insert_with(|| {
                 control.signal(libc::SIGTERM);
-                Instant::now()
+                child_now()
             });
-            if since.elapsed() >= TERM_GRACE {
+            if child_now().saturating_duration_since(since) >= TERM_GRACE {
                 control.signal(libc::SIGKILL);
             }
         }
@@ -574,4 +582,4 @@ fn prune(dir: &Path, age: Duration) {
 }
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;

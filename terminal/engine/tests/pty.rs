@@ -171,7 +171,16 @@ fn a_program_that_does_not_exist_is_an_error() {
 #[test]
 fn hangup_ends_an_interactive_shell() {
     let mut child = PtyChild::spawn(&common::plain_sh(), size(80, 24)).unwrap();
-    std::thread::sleep(Duration::from_millis(200));
+    let deadline = Instant::now() + common::WAIT;
+    let mut ready = Vec::new();
+    let mut bytes = [0; 1024];
+    while !ready.windows(2).any(|w| w == b"$ ") {
+        if let Ok(n) = child.read(&mut bytes) {
+            ready.extend_from_slice(&bytes[..n]);
+        }
+        assert!(Instant::now() < deadline, "shell never printed its prompt");
+        std::thread::yield_now();
+    }
     child.hangup();
     let deadline = Instant::now() + common::WAIT;
     let status = loop {

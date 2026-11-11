@@ -20,8 +20,6 @@
 //!
 //! A plain main with `harness = false` keeps GTK on the main thread.
 
-use std::time::{Duration, Instant};
-
 use gtk4::prelude::*;
 
 // The display this test runs on: its own Xvfb, never an inherited one (2026-09-29).
@@ -39,13 +37,12 @@ const MODULE_X: f64 = 761.0;
 const MODULE_W: i32 = 519;
 const MODULE_H: i32 = 600;
 
-fn pump(ms: u64) {
-    let context = gtk4::glib::MainContext::default();
-    let end = Instant::now() + Duration::from_millis(ms);
-    while Instant::now() < end {
-        while context.iteration(false) {}
-        std::thread::sleep(Duration::from_millis(2));
-    }
+#[allow(dead_code)]
+#[path = "support/frame_turns.rs"]
+mod frame_turns;
+
+fn pump() {
+    frame_turns::settle();
 }
 
 /// What `InputMethodFilter::platformTransformCursorRectToViewCoordinates` adds to the caret.
@@ -86,7 +83,7 @@ fn run() -> Result<Vec<String>, String> {
     let host = web_host::WebHost::new(&content);
     fixed.put(&host, MODULE_X, 0.0);
     window.present();
-    pump(300);
+    pump();
 
     let mut report = Vec::new();
     let direct_addend = webkit_addend(&direct);
@@ -152,7 +149,7 @@ fn run() -> Result<Vec<String>, String> {
         .push("focus: the host is not focusable; a grab on it lands on the content, as one on the content does".into());
 
     window.destroy();
-    pump(50);
+    pump();
     Ok(report)
 }
 

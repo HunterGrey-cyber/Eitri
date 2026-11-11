@@ -2210,8 +2210,14 @@ mod tests {
         let v1 = dir.join(file_name(&root()));
         let (_, text, _) = v1_cases().remove(4);
         crate::test_scratch_dir::write_private(&v1, &text).unwrap();
+        let old = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000);
+        std::fs::File::options()
+            .write(true)
+            .open(&v1)
+            .unwrap()
+            .set_modified(old)
+            .unwrap();
         let mtime = std::fs::metadata(&v1).unwrap().modified().unwrap();
-        std::thread::sleep(std::time::Duration::from_millis(20));
 
         let Loaded::Migrated(opened) = load(&dir, &root(), &[]) else {
             panic!("the version 1 file, migrated")

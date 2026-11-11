@@ -3,8 +3,6 @@ use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
-use base64::Engine as _;
-
 use super::*;
 use crate::test_scratch_dir::ScratchDir;
 use crate::window_link::pair::Role;

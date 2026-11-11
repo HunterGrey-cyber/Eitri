@@ -1,3 +1,6 @@
+//! The fixture drives JavaScript time at rendered-frame boundaries. Reported JavaScript times describe that
+//! controlled cadence; they are not measurements of the host's rendering speed.
+//!
 //! Tests that streaming replies follow the bottom while leaving a parked reader in place.
 //! This drives the real WebKitGTK engine linked by `shell`; jsdom has no layout, and Chromium
 //! does not reproduce the scroll reset exercised here.
@@ -96,6 +99,13 @@
 //! `PANEL_STREAM_SCROLL_ONLY=S1,S2` narrows scenarios while the configuration matrix stays fixed.
 //! The full run has forty-five runs of about 15s each.
 
+#[path = "support/source_scope.rs"]
+mod source_scope;
+
+#[allow(dead_code)]
+#[path = "support/web_clock.rs"]
+mod web_clock;
+
 use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
 use std::path::PathBuf;
@@ -124,8 +134,6 @@ mod own_x_server;
 /// same file, which `shell/build.rs` rebuilds before this test compiles.
 const AGENT_UI_HTML: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../agent-ui/web/dist/index.html"));
 
-/// The pump's cadence (`agent_panel.rs`'s 33ms timer), and so this replay's.
-const TICK: Duration = Duration::from_millis(33);
 /// How long the history sits before the turn starts: long enough for the snapshot's own smooth
 /// scroll to the end to finish, so "at the bottom" is a precondition rather than a race.
 const SETTLE_AFTER_SNAPSHOT_TICKS: usize = 30;
@@ -977,6 +985,7 @@ fn run_one(config: Config, scenario: Scenario, replay: &Replay) -> Result<Value,
     window.set_title(Some(&format!("panel_stream_scroll {} {:?}", scenario.name(), config)));
 
     let content_manager = UserContentManager::new();
+    let clock_turns = web_clock::install(&content_manager);
     content_manager.add_script(&UserScript::new(
         &INSTRUMENT
             .replace("__SCENARIO__", scenario.name())
@@ -991,6 +1000,7 @@ fn run_one(config: Config, scenario: Scenario, replay: &Replay) -> Result<Value,
     ));
     // As `build_agent_panel` builds it: default settings, one `eitriAgent` handler.
     let webview = WebView::builder().user_content_manager(&content_manager).build();
+    web_clock::watch(&webview, clock_turns);
     webview.set_hexpand(true);
     webview.set_vexpand(true);
     webview.set_zoom_level(config.zoom);
@@ -1042,14 +1052,25 @@ fn run_one(config: Config, scenario: Scenario, replay: &Replay) -> Result<Value,
             })
             .collect(),
     );
-    {
+    let replay_source = {
         let window = window.clone();
         let webview = webview.clone();
         let main_loop = main_loop.clone();
         let outcome = outcome.clone();
         let queue = queue.clone();
         let started = started.clone();
-        glib::timeout_add_local(TICK, move || {
+        glib::idle_add_local(move || {
+            if outcome.borrow().is_some() {
+                return glib::ControlFlow::Break;
+            }
+            if let Err(why) = web_clock::try_pump(33) {
+                outcome.borrow_mut().get_or_insert(Err(why));
+                main_loop.quit();
+                return glib::ControlFlow::Break;
+            }
+            if outcome.borrow().is_some() {
+                return glib::ControlFlow::Break;
+            }
             if !started.get() {
                 return glib::ControlFlow::Continue;
             }
@@ -1095,9 +1116,9 @@ fn run_one(config: Config, scenario: Scenario, replay: &Replay) -> Result<Value,
                 },
             );
             glib::ControlFlow::Break
-        });
-    }
-    {
+        })
+    };
+    let timeout_source = {
         let outcome = outcome.clone();
         let main_loop = main_loop.clone();
         glib::timeout_add_local_once(RUN_TIMEOUT, move || {
@@ -1105,14 +1126,16 @@ fn run_one(config: Config, scenario: Scenario, replay: &Replay) -> Result<Value,
                 .borrow_mut()
                 .get_or_insert(Err(format!("run did not finish within {RUN_TIMEOUT:?}")));
             main_loop.quit();
-        });
-    }
+        })
+    };
+    let sources = source_scope::SourceScope::new(glib::MainContext::default(), vec![replay_source, timeout_source]);
     main_loop.run();
+    drop(sources);
     window.destroy();
     // Let the destroyed WebView's web process go before the next run starts one.
     let ctx = glib::MainContext::default();
     for _ in 0..50 {
-        while ctx.iteration(false) {}
+        ctx.iteration(false);
         std::thread::sleep(Duration::from_millis(10));
     }
     let result = outcome.borrow_mut().take();
@@ -2627,6 +2650,7 @@ fn run_ctrl_e_y(config: Config) -> Result<Value, String> {
     window.set_title(Some(&format!("panel_stream_scroll ctrl_e_y {config:?}")));
 
     let content_manager = UserContentManager::new();
+    let clock_turns = web_clock::install(&content_manager);
     content_manager.add_script(&UserScript::new(
         CTRL_E_Y_PROBE,
         UserContentInjectedFrames::TopFrame,
@@ -2635,6 +2659,7 @@ fn run_ctrl_e_y(config: Config) -> Result<Value, String> {
         &[],
     ));
     let webview = WebView::builder().user_content_manager(&content_manager).build();
+    web_clock::watch(&webview, clock_turns);
     webview.set_hexpand(true);
     webview.set_vexpand(true);
     webview.set_zoom_level(config.zoom);
@@ -2665,14 +2690,25 @@ fn run_ctrl_e_y(config: Config) -> Result<Value, String> {
     let step_index = Rc::new(Cell::new(0usize));
     let ready_drained = Rc::new(Cell::new(false));
     let steps: Rc<Vec<Step>> = Rc::new(replay.steps);
-    {
+    let replay_source = {
         let window = window.clone();
         let webview = webview.clone();
         let main_loop = main_loop.clone();
         let outcome = outcome.clone();
         let queue = queue.clone();
         let started = started.clone();
-        glib::timeout_add_local(TICK, move || {
+        glib::idle_add_local(move || {
+            if outcome.borrow().is_some() {
+                return glib::ControlFlow::Break;
+            }
+            if let Err(why) = web_clock::try_pump(33) {
+                outcome.borrow_mut().get_or_insert(Err(why));
+                main_loop.quit();
+                return glib::ControlFlow::Break;
+            }
+            if outcome.borrow().is_some() {
+                return glib::ControlFlow::Break;
+            }
             if !started.get() {
                 return glib::ControlFlow::Continue;
             }
@@ -2719,9 +2755,9 @@ fn run_ctrl_e_y(config: Config) -> Result<Value, String> {
                 },
             );
             glib::ControlFlow::Break
-        });
-    }
-    {
+        })
+    };
+    let timeout_source = {
         let outcome = outcome.clone();
         let main_loop = main_loop.clone();
         glib::timeout_add_local_once(RUN_TIMEOUT, move || {
@@ -2729,13 +2765,15 @@ fn run_ctrl_e_y(config: Config) -> Result<Value, String> {
                 .borrow_mut()
                 .get_or_insert(Err(format!("run did not finish within {RUN_TIMEOUT:?}")));
             main_loop.quit();
-        });
-    }
+        })
+    };
+    let sources = source_scope::SourceScope::new(glib::MainContext::default(), vec![replay_source, timeout_source]);
     main_loop.run();
+    drop(sources);
     window.destroy();
     let ctx = glib::MainContext::default();
     for _ in 0..50 {
-        while ctx.iteration(false) {}
+        ctx.iteration(false);
         std::thread::sleep(Duration::from_millis(10));
     }
     let result = outcome.borrow_mut().take();

@@ -24,14 +24,14 @@ fn artifact(dir: &Path) -> (PathBuf, bool) {
         return (PathBuf::from(real), true);
     }
     let path = dir.join("stand-in-sidecar");
-    std::fs::write(
+    script_fixture::write_executable_script(
         &path,
         "#!/bin/sh\nprintf '%s\\n' 'verdandi-claude-sidecar 0.2.0 (protocol 3, node v22.23.2, build 0)' \
          'claude-agent-sdk 0.3.252 (bundled claude code 2.1.252)' 'supported claude code CLI: >=2.1.252 <3.0.0' \
          'executable sources served: host_cli'\n",
+        0o755,
     )
     .unwrap();
-    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
     (path, false)
 }
 
@@ -101,13 +101,13 @@ fn a_refused_artifact_leaves_no_sidecar_directory_behind() {
     let xdg = tempfile::tempdir().unwrap();
     let dir = tempfile::tempdir().unwrap();
     let wrong = dir.path().join("wrong-sidecar");
-    std::fs::write(
+    script_fixture::write_executable_script(
         &wrong,
         "#!/bin/sh\nprintf '%s\\n' 'verdandi-claude-sidecar 0.2.0 (protocol 2, node v22.23.2, build 0)' x x \
          'executable sources served: host_cli'\n",
+        0o755,
     )
     .unwrap();
-    std::fs::set_permissions(&wrong, std::fs::Permissions::from_mode(0o755)).unwrap();
     let out = run_script(
         xdg.path(),
         &[
@@ -122,4 +122,9 @@ fn a_refused_artifact_leaves_no_sidecar_directory_behind() {
     let rev7 = &BUNDLED_SIDECAR_REVISION[..7];
     let left = xdg.path().join("eitri/sidecar").join(rev7);
     assert!(!left.exists(), "{} was left behind", left.display());
+}
+
+#[cfg(test)]
+mod script_fixture {
+    include!(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/support/executable.rs"));
 }

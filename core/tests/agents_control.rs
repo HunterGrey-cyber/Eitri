@@ -630,19 +630,35 @@ fn a_client_facing_a_full_accept_queue_leaves_no_connection_behind() {
         assert!(queued.len() < 64, "the accept queue never filled");
     }
 
+    let observed = std::sync::Arc::new(std::sync::Mutex::new(None));
+    let seen = observed.clone();
+    eitri_core::instance_dir::observe_connect_socket_for_tests(move |fd| {
+        *seen.lock().unwrap() = Some(std::fs::read_link(format!("/proc/self/fd/{fd}")).unwrap());
+    });
     let err = control::send(scratch.dir(), INSTANCE, &focus(Some(7))).unwrap_err();
     assert_eq!(err.kind(), io::ErrorKind::TimedOut);
 
-    // Make room: a connect the client left waiting would now land in the queue.
+    let socket = observed
+        .lock()
+        .unwrap()
+        .take()
+        .expect("the timed-out connect's socket was observed");
+    let guard = std::time::Instant::now() + Duration::from_secs(60);
+    while std::fs::read_dir("/proc/self/fd")
+        .unwrap()
+        .flatten()
+        .any(|entry| std::fs::read_link(entry.path()).ok().as_ref() == Some(&socket))
+    {
+        assert!(
+            std::time::Instant::now() < guard,
+            "a timed-out connect retained its socket"
+        );
+        std::thread::yield_now();
+    }
     listener.set_nonblocking(true).unwrap();
     let mut accepted = 0;
-    let settle = std::time::Instant::now() + Duration::from_millis(300);
-    while std::time::Instant::now() < settle {
-        match listener.accept() {
-            Ok(_) => accepted += 1,
-            Err(e) if e.kind() == io::ErrorKind::WouldBlock => std::thread::sleep(Duration::from_millis(10)),
-            Err(e) => panic!("accept: {e}"),
-        }
+    while listener.accept().is_ok() {
+        accepted += 1;
     }
     assert_eq!(
         accepted,

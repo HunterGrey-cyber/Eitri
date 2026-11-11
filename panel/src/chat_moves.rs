@@ -1135,7 +1135,14 @@ mod tests {
                 .any(|e| matches!(e, ChatMoveEvent::Frozen { .. })),
             "the freeze waits for the page"
         );
-        std::thread::sleep(VIEW_WAIT);
+        src.handle
+            .state
+            .borrow_mut()
+            .chat_moves
+            .freezing
+            .get_mut(&1)
+            .unwrap()
+            .asked -= VIEW_WAIT;
         src.handle.tick();
         let (record, fds) = frozen(&src, 1);
         assert!(record["view"].is_null(), "no view went with it");

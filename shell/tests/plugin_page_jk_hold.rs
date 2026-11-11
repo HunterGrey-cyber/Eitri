@@ -94,11 +94,12 @@ fn x_tool(tool: &str, display: &str, args: &[&str]) -> Result<String, String> {
 }
 
 fn pump(ms: u64) {
-    let context = glib::MainContext::default();
-    let end = Instant::now() + Duration::from_millis(ms);
-    while Instant::now() < end {
-        while context.iteration(false) {}
-        std::thread::sleep(Duration::from_millis(1));
+    let context = gtk4::glib::MainContext::default();
+    let done = Rc::new(std::cell::Cell::new(false));
+    let elapsed = done.clone();
+    gtk4::glib::timeout_add_local_once(Duration::from_millis(ms), move || elapsed.set(true));
+    while !done.get() {
+        context.iteration(true);
     }
 }
 
@@ -195,6 +196,28 @@ impl Harness {
     fn hold(&self, key: &str, ms: u64) -> Result<(), String> {
         x_tool("xdotool", &self.display, &["keydown", key])?;
         pump(ms);
+        let deadline = Instant::now() + Duration::from_secs(60);
+        for turn in 0..10_000 {
+            let enough = self.eval(
+                &format!(
+                    r#"JSON.stringify((() => {{
+                const log = window.__jkh;
+                if (!log) return true;
+                const first = log.keys.find(k => k[1] === {key:?} && k[2]);
+                return Boolean(first && log.frames.filter(f => f[0] >= first[0] + 300).length >= 20);
+            }})())"#
+                ),
+                5000,
+            )?;
+            if enough == Value::Bool(true) {
+                break;
+            }
+            if turn == 9_999 || Instant::now() >= deadline {
+                x_tool("xdotool", &self.display, &["keyup", key])?;
+                return Err("the hold never produced twenty steady frames after its first repeat".into());
+            }
+            pump(33);
+        }
         x_tool("xdotool", &self.display, &["keyup", key]).map(|_| ())
     }
 

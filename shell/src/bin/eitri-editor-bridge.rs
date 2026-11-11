@@ -231,30 +231,53 @@ struct Bridge<W> {
     /// Calls sent and not answered: the frame's number to the client's id.
     open: BTreeMap<u64, Value>,
     next_number: u64,
+    #[cfg(test)]
+    clock: Option<Box<dyn Fn() -> Instant>>,
 }
 
 impl<W: Write> Bridge<W> {
     fn new(out: W) -> Bridge<W> {
+        Self::new_at(out, Instant::now())
+    }
+
+    fn new_at(out: W, now: Instant) -> Bridge<W> {
         Bridge {
             out,
             link: None,
-            no_host_after: Some(Instant::now() + RECONNECT_LIMIT),
+            no_host_after: Some(now + RECONNECT_LIMIT),
             tools: None,
             lists: Vec::new(),
             queued: VecDeque::new(),
             open: BTreeMap::new(),
             next_number: 1,
+            #[cfg(test)]
+            clock: None,
         }
+    }
+
+    fn now(&self) -> Instant {
+        #[cfg(test)]
+        if let Some(clock) = &self.clock {
+            return clock();
+        }
+        Instant::now()
     }
 
     /// Runs until stdin ends (0) or no host came in time (1).
     fn run(&mut self, events: Receiver<Event>) -> u8 {
+        self.run_with_receive(|within| match within {
+            None => events.recv().map_err(|_| RecvTimeoutError::Disconnected),
+            Some(within) => events.recv_timeout(within),
+        })
+    }
+
+    fn run_with_receive(&mut self, mut receive: impl FnMut(Option<Duration>) -> Result<Event, RecvTimeoutError>) -> u8 {
         loop {
             let event = match self.no_host_after {
-                None => events.recv().map_err(|_| RecvTimeoutError::Disconnected),
-                // `recv_timeout` hands over what is queued before it looks at the time.
-                Some(after) if Instant::now() >= after => Err(RecvTimeoutError::Timeout),
-                Some(after) => events.recv_timeout(after.saturating_duration_since(Instant::now())),
+                None => receive(None),
+                // The deadline wins even when more client input is already queued.
+                Some(after) if self.now() >= after => Err(RecvTimeoutError::Timeout),
+                Some(after) => receive(Some(after.saturating_duration_since(self.now()))),
             };
             match event {
                 Ok(Event::Line(line)) => self.line(line),
@@ -263,6 +286,8 @@ impl<W: Write> Bridge<W> {
                 Ok(Event::Down) => self.dropped(),
                 Ok(Event::StdinEnded) | Err(RecvTimeoutError::Disconnected) => return 0,
                 Err(RecvTimeoutError::Timeout) => {
+                    #[cfg(feature = "probe")]
+                    eprintln!("eitri-editor-bridge: reconnect budget {RECONNECT_LIMIT:?} exhausted");
                     self.give_up();
                     return 1;
                 }
@@ -286,7 +311,7 @@ impl<W: Write> Bridge<W> {
 
     fn dropped(&mut self) {
         self.link = None;
-        self.no_host_after = Some(Instant::now() + RECONNECT_LIMIT);
+        self.no_host_after = Some(self.now() + RECONNECT_LIMIT);
         for (_, id) in std::mem::take(&mut self.open) {
             self.answer(&id, MOVED, true);
         }
@@ -466,6 +491,33 @@ impl<W: Write> Bridge<W> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn no_host_and_a_dropped_host_each_get_the_full_reconnect_budget() {
+        for dropped in [false, true] {
+            let now = std::rc::Rc::new(std::cell::Cell::new(Instant::now()));
+            let mut bridge = Bridge::new_at(Vec::new(), now.get());
+            let reading = now.clone();
+            bridge.clock = Some(Box::new(move || reading.get()));
+            if dropped {
+                bridge.no_host_after = None;
+                now.set(now.get() + Duration::from_secs(50));
+                bridge.dropped();
+            }
+            let mut waits = Vec::new();
+            assert_eq!(
+                bridge.run_with_receive(|within| {
+                    assert!(waits.len() < 2, "the bridge did not expire its wait");
+                    let within = within.expect("no host is connected");
+                    waits.push(within);
+                    now.set(now.get() + within);
+                    Err(RecvTimeoutError::Timeout)
+                }),
+                1
+            );
+            assert_eq!(waits, [Duration::from_secs(5)]);
+        }
+    }
 
     #[test]
     fn nothing_goes_to_a_peer_of_another_uid() {

@@ -27,6 +27,11 @@ use super::*;
 /// The tool server, beside the program that started it.
 const BRIDGE_BINARY: &str = "eitri-editor-bridge";
 
+#[cfg(test)]
+thread_local! {
+    static BRIDGE_CALLS_SEEN: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
 /// A tab's bridge socket by name, and what its session was given: what a move hands on.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct TabBridge {
@@ -679,6 +684,8 @@ fn tell_broker_of_bridge(
             row_id,
             ..
         } => {
+            #[cfg(test)]
+            BRIDGE_CALLS_SEEN.with(|count| count.set(count.get() + 1));
             let tab = TabId(id.tab);
             let caller = Caller::Bridge { id };
             if env.tabs.is_moving(tab) {
@@ -2491,9 +2498,11 @@ pub(super) mod tests {
             panel.tick_until("the sidecar's call to reach the editor", || {
                 panel.editor.asked().len() == 1
             });
+            let before = BRIDGE_CALLS_SEEN.with(std::cell::Cell::get);
             peer.call(1, STATE_TOOL, json!({}));
-            std::thread::sleep(Duration::from_millis(50));
-            panel.settle();
+            panel.tick_until("the bridge call's submission", || {
+                BRIDGE_CALLS_SEEN.with(std::cell::Cell::get) > before
+            });
             assert_eq!(panel.editor.asked().len(), 1, "the bridge's call waits its turn");
 
             panel.editor.answer_oldest(&state_reply());

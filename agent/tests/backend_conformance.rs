@@ -221,8 +221,7 @@ fn real_two_sessions_in_the_same_project_dir_each_see_only_their_own_permission_
 
     let mut a_saw_request = false;
     let mut b_saw_request = false;
-    // Unlike the old version, this loop does NOT stop at the first request seen: it must keep
-    // watching B for the whole window, or "B stayed silent" would only mean "A answered first".
+    // Wait for A's request, then join B's producer before checking its complete event queue.
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
     while std::time::Instant::now() < deadline {
         for event in session_a.pump() {
@@ -236,9 +235,7 @@ fn real_two_sessions_in_the_same_project_dir_each_see_only_their_own_permission_
             }
         }
         if a_saw_request && !session_a.projection.tool_calls.is_empty() {
-            // Give B a further grace window to (incorrectly) receive it too, rather than declaring
-            // isolation the moment A is served.
-            std::thread::sleep(std::time::Duration::from_millis(500));
+            session_b.shutdown();
             for event in session_b.pump() {
                 if matches!(event, AgentDomainEvent::PermissionRequested { .. }) {
                     b_saw_request = true;

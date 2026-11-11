@@ -431,6 +431,10 @@ struct Group {
 }
 
 struct Shared {
+    #[cfg(any(test, feature = "test-support"))]
+    grace_for_tests: Mutex<Option<Duration>>,
+    #[cfg(any(test, feature = "test-support"))]
+    on_grace_for_tests: Mutex<Option<Box<dyn FnOnce() + Send>>>,
     out: Mutex<Out>,
     done: Mutex<bool>,
     done_changed: Condvar,
@@ -460,6 +464,10 @@ impl Shared {
         let (closer, closer_write) = pipe_pair();
         let (pause, pause_write) = if guarded { pipe_pair() } else { (None, None) };
         Arc::new(Shared {
+            #[cfg(any(test, feature = "test-support"))]
+            grace_for_tests: Mutex::new(None),
+            #[cfg(any(test, feature = "test-support"))]
+            on_grace_for_tests: Mutex::new(None),
             out: Mutex::new(Out {
                 lines: VecDeque::new(),
                 bytes: 0,
@@ -532,6 +540,14 @@ impl Shared {
             }
             signal_group(pgid, signal);
         }
+    }
+
+    fn grace(&self) -> Duration {
+        #[cfg(any(test, feature = "test-support"))]
+        if let Some(grace) = *lock(&self.grace_for_tests) {
+            return grace;
+        }
+        GRACE
     }
 
     fn pgid(&self) -> Option<u32> {
@@ -909,9 +925,13 @@ fn finish_run(shared: &Shared, readers: Vec<Reader>, wake: &agent::UiWake, ended
     if let Some(pgid) = shared.pgid() {
         // A stop gives the whole group its grace, not just the leader: a leader that exits on SIGTERM at once
         // must not cut short a child that is cleaning up.
-        let deadline = lock(&shared.stop).map(|(_, at)| at + GRACE);
+        let deadline = lock(&shared.stop).map(|(_, at)| at + shared.grace());
         if let Some(deadline) = deadline {
             while group_alive(pgid) && Instant::now() < deadline {
+                #[cfg(any(test, feature = "test-support"))]
+                if let Some(observer) = lock(&shared.on_grace_for_tests).take() {
+                    observer();
+                }
                 std::thread::sleep(Duration::from_millis(20));
             }
         }
@@ -1082,7 +1102,7 @@ fn term_then_kill(shared: &Arc<Shared>) {
     shared.signal(libc::SIGTERM);
     let shared = shared.clone();
     std::thread::spawn(move || {
-        if !shared.wait_done(GRACE) {
+        if !shared.wait_done(shared.grace()) {
             shared.signal(libc::SIGKILL);
         }
     });
@@ -1104,10 +1124,31 @@ fn request_stop(shared: &Arc<Shared>, reason: StopReason) {
     term_then_kill(shared);
 }
 
+#[cfg(any(test, feature = "test-support"))]
+thread_local! {
+    static TIMEOUT_WAIT_FOR_TESTS: std::cell::RefCell<Option<Box<dyn FnOnce(Duration) -> bool + Send>>> = const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(any(test, feature = "test-support"))]
+pub fn set_timeout_wait_for_tests(wait: impl FnOnce(Duration) -> bool + Send + 'static) {
+    TIMEOUT_WAIT_FOR_TESTS.with(|slot| {
+        assert!(slot.borrow_mut().replace(Box::new(wait)).is_none());
+    });
+}
+
 fn start_timeout(shared: &Arc<Shared>, limit: Duration) {
+    #[cfg(any(test, feature = "test-support"))]
+    let wait = TIMEOUT_WAIT_FOR_TESTS.with(|slot| slot.borrow_mut().take());
     let s = shared.clone();
     std::thread::spawn(move || {
-        if !s.wait_done(limit) {
+        #[cfg(any(test, feature = "test-support"))]
+        let finished = match wait {
+            Some(wait) => wait(limit),
+            None => s.wait_done(limit),
+        };
+        #[cfg(not(any(test, feature = "test-support")))]
+        let finished = s.wait_done(limit);
+        if !finished {
             request_stop(&s, StopReason::Timeout);
         }
     });
@@ -1337,6 +1378,26 @@ impl TaskRunner {
         Ok(id)
     }
 
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn observe_stop_grace_for_tests(&mut self, run: u64, observer: impl FnOnce() + Send + 'static) {
+        let run = self
+            .runs
+            .iter()
+            .find(|candidate| candidate.id == run)
+            .expect("a running task");
+        *lock(&run.shared.on_grace_for_tests) = Some(Box::new(observer));
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn set_stop_grace_for_tests(&mut self, run: u64, grace: Duration) {
+        let run = self
+            .runs
+            .iter()
+            .find(|candidate| candidate.id == run)
+            .expect("a running task");
+        *lock(&run.shared.grace_for_tests) = Some(grace);
+    }
+
     /// Whether `run` is one this runner still reports on.
     pub fn cancel(&mut self, run: u64) -> bool {
         let Some(r) = self.runs.iter().find(|r| r.id == run) else {
@@ -1456,6 +1517,15 @@ impl TaskRunner {
     /// Takes a run another runner paused (or this one, when a move is called off): its readers go on with the
     /// lines they had begun, its held lines are delivered as if read here, and its timeout keeps its deadline.
     pub fn adopt(&mut self, handoff: TaskHandoff) -> Result<u64, Box<AdoptRefused>> {
+        self.adopt_at(handoff, &Instant::now, &monotonic_ms)
+    }
+
+    fn adopt_at(
+        &mut self,
+        handoff: TaskHandoff,
+        instant: &dyn Fn() -> Instant,
+        monotonic: &dyn Fn() -> u64,
+    ) -> Result<u64, Box<AdoptRefused>> {
         let refuse = |why, handoff| Err(Box::new(AdoptRefused { why, handoff }));
         if self.runs.iter().any(|r| r.id == handoff.record.run) {
             return refuse(AdoptError::RunTaken, handoff);
@@ -1489,7 +1559,7 @@ impl TaskRunner {
             lifetime,
         } = fds;
         let shared = Shared::new(true);
-        let now = Instant::now();
+        let now = instant();
         let waiting = {
             let mut out = lock(&shared.out);
             for line in tail {
@@ -1531,7 +1601,7 @@ impl TaskRunner {
             std::thread::spawn(move || watch_guard(watch, None, readers, s, w, tx));
         }
         // What is left of the timeout: the time the run spent handed over counts, so moving a run never extends it.
-        let limit = timeout_at_ms.map(|at| Duration::from_millis(at.saturating_sub(monotonic_ms())));
+        let limit = timeout_at_ms.map(|at| Duration::from_millis(at.saturating_sub(monotonic())));
         if let Some(limit) = limit {
             start_timeout(&shared, limit);
         }
@@ -1963,8 +2033,14 @@ mod tests {
         #[test]
         fn no_line_is_delivered_twice_after_adoption() {
             let mut a = runner();
-            let script = "seq 1 100; sleep 0.3; seq 101 25000; sleep 1; seq 25001 50000";
-            let run = a.start(sh("t", script, None)).unwrap();
+            let dir = crate::plugin::test_support::Scratch::new("adopt-lines");
+            let go = dir.0.join("go");
+            let finish = dir.0.join("finish");
+            let script = format!(
+                "seq 1 100; while [ ! -e '{}' ]; do sleep 0.02; done; seq 101 25000; while [ ! -e '{}' ]; do sleep 0.02; done; seq 25001 50000",
+                go.display(), finish.display()
+            );
+            let run = a.start(sh("t", &script, None)).unwrap();
             let mut seen = Vec::new();
             let deadline = Instant::now() + HANG_GUARD;
             while seen.last().map(String::as_str) != Some("100") {
@@ -1973,6 +2049,7 @@ mod tests {
                 std::thread::sleep(Duration::from_millis(5));
             }
             // Lines delivered here, lines read and held for the page, and lines still in the pipe all exist at once.
+            std::fs::write(&go, b"").unwrap();
             let handoff = pause_when(&mut a, run, |rec| !rec.held.is_empty());
             let mut b = runner();
             // A run here already has the moved run's number, then the moved run's task is busy here: each refusal
@@ -1992,6 +2069,7 @@ mod tests {
             until_exit(&mut b, busy);
             b.adopt(refused.handoff)
                 .expect("adopted once the number and the task are free");
+            std::fs::write(&finish, b"").unwrap();
             let (rest, kind, dropped) = until_exit(&mut b, run);
             seen.extend(rest);
             assert_eq!((kind, dropped), (ExitKind::Exited(0), 0));
@@ -2005,16 +2083,15 @@ mod tests {
             // A timeout set in one window ends the task in the window it moved to.
             let mut a = runner();
             let mut b = runner();
-            let run = a
-                .start(sh("t", "sleep 300 & echo $!; wait", Some(Duration::from_millis(1500))))
-                .unwrap();
+            let run = a.start(sh("t", "sleep 300 & echo $!; wait", Some(HANG_GUARD))).unwrap();
             let pid: u32 = first_line(&mut a, run).parse().unwrap();
             let handoff = a.pause_for_move(run).unwrap();
             assert!(handoff
                 .record
                 .timeout_at_ms
-                .is_some_and(|at| at <= monotonic_ms() + 1500));
-            b.adopt(handoff).unwrap();
+                .is_some_and(|at| at <= monotonic_ms() + HANG_GUARD.as_millis() as u64));
+            let expired_ms = handoff.record.timeout_at_ms.unwrap() + 1;
+            b.adopt_at(handoff, &Instant::now, &|| expired_ms).unwrap();
             let (_, kind, _) = until_exit(&mut b, run);
             assert_eq!(kind, ExitKind::Timeout);
             wait_gone(pid);
@@ -2059,7 +2136,12 @@ mod tests {
                     "sleep 300 & echo $!; while [ ! -e '{}' ]; do sleep 0.02; done; exit 0",
                     go.display()
                 );
-                let mut a = runner();
+                let waited = dir.0.join("waited");
+                let mut guard = crate::run_guard::test_binary_guard("run_guard::tests::guard_entry");
+                guard
+                    .env
+                    .push(("EITRI_RUN_GUARD_TEST_WAIT".into(), waited.clone().into_os_string()));
+                let mut a = TaskRunner::with_guard(Arc::new(|| {}), Some(guard));
                 let run = a.start(sh("t", &script, None)).unwrap();
                 let left: u32 = first_line(&mut a, run).parse().unwrap();
                 let handoff = pause_when(&mut a, run, |rec| rec.pid.is_some());
@@ -2067,7 +2149,11 @@ mod tests {
                 // The leader ends while nobody reads its guard's status pipe; its child is still in the group.
                 std::fs::write(&go, b"").unwrap();
                 wait_gone(leader);
-                std::thread::sleep(Duration::from_millis(300));
+                let until = Instant::now() + HANG_GUARD;
+                while !waited.exists() {
+                    assert!(Instant::now() < until, "the guard never reached its held-group wait");
+                    std::thread::yield_now();
+                }
                 assert!(alive(left), "the leader's child ended with the leader");
                 if adopted {
                     let mut b = runner();
@@ -2082,12 +2168,43 @@ mod tests {
 
         #[test]
         fn a_pid_that_now_names_another_process_is_never_signalled() {
-            let mut other = Command::new("sleep")
-                .arg("300")
-                .process_group(0)
-                .spawn()
-                .expect("sleep starts");
-            let pid = other.id();
+            struct Other(std::process::Child);
+            impl Drop for Other {
+                fn drop(&mut self) {
+                    // Only this thread reaps the child, so its group cannot be reused before this check.
+                    if self.0.id() > 1 && matches!(self.0.try_wait(), Ok(None)) {
+                        unsafe {
+                            libc::kill(-(self.0.id() as i32), libc::SIGKILL);
+                        }
+                    }
+                    let _ = self.0.wait();
+                }
+            }
+            let mut other = Other(
+                Command::new("/bin/sh")
+                    .args(["-c", "echo ready; read ping; echo pong; exec sleep 300"])
+                    .stdin(std::process::Stdio::piped())
+                    .stdout(std::process::Stdio::piped())
+                    .process_group(0)
+                    .spawn()
+                    .expect("the responder starts"),
+            );
+            let mut output = std::io::BufReader::new(other.0.stdout.take().unwrap());
+            let read_line = |output: &mut std::io::BufReader<std::process::ChildStdout>| {
+                use std::io::BufRead;
+                let mut fd = libc::pollfd {
+                    fd: output.get_ref().as_raw_fd(),
+                    events: libc::POLLIN,
+                    revents: 0,
+                };
+                assert!(unsafe { libc::poll(&mut fd, 1, 60000) } > 0, "the responder hung");
+                let mut line = String::new();
+                output.read_line(&mut line).unwrap();
+                line
+            };
+            assert_eq!(read_line(&mut output), "ready\n");
+            let pid = other.0.id();
+            assert!(pid > 1);
             let start = start_time_of(pid).expect("its start time");
             let shared = Shared::new(true);
             let mut watch = Watch {
@@ -2099,32 +2216,34 @@ mod tests {
             status_line(&shared, &mut watch, &format!("pid {pid} {}", start + 1));
             assert_eq!(shared.pgid(), Some(pid));
             shared.signal(libc::SIGKILL);
-            std::thread::sleep(Duration::from_millis(200));
-            assert!(
-                other.try_wait().unwrap().is_none(),
-                "a group whose leader started at another time was signalled"
+            other.0.stdin.as_mut().unwrap().write_all(b"ping\n").unwrap();
+            assert_eq!(
+                read_line(&mut output),
+                "pong\n",
+                "the other process answered after signal returned"
             );
             // The same line with the start time that matches does reach the group.
             let shared = Shared::new(true);
             status_line(&shared, &mut watch, &format!("pid {pid} {start}"));
             shared.signal(libc::SIGKILL);
-            assert_eq!(other.wait().unwrap().signal(), Some(libc::SIGKILL));
+            assert_eq!(other.0.wait().unwrap().signal(), Some(libc::SIGKILL));
         }
 
         #[test]
         fn the_time_a_run_spends_handed_over_counts_toward_its_timeout() {
-            let timeout = Duration::from_millis(1500);
+            let timeout = HANG_GUARD;
             let mut a = runner();
             let run = a.start(sh("t", "sleep 300 & echo $!; wait", Some(timeout))).unwrap();
             let pid: u32 = first_line(&mut a, run).parse().unwrap();
             let handoff = a.pause_for_move(run).unwrap();
             // Held for longer than the whole timeout: the run is past its deadline when it is taken.
-            std::thread::sleep(timeout + Duration::from_millis(300));
+            let expired_ms = handoff.record.timeout_at_ms.unwrap() + 300;
+            let now = Instant::now();
             let mut b = runner();
-            b.adopt(handoff).unwrap();
+            b.adopt_at(handoff, &|| now, &|| expired_ms).unwrap();
             let deadline = b.runs.iter().find(|r| r.id == run).and_then(|r| r.deadline);
             assert!(
-                deadline.is_some_and(|at| at <= Instant::now()),
+                deadline.is_some_and(|at| at == now),
                 "the adopted run was given its remaining time afresh"
             );
             assert_eq!(until_exit(&mut b, run).1, ExitKind::Timeout);

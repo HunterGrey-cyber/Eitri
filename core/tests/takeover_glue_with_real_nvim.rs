@@ -70,7 +70,7 @@ fn detach(nvim: &EmbedNvim, chan: u64) {
 }
 
 fn settle(nvim: &EmbedNvim) {
-    nvim.exec_lua("vim.wait(180)", vec![]);
+    nvim.advance_timers(180);
 }
 
 fn snapshot(nvim: &EmbedNvim) -> (nvim_snapshot::Snapshot, serde_json::Value) {
@@ -106,6 +106,7 @@ fn assert_same(
 
 fn ready() -> EmbedNvim {
     let nvim = EmbedNvim::start();
+    nvim.manual_timers();
     // Load the APIs the widened observation itself uses before taking either snapshot.
     snapshot(&nvim);
     settle(&nvim);
@@ -188,7 +189,7 @@ fn the_liveness_timer_tears_down_when_either_channel_goes() {
         nvim.exec_lua("_G.__neovide_attach = {chan=...}", vec![fork.into()]);
         nvim.close_channel(if fork_gone { fork } else { link });
         nvim.exec_lua(
-            "assert(vim.wait(1000, function() return __eitri_companion == nil end, 10))",
+            "assert(test_timers.until_ready(function() return __eitri_companion == nil end))",
             vec![],
         );
         assert_eq!(
@@ -212,15 +213,15 @@ fn a_fork_record_that_went_with_its_channel_still_tears_the_glue_down() {
         install(&nvim, link);
         nvim.exec_lua("_G.__neovide_attach = {chan=...}", vec![fork.into()]);
         // Long enough for the glue's timer to have seen the record at least once.
-        nvim.exec_lua("vim.wait(700, function() return false end, 10)", vec![]);
+        nvim.exec_lua("test_timers.advance(700)", vec![]);
         nvim.close_channel(fork);
         nvim.exec_lua(
-            "local after = ...; vim.wait(after, function() return false end, 5); _G.__neovide_attach = nil",
+            "local after = ...; test_timers.advance(after); _G.__neovide_attach = nil",
             vec![removed_after_ms.into()],
         );
         let gone = nvim
             .exec_lua(
-                "return vim.wait(1500, function() return __eitri_companion == nil end, 10)",
+                "return test_timers.until_ready(function() return __eitri_companion == nil end)",
                 vec![],
             )
             .as_bool();
@@ -256,7 +257,7 @@ _G.takeover_back = __eitri_companion.take_back
 assert(takeover_back())
 assert(__eitri_companion == nil and __eitri_window == nil)
 assert(takeover_cleaned)
-assert(vim.wait(1000, function() return vim.api.nvim_get_chan_info(fork).id == nil end, 10))
+assert(test_timers.until_ready(function() return vim.api.nvim_get_chan_info(fork).id == nil end))
 assert(takeover_back() == false)
 "#,
         vec![fork.into()],
@@ -289,16 +290,16 @@ local fork, other = ...
 _G.__neovide_attach = {chan=fork}
 local attach = "vim.rpcnotify(1, 'nvim_ui_attach', 80, 24, {rgb=true})"
 vim.rpcrequest(fork, 'nvim_exec_lua', attach, {})
-assert(vim.wait(1000, function() return #vim.api.nvim_list_uis() == 1 end, 10))
+assert(test_timers.until_ready(function() return #vim.api.nvim_list_uis() == 1 end))
 assert(takeover_ui_notices == 0)
 vim.rpcrequest(other, 'nvim_exec_lua', attach, {})
-assert(vim.wait(1000, function() return #vim.api.nvim_list_uis() == 2 end, 10))
+assert(test_timers.until_ready(function() return #vim.api.nvim_list_uis() == 2 end))
 assert(takeover_ui_notices == 1)
 __eitri_companion.teardown()
 vim.rpcrequest(other, 'nvim_exec_lua', "vim.rpcnotify(1, 'nvim_ui_detach')", {})
-vim.wait(50)
+assert(vim.wait(60000, function() return #vim.api.nvim_list_uis() == 1 end, 1))
 vim.rpcrequest(other, 'nvim_exec_lua', attach, {})
-vim.wait(50)
+assert(vim.wait(60000, function() return #vim.api.nvim_list_uis() == 2 end, 1))
 assert(takeover_ui_notices == 1)
 "#,
         vec![fork.into(), other.into()],
@@ -405,12 +406,12 @@ end
         r#"
 local n = takeover_checks
 vim.fn.writefile({'two', 'three'}, vim.api.nvim_buf_get_name(0))
-assert(vim.wait(1500, function() return takeover_checks > n end, 10))
+assert(test_timers.until_ready(function() return takeover_checks > n end))
 assert(vim.deep_equal(vim.api.nvim_buf_get_lines(0, 0, -1, false), {'two', 'three'}))
 __eitri_companion.calls.busy(false)
 n = takeover_checks
 vim.fn.writefile({'four'}, vim.api.nvim_buf_get_name(0))
-assert(vim.wait(1500, function() return takeover_checks > n end, 10))
+assert(test_timers.until_ready(function() return takeover_checks > n end))
 assert(vim.deep_equal(vim.api.nvim_buf_get_lines(0, 0, -1, false), {'four'}))
 "#,
         vec![],
@@ -459,7 +460,7 @@ fn leftover_after_detach_and_after_link_kill() {
             }
             nvim.close_channel(chan);
             nvim.exec_lua(
-                "assert(vim.wait(1000, function() return __eitri_companion == nil end, 10))",
+                "assert(test_timers.until_ready(function() return __eitri_companion == nil end))",
                 vec![],
             );
             settle(&nvim);
@@ -559,15 +560,21 @@ fn socket_notices_and_ui_enter_are_delivered_to_the_link() {
         ));
     };
     attach(&fork);
-    assert!(events.recv_timeout(Duration::from_millis(100)).is_err());
+    answer(link.exec_lua("vim.rpcnotify(..., 'test_barrier')", vec![link.channel_id().into()]));
+    assert!(
+        matches!(events.recv_timeout(Duration::from_secs(60)).unwrap(), LinkEvent::Notification { method, .. } if method == "test_barrier")
+    );
     attach(&other);
     assert!(
         matches!(events.recv_timeout(Duration::from_secs(1)).unwrap(), LinkEvent::Notification {method, ..} if method == "eitri_ui_entered")
     );
-    assert!(events.recv_timeout(Duration::from_millis(100)).is_err());
+    answer(link.exec_lua("vim.rpcnotify(..., 'test_barrier')", vec![link.channel_id().into()]));
+    assert!(
+        matches!(events.recv_timeout(Duration::from_secs(60)).unwrap(), LinkEvent::Notification { method, .. } if method == "test_barrier")
+    );
     link.close();
     nvim.exec_lua(
-        "assert(vim.wait(1000, function() return __eitri_companion == nil end, 10))",
+        "assert(test_timers.until_ready(function() return __eitri_companion == nil end))",
         vec![],
     );
     fork.close();
@@ -615,7 +622,7 @@ fn socket_a_refused_page_killed_with_sigkill_leaves_the_takeover_and_no_pages() 
     );
     drop(page_process);
     nvim.exec_lua(
-        "vim.wait(600); assert(__eitri_companion.chan == ... and __eitri_pages == nil)",
+        "test_timers.advance(600); assert(__eitri_companion.chan == ... and __eitri_pages == nil)",
         vec![chan.into()],
     );
     detach(&nvim, chan);

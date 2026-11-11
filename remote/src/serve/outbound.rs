@@ -338,22 +338,33 @@ fn frame_into(out: &mut Vec<u8>, first: u8, payload: &[u8]) {
 /// `Err` when the stream fails or `gone` says the session ended.
 pub fn write_through(
     stream: &mut dyn Write,
+    bytes: &[u8],
+    stall: Duration,
+    on_stall: &dyn Fn(),
+    gone: &dyn Fn() -> bool,
+) -> io::Result<()> {
+    write_through_with(stream, bytes, stall, on_stall, gone, Instant::now)
+}
+
+fn write_through_with(
+    stream: &mut dyn Write,
     mut bytes: &[u8],
     stall: Duration,
     on_stall: &dyn Fn(),
     gone: &dyn Fn() -> bool,
+    mut now: impl FnMut() -> Instant,
 ) -> io::Result<()> {
     let mut stalled = false;
     while !bytes.is_empty() {
         if gone() {
             return Err(io::Error::new(io::ErrorKind::BrokenPipe, "the session ended"));
         }
-        let started = Instant::now();
+        let started = now();
         match stream.write(bytes) {
             Ok(0) => return Err(io::Error::new(io::ErrorKind::WriteZero, "the phone took nothing")),
             Ok(moved) => {
                 bytes = &bytes[moved..];
-                if !bytes.is_empty() && started.elapsed() >= stall && !stalled {
+                if !bytes.is_empty() && now().saturating_duration_since(started) >= stall && !stalled {
                     stalled = true;
                     on_stall();
                 }
@@ -508,10 +519,11 @@ mod tests {
         let (telling, told) = std::sync::mpsc::channel();
         let telling = Mutex::new(telling);
         let noted = order.clone();
+        let (release, released) = std::sync::mpsc::channel();
+        let released = Mutex::new(released);
         let out = Outbound::new(10, move |_| {
             let _ = telling.lock().unwrap().send(());
-            // A notice that takes its time to arrive.
-            std::thread::sleep(Duration::from_millis(300));
+            released.lock().unwrap().recv_timeout(Duration::from_secs(60)).unwrap();
             noted.lock().unwrap().push("overflowed");
         });
         assert_eq!(out.push(Source::Local, None, "x".repeat(10)), Pushed::Queued);
@@ -519,7 +531,12 @@ mod tests {
             let out = out.clone();
             std::thread::spawn(move || out.push(Source::Local, None, "y".into()))
         };
-        told.recv().unwrap();
+        told.recv_timeout(Duration::from_secs(60)).unwrap();
+        assert!(
+            matches!(out.state.try_lock(), Err(std::sync::TryLockError::WouldBlock)),
+            "the overflow notice must keep the writer out until it has arrived"
+        );
+        release.send(()).unwrap();
         let writer = {
             let (out, order) = (out.clone(), order.clone());
             std::thread::spawn(move || {
@@ -577,13 +594,16 @@ mod tests {
 
     #[test]
     fn a_short_write_that_lasted_the_deadline_is_the_stall() {
-        struct Slow(Vec<u8>);
-        impl Write for Slow {
+        struct Slow<'a> {
+            bytes: Vec<u8>,
+            clock: &'a std::cell::Cell<Instant>,
+        }
+        impl Write for Slow<'_> {
             fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-                if self.0.len().is_multiple_of(2) {
-                    std::thread::sleep(Duration::from_millis(20));
+                if self.bytes.len().is_multiple_of(2) {
+                    self.clock.set(self.clock.get() + Duration::from_millis(20));
                 }
-                self.0.push(buf[0]);
+                self.bytes.push(buf[0]);
                 Ok(1)
             }
             fn flush(&mut self) -> io::Result<()> {
@@ -591,8 +611,12 @@ mod tests {
             }
         }
         let stalls = AtomicUsize::new(0);
-        let mut slow = Slow(Vec::new());
-        write_through(
+        let clock = std::cell::Cell::new(Instant::now());
+        let mut slow = Slow {
+            bytes: Vec::new(),
+            clock: &clock,
+        };
+        write_through_with(
             &mut slow,
             b"abcd",
             Duration::from_millis(10),
@@ -600,9 +624,10 @@ mod tests {
                 stalls.fetch_add(1, Ordering::SeqCst);
             },
             &|| false,
+            || clock.get(),
         )
         .unwrap();
-        assert_eq!(slow.0, b"abcd", "the frame still ends");
+        assert_eq!(slow.bytes, b"abcd", "the frame still ends");
         assert_eq!(stalls.load(Ordering::SeqCst), 1, "told once per frame");
     }
 }

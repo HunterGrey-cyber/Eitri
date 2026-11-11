@@ -7103,8 +7103,17 @@ pub const TURN_REVIEW_NEEDS_SIDECAR: &str = "turn review needs the sidecar backe
 /// What a request for a review says when `init.lua` switched turn review off.
 pub const TURN_REVIEW_OFF: &str = "turn review is off (init.lua: review.enabled = false)";
 
+#[cfg(test)]
+thread_local! {
+    static TEST_WALL_MS: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
+}
+
 /// Milliseconds since the Unix epoch: the same clock the panel's `Date.now()` reads.
 fn wall_clock_ms() -> u64 {
+    #[cfg(test)]
+    if let Some(now) = TEST_WALL_MS.get() {
+        return now;
+    }
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)

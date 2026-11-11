@@ -379,7 +379,11 @@ fn may_go_ahead(guard: &PresenceGuard) -> Result<(), Refusal> {
     guard.check_own().map_err(Refusal::Blocked)?;
     let not_linked = || Refusal::Blocked(Blocked::NotHeld(NOT_LINKED.to_string()));
     let (job, answer) = group.ask().ok_or_else(not_linked)?;
-    match answer.recv_timeout(GUARD_WAIT) {
+    #[cfg(feature = "test-support")]
+    let reply = group.wait_for_answer_for_tests(&answer, GUARD_WAIT);
+    #[cfg(not(feature = "test-support"))]
+    let reply = answer.recv_timeout(GUARD_WAIT);
+    match reply {
         Ok(Ok(())) => Ok(()),
         Ok(Err(why)) => Err(Refusal::Blocked(Blocked::Group(why))),
         Err(_) => {

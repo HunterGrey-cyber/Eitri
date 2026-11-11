@@ -187,8 +187,14 @@ const ENTRY_POINTS: &[&str] = &["own_x_server::isolate", "own_x_server::init_gtk
 const GTK_ROOTS: &[&str] = &["gtk4", "gtk"];
 const TEST_MACROS: &[&str] = &["test", "test_synced"];
 
-/// This file and the helper name every signal themselves; neither is a test that opens a display.
-const NOT_SCANNED: &[&str] = &["shell/tests/own_display_scan.rs", "shell/tests/support/own_x_server.rs"];
+/// The scanner and isolation helper name display APIs themselves. Frame and clock modules receive existing
+/// widgets and views; they create no display or window. Their entry-point callers are still scanned.
+const NOT_SCANNED: &[&str] = &[
+    "shell/tests/own_display_scan.rs",
+    "shell/tests/support/own_x_server.rs",
+    "shell/tests/support/frame_turns.rs",
+    "shell/tests/support/web_clock.rs",
+];
 
 /// A string literal: its contents, escapes left as written, and where it starts in the blanked code.
 struct Literal {

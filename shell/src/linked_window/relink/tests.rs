@@ -12,6 +12,32 @@ use std::os::unix::fs::PermissionsExt;
 use std::rc::Rc;
 use std::sync::mpsc;
 
+struct WaitTrace {
+    path: PathBuf,
+    heard: Receiver<&'static str>,
+}
+impl WaitTrace {
+    fn new(path: PathBuf) -> Self {
+        let (send, heard) = mpsc::channel();
+        TEST_WAITS
+            .get_or_init(Default::default)
+            .lock()
+            .unwrap()
+            .insert(path.clone(), send);
+        Self { path, heard }
+    }
+    fn ended(&self) -> &'static str {
+        self.heard
+            .recv_timeout(Duration::from_secs(60))
+            .expect("the wait never ended")
+    }
+}
+impl Drop for WaitTrace {
+    fn drop(&mut self) {
+        TEST_WAITS.get().unwrap().lock().unwrap().remove(&self.path);
+    }
+}
+
 /// The project every test here pairs for. Its key, not the path, names the files.
 fn root() -> PathBuf {
     PathBuf::from("/srv/relink-project")
@@ -489,7 +515,7 @@ fn a_new_window_1_finds_the_held_pair_lock_and_relinks_once() {
     }
 
     // With nobody waiting, there is nothing to link to, at once.
-    let started = Instant::now();
+    let trace = WaitTrace::new(socket_path(&run.dir, &root()).unwrap());
     let err = relink(&run.dir, &layout.0, &root(), "b".into(), RELINK_WITHIN)
         .err()
         .unwrap();
@@ -499,7 +525,7 @@ fn a_new_window_1_finds_the_held_pair_lock_and_relinks_once() {
         None,
         "a window with no orphan to link to says nothing on screen"
     );
-    assert!(started.elapsed() < RELINK_WITHIN);
+    assert_eq!(trace.ended(), "connect_failed", "no handshake wait was entered");
 }
 
 #[test]
@@ -634,7 +660,7 @@ fn start_editor_detaches_eitri_for_the_root() {
     std::fs::create_dir_all(&project).unwrap();
     let report = scratch.1.join("report");
     let exe = scratch.1.join("eitri-stand-in");
-    std::fs::write(
+    script_fixture::write_executable_script(
         &exe,
         format!(
             // The standard streams are read before the report's own redirection takes fd 1 for the group.
@@ -642,9 +668,9 @@ fn start_editor_detaches_eitri_for_the_root() {
              cut -d' ' -f6 /proc/$$/stat; echo \"$streams\"; pwd; }} > '{0}.tmp'\nmv '{0}.tmp' '{0}'\n",
             report.display()
         ),
+        0o700,
     )
     .unwrap();
-    std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o700)).unwrap();
 
     let started = start_editor(
         &exe,
@@ -714,15 +740,15 @@ fn window_2_starts_one_editor_window_until_that_one_links_or_ends() {
     std::fs::create_dir_all(&project).unwrap();
     let report = scratch.1.join("report");
     let exe = scratch.1.join("eitri-stand-in");
-    std::fs::write(
+    script_fixture::write_executable_script(
         &exe,
         format!(
             "#!/bin/sh\necho \"$$ $*\" > '{0}.tmp'\nmv '{0}.tmp' '{0}'\nexec sleep 30\n",
             report.display()
         ),
+        0o700,
     )
     .unwrap();
-    std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o700)).unwrap();
     // A window 2 whose window 1 is gone, never linked.
     let (one, two) = fdpass::seqpacket_pair().unwrap();
     let pair = Pair::second(two, &project).unwrap();
@@ -829,10 +855,9 @@ fn a_second_hello_on_a_relinked_link_leaves_the_pair_file_to_the_new_window_1() 
         .send(hello_as_window_1(crate::version::fingerprint(), me, start), Vec::new())
         .unwrap();
     let link = second.pair.link().unwrap();
-    let until = Instant::now() + Duration::from_millis(300);
-    while Instant::now() < until {
+    link.read_handle_through_for_test(&relinked.handle);
+    for _ in 0..20 {
         link.pump();
-        std::thread::sleep(Duration::from_millis(5));
     }
     assert!(link.linked(), "the link stays up");
     assert!(!writing(), "another hello does not give the pair file back to window 2");
@@ -1008,13 +1033,9 @@ fn an_orphan_that_misses_the_bound_is_left_and_the_rest_relink() {
     let silent = OrphanSocket::bind_as(&run.dir, &root(), &c(2)).unwrap();
     let (tell, chat) = module_orphan(&run, &c(1), lock, crate::version::fingerprint());
 
-    let started = Instant::now();
+    let trace = WaitTrace::new(silent.path().to_path_buf());
     let relinked = relink_all_now(&run, &layout, RELINK_WITHIN).expect("the one that answered links");
-    assert!(
-        started.elapsed() < RELINK_WITHIN + Duration::from_secs(5),
-        "the call stops at its bound: {:?}",
-        started.elapsed()
-    );
+    assert_eq!(trace.ended(), "deadline", "the quiet orphan exhausted its receive wait");
     let names: Vec<WindowName> = relinked.iter().map(|one| one.name.clone()).collect();
     assert_eq!(names, vec![c(1)]);
     assert!(is_socket(silent.path()), "the silent orphan is left listening");
@@ -1497,4 +1518,9 @@ fn a_window_says_its_own_name_as_it_closes() {
         "window c3 closed"
     );
     assert_eq!(linked_second(&lock, &run).pair.closed_words(), "window 2 closed");
+}
+
+#[cfg(test)]
+mod script_fixture {
+    include!(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/support/executable.rs"));
 }

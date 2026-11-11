@@ -513,7 +513,7 @@ fn a_quit_while_nvim_waits_for_a_key_types_nothing_into_the_buffer() {
             "nvim_input",
             vec![Value::from(format!("<Cmd>lua {}<CR>", editor_quit_lua(1)))],
         );
-        std::thread::sleep(Duration::from_millis(300));
+        client.request("nvim_exec_lua", vec![Value::from("local done=false; vim.schedule(function() done=true end); assert(vim.wait(60000,function() return done end,1))"), Value::Array(vec![])]);
         let text = buffer_text(&mut client);
         assert!(!text.contains("user edit"), "typed, `u` undid the edit: {text:?}");
         assert!(
@@ -534,14 +534,13 @@ fn a_quit_while_nvim_waits_for_a_key_types_nothing_into_the_buffer() {
     } = editing("pending-rpc");
     client.request("nvim_input", vec![Value::from("f")]);
     let quit = client.send_quit(2);
-    let held_until = Instant::now() + Duration::from_millis(500);
-    while Instant::now() < held_until {
+    for _ in 0..20 {
         assert_eq!(
             client.mode(),
             ("n".to_string(), true),
             "nvim holds the request while it waits for f's character"
         );
-        std::thread::sleep(POLL);
+        assert!(!client.answered(quit));
     }
     assert!(!client.answered(quit));
 

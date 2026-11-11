@@ -24,7 +24,7 @@ pub mod spawn;
 use std::collections::BTreeSet;
 use std::ffi::OsString;
 use std::io;
-use std::os::fd::{AsRawFd, OwnedFd};
+use std::os::fd::OwnedFd;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
@@ -33,7 +33,6 @@ use eitri_core::layout::{Frame, Layout, LayoutError, ModuleId, ModuleKind};
 use eitri_core::window_link::names::WindowName;
 use eitri_core::window_link::pair::PairLock;
 use eitri_core::window_link::start;
-use neovide_editor::NeovideEditorPane;
 
 pub use driver::LinkDriver;
 pub use eitri_core::window_link::end::{away_everywhere, held, hold_away};
@@ -163,18 +162,6 @@ impl WindowRole {
 
 /// What an editor request answers in a window with no editor of its own.
 pub const NO_EDITOR_HERE: &str = "this window has no editor: it is in the first window";
-
-/// The window's own editor, where it has one: what a verb that only reads the editor's cell holds, so it does
-/// nothing in a window with no editor rather than needing an editor to exist. The keys and the editor's focus go
-/// through the window controller's services, which hold the same `Option`.
-#[derive(Clone)]
-pub struct OwnEditor(pub Option<Rc<NeovideEditorPane>>);
-
-impl OwnEditor {
-    pub fn cell_size(&self) -> Option<(f64, f64)> {
-        self.0.as_ref().and_then(|pane| pane.cell_size())
-    }
-}
 
 /// The editor link of a window with no editor: every question is answered at once that there is none to ask.
 pub struct NoEditor;

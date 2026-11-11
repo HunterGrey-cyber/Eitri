@@ -131,13 +131,14 @@ impl Rig {
     fn start_watch_with_pid(&self) -> (u64, i32) {
         let program = self.host.plugin().dir.join("target/learn");
         let script = std::fs::read_to_string(&program).unwrap();
-        std::fs::write(
-            program,
+        script_fixture::write_executable_script(
+            &program,
             script.replacen(
                 "#!/bin/sh\n",
                 "#!/bin/sh\nprintf '%s\\n' \"$$\" > \"$5/watch.pid\"\n",
                 1,
             ),
+            0o755,
         )
         .unwrap();
         self.wakes.try_iter().for_each(drop);
@@ -2160,7 +2161,11 @@ fn open_link_checks_wait_on_a_stalled_filesystem() {
     let from = calls(&d.rig);
     let id = link(&d, "other.md");
     d.rig.host.pump(d.t0);
-    std::thread::sleep(Duration::from_millis(50));
+    let until = Instant::now() + HANG_GUARD;
+    while d.rig.host.path_check_progress().0 < 2 {
+        assert!(Instant::now() < until, "the link check never entered its gate");
+        std::thread::yield_now();
+    }
     d.rig.host.pump(d.t0);
     assert!(d.rig.page.replies_to(id).is_empty());
     assert_eq!(calls(&d.rig), from, "no editor call");
@@ -2171,7 +2176,11 @@ fn open_link_checks_wait_on_a_stalled_filesystem() {
     drop(gate);
     wait_slot(&d, &d.proj);
     d.rig.host.pump(d.t0);
-    std::thread::sleep(Duration::from_millis(50));
+    let until = Instant::now() + HANG_GUARD;
+    while d.rig.host.path_check_progress().1 < 2 {
+        assert!(Instant::now() < until, "the released link check never finished");
+        std::thread::yield_now();
+    }
     d.rig.host.pump(d.t0);
     assert_eq!(calls(&d.rig), from, "nothing opened later");
     assert_eq!(d.rig.page.replies_to(id).len(), 1);
@@ -2262,7 +2271,11 @@ fn a_link_check_that_finishes_after_its_deadline_opens_nothing() {
     let id = link(&d, "other.md");
     // The check finishes, but no pump takes its result before the deadline has passed.
     drop(gate);
-    std::thread::sleep(Duration::from_millis(200));
+    let until = Instant::now() + HANG_GUARD;
+    while d.rig.host.path_check_progress().1 < 2 {
+        assert!(Instant::now() < until, "the link check never finished");
+        std::thread::yield_now();
+    }
     d.rig
         .host
         .pump(Instant::now() + CHECK_DEADLINE + Duration::from_secs(1));
@@ -2432,4 +2445,9 @@ fn a_replaced_documents_waiting_reveal_is_never_sent() {
         ops_since(&d.rig, from)
     );
     assert!(d.rig.page.replies_to(r).is_empty());
+}
+
+#[cfg(test)]
+mod script_fixture {
+    include!(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/support/executable.rs"));
 }

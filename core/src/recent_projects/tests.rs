@@ -451,8 +451,10 @@ fn a_blocked_stat_reads_unknown_at_the_deadline() {
         answer_tx.send(found).unwrap();
         f
     });
-    entered.recv_timeout(Duration::from_secs(5)).unwrap();
-    let found = answer_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    entered.recv_timeout(Duration::from_secs(60)).expect("the stat is held");
+    let found = answer_rx
+        .recv_timeout(Duration::from_secs(60))
+        .expect("the real deadline returns Unknown while stat is held");
     assert_eq!(found.len(), 1);
     assert_eq!(found[0].path, root);
     assert_eq!(found[0].fact, Fact::Unknown);
@@ -490,8 +492,28 @@ fn completed_facts_survive_a_later_blocked_stat() {
         root: roots[1].clone(),
         held,
     };
-    let found = read_with(&f.sources, Box::new(probe), Duration::from_millis(250), flag);
-    entered.recv_timeout(Duration::from_secs(5)).unwrap();
+    let mut delivered = false;
+    let found = read_with_wait(
+        &f.sources,
+        Box::new(probe),
+        Duration::from_millis(250),
+        flag,
+        |receiver, _, _| {
+            if !delivered {
+                delivered = true;
+                Some(
+                    receiver
+                        .recv_timeout(Duration::from_secs(60))
+                        .expect("the first fact finishes"),
+                )
+            } else {
+                entered
+                    .recv_timeout(Duration::from_secs(60))
+                    .expect("the second stat is held");
+                None
+            }
+        },
+    );
     assert_eq!(
         found.iter().map(|row| &row.path).collect::<Vec<_>>(),
         roots.iter().collect::<Vec<_>>()
@@ -523,8 +545,18 @@ fn no_second_fact_worker_while_one_is_stuck() {
     f.stamp(&f.root("project"), 10);
     let (probe, entered, release) = held();
     let flag = busy();
-    let found = read_with(&f.sources, Box::new(probe), Duration::from_millis(20), flag);
-    entered.recv_timeout(Duration::from_secs(5)).unwrap();
+    let found = read_with_wait(
+        &f.sources,
+        Box::new(probe),
+        Duration::from_millis(20),
+        flag,
+        |_, _, _| {
+            entered
+                .recv_timeout(Duration::from_secs(60))
+                .expect("the first stat is held");
+            None
+        },
+    );
     assert_eq!(found[0].fact, Fact::Unknown);
     let called = busy();
     let found = read_with(

@@ -46,8 +46,7 @@ pub fn demo_plugin(root: &Path) -> (PathBuf, BTreeMap<String, String>) {
     )
     .unwrap();
     let learn = dir.join("target/learn");
-    std::fs::write(&learn, FAKE_LEARN).unwrap();
-    std::fs::set_permissions(&learn, std::fs::Permissions::from_mode(0o755)).unwrap();
+    script_fixture::write_executable_script(&learn, FAKE_LEARN, 0o755).unwrap();
     std::os::unix::fs::symlink("../target/learn", dir.join("bin/learn")).unwrap();
     std::fs::write(
         dir.join("build/site/index.html"),
@@ -56,4 +55,8 @@ pub fn demo_plugin(root: &Path) -> (PathBuf, BTreeMap<String, String>) {
     .unwrap();
     let settings = BTreeMap::from([("work".to_string(), root.join("work").display().to_string())]);
     (dir, settings)
+}
+
+mod script_fixture {
+    include!(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/support/executable.rs"));
 }

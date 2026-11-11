@@ -7,9 +7,8 @@
 #[path = "support/tmux_tui.rs"]
 mod tmux_tui;
 
-use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use eitri_core::takeover::room::room_binary;
 use rmpv::Value;
@@ -38,14 +37,18 @@ struct Ended {
 }
 
 /// Runs `command` in a real nvim whose eitri.nvim calls `stub` (a shell script body that ends by itself), and watches
-/// for three seconds that nvim never waits for a key.
+/// across completed request turns after the child exit has been reported.
 fn run(command: &str, stub_body: &str) -> Ended {
     let tui = TmuxTui::start(&nvim());
     let link = tui.link();
     let done = tui.dir.join("done");
     let stub = tui.dir.join("eitri-stub");
-    std::fs::write(&stub, format!("#!/bin/sh\n: > '{}'\n{stub_body}\n", done.display())).unwrap();
-    std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o700)).unwrap();
+    script_fixture::write_executable_script(
+        &stub,
+        format!("#!/bin/sh\n: > '{}'\n{stub_body}\n", done.display()),
+        0o700,
+    )
+    .unwrap();
     let plugin = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .unwrap()
@@ -63,8 +66,7 @@ fn run(command: &str, stub_body: &str) -> Ended {
     wait_until(|| done.exists());
 
     // `nvim_get_mode` is answered even while nvim waits for a key; watch it until the report is out.
-    let end = Instant::now() + Duration::from_secs(3);
-    while Instant::now() < end {
+    for _ in 0..60 {
         let mode = link
             .call("nvim_get_mode", vec![])
             .wait(Duration::from_secs(2))
@@ -76,7 +78,7 @@ fn run(command: &str, stub_body: &str) -> Ended {
             "nvim waits for a key after the window ended: {mode:?}\n{}",
             tui.capture()
         );
-        std::thread::sleep(Duration::from_millis(50));
+        tui.lua(&link, "local done = false; vim.schedule(function() done = true end); assert(vim.wait(60000, function() return done end, 1)); return true", vec![]);
     }
     let messages = tui.lua(
         &link,
@@ -182,4 +184,9 @@ fn a_failure_that_fits_is_shown_whole_and_not_kept() {
     let ended = run("EitriOpen", "echo 'eitri open: the room could not start' >&2\nexit 1");
     assert_eq!(ended.shown, "eitri open: the room could not start");
     assert_eq!(kept(&ended), "", "nothing was cut, so nothing is kept");
+}
+
+#[cfg(test)]
+mod script_fixture {
+    include!(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/support/executable.rs"));
 }

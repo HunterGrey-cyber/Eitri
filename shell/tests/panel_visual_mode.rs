@@ -1,3 +1,6 @@
+//! The fixture drives JavaScript time at rendered-frame boundaries. Reported JavaScript times describe that
+//! controlled cadence; they are not measurements of the host's rendering speed.
+//!
 //! Tests BROWSE's CARET, VISUAL, and V-LINE modes against the real WebKitGTK engine linked
 //! by `shell`. jsdom lacks `Selection.modify`, so these checks require a real WebView.
 //! Compile with `cargo test -p shell --test panel_visual_mode --no-run`. Run with:
@@ -225,15 +228,12 @@ fn xdotool(display: &str, args: &[&str]) -> Result<String, String> {
     }
 }
 
-/// Runs the GLib main context for about `ms`, without a nested `MainLoop::run` -- the same idiom
-/// `close_prompt_placement.rs`'s own `pump` uses.
+#[path = "support/web_clock.rs"]
+mod web_clock;
+
+/// Advances the page clock at acknowledged rendered frames.
 fn pump(ms: u64) {
-    let context = glib::MainContext::default();
-    let end = Instant::now() + Duration::from_millis(ms);
-    while Instant::now() < end {
-        while context.iteration(false) {}
-        std::thread::sleep(Duration::from_millis(2));
-    }
+    web_clock::pump(ms);
 }
 
 /// `xdotool search --name` takes a regex; the titles here are plain words, digits, spaces and dots.
@@ -274,7 +274,9 @@ impl Harness {
         window.set_title(Some(&title));
 
         let content_manager = UserContentManager::new();
+        let clock_turns = web_clock::install(&content_manager);
         let webview = WebView::builder().user_content_manager(&content_manager).build();
+        web_clock::watch(&webview, clock_turns);
         webview.set_hexpand(true);
         webview.set_vexpand(true);
         webview.set_zoom_level(zoom);

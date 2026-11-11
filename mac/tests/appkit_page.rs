@@ -76,13 +76,6 @@ mod macos {
         }
     }
 
-    fn spin(for_: Duration) {
-        let end = Instant::now() + for_;
-        while Instant::now() < end {
-            spin_once();
-        }
-    }
-
     fn spin_once() {
         // SAFETY: turns this thread's own run loop once, for at most 20 ms.
         unsafe {
@@ -197,7 +190,6 @@ mod macos {
                     "(function(){{var s=document.createElement('script');s.textContent='window.__foreign{n}=1';document.head.appendChild(s);return 'x'}})()"
                 ),
             );
-            spin(Duration::from_millis(100));
             if eval(view, &format!("String(window.__foreign{n}||null)")) == "null" {
                 blocked += 1;
             }
@@ -217,8 +209,17 @@ mod macos {
         let mut delivered = 0;
         for _ in 0..TRIALS {
             page.send_direct(envelope);
-            spin(Duration::from_millis(50));
         }
+        assert!(
+            spin_until(Duration::from_secs(60), || {
+                eval(view, "String(window.__got.length)").parse::<usize>().unwrap() >= TRIALS
+            }),
+            "the dispatches never reached the page"
+        );
+        assert_eq!(
+            eval(view, "String(window.__got.length)").parse::<usize>().unwrap(),
+            TRIALS
+        );
         let got = eval(view, "JSON.stringify(window.__got)");
         if let Ok(list) = serde_json::from_str::<Vec<String>>(&got) {
             delivered = list.iter().filter(|e| *e == envelope).count();
@@ -293,7 +294,7 @@ mod macos {
             ),
             (
                 "iframe",
-                "(function(){var f=document.createElement('iframe');f.src='https://eitri-test.invalid/frame';document.body.appendChild(f);setTimeout(function(){f.remove()},300);return 'x'})()",
+                "(function(){var f=document.createElement('iframe');f.src='https://eitri-test.invalid/frame';document.body.appendChild(f);return 'x'})()",
                 None,
                 false,
             ),
@@ -313,8 +314,30 @@ mod macos {
                 let readies = recorder.readies();
                 let links = recorder.links.borrow().len();
                 let decided = recorder.decisions.borrow().len();
-                eval(view, script);
-                spin(Duration::from_millis(400));
+                let before_violation = violations();
+                let result = eval(view, script);
+                if asked {
+                    assert!(
+                        spin_until(Duration::from_secs(60), || recorder.decisions.borrow().len() > decided),
+                        "no navigation decision for {name}"
+                    );
+                } else if name == "window.open" {
+                    assert_eq!(result, "null", "a popup must be refused");
+                } else {
+                    assert!(
+                        spin_until(Duration::from_secs(60), || {
+                            violations() > before_violation
+                                || recorder.decisions.borrow()[decided..].iter().any(|(_, _, decision)| {
+                                    matches!(decision, NavDecision::Cancel | NavDecision::LinkClick(_))
+                                })
+                        }),
+                        "no policy refusal for {name}"
+                    );
+                }
+                eval(
+                    view,
+                    "document.querySelectorAll('iframe').forEach(function(f){f.remove()});'removed'",
+                );
                 let stayed = eval(view, "location.href") == PANEL_BASE_URI
                     && eval(view, "typeof window.__eitriDispatch") == "function"
                     && recorder.readies() == readies;
@@ -388,7 +411,10 @@ mod macos {
         unsafe { view.stopLoading() };
         page.load_document(&document, PANEL_BASE_URI);
         spin_until(Duration::from_secs(15), || recorder.readies() > readies);
-        spin(Duration::from_millis(800));
+        assert!(
+            spin_until(Duration::from_secs(60), || !panel.document_loading()),
+            "the newest load never finished"
+        );
         let allowed_by_two = allowed_now() - allows;
         // Recorded, not judged: WebKit has been seen to ask about both (2 allowed), in which case no entry is
         // left over here; the clearing is shown by the unit test of the bridge.
@@ -398,7 +424,10 @@ mod macos {
             view,
             "(function(){location.href='https://eitri.invalid/';return 'x'})()",
         );
-        spin(Duration::from_millis(500));
+        assert!(
+            spin_until(Duration::from_secs(60), || recorder.decisions.borrow().len() > decided),
+            "the script's navigation was never decided"
+        );
         let decisions = recorder.decisions.borrow()[decided..].to_vec();
         checks.check(
             "after two quick loads a script's location to the panel's address is still refused",
@@ -465,7 +494,7 @@ mod macos {
         let refused_recorder = Rc::new(Recorder::default());
         refused.report_to(refused_recorder.clone());
         refused.page().load_document(&bare, PANEL_BASE_URI);
-        spin(Duration::from_secs(2));
+        assert!(!refused.document_loading(), "the policy check queues no load");
         checks.check(
             "the bundle without its policy is not loaded",
             refused_recorder.readies() == 0 && refused_recorder.decisions.borrow().is_empty(),
@@ -503,7 +532,6 @@ mod macos {
                     "(function(){{var s=document.createElement('script');s.textContent='window.__foreign{n}=1';document.head.appendChild(s);return 'x'}})()"
                 ),
             );
-            spin(Duration::from_millis(100));
             if eval(control_view, &format!("String(window.__foreign{n}||null)")) == "1" {
                 ran += 1;
             }
@@ -523,7 +551,7 @@ mod macos {
             ),
             (
                 "iframe",
-                "(function(){var f=document.createElement('iframe');f.src='https://eitri-test.invalid/frame';document.body.appendChild(f);setTimeout(function(){f.remove()},300);return 'x'})()",
+                "(function(){var f=document.createElement('iframe');f.src='https://eitri-test.invalid/frame';document.body.appendChild(f);return 'x'})()",
                 NavKind::Other,
             ),
         ];
@@ -533,7 +561,15 @@ mod macos {
                 let decided = control_recorder.decisions.borrow().len();
                 let readies = control_recorder.readies();
                 eval(control_view, script);
-                spin(Duration::from_millis(400));
+                assert!(
+                    spin_until(Duration::from_secs(60), || control_recorder.decisions.borrow().len()
+                        > decided),
+                    "no delegate refusal for {name}"
+                );
+                eval(
+                    control_view,
+                    "document.querySelectorAll('iframe').forEach(function(f){f.remove()});'removed'",
+                );
                 let decisions = control_recorder.decisions.borrow()[decided..].to_vec();
                 let stayed =
                     eval(control_view, "location.href") == PANEL_BASE_URI && control_recorder.readies() == readies;
@@ -561,18 +597,25 @@ mod macos {
                 &format!("(function(){{window.webkit.messageHandlers.eitriAgent.postMessage({body});return 'x'}})()"),
             );
         }
-        spin(Duration::from_millis(300));
-        let not_strings = control_recorder.messages.borrow().len() - before;
         eval(
             control_view,
             "(function(){window.webkit.messageHandlers.eitriAgent.postMessage('a string');return 'x'})()",
         );
-        spin(Duration::from_millis(300));
+        assert!(
+            spin_until(Duration::from_secs(60), || {
+                control_recorder
+                    .messages
+                    .borrow()
+                    .last()
+                    .is_some_and(|m| m == "a string")
+            }),
+            "the sentinel string never arrived"
+        );
         let after: Vec<String> = control_recorder.messages.borrow()[before..].to_vec();
         checks.check(
             "only a string message reaches the panel",
-            not_strings == 0 && after == ["a string"],
-            format!("{not_strings} non-string(s) arrived; then {after:?}"),
+            after == ["a string"],
+            format!("messages through the sentinel: {after:?}"),
         );
 
         // Disconnected for shutdown: nothing more reaches the panel, and the view has no delegate.
@@ -585,13 +628,21 @@ mod macos {
         );
         // The delegate stays and cancels everything: a navigation that needs no network (it would succeed at
         // once if allowed) and a link click both leave the page where it is.
+        let decided = control.navigation_cancellations();
         eval(control_view, "(function(){location.href='about:blank';return 'x'})()");
-        spin(Duration::from_millis(400));
+        assert!(
+            spin_until(Duration::from_secs(60), || control.navigation_cancellations() > decided),
+            "the disconnected navigation was never decided"
+        );
+        let decided = control.navigation_cancellations();
         eval(
             control_view,
             "(function(){var a=document.createElement('a');a.href='about:blank#link';document.body.appendChild(a);a.click();return 'x'})()",
         );
-        spin(Duration::from_millis(400));
+        assert!(
+            spin_until(Duration::from_secs(60), || control.navigation_cancellations() > decided),
+            "the disconnected link was never decided"
+        );
         let href = eval(control_view, "location.href");
         // SAFETY: a plain getter on the main thread.
         let delegate_kept = unsafe { control_view.navigationDelegate() }.is_some();
@@ -668,14 +719,16 @@ mod macos {
         // The timer stops itself.
         let calls = Rc::new(Cell::new(0u32));
         let counted = calls.clone();
-        let _timer = repeat(mtm, Duration::from_millis(10), move || {
+        let timer = repeat(mtm, Duration::from_millis(10), move || {
             counted.set(counted.get() + 1);
             counted.get() < 3
         });
-        spin(Duration::from_millis(300));
+        let fired = spin_until(Duration::from_secs(60), || calls.get() >= 3);
+        // SAFETY: a timer retained on this main thread.
+        let stopped = unsafe { !timer.isValid() };
         checks.check(
             "a repeating timer stops when it says so",
-            calls.get() == 3,
+            fired && stopped && calls.get() == 3,
             format!("{} call(s)", calls.get()),
         );
 

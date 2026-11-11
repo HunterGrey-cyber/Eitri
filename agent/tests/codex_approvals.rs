@@ -3,6 +3,10 @@
 //! from recordings of a real `codex app-server` (`record_mcp_approval_shapes`, ignored, run by hand), and
 //! the command shapes from the recordings of the earlier measurements.
 
+#[path = "support/script_gate.rs"]
+mod script_gate;
+use script_gate::ScriptGate;
+
 use agent::providers::codex::{CodexLaunch, CodexProvider};
 use agent::{
     AgentDomainEvent, AgentProvider, DirTrust, ExternalProvider, ExternalStart, InterruptTurnRequest,
@@ -966,6 +970,7 @@ fn interrupt_sends_cancel() {
 /// the first press took the cancel for the turn's end and sent none.
 #[test]
 fn a_second_interrupt_reaches_a_turn_a_cancel_did_not_end() {
+    let gate = ScriptGate::new();
     let provider = running(
         "th-c5",
         "tu-c5",
@@ -978,6 +983,7 @@ fn a_second_interrupt_reaches_a_turn_a_cancel_did_not_end() {
                 json!({"threadId": "th-c5", "turnId": "tu-c5", "itemId": "exec-5", "command": "touch /x"}),
             ),
             expect_answer(json!("r-5"), r#"{"decision":"cancel"}"#),
+            gate.step(),
             expect_exact(r#"{"id":5,"method":"turn/interrupt","params":{"threadId":"th-c5","turnId":"tu-c5"}}"#),
             write(
                 json!({"method": "item/completed", "params": {"threadId": "th-c5", "turnId": "tu-c5",
@@ -996,8 +1002,9 @@ fn a_second_interrupt_reaches_a_turn_a_cancel_did_not_end() {
             .expect("the interrupt is taken")
     };
     interrupt();
-    std::thread::sleep(std::time::Duration::from_millis(200));
+    gate.wait();
     provider.pump();
+    gate.release();
     interrupt();
     let events = until_turn_completed(&provider);
     assert!(events.iter().any(|e| matches!(

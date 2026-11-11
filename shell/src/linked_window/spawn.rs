@@ -500,6 +500,7 @@ impl Pair {
         self.ide_port.clone()
     }
 
+    #[cfg(test)]
     pub fn ide_port(&self) -> Option<u16> {
         self.ide_port.get()
     }
@@ -1920,6 +1921,8 @@ pub struct SecondProcess {
     pidfd: Arc<PidFd>,
     #[cfg_attr(not(test), allow(dead_code))] // The window only logs the reap; the tests wait for it.
     reaped: Arc<Reaped>,
+    #[cfg(test)]
+    end_requests: std::sync::atomic::AtomicUsize,
 }
 
 /// The reaped child's status, once its reaper has it.
@@ -1991,6 +1994,8 @@ impl SecondProcess {
             start,
             pidfd: Arc::new(pidfd),
             reaped,
+            #[cfg(test)]
+            end_requests: Default::default(),
         })
     }
 
@@ -2002,6 +2007,8 @@ impl SecondProcess {
             start: partner.start,
             pidfd: Arc::new(PidFd::open(partner.pid, partner.start)?),
             reaped: Arc::default(),
+            #[cfg(test)]
+            end_requests: Default::default(),
         })
     }
 
@@ -2017,6 +2024,8 @@ impl SecondProcess {
     /// else SIGTERM, and SIGKILL once `grace` has passed with it still running. Only this process is signalled,
     /// never its group or anything it started.
     pub fn end(&self, grace: Duration) -> io::Result<JoinHandle<Ending>> {
+        #[cfg(test)]
+        self.end_requests.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let pidfd = self.pidfd.clone();
         let pid = self.pid;
         std::thread::Builder::new()
@@ -2034,6 +2043,8 @@ impl SecondProcess {
     /// that stopped answering is ended sooner, by its own watchdog, which the SIGTERM wakes. One signal only: a second
     /// forces a close that is under way.
     pub fn end_unless_closed(&self, grace: Duration, told: Duration) -> io::Result<JoinHandle<Ending>> {
+        #[cfg(test)]
+        self.end_requests.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let pidfd = self.pidfd.clone();
         let pid = self.pid;
         std::thread::Builder::new().name("window-ender".into()).spawn(move || {
@@ -2045,6 +2056,11 @@ impl SecondProcess {
             report_ending(pid, &ending);
             ending
         })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn ending_requests(&self) -> usize {
+        self.end_requests.load(std::sync::atomic::Ordering::SeqCst)
     }
 
     /// The reaped status, waiting at most `timeout` for it.
@@ -2063,10 +2079,14 @@ impl SecondProcess {
 /// SIGTERM, then SIGKILL after `grace`, to the process `pidfd` names; nothing to one that has ended. A process that
 /// ends between the check and the signal answers `ESRCH` through its pidfd, and nothing else is reached.
 fn end_process(pidfd: &PidFd, grace: Duration) -> Ending {
+    end_process_with_wait(pidfd, grace, |within| pidfd.wait_exited(within))
+}
+
+fn end_process_with_wait(pidfd: &PidFd, grace: Duration, wait: impl FnOnce(Duration) -> bool) -> Ending {
     if let Some(done) = terminate(pidfd) {
         return done;
     }
-    if pidfd.wait_exited(grace) {
+    if wait(grace) {
         return Ending::Terminated;
     }
     kill_if_running(pidfd)
@@ -2125,16 +2145,30 @@ fn reaped_now(child: &mut Child) -> bool {
 /// that sends SIGKILL once the grace has passed if it still runs. Nothing waits on the caller. The application is
 /// held until the timer has run, so closing the last window during the grace does not end this process first.
 fn end_from_main_loop(pidfd: Arc<PidFd>, pid: u32, grace: Duration) {
+    end_from_main_loop_scheduled(pidfd, pid, grace, |within, run| {
+        gtk4::glib::timeout_add_local_once(within, run);
+    });
+}
+
+fn end_from_main_loop_scheduled(
+    pidfd: Arc<PidFd>,
+    pid: u32,
+    grace: Duration,
+    schedule: impl FnOnce(Duration, Box<dyn FnOnce()>),
+) {
     if let Some(done) = terminate(&pidfd) {
         report_ending(pid, &done);
         return;
     }
     let hold = hold_application();
-    gtk4::glib::timeout_add_local_once(grace, move || {
-        report_ending(pid, &kill_if_running(&pidfd));
-        // Released here, after the SIGKILL, rather than whenever GLib frees the finished source.
-        drop(hold);
-    });
+    schedule(
+        grace,
+        Box::new(move || {
+            report_ending(pid, &kill_if_running(&pidfd));
+            // Released here, after the SIGKILL, rather than whenever GLib frees the finished source.
+            drop(hold);
+        }),
+    );
 }
 
 /// A hold on the running application, so it stays in its main loop with no window left. Once window 1's last
@@ -2662,10 +2696,7 @@ pub(crate) mod tests {
         let linked = stand_in(false);
         assert!(end_if_overdue(&driver, &linked, overdue + HANDSHAKE_WITHIN, grace).is_none());
         assert!(driver.linked());
-        assert!(
-            linked.wait_reaped(Duration::from_millis(300)).is_none(),
-            "the linked window still runs"
-        );
+        assert_eq!(linked.ending_requests(), 0, "a linked window schedules no ending");
         // The test's own clean-up of its stand-in.
         assert_eq!(linked.end(grace).unwrap().join().unwrap(), Ending::Terminated);
         assert!(linked.wait_reaped(Duration::from_secs(10)).is_some());
@@ -2762,27 +2793,69 @@ pub(crate) mod tests {
     #[test]
     #[ignore = "runs a real gio main loop on the default main context; must not race the rest of the suite"]
     fn the_application_outlives_an_ending_in_its_grace() {
+        let _turn = crate::layout_state::default_context_turn();
         use gtk4::gio;
         use gtk4::prelude::*;
-        let grace = Duration::from_millis(400);
-        let app = gio::Application::new(None, gio::ApplicationFlags::empty());
-        let stubborn = Rc::new(stand_in(true));
-        let on_timer = Rc::new(stand_in(true));
-        {
-            let (stubborn, on_timer) = (stubborn.clone(), on_timer.clone());
-            // Nothing else holds the application: without the holds, `run` would return as soon as this does.
+        let grace = Duration::from_secs(400);
+        for on_timer in [false, true] {
+            let app = gio::Application::new(None, gio::ApplicationFlags::NON_UNIQUE);
+            let second = Rc::new(stand_in(true));
+            let completed = Rc::new(std::cell::Cell::new(false));
+            let (activating, observed) = (second.clone(), completed.clone());
             app.connect_activate(move |_| {
-                hold_until_finished(stubborn.end(grace).unwrap());
-                end_from_main_loop(on_timer.pidfd.clone(), on_timer.pid, grace);
+                if on_timer {
+                    let observed = observed.clone();
+                    end_from_main_loop_scheduled(
+                        activating.pidfd.clone(),
+                        activating.pid,
+                        grace,
+                        move |within, run| {
+                            assert_eq!(within, grace);
+                            gtk4::glib::idle_add_local_once(move || {
+                                run();
+                                observed.set(true);
+                            });
+                        },
+                    );
+                } else {
+                    let pidfd = activating.pidfd.clone();
+                    let (release, held) = std::sync::mpsc::channel();
+                    let (entered, entering) = std::sync::mpsc::channel();
+                    let ending = std::thread::spawn(move || {
+                        end_process_with_wait(&pidfd, grace, |within| {
+                            assert_eq!(within, grace);
+                            entered.send(()).unwrap();
+                            held.recv_timeout(Duration::from_secs(60))
+                                .expect("the application dispatched the release");
+                            false
+                        })
+                    });
+                    entering
+                        .recv_timeout(Duration::from_secs(60))
+                        .expect("inside the grace wait");
+                    hold_until_finished(ending);
+                    let observed = observed.clone();
+                    gtk4::glib::idle_add_local_once(move || {
+                        observed.set(true);
+                        release.send(()).unwrap();
+                    });
+                }
             });
-        }
-        let started = Instant::now();
-        app.run_with_args(&["shell-ending-hold"]);
-        let ran = started.elapsed();
-        assert!(ran >= grace, "run() returned after {ran:?}, inside the grace");
-        for second in [&stubborn, &on_timer] {
-            let status = second.wait_reaped(Duration::from_secs(10)).expect("reaped");
-            assert_eq!(signal_of(status), Some(libc::SIGKILL), "{status:?}");
+            let expired = Rc::new(std::cell::Cell::new(false));
+            let expired_in_timer = expired.clone();
+            let quitting = app.clone();
+            let guard = gtk4::glib::timeout_add_local_once(Duration::from_secs(60), move || {
+                expired_in_timer.set(true);
+                quitting.quit();
+            });
+            app.run_with_args(&["shell-ending-hold"]);
+            if let Some(source) = gtk4::glib::MainContext::default().find_source_by_id(&guard) {
+                source.destroy();
+            }
+            assert!(!expired.get(), "the application never released its hold");
+            assert!(completed.get(), "the application returned before the grace boundary");
+            let status = second.wait_reaped(Duration::from_secs(60)).expect("reaped");
+            assert_eq!(signal_of(status), Some(libc::SIGKILL));
         }
     }
 
@@ -3128,8 +3201,11 @@ pub(crate) mod tests {
         })
         .unwrap();
         assert!(
-            reported.recv_timeout(Duration::from_secs(5)).is_err(),
-            "nothing is reported"
+            matches!(
+                reported.recv_timeout(Duration::from_secs(60)),
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected)
+            ),
+            "the watcher finished without reporting"
         );
     }
 
@@ -3207,12 +3283,15 @@ pub(crate) mod tests {
     }
 
     fn restoring(label: &str, script: &str, within: Duration) -> Restoring {
-        use std::os::unix::fs::PermissionsExt;
         let dir = crate::linked_window::tests::Scratch::new(label);
         let report = dir.1.join("pid");
         let exe = dir.1.join("window-2-stand-in");
-        std::fs::write(&exe, format!("#!/bin/sh\necho $$ > '{}'\n{script}\n", report.display())).unwrap();
-        std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o700)).unwrap();
+        script_fixture::write_executable_script(
+            &exe,
+            format!("#!/bin/sh\necho $$ > '{}'\n{script}\n", report.display()),
+            0o700,
+        )
+        .unwrap();
         let lock = PairLock::try_take(&dir.0, Path::new("/p")).unwrap().unwrap();
         let pair = Pair::full(Ok(Some(lock)), &dir.1, false, false);
         let timers: Rc<RefCell<Vec<Box<dyn FnOnce()>>>> = Rc::default();
@@ -3570,9 +3649,20 @@ pub(crate) mod tests {
         let window1 = Pair::new(WindowRole::Main { link: Some(one) }, None, Path::new("/p"));
 
         window1.ide_port_changed(Some(PORT));
+        window1
+            .link()
+            .unwrap()
+            .send(Msg::Away { ids: Vec::new() }, Vec::new())
+            .unwrap();
         assert!(
-            their_inbound.recv_timeout(Duration::from_millis(50)).is_err(),
-            "nothing goes ahead of welcome"
+            matches!(
+                their_inbound.recv_timeout(Duration::from_secs(60)),
+                Ok(Inbound::Msg {
+                    msg: Msg::Away { .. },
+                    ..
+                })
+            ),
+            "nothing goes ahead of welcome or the queue's marker"
         );
 
         let link = window1.link().unwrap();
@@ -3633,4 +3723,9 @@ pub(crate) mod tests {
             "{line}"
         );
     }
+}
+
+#[cfg(test)]
+mod script_fixture {
+    include!(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/support/executable.rs"));
 }

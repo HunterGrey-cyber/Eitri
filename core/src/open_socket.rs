@@ -325,6 +325,16 @@ struct Serving {
 }
 
 impl Serving {
+    fn poll_listener(&self, waiting: &mut [libc::pollfd], timeout_ms: libc::c_int) -> libc::c_int {
+        #[cfg(test)]
+        {
+            self.watch.timeout_ms.store(timeout_ms, Ordering::SeqCst);
+            self.watch.entered.store(true, Ordering::SeqCst);
+        }
+        // SAFETY: the slice supplies its actual length and owns valid borrowed descriptors.
+        unsafe { libc::poll(waiting.as_mut_ptr(), waiting.len() as libc::nfds_t, timeout_ms) }
+    }
+
     /// Parks in `poll` on the listener and the stop descriptor, and serves one connection at a time.
     fn run(&self, listener: &UnixListener, stop: &UnixStream) {
         let mut waiting = [
@@ -340,9 +350,8 @@ impl Serving {
             },
         ];
         loop {
-            // SAFETY: `waiting` is valid for the call, its length is passed, and both descriptors
-            // are borrowed for all of this function.
-            let ready = unsafe { libc::poll(waiting.as_mut_ptr(), waiting.len() as libc::nfds_t, -1) };
+            let timeout_ms = -1;
+            let ready = self.poll_listener(&mut waiting, timeout_ms);
             #[cfg(test)]
             self.watch.polls.fetch_add(1, Ordering::SeqCst);
             if ready < 0 {
@@ -470,6 +479,8 @@ impl Serving {
 #[cfg(test)]
 #[derive(Default)]
 struct ThreadWatch {
+    entered: std::sync::atomic::AtomicBool,
+    timeout_ms: std::sync::atomic::AtomicI32,
     polls: std::sync::atomic::AtomicU64,
     finished: std::sync::atomic::AtomicBool,
 }
@@ -786,7 +797,18 @@ pub enum Delivered {
 /// a window can run a request once it is sent, so that is the point after which giving up costs a
 /// second open.
 fn exchange(sock: &Path, line: &str, me: u32, within: Duration) -> Result<String, String> {
-    let deadline = Instant::now() + within;
+    exchange_with(sock, line, me, within, &Instant::now, &mut read_line)
+}
+
+fn exchange_with(
+    sock: &Path,
+    line: &str,
+    me: u32,
+    within: Duration,
+    now: &dyn Fn() -> Instant,
+    read: &mut dyn FnMut(&UnixStream, Instant, usize) -> Result<Vec<u8>, LineFail>,
+) -> Result<String, String> {
+    let deadline = now() + within;
     // A connect to a listener whose accept queue is full blocks on Linux, so it runs on a helper
     // thread that is simply abandoned when the deadline passes; it owns nothing but its stream.
     let (tx, rx) = mpsc::channel();
@@ -805,7 +827,7 @@ fn exchange(sock: &Path, line: &str, me: u32, within: Duration) -> Result<String
         Ok(_) => return Err(format!("{} is served by another user", sock.display())),
         Err(e) => return Err(format!("could not read the peer of {}: {e}", sock.display())),
     }
-    let greeting = read_line(&stream, deadline, MAX_LINE).map_err(|why| format!("not served ({why:?})"))?;
+    let greeting = read(&stream, deadline, MAX_LINE).map_err(|why| format!("not served ({why:?})"))?;
     if greeting != READY.as_bytes() {
         return Err(format!("{} did not say it was ready", sock.display()));
     }
@@ -813,7 +835,7 @@ fn exchange(sock: &Path, line: &str, me: u32, within: Duration) -> Result<String
         .set_write_timeout(Some(within))
         .and_then(|()| (&stream).write_all(line.as_bytes()))
         .map_err(|e| format!("could not send to {}: {e}", sock.display()))?;
-    let reply = read_line(&stream, Instant::now() + within, MAX_LINE).map_err(|why| format!("no reply ({why:?})"))?;
+    let reply = read(&stream, now() + within, MAX_LINE).map_err(|why| format!("no reply ({why:?})"))?;
     Ok(String::from_utf8_lossy(&reply).into_owned())
 }
 
@@ -1112,6 +1134,29 @@ mod tests {
         while !done() {
             assert!(Instant::now() < give_up, "never happened: {what}");
             std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    /// Waits until `sock`'s liveness lock can be taken. A child forked by another test keeps a dropped
+    /// holder's descriptor until it execs, so a lock just let go can look held for a moment; one that
+    /// was never let go is still held at the end of the wait. The probe is unlocked before it goes, so
+    /// a fork's copy of the probe cannot hold the lock past its drop either.
+    fn liveness_comes_free(sock: &Path) {
+        let give_up = Instant::now() + PATIENCE;
+        let probe = loop {
+            if let Some(lock) = liveness_lock(sock).unwrap() {
+                break lock;
+            }
+            assert!(Instant::now() < give_up, "never happened: the liveness lock comes free");
+            std::thread::sleep(Duration::from_millis(5));
+        };
+        loop {
+            // SAFETY: the lock owns the descriptor for this call; flock takes no pointers.
+            if unsafe { libc::flock(probe.as_file().as_raw_fd(), libc::LOCK_UN) } == 0 {
+                break;
+            }
+            let error = std::io::Error::last_os_error();
+            assert_eq!(error.kind(), std::io::ErrorKind::Interrupted, "{error}");
         }
     }
 
@@ -1654,6 +1699,7 @@ mod tests {
         std::fs::hard_link(&sock, &kept).unwrap();
         let before = identity(&sock);
         drop(alive);
+        liveness_comes_free(&sock);
         let server = fixture.server();
         assert_eq!(server.socket(), sock);
         assert_ne!(identity(&sock), before);
@@ -1667,7 +1713,69 @@ mod tests {
         assert_eq!(sock.with_extension("alive").metadata().unwrap().mode() & 0o777, 0o600);
         assert!(liveness_lock(&sock).unwrap().is_none());
         drop(alive);
-        assert!(liveness_lock(&sock).unwrap().is_some());
+        liveness_comes_free(&sock);
+        assert!(liveness_lock(&sock).unwrap().is_some(), "the next claimant can take the lock");
+    }
+
+    #[test]
+    fn a_dead_socket_whose_liveness_lock_is_held_is_not_reclaimed() {
+        let fixture = fixture();
+        let sock = fixture.root_socket();
+        drop(UnixListener::bind(&sock).unwrap());
+        let before = identity(&sock).unwrap();
+        let held = liveness_lock(&sock).unwrap().expect("nobody holds it yet");
+        let server = fixture.server();
+        assert_eq!(server.socket(), fixture.pid_socket());
+        assert_eq!(identity(&sock), Some(before));
+        // Reclaim checks liveness itself, whatever its two connects say.
+        assert!(reclaim(&sock).unwrap().is_none());
+        assert_eq!(identity(&sock), Some(before));
+        drop(held);
+    }
+
+    #[test]
+    fn a_link_at_a_liveness_file_is_refused_without_touching_its_target() {
+        let fixture = fixture();
+        let target = fixture.outside("target");
+        for sock in [fixture.root_socket(), fixture.pid_socket()] {
+            symlink(&target, sock.with_extension("alive")).unwrap();
+            assert!(liveness_lock(&sock).is_err());
+            assert_eq!(std::fs::read(&target).unwrap(), b"text\n");
+        }
+    }
+
+    #[test]
+    fn a_server_holds_its_liveness_lock_until_close() {
+        let fixture = fixture();
+        let server = fixture.server();
+        assert_eq!(server.socket(), fixture.root_socket());
+        let other = PrivateLock::open(&server.socket().with_extension("alive")).unwrap();
+        let meta = other.as_file().metadata().unwrap();
+        assert!(meta.is_file());
+        assert_eq!(meta.mode() & 0o777, 0o600);
+        // SAFETY: the lock's file owns this descriptor for the call; F_GETFD takes no pointer.
+        let flags = unsafe { libc::fcntl(other.as_file().as_raw_fd(), libc::F_GETFD) };
+        assert!(flags >= 0 && flags & libc::FD_CLOEXEC != 0);
+        assert!(!other.try_lock().unwrap(), "the open server holds its lock");
+        drop(other);
+        server.close();
+        liveness_comes_free(server.socket());
+        server.close();
+        assert!(!server.socket().exists());
+    }
+
+    #[test]
+    fn a_closed_server_leaves_the_root_socket_free_before_it_is_dropped() {
+        let fixture = fixture();
+        let first = fixture.server();
+        assert_eq!(first.socket(), fixture.root_socket());
+        first.close();
+        liveness_comes_free(first.socket());
+
+        let second = fixture.server();
+        assert_eq!(second.socket(), fixture.root_socket());
+        first.close();
+        assert!(UnixStream::connect(second.socket()).is_ok());
     }
 
     #[test]
@@ -1718,6 +1826,7 @@ mod tests {
             root_alive.exists(),
             "the root's .alive file is shared by every claimant and stays"
         );
+        liveness_comes_free(&fixture.root_socket());
         // The name is free again for a later window of this pid.
         let third = fixture.server();
         let fourth = fixture.server();
@@ -1814,8 +1923,28 @@ mod tests {
     fn the_thread_parks_with_no_wakeups() {
         let fixture = fixture();
         let server = fixture.server();
-        std::thread::sleep(Duration::from_millis(200));
-        assert_eq!(server.watch.polls.load(Ordering::SeqCst), 0);
+        wait_until("the listener enters its poll", || {
+            server.watch.entered.load(Ordering::SeqCst)
+        });
+        assert_eq!(
+            server.watch.timeout_ms.load(Ordering::SeqCst),
+            -1,
+            "an idle listener waits for descriptors only"
+        );
+        server.close();
+        wait_until("the stop wakes the listener", || {
+            server.watch.finished.load(Ordering::SeqCst)
+        });
+        assert_eq!(
+            server.watch.timeout_ms.load(Ordering::SeqCst),
+            -1,
+            "the completed poll received an infinite timeout"
+        );
+        assert_eq!(
+            server.watch.polls.load(Ordering::SeqCst),
+            1,
+            "after shutdown every wakeup has been counted, and stop is the only one"
+        );
     }
 
     fn target(path: PathBuf) -> OpenTarget {
@@ -1866,23 +1995,42 @@ mod tests {
     #[test]
     fn a_client_behind_a_held_request_hears_what_became_of_it() {
         let fixture = fixture();
-        let (first_file, second_file) = (fixture.file("a"), fixture.file("b"));
-        let server = fixture.server();
-        let first = deliver_later(&fixture, vec![target(first_file)], None);
-        let (_, _held) = next_request(&server).take().unwrap();
-        let connected = Instant::now();
-        let second = deliver_later(&fixture, vec![target(second_file)], None);
-        // The held request keeps the thread for three seconds.
-        assert_eq!(first.join().unwrap(), fixture.opened());
-        let (_, answering) = next_request(&server).take().unwrap();
-        let past_a_deadline_from_the_connect = CLIENT_DEADLINE + Duration::from_millis(200);
-        std::thread::sleep(past_a_deadline_from_the_connect.saturating_sub(connected.elapsed()));
-        answering.answer(Answer::Accepted);
+        let listener = UnixListener::bind(fixture.root_socket()).unwrap();
+        let peer = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream.set_read_timeout(Some(PATIENCE)).unwrap();
+            reply_line(&stream, READY).unwrap();
+            let mut line = [0u8; 2];
+            stream.read_exact(&mut line).unwrap();
+            assert_eq!(&line, b"x\n");
+            reply_line(&stream, "ok").unwrap();
+        });
+        let clock = Cell::new(Instant::now());
+        let connected = clock.get();
+        let mut reads = Vec::new();
+        let answer = exchange_with(
+            &fixture.root_socket(),
+            "x\n",
+            euid(),
+            PATIENCE,
+            &|| clock.get(),
+            &mut |stream, deadline, cap| {
+                reads.push(deadline);
+                let line = read_line(stream, Instant::now() + PATIENCE, cap)?;
+                if reads.len() == 1 {
+                    clock.set(connected + PATIENCE + Duration::from_secs(1));
+                }
+                Ok(line)
+            },
+        )
+        .unwrap();
+        assert_eq!(answer, "ok");
         assert_eq!(
-            second.join().unwrap(),
-            fixture.opened(),
-            "the window runs this request, so a new window would hold the file as well"
+            reads,
+            [connected + PATIENCE, clock.get() + PATIENCE],
+            "the reply gets its whole budget after ready, even after a queued wait"
         );
+        peer.join().unwrap();
     }
 
     #[test]

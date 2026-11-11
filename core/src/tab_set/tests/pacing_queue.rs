@@ -185,6 +185,7 @@ fn closing_asks_only_for_a_running_turn_a_connect_or_a_queue() {
 /// snapshot a switch (or a reload) sends carries it.
 #[test]
 fn a_running_turn_keeps_its_start_time_across_ticks_and_the_snapshot_carries_it() {
+    let clock = TestWallClock::new();
     let dir = workspace("tabs-turn-clock");
     let mut set = set();
     let tab = set.active();
@@ -200,7 +201,7 @@ fn a_running_turn_keeps_its_start_time_across_ticks_and_the_snapshot_carries_it(
         .turn_started_at_ms()
         .expect("stamped when the turn is delivered");
     assert!(stamp >= before && stamp <= wall_clock_ms());
-    std::thread::sleep(Duration::from_millis(20));
+    clock.advance(20);
     set.pump(&dir, true);
     assert_eq!(
         set.get(tab).unwrap().turn_started_at_ms(),
@@ -255,6 +256,7 @@ fn snapshot_turn_times(set: &mut TabSet) -> serde_json::Value {
 /// and in every later snapshot; a second end is a second entry.
 #[test]
 fn a_completed_turn_records_its_duration_in_the_events_and_the_snapshot() {
+    let clock = TestWallClock::new();
     let dir = workspace("tabs-turn-times-completed");
     let mut set = set();
     let tab = set.active();
@@ -269,7 +271,7 @@ fn a_completed_turn_records_its_duration_in_the_events_and_the_snapshot() {
     provider.queue(started("t1"));
     pump_until_running(&mut set, &dir, tab, true);
     let started_at = set.get(tab).unwrap().turn_started_at_ms().expect("t1 stamped");
-    std::thread::sleep(Duration::from_millis(25));
+    clock.advance(25);
     provider.queue(text_delta("t1", "done"));
     provider.queue(completed("t1", agent::TurnOutcome::Completed));
     let times = pump_until_turn_times(&mut set, &dir);
@@ -280,7 +282,7 @@ fn a_completed_turn_records_its_duration_in_the_events_and_the_snapshot() {
     let ended_at = times[0]["endedAtMs"].as_u64().unwrap();
     assert!(
         ended_at >= started_at + 25,
-        "the turn ran at least the sleep: {started_at} -> {ended_at}"
+        "the turn includes the advanced time: {started_at} -> {ended_at}"
     );
     assert_eq!(
         set.get(tab).unwrap().session.turn_times_unsent,

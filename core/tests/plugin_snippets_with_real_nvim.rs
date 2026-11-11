@@ -52,7 +52,8 @@ fn case_with(name: &str, args: &[&str]) -> Case {
     std::fs::write(&a, "fn main() {\nlet s = \"\u{4e2d}\u{6587}\"; x\n}\n").unwrap();
     std::fs::write(&b, "one\ntwo\n").unwrap();
     std::fs::write(&outside, "out\n").unwrap();
-    let nvim = Embed::start(&dir, args, &[]);
+    let mut nvim = Embed::start(&dir, args, &[]);
+    nvim.manual_timers();
     Case {
         dir,
         root,
@@ -276,9 +277,9 @@ fn reassert_holds_after_an_lsp_attach_that_turns_hints_on() {
     attach(&mut c, &a);
     c.nvim.flush_scheduled();
     // Past the first retry, then past the late enable and the retry after it.
-    c.nvim.lua("vim.wait(150)", vec![]);
+    c.nvim.advance_timers(150);
     assert_eq!(state(&mut c, &a), (true, false));
-    c.nvim.lua("vim.wait(550)", vec![]);
+    c.nvim.advance_timers(550);
     assert_eq!(state(&mut c, &a), (true, false));
     // A buffer under the root opened after the apply gets the setting too.
     edit(&mut c, &b);
@@ -302,7 +303,7 @@ fn a_hint_baseline_read_before_a_server_attaches_settles_after_it() {
     // Applied before any server is attached: the hint baseline read now is not the one to restore.
     apply(&mut c, "demo", true, false);
     attach(&mut c, &a);
-    c.nvim.lua("vim.wait(600)", vec![]);
+    c.nvim.advance_timers(600);
     assert_eq!(
         state(&mut c, &a),
         (true, false),
@@ -325,7 +326,7 @@ fn an_owner_value_applied_before_an_attach_is_not_taken_as_the_baseline() {
     edit(&mut c, &a);
     apply(&mut c, "demo", true, true);
     attach(&mut c, &a);
-    c.nvim.lua("vim.wait(600)", vec![]);
+    c.nvim.advance_timers(600);
     assert_eq!(
         state(&mut c, &a),
         (true, true),
@@ -353,13 +354,13 @@ fn a_buffer_event_before_the_first_retry_does_not_hide_the_configurations_hints(
     apply(&mut c, "demo", true, false);
     attach(&mut c, &a);
     // After the configuration's scheduled enable and before the first retry at 100 ms.
-    c.nvim.lua("vim.wait(30)", vec![]);
+    c.nvim.advance_timers(30);
     c.nvim.lua(
         "vim.api.nvim_exec_autocmds('BufEnter', { buffer = vim.fn.bufnr(...), modeline = false })",
         vec![s(&a)],
     );
     c.nvim.flush_scheduled();
-    c.nvim.lua("vim.wait(600)", vec![]);
+    c.nvim.advance_timers(600);
     assert_eq!(state(&mut c, &a), (true, false), "the owner's value holds");
     clear(&mut c, "demo");
     assert_eq!(
@@ -736,20 +737,21 @@ fn bytes(path: &Path) -> Value {
 
 /// A case with the follow socket listening at `<case dir>/f.sock`.
 fn follow_case(name: &str) -> (Case, UnixListener, PathBuf) {
-    let c = case(&format!("f-{name}"));
+    let mut c = case(&format!("f-{name}"));
+    c.nvim.manual_timers();
+    c.nvim.lua(
+        "vim.uv.hrtime = function() return test_timers.now() * 1000000 end",
+        vec![],
+    );
     let socket = c.dir.join("f.sock");
     let listener = UnixListener::bind(&socket).unwrap();
     listener.set_nonblocking(true).unwrap();
     (c, listener, socket)
 }
 
-/// Every line nvim sent to `listener` within `wait`, parsed, in accept order. nvim writes from its own loop, so
-/// the test gives it the time with `vim.wait` before reading.
+/// Every line sent while manually advancing the snippet's timers, parsed in accept order.
 fn lines_within(nvim: &mut Embed, listener: &UnixListener, wait: Duration) -> Vec<serde_json::Value> {
-    nvim.lua(
-        "local ms = ... vim.wait(ms)",
-        vec![Value::from(wait.as_millis() as u64)],
-    );
+    nvim.advance_timers(wait.as_millis() as u64);
     let mut out = Vec::new();
     loop {
         match listener.accept() {
@@ -2362,7 +2364,7 @@ fn preload_server(c: &mut Case) {
 fn wait_preload_server(c: &mut Case, buf: &Value) -> Value {
     c.nvim.lua(
         "local b = ... assert(vim.wait(2000, function() return #vim.lsp.get_clients({bufnr=b}) > 0 end)) \
-         vim.wait(600, function() return false end) return vim.lsp.get_clients({bufnr=b})[1].id",
+         test_timers.advance(600) return vim.lsp.get_clients({bufnr=b})[1].id",
         vec![buf.clone()],
     )
 }
@@ -2494,7 +2496,7 @@ fn assist_on_a_preloaded_buffer_takes_its_own_values_from_the_preload_record() {
     wait_preload_server(&mut c, field(&result, "buf"));
     apply(&mut c, "demo", false, false);
     clear(&mut c, "demo");
-    c.nvim.lua("vim.wait(1100, function() return false end)", vec![]);
+    c.nvim.lua("test_timers.advance(1100)", vec![]);
     assert_eq!(state(&mut c, &a), (true, true));
     let got = c.nvim.lua("local b = ... return {vim.b[b].eitri_plugin_preload_own == nil, not pcall(vim.api.nvim_get_autocmds, {group='eitri_plugin_preload_demo'})}", vec![field(&result, "buf").clone()]);
     assert_eq!(got, Value::Array(vec![true.into(), true.into()]));
@@ -2521,7 +2523,7 @@ fn a_preload_takes_the_hint_value_its_configuration_sets_when_a_server_attaches(
     );
     apply(&mut c, "demo", false, false);
     clear(&mut c, "demo");
-    c.nvim.lua("vim.wait(1100, function() return false end)", vec![]);
+    c.nvim.lua("test_timers.advance(1100)", vec![]);
     assert_eq!(
         state(&mut c, &a),
         (true, true),

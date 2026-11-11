@@ -140,12 +140,22 @@ impl QuitGate {
 /// that took. The app's shutdown runs it last, on the main thread, after the window's own sources have stopped:
 /// AppKit ends the process once a terminate's notification returns, and Neovide's loop has already ended on the
 /// other way out, so this wait is what keeps the process alive for them, as the application hold does on Linux.
-pub fn wait_for_the_close(mut watch: eitri_panel::agent_panel::ShutdownWatch) -> Duration {
-    let started = Instant::now();
-    while watch.step(Instant::now()) {
-        std::thread::sleep(eitri_panel::agent_panel::CLOSE_WATCH_POLL);
+pub fn wait_for_the_close(watch: eitri_panel::agent_panel::ShutdownWatch) -> Duration {
+    wait_for_close_with(watch, Instant::now, || {
+        std::thread::sleep(eitri_panel::agent_panel::CLOSE_WATCH_POLL)
+    })
+}
+
+fn wait_for_close_with(
+    mut watch: eitri_panel::agent_panel::ShutdownWatch,
+    mut now: impl FnMut() -> Instant,
+    mut pause: impl FnMut(),
+) -> Duration {
+    let started = now();
+    while watch.step(now()) {
+        pause();
     }
-    started.elapsed()
+    now().saturating_duration_since(started)
 }
 
 #[cfg(test)]
@@ -163,7 +173,7 @@ mod tests {
     }
 
     /// The close hands the saved tabs to their writer and the app's shutdown waits until the write is on disk:
-    /// held for 300 ms on the writer thread, the wait lasts that long, and the tab is in the file after it.
+    /// the writer waits until the close has been observed holding, and the tab is in the file after it.
     #[test]
     fn the_close_waits_for_the_saved_tabs_last_write() {
         use std::sync::{mpsc, Arc, Mutex};
@@ -173,26 +183,48 @@ mod tests {
         let project = project.canonicalize().unwrap();
         let (release_tx, release_rx) = mpsc::channel::<()>();
         let release_rx = Mutex::new(release_rx);
+        let (entered, writing) = mpsc::channel();
+        let entered = Mutex::new(entered);
         let panel = eitri_panel::agent_panel::AgentPanelHandle::for_host_test_with_saved_tabs(
             std::rc::Rc::new(NoPage),
             files.clone(),
             project.clone(),
             "s-held",
             Arc::new(move || {
-                let _ = release_rx.lock().unwrap().recv_timeout(Duration::from_secs(10));
+                entered.lock().unwrap().send(()).unwrap();
+                release_rx
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(Duration::from_secs(60))
+                    .unwrap();
             }),
         );
-        let release = std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_millis(300));
-            let _ = release_tx.send(());
-        });
-        let took = wait_for_the_close(panel.shutdown());
-        release.join().unwrap();
-        assert!(
-            took >= Duration::from_millis(250),
-            "the wait ended before the write did: {took:?}"
+        let clock = std::cell::Cell::new(Instant::now());
+        let watch = panel.shutdown();
+        writing
+            .recv_timeout(Duration::from_secs(60))
+            .expect("the write started");
+        let guard = Instant::now() + Duration::from_secs(60);
+        let mut waits = 0;
+        wait_for_close_with(
+            watch,
+            || clock.get(),
+            || {
+                waits += 1;
+                if waits <= 3 {
+                    clock.set(clock.get() + eitri_panel::agent_panel::CLOSE_WATCH_POLL);
+                }
+                if waits == 3 {
+                    release_tx.send(()).unwrap();
+                }
+                assert!(
+                    Instant::now() < guard,
+                    "the close never finished after releasing the write"
+                );
+                std::thread::yield_now();
+            },
         );
-        assert!(took < Duration::from_secs(5), "and ended once it was done: {took:?}");
+        assert!(waits >= 3, "the close must keep holding until the write is released");
         let saved = match eitri_core::saved_tabs::load(&files, &project) {
             eitri_core::saved_tabs::Loaded::Saved(saved) => saved,
             other => panic!("{other:?}"),

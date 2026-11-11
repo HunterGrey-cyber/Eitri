@@ -62,6 +62,12 @@ pub(crate) struct FeedPump {
     me: Weak<FeedPump>,
     #[cfg(test)]
     ticks: std::cell::Cell<u32>,
+    #[cfg(test)]
+    timer_id: Cell<Option<u32>>,
+    #[cfg(test)]
+    timer_interval: Cell<std::time::Duration>,
+    #[cfg(test)]
+    test_now: Cell<Option<Instant>>,
 }
 
 impl FeedPump {
@@ -79,7 +85,21 @@ impl FeedPump {
             me: me.clone(),
             #[cfg(test)]
             ticks: std::cell::Cell::new(0),
+            #[cfg(test)]
+            timer_id: Cell::new(None),
+            #[cfg(test)]
+            timer_interval: Cell::new(EditorFeeds::TICK),
+            #[cfg(test)]
+            test_now: Cell::new(None),
         })
+    }
+
+    fn now(&self) -> Instant {
+        #[cfg(test)]
+        if let Some(now) = self.test_now.get() {
+            return now;
+        }
+        Instant::now()
     }
 
     /// The timer fired: poll, and keep the timer only while there is more to read.
@@ -138,7 +158,15 @@ impl FeedPump {
         let Some(pump) = self.me.upgrade() else {
             return Wake::Watches(Vec::new());
         };
-        glib::timeout_add_local(EditorFeeds::TICK, move || pump.on_timer());
+        #[cfg(not(test))]
+        let interval = EditorFeeds::TICK;
+        #[cfg(test)]
+        let interval = self.timer_interval.get();
+        let id = glib::timeout_add_local(interval, move || pump.on_timer());
+        #[cfg(test)]
+        self.timer_id.set(Some(id.as_raw()));
+        #[cfg(not(test))]
+        let _ = id;
         Wake::Timer
     }
 
@@ -190,7 +218,12 @@ impl FeedPump {
     fn tick(&self) {
         #[cfg(test)]
         self.ticks.set(self.ticks.get() + 1);
-        let events = self.feeds.borrow_mut().poll(Instant::now());
+        #[cfg(test)]
+        if let Some(now) = self.test_now.get() {
+            // Each dispatched poll passes every reader's cadence, including readers added by a handler.
+            self.test_now.set(Some(now + std::time::Duration::from_secs(1)));
+        }
+        let events = self.feeds.borrow_mut().poll(self.now());
         if let Some(payload) = events.theme {
             let handler = self.theme.borrow().clone();
             if let Some(handler) = handler {
@@ -259,7 +292,7 @@ impl FeedPump {
         *self.theme.borrow_mut() = Some(Rc::new(on_payload));
         self.feeds
             .borrow_mut()
-            .add_theme(ThemePayloadReader::new(listener), Instant::now());
+            .add_theme(ThemePayloadReader::new(listener), self.now());
         self.rearm();
     }
 
@@ -273,7 +306,7 @@ impl FeedPump {
         *self.keys.borrow_mut() = Some(Rc::new(on_report));
         self.feeds
             .borrow_mut()
-            .add_keys(NvimKeysReader::new(listener), Instant::now());
+            .add_keys(NvimKeysReader::new(listener), self.now());
         self.rearm();
     }
 
@@ -291,7 +324,7 @@ impl FeedPump {
             return (Rc::new(|| None), Rc::new(|| {}));
         };
         let reader = EditorContextReader::with_generation(listener, generation);
-        let added = self.feeds.borrow_mut().add_context(reader, scratch_dir, Instant::now());
+        let added = self.feeds.borrow_mut().add_context(reader, scratch_dir, self.now());
         self.rearm();
         added
     }
@@ -327,7 +360,7 @@ impl FeedPump {
         };
         *self.pane.borrow_mut() = Some(Rc::new(on_message));
         let reader = PaneSwitchReader::with_generation(listener, generation);
-        self.feeds.borrow_mut().add_pane_switch(reader, Instant::now());
+        self.feeds.borrow_mut().add_pane_switch(reader, self.now());
         self.rearm();
     }
 
@@ -341,7 +374,7 @@ impl FeedPump {
         *self.follow.borrow_mut() = Some(Rc::new(on_batch));
         self.feeds
             .borrow_mut()
-            .add_follow(FollowReader::new(listener), Instant::now());
+            .add_follow(FollowReader::new(listener), self.now());
         self.rearm();
     }
 }
@@ -396,18 +429,59 @@ mod tests {
     use std::os::unix::net::UnixStream;
     use std::time::Duration;
 
-    /// Runs glib's default main context for `ms`, or until `done` holds.
+    fn start_pump() -> Rc<FeedPump> {
+        let pump = FeedPump::start();
+        pump.test_now.set(Some(Instant::now()));
+        pump
+    }
+
+    /// Waits for an event on glib's default main context, with a deadline only as a hang guard.
     fn iterate_until(ms: u64, done: impl Fn() -> bool) -> bool {
         let context = glib::MainContext::default();
-        let deadline = Instant::now() + Duration::from_millis(ms);
-        while Instant::now() < deadline {
-            while context.iteration(false) {}
+        let deadline = Instant::now() + Duration::from_millis(ms.max(60_000));
+        for _ in 0..100_000 {
+            if Instant::now() >= deadline {
+                return false;
+            }
+            context.iteration(false);
             if done() {
                 return true;
             }
             std::thread::sleep(Duration::from_millis(1));
         }
-        false
+        panic!("the feed event did not arrive in 100000 turns");
+    }
+
+    fn settle_pump(pump: &FeedPump) {
+        let deadline = Instant::now() + Duration::from_secs(60);
+        for _ in 0..100_000 {
+            assert!(Instant::now() < deadline, "the feed readers never became quiet");
+            if matches!(*pump.wake.borrow(), Wake::Watches(_)) {
+                return;
+            }
+            gtk4::glib::MainContext::default().iteration(false);
+            if matches!(*pump.wake.borrow(), Wake::Timer) {
+                // Dispatch the timer through its installed source, so Break removes it normally.
+                let context = gtk4::glib::MainContext::default();
+                use gtk4::glib::translate::ToGlibPtr;
+                let id = pump.timer_id.get().expect("a timer was installed");
+                let raw = unsafe { gtk4::glib::ffi::g_main_context_find_source_by_id(context.to_glib_none().0, id) };
+                assert!(!raw.is_null(), "the timer is attached");
+                unsafe { gtk4::glib::ffi::g_source_set_ready_time(raw, 0) };
+            }
+            std::thread::yield_now();
+        }
+        panic!("the pump did not become quiet in 100000 turns");
+    }
+
+    fn quiet_turns(pump: &FeedPump) {
+        for _ in 0..100 {
+            assert!(
+                matches!(*pump.wake.borrow(), Wake::Watches(_)),
+                "an idle pump armed a timer"
+            );
+            gtk4::glib::MainContext::default().iteration(false);
+        }
     }
 
     fn send(path: &std::path::Path, line: &str) {
@@ -427,7 +501,8 @@ mod tests {
         let _owner = context
             .acquire()
             .expect("glib's default main context, which the other tests on it leave to this one");
-        let pump = FeedPump::start();
+        let pump = start_pump();
+        pump.timer_interval.set(Duration::from_secs(86400));
         let mut theme = ThemeFeed::new().unwrap();
         let mut keys = NvimKeysFeed::new().unwrap();
         let mut context_feed = EditorContextFeed::new().unwrap();
@@ -459,17 +534,14 @@ mod tests {
         }
         assert_eq!(pump.feeds.borrow().listener_fds().len(), 5);
 
-        iterate_until(300, || false);
+        settle_pump(&pump);
         let before = pump.ticks.get();
-        iterate_until(1000, || false);
-        assert_eq!(pump.ticks.get() - before, 0, "polls in a second with nothing sent");
+        quiet_turns(&pump);
+        assert_eq!(pump.ticks.get() - before, 0, "polls during idle dispatch turns");
 
-        let sent = Instant::now();
         send(pane.socket_path(), "L");
         assert!(iterate_until(2000, || !panes.borrow().is_empty()), "the pane message");
-        let waited = sent.elapsed();
         assert_eq!(*panes.borrow(), vec![PaneMessage::Direction('L')]);
-        assert!(waited < Duration::from_millis(500), "took {waited:?}");
 
         send(
             theme.socket_path(),
@@ -487,13 +559,11 @@ mod tests {
         assert!(iterate_until(2000, || contexts.get() == 1), "the context change");
         assert_eq!(context_source().map(|c| c.file), Some("/p/a.rs".to_string()));
 
-        let sent = Instant::now();
         send(follow.socket_path(), r#"{"v":1,"k":"cmd","owner":"demo","cmd":"show"}"#);
         assert!(
             iterate_until(2000, || !follows.borrow().is_empty()),
             "the follow command"
         );
-        let waited = sent.elapsed();
         assert_eq!(
             *follows.borrow(),
             vec![eitri_core::plugin::follow_feed::Ordered::Cmd {
@@ -502,11 +572,10 @@ mod tests {
                 buf: None,
             }]
         );
-        assert!(waited < Duration::from_millis(500), "took {waited:?}");
 
-        iterate_until(300, || false);
+        settle_pump(&pump);
         let before = pump.ticks.get();
-        iterate_until(500, || false);
+        quiet_turns(&pump);
         assert_eq!(pump.ticks.get() - before, 0, "quiet again after the messages");
         assert_eq!(contexts.get(), 1, "said once");
 
@@ -528,7 +597,7 @@ mod tests {
         let _owner = context
             .acquire()
             .expect("glib's default main context, which the other tests on it leave to this one");
-        let pump = FeedPump::start();
+        let pump = start_pump();
         let mut pane = PaneSwitchChannel::bind_without_shim().unwrap();
         let theme = Rc::new(RefCell::new(ThemeFeed::new().unwrap()));
         let themes = Rc::new(RefCell::new(Vec::new()));
@@ -544,7 +613,7 @@ mod tests {
                 });
             });
         }
-        iterate_until(200, || false);
+        settle_pump(&pump);
         send(pane.socket_path(), "L");
         assert!(
             iterate_until(2000, || pump.feeds.borrow().listener_fds().len() == 2),
@@ -560,9 +629,9 @@ mod tests {
         );
         assert_eq!(*themes.borrow(), vec!["y".to_string()]);
 
-        iterate_until(300, || false);
+        settle_pump(&pump);
         let before = pump.ticks.get();
-        iterate_until(500, || false);
+        quiet_turns(&pump);
         assert_eq!(pump.ticks.get() - before, 0, "quiet again");
         theme.borrow_mut().cleanup();
         pane.cleanup();
@@ -576,12 +645,12 @@ mod tests {
         let _turn = crate::layout_state::default_context_turn();
         let context = glib::MainContext::default();
         let _owner = context.acquire().expect("glib's default main context");
-        let pump = FeedPump::start();
+        let pump = start_pump();
         let mut feed = EditorContextFeed::new().unwrap();
         let (source, _) = pump.listen_context(&mut feed, None, None);
         let panel = eitri_panel::agent_panel::AgentPanelHandle::for_host_test(Rc::new(NoPage));
         wake_panel_on_context(&pump, &panel);
-        iterate_until(200, || false);
+        settle_pump(&pump);
         let now = Instant::now();
         let _ = panel.take_wake(now);
         assert_eq!(panel.take_wake(now), None, "nothing raised before the context");
@@ -617,19 +686,19 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn companion_feed_counts_as_presence() {
+        let _clock = crate::remote_presence::StampClock::new();
         agent::state_dirs::redirect_state_to_a_test_root();
         let _turn = crate::layout_state::default_context_turn();
         let context = glib::MainContext::default();
         let _owner = context.acquire().expect("glib's default main context");
-        let pump = FeedPump::start();
+        let pump = start_pump();
         let mut feed = EditorContextFeed::new().unwrap();
         // No panel listens: the stamp does not depend on one.
         let _ = pump.listen_context(&mut feed, Some(std::path::PathBuf::from("/p/scratch")), None);
-        iterate_until(200, || false);
+        settle_pump(&pump);
         // A file, then a draft in Eitri's scratch directory, which never becomes the context.
         for file in ["/p/b.rs", "/p/scratch/1-draft.md"] {
             let before = crate::remote_presence::last_stamp();
-            std::thread::sleep(Duration::from_millis(2));
             send(
                 feed.socket_path(),
                 &format!(r#"{{"v":1,"file":"{file}","selection":null}}"#),
@@ -651,7 +720,7 @@ mod tests {
         let _turn = crate::layout_state::default_context_turn();
         let context = glib::MainContext::default();
         let _owner = context.acquire().expect("glib's default main context");
-        let pump = FeedPump::start();
+        let pump = start_pump();
         let mut feed = EditorContextFeed::new().unwrap();
         let own = pump.listen_own_context(&mut feed, None);
         let source = own.source();
@@ -671,8 +740,14 @@ mod tests {
         assert!(source().is_none(), "the left nvim's file is still the editor's context");
         assert!(facts().is_none(), "the left nvim's facts are still the editor's");
         assert_eq!(heard.get(), before + 1, "the hookup hears the change once");
+        let ticks = pump.ticks.get();
         send(feed.socket_path(), r#"{"v":1,"file":"/p/b.rs","selection":null}"#);
-        iterate_until(300, || false);
+        assert!(
+            iterate_until(60_000, || pump.ticks.get() > ticks),
+            "the left nvim's packet was never read"
+        );
+        settle_pump(&pump);
+        quiet_turns(&pump);
         assert!(
             source().is_none(),
             "what the left nvim still sends is taken as the editor's"

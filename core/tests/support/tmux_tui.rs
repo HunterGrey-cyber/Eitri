@@ -124,7 +124,7 @@ impl TmuxTui {
         self.server
     }
     pub fn link(&self) -> NvimLink {
-        NvimLink::connect(&self.addr, Duration::from_secs(2)).unwrap().0
+        NvimLink::connect(self.server_addr(), Duration::from_secs(2)).unwrap().0
     }
     pub fn lua(&self, link: &NvimLink, code: &str, args: Vec<Value>) -> Value {
         link.exec_lua(code, args)
@@ -137,7 +137,7 @@ impl TmuxTui {
 impl Drop for TmuxTui {
     fn drop(&mut self) {
         // Both processes were started by this private terminal. The server can outlive its UI.
-        for (pid, start) in [self.server, self.tui].into_iter().zip(self.starts) {
+        for (pid, start) in [self.server_pid(), self.tui_pid()].into_iter().zip(self.starts) {
             if pid > 0 && start.is_some() && eitri_core::split::proc_start_time(pid) == start {
                 unsafe {
                     libc::kill(pid as libc::pid_t, libc::SIGKILL);

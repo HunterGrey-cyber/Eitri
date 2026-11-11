@@ -62,6 +62,14 @@ pub struct Embed {
 }
 
 impl Embed {
+    pub fn manual_timers(&mut self) {
+        self.lua(include_str!("manual_timers.lua"), vec![]);
+    }
+
+    pub fn advance_timers(&mut self, ms: u64) {
+        self.lua("test_timers.advance(...)", vec![Value::from(ms)]);
+    }
+
     /// Runs `nvim --clean --embed --headless -n -i NONE <extra_args>` (without `-n` if `env` names `EMBED_KEEP_SWAP`) in `dir`, with `env` added and
     /// every XDG directory pointed under `dir`, so nothing of the user's reaches it.
     pub fn start(dir: &Path, extra_args: &[&str], env: &[(&str, &str)]) -> Embed {
@@ -288,4 +296,18 @@ impl Drop for Embed {
 /// A table of string keys to values, as `nvim_exec_lua` takes it.
 pub fn opts_map(entries: &[(&str, Value)]) -> Value {
     Value::Map(entries.iter().map(|(k, v)| (Value::from(*k), v.clone())).collect())
+}
+
+/// Gives same-size disk edits a distinct mtime without waiting for filesystem timestamp granularity.
+pub fn write_changed(path: impl AsRef<Path>, bytes: impl AsRef<[u8]>) -> std::io::Result<()> {
+    let path = path.as_ref();
+    let before = std::fs::metadata(path).and_then(|m| m.modified()).ok();
+    std::fs::write(path, bytes)?;
+    if let Some(before) = before {
+        std::fs::File::options()
+            .write(true)
+            .open(path)?
+            .set_times(std::fs::FileTimes::new().set_modified(before + Duration::from_secs(2)))?;
+    }
+    Ok(())
 }

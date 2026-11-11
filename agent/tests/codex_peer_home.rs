@@ -6,11 +6,10 @@
 #[path = "support/codex_peer.rs"]
 mod codex_peer;
 
-use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 
 use agent::providers::codex::BinaryKey;
-use codex_peer::{real_codex, require_supported_codex, write_file, Scratch};
+use codex_peer::{real_codex, require_supported_codex, Scratch};
 
 #[test]
 fn every_probe_runs_in_a_private_home_whatever_the_caller_exported() {
@@ -18,19 +17,26 @@ fn every_probe_runs_in_a_private_home_whatever_the_caller_exported() {
     let exported = s.dir("exported");
     let seen = s.path("seen");
     let program = s.path("codex");
-    write_file(
+    script_fixture::write_executable_script(
         &program,
         &format!(
             "#!/bin/sh\nprintf '%s\\n' \"$CODEX_HOME\" >> '{}'\necho 'codex-cli 0.166.0'\n",
             seen.display()
         ),
-    );
-    std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).expect("an executable stand-in");
-    std::env::set_var("EITRI_CODEX", &program);
-    std::env::set_var("CODEX_HOME", &exported);
+        0o755,
+    )
+    .expect("an executable stand-in");
+    if !agent::testkit::environment::in_child(&[
+        ("EITRI_CODEX", Some(program.as_os_str())),
+        ("CODEX_HOME", Some(exported.as_os_str())),
+    ]) {
+        return;
+    }
 
     // Three ways a suite meets `--version`: the print, the floor's check, and the product's own probe.
     let found = real_codex();
+    let seen = found.parent().unwrap().join("seen");
+    let exported = std::env::var_os("CODEX_HOME").unwrap();
     require_supported_codex(&found);
     BinaryKey::of(&found).expect("the stand-in's version");
 
@@ -42,4 +48,9 @@ fn every_probe_runs_in_a_private_home_whatever_the_caller_exported() {
         assert_ne!(Path::new(home), exported, "a probe ran in the caller's home");
         assert!(Path::new(home).starts_with(&target), "a probe ran in {home:?}");
     }
+}
+
+#[cfg(test)]
+mod script_fixture {
+    include!(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/support/executable.rs"));
 }

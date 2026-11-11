@@ -422,6 +422,9 @@ fn lexical(path: &Path) -> PathBuf {
     out
 }
 
+#[cfg(test)]
+thread_local! { static MATCH_CELLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) }; }
+
 /// Whether the pattern's segments match the path's segments from the first to the last. Worked out over every place in
 /// the pattern and in the path at once, so a pattern with many `**` costs its length times the path's and no more:
 /// a project's settings are not trusted to keep it small.
@@ -433,6 +436,8 @@ fn matches_segments(pattern: &[String], path: &[String]) -> bool {
     }
     let (rows, columns) = (pattern.len() + 1, path.len() + 1);
     // `reach[p][n]`: the first `p` segments of the pattern match the first `n` of the path.
+    #[cfg(test)]
+    MATCH_CELLS.with(|count| count.set(count.get() + rows * columns));
     let mut reach = vec![vec![false; columns]; rows];
     reach[0][0] = true;
     for p in 0..pattern.len() {
@@ -628,12 +633,15 @@ mod tests {
         let pattern = format!("Read({}never.txt)", "**/".repeat(40));
         let rules = rules(&[&pattern]);
         let deep = format!("/work/project/{}x.txt", "d/".repeat(60));
-        let started = std::time::Instant::now();
+        MATCH_CELLS.with(|count| count.set(0));
         assert!(!rules.denies(Path::new(ROOT), Path::new(&deep)));
-        assert!(
-            started.elapsed() < std::time::Duration::from_secs(5),
-            "{:?}",
-            started.elapsed()
+        let pattern: Vec<String> = (0..40).map(|_| "**".into()).chain(["never.txt".into()]).collect();
+        let path: Vec<String> = (0..60).map(|_| "d".into()).chain(["x.txt".into()]).collect();
+        MATCH_CELLS.with(|count| count.set(0));
+        assert!(!matches_segments(&pattern, &path));
+        assert_eq!(
+            MATCH_CELLS.with(|count| count.get()),
+            (pattern.len() + 1) * (path.len() + 1)
         );
         assert!(rules.denies(
             Path::new(ROOT),
@@ -811,12 +819,9 @@ mod tests {
                 1 => std::os::unix::fs::symlink("/dev/zero", &file).unwrap(),
                 _ => std::fs::write(&file, vec![b' '; (FILE_MAX + 1) as usize]).unwrap(),
             }
-            let started = std::time::Instant::now();
-            let rules = ReadRules::load(&root, Some(&config), None);
-            assert!(
-                started.elapsed() < std::time::Duration::from_secs(5),
-                "{label} was waited for"
-            );
+            let config = config.clone();
+            let root_in = root.clone();
+            let rules = crate::test_tmp::completed(move || ReadRules::load(&root_in, Some(&config), None));
             let why = rules.closed().unwrap_or_else(|| panic!("{label}: not closed"));
             assert!(why.contains("settings.json"), "{label}: {why}");
             let reason = if make == 2 {
@@ -907,14 +912,18 @@ mod tests {
         let many: Vec<&str> = many.iter().map(String::as_str).collect();
         let rules = rules(&many);
         assert!(rules.closed().is_none());
-        let started = std::time::Instant::now();
+        MATCH_CELLS.with(|count| count.set(0));
         for n in 0..50 {
             assert!(!rules.denies(Path::new(ROOT), Path::new(&format!("/work/project/d/e/f{n}/g/h/i.txt"))));
         }
-        assert!(
-            started.elapsed() < std::time::Duration::from_millis(500),
-            "{:?}",
-            started.elapsed()
+        assert!(!matches_segments(
+            &["a".to_owned(), "b".to_owned(), "c".to_owned()],
+            &["a".to_owned(), "b".to_owned()]
+        ));
+        assert_eq!(
+            MATCH_CELLS.with(|count| count.get()),
+            0,
+            "impossible patterns allocate no match table"
         );
         assert!(matches_segments(
             &["**".to_owned(), "x".to_owned()],

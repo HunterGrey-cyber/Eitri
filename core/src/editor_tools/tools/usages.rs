@@ -287,6 +287,7 @@ mod tests {
     }
 
     fn with_cx<R>(root: &Path, setting: &Setting, f: impl FnOnce(&ToolCx<'_>) -> R) -> R {
+        let _clock = crate::editor_tools::testing::clock::Clock::new();
         let memory = Memory::default();
         let cx = ToolCx {
             mode: setting.mode,
@@ -834,11 +835,16 @@ mod tests {
         let project = project("attach-gives-up");
         let setting = setting(Bypass, Trusted);
         let steps = with_cx(&project.root, &setting, |cx| {
-            drive(run("src/a.rs", Duration::from_millis(30)), cx, |_| {
-                std::thread::sleep(Duration::from_millis(5));
-                Ok(no_client(true))
-            })
+            drive(run("src/a.rs", LSP_BUDGET), cx, |_| Ok(no_client(true)))
         });
+        let polls: Vec<_> = steps
+            .iter()
+            .filter_map(|step| match step {
+                Step::PollAfter(wait) => Some(*wait),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(polls, vec![Duration::from_millis(200); 25]);
         assert_eq!(
             the_error(&steps),
             format!(
@@ -872,7 +878,7 @@ mod tests {
                 EditorCall::LspAsk(_) => started(),
                 EditorCall::LspCollect { last: true, .. } => last.clone(),
                 _ => {
-                    std::thread::sleep(Duration::from_millis(2));
+                    crate::editor_tools::testing::clock::advance(Duration::from_millis(2));
                     pending()
                 }
             })
@@ -905,7 +911,7 @@ mod tests {
             &["references"],
         );
         let steps = with_cx(&project.root, &setting, |cx| {
-            drive(run("src/a.rs", Duration::from_millis(20)), cx, hung_until_last(last))
+            drive(run("src/a.rs", Duration::from_secs(1)), cx, hung_until_last(last))
         });
         let answer = the_answer_of(&steps);
         assert_eq!(answer["definitions"][0]["line"], 1);
@@ -925,7 +931,7 @@ mod tests {
         let setting = setting(Bypass, Trusted);
         let steps = with_cx(&project.root, &setting, |cx| {
             drive(
-                run("src/a.rs", Duration::from_millis(20)),
+                run("src/a.rs", Duration::from_secs(1)),
                 cx,
                 hung_until_last(one_definition(&project.root)),
             )
@@ -947,7 +953,7 @@ mod tests {
             &["definitions", "references"],
         );
         let steps = with_cx(&project.root, &setting, |cx| {
-            drive(run("src/a.rs", Duration::from_millis(5)), cx, hung_until_last(last))
+            drive(run("src/a.rs", Duration::from_secs(1)), cx, hung_until_last(last))
         });
         assert_eq!(the_error(&steps), "the language server did not answer within 10 s");
     }
@@ -961,7 +967,7 @@ mod tests {
             &["references"],
         );
         let steps = with_cx(&project.root, &setting, |cx| {
-            drive(run("src/a.rs", Duration::from_millis(5)), cx, hung_until_last(last))
+            drive(run("src/a.rs", Duration::from_secs(1)), cx, hung_until_last(last))
         });
         let answer = the_answer_of(&steps);
         assert_eq!(answer["definitions"], json!([]));
@@ -992,7 +998,7 @@ mod tests {
                     })
                 },
                 |_| {
-                    std::thread::sleep(budget + Duration::from_millis(20));
+                    crate::editor_tools::testing::clock::advance(budget + Duration::from_millis(20));
                     (CardDecision::Allow, CardOrigin::Key)
                 },
             )
@@ -1103,10 +1109,10 @@ mod tests {
         let project = project("last-late");
         let setting = setting(Bypass, Trusted);
         let steps = with_cx(&project.root, &setting, |cx| {
-            drive(run("src/a.rs", Duration::from_millis(2)), cx, |call| match call {
+            drive(run("src/a.rs", Duration::from_secs(1)), cx, |call| match call {
                 EditorCall::LspAsk(_) => Ok(started()),
                 EditorCall::LspCollect { .. } => {
-                    std::thread::sleep(Duration::from_millis(3));
+                    crate::editor_tools::testing::clock::advance(Duration::from_secs(2));
                     Err(EditorFailure::NotAnswered)
                 }
                 other => panic!("{other:?}"),

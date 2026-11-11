@@ -50,6 +50,7 @@ impl FileBuffer {
         let file = dir.join("file with spaces.txt");
         agent::private_fs::write_private(&file, b"before\n").unwrap();
         let nvim = EmbedNvim::start();
+        nvim.manual_timers();
         nvim.exec_lua(
             r#"
 vim.api.nvim_cmd({cmd='edit', args={...}, magic={file=false}}, {})
@@ -136,14 +137,16 @@ end
     }
 
     fn wait(&self, millis: u64) {
-        self.nvim.exec_lua("vim.wait(...)", vec![Value::from(millis)]);
+        self.nvim.advance_timers(millis);
     }
 
     fn wait_for_reload(&self) {
-        assert_eq!(self.nvim.exec_lua(
-            "return vim.wait(1500, function() return vim.api.nvim_buf_get_lines(0, 0, 1, false)[1] == 'changed on disk' end, 10)",
-            vec![],
-        ).as_bool(), Some(true), "the timer reloads the displayed buffer");
+        self.nvim.advance_timers(1000);
+        assert_eq!(
+            self.first_line(),
+            "changed on disk",
+            "the timer reloads the displayed buffer"
+        );
     }
 
     fn slot_call(&self, channel: u64, name: &str, args: Vec<Value>) -> Value {
@@ -267,10 +270,8 @@ fn a_closed_channel_while_busy_reloads_through_the_teardown() {
     f.nvim.exec_lua("_G.saved_reload_slot = __eitri_companion", vec![]);
     f.change_on_disk();
     f.nvim.close_channel(chan);
-    f.nvim.exec_lua(
-        "assert(vim.wait(1000, function() return __eitri_companion == nil end, 10))",
-        vec![],
-    );
+    f.nvim
+        .exec_lua("test_timers.advance(1000); assert(__eitri_companion == nil)", vec![]);
     f.wait(20);
     assert_eq!(f.first_line(), "changed on disk");
     assert_eq!(
@@ -367,7 +368,7 @@ local schedule = vim.schedule
 local queued = {}
 vim.schedule = function(fn) queued[#queued + 1] = fn end
 reload_part.calls.busy(true)
-assert(vim.wait(1500, function() return #queued > 0 end, 10))
+test_timers.advance(1000); assert(#queued > 0)
 vim.schedule = schedule
 reload_part.calls.busy(false)
 reload_part.calls.busy(true)
@@ -377,7 +378,7 @@ assert(reload_checks == checks, 'a tick from the stopped timer does nothing afte
 
 queued = {}
 vim.schedule = function(fn) queued[#queued + 1] = fn end
-assert(vim.wait(1500, function() return #queued > 0 end, 10))
+test_timers.advance(1000); assert(#queued > 0)
 reload_part.teardown()
 vim.schedule = schedule
 assert(#queued >= 2, 'a timer tick and the final reload are queued')
@@ -440,7 +441,7 @@ fn ui_with_part_env(label: &str, always: bool, env: &[(&str, &str)]) -> (embed_c
     let _ = std::fs::remove_dir_all(&scratch);
     std::fs::create_dir_all(&scratch).unwrap();
     let file = scratch.join("f.txt");
-    std::fs::write(&file, "one\ntwo\n").unwrap();
+    embed_client::write_changed(&file, "one\ntwo\n").unwrap();
     let mut nvim = Embed::start(&scratch, &[], env);
     nvim.wait_until("VimEnter", |n| n.eval("v:vim_did_enter").as_i64() == Some(1));
     nvim.request(
@@ -452,6 +453,7 @@ fn ui_with_part_env(label: &str, always: bool, env: &[(&str, &str)]) -> (embed_c
         ],
     );
     nvim.command(&format!("edit {}", file.display()));
+    nvim.manual_timers();
     nvim.lua(
         "local src, opts = ...; _G.rp = assert(loadstring(src))(opts)",
         vec![Value::from(reload_source()), opts(always)],
@@ -483,8 +485,8 @@ fn typing_while_the_timer_runs_meets_no_dialog() {
     let (mut nvim, scratch, file) = ui_with_part("typ", true);
     nvim.input("ix");
     nvim.wait_until("insert mode", |n| ui_mode(n).0 == "i");
-    std::fs::write(&file, "DISK\nchange\n").unwrap();
-    std::thread::sleep(std::time::Duration::from_millis(2500));
+    embed_client::write_changed(&file, "DISK\nchange\n").unwrap();
+    nvim.advance_timers(2500);
     assert_eq!(ui_mode(&mut nvim), ("i".to_string(), false), "a dialog met the typing");
     nvim.input("<Esc>");
     nvim.wait_until("normal mode", |n| ui_mode(n).0 == "n");
@@ -505,10 +507,10 @@ fn a_turn_end_on_a_modified_buffer_meets_no_dialog() {
     let (mut nvim, scratch, file) = ui_with_part("now", false);
     nvim.input("ix");
     nvim.wait_until("insert mode", |n| ui_mode(n).0 == "i");
-    std::fs::write(&file, "DISK\nchange\n").unwrap();
-    std::thread::sleep(std::time::Duration::from_millis(1100));
+    embed_client::write_changed(&file, "DISK\nchange\n").unwrap();
+    nvim.advance_timers(1100);
     nvim.lua("vim.schedule(function() rp.calls.now() end)", vec![]);
-    std::thread::sleep(std::time::Duration::from_millis(300));
+    nvim.advance_timers(300);
     assert_eq!(ui_mode(&mut nvim), ("i".to_string(), false), "a dialog met the typing");
     nvim.input("<Esc>");
     nvim.wait_until("normal mode", |n| ui_mode(n).0 == "n");
@@ -529,16 +531,17 @@ fn a_turn_end_on_a_modified_buffer_meets_no_dialog() {
 fn a_noautoread_buffer_meets_no_dialog_and_is_not_reloaded() {
     let (mut nvim, scratch, file) = ui_with_part("noar", true);
     let other = scratch.join("g.txt");
-    std::fs::write(&other, "three\n").unwrap();
+    embed_client::write_changed(&other, "three\n").unwrap();
     nvim.command("setlocal noautoread");
     nvim.command(&format!("vsplit {}", other.display()));
-    std::thread::sleep(std::time::Duration::from_millis(1100));
-    std::fs::write(&file, "DISK\nchange\n").unwrap();
-    std::fs::write(&other, "DISK too\n").unwrap();
+    nvim.advance_timers(1100);
+    embed_client::write_changed(&file, "DISK\nchange\n").unwrap();
+    embed_client::write_changed(&other, "DISK too\n").unwrap();
+    nvim.advance_timers(1000);
     nvim.wait_until("the other buffer's reload", |n| {
         n.eval("getline(1)").as_str() == Some("DISK too")
     });
-    std::thread::sleep(std::time::Duration::from_millis(1200));
+    nvim.advance_timers(1200);
     assert_eq!(ui_mode(&mut nvim), ("n".to_string(), false), "a dialog met the buffer");
     assert_eq!(
         nvim.lua(
@@ -555,10 +558,10 @@ fn a_noautoread_buffer_meets_no_dialog_and_is_not_reloaded() {
 }
 
 /// One tick of the part, as the timer, `FocusGained` and a turn end run it: scheduled, so a dialog
-/// it raised would block nvim and not the request, then given time to run.
+/// it raised would block nvim and not the request, then followed by a scheduling barrier.
 fn tick(nvim: &mut embed_client::Embed) {
     nvim.lua("vim.schedule(function() rp.calls.now() end)", vec![]);
-    std::thread::sleep(std::time::Duration::from_millis(300));
+    nvim.flush_scheduled();
 }
 
 /// A key typed after the tick reaches nvim: `i` puts it in Insert mode. A dialog would take it.
@@ -589,7 +592,7 @@ fn a_file_created_after_the_buffer_was_opened_meets_no_dialog() {
     let made = scratch.join("new.rs");
     nvim.command(&format!("edit {}", made.display()));
     tick(&mut nvim);
-    std::fs::write(&made, "made by the agent\n").unwrap();
+    embed_client::write_changed(&made, "made by the agent\n").unwrap();
     tick(&mut nvim);
     tick(&mut nvim);
     assert_eq!(
@@ -610,7 +613,7 @@ fn a_file_created_before_the_first_tick_meets_no_dialog() {
     let (mut nvim, scratch, _file) = ui_with_part("w13first", false);
     let made = scratch.join("new.rs");
     nvim.command(&format!("edit {}", made.display()));
-    std::fs::write(&made, "made by the agent\n").unwrap();
+    embed_client::write_changed(&made, "made by the agent\n").unwrap();
     tick(&mut nvim);
     tick(&mut nvim);
     assert_eq!(
@@ -634,11 +637,11 @@ fn a_buffer_opened_on_a_missing_file_is_reloaded_like_any_other_afterwards() {
     let read = scratch.join("read.rs");
     nvim.command(&format!("edit {}", read.display()));
     tick(&mut nvim);
-    std::fs::write(&read, "made\n").unwrap();
+    embed_client::write_changed(&read, "made\n").unwrap();
     tick(&mut nvim);
     assert_eq!(buffer_line(&mut nvim, &read).as_deref(), Some("made"));
-    std::thread::sleep(std::time::Duration::from_millis(1100));
-    std::fs::write(&read, "DISK\n").unwrap();
+    nvim.advance_timers(1100);
+    embed_client::write_changed(&read, "DISK\n").unwrap();
     tick(&mut nvim);
     assert_eq!(
         buffer_line(&mut nvim, &read).as_deref(),
@@ -651,8 +654,8 @@ fn a_buffer_opened_on_a_missing_file_is_reloaded_like_any_other_afterwards() {
     tick(&mut nvim);
     nvim.command("write");
     tick(&mut nvim);
-    std::thread::sleep(std::time::Duration::from_millis(1100));
-    std::fs::write(&wrote, "DISK\n").unwrap();
+    nvim.advance_timers(1100);
+    embed_client::write_changed(&wrote, "DISK\n").unwrap();
     tick(&mut nvim);
     assert_eq!(
         buffer_line(&mut nvim, &wrote).as_deref(),
@@ -675,11 +678,11 @@ fn buffers_over_empty_or_vanished_files_meet_no_dialog_and_are_read() {
 
     let touched = scratch.join("touched.rs");
     nvim.command(&format!("edit {}", touched.display()));
-    std::fs::write(&touched, "").unwrap();
+    embed_client::write_changed(&touched, "").unwrap();
     tick(&mut nvim);
     the_next_key_reaches_nvim(&mut nvim);
-    std::thread::sleep(std::time::Duration::from_millis(1100));
-    std::fs::write(&touched, "filled later\n").unwrap();
+    nvim.advance_timers(1100);
+    embed_client::write_changed(&touched, "filled later\n").unwrap();
     tick(&mut nvim);
     assert_eq!(
         buffer_line(&mut nvim, &touched).as_deref(),
@@ -688,9 +691,9 @@ fn buffers_over_empty_or_vanished_files_meet_no_dialog_and_are_read() {
     );
 
     let always = scratch.join("always.rs");
-    std::fs::write(&always, "").unwrap();
+    embed_client::write_changed(&always, "").unwrap();
     nvim.command(&format!("edit {}", always.display()));
-    std::fs::write(&always, "filled before the first tick\n").unwrap();
+    embed_client::write_changed(&always, "filled before the first tick\n").unwrap();
     tick(&mut nvim);
     assert_eq!(
         buffer_line(&mut nvim, &always).as_deref(),
@@ -699,13 +702,13 @@ fn buffers_over_empty_or_vanished_files_meet_no_dialog_and_are_read() {
     the_next_key_reaches_nvim(&mut nvim);
 
     let reopened = scratch.join("reopened.rs");
-    std::fs::write(&reopened, "one\n").unwrap();
+    embed_client::write_changed(&reopened, "one\n").unwrap();
     nvim.command(&format!("edit {}", reopened.display()));
     tick(&mut nvim);
     std::fs::remove_file(&reopened).unwrap();
     tick(&mut nvim);
     nvim.command("edit!");
-    std::fs::write(&reopened, "back\n").unwrap();
+    embed_client::write_changed(&reopened, "back\n").unwrap();
     tick(&mut nvim);
     assert_eq!(
         buffer_line(&mut nvim, &reopened).as_deref(),
@@ -720,39 +723,23 @@ fn buffers_over_empty_or_vanished_files_meet_no_dialog_and_are_read() {
 }
 
 /// A shown file the agent deletes: nvim answers a check with `E211` and, in Normal mode, waits a second.
-/// The length of that wait is measured on the same nvim with a bare `checktime` first.
+/// Each scheduled check skips the missing file before it can reach `checktime`.
 #[test]
 #[ignore = "needs a real nvim on PATH; spends no tokens and needs no display"]
 fn a_deleted_file_does_not_stall_the_tick() {
     let (mut nvim, scratch, file) = ui_with_part("e211", false);
-    nvim.command(&format!("cd {}", scratch.display()));
-    let other = scratch.join("other.txt");
-    std::fs::write(&other, "stock\n").unwrap();
-    nvim.command("edit other.txt");
-    std::fs::remove_file(&other).unwrap();
-    let began = std::time::Instant::now();
-    nvim.command("checktime");
-    let stall = began.elapsed();
-    assert!(
-        stall >= std::time::Duration::from_millis(500),
-        "calibration: a bare checktime on a deleted file waits ({stall:?})"
-    );
-    nvim.command("edit f.txt");
-    nvim.command("silent! bwipeout! other.txt");
-    // A bare check clears nvim's "already warned" flag, which the calibration's warning set and which would
-    // turn the next warning into a plain error message.
-    nvim.command("checktime");
-
+    nvim.lua("local cmd = vim.api.nvim_cmd; _G.deleted_checks = 0; vim.api.nvim_cmd = function(c, o) if c.cmd == 'checktime' then deleted_checks = deleted_checks + 1 end; return cmd(c, o) end", vec![]);
     std::fs::remove_file(&file).unwrap();
-    let began = std::time::Instant::now();
-    nvim.lua("rp.calls.now()", vec![]);
-    let ticked = began.elapsed();
-    assert!(
-        ticked < stall / 2,
-        "the tick took {ticked:?}, a stalled one takes about {stall:?}"
-    );
+    for _ in 0..5 {
+        tick(&mut nvim);
+        assert_eq!(
+            nvim.lua("return deleted_checks", vec![]).as_i64(),
+            Some(0),
+            "a deleted file reached checktime"
+        );
+    }
 
-    std::fs::write(&file, "back\n").unwrap();
+    embed_client::write_changed(&file, "back\n").unwrap();
     tick(&mut nvim);
     assert_eq!(
         nvim.eval("getline(1)").as_str(),
@@ -775,7 +762,7 @@ fn a_deleted_file_with_a_long_name_raises_no_prompt() {
         scratch.join("a-directory-name-long-enough-that-the-deleted-file-warning-needs-more-than-one-screen-line");
     std::fs::create_dir_all(&dir).unwrap();
     let stock = dir.join("stock.txt");
-    std::fs::write(&stock, "stock\n").unwrap();
+    embed_client::write_changed(&stock, "stock\n").unwrap();
     nvim.command(&format!("edit {}", stock.display()));
     std::fs::remove_file(&stock).unwrap();
     nvim.lua("vim.schedule(function() vim.cmd('checktime') end)", vec![]);
@@ -788,18 +775,17 @@ fn a_deleted_file_with_a_long_name_raises_no_prompt() {
     nvim.command("checktime");
 
     let file = dir.join("f.txt");
-    std::fs::write(&file, "one\ntwo\n").unwrap();
+    embed_client::write_changed(&file, "one\ntwo\n").unwrap();
     nvim.command(&format!("edit {}", file.display()));
     std::fs::remove_file(&file).unwrap();
     nvim.lua("vim.schedule(function() rp.calls.now() end)", vec![]);
-    let until = std::time::Instant::now() + std::time::Duration::from_millis(2500);
-    while std::time::Instant::now() < until {
+    for _ in 0..5 {
+        tick(&mut nvim);
         assert_eq!(
             ui_mode(&mut nvim),
             ("n".to_string(), false),
             "a prompt met the deletion"
         );
-        std::thread::sleep(std::time::Duration::from_millis(30));
     }
     nvim.lua("rp.teardown()", vec![]);
     nvim.quit();
@@ -849,11 +835,11 @@ vim.cmd('terminal')
 fn a_file_holding_only_a_newline_is_reloaded() {
     let (mut nvim, scratch, _file) = ui_with_part("nl", false);
     let nl = scratch.join("nl.txt");
-    std::fs::write(&nl, "\n").unwrap();
+    embed_client::write_changed(&nl, "\n").unwrap();
     nvim.command(&format!("edit {}", nl.display()));
     tick(&mut nvim);
-    std::thread::sleep(std::time::Duration::from_millis(1100));
-    std::fs::write(&nl, "DISK\n").unwrap();
+    nvim.advance_timers(1100);
+    embed_client::write_changed(&nl, "DISK\n").unwrap();
     tick(&mut nvim);
     assert_eq!(buffer_line(&mut nvim, &nl).as_deref(), Some("DISK"));
     the_next_key_reaches_nvim(&mut nvim);
@@ -871,7 +857,7 @@ fn an_edited_and_undone_buffer_meets_no_dialog() {
     let seen = scratch.join("seen.rs");
     nvim.command(&format!("edit {}", seen.display()));
     tick(&mut nvim);
-    std::fs::write(&seen, "made by the agent\n").unwrap();
+    embed_client::write_changed(&seen, "made by the agent\n").unwrap();
     nvim.command("normal! ix");
     nvim.command("undo");
     assert_eq!(nvim.eval("&modified").as_i64(), Some(0));
@@ -883,7 +869,7 @@ fn an_edited_and_undone_buffer_meets_no_dialog() {
     nvim.command(&format!("edit {}", unseen.display()));
     nvim.command("normal! ix");
     nvim.command("undo");
-    std::fs::write(&unseen, "made by the agent\n").unwrap();
+    embed_client::write_changed(&unseen, "made by the agent\n").unwrap();
     tick(&mut nvim);
     assert_eq!(buffer_line(&mut nvim, &unseen).as_deref(), Some("made by the agent"));
     the_next_key_reaches_nvim(&mut nvim);

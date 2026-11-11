@@ -41,7 +41,6 @@ fn render(harness: &mut LiveHarness, surface: &mut Surface, region: &PixelRect<f
 fn settle(harness: &mut LiveHarness, surface: &mut Surface, region: &PixelRect<f32>) {
     for _ in 0..90 {
         render(harness, surface, region);
-        std::thread::sleep(Duration::from_millis(5));
     }
 }
 
@@ -96,11 +95,49 @@ fn measure(scale: f64, insert: bool, keys: &str, extra: &[String]) -> (usize, us
         render(&mut harness, &mut surface, &region);
         std::thread::sleep(Duration::from_millis(16));
     }
-    if !keys.is_empty() {
-        harness.send_text_input(keys);
+    harness.send_text_input(&format!(
+        "{keys}:let g:eitri_input_ready=1<CR>{}",
+        if insert { "i" } else { "" }
+    ));
+    let nvim = harness
+        .neovim_handler()
+        .clone_current_neovim()
+        .expect("nvim connection");
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        let answer = runtime
+            .block_on(async {
+                tokio::time::timeout(
+                    Duration::from_secs(60),
+                    nvim.exec_lua(
+                        "return vim.g.eitri_input_ready == 1 and vim.api.nvim_get_mode().mode",
+                        vec![],
+                    ),
+                )
+                .await
+            })
+            .unwrap()
+            .unwrap();
+        if answer.as_str() == Some(if insert { "i" } else { "n" }) {
+            break;
+        }
+        assert!(Instant::now() < deadline, "setup keys never reached nvim");
     }
-    if insert {
-        harness.send_text_input("i");
+    // This size has never been requested before. Its redraw follows the acknowledged setup
+    // on nvim's ordered notification stream, including mode_change and setting_changed. The
+    // editor worker preserves redraw order, so consuming this resize also consumes the final
+    // cursor update; an unrelated startup or command-line flush cannot satisfy this barrier.
+    let setup_grid = GridSize::new(41u32, 9u32);
+    assert_ne!(harness.get_grid_size(), setup_grid, "setup marker must be a new size");
+    harness.resize_grid(setup_grid);
+    while harness.get_grid_size() != setup_grid {
+        assert!(Instant::now() < deadline, "setup redraw never reached the renderer");
+        render(&mut harness, &mut surface, &region);
+        std::thread::yield_now();
     }
     settle(&mut harness, &mut surface, &region);
     let focused = cursor_pixels(&harness, &mut surface);

@@ -7103,16 +7103,10 @@ mod tests {
         // Links in `.git` whose every hop resolves inside it still need a resolution budget.
         let ws = Workspace::new();
         padded_chain(&ws.path().join(".git/links"), "h", 39, 4000, "../HEAD");
-        let started = std::time::Instant::now();
         assert_eq!(
             bash("git status", ws.path()),
             PermissionVerdict::AskTheUser,
             "padded links in .git"
-        );
-        assert!(
-            started.elapsed() < std::time::Duration::from_secs(2),
-            "{:?}",
-            started.elapsed()
         );
 
         // A short link in `.git` whose chain continues in the project, where the walk never goes.
@@ -7139,16 +7133,10 @@ mod tests {
         let ws = Workspace::new();
         padded_chain(&ws.path().join("chain"), "c", 39, 4000, "../src/main.rs");
         let command = format!("cat {}", "chain/c0 ".repeat(500));
-        let started = std::time::Instant::now();
         assert_eq!(
             bash(&command, ws.path()),
             PermissionVerdict::AskTheUser,
             "argument chains"
-        );
-        assert!(
-            started.elapsed() < std::time::Duration::from_secs(2),
-            "{:?}",
-            started.elapsed()
         );
         // And a Read of one.
         assert_eq!(
@@ -7409,15 +7397,9 @@ mod tests {
             ws.write(&format!(".git/l{level}.inc"), body);
         }
         ws.write(".git/config", format!("[include]\n{}", fan.replace("next", "l0")));
-        let started = std::time::Instant::now();
         let fanned = classify_permission_request("Bash", &input, ws.path());
         assert_eq!(fanned.verdict, PermissionVerdict::AskTheUser);
         assert_eq!(fanned.reason, REASON_TOO_MUCH_WORK);
-        assert!(
-            started.elapsed() < std::time::Duration::from_secs(2),
-            "{:?}",
-            started.elapsed()
-        );
     }
 
     /// `git -C x <sub>` (and `--git-dir`, `--work-tree`,

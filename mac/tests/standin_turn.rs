@@ -152,8 +152,7 @@ fn the_stand_in_holds_a_turn_raises_a_card_and_finishes_when_told() {
         "the denied call came back as a tool result: {:?}",
         types(&seen)
     );
-    // Held: still running after two more seconds.
-    pump_until(set, &dir, Duration::from_secs(2), &mut seen, |_, _| false);
+    // The acknowledged tool result is the boundary before the test releases the held turn.
     assert!(set.get(tab).unwrap().turn_running(), "the turn is held open");
     let mode = set
         .get(tab)
@@ -177,7 +176,6 @@ fn the_stand_in_holds_a_turn_raises_a_card_and_finishes_when_told() {
 
     // ---- 2: a turn that finishes at once.
     // The panel's loop folds the end of the last turn before the next is sent, as a user's next message would be.
-    pump_until(set, &dir, Duration::from_millis(500), &mut Vec::new(), |_, _| false);
     let mut seen = Vec::new();
     set.get_mut(tab)
         .unwrap()
@@ -192,7 +190,6 @@ fn the_stand_in_holds_a_turn_raises_a_card_and_finishes_when_told() {
 
     // ---- 3: an interrupt ends a held turn.
     // The panel's loop folds the end of the last turn before the next is sent, as a user's next message would be.
-    pump_until(set, &dir, Duration::from_millis(500), &mut Vec::new(), |_, _| false);
     let mut seen = Vec::new();
     set.get_mut(tab)
         .unwrap()
@@ -204,7 +201,12 @@ fn the_stand_in_holds_a_turn_raises_a_card_and_finishes_when_told() {
         set.get(tab).unwrap().turn_running()
     });
     assert!(running, "the third turn runs");
-    pump_until(set, &dir, Duration::from_secs(1), &mut seen, |_, _| false);
+    assert!(
+        pump_until(set, &dir, Duration::from_secs(60), &mut seen, |_, seen| {
+            seen.iter().any(|event| event["type"] == "content_delta")
+        }),
+        "the stand-in received the third turn before its interrupt"
+    );
     set.get_mut(tab).unwrap().live_mut().unwrap().interrupt().unwrap();
     let ended = pump_until(set, &dir, Duration::from_secs(15), &mut seen, |set, _| {
         !set.get(tab).unwrap().turn_running()

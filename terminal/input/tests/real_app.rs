@@ -36,8 +36,6 @@ use terminal_input::keys::{Key, KeyEvent, ModifiersState as M, NamedKey as N};
 use terminal_input::NormalizedInput;
 
 const SIZE: Size = Size { cols: 80, rows: 24 };
-const QUIET: Duration = Duration::from_millis(250);
-const DEADLINE: Duration = Duration::from_secs(8);
 
 struct Fixture {
     dir: tempfile::TempDir,
@@ -93,6 +91,29 @@ struct FixtureApp {
     _fixture: Fixture,
 }
 
+impl FixtureApp {
+    fn sync(&mut self) {
+        self.app.sync();
+        if let Ok(state) = std::fs::read_to_string(self._fixture.dir.path().join("nvim-fence")) {
+            eprintln!("nvim input acknowledgement: {state:?}");
+            let mut fields = state.splitn(3, '\0');
+            let insert = fields.next().unwrap().starts_with('i');
+            let row: usize = fields.next().unwrap().parse().unwrap();
+            let lines: Vec<String> = fields.next().unwrap().split('\n').map(str::to_owned).collect();
+            // The acknowledgement is after input processing. Wait for that exact buffer state
+            // and its mode/cursor row to be painted, rather than sampling a transient redraw.
+            self.app.wait_until(|app| {
+                app.screen.cursor().0 == row
+                    && lines
+                        .iter()
+                        .enumerate()
+                        .all(|(row, text)| app.screen.line(row) == *text)
+                    && (app.screen.line(23) == "-- INSERT --") == insert
+            });
+        }
+    }
+}
+
 impl Deref for FixtureApp {
     type Target = App;
     fn deref(&self) -> &App {
@@ -125,6 +146,9 @@ fn up(key: Key<String>, mods: M) -> NormalizedInput {
 fn keystroke(app: &mut App, key: Key<String>, mods: M) -> (Vec<u8>, Vec<u8>) {
     let d = app.send(&down(key.clone(), mods));
     let u = app.send(&up(key, mods));
+    if !app.screen.mode().contains(TermMode::REPORT_EVENT_TYPES) {
+        assert!(u.is_empty(), "unsolicited release {u:?}");
+    }
     (d, u)
 }
 
@@ -145,9 +169,18 @@ fn nvim_with_kitty(scratch: &str, kitty: bool) -> FixtureApp {
     let mut env = fixture.env();
     env.push(("NVIM_APPNAME", "terminal-input-test"));
     let _ = scratch;
-    let mut app =
-        App::launch_with_kitty("nvim", &["--clean", "-n", "-i", "NONE"], &env, SIZE, kitty).expect("spawn nvim");
-    app.settle(QUIET, DEADLINE);
+    let fence = "lua local n=0; vim.keymap.set({'n','i'},'<C-G>',function() vim.schedule(function() n=n+1; local c=vim.api.nvim_win_get_cursor(0); local f=assert(io.open(vim.env.HOME..'/nvim-fence','wb')); f:write(vim.api.nvim_get_mode().mode,string.char(0),tostring(c[1]-1),string.char(0),table.concat(vim.api.nvim_buf_get_lines(0,0,-1,false),string.char(10))); f:close(); vim.o.titlestring='fence-'..n..','; vim.o.title=true; vim.cmd('redraw!') end) end)";
+    let mut app = App::launch_with_kitty(
+        "nvim",
+        &["--clean", "-n", "-i", "NONE", "--cmd", fence],
+        &env,
+        SIZE,
+        kitty,
+    )
+    .expect("spawn nvim");
+    app.set_nvim_fence();
+    app.wait_until(|app| app.screen.line(1) == "~" && app.screen.mode().contains(TermMode::APP_CURSOR));
+    app.sync();
     FixtureApp { app, _fixture: fixture }
 }
 
@@ -174,7 +207,7 @@ fn nvim_one_backspace_keystroke_deletes_exactly_one_character() {
 
     keystroke(&mut app, Key::character("i"), M::empty());
     type_str(&mut app, "ABCDEF");
-    app.settle(QUIET, DEADLINE);
+    app.sync();
 
     let before = app.screen.line(0);
     let (before_row, before_col) = app.screen.cursor();
@@ -183,7 +216,7 @@ fn nvim_one_backspace_keystroke_deletes_exactly_one_character() {
 
     // ONE keystroke: press and release.
     let (press, release) = keystroke(&mut app, Key::Named(N::Backspace), M::empty());
-    app.settle(QUIET, DEADLINE);
+    app.sync();
 
     let after = app.screen.line(0);
     let (after_row, after_col) = app.screen.cursor();
@@ -216,13 +249,13 @@ fn nvim_one_enter_keystroke_inserts_exactly_one_line() {
 
     keystroke(&mut app, Key::character("i"), M::empty());
     type_str(&mut app, "AAA");
-    app.settle(QUIET, DEADLINE);
+    app.sync();
     assert_eq!(app.screen.line(0), "AAA");
 
     let (press, release) = keystroke(&mut app, Key::Named(N::Enter), M::empty());
-    app.settle(QUIET, DEADLINE);
+    app.sync();
     type_str(&mut app, "BBB");
-    app.settle(QUIET, DEADLINE);
+    app.sync();
 
     eprintln!(
         "nvim Enter: press={press:?} release={release:?} line0={:?} line1={:?} line2={:?}",
@@ -267,7 +300,7 @@ fn nvim_alt_unknown_key_does_not_leave_insert() {
 
     keystroke(&mut app, Key::character("i"), M::empty());
     type_str(&mut app, "ABC");
-    app.settle(QUIET, DEADLINE);
+    app.sync();
     assert_eq!(app.screen.line(23), "-- INSERT --", "setup: not in insert mode");
     assert_eq!(app.screen.line(0), "ABC");
 
@@ -298,8 +331,7 @@ fn nvim_alt_unknown_key_does_not_leave_insert() {
             sent += 1;
         }
     }
-    app.settle(QUIET, DEADLINE);
-
+    // Every encoder call completed without writing a byte; no application action is pending.
     assert_eq!(sent, 24, "expected 12 keys x 2 modifier sets");
     assert_eq!(
         app.screen.line(23),
@@ -311,7 +343,7 @@ fn nvim_alt_unknown_key_does_not_leave_insert() {
     // CONTROL: prove the assertion above can fail. A genuine lone ESC DOES leave
     // insert mode, so "still in INSERT" is an observation, not a blind spot.
     app.send_raw(b"\x1b");
-    app.settle(QUIET, DEADLINE);
+    app.wait_until(|app| app.screen.line(23) != "-- INSERT --");
     assert_ne!(
         app.screen.line(23),
         "-- INSERT --",
@@ -331,10 +363,10 @@ fn nvim_probe(seq: &[u8]) -> (String, String) {
     let mut app = nvim("probe");
     keystroke(&mut app, Key::character("i"), M::empty());
     type_str(&mut app, "ABC");
-    app.settle(QUIET, DEADLINE);
+    app.sync();
     assert_eq!(app.screen.line(23), "-- INSERT --", "setup failed for {seq:?}");
     app.send_raw(seq);
-    app.settle(QUIET, DEADLINE);
+    app.sync();
     (app.screen.line(23), app.screen.line(0))
 }
 
@@ -414,7 +446,7 @@ fn nvim_app_cursor_arrows_navigate() {
     type_str(&mut app, "L2");
     keystroke(&mut app, Key::Named(N::Enter), M::empty());
     type_str(&mut app, "L3");
-    app.settle(QUIET, DEADLINE);
+    app.sync();
     assert_eq!(app.screen.line(2), "L3");
     let (row_before, _) = app.screen.cursor();
     assert_eq!(row_before, 2);
@@ -427,17 +459,17 @@ fn nvim_app_cursor_arrows_navigate() {
     // directly (keyboard.rs:276) and never consults the binding table, so the
     // APP_CURSOR rows cannot apply to a release. That asymmetry is upstream's.
     assert_eq!(release, b"\x1b[1;1:3A", "unexpected arrow release");
-    app.settle(QUIET, DEADLINE);
+    app.sync();
     let (row_after, _) = app.screen.cursor();
     assert_eq!(row_after, 1, "ArrowUp did not move the cursor up one line");
 
     keystroke(&mut app, Key::Named(N::ArrowUp), M::empty());
-    app.settle(QUIET, DEADLINE);
+    app.sync();
     assert_eq!(app.screen.cursor().0, 0, "second ArrowUp did not move");
 
     let (press, _) = keystroke(&mut app, Key::Named(N::ArrowDown), M::empty());
     assert_eq!(press, b"\x1bOB");
-    app.settle(QUIET, DEADLINE);
+    app.sync();
     assert_eq!(app.screen.cursor().0, 1, "ArrowDown did not move the cursor down");
 }
 
@@ -449,8 +481,19 @@ fn bash() -> FixtureApp {
     let fixture = Fixture::new();
     let mut env = fixture.env();
     env.push(("PS1", "PROMPT> "));
-    let mut app = App::launch("bash", &["--norc", "--noprofile", "-i"], &env, SIZE).expect("spawn bash");
-    app.settle(QUIET, DEADLINE);
+    let rc = fixture.dir.path().join("bashrc");
+    std::fs::write(&rc, r#"eitri_fence() { EITRI_FENCE=$((EITRI_FENCE+1)); printf %s "$READLINE_LINE" > "$HOME/readline-fence"; printf '\033]2;fence-%s,\007' "$EITRI_FENCE"; }
+bind -x '"\C-]":eitri_fence'
+"#).unwrap();
+    let mut app = App::launch(
+        "bash",
+        &["--noprofile", "--rcfile", rc.to_str().unwrap(), "-i"],
+        &env,
+        SIZE,
+    )
+    .expect("spawn bash");
+    app.set_readline_fence();
+    app.wait_until(|app| app.screen.visible_lines().last().is_some_and(|l| l == "PROMPT>"));
     FixtureApp { app, _fixture: fixture }
 }
 
@@ -465,16 +508,27 @@ fn bash_arrow_history_works_with_app_cursor_off_and_on() {
 
     type_str(&mut app, "echo first");
     keystroke(&mut app, Key::Named(N::Enter), M::empty());
-    app.settle(QUIET, DEADLINE);
+    app.wait_until(|app| {
+        app.screen.visible_lines().iter().any(|l| l == "first")
+            && app.screen.visible_lines().last().is_some_and(|l| l == "PROMPT>")
+    });
     type_str(&mut app, "echo second");
     keystroke(&mut app, Key::Named(N::Enter), M::empty());
-    app.settle(QUIET, DEADLINE);
+    app.wait_until(|app| {
+        app.screen.visible_lines().iter().any(|l| l == "second")
+            && app.screen.visible_lines().last().is_some_and(|l| l == "PROMPT>")
+    });
     assert!(app.screen.visible_lines().iter().any(|l| l == "second"), "setup failed");
 
     // --- APP_CURSOR OFF: the CSI form, encoded against bash's real mode.
     let (csi, _) = keystroke(&mut app, Key::Named(N::ArrowUp), M::empty());
     assert_eq!(csi, b"\x1b[A", "with DECCKM off the arrow must be CSI A");
-    app.settle(QUIET, DEADLINE);
+    app.wait_until(|app| {
+        app.screen
+            .visible_lines()
+            .last()
+            .is_some_and(|l| l.ends_with("echo second"))
+    });
     let recalled = app.screen.visible_lines().last().cloned().unwrap_or_default();
     assert!(
         recalled.ends_with("echo second"),
@@ -491,10 +545,16 @@ fn bash_arrow_history_works_with_app_cursor_off_and_on() {
     let mut app2 = bash();
     type_str(&mut app2, "echo first");
     keystroke(&mut app2, Key::Named(N::Enter), M::empty());
-    app2.settle(QUIET, DEADLINE);
+    app2.wait_until(|app| {
+        app.screen.visible_lines().iter().any(|l| l == "first")
+            && app.screen.visible_lines().last().is_some_and(|l| l == "PROMPT>")
+    });
     type_str(&mut app2, "echo second");
     keystroke(&mut app2, Key::Named(N::Enter), M::empty());
-    app2.settle(QUIET, DEADLINE);
+    app2.wait_until(|app| {
+        app.screen.visible_lines().iter().any(|l| l == "second")
+            && app.screen.visible_lines().last().is_some_and(|l| l == "PROMPT>")
+    });
 
     let forced = app2.screen.mode() | TermMode::APP_CURSOR;
     let ss3 = terminal_input::encode(&down(Key::Named(N::ArrowUp), M::empty()), forced);
@@ -504,7 +564,12 @@ fn bash_arrow_history_works_with_app_cursor_off_and_on() {
         "the two regimes produced the same bytes; one of them is not applied"
     );
     app2.send_raw(&ss3);
-    app2.settle(QUIET, DEADLINE);
+    app2.wait_until(|app| {
+        app.screen
+            .visible_lines()
+            .last()
+            .is_some_and(|l| l.ends_with("echo second"))
+    });
     let recalled = app2.screen.visible_lines().last().cloned().unwrap_or_default();
     assert!(
         recalled.ends_with("echo second"),
@@ -513,7 +578,12 @@ fn bash_arrow_history_works_with_app_cursor_off_and_on() {
     // A second SS3 arrow must step one further back, proving each arrow is
     // delivered exactly once.
     app2.send_raw(&ss3);
-    app2.settle(QUIET, DEADLINE);
+    app2.wait_until(|app| {
+        app.screen
+            .visible_lines()
+            .last()
+            .is_some_and(|l| l.ends_with("echo first"))
+    });
     let recalled2 = app2.screen.visible_lines().last().cloned().unwrap_or_default();
     assert!(
         recalled2.ends_with("echo first"),
@@ -528,7 +598,12 @@ fn bash_arrow_history_works_with_app_cursor_off_and_on() {
 fn bash_ctrl_c_abandons_the_line_without_running_it() {
     let mut app = bash();
     type_str(&mut app, "echo SHOULD-NOT-RUN");
-    app.settle(QUIET, DEADLINE);
+    app.wait_until(|app| {
+        app.screen
+            .visible_lines()
+            .iter()
+            .any(|l| l.contains("echo SHOULD-NOT-RUN"))
+    });
     assert!(
         app.screen
             .visible_lines()
@@ -546,7 +621,10 @@ fn bash_ctrl_c_abandons_the_line_without_running_it() {
         event: KeyEvent::release(Key::character("c")).with_text(Some("\u{3}")),
         mods: M::CONTROL,
     });
-    app.settle(QUIET, DEADLINE);
+    app.wait_until(|app| {
+        app.screen.visible_lines().iter().any(|l| l.contains("^C"))
+            && app.screen.visible_lines().last().is_some_and(|l| l == "PROMPT>")
+    });
 
     assert_eq!(bytes, b"\x03", "Ctrl-C must encode as ETX");
     let lines = app.screen.visible_lines();
@@ -579,20 +657,13 @@ fn bash_ctrl_d_ends_the_shell() {
     let bytes = app.send(&ctrl_d);
     assert_eq!(bytes, b"\x04", "Ctrl-D must encode as EOT");
 
-    // The shell should exit; the PTY master then reports EOF / EIO.
-    let mut sawpity_eof = false;
-    for _ in 0..40 {
-        let chunk = app
-            .pty
-            .read_quiescent(Duration::from_millis(50), Duration::from_millis(200));
-        app.screen.advance(&chunk);
-        if chunk.is_empty() {
-            // A dead child closes the slave; reads then stop producing data.
-            sawpity_eof = true;
-            break;
-        }
-    }
-    assert!(sawpity_eof, "bash kept producing output after Ctrl-D");
+    assert_eq!(
+        app.pty.wait_exit(Duration::from_secs(60)).code(),
+        Some(0),
+        "Ctrl-D ended bash"
+    );
+    let bytes = app.pty.read_available();
+    app.screen.advance(&bytes);
     eprintln!("bash after Ctrl-D:\n{}", app.screen.visible_lines().join("\n"));
 }
 
@@ -610,7 +681,13 @@ fn bash_bracketed_multiline_paste_does_not_act_as_multiple_enters() {
         bracketed: true,
     };
     let bytes = app.send(&paste);
-    app.settle(QUIET, DEADLINE);
+    app.sync();
+    assert_eq!(
+        std::fs::read_to_string(app._fixture.dir.path().join("readline-fence")).unwrap(),
+        "echo PASTE1\necho PASTE2\necho PASTE3",
+        "all pasted lines are still in readline"
+    );
+    app.wait_until(|app| app.screen.visible_lines().iter().any(|l| l.contains("echo PASTE3")));
 
     assert_eq!(
         bytes, b"\x1b[200~echo PASTE1\necho PASTE2\necho PASTE3\x1b[201~",
@@ -648,7 +725,13 @@ fn bracketed_paste_filtering_stops_a_paste_from_escaping_its_brackets() {
         bracketed: true,
     };
     let bytes = app.send(&paste);
-    app.settle(QUIET, DEADLINE);
+    app.sync();
+    let pending = std::fs::read_to_string(app._fixture.dir.path().join("readline-fence")).unwrap();
+    assert!(
+        pending.contains("echo ESCAPED") && pending.ends_with('\n'),
+        "the hostile command stayed in readline: {pending:?}"
+    );
+    app.wait_until(|app| app.screen.visible_lines().iter().any(|l| l.contains("echo ESCAPED")));
 
     let s = String::from_utf8(bytes.clone()).unwrap();
     assert_eq!(
@@ -686,7 +769,7 @@ fn fzf(fixture: Fixture) -> FixtureApp {
         SIZE,
     )
     .expect("spawn fzf");
-    app.settle(Duration::from_millis(400), DEADLINE);
+    app.wait_until(|app| app.screen.visible_lines().iter().any(|line| line.contains("alpha")));
     FixtureApp { app, _fixture: fixture }
 }
 
@@ -709,10 +792,8 @@ fn fzf_arrows_move_the_selection_with_app_cursor_off() {
     for _ in 0..2 {
         let (press, _) = keystroke(&mut app, Key::Named(N::ArrowUp), M::empty());
         assert_eq!(press, b"\x1b[A");
-        app.settle(Duration::from_millis(150), DEADLINE);
     }
     keystroke(&mut app, Key::Named(N::Enter), M::empty());
-    app.settle(Duration::from_millis(400), DEADLINE);
     assert_eq!(app.pty.wait_exit(Duration::from_secs(60)).code(), Some(0));
 
     let selected = std::fs::read_to_string(&out).expect("read fzf output");
@@ -743,10 +824,8 @@ fn fzf_arrows_move_the_selection_with_app_cursor_on() {
 
     for _ in 0..3 {
         app.send_raw(&ss3);
-        app.settle(Duration::from_millis(150), DEADLINE);
     }
     keystroke(&mut app, Key::Named(N::Enter), M::empty());
-    app.settle(Duration::from_millis(400), DEADLINE);
     assert_eq!(app.pty.wait_exit(Duration::from_secs(60)).code(), Some(0));
 
     let selected = std::fs::read_to_string(&out).expect("read fzf output");
@@ -771,7 +850,6 @@ fn fzf_ctrl_c_aborts_without_selecting() {
         mods: M::CONTROL,
     });
     assert_eq!(bytes, b"\x03");
-    app.settle(Duration::from_millis(400), DEADLINE);
     assert_eq!(app.pty.wait_exit(Duration::from_secs(60)).code(), Some(130));
 
     let selected = std::fs::read_to_string(&out).expect("read fzf output");

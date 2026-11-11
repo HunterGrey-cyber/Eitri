@@ -1867,8 +1867,8 @@ mod tests {
     /// ```
     ///
     /// Either variable may be left out to skip that server. It prints one line per lookup and asserts only what holds
-    /// whatever the machine's load: the warm answers' places, and that no reply hangs (a generous multiple of the
-    /// budget; the budget and its grace themselves are held by the injected-clock tests above).
+    /// the warm answers' places. Elapsed durations are printed for diagnosis; waits use hang guards (the budget and its
+    /// grace themselves are held by the injected-clock tests above).
     ///
     /// The real-nvim gate (`tools/real-nvim-gate.sh`) leaves this and the next test out on purpose: they need the
     /// variables, so they are run by name.
@@ -2011,7 +2011,9 @@ mod tests {
         );
         let since = Instant::now();
         let mut loaded = false;
-        for round in 0..12 {
+        let guard = since + Duration::from_secs(120);
+        let mut round = 0;
+        loop {
             for name in ["PanelKeymap", "effective", "reserved", "human", "wire", "parse_seq"] {
                 let got = editor.look(&root, name, None);
                 let phase = format!("t+{:.1}s", since.elapsed().as_secs_f32());
@@ -2023,8 +2025,9 @@ mod tests {
             if loaded && round > 0 {
                 break;
             }
+            assert!(Instant::now() < guard, "rust-analyzer never answered PanelKeymap");
+            round += 1;
         }
-        assert!(loaded, "rust-analyzer never answered PanelKeymap");
         editor.stop();
     }
 
@@ -2183,13 +2186,10 @@ mod tests {
                 };
                 if let Some(reply) = lookup.poll(&mut cx) {
                     let took = started.elapsed();
-                    // Only a hang guard: a loaded machine may run well past the budget, and the budget itself is
-                    // held by the injected-clock tests.
-                    assert!(took <= BUDGET * 3, "{name} took {took:?}");
-                    eprintln!("gd-e2e {name}: replied after {} ms", took.as_millis());
                     return (took, reply);
                 }
                 drop((sequencer, asks));
+                assert!(started.elapsed() < Duration::from_secs(60), "{name} never answered");
                 std::thread::sleep(Duration::from_millis(33));
             }
         }

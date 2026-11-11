@@ -26,7 +26,7 @@
 //! | `tap_line` | `{kind, fields?, count?}`; `kind` is a stdout line's `type` or `type/subtype` |
 //! | `cli_results` | how many `result` lines at least |
 //! | `session_state` | `idle`, `running` or `requires_action`: the newest state line since the last action |
-//! | `transcript_line` | `{type, fields?, count?}` over the CLI's own session files |
+//! | `transcript_line` | `{type, fields?, count?, subagents?}` over the CLI's own session files; `subagents: true` includes nested agent transcripts |
 //! | `projection` | `{question: "waiting"\|"settled"}`, or an object the host judges |
 //! | `interaction` | an object the host judges |
 //! | `roster` | `{task, status}` |
@@ -517,6 +517,10 @@ pub struct Driver<'a> {
     mark: u64,
     reached: BTreeMap<String, Instant>,
     transcripts: BTreeMap<PathBuf, (u64, Vec<Value>)>,
+    #[cfg(test)]
+    clock: std::cell::Cell<Instant>,
+    #[cfg(test)]
+    waits: std::cell::Cell<usize>,
 }
 
 impl<'a> Driver<'a> {
@@ -528,7 +532,32 @@ impl<'a> Driver<'a> {
             mark: 0,
             reached: BTreeMap::new(),
             transcripts: BTreeMap::new(),
+            #[cfg(test)]
+            clock: std::cell::Cell::new(Instant::now()),
+            #[cfg(test)]
+            waits: std::cell::Cell::new(0),
         }
+    }
+
+    fn now(&self) -> Instant {
+        #[cfg(test)]
+        {
+            self.clock.get()
+        }
+        #[cfg(not(test))]
+        {
+            Instant::now()
+        }
+    }
+
+    fn pause(&self) {
+        #[cfg(test)]
+        {
+            self.waits.set(self.waits.get() + 1);
+            self.clock.set(self.clock.get() + self.settings.poll);
+        }
+        #[cfg(not(test))]
+        std::thread::sleep(self.settings.poll);
     }
 
     /// Runs every part in order. The first failure ends the run with the part's label and the reason.
@@ -617,7 +646,7 @@ impl<'a> Driver<'a> {
         };
         match result {
             Ok(()) => {
-                let now = Instant::now();
+                let now = self.now();
                 self.reached.insert(label.to_owned(), now);
                 if let Some(target) = target_of(verb, arg) {
                     self.reached.insert(format!("{verb}:{target}"), now);
@@ -922,9 +951,10 @@ impl<'a> Driver<'a> {
             "transcript_line" => {
                 let ty = text_arg(arg, "type").ok_or_else(|| Failure::text("`transcript_line` needs a type"))?;
                 let (fields, count) = (arg["fields"].clone(), want_count(arg));
+                let subagents = arg["subagents"].as_bool().unwrap_or(false);
                 self.wait_for(&what, limit, false, move |d| {
                     let n = d
-                        .transcript_lines()
+                        .transcript_lines(subagents)
                         .iter()
                         .filter(|j| j["type"].as_str() == Some(&ty) && fields_match(j, &fields))
                         .count();
@@ -1016,8 +1046,8 @@ impl<'a> Driver<'a> {
                     )));
                 };
                 let limit = Duration::from_secs_f64(seconds.max(0.0)) + self.settings.limit(part["timeout"].as_f64());
-                self.wait_for(&what, limit, false, move |_| {
-                    Ok(start.elapsed().as_secs_f64() >= seconds)
+                self.wait_for(&what, limit, false, move |d| {
+                    Ok(d.now().duration_since(start).as_secs_f64() >= seconds)
                 })
             }
             other => Err(Failure::text(format!("no wait `{other}`"))),
@@ -1031,7 +1061,7 @@ impl<'a> Driver<'a> {
     where
         F: FnMut(&mut Self) -> Result<bool, Failure>,
     {
-        let end = Instant::now() + limit;
+        let end = self.now() + limit;
         loop {
             self.host.poll()?;
             // The failure checks come first: a condition that became true with an unmatched request or an
@@ -1056,14 +1086,14 @@ impl<'a> Driver<'a> {
             if check(self)? {
                 return Ok(());
             }
-            if Instant::now() >= end {
+            if self.now() >= end {
                 return Err(Failure::text(format!(
                     "timed out after {:.1}s waiting for {what}{}",
                     limit.as_secs_f64(),
                     self.report_tail()
                 )));
             }
-            std::thread::sleep(self.settings.poll);
+            self.pause();
         }
     }
 
@@ -1125,16 +1155,22 @@ impl<'a> Driver<'a> {
     }
 
     /// Every parsed line of the CLI's session files `claude/projects/<slug>/<session>.jsonl`, re-read only when a
-    /// file grew.
-    fn transcript_lines(&mut self) -> Vec<Value> {
+    /// file grew. Nested agent transcripts are included only when the wait explicitly asks for them.
+    fn transcript_lines(&mut self, subagents: bool) -> Vec<Value> {
+        fn collect(dir: &Path, nested: bool, files: &mut Vec<PathBuf>) {
+            for entry in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+                let Ok(kind) = entry.file_type() else { continue };
+                if nested && kind.is_dir() {
+                    collect(&entry.path(), nested, files);
+                } else if kind.is_file() && entry.path().extension().is_some_and(|e| e == "jsonl") {
+                    files.push(entry.path());
+                }
+            }
+        }
         let root = self.settings.run.join("claude/projects");
         let mut files = Vec::new();
         for slug in std::fs::read_dir(&root).into_iter().flatten().flatten() {
-            for file in std::fs::read_dir(slug.path()).into_iter().flatten().flatten() {
-                if file.path().extension().is_some_and(|e| e == "jsonl") {
-                    files.push(file.path());
-                }
-            }
+            collect(&slug.path(), subagents, &mut files);
         }
         files.sort();
         let mut all = Vec::new();
@@ -1927,6 +1963,40 @@ mod tests {
     }
 
     #[test]
+    fn a_workflow_stop_fence_waits_for_the_nested_tool_result() {
+        let (run, endpoint, mut host) = (run_dir(), FakeEndpoint::default(), Fake::new());
+        let scenario: Value =
+            serde_json::from_str(include_str!("../../../tests/claude_scenarios/c16w_stop.json")).unwrap();
+        for parts in [&scenario["driver"], &scenario["variants"]["run1"]["driver"]] {
+            let parts = parts.as_array().unwrap();
+            let gate = parts
+                .iter()
+                .rposition(|part| part.get("open_gate") == Some(&json!("wb")))
+                .unwrap();
+            let fence = &parts[gate + 1];
+            assert_eq!(fence["name"], "wb-ended");
+            let mut waiting = json!([fence]);
+            waiting[0]["timeout"] = json!(0.01);
+            let dir = run.join("claude/projects/-slug/session/subagents/workflows/wf");
+            std::fs::create_dir_all(&dir).unwrap();
+            let path = dir.join("agent-b.jsonl");
+            std::fs::write(&path, "").unwrap();
+            assert!(drive(&mut host, &endpoint, &run, waiting.clone())
+                .unwrap_err()
+                .contains("timed out"));
+            // An unrelated tool's error cannot satisfy B's completion fence.
+            let mut result = json!({"type": "user", "message": {"content": [{"type": "tool_result", "tool_use_id": "toolu_wa", "is_error": true}]}});
+            std::fs::write(&path, format!("{result}\n")).unwrap();
+            assert!(drive(&mut host, &endpoint, &run, waiting.clone())
+                .unwrap_err()
+                .contains("timed out"));
+            result["message"]["content"][0]["tool_use_id"] = json!("toolu_wb");
+            std::fs::write(&path, format!("{result}\n")).unwrap();
+            drive(&mut host, &endpoint, &run, waiting).unwrap();
+        }
+    }
+
+    #[test]
     fn projection_interaction_roster_and_card_waits_ask_the_host() {
         let (run, endpoint, mut host) = (run_dir(), FakeEndpoint::default(), Fake::new());
         host.projection = vec![json!({"type": "turn_started", "turn_id": "t1"})];
@@ -1971,15 +2041,17 @@ mod tests {
     fn a_wall_floor_waits_out_the_time_since_an_earlier_part() {
         let (run, endpoint, mut host) = (run_dir(), FakeEndpoint::default(), Fake::new());
         endpoint.held.lock().unwrap().push("h1".into());
-        let started = Instant::now();
-        drive(
-            &mut host,
-            &endpoint,
-            &run,
-            json!([{"held": "h1", "name": "gate-up"}, {"wall_floor": {"after": "gate-up", "seconds": 0.15}}]),
-        )
-        .unwrap();
-        assert!(started.elapsed() >= Duration::from_millis(150));
+        let mut driver = Driver::new(settings(&run), &endpoint, &mut host);
+        let started = driver.now();
+        driver
+            .run(&[
+                json!({"held": "h1", "name": "gate-up"}),
+                json!({"wall_floor": {"after": "gate-up", "seconds": 0.15}}),
+            ])
+            .unwrap();
+        assert_eq!(driver.now().duration_since(started), Duration::from_millis(150));
+        assert_eq!(driver.waits.get(), 30);
+        drop(driver);
         let err = drive(
             &mut host,
             &endpoint,
@@ -2025,14 +2097,9 @@ mod tests {
         *endpoint.records.lock().unwrap() = vec![record(4, None, None, Some("no scripted step takes this request"))];
         let mut slow = settings(&run);
         slow.base = Duration::from_secs(30);
-        let started = Instant::now();
-        let err = Driver::new(slow, &endpoint, &mut host)
-            .run(&[json!({"held": "h1"})])
-            .unwrap_err();
-        assert!(
-            started.elapsed() < Duration::from_secs(5),
-            "failed only at the deadline"
-        );
+        let mut driver = Driver::new(slow, &endpoint, &mut host);
+        let err = driver.run(&[json!({"held": "h1"})]).unwrap_err();
+        assert_eq!(driver.waits.get(), 0, "an unmatched request fails before waiting");
         assert!(
             err.contains("could not match request #4") && err.contains("no scripted step"),
             "{err}"

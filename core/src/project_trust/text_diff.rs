@@ -73,6 +73,7 @@ pub struct Budget {
     pub steps: u64,
 }
 impl Budget {
+    #[cfg(test)]
     pub fn for_a_question() -> Budget {
         Budget {
             rows: MAX_QUESTION_ROWS,

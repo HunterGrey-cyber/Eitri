@@ -2,7 +2,7 @@
 //! No display, session bus, user configuration, clipboard tools or model accounts are reachable.
 
 use eitri_core::host_clipboard::{self, Admission, Answer, ClipboardServer, Reply, Request, NOT_NVIM, SOCKET_NAME};
-use std::os::unix::fs::{symlink, PermissionsExt};
+use std::os::unix::fs::symlink;
 use std::os::unix::net::UnixListener;
 use std::path::PathBuf;
 use std::process::Command;
@@ -385,8 +385,7 @@ fn a_clipboard_tool_on_path_takes_precedence_over_the_shim() {
     let tool = bin.join("lemonade");
     // Shell built-ins only: the test's PATH holds nothing but the bin directory.
     let script = "#!/bin/sh\nif [ \"$1\" = copy ]; then\n  while IFS= read -r line; do printf '%s\\n' \"$line\"; done > \"$HOME/tool-copy\"\nelse\n  printf called > \"$HOME/tool-paste\"\n  while IFS= read -r line; do printf '%s\\n' \"$line\"; done < \"$HOME/tool-copy\"\nfi\n";
-    std::fs::write(&tool, script).expect("tool stand-in");
-    std::fs::set_permissions(&tool, std::fs::Permissions::from_mode(0o700)).expect("executable stand-in");
+    script_fixture::write_executable_script(&tool, script, 0o700).expect("executable stand-in");
     let out = f.run(
         r#"
 print("provider=" .. provider())
@@ -483,4 +482,9 @@ assert(vim.fn.jobwait({ job }, 60000)[1] == 1, "the open-stdin call did not exit
     f.assert_host(b"kept", 0);
     assert_eq!(f.pastes.load(Ordering::SeqCst), 0);
     assert!(!f.dir.join("g").exists(), "save-buffer to a file wrote one");
+}
+
+#[cfg(test)]
+mod script_fixture {
+    include!(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/support/executable.rs"));
 }

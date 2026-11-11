@@ -7,7 +7,6 @@
 
 use std::ffi::OsString;
 use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
-use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
 use eitri_core::window_link::fdpass;
@@ -48,8 +47,7 @@ fn helper_script(dir: &Path, name: &str, exec: bool) -> PathBuf {
         format!("#!/bin/sh\nexport {HELPER_ENV}=1\n{run}\nexit $?\n")
     };
     let path = dir.join(name);
-    std::fs::write(&path, body).unwrap();
-    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+    script_fixture::write_executable_script(&path, body, 0o700).unwrap();
     path
 }
 
@@ -156,4 +154,9 @@ fn the_token_is_an_argument_and_never_in_the_environment() {
     let direct = helper_script(&dir.0, "direct", true);
     let token = "activation-token-5f3a91";
     assert_eq!(spawn_and_read(&direct, Some(token)), format!("ok token={token}"));
+}
+
+#[cfg(test)]
+mod script_fixture {
+    include!(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/support/executable.rs"));
 }

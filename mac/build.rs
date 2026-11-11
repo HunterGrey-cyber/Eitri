@@ -25,7 +25,7 @@ fn main() {
         );
     }
     println!("cargo:rerun-if-changed=build.rs");
-    for path in web_build_watch_paths(&web_dir) {
+    for path in web_build_watch_paths(&web_dir, "dist/index.html") {
         println!("cargo:rerun-if-changed={}", path.display());
     }
     println!("cargo:rerun-if-env-changed=EITRI_WEB_CLEAN_BUILD");

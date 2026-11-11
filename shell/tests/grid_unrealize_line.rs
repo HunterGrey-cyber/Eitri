@@ -21,7 +21,6 @@
 
 use std::cell::RefCell;
 use std::rc::Rc;
-use std::time::{Duration, Instant};
 
 use gtk4::prelude::*;
 
@@ -32,14 +31,13 @@ mod own_x_server;
 #[path = "../src/module_grid/unrealize.rs"]
 mod unrealize;
 
-/// Runs the default main loop for `ms`, so the window maps, draws and is taken down.
-fn pump(ms: u64) {
-    let context = gtk4::glib::MainContext::default();
-    let end = Instant::now() + Duration::from_millis(ms);
-    while Instant::now() < end {
-        while context.iteration(false) {}
-        std::thread::sleep(Duration::from_millis(2));
-    }
+/// Waits for complete frames after a window change.
+#[allow(dead_code)]
+#[path = "support/frame_turns.rs"]
+mod frame_turns;
+
+fn pump() {
+    frame_turns::settle();
 }
 
 /// What `act` on a shown window did to its one host: the grid's line for each unrealize the host
@@ -65,17 +63,17 @@ fn lines_after(act: impl FnOnce(&gtk4::Window, &gtk4::Box, &gtk4::Button) -> boo
         });
     }
     window.present();
-    pump(400);
+    pump();
     if !host.is_mapped() {
         let said = vec!["did not exercise the trigger: the host never got on screen".to_string()];
         return (said.clone(), said);
     }
     let down = act(&window, &row, &host);
-    pump(300);
+    pump();
     let during = lines.borrow().clone();
     if !down {
         window.destroy();
-        pump(50);
+        pump();
     }
     let after = lines.borrow().clone();
     (during, after)

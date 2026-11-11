@@ -8,7 +8,6 @@
 
 use agent::providers::claude_sidecar::probe;
 use agent::REQUIRED_CAPABILITIES;
-use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant};
@@ -50,8 +49,7 @@ fn launcher(dir: &Path, name: &str, vars: &[(&str, &str)]) -> PathBuf {
         "exec {} \"$@\"\n",
         quoted(env!("CARGO_BIN_EXE_eitri-sidecar-standin"))
     ));
-    agent::private_fs::write_private(&path, script.as_bytes()).unwrap();
-    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+    script_fixture::write_executable_script(&path, script.as_bytes(), 0o700).unwrap();
     // A child forked by another test at the moment of the write holds the file open for writing until it
     // reaches its own exec, and until then this file does not run.
     let started = Instant::now();
@@ -158,4 +156,9 @@ fn a_path_with_no_program_is_an_error_with_a_reason() {
         .err()
         .expect("a missing program fails the probe");
     assert!(!reason.trim().is_empty(), "the failure says something");
+}
+
+#[cfg(test)]
+mod script_fixture {
+    include!(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/support/executable.rs"));
 }

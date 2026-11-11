@@ -47,7 +47,6 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{self, Read, Write};
-use std::net::Shutdown;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -60,8 +59,8 @@ use eitri_core::ide_server::frames::{close_frame, pong_frame, Decoder, Inbound};
 use eitri_core::remote_audit::{AuditLog, DeviceRef, Event as AuditEvent, Filter, Listener, Reason};
 use eitri_core::remote_devices::Grant;
 use eitri_core::remote_rv::{
-    parse_rv_outbound, pong_line, refused_line, result_line, rv_socket_path, Connected, RvClient, RvInbound,
-    RvOutbound, Secret, SendBlock, RV_MAX_OUTBOUND_LINE, RV_PROTOCOL, RV_REFUSED_FULL,
+    parse_rv_outbound, pong_line, refused_line, result_line, rv_socket_path, shut_both_ways, Connected, RvClient,
+    RvInbound, RvOutbound, Secret, SendBlock, RV_MAX_OUTBOUND_LINE, RV_PROTOCOL, RV_REFUSED_FULL,
 };
 use eitri_core::remote_wire::{parse_phone_frame, PhoneFrame, PhoneInbound, MAX_PHONE_FRAME_BYTES, REMOTE_PROTOCOL};
 use eitri_core::tab_set::{GoneWhy, RowKey};
@@ -121,6 +120,8 @@ pub struct Audit {
     mine_last: Mutex<BTreeMap<String, Instant>>,
     /// Held while an `audit_mine` answer reads the log, so one reading runs at a time.
     mine_reading: Mutex<()>,
+    #[cfg(feature = "remote-test-hooks")]
+    mine_now: Mutex<Option<Instant>>,
 }
 
 /// A connection whose `hello` was accepted, as its `conn_close` will name it.
@@ -181,6 +182,11 @@ impl EarlyRefusals {
 }
 
 impl Audit {
+    #[cfg(feature = "remote-test-hooks")]
+    pub(super) fn notifier_turn_path_for_tests(&self) -> Option<PathBuf> {
+        self.dir.as_ref().map(|dir| dir.join("notifier-turn-for-tests"))
+    }
+
     /// Records through `log`, which was opened on `dir`.
     pub fn new(log: AuditLog, dir: &Path) -> Arc<Audit> {
         Audit::with(Some(log), Some(dir.to_owned()))
@@ -201,6 +207,8 @@ impl Audit {
             early: Mutex::new(EarlyRefusals::new(Instant::now())),
             mine_last: Mutex::new(BTreeMap::new()),
             mine_reading: Mutex::new(()),
+            #[cfg(feature = "remote-test-hooks")]
+            mine_now: Mutex::new(None),
         })
     }
 
@@ -317,11 +325,19 @@ impl Audit {
             .collect()
     }
 
+    #[cfg(feature = "remote-test-hooks")]
+    pub fn set_mine_time_for_tests(&self, now: Instant) {
+        *lock(&self.mine_now) = Some(now);
+    }
+
     /// The `audit_mine` answer: the newest records about `device` by its id (a record about another device whose
     /// claimed name is this id is not this device's), at most `limit` and [`AUDIT_MINE_MAX`], within
     /// [`AUDIT_MINE_BYTES`]. `None` when `device` was answered less than [`AUDIT_MINE_EVERY`] ago, on any of its
     /// connections, or another answer is reading the log now.
     fn mine(&self, device: &str, limit: u32) -> Option<String> {
+        #[cfg(feature = "remote-test-hooks")]
+        let now = lock(&self.mine_now).unwrap_or_else(Instant::now);
+        #[cfg(not(feature = "remote-test-hooks"))]
         let now = Instant::now();
         {
             let mut last = lock(&self.mine_last);
@@ -405,6 +421,42 @@ pub struct Arrival {
 /// A device id as the store names it.
 pub type DeviceId = String;
 
+#[cfg(feature = "remote-test-hooks")]
+#[derive(Debug)]
+pub enum HelloReadForTests {
+    Read,
+    Deadline,
+}
+
+#[cfg(feature = "remote-test-hooks")]
+#[derive(Debug)]
+pub struct HelloWaitForTests {
+    elapsed_ms: AtomicU64,
+    calls: Sender<Duration>,
+    steps: Mutex<Receiver<HelloReadForTests>>,
+}
+
+#[cfg(feature = "remote-test-hooks")]
+impl HelloWaitForTests {
+    pub fn new() -> (Arc<Self>, Receiver<Duration>, Sender<HelloReadForTests>) {
+        let (calls, called) = std::sync::mpsc::channel();
+        let (step, steps) = std::sync::mpsc::channel();
+        (
+            Arc::new(Self {
+                elapsed_ms: AtomicU64::new(0),
+                calls,
+                steps: Mutex::new(steps),
+            }),
+            called,
+            step,
+        )
+    }
+    pub fn advance(&self, elapsed: Duration) {
+        self.elapsed_ms
+            .fetch_add(elapsed.as_millis().try_into().unwrap(), Ordering::SeqCst);
+    }
+}
+
 /// The deadlines and bounds of every connection. Tests shorten them.
 #[derive(Debug, Clone)]
 pub struct Limits {
@@ -413,6 +465,10 @@ pub struct Limits {
     pub out_cap: usize,
     pub write_stall: Duration,
     pub rv_ping: Duration,
+    #[cfg(feature = "remote-test-hooks")]
+    pub hello_wait_for_tests: Option<Arc<HelloWaitForTests>>,
+    #[cfg(feature = "remote-test-hooks")]
+    pub report_interval_for_tests: Option<Duration>,
 }
 
 impl Default for Limits {
@@ -423,6 +479,10 @@ impl Default for Limits {
             out_cap: PHONE_OUT_CAP_BYTES,
             write_stall: PHONE_WRITE_STALL,
             rv_ping: RV_PING_EVERY,
+            #[cfg(feature = "remote-test-hooks")]
+            hello_wait_for_tests: None,
+            #[cfg(feature = "remote-test-hooks")]
+            report_interval_for_tests: None,
         }
     }
 }
@@ -440,6 +500,8 @@ pub struct PhoneSession {
 
 /// What the session's own thread is told.
 enum Event {
+    #[cfg(feature = "remote-test-hooks")]
+    TestTick(Instant, Sender<()>),
     Phone(PhoneFrame),
     /// A frame that is not one, or a broken rule of the phone's stream.
     Bad,
@@ -525,7 +587,7 @@ impl Kill {
         self.phone.shut();
         self.out.close();
         for stream in lock(&self.upstreams).values() {
-            let _ = stream.shutdown(Shutdown::Both);
+            shut_both_ways(stream);
         }
         let _ = self.events.send(Event::Killed);
     }
@@ -565,6 +627,24 @@ pub struct Hub {
 }
 
 impl Hub {
+    #[cfg(feature = "remote-test-hooks")]
+    pub fn report_look_for_tests(&self) {
+        self.reporter.look_for_tests();
+    }
+
+    #[cfg(feature = "remote-test-hooks")]
+    pub fn tick_sessions_for_tests(&self, now: Instant) {
+        let senders: Vec<_> = lock(&self.links).values().map(|link| link.events.clone()).collect();
+        for sender in senders {
+            let (tx, rx) = std::sync::mpsc::channel();
+            sender
+                .send(Event::TestTick(now, tx))
+                .expect("the session ended before its tick");
+            rx.recv_timeout(Duration::from_secs(60))
+                .expect("the session did not finish its tick");
+        }
+    }
+
     /// [`Hub::start_audited`] with no audit log.
     pub fn start(control_dir: &Path, store_path: &Path, limits: Limits) -> io::Result<Arc<Hub>> {
         Hub::start_audited(control_dir, store_path, limits, Audit::off())
@@ -583,6 +663,13 @@ impl Hub {
         store.remember_revoked(audit.revoked_in_log());
         // The first reading: a device that leaves the store from now on is seen leaving.
         store.refresh();
+        #[cfg(feature = "remote-test-hooks")]
+        let reporter = Reporter::start_with_interval(
+            control_dir,
+            limits.report_interval_for_tests.unwrap_or(super::report::LOOK_EVERY),
+        )?;
+        #[cfg(not(feature = "remote-test-hooks"))]
+        let reporter = Reporter::start(control_dir)?;
         let hub = Arc::new(Hub {
             control: control_dir.to_owned(),
             store,
@@ -590,7 +677,7 @@ impl Hub {
             links: Mutex::new(BTreeMap::new()),
             next_id: AtomicU64::new(1),
             limits,
-            reporter: Reporter::start(control_dir)?,
+            reporter,
             reader: Mutex::new(None),
             audit,
             finished_keys: Mutex::new(BTreeMap::new()),
@@ -799,6 +886,8 @@ impl Hub {
             feed: None,
             paused: false,
             next_ping: Instant::now() + self.limits.rv_ping,
+            #[cfg(feature = "remote-test-hooks")]
+            now_for_tests: None,
         };
         control.run(&rx);
         control.stop_feed();
@@ -854,17 +943,50 @@ fn read_phone(
 ) {
     const MESSAGE_TOO_BIG: u16 = 1009;
     let started = Instant::now();
+    #[cfg(feature = "remote-test-hooks")]
+    let initial_test_elapsed = limits
+        .hello_wait_for_tests
+        .as_ref()
+        .map(|wait| wait.elapsed_ms.load(Ordering::SeqCst));
     let mut first = true;
     let mut decoder = Decoder::new(MAX_PHONE_FRAME_BYTES, MAX_PHONE_FRAME_BYTES);
     let mut buf = vec![0u8; 16 * 1024];
     let mut inbound = Vec::new();
     loop {
+        #[cfg(feature = "remote-test-hooks")]
+        let elapsed = limits.hello_wait_for_tests.as_ref().map_or_else(
+            || started.elapsed(),
+            |wait| {
+                Duration::from_millis(
+                    wait.elapsed_ms
+                        .load(Ordering::SeqCst)
+                        .saturating_sub(initial_test_elapsed.unwrap()),
+                )
+            },
+        );
+        #[cfg(not(feature = "remote-test-hooks"))]
+        let elapsed = started.elapsed();
         let within = if first {
-            limits.hello_within.saturating_sub(started.elapsed())
+            limits.hello_within.saturating_sub(elapsed)
         } else {
             limits.idle
         };
-        if within.is_zero() || stream.set_read_deadline(Some(within)).is_err() {
+        if within.is_zero() {
+            let _ = tx.send(Event::PhoneEnded);
+            return;
+        }
+        #[cfg(feature = "remote-test-hooks")]
+        if let (true, Some(wait)) = (first, &limits.hello_wait_for_tests) {
+            let _ = wait.calls.send(within);
+            if matches!(
+                lock(&wait.steps).recv_timeout(Duration::from_secs(60)),
+                Ok(HelloReadForTests::Deadline)
+            ) {
+                wait.advance(within);
+                continue;
+            }
+        }
+        if stream.set_read_deadline(Some(within)).is_err() {
             let _ = tx.send(Event::PhoneEnded);
             return;
         }
@@ -1126,6 +1248,8 @@ struct Control {
     feed: Option<(u64, AgentsFeed)>,
     paused: bool,
     next_ping: Instant,
+    #[cfg(feature = "remote-test-hooks")]
+    now_for_tests: Option<Instant>,
 }
 
 /// Why the session ends.
@@ -1166,6 +1290,14 @@ fn ending_word(event: &Event) -> &'static str {
 }
 
 impl Control {
+    fn now(&self) -> Instant {
+        #[cfg(feature = "remote-test-hooks")]
+        if let Some(now) = self.now_for_tests {
+            return now;
+        }
+        Instant::now()
+    }
+
     fn run(&mut self, rx: &Receiver<Event>) {
         match self.hello(rx) {
             Ok(()) => {}
@@ -1213,6 +1345,12 @@ impl Control {
     /// The first frame, within the deadline.
     fn hello(&mut self, rx: &Receiver<Event>) -> Result<(), End> {
         let deadline = Instant::now() + self.hub.limits.hello_within + Duration::from_millis(500);
+        #[cfg(feature = "remote-test-hooks")]
+        let deadline = if self.hub.limits.hello_wait_for_tests.is_some() {
+            Instant::now() + Duration::from_secs(600)
+        } else {
+            deadline
+        };
         let first = loop {
             let left = deadline.saturating_duration_since(Instant::now());
             match rx.recv_timeout(left) {
@@ -1329,7 +1467,7 @@ impl Control {
 
     /// Until the next ping, or the next deadline of a tab that waits for a window.
     fn wait_for(&self) -> Duration {
-        let now = Instant::now();
+        let now = self.now();
         let mut until = self.next_ping;
         for sub in self.subs.values().filter(|sub| sub.via.is_none()) {
             let deadlines = [
@@ -1346,6 +1484,13 @@ impl Control {
 
     fn take(&mut self, event: Event) -> Result<(), End> {
         match event {
+            #[cfg(feature = "remote-test-hooks")]
+            Event::TestTick(now, done) => {
+                self.now_for_tests = Some(now);
+                self.tick();
+                let _ = done.send(());
+                Ok(())
+            }
             Event::Phone(frame) => {
                 self.credits.give();
                 if self.out.heard(frame.seq, frame.ack, &mut self.session.ack_in).is_err() {
@@ -1594,7 +1739,7 @@ impl Control {
             Route::Owner { instance } => instance,
             Route::Refused(NO_SUCH_TAB) => {
                 let waiting = Sub {
-                    unknown_since: Some(Instant::now()),
+                    unknown_since: Some(self.now()),
                     ..Sub::default()
                 };
                 self.subs.insert(key, waiting);
@@ -1668,9 +1813,10 @@ impl Control {
     /// One more try at `key`'s window came to nothing: the next is [`RECONNECT_PAUSE`] away, and past
     /// [`RECONNECT_TRIES`] the phone is told the tab is gone.
     fn failed_try(&mut self, key: &str) {
+        let now = self.now();
         let give_up = self.subs.get_mut(key).is_some_and(|sub| {
             sub.tries += 1;
-            sub.not_before = Some(Instant::now() + RECONNECT_PAUSE);
+            sub.not_before = Some(now + RECONNECT_PAUSE);
             sub.tries > RECONNECT_TRIES
         });
         if give_up {
@@ -1717,7 +1863,7 @@ impl Control {
         self.out.hear(id);
         lock(&self.kill.upstreams).insert(id, shut);
         if self.kill.dead() {
-            let _ = writer.shutdown(Shutdown::Both);
+            shut_both_ways(&writer);
             return Err(io::Error::new(io::ErrorKind::BrokenPipe, "the session ended"));
         }
         let (out, tx) = (self.out.clone(), self.tx.clone());
@@ -1774,7 +1920,7 @@ impl Control {
         let upstream = self.upstreams.remove(&id)?;
         self.out.forget(id);
         if let Some(stream) = lock(&self.kill.upstreams).remove(&id) {
-            let _ = stream.shutdown(Shutdown::Both);
+            shut_both_ways(&stream);
         }
         Some(upstream)
     }
@@ -1785,7 +1931,7 @@ impl Control {
         let Some(upstream) = self.close_upstream(id) else {
             return;
         };
-        let now = Instant::now();
+        let now = self.now();
         for key in upstream.keys {
             let Some(sub) = self.subs.get_mut(&key).filter(|sub| sub.via == Some(id)) else {
                 continue;
@@ -1815,7 +1961,7 @@ impl Control {
             return self.local(line);
         }
         // Wherever the row is now; the same window once the move has had time to land there or not at all.
-        let now = Instant::now();
+        let now = self.now();
         if let Some(sub) = self.subs.get_mut(&key) {
             sub.via = None;
             sub.tries = 0;
@@ -1838,13 +1984,14 @@ impl Control {
             upstream.keys.remove(&key);
         }
         self.out.route(&key, None);
+        let now = self.now();
         let after_move = self.subs.get_mut(&key).is_some_and(|sub| {
             if sub.moved_from.is_none() {
                 return false;
             }
             // Asked again after a move that has not landed: wait for the row instead.
             sub.via = None;
-            sub.not_before = Some(Instant::now() + MOVE_SETTLE);
+            sub.not_before = Some(now + MOVE_SETTLE);
             true
         });
         if !after_move {
@@ -1859,7 +2006,7 @@ impl Control {
             return;
         }
         let rows = lock(&self.hub.rows).clone();
-        let now = Instant::now();
+        let now = self.now();
         let mut moves = Vec::new();
         for (key, sub) in &self.subs {
             let owner = rows.owner(key);
@@ -1898,7 +2045,7 @@ impl Control {
             return;
         }
         let rows = lock(&self.hub.rows).clone();
-        let now = Instant::now();
+        let now = self.now();
         let mut due = Vec::new();
         let mut orphans = Vec::new();
         let mut unknown = Vec::new();
@@ -1937,7 +2084,7 @@ impl Control {
     }
 
     fn tick(&mut self) {
-        let now = Instant::now();
+        let now = self.now();
         if now >= self.next_ping {
             self.next_ping = now + self.hub.limits.rv_ping;
             let ids: Vec<u64> = self.upstreams.keys().copied().collect();
@@ -1997,7 +2144,7 @@ impl Control {
             return;
         }
         self.paused = false;
-        let now = Instant::now();
+        let now = self.now();
         for sub in self.subs.values_mut() {
             sub.tries = 0;
             sub.orphan_since.get_or_insert(now);

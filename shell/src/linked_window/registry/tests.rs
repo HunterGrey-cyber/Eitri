@@ -1,7 +1,7 @@
 use std::cell::RefCell;
 use std::collections::BTreeSet;
 use std::os::fd::OwnedFd;
-use std::os::unix::fs::{MetadataExt, PermissionsExt};
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::mpsc::Receiver;
@@ -56,8 +56,7 @@ fn group(label: &str, within: Duration) -> Group {
     let dir = Scratch::new(label);
     let report = dir.1.join("started");
     let exe = dir.1.join("module-window-stand-in");
-    std::fs::write(&exe, stand_in(&report)).unwrap();
-    std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o700)).unwrap();
+    script_fixture::write_executable_script(&exe, stand_in(&report), 0o700).unwrap();
     let lock = PairLock::try_take(&dir.0, Path::new("/p")).unwrap().unwrap();
     let pair = Pair::full(Ok(Some(lock)), &dir.1, false, false);
     let timers: Rc<RefCell<Vec<Box<dyn FnOnce()>>>> = Rc::default();
@@ -121,8 +120,7 @@ impl Group {
     fn stand_ins_run(&self, body: &str) {
         let exe = self.dir.1.join("module-window-stand-in");
         let next = self.dir.1.join("next-stand-in");
-        std::fs::write(&next, format!("#!/bin/sh\nexec 3>&-\n{body}\n")).unwrap();
-        std::fs::set_permissions(&next, std::fs::Permissions::from_mode(0o700)).unwrap();
+        script_fixture::write_executable_script(&next, format!("#!/bin/sh\nexec 3>&-\n{body}\n"), 0o700).unwrap();
         std::fs::rename(&next, &exe).unwrap();
     }
 
@@ -218,6 +216,28 @@ fn next_that<T>(inbound: &Receiver<Inbound>, within: Duration, want: impl Fn(Msg
             }
             Ok(other) => panic!("{other:?}"),
             Err(_) => return None,
+        }
+    }
+}
+
+fn before_marker<T>(link: &LinkDriver, inbound: &Receiver<Inbound>, want: impl Fn(Msg) -> Option<T>) -> Option<T> {
+    link.send(Msg::IdePort { port: Some(u16::MAX) }, Vec::new()).unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    loop {
+        match inbound
+            .recv_timeout(deadline.saturating_duration_since(std::time::Instant::now()))
+            .expect("the marker never arrived")
+        {
+            Inbound::Msg {
+                msg: Msg::IdePort { port: Some(u16::MAX) },
+                ..
+            } => return None,
+            Inbound::Msg { msg, .. } => {
+                if let Some(found) = want(msg) {
+                    return Some(found);
+                }
+            }
+            other => panic!("the link ended before its marker: {other:?}"),
         }
     }
 }
@@ -346,12 +366,7 @@ fn a_module_window_that_misses_its_handshake_is_ended_and_others_stay_linked() {
     let link = group.pair.module_link(&chat(1)).unwrap();
     assert!(link.linked(), "the window that linked stays");
     assert!(
-        group
-            .pair
-            .module_process(&chat(1))
-            .unwrap()
-            .wait_reaped(Duration::from_millis(200))
-            .is_none(),
+        group.pair.module_process(&chat(1)).unwrap().ending_requests() == 0,
         "and runs on"
     );
     link.send(Msg::Presence { held: true }, Vec::new()).unwrap();
@@ -495,7 +510,7 @@ fn end_peer_ends_the_module_window_it_names_and_no_other() {
     );
     LinkedWindows::end_peer(&*group.pair, WinId::MAIN, second).unwrap();
     assert!(ended.wait_reaped(Duration::from_secs(10)).is_some());
-    assert!(kept.wait_reaped(Duration::from_millis(200)).is_none());
+    assert_eq!(kept.ending_requests(), 0, "no ending was scheduled for the kept window");
     assert!(
         LinkedWindows::end_peer(&*group.pair, WinId::MAIN, PeerId(99)).is_err(),
         "a peer nobody holds ends nothing"
@@ -542,7 +557,18 @@ fn each_module_window_hears_what_this_window_holds_once() {
             Some(vec!["terminal#2".to_string()])
         );
         assert_eq!(
-            next_that(&end.inbound, Duration::from_millis(100), away),
+            before_marker(
+                &group
+                    .pair
+                    .module_link(&if std::ptr::eq(end, &first_end) {
+                        chat(1)
+                    } else {
+                        chat(2)
+                    })
+                    .unwrap(),
+                &end.inbound,
+                away
+            ),
             None,
             "an unchanged set is not said again"
         );
@@ -808,7 +834,7 @@ fn a_message_for_a_peer_goes_over_that_peers_link() {
         Some(msg).filter(|m| *m == run)
     });
     assert_eq!(got, Some(run));
-    let quiet = next_that(&their.inbound, Duration::from_millis(200), |msg| {
+    let quiet = before_marker(&group.pair.module_link(&chat(1)).unwrap(), &their.inbound, |msg| {
         matches!(msg, Msg::RunAction { .. }).then_some(())
     });
     assert_eq!(quiet, None, "the other window heard nothing");
@@ -984,12 +1010,7 @@ fn a_module_window_crash_takes_only_that_window() {
     assert!(group.failed.borrow().is_empty(), "it had linked, so no start failed");
     assert!(group.pair.module_link(&chat(2)).unwrap().linked(), "the other stays");
     assert!(
-        group
-            .pair
-            .module_process(&chat(2))
-            .unwrap()
-            .wait_reaped(Duration::from_millis(200))
-            .is_none(),
+        group.pair.module_process(&chat(2)).unwrap().ending_requests() == 0,
         "and runs on"
     );
     let (again, _again_end) = group.open(&chat(1));
@@ -1004,3 +1025,8 @@ fn each_window_says_its_own_close() {
 
 mod hand_over;
 mod tabs;
+
+#[cfg(test)]
+mod script_fixture {
+    include!(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/support/executable.rs"));
+}

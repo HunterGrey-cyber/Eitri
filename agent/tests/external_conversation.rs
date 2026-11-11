@@ -10,21 +10,16 @@ use agent::{
 };
 use std::collections::VecDeque;
 use std::path::Path;
-use std::sync::{Arc, Mutex, Once};
+use std::sync::{Arc, Mutex};
 
-/// Where a Claude transcript would be read from, set once for the whole binary before any test reads
-/// the environment: a test that plants a transcript must not touch the developer's own `~/.claude`.
-fn setup() {
-    static ONCE: Once = Once::new();
-    ONCE.call_once(|| {
-        let dir = agent::state_dirs::redirect_state_to_a_test_root().join("claude-config");
-        std::fs::create_dir_all(&dir).unwrap();
-        std::env::set_var("CLAUDE_CONFIG_DIR", dir);
-    });
+/// Gives each test a fresh child with a private Claude configuration directory.
+fn setup() -> bool {
+    let dir = agent::state_dirs::redirect_state_to_a_test_root().join("claude-config");
+    std::fs::create_dir_all(&dir).unwrap();
+    agent::testkit::environment::in_child(&[("CLAUDE_CONFIG_DIR", Some(dir.as_os_str()))])
 }
 
 fn workspace(label: &str) -> std::path::PathBuf {
-    setup();
     agent::state_dirs::test_workspace_dir(label)
 }
 
@@ -170,6 +165,9 @@ fn wait_for(what: &str, mut ready: impl FnMut() -> bool) {
 
 #[test]
 fn external_conversation_records_carry_the_provider_name() {
+    if !setup() {
+        return;
+    }
     let cwd = workspace("ext-record");
     let provider = Scripted::new("codex");
     let mut conversation =
@@ -208,6 +206,9 @@ fn external_conversation_records_carry_the_provider_name() {
 
 #[test]
 fn plain_send_turn_on_external_is_refused() {
+    if !setup() {
+        return;
+    }
     let cwd = workspace("ext-plain");
     let provider = Scripted::new("codex");
     let mut conversation =
@@ -235,6 +236,9 @@ fn plain_send_turn_on_external_is_refused() {
 
 #[test]
 fn send_turn_with_refuses_while_a_turn_is_active() {
+    if !setup() {
+        return;
+    }
     let cwd = workspace("ext-active");
     let provider = Scripted::new("codex");
     let mut conversation =
@@ -264,6 +268,9 @@ fn send_turn_with_refuses_while_a_turn_is_active() {
 
 #[test]
 fn create_external_refuses_a_start_that_names_a_session() {
+    if !setup() {
+        return;
+    }
     let cwd = workspace("ext-create-resume");
     let provider = Scripted::new("codex");
     let refused = AgentConversation::create_external(provider.clone(), start_for(&cwd, Some("thread-9")), &cwd);
@@ -273,6 +280,9 @@ fn create_external_refuses_a_start_that_names_a_session() {
 
 #[test]
 fn resume_external_does_not_read_a_claude_transcript() {
+    if !setup() {
+        return;
+    }
     let cwd = workspace("ext-resume");
     let canonical = cwd.canonicalize().unwrap();
     let canonical_str = canonical.to_string_lossy().to_string();
@@ -350,6 +360,9 @@ fn resume_external_does_not_read_a_claude_transcript() {
 /// and overlaps, the queue's flush, attention).
 #[test]
 fn resume_external_seeds_the_history_and_delivers_no_past_turn() {
+    if !setup() {
+        return;
+    }
     let cwd = workspace("ext-resume-history");
     let canonical = cwd.canonicalize().unwrap();
     let canonical_str = canonical.to_string_lossy().to_string();
@@ -423,6 +436,9 @@ fn resume_external_seeds_the_history_and_delivers_no_past_turn() {
 /// never writes today's reset time into it.
 #[test]
 fn a_resumed_ending_is_not_filled_by_a_live_limits_report() {
+    if !setup() {
+        return;
+    }
     let cwd = workspace("ext-resume-ending");
     let canonical = cwd.canonicalize().unwrap();
     let canonical_str = canonical.to_string_lossy().to_string();
@@ -489,6 +505,9 @@ fn a_resumed_ending_is_not_filled_by_a_live_limits_report() {
 
 #[test]
 fn resume_external_refuses_a_lease_for_another_session() {
+    if !setup() {
+        return;
+    }
     let cwd = workspace("ext-resume-lease");
     let canonical = cwd.canonicalize().unwrap();
     let canonical_str = canonical.to_string_lossy().to_string();
@@ -509,6 +528,9 @@ fn resume_external_refuses_a_lease_for_another_session() {
 
 #[test]
 fn resume_external_needs_a_session_to_resume() {
+    if !setup() {
+        return;
+    }
     let cwd = workspace("ext-resume-none");
     let canonical = cwd.canonicalize().unwrap();
     let provider = Scripted::new("codex");
@@ -521,6 +543,9 @@ fn resume_external_needs_a_session_to_resume() {
 /// external extension, so that nothing about a Claude session can route through it.
 #[test]
 fn claude_sidecar_does_not_name_agent_external() {
+    if !setup() {
+        return;
+    }
     let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/providers/claude_sidecar");
     let mut files = Vec::new();
     for entry in std::fs::read_dir(&dir).expect("the sidecar provider directory exists") {

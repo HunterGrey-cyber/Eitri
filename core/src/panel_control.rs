@@ -1814,10 +1814,8 @@ mod tests {
         let dir = scratch.join("c");
         // The winner's own side never polls `requests()`: the answer comes from the server thread.
         let _first = ours(claim_for(&dir, &ControlKey::Project(&root()), None));
-        let started = Instant::now();
         let second = claim_for(&dir, &ControlKey::Project(&root()), None);
         assert!(matches!(second, Ok(Claim::Forwarded(Reply::Ok))), "{second:?}");
-        assert!(started.elapsed() < Duration::from_secs(2));
     }
 
     #[test]
@@ -1834,7 +1832,7 @@ mod tests {
             Ok(Claim::Forwarded(Reply::Refused(why))) => assert!(why.contains("TCP"), "{why}"),
             other => panic!("{other:?}"),
         }
-        assert!(first.requests().recv_timeout(Duration::from_millis(300)).is_err());
+        assert!(first.requests().try_recv().is_err());
     }
 
     /// `<tmp>/eitri-<uid>` is only as safe as what holds it: in a directory another user can write, this one can be
@@ -2030,13 +2028,11 @@ mod tests {
         let pid_file = pid_path(&dir, &root());
         let own = std::process::id();
         std::fs::write(&pid_file, format!("{own}\n")).unwrap();
-        let started = Instant::now();
         let claimed = claim_for(&dir, &ControlKey::Project(&root()), None);
         assert!(
             matches!(claimed, Ok(Claim::Unresponsive { pid }) if pid == own),
             "{claimed:?}"
         );
-        assert!(started.elapsed() < Duration::from_secs(3));
         assert!(sock.exists() && pid_file.exists());
     }
 

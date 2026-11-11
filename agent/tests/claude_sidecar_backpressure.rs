@@ -28,11 +28,17 @@ use std::time::{Duration, Instant};
 const LONG_PROMPT: &str = "Write about 800 words on the history of version control, from SCCS to modern distributed \
      systems. Continuous prose, no headings, no bullet points.";
 
-/// The interrupt test's prompt: a reply still streaming after its first 300 characters and the test's 8s stall
-/// that follows. The 800 words of `LONG_PROMPT` can be over within 20s of the send. The turn is interrupted at
-/// the end of the stall whatever its length, so the longer ask adds no output past that point.
+/// A long reply provides enough queued content to interrupt with a backlog still held.
 const INTERRUPT_PROMPT: &str = "Write about 2000 words on the history of version control, from SCCS to modern \
      distributed systems. Continuous prose, no headings, no bullet points.";
+
+fn wait_for_backlog(provider: &ClaudeSidecarProvider, count: usize) {
+    let deadline = Instant::now() + Duration::from_secs(180);
+    while provider.backpressure_stats().pending_events < count {
+        assert!(Instant::now() < deadline, "the event backlog never reached {count}");
+        std::thread::sleep(Duration::from_millis(25));
+    }
+}
 
 fn connect() -> ClaudeSidecarProvider {
     ClaudeSidecarProvider::connect(&uuid::Uuid::new_v4().to_string())
@@ -237,7 +243,7 @@ fn a_watch_stream_that_dies_mid_turn_reports_a_typed_loss_not_silence() {
 /// outcome.
 #[test]
 #[ignore]
-fn a_consumer_that_stalls_for_twenty_seconds_loses_nothing() {
+fn a_consumer_that_stalls_until_a_backlog_accumulates_loses_nothing() {
     let provider = connect();
     let session_id = open(&provider);
 
@@ -248,9 +254,8 @@ fn a_consumer_that_stalls_for_twenty_seconds_loses_nothing() {
         })
         .unwrap();
 
-    // Deliberately do not pump at all. Every event produced in this window has to be held somewhere.
-    eprintln!("stalling the consumer for 20s while the reply streams");
-    std::thread::sleep(Duration::from_secs(20));
+    // Do not pump until the queue has enough events to exercise backpressure.
+    wait_for_backlog(&provider, 51);
 
     let backlog = provider.pump();
     eprintln!("backlog drained in one pump(): {} events", backlog.len());
@@ -266,7 +271,7 @@ fn a_consumer_that_stalls_for_twenty_seconds_loses_nothing() {
         all.extend(provider.pump());
         std::thread::sleep(Duration::from_millis(25));
     }
-    summarize("after a 20s stall", &all);
+    summarize("after a backlog accumulated", &all);
 
     assert!(
         all.iter().any(|e| matches!(e, AgentDomainEvent::TurnCompleted { .. })),
@@ -347,7 +352,7 @@ fn interrupting_with_an_undrained_backlog_still_terminates_the_turn_correctly() 
         "the turn ended before its text was 300 characters long"
     );
     let drained = all.len();
-    std::thread::sleep(Duration::from_secs(8));
+    wait_for_backlog(&provider, 150);
     provider
         .interrupt_turn(InterruptTurnRequest {
             session_id: session_id.clone(),
@@ -440,14 +445,17 @@ fn interrupting_with_an_undrained_backlog_still_terminates_the_turn_correctly() 
 #[test]
 #[ignore]
 fn the_sidecar_write_queue_under_a_real_turn_and_a_pump_stall() {
-    std::env::set_var("EITRI_SIDECAR_TEST_SEAMS", "1");
-    for (k, v) in [("VERDANDI_CLAUDE_SIDECAR_WRITE_QUEUE_STATS_MS", "1000")] {
-        std::env::set_var(k, v);
+    if !agent::testkit::environment::in_child(&[
+        ("EITRI_SIDECAR_TEST_SEAMS", Some(std::ffi::OsStr::new("1"))),
+        (
+            "VERDANDI_CLAUDE_SIDECAR_WRITE_QUEUE_STATS_MS",
+            Some(std::ffi::OsStr::new("1000")),
+        ),
+    ]) {
+        return;
     }
     let provider = ClaudeSidecarProvider::connect(&uuid::Uuid::new_v4().to_string())
         .expect("connecting to a real sidecar should succeed");
-    std::env::remove_var("VERDANDI_CLAUDE_SIDECAR_WRITE_QUEUE_STATS_MS");
-    std::env::remove_var("EITRI_SIDECAR_TEST_SEAMS");
 
     let pid = provider.sidecar_pid();
     let session_id = open(&provider);

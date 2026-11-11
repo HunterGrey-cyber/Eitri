@@ -72,9 +72,6 @@ const PERMISSION_BUDGET: Duration = Duration::from_secs(180);
 const REPLAY_BUDGET: Duration = Duration::from_secs(30);
 /// From the answer to the end of the turn: the tool runs, then the model writes a short reply.
 const TURN_END_BUDGET: Duration = Duration::from_secs(240);
-/// How long the sidecar must keep serving after the spawner's copy of its stdin is closed.
-const HELD_ALIVE_FOR: Duration = Duration::from_secs(2);
-
 const PROMPT: &str = "Use the Bash tool to run exactly this command in the current directory: touch probe-file\n\
                       Run nothing else. After it has run, reply with the single word done.";
 
@@ -927,6 +924,8 @@ async fn hand_stdin_to_helper(sidecar: &mut Sidecar) -> Result<String, String> {
     let mut ack = [0u8; 1];
     ours.read_exact(&mut ack)
         .map_err(|e| format!("the helper did not confirm it holds the descriptor: {e}"))?;
+    let watched = agent::child::PidFd::open(pid, agent::child::start_time(pid).map_err(|e| e.to_string())?)
+        .map_err(|e| format!("watch sidecar exit: {e}"))?;
     drop(stdin);
     let (pipe, ours_left) = copies_of_sidecar_stdin(pid);
     if !ours_left.is_empty() {
@@ -935,10 +934,10 @@ async fn hand_stdin_to_helper(sidecar: &mut Sidecar) -> Result<String, String> {
         ));
     }
 
-    tokio::time::sleep(HELD_ALIVE_FOR).await;
-    if !sidecar.running() {
+    // A grace deadline with no exit readiness is followed by a fresh RPC, while the helper still owns stdin.
+    if watched.wait_exited(agent::SIDECAR_EXIT_GRACE) {
         return Err(format!(
-            "the sidecar exited within {HELD_ALIVE_FOR:?} of the spawner closing its copy of stdin ({pipe}), \
+            "the sidecar exited after the spawner closed its copy of stdin ({pipe}), \
              although the helper (pid {}) held another",
             helper.0.id()
         ));
@@ -968,12 +967,9 @@ async fn hand_stdin_to_helper(sidecar: &mut Sidecar) -> Result<String, String> {
     }
     let released = Instant::now();
     let grace = agent::SIDECAR_EXIT_GRACE;
-    let give_up = released + grace + Duration::from_secs(5);
-    while sidecar.running() && Instant::now() < give_up {
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
+    let exited_during_grace = watched.wait_exited(grace);
     let exited_after = released.elapsed();
-    if sidecar.running() {
+    if !exited_during_grace {
         return Err(format!(
             "after the helper's copy of stdin closed the sidecar was still running {exited_after:?} later \
              (grace {grace:?})"
@@ -981,13 +977,9 @@ async fn hand_stdin_to_helper(sidecar: &mut Sidecar) -> Result<String, String> {
     }
     let status = sidecar.child.wait().map(|s| s.to_string()).unwrap_or_default();
     let detail = format!(
-        "the helper received {pipe} by SCM_RIGHTS, the spawner closed its copy; {HELD_ALIVE_FOR:?} later the \
+        "the helper received {pipe} by SCM_RIGHTS, the spawner closed its copy; the \
          sidecar was running and {answered}; the helper exited and the sidecar exited {exited_after:?} later \
          ({status}), grace {grace:?}"
     );
-    if exited_after <= grace {
-        Ok(detail)
-    } else {
-        Err(detail)
-    }
+    Ok(detail)
 }

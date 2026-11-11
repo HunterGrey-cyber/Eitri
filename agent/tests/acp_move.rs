@@ -6,6 +6,10 @@
 
 #![cfg(target_os = "linux")]
 
+#[path = "support/script_gate.rs"]
+mod script_gate;
+use script_gate::{until, ScriptGate};
+
 use agent::jsonrpc_link::LinkHandoff;
 use agent::providers::acp::{AcpAgentSpec, AcpProvider, AcpProviderHandoff};
 use agent::{
@@ -331,7 +335,7 @@ fn a_flooding_agent_with_a_full_queue_moves_with_its_messages_in_order() {
     rest.push(reply(3, json!({"stopReason": "end_turn"})));
     let source = running(&dir, rest);
     // Nothing is pumped: the agent fills the queue and the reader blocks on it.
-    std::thread::sleep(Duration::from_millis(1500));
+    until(|| source.reader_waiting_for_tests());
     let destination = moved(&source);
     let after = pump_until(&destination, |events| completed(events).is_some());
     let expected: String = (0..CHUNKS).map(|i| format!("{i},")).collect();
@@ -422,6 +426,7 @@ fn an_agent_whose_end_still_waits_for_its_stderr_refuses_the_move_and_keeps_its_
 
 #[test]
 fn a_saved_session_still_replaying_refuses_the_move_at_once() {
+    let gate = ScriptGate::new();
     let dir = scratch("replaying");
     let script = vec![
         json!({"expect": r#"^\{"jsonrpc":"2\.0","id":1,"method":"initialize""#}),
@@ -436,7 +441,7 @@ fn a_saved_session_still_replaying_refuses_the_move_at_once() {
         ),
         json!({"expect": r#"^\{"jsonrpc":"2\.0","id":2,"method":"session/load""#}),
         // A long replay: the answer comes well after a start's short wait.
-        json!({"sleep_ms": 3000}),
+        gate.step(),
         reply(
             2,
             json!({"modes": {"currentModeId": "agent", "availableModes": []}, "models": {"currentModelId": "m-1"}}),
@@ -450,6 +455,7 @@ fn a_saved_session_still_replaying_refuses_the_move_at_once() {
     };
     let provider = AcpProvider::connect(spec, std::env::temp_dir()).expect("connects");
     std::thread::scope(|scope| {
+        let gate = gate;
         let loading = scope.spawn(|| {
             provider.start(ExternalStart {
                 cwd: "/work".to_string(),
@@ -472,16 +478,13 @@ fn a_saved_session_still_replaying_refuses_the_move_at_once() {
             assert!(Instant::now() < end, "the load was never sent");
             std::thread::sleep(Duration::from_millis(10));
         }
-        let asked = Instant::now();
+        gate.wait();
         let refused = provider
-            .freeze_for_move()
+            .freeze_with_clock_for_tests(Instant::now, |_| panic!("this refusal must not wait for a start"))
             .map(|_| ())
             .expect_err("a replay holds the move");
         assert_eq!(refused, MoveRefusedWhy::HistoryLoading);
-        assert!(
-            asked.elapsed() < Duration::from_secs(1),
-            "a replay is refused at once, not after the start's wait"
-        );
+        gate.release();
         assert_eq!(
             loading.join().expect("the start").expect("the saved session opens"),
             "s1",

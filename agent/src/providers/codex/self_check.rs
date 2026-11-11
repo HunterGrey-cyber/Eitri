@@ -88,6 +88,16 @@ const EXIT_GRACE: Duration = Duration::from_secs(5);
 const CHECK_REVISION: u32 = 4;
 /// The directory under Eitri's state directory that holds one directory per checked binary.
 const CHECK_DIR: &str = "codex-check";
+
+#[cfg(feature = "test-support")]
+static RUN_COUNTS: std::sync::LazyLock<std::sync::Mutex<std::collections::HashMap<PathBuf, usize>>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+
+#[cfg(feature = "test-support")]
+pub fn runs_for_tests(state_home: &Path) -> usize {
+    RUN_COUNTS.lock().unwrap().get(state_home).copied().unwrap_or(0)
+}
+
 /// The file in a binary's check directory that records how its last run ended, so the starts that waited
 /// for that run get its answer.
 const LAST_RUN: &str = "last-run.json";
@@ -266,13 +276,33 @@ fn failed_without_log(reason: String) -> SelfCheckError {
     }
 }
 
+/// The private home for version probes made by the real-Codex test harness. Child commands read
+/// this owned path; setting it never changes the process environment.
+#[cfg(feature = "test-support")]
+static TEST_PROBE_HOME: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+
+#[cfg(feature = "test-support")]
+pub fn set_probe_home_for_tests(home: PathBuf) {
+    if TEST_PROBE_HOME.set(home.clone()).is_err() {
+        assert_eq!(TEST_PROBE_HOME.get(), Some(&home));
+    }
+}
+
 /// `<program> --version`: the last word of its first line, such as `0.161.0`.
 fn probe_version(program: &Path) -> Result<String, String> {
     // A file written a moment ago can still be open in a child another thread is forking; the kernel then
     // refuses to run it for a few milliseconds ("text file busy").
     let mut attempts = 0;
     let mut child = loop {
-        let spawned = Command::new(program)
+        let mut command = Command::new(program);
+        #[cfg(feature = "test-support")]
+        if let Some(home) = TEST_PROBE_HOME.get() {
+            command
+                .env("CODEX_HOME", home)
+                .env_remove("TMUX")
+                .env_remove("TMUX_PANE");
+        }
+        let spawned = command
             .arg("--version")
             .current_dir("/")
             .stdin(Stdio::null())
@@ -467,6 +497,19 @@ impl Pending {
         record: bool,
         run: impl FnOnce(&BinaryKey, &Path, &mut Log) -> Result<bool, Vec<String>>,
     ) -> Result<Checked, SelfCheckError> {
+        self.finish_with_clock(lock_wait, record, run, &Instant::now, &|| {
+            std::thread::sleep(Duration::from_millis(50))
+        })
+    }
+
+    fn finish_with_clock(
+        self,
+        lock_wait: Duration,
+        record: bool,
+        run: impl FnOnce(&BinaryKey, &Path, &mut Log) -> Result<bool, Vec<String>>,
+        now: &dyn Fn() -> Instant,
+        pause: &dyn Fn(),
+    ) -> Result<Checked, SelfCheckError> {
         let Pending {
             key,
             state_home,
@@ -489,10 +532,11 @@ impl Pending {
         // One check at a time per binary; whoever waits finds the verdict, or the failure of the run it
         // waited for. Waiting has an end, so a check that hangs past its own budget does not hold every
         // later start of this binary for good.
-        let _lock = DirLock::take(&dir.join("lock"), Instant::now() + lock_wait).map_err(|e| match e.kind() {
-            std::io::ErrorKind::TimedOut => SelfCheckError::Unfinished { waited: lock_wait },
-            _ => fail(format!("the check's lock could not be taken: {e}")),
-        })?;
+        let _lock =
+            DirLock::take_with_clock(&dir.join("lock"), now() + lock_wait, now, pause).map_err(|e| match e.kind() {
+                std::io::ErrorKind::TimedOut => SelfCheckError::Unfinished { waited: lock_wait },
+                _ => fail(format!("the check's lock could not be taken: {e}")),
+            })?;
         if let Some(editor_server_lever) = recorded_pass(&verdict_path, &key) {
             return Ok(Checked {
                 key,
@@ -513,6 +557,11 @@ impl Pending {
             .map_err(|e| fail(format!("{} cannot be made: {e}", run_dir.display())))?;
         let mut log = Log::new();
         log.line(format!("codex {} at {}", key.version, key.path.display()));
+        #[cfg(feature = "test-support")]
+        {
+            let mut runs = RUN_COUNTS.lock().unwrap();
+            *runs.entry(state_home.to_path_buf()).or_default() += 1;
+        }
         let started = Instant::now();
         let result = run(&key, &run_dir, &mut log);
         let _ = std::fs::remove_dir_all(&run_dir);
@@ -620,7 +669,19 @@ struct DirLock(File);
 
 impl DirLock {
     /// Takes the lock, waiting for whoever holds it until `deadline`; past it the error is `TimedOut`.
+    #[cfg(test)]
     fn take(path: &Path, deadline: Instant) -> std::io::Result<DirLock> {
+        Self::take_with_clock(path, deadline, &Instant::now, &|| {
+            std::thread::sleep(Duration::from_millis(50))
+        })
+    }
+
+    fn take_with_clock(
+        path: &Path,
+        deadline: Instant,
+        now: &dyn Fn() -> Instant,
+        pause: &dyn Fn(),
+    ) -> std::io::Result<DirLock> {
         let file = open_private(path)?;
         loop {
             // SAFETY: the descriptor is `file`'s own and stays open for the call.
@@ -630,8 +691,8 @@ impl DirLock {
             let e = std::io::Error::last_os_error();
             match e.kind() {
                 std::io::ErrorKind::Interrupted => {}
-                std::io::ErrorKind::WouldBlock if Instant::now() < deadline => {
-                    std::thread::sleep(Duration::from_millis(50));
+                std::io::ErrorKind::WouldBlock if now() < deadline => {
+                    pause();
                 }
                 std::io::ErrorKind::WouldBlock => {
                     return Err(std::io::Error::new(
@@ -1872,8 +1933,8 @@ mod tests {
         /// An executable that prints a version line, as `codex --version` does.
         fn program(&self, name: &str, version_line: &str) -> PathBuf {
             let path = self.0.join(name);
-            std::fs::write(&path, format!("#!/bin/sh\necho '{version_line}'\n")).expect("writes");
-            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+            script_fixture::write_executable_script(&path, format!("#!/bin/sh\necho '{version_line}'\n"), 0o755)
+                .expect("chmod");
             path
         }
 
@@ -1916,6 +1977,7 @@ mod tests {
         // A pass is recorded privately, once per binary.
         check(&a, &state, &runs, Ok(())).expect("passes");
         assert_eq!(runs.get(), 1);
+        assert_eq!(runs_for_tests(&state), 1);
         let key_a = BinaryKey::of(&a).expect("key");
         let dir_a = state.join(CHECK_DIR).join(key_a.id());
         assert_eq!(mode(&dir_a), 0o700);
@@ -1924,6 +1986,7 @@ mod tests {
         assert!(!dir_a.join("run").exists(), "the scratch directory is removed");
         check(&a, &state, &runs, Err(vec!["not asked".into()])).expect("the cached pass answers");
         assert_eq!(runs.get(), 1, "a recorded pass is not run again");
+        assert_eq!(runs_for_tests(&state), 1, "the run counter must see no second check");
 
         // Another binary has its own key and its own directory.
         check(&b, &state, &runs, Ok(())).expect("passes");
@@ -2038,18 +2101,24 @@ mod tests {
         // Another check holds the lock and never finishes.
         let held = DirLock::take(&dir.join("lock"), Instant::now() + Duration::from_secs(5)).expect("lock");
 
-        let (done, finished) = std::sync::mpsc::channel();
-        let (program_in, state_in) = (program.clone(), state.clone());
-        std::thread::spawn(move || {
-            let started = Instant::now();
-            let result = Pending::new(&program_in, &state_in).and_then(|pending| {
-                pending.finish(Duration::from_millis(300), true, |_, _, _| Err(vec!["ran".into()]))
-            });
-            let _ = done.send((result, started.elapsed()));
+        let clock = Cell::new(Instant::now());
+        let started = clock.get();
+        let result = Pending::new(&program, &state).and_then(|pending| {
+            pending.finish_with_clock(
+                Duration::from_millis(300),
+                true,
+                |_, _, _| Err(vec!["ran".into()]),
+                &|| clock.get(),
+                &|| {
+                    assert!(
+                        clock.get() - started < Duration::from_secs(1),
+                        "lock wait ignored its deadline"
+                    );
+                    clock.set(clock.get() + Duration::from_millis(50));
+                },
+            )
         });
-        let (result, waited) = finished
-            .recv_timeout(Duration::from_secs(20))
-            .expect("the waiting start gives up instead of waiting for ever");
+        assert_eq!(clock.get().duration_since(started), Duration::from_millis(300));
         drop(held);
         let err = result.expect_err("refused");
         assert!(matches!(err, SelfCheckError::Unfinished { .. }), "{err:?}");
@@ -2057,7 +2126,6 @@ mod tests {
             err.to_string().contains("another check of this Codex did not finish"),
             "{err}"
         );
-        assert!(waited >= Duration::from_millis(300), "{waited:?}");
     }
 
     #[test]
@@ -2420,4 +2488,9 @@ mod tests {
         );
         assert_eq!(find_hook(&listing, "/q"), None);
     }
+}
+
+#[cfg(test)]
+mod script_fixture {
+    include!(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/support/executable.rs"));
 }

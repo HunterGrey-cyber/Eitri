@@ -329,8 +329,8 @@ pub(super) fn watch_connect(rx: mpsc::Receiver<Result<AgentBackend, BackendError
 
 /// Waits for each teardown worker's report and says how many arrived. A worker that died drops its
 /// sender without one, which ends that wait at once.
-pub(super) fn collect_reports(each: Vec<mpsc::Receiver<()>>) -> usize {
-    each.iter().filter(|rx| rx.recv().is_ok()).count()
+pub(super) fn collect_reports(each: impl IntoIterator<Item = mpsc::Receiver<()>>) -> usize {
+    each.into_iter().filter(|rx| rx.recv().is_ok()).count()
 }
 
 /// What tabs that left while the window stays open are still doing: a backend being shut down on
@@ -800,7 +800,6 @@ mod tests {
         page.visible.set(true);
         for _ in 0..5 {
             handle.tick();
-            std::thread::sleep(std::time::Duration::from_millis(10));
         }
         assert_eq!(
             guard.check(),
@@ -827,25 +826,38 @@ mod tests {
     #[test]
     fn the_close_collector_counts_every_worker_and_survives_one_dying() {
         let mut each = Vec::new();
+        let mut releases = Vec::new();
+        let mut workers = Vec::new();
         for n in 0..3 {
             let (tx, rx) = mpsc::channel();
             each.push(rx);
-            std::thread::spawn(move || {
+            let (release, held) = mpsc::channel();
+            releases.push(release);
+            workers.push(std::thread::spawn(move || {
+                held.recv_timeout(std::time::Duration::from_secs(60))
+                    .expect("collection never started");
                 if n == 1 {
                     drop(tx);
                     return;
                 }
-                std::thread::sleep(std::time::Duration::from_millis(20 * n));
                 let _ = tx.send(());
-            });
+            }));
         }
         let (done_tx, done_rx) = mpsc::channel();
         std::thread::spawn(move || {
-            let _ = done_tx.send(collect_reports(each));
+            let waiting = each.into_iter().zip(releases).map(|(rx, release)| {
+                // Workers cannot finish until the collector reaches their receiver.
+                release.send(()).unwrap();
+                rx
+            });
+            let _ = done_tx.send(collect_reports(waiting));
         });
         let finished = done_rx
             .recv_timeout(std::time::Duration::from_secs(5))
             .expect("the collector must not hang on a dead worker");
+        for worker in workers {
+            worker.join().unwrap();
+        }
         assert_eq!(finished, 2);
     }
 
@@ -928,11 +940,15 @@ mod tests {
         let mut writer = TabWriter::new(Some(files.clone()), dir.clone());
         let (release_tx, release_rx) = mpsc::channel::<()>();
         let release_rx = std::sync::Mutex::new(release_rx);
+        let (entered, writing) = mpsc::channel();
+        let entered = std::sync::Mutex::new(entered);
         writer.set_before_write(std::sync::Arc::new(move || {
-            let _ = release_rx
+            entered.lock().unwrap().send(()).unwrap();
+            release_rx
                 .lock()
                 .unwrap()
-                .recv_timeout(std::time::Duration::from_secs(10));
+                .recv_timeout(std::time::Duration::from_secs(60))
+                .unwrap();
         }));
         state.borrow_mut().tab_memory = writer;
         {
@@ -945,20 +961,19 @@ mod tests {
                 reason: "stopped".to_string(),
             });
         }
+        let now = std::time::Instant::now();
         let mut watch = handle_for(&state).shutdown();
-        let held_until = std::time::Instant::now() + std::time::Duration::from_millis(300);
-        while std::time::Instant::now() < held_until {
-            assert!(
-                watch.step(std::time::Instant::now()),
-                "let go while the write was under way"
-            );
-            std::thread::sleep(std::time::Duration::from_millis(10));
+        writing
+            .recv_timeout(std::time::Duration::from_secs(60))
+            .expect("the write started");
+        for _ in 0..3 {
+            assert!(watch.step(now), "let go while the write was held");
         }
         release_tx.send(()).unwrap();
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-        while watch.step(std::time::Instant::now()) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        while watch.step(now) {
             assert!(std::time::Instant::now() < deadline, "the close never let go");
-            std::thread::sleep(std::time::Duration::from_millis(10));
+            std::thread::yield_now();
         }
         let loaded = match eitri_core::saved_tabs::load(&files, &dir) {
             eitri_core::saved_tabs::Loaded::Saved(saved) => saved,

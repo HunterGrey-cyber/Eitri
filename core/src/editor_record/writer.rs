@@ -61,9 +61,39 @@ impl Drop for Handle {
 struct Shared {
     state: Mutex<State>,
     ready: Condvar,
+    #[cfg(test)]
+    handoff_clock: Mutex<Option<(Instant, usize)>>,
+    #[cfg(test)]
+    handoff_park: Mutex<Option<(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>>,
 }
 
 impl Shared {
+    fn handoff_now(&self) -> Instant {
+        #[cfg(test)]
+        if let Some((now, _)) = *self.handoff_clock.lock().unwrap() {
+            return now;
+        }
+        Instant::now()
+    }
+
+    fn handoff_wait(&self, wait: Duration) {
+        #[cfg(test)]
+        if let Some((entered, release)) = self.handoff_park.lock().unwrap().take() {
+            entered.send(()).unwrap();
+            release
+                .recv_timeout(Duration::from_secs(60))
+                .expect("handoff hold released");
+        }
+        #[cfg(test)]
+        if let Some((now, turns)) = self.handoff_clock.lock().unwrap().as_mut() {
+            assert!(*turns < 1_000, "handoff did not finish within 1,000 polls");
+            *now += wait;
+            *turns += 1;
+            return;
+        }
+        std::thread::sleep(wait);
+    }
+
     fn lock(&self) -> MutexGuard<'_, State> {
         self.state.lock().unwrap_or_else(PoisonError::into_inner)
     }
@@ -176,6 +206,10 @@ impl RecordWriter {
                 ..State::default()
             }),
             ready: Condvar::new(),
+            #[cfg(test)]
+            handoff_clock: Mutex::new(None),
+            #[cfg(test)]
+            handoff_park: Mutex::new(None),
         });
         let thread_shared = shared.clone();
         let worker = Worker {
@@ -228,7 +262,7 @@ impl RecordWriter {
     /// answers [`WriterAnswer::Handoff`]. The record in it is handed over with `seq` and the file removed. Once per
     /// token: a second call for a token already asked is ignored, its answer being the first one's.
     pub fn read_handoff(&self, seq: u64, token: String, path: PathBuf, wait: Duration) {
-        let now = Instant::now();
+        let now = self.shared().handoff_now();
         let until = now.checked_add(wait).unwrap_or(now);
         if !self.shared().lock().asked.insert(token.clone()) {
             return;
@@ -491,7 +525,7 @@ impl Worker {
             match agent::private_fs::read_private_nofollow_capped(path, RECORD_MAX as u64) {
                 Ok(text) => break text,
                 Err(e) if e.kind() == io::ErrorKind::NotFound => {
-                    let left = until.saturating_duration_since(Instant::now());
+                    let left = until.saturating_duration_since(shared.handoff_now());
                     if left.is_zero() || shared.lock().off {
                         eprintln!(
                             "[editor] reopen: no handoff at {}; the last record stands",
@@ -499,7 +533,7 @@ impl Worker {
                         );
                         return None;
                     }
-                    std::thread::sleep(left.min(HANDOFF_POLL));
+                    shared.handoff_wait(left.min(HANDOFF_POLL));
                 }
                 Err(e) => {
                     eprintln!("[editor] reopen: the handoff at {} was refused: {e}", path.display());

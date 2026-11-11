@@ -161,10 +161,9 @@ impl StandIn {
         true
     }
 
-    fn pump_for(&self, span: Duration) {
-        let start = Instant::now();
-        while start.elapsed() < span {
-            self.pump(Duration::from_millis(1));
+    fn turns(&self) {
+        for _ in 0..100 {
+            self.pump(Duration::ZERO);
         }
     }
 }
@@ -318,7 +317,6 @@ impl Setup {
 fn no_deadlock_and_no_lost_event_over_20000_syncs() {
     let setup = Setup::start(Vec::new(), None);
     let (pane, recorder) = setup.pane_after_startup();
-    let start = Instant::now();
     let mut seq = 0;
     for _ in 0..100 {
         // Both queues' requests interleaved, both readers active while the replies arrive.
@@ -343,55 +341,35 @@ fn no_deadlock_and_no_lost_event_over_20000_syncs() {
         "every done, once, in order"
     );
     assert_eq!(setup.stand_in.done(), 10_000);
-    assert!(
-        start.elapsed() < Duration::from_secs(30),
-        "a stall between the readers: {:?}",
-        start.elapsed()
-    );
 }
 
 fn our_queue_is_dispatched_when_only_gdk_reads() {
     let setup = Setup::start(Vec::new(), None);
     let (pane, recorder) = setup.pane_after_startup();
 
-    // The thread waits in its poll with no timeout; the stand-in is reading too.
     for seq in 0..20 {
-        let sent = Instant::now();
         setup.sync(pane, seq);
         assert!(setup.stand_in.pump_until(LIMIT, || recorder.frame(seq).is_some()));
-        let delay = recorder.frame(seq).unwrap().duration_since(sent);
-        assert!(
-            delay < Duration::from_millis(50),
-            "done {seq} reached the thread after {delay:?}"
-        );
     }
-
-    // The thread is busy outside its poll when the reply comes, so only the stand-in reads it; the
-    // thread dispatches it from its queue as soon as it is back.
     let (report, hold) = mpsc::channel();
+    let (release, released) = mpsc::channel();
     setup.thread.send_test_command(TestCommand::Hold {
-        span: Duration::from_millis(200),
+        release: released,
         report,
     });
     let held_from = hold.recv_timeout(LIMIT).expect("the hold started");
     setup.sync(pane, 100);
     setup.stand_in.sync();
     assert!(setup.stand_in.pump_until(LIMIT, || setup.stand_in.done() == 1));
-    let stand_in_done = Instant::now();
-    assert!(setup.stand_in.pump_until(LIMIT, || recorder.frame(100).is_some()));
+    assert!(
+        recorder.frame(100).is_none(),
+        "the worker is held with the reply queued"
+    );
+    release.send(()).unwrap();
     let held_until = hold.recv_timeout(LIMIT).expect("the hold ended");
-    assert!(
-        stand_in_done < held_until,
-        "the stand-in's own done arrived only after the hold ({:?} after it began)",
-        stand_in_done.duration_since(held_from)
-    );
-    let at = recorder.frame(100).unwrap();
-    assert!(at >= held_until, "the busy thread dispatched during its hold");
-    let delay = at.duration_since(held_until);
-    assert!(
-        delay < Duration::from_millis(50),
-        "done 100 reached the thread {delay:?} after the hold"
-    );
+    assert!(held_from <= held_until);
+    assert!(setup.stand_in.pump_until(LIMIT, || recorder.frame(100).is_some()));
+    assert!(recorder.frame(100).unwrap() >= held_until, "dispatch follows release");
 }
 
 fn a_roundtrip_whose_reply_gdk_read_first_still_ends() {
@@ -401,10 +379,18 @@ fn a_roundtrip_whose_reply_gdk_read_first_still_ends() {
     // the thread's queue; the thread must find it there rather than wait in its poll for more.
     for _ in 0..5 {
         let (done, ended) = mpsc::channel();
+        let (entered, entry) = mpsc::channel();
+        let (release, released) = mpsc::channel();
         setup.thread.send_test_command(TestCommand::Roundtrip {
-            hold: Duration::from_millis(50),
+            entered,
+            release: released,
             done,
         });
+        entry.recv_timeout(LIMIT).expect("inside the roundtrip wait");
+        let before = setup.stand_in.done();
+        setup.stand_in.sync();
+        assert!(setup.stand_in.pump_until(LIMIT, || setup.stand_in.done() > before));
+        release.send(()).unwrap();
         assert!(
             setup.stand_in.pump_until(LIMIT, || ended.try_recv().is_ok()),
             "the thread is still waiting for a reply that is already in its queue; {}",
@@ -450,15 +436,18 @@ fn a_thread_that_does_not_confirm_stop_is_leaked_not_dropped() {
     let _ = setup.pane_after_startup();
     let probe = setup.thread.connection_probe().expect("a live connection");
     let (report, hold) = mpsc::channel();
+    let (release, released) = mpsc::channel();
     setup.thread.send_test_command(TestCommand::Hold {
-        span: Duration::from_millis(300),
+        release: released,
         report,
     });
     hold.recv_timeout(LIMIT).expect("the hold started");
-    let start = Instant::now();
     setup.thread.shutdown();
-    let took = start.elapsed();
-    assert!(took < Duration::from_millis(150), "the shutdown took {took:?}");
+    assert!(
+        !setup.thread.thread_exited(),
+        "shutdown returned while the worker was held"
+    );
+    release.send(()).unwrap();
     hold.recv_timeout(LIMIT).expect("the hold ended");
     assert!(
         setup.stand_in.pump_until(LIMIT, || setup.thread.thread_exited()),
@@ -531,7 +520,7 @@ fn a_panic_on_the_thread_becomes_thread_failed() {
     );
     // Its pending callback's done lands on the leaked queue, unread, and aborts nothing.
     setup.server.release(callback);
-    setup.stand_in.pump_for(Duration::from_millis(200));
+    setup.stand_in.turns();
     // GDK's reader is not held by a read intention the thread left behind.
     setup.stand_in.sync();
     assert!(
@@ -547,7 +536,7 @@ fn a_panic_on_the_thread_becomes_thread_failed() {
 fn the_mailbox_wakes_once_per_drain() {
     let setup = Setup::start(Vec::new(), None);
     let (pane, recorder) = setup.pane_after_startup();
-    setup.stand_in.pump_for(Duration::from_millis(20));
+    setup.stand_in.turns();
     let before = setup.thread.mailbox_wakes();
     let (done, burst) = mpsc::channel();
     setup

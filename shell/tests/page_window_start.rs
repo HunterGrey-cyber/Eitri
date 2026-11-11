@@ -64,8 +64,7 @@ impl Case {
         .unwrap();
         // Anything that could start the agent's sidecar finds this first, and it answers nothing.
         let claude = scratch.join("bin/claude");
-        std::fs::write(&claude, "#!/bin/sh\nexit 1\n").unwrap();
-        std::fs::set_permissions(&claude, std::fs::Permissions::from_mode(0o755)).unwrap();
+        script_fixture::write_executable_script(&claude, "#!/bin/sh\nexit 1\n", 0o755).unwrap();
         std::fs::write(scratch.join("project/doc.md"), "# Doc\n\nline\n").unwrap();
         std::fs::write(scratch.join("project/other.md"), "# Other\n").unwrap();
 
@@ -403,4 +402,9 @@ fn main() {
     }
     println!("page_window_start: {} passed; {failed} failed", ran - failed);
     server.exit(if failed == 0 && ran > 0 { 0 } else { 1 });
+}
+
+#[cfg(test)]
+mod script_fixture {
+    include!(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/support/executable.rs"));
 }

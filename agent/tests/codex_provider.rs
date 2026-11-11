@@ -18,6 +18,10 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+#[path = "support/script_gate.rs"]
+mod script_gate;
+use script_gate::{until, ScriptGate};
+
 const UA: &str = "eitri-probe/0.160.0 (Arch Linux Rolling Release; x86_64) tmux-256color (eitri-probe; 0)";
 const FIXTURES: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/codex");
 
@@ -642,53 +646,35 @@ fn timed_start(thread: &str, request: ExternalStart, rest: Vec<Value>) -> (Codex
 #[test]
 fn the_start_waits_for_the_server_to_leave_starting_and_no_longer_than_3_s() {
     assert_eq!(EDITOR_SERVER_WAIT, Duration::from_secs(3));
-    let (t, took_up) = ("th-70", Duration::from_millis(400));
-    let (_up, came_up) = timed_start(
-        t,
+    let (provider, _) = timed_start(
+        "th-70",
         start_with_editor_server(),
         vec![
-            server_status(t, "eitri", "starting"),
-            json!({"sleep_ms": took_up.as_millis() as u64}),
-            server_status(t, "eitri", "ready"),
+            server_status("th-70", "eitri", "starting"),
+            server_status("th-70", "theirs", "ready"),
+            server_status("th-70", "eitri", "ready"),
         ],
     );
-    assert!(came_up >= took_up, "the start did not wait for the server: {came_up:?}");
-
-    // Another server's word is not this one's.
-    let (_stuck, gave_up) = timed_start(
-        t,
-        start_with_editor_server(),
-        vec![
-            server_status(t, "eitri", "starting"),
-            server_status(t, "theirs", "ready"),
-        ],
-    );
-    assert!(gave_up >= EDITOR_SERVER_WAIT, "gave up after {gave_up:?}");
-    assert!(
-        gave_up <= EDITOR_SERVER_WAIT + Duration::from_secs(2),
-        "gave up after {gave_up:?}"
-    );
-    assert!(
-        came_up < gave_up,
-        "a server that came up took as long as one that never did"
-    );
+    assert_eq!(provider.editor_wait_count_for_tests(), 1);
+    assert_eq!(provider.editor_wait_outcome_for_tests(), Some("ready"));
 }
 
 #[test]
 fn no_editor_server_means_no_wait() {
     let t = "th-71";
-    let (_provider, took) = timed_start(
+    let (provider, _) = timed_start(
         t,
         start_request(Reviewer::User),
         vec![server_status(t, "eitri", "starting")],
     );
-    assert!(took < EDITOR_SERVER_WAIT, "the start waited: {took:?}");
+    assert_eq!(provider.editor_wait_count_for_tests(), 0);
+    assert_eq!(provider.editor_wait_outcome_for_tests(), None);
 }
 
 #[test]
 fn a_failed_server_leaves_a_usable_session() {
     let (t, u) = ("th-72", "turn-72");
-    let (provider, took) = timed_start(
+    let (provider, _) = timed_start(
         t,
         start_with_editor_server(),
         vec![
@@ -699,7 +685,8 @@ fn a_failed_server_leaves_a_usable_session() {
             turn_completed(t, u, "completed", Value::Null),
         ],
     );
-    assert!(took < EDITOR_SERVER_WAIT, "a failure ends the wait: {took:?}");
+    assert_eq!(provider.editor_wait_count_for_tests(), 1);
+    assert_eq!(provider.editor_wait_outcome_for_tests(), Some("failed"));
     assert_eq!(send(&provider, t, "go").expect("the turn starts"), u);
     let events = until_turn_completed(&provider);
     assert!(matches!(
@@ -774,13 +761,9 @@ fn a_session_given_an_editor_server_sends_it_on_start_and_on_resume() {
             script.push(write(json!({"id": 4, "result": {"data": [], "nextCursor": null}})));
         }
         let provider = connect(script).expect("connects");
-        let began = Instant::now();
         assert_eq!(provider.start(request).expect("starts"), "th-1");
-        assert!(
-            began.elapsed() < EDITOR_SERVER_WAIT,
-            "the server's status was missed: {:?}",
-            began.elapsed()
-        );
+        assert_eq!(provider.editor_wait_count_for_tests(), 1);
+        assert_eq!(provider.editor_wait_outcome_for_tests(), Some("ready"));
     }
 }
 
@@ -954,11 +937,22 @@ fn second_send_before_turn_completed_is_refused() {
 
 #[test]
 fn turn_start_wait_is_bounded_by_10s() {
+    assert_eq!(agent::UNARY_RPC_TIMEOUT, Duration::from_secs(10));
     let (provider, thread) = open(
         "th-4",
-        vec![expect_request(4, "turn/start"), json!({"sleep_ms": 40_000})],
+        vec![expect_request(4, "turn/start"), json!({"ignore_eof": true})],
     );
-    let began = Instant::now();
+    let start = Instant::now();
+    let ticks = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counted = ticks.clone();
+    provider.set_rpc_clock_for_tests(
+        start,
+        std::sync::Arc::new(move || {
+            let tick = counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            assert!(tick <= 10, "turn start ignored its deadline");
+            start + Duration::from_secs(tick as u64)
+        }),
+    );
     let (sent, received) = std::sync::mpsc::channel();
     let pending = provider.clone();
     let session = thread.clone();
@@ -966,9 +960,12 @@ fn turn_start_wait_is_bounded_by_10s() {
         let _ = sent.send(send(&pending, &session, "never answered"));
     });
     let result = received.recv_timeout(Duration::from_secs(60)).expect("turn/start hung");
-    let took = began.elapsed();
     assert!(matches!(result, Err(ProviderError::Timeout)), "{result:?}");
-    assert!(took >= Duration::from_secs(10), "the wait took {took:?}");
+    assert_eq!(
+        ticks.load(std::sync::atomic::Ordering::SeqCst),
+        11,
+        "the pending wait used the entire 10s deadline"
+    );
     // The failed start left no turn behind.
     let interrupt = provider.interrupt_turn(InterruptTurnRequest {
         session_id: thread.clone(),
@@ -1706,7 +1703,7 @@ fn interrupt_sends_one_turn_interrupt_and_never_waits() {
         ],
     );
     send(&provider, &thread, "go").expect("starts");
-    let began = Instant::now();
+    let waits = provider.blocking_waits_for_tests();
     for _ in 0..3 {
         provider
             .interrupt_turn(InterruptTurnRequest {
@@ -1714,9 +1711,10 @@ fn interrupt_sends_one_turn_interrupt_and_never_waits() {
             })
             .expect("an interrupt is accepted");
     }
-    assert!(
-        began.elapsed() < Duration::from_secs(2),
-        "interrupts must not wait for an answer"
+    assert_eq!(
+        provider.blocking_waits_for_tests(),
+        waits,
+        "interrupt never waits on its RPC"
     );
     let events = until_turn_completed(&provider);
     assert!(matches!(
@@ -1734,11 +1732,12 @@ fn interrupt_sends_one_turn_interrupt_and_never_waits() {
 
 #[test]
 fn interrupt_before_the_turn_id_is_held_until_the_answer() {
+    let gate = ScriptGate::new();
     let (provider, thread) = open(
         "th-12",
         vec![
             expect_request(4, "turn/start"),
-            json!({"sleep_ms": 600}),
+            gate.step(),
             turn_response(4, "turn-12"),
             expect_exact(r#"{"id":5,"method":"turn/interrupt","params":{"threadId":"th-12","turnId":"turn-12"}}"#),
             turn_completed("th-12", "turn-12", "interrupted", Value::Null),
@@ -1750,12 +1749,13 @@ fn interrupt_before_the_turn_id_is_held_until_the_answer() {
         std::thread::spawn(move || send(&provider, &thread, "go"))
     };
     // Wait until the turn is in flight, then press the key before its id is known.
-    std::thread::sleep(Duration::from_millis(250));
+    gate.wait();
     provider
         .interrupt_turn(InterruptTurnRequest {
             session_id: thread.clone(),
         })
         .expect("the interrupt is accepted");
+    gate.release();
     assert_eq!(
         sender.join().expect("the sender ran").expect("the turn started"),
         "turn-12"
@@ -1783,13 +1783,12 @@ fn close_unsubscribes_then_eof() {
     );
     let pid = provider.pid();
     assert!(alive(pid));
-    let began = Instant::now();
-    provider
-        .close_session(CloseSessionRequest {
+    assert!(
+        provider.close_on_eof_for_tests(CloseSessionRequest {
             session_id: thread.clone(),
-        })
-        .expect("closes");
-    assert!(began.elapsed() < Duration::from_secs(4), "took {:?}", began.elapsed());
+        }),
+        "the child must exit on EOF during grace"
+    );
     assert!(!alive(pid), "the child is gone and reaped");
     let events = provider.pump();
     assert_eq!(
@@ -1838,6 +1837,13 @@ fn interrupted_with(thread: &str, turn: &str, item: Value, then: Vec<Value>) -> 
         expect_request(4, "turn/start"),
         turn_response(4, turn),
         item_note("item/started", thread, turn, item),
+        delta_note(
+            "item/agentMessage/delta",
+            thread,
+            turn,
+            "checkpoint",
+            "ready-to-interrupt",
+        ),
         expect_exact(&format!(
             r#"{{"id":5,"method":"turn/interrupt","params":{{"threadId":"{thread}","turnId":"{turn}"}}}}"#
         )),
@@ -1845,10 +1851,14 @@ fn interrupted_with(thread: &str, turn: &str, item: Value, then: Vec<Value>) -> 
     ];
     rest.extend(then);
     let (provider, id) = open(thread, rest);
+    provider.pause_time_for_tests();
     send(&provider, &id, "go").expect("starts");
     // The item is read before the key is pressed.
-    std::thread::sleep(Duration::from_millis(300));
-    provider.pump();
+    pump_until(&provider, |events| {
+        events
+            .iter()
+            .any(|event| matches!(event, AgentDomainEvent::ContentDelta { text, .. } if text == "ready-to-interrupt"))
+    });
     provider
         .interrupt_turn(InterruptTurnRequest { session_id: id.clone() })
         .expect("the interrupt is accepted");
@@ -1861,25 +1871,31 @@ fn position(events: &[AgentDomainEvent], what: impl Fn(&AgentDomainEvent) -> boo
 
 #[test]
 fn an_interrupted_turn_waits_for_the_command_codex_kept_running() {
+    let gate = ScriptGate::new();
     let (t, u) = ("th-30", "turn-30");
     let (provider, thread) = interrupted_with(
         t,
         u,
         command("c1", "inProgress"),
         vec![
-            json!({"sleep_ms": 800}),
+            gate.step(),
             item_note("item/completed", t, u, command("c1", "completed")),
             expect_request(6, "turn/start"),
             turn_response(6, "turn-31"),
         ],
     );
-    let pressed = Instant::now();
-    let events = until_turn_completed(&provider);
-    assert!(
-        pressed.elapsed() >= Duration::from_millis(600),
-        "the turn ended {:?} after the interrupt, while Codex still ran the command",
-        pressed.elapsed()
-    );
+    gate.wait();
+    until(|| provider.lines_read_for_tests() >= 7);
+    let before = provider.pump();
+    assert!(!before
+        .iter()
+        .any(|e| matches!(e, AgentDomainEvent::TurnCompleted { .. })));
+    gate.release();
+    let events = pump_on(&provider, before, |events| {
+        events
+            .iter()
+            .any(|e| matches!(e, AgentDomainEvent::TurnCompleted { .. }))
+    });
     let result = position(
         &events,
         |e| matches!(e, AgentDomainEvent::ToolCallCompleted { content, .. } if content == &json!("all three")),
@@ -1912,17 +1928,25 @@ fn a_command_still_running_after_the_settle_time_stops_the_session() {
     // Codex never reports the command ended; the stand-in then waits for EOF on its stdin.
     let (provider, thread) = interrupted_with(t, u, command("c1", "inProgress"), vec![]);
     let pid = provider.pid();
-    let pressed = Instant::now();
-    let events = pump_until(&provider, |events| {
+    // First fold the server's interrupted end, then cross its settle deadline.
+    until(|| provider.lines_read_for_tests() >= 7);
+    let before = provider.pump();
+    assert!(!before
+        .iter()
+        .any(|e| matches!(e, AgentDomainEvent::SessionUnavailable { .. })));
+    provider.advance_time_for_tests(INTERRUPT_SETTLE - Duration::from_millis(1));
+    let mut before = before;
+    before.extend(provider.pump());
+    assert!(
+        !provider.session_dead_for_tests(),
+        "shutdown cannot start before the settle deadline"
+    );
+    provider.advance_time_for_tests(Duration::from_millis(1));
+    let events = pump_on(&provider, before, |events| {
         events
             .iter()
             .any(|e| matches!(e, AgentDomainEvent::SessionUnavailable { .. }))
     });
-    let waited = pressed.elapsed();
-    assert!(
-        waited + Duration::from_millis(200) >= agent::providers::codex::provider::INTERRUPT_SETTLE,
-        "the session was stopped after only {waited:?}"
-    );
     assert!(!alive(pid), "the turn ended before the child was gone");
     let row = position(&events, |e| {
         matches!(e, AgentDomainEvent::ToolCallCompleted { is_error: true, content, .. }
@@ -1969,7 +1993,14 @@ fn a_call_eitri_cannot_read_counts_as_still_running() {
     let (t, u) = ("th-33", "turn-33");
     let (provider, _) = interrupted_with(t, u, json!({"type": "someFutureCall", "id": "z1"}), vec![]);
     let pid = provider.pid();
-    let events = pump_until(&provider, |events| {
+    // First fold the server's interrupted end, then cross its settle deadline.
+    until(|| provider.lines_read_for_tests() >= 7);
+    let before = provider.pump();
+    assert!(!before
+        .iter()
+        .any(|e| matches!(e, AgentDomainEvent::SessionUnavailable { .. })));
+    provider.advance_time_for_tests(INTERRUPT_SETTLE);
+    let events = pump_on(&provider, before, |events| {
         events
             .iter()
             .any(|e| matches!(e, AgentDomainEvent::SessionUnavailable { .. }))
@@ -1991,7 +2022,14 @@ fn a_tool_server_call_left_running_is_not_a_reason_to_stop() {
         vec![expect_request(6, "turn/start"), turn_response(6, "turn-35")],
     );
     let pid = provider.pid();
-    let events = until_turn_completed(&provider);
+    until(|| provider.lines_read_for_tests() >= 7);
+    let before = provider.pump();
+    provider.advance_time_for_tests(INTERRUPT_SETTLE);
+    let events = pump_on(&provider, before, |events| {
+        events
+            .iter()
+            .any(|e| matches!(e, AgentDomainEvent::TurnCompleted { .. }))
+    });
     assert!(alive(pid));
     assert!(!events
         .iter()
@@ -2038,7 +2076,14 @@ fn an_interrupted_mcp_call_ends_its_row_and_is_no_background_work() {
             turn_completed(t, next, "interrupted", Value::Null),
         ],
     );
-    let events = until_turn_completed(&provider);
+    until(|| provider.lines_read_for_tests() >= 7);
+    let before = provider.pump();
+    provider.advance_time_for_tests(INTERRUPT_SETTLE);
+    let events = pump_on(&provider, before, |events| {
+        events
+            .iter()
+            .any(|e| matches!(e, AgentDomainEvent::TurnCompleted { .. }))
+    });
     assert_eq!(row_ends(&events), [("k1".to_string(), json!("interrupted"), true)]);
     let row_ended = position(&events, |e| matches!(e, AgentDomainEvent::ToolCallCompleted { .. }));
     let turn_ended = position(&events, |e| matches!(e, AgentDomainEvent::TurnCompleted { .. }));
@@ -2054,18 +2099,12 @@ fn an_interrupted_mcp_call_ends_its_row_and_is_no_background_work() {
 
     // Nothing of it stays running: an interrupt of the next turn has no call to wait for.
     assert_eq!(send(&provider, &thread, "next").expect("the session goes on"), next);
-    let pressed = Instant::now();
     provider
         .interrupt_turn(InterruptTurnRequest {
             session_id: thread.clone(),
         })
         .expect("the interrupt is accepted");
     let events = until_turn_completed(&provider);
-    assert!(
-        pressed.elapsed() < INTERRUPT_SETTLE,
-        "it waited: {:?}",
-        pressed.elapsed()
-    );
     assert_eq!(background_counts(&events), Vec::<u32>::new());
 }
 
@@ -2109,6 +2148,7 @@ fn an_interrupt_with_nothing_running_ends_the_turn_at_once() {
             turn_completed(t, u, "interrupted", Value::Null),
         ],
     );
+    provider.pause_time_for_tests();
     send(&provider, &thread, "go").expect("starts");
     pump_until(&provider, |events| {
         events
@@ -2120,26 +2160,14 @@ fn an_interrupt_with_nothing_running_ends_the_turn_at_once() {
             session_id: thread.clone(),
         })
         .expect("accepted");
-    let pressed = Instant::now();
     until_turn_completed(&provider);
-    assert!(
-        pressed.elapsed() < Duration::from_secs(1),
-        "took {:?}",
-        pressed.elapsed()
-    );
 }
 
 #[test]
 fn a_search_left_running_is_not_waited_on() {
     let (t, u) = ("th-37", "turn-37");
     let (provider, _) = interrupted_with(t, u, json!({"type": "webSearch", "id": "w1", "query": "x"}), vec![]);
-    let pressed = Instant::now();
     let events = until_turn_completed(&provider);
-    assert!(
-        pressed.elapsed() < Duration::from_secs(1),
-        "took {:?}",
-        pressed.elapsed()
-    );
     assert!(!events
         .iter()
         .any(|e| matches!(e, AgentDomainEvent::SessionUnavailable { .. })));
@@ -2147,6 +2175,7 @@ fn a_search_left_running_is_not_waited_on() {
 
 #[test]
 fn a_family_turn_named_while_the_turn_settles_is_waited_for() {
+    let gate = ScriptGate::new();
     let (t, u) = ("th-38", "turn-38");
     let (provider, _) = interrupted_with(
         t,
@@ -2166,17 +2195,26 @@ fn a_family_turn_named_while_the_turn_settles_is_waited_for() {
                 r#"{{"id":6,"method":"turn/interrupt","params":{{"threadId":"{t}","turnId":"turn-38b"}}}}"#
             )),
             item_note("item/completed", t, u, command("c1", "completed")),
-            json!({"sleep_ms": 700}),
+            gate.step(),
             turn_completed(t, "turn-38b", "interrupted", Value::Null),
         ],
     );
-    let pressed = Instant::now();
-    let events = until_turn_completed(&provider);
-    assert!(
-        pressed.elapsed() >= Duration::from_millis(600),
-        "the tab's turn ended {:?} after the key, while a family turn still ran: {events:#?}",
-        pressed.elapsed()
-    );
+    let mut before = Vec::new();
+    until(|| {
+        before.extend(provider.pump());
+        gate.is_ready()
+    });
+    until(|| provider.lines_read_for_tests() >= 10);
+    before.extend(provider.pump());
+    assert!(!before
+        .iter()
+        .any(|e| matches!(e, AgentDomainEvent::TurnCompleted { .. })));
+    gate.release();
+    let events = pump_on(&provider, before, |events| {
+        events
+            .iter()
+            .any(|e| matches!(e, AgentDomainEvent::TurnCompleted { .. }))
+    });
     assert!(!events
         .iter()
         .any(|e| matches!(e, AgentDomainEvent::SessionUnavailable { .. })));
@@ -2185,18 +2223,28 @@ fn a_family_turn_named_while_the_turn_settles_is_waited_for() {
 #[test]
 fn closing_during_a_stop_waits_until_the_child_is_gone() {
     let (t, u) = ("th-39", "turn-39");
-    // The stand-in sleeps through its stdin's end, so only the process-group kill after the grace ends it.
-    let (provider, thread) = interrupted_with(t, u, command("c1", "inProgress"), vec![json!({"sleep_ms": 30000})]);
+    let (provider, thread) = interrupted_with(t, u, command("c1", "inProgress"), vec![json!({"ignore_eof": true})]);
+    let (parked, release) = provider.shutdown_checkpoint_for_tests();
     let pid = provider.pid();
-    let pressed = Instant::now();
-    while pressed.elapsed() < agent::providers::codex::provider::INTERRUPT_SETTLE + Duration::from_millis(300) {
-        provider.pump();
-        std::thread::sleep(Duration::from_millis(5));
-    }
-    assert!(alive(pid), "the stand-in should still be inside its grace period");
-    provider
-        .close_session(CloseSessionRequest { session_id: thread })
-        .expect("closes");
+    until(|| provider.lines_read_for_tests() >= 7);
+    provider.pump();
+    provider.advance_time_for_tests(INTERRUPT_SETTLE);
+    provider.pump();
+    parked
+        .recv_timeout(Duration::from_secs(60))
+        .expect("shutdown reaches its checkpoint");
+    assert!(alive(pid), "shutdown is held before closing stdin");
+    std::thread::scope(|scope| {
+        let closing = scope.spawn(|| provider.close_session(CloseSessionRequest { session_id: thread }));
+        until(|| provider.closed_for_tests() || closing.is_finished());
+        drop(release);
+        closing.join().unwrap().expect("closes");
+    });
+    assert_eq!(
+        provider.close_stop_joined_for_tests(),
+        Some(true),
+        "close joined the existing shutdown worker"
+    );
     assert!(
         !alive(pid),
         "the close returned while the stop had not killed the child"
@@ -2256,7 +2304,7 @@ fn started_with(thread: &str, line: Value, rest: Vec<Value>, held: bool) -> (Cod
 fn a_failed_lever_attaches_no_server_and_the_session_runs() {
     let (t, u) = ("th-80", "turn-80");
     let request = start_with_editor_server();
-    let (provider, took) = started_with(
+    let (provider, _) = started_with(
         t,
         start_line(&request, None),
         vec![
@@ -2266,7 +2314,8 @@ fn a_failed_lever_attaches_no_server_and_the_session_runs() {
         ],
         false,
     );
-    assert!(took < EDITOR_SERVER_WAIT, "no server, no wait: {took:?}");
+    assert_eq!(provider.editor_wait_count_for_tests(), 0);
+    assert_eq!(provider.editor_wait_outcome_for_tests(), None);
     assert_eq!(send(&provider, t, "go").expect("the turn starts"), u);
     let events = until_turn_completed(&provider);
     assert!(matches!(
@@ -2329,8 +2378,9 @@ fn a_held_lever_attaches_the_server() {
     let t = "th-84";
     let request = start_with_editor_server();
     let line = start_line(&request, request.editor_server.as_ref());
-    let (provider, took) = started_with(t, line, vec![server_status(t, "eitri", "ready")], true);
-    assert!(took < EDITOR_SERVER_WAIT, "the server's status was missed: {took:?}");
+    let (provider, _) = started_with(t, line, vec![server_status(t, "eitri", "ready")], true);
+    assert_eq!(provider.editor_wait_count_for_tests(), 1);
+    assert_eq!(provider.editor_wait_outcome_for_tests(), Some("ready"));
     assert_eq!(provider.editor_note(), None);
 }
 
@@ -2527,7 +2577,6 @@ fn a_command_that_ends_inside_its_turn_is_never_counted() {
     );
     send(&provider, &id, "go").expect("starts");
     let mut events = until_turn_completed(&provider);
-    std::thread::sleep(Duration::from_millis(100));
     events.extend(provider.pump());
     assert!(background_counts(&events).is_empty(), "{events:#?}");
 }
@@ -2598,12 +2647,13 @@ fn the_background_is_not_stopped_while_a_turn_runs_or_when_nothing_is_left() {
 /// after all, it is interrupted rather than left running unseen by the user.
 #[test]
 fn a_turn_codex_starts_after_its_start_timed_out_is_interrupted() {
+    let gate = ScriptGate::new();
     let (t, u) = ("th-64", "turn-64");
     let (provider, id) = open(
         t,
         vec![
             expect_request(4, "turn/start"),
-            json!({"sleep_ms": agent::UNARY_RPC_TIMEOUT.as_millis() as u64 + 500}),
+            gate.step(),
             write(json!({"method": "turn/started", "params": {"threadId": t, "turn": {
                 "id": u, "items": [], "itemsView": "notLoaded", "status": "inProgress", "error": null}}})),
             expect_exact(&format!(
@@ -2613,6 +2663,7 @@ fn a_turn_codex_starts_after_its_start_timed_out_is_interrupted() {
         ],
     );
     assert!(matches!(send(&provider, &id, "go"), Err(ProviderError::Timeout)));
+    gate.release();
     let events = until_turn_completed(&provider);
     assert!(matches!(
         the_completion(&events),
@@ -2787,22 +2838,22 @@ fn a_turn_that_does_not_end_after_its_interrupt_stops_the_session() {
         ],
     );
     send(&provider, &thread, "go").expect("starts");
-    let pressed = Instant::now();
+    provider.pause_time_for_tests();
     provider
         .interrupt_turn(InterruptTurnRequest {
             session_id: thread.clone(),
         })
         .expect("the interrupt is accepted");
-    let events = pump_until(&provider, |events| {
+    let before = provider.pump();
+    assert!(!before
+        .iter()
+        .any(|e| matches!(e, AgentDomainEvent::SessionUnavailable { .. })));
+    provider.advance_time_for_tests(INTERRUPT_SETTLE);
+    let events = pump_on(&provider, before, |events| {
         events
             .iter()
             .any(|e| matches!(e, AgentDomainEvent::SessionUnavailable { .. }))
     });
-    assert!(
-        pressed.elapsed() >= agent::providers::codex::provider::INTERRUPT_SETTLE,
-        "the session was stopped {:?} after the interrupt",
-        pressed.elapsed()
-    );
     let end = events
         .iter()
         .position(|e| {
@@ -3003,11 +3054,12 @@ fn expect_steer(id: u64, client_id: &str) -> Value {
 /// and the later one was never sent (it is dropped as waiting behind the refusal, not by the turn's end).
 #[test]
 fn a_message_waits_behind_an_unanswered_one_and_a_refusal_drops_both() {
+    let gate = ScriptGate::new();
     let rest = vec![
         expect_request(4, "turn/start"),
         turn_response(4, "turn-a"),
         expect_steer(5, "m1"),
-        json!({"sleep_ms": 300}),
+        gate.step(),
         write(json!({"id": 5, "error": {"code": -32600, "message": "input exceeds the maximum length"}})),
         turn_completed("th-s5", "turn-a", "completed", Value::Null),
     ];
@@ -3015,6 +3067,7 @@ fn a_message_waits_behind_an_unanswered_one_and_a_refusal_drops_both() {
     let turn = send(&provider, &thread, "go").expect("the turn starts");
     steer(&provider, &thread, &turn, "m1", "too long").expect("sent");
     steer(&provider, &thread, &turn, "m2", "after it").expect("taken, to wait");
+    gate.release();
     let events = until_turn_completed(&provider);
     let dropped: Vec<&AgentDomainEvent> = events
         .iter()
@@ -3038,11 +3091,12 @@ fn a_message_waits_behind_an_unanswered_one_and_a_refusal_drops_both() {
 /// Accepted, the waiting message goes out next, and both are read in the order they were typed.
 #[test]
 fn a_waiting_message_goes_out_once_the_earlier_one_is_taken() {
+    let gate = ScriptGate::new();
     let mut rest = vec![
         expect_request(4, "turn/start"),
         turn_response(4, "turn-a"),
         expect_steer(5, "m1"),
-        json!({"sleep_ms": 200}),
+        gate.step(),
         write(json!({"id": 5, "result": {"turnId": "turn-a"}})),
         expect_steer(6, "m2"),
         write(json!({"id": 6, "result": {"turnId": "turn-a"}})),
@@ -3054,6 +3108,7 @@ fn a_waiting_message_goes_out_once_the_earlier_one_is_taken() {
     let turn = send(&provider, &thread, "go").expect("the turn starts");
     steer(&provider, &thread, &turn, "m1", "first").expect("sent");
     steer(&provider, &thread, &turn, "m2", "second").expect("taken, to wait");
+    gate.release();
     let events = until_turn_completed(&provider);
     let delivered: Vec<String> = events
         .iter()

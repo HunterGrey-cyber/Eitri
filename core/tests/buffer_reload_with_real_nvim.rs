@@ -20,13 +20,14 @@ fn buffer_after_a_disk_change(extra_args: &[String], modify_buffer_first: bool) 
     let dir = std::env::temp_dir().join(format!("nv-w3-{}", uuid::Uuid::new_v4().simple()));
     std::fs::create_dir_all(&dir).unwrap();
     let file = dir.join("f.txt");
-    std::fs::write(&file, "one\ntwo\n").unwrap();
+    embed_client::write_changed(&file, "one\ntwo\n").unwrap();
 
     let mut command = std::process::Command::new("nvim");
     // `--clean`: the user's own config is irrelevant here and, on this machine, actively misleading
     // -- LazyVim installs a `checktime` autocommand of its own, on `FocusGained`, which cannot fire
     // in Eitri but CAN fire in some other harness and would make this pass for the wrong reason.
     command.arg("--headless").arg("--clean");
+    command.args(["--cmd", &format!("lua {}", include_str!("support/manual_timers.lua"))]);
     for arg in extra_args {
         command.arg(arg);
     }
@@ -43,7 +44,7 @@ fn buffer_after_a_disk_change(extra_args: &[String], modify_buffer_first: bool) 
                 file.display()
             ),
         ])
-        .args(["-c", &format!("sleep {}m", RELOAD_INTERVAL_MS + 800)])
+        .args(["-c", "lua test_timers.advance(2000)"])
         .args([
             "-c",
             &format!(
@@ -119,7 +120,7 @@ fn typing_in_a_file_changed_on_disk_meets_no_dialog() {
     let _ = std::fs::remove_dir_all(&scratch);
     std::fs::create_dir_all(&scratch).unwrap();
     let file = scratch.join("f.txt");
-    std::fs::write(&file, "one\ntwo\n").unwrap();
+    embed_client::write_changed(&file, "one\ntwo\n").unwrap();
 
     let mut nvim = Embed::start(&scratch, &[], &[]);
     nvim.wait_until("VimEnter", |n| n.eval("v:vim_did_enter").as_i64() == Some(1));
@@ -132,6 +133,7 @@ fn typing_in_a_file_changed_on_disk_meets_no_dialog() {
         ],
     );
     nvim.command(&format!("edit {}", file.display()));
+    nvim.manual_timers();
     nvim.inject(
         eitri_core::buffer_reload::RELOAD_CMD.trim_start_matches("lua "),
         opts_map(&[]),
@@ -152,8 +154,8 @@ fn typing_in_a_file_changed_on_disk_meets_no_dialog() {
     };
     nvim.input("ix");
     nvim.wait_until("insert mode", |n| mode(n).0 == "i");
-    std::fs::write(&file, "DISK\nchange\n").unwrap();
-    std::thread::sleep(std::time::Duration::from_millis(2 * RELOAD_INTERVAL_MS + 500));
+    embed_client::write_changed(&file, "DISK\nchange\n").unwrap();
+    nvim.advance_timers(2 * RELOAD_INTERVAL_MS + 500);
     assert_eq!(
         mode(&mut nvim),
         ("i".to_string(), false),
@@ -181,7 +183,7 @@ fn injected_reload_timer_reloads_and_teardown_stops_it() {
     let _ = std::fs::remove_dir_all(&scratch);
     std::fs::create_dir_all(&scratch).unwrap();
     let file = scratch.join("f.txt");
-    std::fs::write(&file, "one\ntwo\n").unwrap();
+    embed_client::write_changed(&file, "one\ntwo\n").unwrap();
 
     let mut nvim = Embed::start(&scratch, &[], &[]);
     nvim.wait_until("VimEnter", |n| n.eval("v:vim_did_enter").as_i64() == Some(1));
@@ -189,6 +191,7 @@ fn injected_reload_timer_reloads_and_teardown_stops_it() {
     let baseline = nvim.footprint_of(&[], &["eitri_reload_timer"]);
     assert!(baseline.globals.is_empty(), "{baseline:?}");
 
+    nvim.manual_timers();
     nvim.inject(
         eitri_core::buffer_reload::RELOAD_CMD.trim_start_matches("lua "),
         opts_map(&[]),
@@ -208,7 +211,8 @@ fn injected_reload_timer_reloads_and_teardown_stops_it() {
         .filter_map(|v| v.as_str().map(str::to_string))
         .collect()
     };
-    std::fs::write(&file, "DISK\nchange\n").unwrap();
+    embed_client::write_changed(&file, "DISK\nchange\n").unwrap();
+    nvim.advance_timers(1000);
     nvim.wait_until("the timer's reload", |n| {
         lines(n).first().map(String::as_str) == Some("DISK")
     });
@@ -218,8 +222,8 @@ fn injected_reload_timer_reloads_and_teardown_stops_it() {
     assert!(stopped.globals.is_empty(), "{stopped:?}");
     assert_eq!(stopped.active_timers, baseline.active_timers, "{stopped:?}");
 
-    std::fs::write(&file, "LATER AND LONGER\nchange\n").unwrap();
-    std::thread::sleep(std::time::Duration::from_millis(2500));
+    embed_client::write_changed(&file, "LATER AND LONGER\nchange\n").unwrap();
+    nvim.advance_timers(2500);
     assert_eq!(
         lines(&mut nvim).first().map(String::as_str),
         Some("DISK"),
@@ -245,7 +249,7 @@ fn ui_with_timer_env(
     let _ = std::fs::remove_dir_all(&scratch);
     std::fs::create_dir_all(&scratch).unwrap();
     let file = scratch.join("f.txt");
-    std::fs::write(&file, "one\ntwo\n").unwrap();
+    embed_client::write_changed(&file, "one\ntwo\n").unwrap();
     let mut nvim = Embed::start(&scratch, &[], env);
     nvim.wait_until("VimEnter", |n| n.eval("v:vim_did_enter").as_i64() == Some(1));
     nvim.request(
@@ -257,6 +261,7 @@ fn ui_with_timer_env(
         ],
     );
     nvim.command(&format!("edit {}", file.display()));
+    nvim.manual_timers();
     nvim.inject(
         eitri_core::buffer_reload::RELOAD_CMD.trim_start_matches("lua "),
         opts_map(&[]),
@@ -296,9 +301,10 @@ fn a_window_a_reload_closes_is_skipped_without_an_error() {
         vec![],
     );
     nvim.command("messages clear");
-    std::fs::write(&file, "DISK\nchange\n").unwrap();
+    embed_client::write_changed(&file, "DISK\nchange\n").unwrap();
+    nvim.advance_timers(1000);
     nvim.wait_until("the timer's reload", |n| n.eval("getline(1)").as_str() == Some("DISK"));
-    std::thread::sleep(std::time::Duration::from_millis(RELOAD_INTERVAL_MS + 300));
+    nvim.advance_timers(RELOAD_INTERVAL_MS + 300);
     assert_eq!(
         ui_mode(&mut nvim),
         ("n".to_string(), false),
@@ -326,8 +332,8 @@ fn a_window_a_reload_closes_is_skipped_without_an_error() {
 fn a_noautoread_buffer_meets_no_dialog_and_is_not_reloaded() {
     let (mut nvim, scratch, file) = ui_with_timer("noar");
     nvim.command("setlocal noautoread");
-    std::fs::write(&file, "DISK\nchange\n").unwrap();
-    std::thread::sleep(std::time::Duration::from_millis(2 * RELOAD_INTERVAL_MS + 500));
+    embed_client::write_changed(&file, "DISK\nchange\n").unwrap();
+    nvim.advance_timers(2 * RELOAD_INTERVAL_MS + 500);
     assert_eq!(ui_mode(&mut nvim), ("n".to_string(), false), "a dialog met the buffer");
     assert_eq!(
         nvim.eval("getline(1)").as_str(),
@@ -337,19 +343,6 @@ fn a_noautoread_buffer_meets_no_dialog_and_is_not_reloaded() {
     nvim.teardown();
     nvim.quit();
     let _ = std::fs::remove_dir_all(&scratch);
-}
-
-/// The longest an `nvim_eval` took to answer over `window`: a pause inside nvim shows as one slow answer.
-fn slowest_answer(nvim: &mut embed_client::Embed, window: std::time::Duration) -> std::time::Duration {
-    let until = std::time::Instant::now() + window;
-    let mut slowest = std::time::Duration::ZERO;
-    while std::time::Instant::now() < until {
-        let began = std::time::Instant::now();
-        nvim.eval("1");
-        slowest = slowest.max(began.elapsed());
-        std::thread::sleep(std::time::Duration::from_millis(20));
-    }
-    slowest
 }
 
 fn the_next_key_reaches_nvim(nvim: &mut embed_client::Embed) {
@@ -368,9 +361,9 @@ fn a_file_created_after_the_buffer_was_opened_meets_no_dialog() {
     let (mut nvim, scratch, _file) = ui_with_timer("w13");
     let made = scratch.join("new.rs");
     nvim.command(&format!("edit {}", made.display()));
-    std::thread::sleep(std::time::Duration::from_millis(RELOAD_INTERVAL_MS + 300));
-    std::fs::write(&made, "made by the agent\n").unwrap();
-    std::thread::sleep(std::time::Duration::from_millis(2 * RELOAD_INTERVAL_MS + 300));
+    nvim.advance_timers(RELOAD_INTERVAL_MS + 300);
+    embed_client::write_changed(&made, "made by the agent\n").unwrap();
+    nvim.advance_timers(2 * RELOAD_INTERVAL_MS + 300);
     the_next_key_reaches_nvim(&mut nvim);
     nvim.teardown();
     nvim.quit();
@@ -384,8 +377,8 @@ fn a_file_created_before_the_first_tick_meets_no_dialog() {
     let (mut nvim, scratch, _file) = ui_with_timer("w13first");
     let made = scratch.join("new.rs");
     nvim.command(&format!("edit {}", made.display()));
-    std::fs::write(&made, "made by the agent\n").unwrap();
-    std::thread::sleep(std::time::Duration::from_millis(2 * RELOAD_INTERVAL_MS + 300));
+    embed_client::write_changed(&made, "made by the agent\n").unwrap();
+    nvim.advance_timers(2 * RELOAD_INTERVAL_MS + 300);
     the_next_key_reaches_nvim(&mut nvim);
     nvim.teardown();
     nvim.quit();
@@ -399,8 +392,9 @@ fn shown_file_with_timer(nvim: &mut embed_client::Embed, dir: &std::path::Path, 
     nvim.command(&format!("cd {}", dir.display()));
     let file = dir.join(name);
     std::fs::create_dir_all(file.parent().unwrap()).unwrap();
-    std::fs::write(&file, "one\ntwo\n").unwrap();
+    embed_client::write_changed(&file, "one\ntwo\n").unwrap();
     nvim.command(&format!("edit {name}"));
+    nvim.manual_timers();
     nvim.inject(
         eitri_core::buffer_reload::RELOAD_CMD.trim_start_matches("lua "),
         embed_client::opts_map(&[]),
@@ -409,40 +403,30 @@ fn shown_file_with_timer(nvim: &mut embed_client::Embed, dir: &std::path::Path, 
 }
 
 /// A shown file the agent deletes: nvim answers a check with `E211` and, in Normal mode, waits a second.
-/// That wait is measured on the same nvim with a bare `checktime` first; the timer causes none, and a
-/// file that comes back is reloaded.
+/// Each driven timer turn skips `checktime` for the missing file; a file that returns is reloaded.
 #[test]
 #[ignore = "needs a real nvim on PATH; spends no tokens and needs no display"]
 fn a_deleted_file_does_not_stall_nvim() {
     let (mut nvim, scratch, _file) = ui_with_timer("e211");
-    let stock = shown_file_with_timer(&mut nvim, &scratch, "stock.txt");
-    nvim.teardown();
-    std::fs::remove_file(&stock).unwrap();
-    let began = std::time::Instant::now();
-    nvim.command("checktime");
-    let stall = began.elapsed();
-    assert!(
-        stall >= std::time::Duration::from_millis(500),
-        "calibration: a bare checktime on a deleted file waits ({stall:?})"
-    );
     let file = shown_file_with_timer(&mut nvim, &scratch, "f.txt");
-    nvim.command("silent! bwipeout! stock.txt");
-    // A bare check clears nvim's "already warned" flag, which the calibration's warning set and which would
-    // turn the next warning into a plain error message.
-    nvim.command("checktime");
-
+    nvim.lua("local cmd = vim.cmd; _G.deleted_checks = 0; vim.cmd = function(c) if c:match('^checktime ') then deleted_checks = deleted_checks + 1 end; return cmd(c) end", vec![]);
     std::fs::remove_file(&file).unwrap();
-    let slowest = slowest_answer(
-        &mut nvim,
-        std::time::Duration::from_millis(2 * RELOAD_INTERVAL_MS + 500),
-    );
-    assert!(
-        slowest < stall / 2,
-        "nvim paused for {slowest:?}; a stalled check pauses about {stall:?}"
-    );
+    for _ in 0..5 {
+        nvim.advance_timers(RELOAD_INTERVAL_MS);
+        assert_eq!(
+            nvim.lua("return deleted_checks", vec![]).as_i64(),
+            Some(0),
+            "a deleted file reached checktime"
+        );
+    }
 
-    std::fs::write(&file, "back\n").unwrap();
+    embed_client::write_changed(&file, "back\n").unwrap();
+    nvim.advance_timers(1000);
     nvim.wait_until("the timer's reload", |n| n.eval("getline(1)").as_str() == Some("back"));
+    assert!(
+        nvim.lua("return deleted_checks", vec![]).as_i64().unwrap() >= 1,
+        "the hook counts checktime once the file returns"
+    );
     the_next_key_reaches_nvim(&mut nvim);
     nvim.teardown();
     nvim.quit();
@@ -460,7 +444,7 @@ fn a_deleted_file_with_a_long_name_raises_no_prompt() {
         scratch.join("a-directory-name-long-enough-that-the-deleted-file-warning-needs-more-than-one-screen-line");
     std::fs::create_dir_all(&dir).unwrap();
     let stock = dir.join("stock.txt");
-    std::fs::write(&stock, "stock\n").unwrap();
+    embed_client::write_changed(&stock, "stock\n").unwrap();
     nvim.command(&format!("edit {}", stock.display()));
     std::fs::remove_file(&stock).unwrap();
     nvim.lua("vim.schedule(function() vim.cmd('checktime') end)", vec![]);
@@ -473,21 +457,21 @@ fn a_deleted_file_with_a_long_name_raises_no_prompt() {
     nvim.command("checktime");
 
     let file = dir.join("f.txt");
-    std::fs::write(&file, "one\ntwo\n").unwrap();
+    embed_client::write_changed(&file, "one\ntwo\n").unwrap();
     nvim.command(&format!("edit {}", file.display()));
+    nvim.manual_timers();
     nvim.inject(
         eitri_core::buffer_reload::RELOAD_CMD.trim_start_matches("lua "),
         embed_client::opts_map(&[]),
     );
     std::fs::remove_file(&file).unwrap();
-    let until = std::time::Instant::now() + std::time::Duration::from_millis(2 * RELOAD_INTERVAL_MS + 500);
-    while std::time::Instant::now() < until {
+    for _ in 0..5 {
+        nvim.advance_timers(RELOAD_INTERVAL_MS);
         assert_eq!(
             ui_mode(&mut nvim),
             ("n".to_string(), false),
             "a prompt met the deletion"
         );
-        std::thread::sleep(std::time::Duration::from_millis(30));
     }
     nvim.teardown();
     nvim.quit();
@@ -500,10 +484,11 @@ fn a_deleted_file_with_a_long_name_raises_no_prompt() {
 fn a_file_holding_only_a_newline_is_reloaded() {
     let (mut nvim, scratch, _file) = ui_with_timer("nl");
     let nl = scratch.join("nl.txt");
-    std::fs::write(&nl, "\n").unwrap();
+    embed_client::write_changed(&nl, "\n").unwrap();
     nvim.command(&format!("edit {}", nl.display()));
-    std::thread::sleep(std::time::Duration::from_millis(RELOAD_INTERVAL_MS + 300));
-    std::fs::write(&nl, "DISK\n").unwrap();
+    nvim.advance_timers(RELOAD_INTERVAL_MS + 300);
+    embed_client::write_changed(&nl, "DISK\n").unwrap();
+    nvim.advance_timers(1000);
     nvim.wait_until("the timer's reload", |n| n.eval("getline(1)").as_str() == Some("DISK"));
     the_next_key_reaches_nvim(&mut nvim);
     nvim.teardown();
@@ -519,11 +504,12 @@ fn an_edited_and_undone_buffer_meets_no_dialog() {
     let (mut nvim, scratch, _file) = ui_with_timer("undo");
     let made = scratch.join("new.rs");
     nvim.command(&format!("edit {}", made.display()));
-    std::thread::sleep(std::time::Duration::from_millis(RELOAD_INTERVAL_MS + 300));
-    std::fs::write(&made, "made by the agent\n").unwrap();
+    nvim.advance_timers(RELOAD_INTERVAL_MS + 300);
+    embed_client::write_changed(&made, "made by the agent\n").unwrap();
     nvim.command("normal! ix");
     nvim.command("undo");
     assert_eq!(nvim.eval("&modified").as_i64(), Some(0));
+    nvim.advance_timers(1000);
     nvim.wait_until("the file is read", |n| {
         n.eval("getline(1)").as_str() == Some("made by the agent")
     });
@@ -541,18 +527,20 @@ fn buffers_over_empty_files_meet_no_dialog_and_are_read() {
     let (mut nvim, scratch, _file) = ui_with_timer("w13empty");
     let touched = scratch.join("touched.rs");
     nvim.command(&format!("edit {}", touched.display()));
-    std::fs::write(&touched, "").unwrap();
-    std::thread::sleep(std::time::Duration::from_millis(RELOAD_INTERVAL_MS + 500));
+    embed_client::write_changed(&touched, "").unwrap();
+    nvim.advance_timers(RELOAD_INTERVAL_MS + 500);
     the_next_key_reaches_nvim(&mut nvim);
-    std::fs::write(&touched, "filled later\n").unwrap();
+    embed_client::write_changed(&touched, "filled later\n").unwrap();
+    nvim.advance_timers(1000);
     nvim.wait_until("the fill is read", |n| {
         n.eval("getline(1)").as_str() == Some("filled later")
     });
 
     let always = scratch.join("always.rs");
-    std::fs::write(&always, "").unwrap();
+    embed_client::write_changed(&always, "").unwrap();
     nvim.command(&format!("edit {}", always.display()));
-    std::fs::write(&always, "filled before the first tick\n").unwrap();
+    embed_client::write_changed(&always, "filled before the first tick\n").unwrap();
+    nvim.advance_timers(1000);
     nvim.wait_until("the fill is read", |n| {
         n.eval("getline(1)").as_str() == Some("filled before the first tick")
     });
@@ -568,9 +556,7 @@ fn timer_case(
     case: fn(&mut embed_client::Embed, &std::path::Path, reload_cases::Tick<'_>),
 ) {
     let (mut nvim, scratch, _file) = ui_with_timer_env(label, env);
-    case(&mut nvim, &scratch, &mut |_| {
-        std::thread::sleep(std::time::Duration::from_millis(RELOAD_INTERVAL_MS + 400))
-    });
+    case(&mut nvim, &scratch, &mut |n| n.advance_timers(RELOAD_INTERVAL_MS));
     nvim.teardown();
     nvim.quit();
     let _ = std::fs::remove_dir_all(&scratch);

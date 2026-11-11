@@ -25,26 +25,45 @@ pub const LOOK_EVERY: Duration = Duration::from_secs(1);
 /// Sends the connected phones to every window; cheap to clone.
 #[derive(Clone)]
 pub struct Reporter {
-    tx: Sender<Vec<Connected>>,
+    tx: Sender<ReportStep>,
+}
+
+enum ReportStep {
+    Now(Vec<Connected>),
+    #[cfg(feature = "remote-test-hooks")]
+    Look(Sender<()>),
 }
 
 impl Reporter {
     /// Starts the reporting thread for the windows whose sockets are in `control_dir`.
     pub fn start(control_dir: &Path) -> std::io::Result<Reporter> {
+        Self::start_with_interval(control_dir, LOOK_EVERY)
+    }
+
+    pub(crate) fn start_with_interval(control_dir: &Path, interval: Duration) -> std::io::Result<Reporter> {
         let (tx, rx) = mpsc::channel();
         // A new serve has no phones, even if a window still names phones from the previous process.
-        tx.send(Vec::new()).expect("the report receiver is alive");
+        tx.send(ReportStep::Now(Vec::new()))
+            .expect("the report receiver is alive");
         let control = control_dir.to_owned();
         let epoch = boot_clock_ns();
         std::thread::Builder::new()
             .name("eitri-remote-report".into())
-            .spawn(move || run(&control, epoch, rx))?;
+            .spawn(move || run(&control, epoch, rx, interval))?;
         Ok(Reporter { tx })
     }
 
     /// Reports `now`, the phones connected now.
     pub fn report(&self, now: Vec<Connected>) {
-        let _ = self.tx.send(now);
+        let _ = self.tx.send(ReportStep::Now(now));
+    }
+
+    #[cfg(feature = "remote-test-hooks")]
+    pub(crate) fn look_for_tests(&self) {
+        let (tx, rx) = mpsc::channel();
+        self.tx.send(ReportStep::Look(tx)).expect("the reporter ended");
+        rx.recv_timeout(Duration::from_secs(60))
+            .expect("the reporter did not finish its look");
     }
 }
 
@@ -70,26 +89,37 @@ fn bound(path: PathBuf) -> Option<Bound> {
     Some((path, meta.ino(), meta.ctime(), meta.ctime_nsec()))
 }
 
-fn run(control: &Path, epoch: u64, rx: Receiver<Vec<Connected>>) {
+fn run(control: &Path, epoch: u64, rx: Receiver<ReportStep>, interval: Duration) {
     // The newest report, the number the next one gets, and the sockets that have taken the newest.
     let mut newest: Option<RvInbound> = None;
     let mut seq = 0u64;
     let mut told: BTreeSet<Bound> = BTreeSet::new();
     loop {
-        match rx.recv_timeout(LOOK_EVERY) {
-            Ok(mut now) => {
+        #[cfg(feature = "remote-test-hooks")]
+        let mut looks = Vec::new();
+        match rx.recv_timeout(interval) {
+            Ok(step) => {
+                let mut now = None;
+                let mut take = |step| match step {
+                    ReportStep::Now(report) => now = Some(report),
+                    #[cfg(feature = "remote-test-hooks")]
+                    ReportStep::Look(done) => looks.push(done),
+                };
+                take(step);
                 // Only the newest report matters.
                 while let Ok(newer) = rx.try_recv() {
-                    now = newer;
+                    take(newer);
                 }
-                newest = Some(RvInbound::DevicesConnected {
-                    v: RV_PROTOCOL,
-                    devices: now,
-                    epoch,
-                    seq,
-                });
-                seq += 1;
-                told.clear();
+                if let Some(now) = now {
+                    newest = Some(RvInbound::DevicesConnected {
+                        v: RV_PROTOCOL,
+                        devices: now,
+                        epoch,
+                        seq,
+                    });
+                    seq += 1;
+                    told.clear();
+                }
             }
             Err(RecvTimeoutError::Timeout) => {}
             Err(RecvTimeoutError::Disconnected) => return,
@@ -109,6 +139,10 @@ fn run(control: &Path, epoch: u64, rx: Receiver<Vec<Connected>>) {
                 }
                 told.insert(socket);
             }
+        }
+        #[cfg(feature = "remote-test-hooks")]
+        for done in looks {
+            let _ = done.send(());
         }
     }
 }

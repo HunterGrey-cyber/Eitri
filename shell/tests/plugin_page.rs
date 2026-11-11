@@ -17,6 +17,21 @@
 //! Uses a plain `main` (`harness = false`) because GTK must own the main thread. Run one at a
 //! time.
 
+#[path = "support/web_clock.rs"]
+mod web_clock;
+
+fn build_with_clock(
+    spec: &plugin_page::PageSpec,
+    hooks: plugin_page::PageHooks,
+    theme: &eitri_core::plugin::theme::PageTheme,
+) -> webkit6::WebView {
+    let manager = webkit6::UserContentManager::new();
+    let turns = web_clock::install(&manager);
+    let view = plugin_page::build_with_content(spec, hooks, theme, manager);
+    web_clock::watch(&view, turns);
+    view
+}
+
 use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::io::Read;
@@ -247,7 +262,7 @@ fn run(display: &str) -> Result<Vec<String>, String> {
     let window = gtk4::Window::new();
     window.set_title(Some(&window_title()));
     window.set_default_size(800, 600);
-    let webview = plugin_page::build(&spec, hooks, &PageTheme::fallback());
+    let webview = build_with_clock(&spec, hooks, &PageTheme::fallback());
     window.set_child(Some(&webview));
     window.present();
     let page: Rc<dyn PagePort> = Rc::new(plugin_page::WebKitPluginPage(webview.downgrade()));
@@ -278,7 +293,7 @@ fn run(display: &str) -> Result<Vec<String>, String> {
         if Instant::now() >= deadline {
             return Err(format!("the page never finished; it reported {items:?}"));
         }
-        std::thread::sleep(Duration::from_millis(10));
+        web_clock::pump(33);
     };
     let get = |key: &str| items.iter().find_map(|v| v.get(key).cloned()).unwrap_or(Value::Null);
     let mut report = Vec::new();
@@ -353,7 +368,7 @@ fn run(display: &str) -> Result<Vec<String>, String> {
     let deadline = Instant::now() + Duration::from_secs(10);
     while clicked.is_ok() && opened.borrow().is_empty() && Instant::now() < deadline {
         while context.iteration(false) {}
-        std::thread::sleep(Duration::from_millis(10));
+        web_clock::pump(33);
     }
     all &= check(
         clicked.is_ok() && *opened.borrow() == ["https://example.invalid/x"],
@@ -371,11 +386,7 @@ fn run(display: &str) -> Result<Vec<String>, String> {
         &window_title(),
         &["windowfocus", "--sync", "%1", "key", "Return"],
     );
-    let until = Instant::now() + Duration::from_secs(2);
-    while Instant::now() < until {
-        while context.iteration(false) {}
-        std::thread::sleep(Duration::from_millis(10));
-    }
+    web_clock::pump(2000);
     let enter = match pressed {
         Ok(()) => format!("{}", opened.borrow().len() > before),
         Err(e) => format!("not tried: {e}"),
@@ -541,18 +552,14 @@ impl Probe {
                     &items[from.min(items.len())..]
                 ));
             }
-            std::thread::sleep(Duration::from_millis(10));
+            web_clock::pump(33);
         }
     }
 
     /// Runs GTK and the host for `long` without waiting on anything.
     fn settle(&self, long: Duration) {
-        let until = Instant::now() + long;
-        while Instant::now() < until {
-            while self.context.iteration(false) {}
-            self.host.pump(Instant::now() + Duration::from_secs(1));
-            std::thread::sleep(Duration::from_millis(10));
-        }
+        web_clock::pump(long.as_millis().try_into().unwrap());
+        self.host.pump(Instant::now() + Duration::from_secs(1));
     }
 }
 
@@ -641,7 +648,7 @@ fn run_theme() -> Result<(Vec<String>, bool), String> {
 
     let window = gtk4::Window::new();
     window.set_default_size(800, 600);
-    let webview = plugin_page::build(&spec, hooks, &fallback);
+    let webview = build_with_clock(&spec, hooks, &fallback);
     window.set_child(Some(&webview));
     window.present();
     let page: Rc<dyn PagePort> = Rc::new(plugin_page::WebKitPluginPage(webview.downgrade()));
@@ -799,14 +806,18 @@ impl Listener {
         std::thread::spawn(move || {
             for stream in listener.incoming() {
                 let Ok(mut stream) = stream else { continue };
-                let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
+                let _ = stream.set_read_timeout(Some(Duration::from_secs(60)));
                 let mut head = [0u8; 4];
-                let kind = match stream.read(&mut head) {
-                    Ok(n) if n > 0 && head[0] == 0x16 => "tls",
-                    Ok(n) if n > 0 && head[0].is_ascii_uppercase() => "plain",
-                    Ok(_) => "empty",
-                    Err(_) => "silent",
+                let kind = match stream.read_exact(&mut head) {
+                    Ok(()) if head[0] == 0x16 => "tls",
+                    Ok(()) if head[0].is_ascii_uppercase() => "plain",
+                    Ok(()) => "empty",
+                    Err(_) => "empty",
                 };
+                if head == *b"SYNC" {
+                    let _ = std::io::Write::write_all(&mut stream, b"ok");
+                    continue;
+                }
                 noted.lock().unwrap().push(kind.to_owned());
             }
         });
@@ -814,6 +825,15 @@ impl Listener {
     }
 
     fn seen(&self) -> Vec<String> {
+        use std::io::Write;
+        let mut marker = std::net::TcpStream::connect(("127.0.0.1", self.port)).expect("the listener marker connects");
+        marker.set_read_timeout(Some(Duration::from_secs(60))).unwrap();
+        marker.write_all(b"SYNC").unwrap();
+        let mut ack = [0; 2];
+        marker
+            .read_exact(&mut ack)
+            .expect("the listener never acknowledged earlier accepts");
+        assert_eq!(&ack, b"ok");
         self.seen.lock().unwrap().clone()
     }
 }
@@ -917,7 +937,7 @@ fn p4_view(label: &str, ip: IpAddr, remote_images: bool, proxy: ProxyOverride) -
     };
     let window = gtk4::Window::new();
     window.set_default_size(400, 300);
-    let webview = plugin_page::build(&spec, hooks, &PageTheme::fallback());
+    let webview = build_with_clock(&spec, hooks, &PageTheme::fallback());
     // Set before the main loop runs again: the images are asked for only once the entry has been served and
     // parsed, which needs the loop.
     let session = webview.network_session().ok_or("the view has no network session")?;
@@ -949,8 +969,7 @@ fn p4_view(label: &str, ip: IpAddr, remote_images: bool, proxy: ProxyOverride) -
         store,
     };
     let page = probe.wait(0, &format!("P4 {label}"), |v| v.get("p4").is_some())?;
-    // A connection is noted only after its first bytes or a two-second silence; wait out a late one.
-    probe.settle(Duration::from_millis(2500));
+    // The page's image load/error reports precede the listeners' accept barriers below.
     window.close();
     let _ = std::fs::remove_dir_all(&root);
     Ok(ViewOutcome {
@@ -994,13 +1013,7 @@ fn p4_open_view(label: &str, ip: IpAddr, session: &webkit6::NetworkSession) -> R
             window.close();
             return Err(format!("P4 {label} without a policy: the page never finished loading"));
         }
-        std::thread::sleep(Duration::from_millis(10));
-    }
-    // A connection is noted only after its first bytes or a two-second silence; wait out a late one.
-    let until = Instant::now() + Duration::from_millis(2500);
-    while Instant::now() < until {
-        while context.iteration(false) {}
-        std::thread::sleep(Duration::from_millis(10));
+        web_clock::pump(33);
     }
     window.close();
     Ok(ViewOutcome {
@@ -1137,7 +1150,7 @@ fn terminal_at_restarts_the_base_terminal_in_place() -> Result<Vec<String>, Stri
             if Instant::now() >= deadline {
                 return Err("terminal restart did not settle in 5 s".into());
             }
-            std::thread::sleep(Duration::from_millis(10));
+            web_clock::pump(33);
         }
     }
 

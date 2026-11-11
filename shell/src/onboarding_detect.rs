@@ -233,7 +233,6 @@ fn hypr_dir(env: &dyn Fn(&str) -> Option<OsString>) -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use std::cell::RefCell;
-    use std::time::Instant;
 
     use eitri_core::keymap::KeySpec;
 
@@ -380,16 +379,23 @@ mod tests {
 
     #[test]
     fn a_command_that_never_answers_leaves_its_row_looking() {
+        let timed_out = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let observed = timed_out.clone();
         let ctx = fake(
             &[("SWAYSOCK", "/run/sway.sock")],
-            Box::new(|_| crate::root_conflicts::run_capped(&["sleep", "30"], Duration::from_millis(200), 1024)),
+            Box::new(move |_| {
+                let result = crate::root_conflicts::run_capped(&["sleep", "30"], Duration::from_millis(200), 1024);
+                observed.store(
+                    result.as_ref().is_err_and(|why| why.contains("did not answer in time")),
+                    std::sync::atomic::Ordering::SeqCst,
+                );
+                result
+            }),
         );
-        let started = Instant::now();
         let rows = collect(ctx);
         assert!(
-            started.elapsed() < Duration::from_secs(10),
-            "the worker ended after {:?}",
-            started.elapsed()
+            timed_out.load(std::sync::atomic::Ordering::SeqCst),
+            "the command's output wait must expire"
         );
         assert!(
             !rows

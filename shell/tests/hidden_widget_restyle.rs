@@ -25,8 +25,6 @@
 //! Checking only `GDK_BACKEND=x11` would also accept a desktop's XWayland display.
 //! Takes about 8s.
 
-use std::time::{Duration, Instant};
-
 use eitri_core::layout::ModuleId;
 use eitri_core::wm::chrome::Chip;
 use gtk4::prelude::*;
@@ -60,14 +58,13 @@ fn css(chip: &str) -> String {
     )
 }
 
-/// Runs the default main loop for `ms`, so frames are laid out, drawn and restyled.
-fn pump(ms: u64) {
-    let context = gtk4::glib::MainContext::default();
-    let end = Instant::now() + Duration::from_millis(ms);
-    while Instant::now() < end {
-        while context.iteration(false) {}
-        std::thread::sleep(Duration::from_millis(2));
-    }
+/// Waits for complete frames after a layout or style change.
+#[allow(dead_code)]
+#[path = "support/frame_turns.rs"]
+mod frame_turns;
+
+fn pump() {
+    frame_turns::settle();
 }
 
 /// The computed `color` of `widget`, as `#rrggbb`.
@@ -97,7 +94,7 @@ fn close(window: gtk4::Window, provider: gtk4::CssProvider) {
     window.destroy();
     let display = gtk4::gdk::Display::default().expect("a display");
     gtk4::style_context_remove_provider_for_display(&display, &provider);
-    pump(50);
+    pump();
 }
 
 /// The reload `ThemeCss::update` does, with or without its second half.
@@ -138,7 +135,7 @@ fn tray_chip(with_fix: bool) -> Result<Read, String> {
     // The first launch: the terminal hidden, so its chip alone shows.
     tray.set_chip(&chip(ModuleId::terminal(), "terminal"));
     window.present();
-    pump(600);
+    pump();
     if !terminal_chip.is_mapped() || editor_chip.is_realized() {
         return Err(
             "did not exercise the trigger: the terminal's chip should be on screen and the editor's never realized"
@@ -152,10 +149,10 @@ fn tray_chip(with_fix: bool) -> Result<Read, String> {
         ));
     }
     reload(&provider, &window, with_fix);
-    pump(300);
+    pump();
     // `Ctrl+a x` in the editor: its chip shows.
     tray.set_chip(&chip(ModuleId::editor(), "editor"));
-    pump(900);
+    pump();
     if !editor_chip.is_mapped() {
         return Err("did not exercise the trigger: the editor's chip never got on screen".into());
     }
@@ -178,17 +175,17 @@ fn child_visible(with_fix: bool) -> Result<Read, String> {
     row.append(&beside);
     let (window, provider) = window_with(&row);
     window.present();
-    pump(600);
+    pump();
     if divider.is_realized() || !beside.is_mapped() || color_of(&beside) != OLD {
         return Err(
             "did not exercise the trigger: the divider should be unrealized, the button on screen in OLD".into(),
         );
     }
     reload(&provider, &window, with_fix);
-    pump(300);
+    pump();
     divider.set_child_visible(true);
     row.queue_resize();
-    pump(900);
+    pump();
     if !divider.is_mapped() {
         return Err("did not exercise the trigger: the divider never got on screen".into());
     }

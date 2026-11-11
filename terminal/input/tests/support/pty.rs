@@ -135,31 +135,17 @@ impl Pty {
         f.flush().ok();
     }
 
-    /// Drain the master until `quiet` has elapsed with no new bytes, giving up
-    /// after `deadline`.
-    pub fn read_quiescent(&mut self, quiet: Duration, deadline: Duration) -> Vec<u8> {
+    /// Reads bytes already queued by the child; waiting for a particular event belongs to App.
+    pub fn read_available(&mut self) -> Vec<u8> {
         let mut out = Vec::new();
-        let start = Instant::now();
-        let mut last = Instant::now();
         let mut buf = [0u8; 8192];
         let mut f = unsafe { std::mem::ManuallyDrop::new(std::fs::File::from_raw_fd(self.master.as_raw_fd())) };
         loop {
             match f.read(&mut buf) {
                 Ok(0) => break,
-                Ok(n) => {
-                    out.extend_from_slice(&buf[..n]);
-                    last = Instant::now();
-                }
-                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                    if last.elapsed() >= quiet {
-                        break;
-                    }
-                    std::thread::sleep(Duration::from_millis(2));
-                }
+                Ok(n) => out.extend_from_slice(&buf[..n]),
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
                 Err(_) => break,
-            }
-            if start.elapsed() >= deadline {
-                break;
             }
         }
         out
@@ -214,12 +200,13 @@ impl Dimensions for Size {
 
 /// Captures everything the terminal wants to send back to the application.
 #[derive(Clone, Default)]
-pub struct Replies(Arc<Mutex<Vec<u8>>>);
+pub struct Replies(Arc<Mutex<Vec<u8>>>, Arc<Mutex<Option<String>>>);
 
 impl EventListener for Replies {
     fn send_event(&self, event: Event) {
         let mut buf = self.0.lock().unwrap();
         match event {
+            Event::Title(title) => *self.1.lock().unwrap() = Some(title),
             Event::PtyWrite(s) => buf.extend_from_slice(s.as_bytes()),
             Event::ColorRequest(index, fmt) => {
                 // Any plausible colour will do; the point is to answer at all,
@@ -326,6 +313,9 @@ impl Screen {
 pub struct App {
     pub pty: Pty,
     pub screen: Screen,
+    fence: &'static [u8],
+    serial: u64,
+    nvim_fence: bool,
 }
 
 impl App {
@@ -344,30 +334,62 @@ impl App {
         Ok(App {
             pty,
             screen: Screen::with_kitty(size, kitty_keyboard),
+            fence: b"",
+            serial: 0,
+            nvim_fence: false,
         })
     }
 
-    /// Read whatever the application produced, feed it to the terminal, and send
-    /// the terminal's own replies back. Repeats until nothing new arrives, so
-    /// multi-round negotiations (query -> reply -> mode set) complete.
-    pub fn settle(&mut self, quiet: Duration, deadline: Duration) {
-        let start = Instant::now();
+    pub fn wait_until(&mut self, mut done: impl FnMut(&App) -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(60);
         loop {
-            let bytes = self.pty.read_quiescent(quiet, deadline);
-            let replies = {
-                self.screen.advance(&bytes);
-                self.screen.replies.take()
-            };
+            let bytes = self.pty.read_available();
+            self.screen.advance(&bytes);
+            let replies = self.screen.replies.take();
             if !replies.is_empty() {
                 self.pty.write(&replies);
             }
-            if bytes.is_empty() && replies.is_empty() {
-                break;
+            if done(self) {
+                return;
             }
-            if start.elapsed() >= deadline {
-                break;
-            }
+            assert!(
+                Instant::now() < deadline,
+                "application never reached its event; title={:?}, cursor={:?}; screen:\n{}",
+                self.screen.replies.1.lock().unwrap(),
+                self.screen.cursor(),
+                self.screen.screen_text()
+            );
+            std::thread::yield_now();
         }
+    }
+
+    pub fn set_nvim_fence(&mut self) {
+        self.fence = b"nvim";
+        self.nvim_fence = true;
+    }
+    pub fn set_readline_fence(&mut self) {
+        self.fence = b"\x1d";
+    }
+
+    /// A mapped key emits its numbered title only after earlier input and a synchronous redraw.
+    pub fn sync(&mut self) {
+        assert!(!self.fence.is_empty(), "fixture has no input fence");
+        self.serial += 1;
+        let expected = format!("fence-{},", self.serial);
+        if self.nvim_fence {
+            self.send_raw(b"\x07");
+        } else {
+            self.send_raw(self.fence);
+        }
+        self.wait_until(|app| {
+            app.screen
+                .replies
+                .1
+                .lock()
+                .unwrap()
+                .as_deref()
+                .is_some_and(|title| title.starts_with(&expected))
+        });
     }
 
     /// Encode one input against the terminal's CURRENT mode and send it.

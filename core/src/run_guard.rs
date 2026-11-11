@@ -306,6 +306,10 @@ fn hold_leftovers(lifetime: &OwnedFd, pgid: u32) {
         };
         // SAFETY: one `pollfd` that lives for the call.
         let r = unsafe { libc::poll(&mut fd, 1, LEFTOVER_POLL.as_millis() as libc::c_int) };
+        #[cfg(test)]
+        if let Some(path) = std::env::var_os("EITRI_RUN_GUARD_TEST_WAIT") {
+            std::fs::write(path, b"waiting").unwrap();
+        }
         if r < 0 {
             if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
                 continue;
@@ -343,11 +347,20 @@ fn end_leftovers(pgid: u32) {
 
 /// SIGTERM to the task's group, SIGKILL after the grace to whatever is left of it; the leader's status.
 fn end_group(pgid: u32, child: &mut Child) -> std::io::Result<ExitStatus> {
+    end_group_with(pgid, child, &Instant::now, &std::thread::sleep)
+}
+
+fn end_group_with(
+    pgid: u32,
+    child: &mut Child,
+    now: &dyn Fn() -> Instant,
+    pause: &dyn Fn(Duration),
+) -> std::io::Result<ExitStatus> {
     // SAFETY: `kill` takes plain integers; a group that is gone is ESRCH.
     unsafe {
         libc::kill(-(pgid as libc::pid_t), libc::SIGTERM);
     }
-    let deadline = Instant::now() + GRACE;
+    let deadline = now() + GRACE;
     let mut reaped = None;
     loop {
         if reaped.is_none() {
@@ -356,10 +369,10 @@ fn end_group(pgid: u32, child: &mut Child) -> std::io::Result<ExitStatus> {
                 reaped = Some(status);
             }
         }
-        if (reaped.is_some() && !group_alive(pgid)) || Instant::now() >= deadline {
+        if (reaped.is_some() && !group_alive(pgid)) || now() >= deadline {
             break;
         }
-        std::thread::sleep(Duration::from_millis(20));
+        pause(Duration::from_millis(20));
     }
     if group_alive(pgid) || reaped.is_none() {
         // SAFETY: as above.
@@ -452,7 +465,7 @@ mod tests {
     }
 
     /// Reads one status line, waiting at most the hang guard.
-    fn status_line(status: &mut BufReader<File>) -> String {
+    fn status_line<R: Read + AsRawFd>(status: &mut BufReader<R>) -> String {
         let fd = status.get_ref().as_raw_fd();
         if status.buffer().is_empty() {
             let mut pfd = libc::pollfd {
@@ -495,14 +508,13 @@ mod tests {
         }
     }
 
-    /// Waits for group `pgid` to go; how long it took.
-    fn wait_group_gone(pgid: u32) -> Duration {
+    /// Waits for group `pgid` to go; the deadline only detects a hung fixture.
+    fn wait_group_gone(pgid: u32) {
         let began = Instant::now();
         while group_alive(pgid) {
             assert!(began.elapsed() < HANG_GUARD, "group {pgid} outlived its holder");
             std::thread::sleep(Duration::from_millis(20));
         }
-        began.elapsed()
     }
 
     fn parent_of(pid: u32) -> u32 {
@@ -562,15 +574,33 @@ mod tests {
             let (out_r, out_w) = std::io::pipe().unwrap();
             let (err_r, err_w) = std::io::pipe().unwrap();
             // The group ignores SIGTERM, so it ends only by the SIGKILL that follows.
-            let launch = sh("trap '' TERM; sleep 300 & wait");
+            let scratch = crate::test_scratch_dir::ScratchDir::new("guard", "survives");
+            let marker = scratch.join("alive");
+            let launch = sh(&format!(
+                "trap '' TERM; trap 'echo alive > {}' USR1; echo ready; i=0; while [ $i -lt 6000 ]; do i=$((i+1)); sleep 0.02; done",
+                marker.display()
+            ));
             let spec = crate::plugin::tasks::encode_spec(&launch);
             life_w.write_all(&spec).unwrap();
             start_spawner(life_r.into(), status_w.into(), out_w.into(), err_w.into());
-            drop((out_r, err_r));
+            let mut task_output = BufReader::new(File::from(OwnedFd::from(out_r)));
+            assert_eq!(status_line(&mut task_output), "ready");
+            drop(err_r);
             let mut status = BufReader::new(File::from(OwnedFd::from(status_r)));
             let pid = pid_of(&status_line(&mut status));
-            // The spawner and its starting thread are gone; give a parent-death signal time to land.
-            std::thread::sleep(Duration::from_millis(300));
+            assert!(pid > 1);
+            let target = agent::child::PidFd::open(pid, agent::child::start_time(pid).unwrap()).unwrap();
+            // The spawner has been reaped; a fresh task response proves it survived that exit.
+            life_w.write_all(b"probe").unwrap();
+            let deadline = Instant::now() + HANG_GUARD;
+            while !marker.exists() {
+                assert!(
+                    Instant::now() < deadline,
+                    "the task never answered after its spawner ended"
+                );
+                target.signal(libc::SIGUSR1).expect("the original task still exists");
+                std::thread::sleep(Duration::from_millis(5));
+            }
             assert!(!gone(pid), "the task died with the process that started its guard");
             assert!(group_alive(pid));
             let holder = if holder_killed {
@@ -599,18 +629,20 @@ mod tests {
             // This process lets go of its own copy: from here only the holder (or nobody) keeps the task alive.
             drop(life_w);
             if let Some(mut holder) = holder {
-                std::thread::sleep(Duration::from_millis(300));
+                std::fs::remove_file(&marker).unwrap();
+                target
+                    .signal(libc::SIGUSR1)
+                    .expect("the live holder keeps the original task");
+                let deadline = Instant::now() + HANG_GUARD;
+                while !marker.exists() {
+                    assert!(Instant::now() < deadline, "the live holder lost its task");
+                    std::thread::yield_now();
+                }
                 assert!(group_alive(pid), "the task ended while its holder still lived");
                 holder.kill().unwrap();
                 holder.wait().unwrap();
             }
-            // The group ignores SIGTERM, so it lasts the whole grace; the SIGKILL after it is what ends it. A guard
-            // that waited on past its grace would take several times as long.
-            let took = wait_group_gone(pid);
-            assert!(
-                took < GRACE * 3,
-                "the group outlived its holder by {took:?}, past the guard's grace of {GRACE:?}"
-            );
+            wait_group_gone(pid);
             let exit = status_line(&mut status);
             assert!(
                 exit.starts_with("signal ") || exit.starts_with("exit "),
@@ -619,9 +651,73 @@ mod tests {
         }
     }
 
+    struct GroupCleanup(Child);
+    impl Drop for GroupCleanup {
+        fn drop(&mut self) {
+            if self.0.id() > 1 && matches!(self.0.try_wait(), Ok(None)) {
+                // This child has no other reaper; the number still names its group.
+                unsafe {
+                    libc::kill(-(self.0.id() as i32), libc::SIGKILL);
+                }
+            }
+            let _ = self.0.wait();
+        }
+    }
+
+    #[test]
+    fn the_group_cleanup_guard_kills_on_unwind() {
+        let scratch = crate::test_scratch_dir::ScratchDir::new("guard", "panic-cleanup");
+        let child = GroupCleanup(Command::new("/bin/sh")
+            .args(["-c", "trap '' TERM; echo ready; i=0; while [ $i -lt 100 ]; do i=$((i+1)); sleep 0.02; done; touch survived"])
+            .current_dir(&*scratch).process_group(0).stdout(Stdio::piped()).spawn().unwrap());
+        let mut child = child;
+        let mut output = BufReader::new(child.0.stdout.take().unwrap());
+        assert_eq!(status_line(&mut output), "ready");
+        let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+            let _cleanup = child;
+            panic!("exercise unwinding with an unreaped group leader");
+        }));
+        assert!(unwound.is_err());
+        assert!(
+            !scratch.join("survived").exists(),
+            "unwinding kills and reaps the group"
+        );
+    }
+
+    #[test]
+    fn an_ignoring_group_is_killed_at_the_grace_deadline() {
+        let mut child = GroupCleanup(
+            Command::new("/bin/sh")
+                .args([
+                    "-c",
+                    "trap '' TERM; echo ready; i=0; while [ $i -lt 1000 ]; do i=$((i+1)); sleep 0.02; done",
+                ])
+                .process_group(0)
+                .stdout(Stdio::piped())
+                .spawn()
+                .unwrap(),
+        );
+        let mut output = BufReader::new(child.0.stdout.take().unwrap());
+        assert_eq!(status_line(&mut output), "ready");
+        let clock = std::cell::Cell::new(Instant::now());
+        let began = clock.get();
+        let turns = std::cell::Cell::new(0);
+        let status = end_group_with(child.0.id(), &mut child.0, &|| clock.get(), &|pause| {
+            assert!(turns.get() < 1000, "the grace loop did not stop at its deadline");
+            turns.set(turns.get() + 1);
+            clock.set(clock.get() + pause);
+        })
+        .unwrap();
+        assert_eq!(clock.get() - began, GRACE);
+        assert_eq!(status.signal(), Some(libc::SIGKILL));
+    }
+
     #[test]
     fn the_guard_reports_the_tasks_pid_first() {
         let guard = test_binary_guard("run_guard::tests::guard_entry");
+        let scratch = crate::test_scratch_dir::ScratchDir::new("guard", "pid-first");
+        let mut launch = sh("while [ ! -e exit ]; do sleep 0.02; done; exit 3");
+        launch.cwd = scratch.to_path_buf();
         let GuardStart {
             mut child,
             lifetime,
@@ -629,7 +725,7 @@ mod tests {
             stdout,
             stderr,
             ..
-        } = spawn_guarded(&guard, &sh("sleep 0.3; exit 3")).expect("the guard starts");
+        } = spawn_guarded(&guard, &launch).expect("the guard starts");
         drop((stdout, stderr));
         let mut status = BufReader::new(File::from(OwnedFd::from(status)));
         let (pid, start) = pid_line(&status_line(&mut status));
@@ -653,6 +749,7 @@ mod tests {
             agent::child::process_group(std::process::id()).unwrap(),
             "the guard is in a group of its own"
         );
+        std::fs::write(scratch.join("exit"), b"").unwrap();
         assert_eq!(status_line(&mut status), "exit 3");
         assert!(child.wait().unwrap().success());
         drop(lifetime);
@@ -691,7 +788,12 @@ mod tests {
 
     #[test]
     fn what_a_task_left_running_is_held_after_it_ends_and_ends_when_the_holder_lets_go() {
-        let guard = test_binary_guard("run_guard::tests::guard_entry");
+        let scratch = crate::test_scratch_dir::ScratchDir::new("guard", "leftovers");
+        let waited = scratch.join("waited");
+        let mut guard = test_binary_guard("run_guard::tests::guard_entry");
+        guard
+            .env
+            .push(("EITRI_RUN_GUARD_TEST_WAIT".into(), waited.clone().into_os_string()));
         // The leader ends at once and leaves a child in its group, with the output pipes closed.
         let GuardStart {
             mut child,
@@ -708,7 +810,11 @@ mod tests {
         let mut status = BufReader::new(File::from(OwnedFd::from(status)));
         let pid = pid_of(&status_line(&mut status));
         assert_eq!(status_line(&mut status), "exit 4");
-        std::thread::sleep(Duration::from_millis(300));
+        let deadline = Instant::now() + HANG_GUARD;
+        while !waited.exists() {
+            assert!(Instant::now() < deadline, "the guard never held the surviving group");
+            std::thread::yield_now();
+        }
         assert!(!gone(left), "the task's child ended with its leader");
         assert!(
             child.try_wait().unwrap().is_none(),

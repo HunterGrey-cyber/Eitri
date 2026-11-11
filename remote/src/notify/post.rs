@@ -571,7 +571,10 @@ mod tests {
                             let _ = stream.write_all(bytes);
                         }
                         // Holds the connection open and says nothing.
-                        None => std::thread::sleep(Duration::from_secs(30)),
+                        None => {
+                            stream.set_read_timeout(Some(Duration::from_secs(60))).unwrap();
+                            let _ = stream.read(&mut [0u8; 1]);
+                        }
                     }
                 });
             }

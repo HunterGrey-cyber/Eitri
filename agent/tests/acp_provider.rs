@@ -3,6 +3,10 @@
 //! `session/update` and `session/request_permission`), and by hand for the ones no run produced. No real
 //! agent runs here and no model turn is spent.
 
+#[path = "support/script_gate.rs"]
+mod script_gate;
+use script_gate::{until, ScriptGate};
+
 use agent::providers::acp::{AcpAgentSpec, AcpProvider, ContextGauge};
 use agent::{
     AgentDomainEvent, AgentProvider, CloseSessionRequest, ContentKind, DirTrust, EditorServerSpec, ExternalProvider,
@@ -1660,8 +1664,7 @@ fn a_request_whose_diff_would_not_be_shown_whole_cannot_be_approved() {
 
 #[test]
 fn a_pump_during_the_start_cannot_take_the_modes_report() {
-    // The agent reports another mode just ahead of its answer to `session/set_mode`. A host that pumps
-    // while the start is running must not read that report away from the start's own check.
+    let reply_gate = ScriptGate::new();
     let mut script = boot("agent");
     script.extend([
         expect_request(
@@ -1669,36 +1672,26 @@ fn a_pump_during_the_start_cannot_take_the_modes_report() {
             "session/set_mode",
             json!({"sessionId": "s1", "modeId": "workspace-write"}),
         ),
-        sleep_ms(50),
         update(
             "s1",
             json!({"sessionUpdate": "current_mode_update", "currentModeId": "agent-full-access"}),
         ),
-        sleep_ms(50),
+        reply_gate.step(),
         reply(3, json!({})),
     ]);
-    let provider = std::sync::Arc::new(connect(script, Some("workspace-write")).expect("connects"));
-    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let pumper = {
-        let (provider, stop) = (provider.clone(), stop.clone());
-        std::thread::spawn(move || {
-            let mut seen = Vec::new();
-            while !stop.load(std::sync::atomic::Ordering::SeqCst) {
-                seen.extend(provider.pump());
-                std::thread::sleep(Duration::from_millis(1));
-            }
-            seen
-        })
-    };
-    provider.start(start_request(None)).expect("starts");
-    let mut events = provider.pump();
-    std::thread::sleep(Duration::from_millis(20));
+    let provider = connect(script, Some("workspace-write")).expect("connects");
+    let mut events = Vec::new();
+    std::thread::scope(|scope| {
+        let starting = scope.spawn(|| provider.start(start_request(None)));
+        reply_gate.wait();
+        until(|| provider.lines_read_for_tests() >= 3);
+        events.extend(provider.pump());
+        reply_gate.release();
+        starting.join().unwrap().expect("starts");
+    });
     events.extend(provider.pump());
-    stop.store(true, std::sync::atomic::Ordering::SeqCst);
-    events.extend(pumper.join().expect("the pumping thread ends"));
     assert!(
-        events.iter().any(|e| matches!(
-            e,
+        events.iter().any(|e| matches!(e,
             AgentDomainEvent::PolicyMismatch { reported, .. } if reported == "mode agent-full-access"
         )),
         "the report was lost: {events:#?}"

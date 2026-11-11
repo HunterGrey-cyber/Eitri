@@ -423,22 +423,24 @@ fn shutdown_by_eof_then_sigkill() {
     let polite = link(Framing::Bare, json!([]));
     let pid = polite.pid();
     assert!(alive(pid));
-    let started = Instant::now();
-    polite.shutdown(Duration::from_secs(5));
     assert!(
-        started.elapsed() < Duration::from_secs(1),
-        "EOF should end the child at once"
+        polite.shutdown_for_tests(Duration::from_secs(60)),
+        "the child exits on stdin EOF"
     );
     assert!(!alive(pid), "the child is reaped");
 
     // Ignores EOF: killed after the grace.
     let stubborn = link(Framing::Bare, json!([{"ignore_eof": true}]));
     let pid = stubborn.pid();
-    let started = Instant::now();
-    stubborn.shutdown(Duration::from_millis(300));
-    let took = started.elapsed();
-    assert!(took >= Duration::from_millis(300), "the grace is waited out: {took:?}");
-    assert!(took < Duration::from_secs(3));
+    let used_grace = stubborn.shutdown_grace_for_tests();
+    assert!(
+        !stubborn.shutdown_for_tests(Duration::from_millis(300)),
+        "an EOF-ignoring child needs a signal"
+    );
+    assert!(
+        used_grace().expect("shutdown reached the signal point") >= Duration::from_millis(300),
+        "the child is signalled only after the full subsecond grace"
+    );
     assert!(!alive(pid), "the child is killed and reaped");
 }
 

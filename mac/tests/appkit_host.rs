@@ -62,6 +62,12 @@ mod macos {
         done()
     }
 
+    fn spin_once() {
+        let until = NSDate::dateWithTimeIntervalSinceNow(0.02);
+        // SAFETY: an extern static Foundation defines.
+        NSRunLoop::currentRunLoop().runMode_beforeDate(unsafe { NSDefaultRunLoopMode }, &until);
+    }
+
     /// Stands in for Neovide's nvim on `listener`: answers the handshake, the install (with a report of no parts),
     /// and every other request with nil, until `go` says the editor goes; then it closes the connection.
     fn fake_nvim(listener: UnixListener, go: mpsc::Receiver<()>) -> std::thread::JoinHandle<()> {
@@ -155,7 +161,7 @@ mod macos {
         );
         host.attach(assembly.clone());
 
-        let waiting = spin_until(Duration::from_millis(500), || {
+        let waiting = spin_until(Duration::from_secs(60), || {
             assembly.editor_link() == Some((AttachWait::WAITING.0.into(), AttachWait::WAITING.1.into()))
         });
         check(
@@ -172,25 +178,28 @@ mod macos {
             String::new(),
         );
         let panel = assembly.panel.clone();
-        let ticked = spin_until(Duration::from_millis(500), || panel.ticks_run() > 0);
+        let ticked = spin_until(Duration::from_secs(60), || panel.ticks_run() > 0);
         check(
             "its first tick runs on the loop's first turns",
             ticked,
             format!("{} ticks", panel.ticks_run()),
         );
-        // The page loads and says ready, the start's trust check answers: then it settles.
-        spin_until(Duration::from_secs(3), || false);
+        let idle = spin_until(Duration::from_secs(60), || {
+            !host.page().document_loading() && !host.panel_timer_armed()
+        });
         let before = panel.ticks_run();
-        spin_until(Duration::from_secs(1), || false);
-        let idle = panel.ticks_run() - before;
+        for _ in 0..64 {
+            spin_once();
+        }
+        let ticks = panel.ticks_run() - before;
         check(
             "an idle panel is not ticked",
-            idle <= 1,
-            format!("{idle} ticks in a second"),
+            idle && ticks == 0,
+            format!("{ticks} ticks"),
         );
         let before = panel.ticks_run();
         panel.new_tab();
-        let woke = spin_until(Duration::from_millis(500), || panel.ticks_run() > before);
+        let woke = spin_until(Duration::from_secs(60), || panel.ticks_run() > before);
         check(
             "a call into the panel wakes its tick (the wake's dispatch source)",
             woke,
@@ -200,7 +209,7 @@ mod macos {
         panel.new_tab();
         // SAFETY: an extern static AppKit defines.
         let tracking = unsafe { NSEventTrackingRunLoopMode };
-        let woke = spin_in(tracking, Duration::from_millis(500), || panel.ticks_run() > before);
+        let woke = spin_in(tracking, Duration::from_secs(60), || panel.ticks_run() > before);
         check(
             "and also while a menu is open or the window resizes",
             woke,
@@ -211,7 +220,7 @@ mod macos {
         let listener = UnixListener::bind(&nvim_listen).expect("a socket where nvim would listen");
         let (go, gone) = mpsc::channel();
         let nvim = fake_nvim(listener, gone);
-        let attached = spin_until(Duration::from_secs(2), || {
+        let attached = spin_until(Duration::from_secs(60), || {
             host.life.attach_phase().starts_with("attach requested")
         });
         check(
@@ -223,27 +232,29 @@ mod macos {
         // The editor's poll: on its timer while the link attaches, then on its sockets alone.
         let editor = assembly.editor.clone();
         let band = || assembly.editor_link().map(|(state, _)| state).unwrap_or_default();
-        let linked = spin_until(Duration::from_secs(3), || band() == "attached");
+        let linked = spin_until(Duration::from_secs(60), || band() == "attached");
         check(
             "the link attaches to an nvim that answers",
             linked,
             format!("{:?}", assembly.editor_link()),
         );
-        let settled = spin_until(Duration::from_secs(1), || host.editor_ticking() == Some(false));
+        let settled = spin_until(Duration::from_secs(60), || host.editor_ticking() == Some(false));
         let before = editor.polls_run();
-        spin_until(Duration::from_secs(1), || false);
-        let idle = editor.polls_run() - before;
+        for _ in 0..64 {
+            spin_once();
+        }
+        let polls = editor.polls_run() - before;
         check(
             "an attached, idle editor is not polled",
-            settled && idle == 0 && host.editor_ticking() == Some(false),
-            format!("{idle} polls in a second, ticking {:?}", host.editor_ticking()),
+            settled && polls == 0 && host.editor_ticking() == Some(false),
+            format!("{polls} polls, ticking {:?}", host.editor_ticking()),
         );
         let before = editor.polls_run();
         let mut feed = UnixStream::connect(editor.context_socket().expect("the context feed")).expect("connect");
         feed.write_all(b"{\"v\":1,\"file\":\"/p/a.rs\",\"selection\":null}\n")
             .expect("write");
         drop(feed);
-        let read = spin_until(Duration::from_millis(500), || {
+        let read = spin_until(Duration::from_secs(60), || {
             (assembly.editor.context())().is_some_and(|context| context.file == "/p/a.rs")
         });
         check(
@@ -251,7 +262,7 @@ mod macos {
             read && editor.polls_run() > before,
             format!("{} polls", editor.polls_run() - before),
         );
-        let back = spin_until(Duration::from_secs(1), || host.editor_ticking() == Some(false));
+        let back = spin_until(Duration::from_secs(60), || host.editor_ticking() == Some(false));
         check(
             "then it waits on its sockets again",
             back,
@@ -259,7 +270,7 @@ mod macos {
         );
         go.send(()).unwrap();
         nvim.join().unwrap();
-        let detached = spin_until(Duration::from_millis(500), || band() == "detached");
+        let detached = spin_until(Duration::from_secs(60), || band() == "detached");
         check(
             "the link's own news wakes it: the editor going is told",
             detached,
@@ -268,7 +279,7 @@ mod macos {
 
         // A ticker let go of without `stop` cancels what it armed: libdispatch keeps an uncancelled source alive
         // after its last owner, with a handler that reaches nothing.
-        spin_until(Duration::from_secs(1), || host.editor_ticking() == Some(false));
+        spin_until(Duration::from_secs(60), || host.editor_ticking() == Some(false));
         let sources = host.editor_watch_sources();
         let armed = !sources.is_empty() && sources.iter().all(|s| s.testcancel() == 0);
         host.drop_editor_tick_without_stopping();
@@ -299,7 +310,6 @@ mod macos {
             format!("{:?} in {} ms", host.life.finished_via(), took.as_millis()),
         );
         let after = panel.ticks_run();
-        spin_until(Duration::from_millis(300), || false);
         check(
             "the shutdown stops the editor's poll",
             host.editor_ticking().is_none(),

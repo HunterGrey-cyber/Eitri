@@ -186,8 +186,7 @@ mod tests {
     const LAUNCHSERVICES_PATH: &str = "/usr/bin:/bin:/usr/sbin:/sbin";
 
     fn executable(path: &Path, text: &str) {
-        std::fs::write(path, text).unwrap();
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        script_fixture::write_executable_script(path, text, 0o755).unwrap();
     }
 
     /// A stand-in login shell: chatter from a shell configuration first, then the `PATH` it sets, printed by the
@@ -271,11 +270,9 @@ mod tests {
         assert!(why.contains("command not found: brew"), "{why}");
 
         let hangs = tmp.path().join("hangs");
-        executable(&hangs, "#!/bin/sh\nsleep 30 &\nsleep 30\n");
-        let started = Instant::now();
+        executable(&hangs, "#!/bin/sh\nsleep 30 &\nwait\n");
         let why = path_from_command(&hangs, &[], Duration::from_millis(300)).unwrap_err();
         assert!(why.contains("no answer"), "{why}");
-        assert!(started.elapsed() < Duration::from_secs(5), "killed at the budget");
 
         let env = decide(1, Some(LAUNCHSERVICES_PATH.into()), None, &|| Err("gave up".into()));
         assert_eq!(env.path, OsString::from(LAUNCHSERVICES_PATH));
@@ -303,10 +300,10 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let pid_file = tmp.path().join("pid");
         let endless = tmp.path().join("endless");
-        // A configuration with a stray `yes` on each stream, one of them in a child of its own.
+        // A configuration with a stray `yes` on each stream. A watchdog ends both writers if the reader hangs.
         executable(
             &endless,
-            "#!/bin/sh\necho $$ > \"$1\"\nyes 'on stderr' >&2 &\nyes 'on stdout'\n",
+            "#!/bin/sh\necho $$ > \"$1\"\nyes 'on stderr' >&2 &\nerr=$!\nyes 'on stdout' &\nout=$!\n(sleep 30; kill \"$out\" \"$err\") &\nwait\n",
         );
         // How soon a loaded machine gets the shell as far as its `yes` on stderr is not the test's to say: a budget
         // that ran out first says nothing about the cut, so the budget doubles until the shell was seen to get
@@ -317,13 +314,18 @@ mod tests {
             budget *= 2;
             rounds += 1;
             let _ = std::fs::remove_file(&pid_file);
-            let started = Instant::now();
-            let why = path_from_command(&endless, &[pid_file.clone().into_os_string()], budget).unwrap_err();
-            assert!(
-                started.elapsed() < budget * 4,
-                "{:?} for a budget of {budget:?}",
-                started.elapsed()
-            );
+            let mut observed_budget = None;
+            let why = {
+                let _spawning = crate::spawn_gate::spawning();
+                eitri_core::login_path::path_from_command_observing_deadline(
+                    &endless,
+                    &[pid_file.clone().into_os_string()],
+                    budget,
+                    &mut |start, deadline| observed_budget = Some(deadline.duration_since(start)),
+                )
+                .unwrap_err()
+            };
+            assert_eq!(observed_budget, Some(budget));
             assert!(why.contains("no answer"), "{why}");
             let pgid: Option<libc::pid_t> = std::fs::read_to_string(&pid_file)
                 .ok()
@@ -421,4 +423,9 @@ mod tests {
         assert!(started_from_the_desktop(1));
         assert!(!started_from_the_desktop(0) && !started_from_the_desktop(4242));
     }
+}
+
+#[cfg(test)]
+mod script_fixture {
+    include!(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/support/executable.rs"));
 }

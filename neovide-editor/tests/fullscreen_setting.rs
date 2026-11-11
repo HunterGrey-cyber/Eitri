@@ -50,7 +50,6 @@ impl Frames {
 
     fn step(&mut self, harness: &mut LiveHarness) {
         harness.render_frame(self.surface.canvas(), Some(&self.region), 1.0 / 60.0);
-        std::thread::sleep(Duration::from_millis(16));
     }
 }
 
@@ -66,11 +65,10 @@ fn wait_for(harness: &mut LiveHarness, frames: &mut Frames, want: bool, what: &s
     }
 }
 
-/// Pumps for `for_how_long` and panics if the getter moves off `want` meanwhile: the control that
+/// Pumps 100 simulated turns and panics if the getter moves off `want`: the control that
 /// makes a later change the doing of the step that follows, not drift.
-fn holds(harness: &mut LiveHarness, frames: &mut Frames, want: bool, for_how_long: Duration) {
-    let until = Instant::now() + for_how_long;
-    while Instant::now() < until {
+fn holds(harness: &mut LiveHarness, frames: &mut Frames, want: bool) {
+    for _ in 0..100 {
         frames.step(harness);
         assert_eq!(harness.fullscreen_setting(), want, "the getter moved on its own");
     }
@@ -118,13 +116,13 @@ fn main() {
 
     // 1. The startup value.
     wait_for(&mut harness, &mut frames, true, "--cmd before ui_attach");
-    holds(&mut harness, &mut frames, true, Duration::from_millis(300));
+    holds(&mut harness, &mut frames, true);
     println!("ok: a value set before ui_attach is the getter's starting value");
 
     // 2. nvim -> host.
     harness.send_text_input(":let g:neovide_fullscreen = v:false<CR>");
     wait_for(&mut harness, &mut frames, false, "runtime :let");
-    holds(&mut harness, &mut frames, false, Duration::from_millis(300));
+    holds(&mut harness, &mut frames, false);
     println!("ok: a runtime :let reaches the getter");
 
     // 3. host -> nvim.

@@ -161,7 +161,7 @@ fn a_buffer_read_through_a_link_says_where_on_the_line_and_its_selection_is_not_
 #[ignore = "needs a real nvim on PATH; spends no tokens and needs no display"]
 fn a_reload_that_moves_the_record_is_reported() {
     let case = LinkedOut::new(std::ffi::OsStr::new("secret.py"));
-    let mut commands = vec!["sleep 300m".to_owned(), "set autoread".to_owned()];
+    let mut commands = vec!["lua test_timers.advance(300)".to_owned(), "set autoread".to_owned()];
     commands.extend(case.replace_the_link());
     commands.push("checktime".to_owned());
     let update = drive_linked(&case, &commands);
@@ -200,9 +200,7 @@ fn a_record_that_is_not_utf8_arrives_marked_and_is_not_pushed() {
 
 /// Opens `file`, runs `normal_command`, and returns whatever the snippet sent.
 ///
-/// The `sleep` is inside nvim's own command sequence rather than in this process: the snippet
-/// batches on a 150ms timer, so quitting immediately would race it, and sleeping here instead would
-/// race nvim's startup as well.
+/// The test dispatches the snippet's debounce timers before quitting, so startup scheduling cannot race a sleep.
 fn drive_nvim(
     feed: &EditorContextFeed,
     reader: &mut EditorContextReader,
@@ -213,7 +211,7 @@ fn drive_nvim(
 }
 
 /// [`drive_nvim`] with extra startup arguments (`--clean`) ahead of the feed's own, and several
-/// commands run in order before the sleep.
+/// commands run in order before advancing the timers.
 fn drive_nvim_with(
     feed: &EditorContextFeed,
     reader: &mut EditorContextReader,
@@ -233,6 +231,7 @@ fn drive_nvim_update(
 ) -> Option<eitri_core::editor_context::feed::FeedUpdate> {
     let mut command = std::process::Command::new("nvim");
     command.arg("--headless");
+    command.args(["--cmd", &format!("lua {}", include_str!("support/manual_timers.lua"))]);
     command.args(startup_args);
     for arg in feed.nvim_args() {
         command.arg(arg);
@@ -245,7 +244,7 @@ fn drive_nvim_update(
         command.args(["-c", each]);
     }
     let status = command
-        .args(["-c", "sleep 600m"])
+        .args(["-c", "lua test_timers.advance(600)"])
         .args(["-c", "qa!"])
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
@@ -887,7 +886,13 @@ fn an_idle_snippet_leaves_no_timer_running() {
          vim.fn.writefile({{tostring(n)}}, '{}')",
         count.display()
     );
-    let context = drive_nvim_with(&feed, &mut reader, &file, &["--clean"], &["sleep 500m", &report]);
+    let context = drive_nvim_with(
+        &feed,
+        &mut reader,
+        &file,
+        &["--clean"],
+        &["lua test_timers.advance(500)", &report],
+    );
     assert_eq!(
         context.expect("what the editor showed was sent").file,
         file.display().to_string()
@@ -926,7 +931,7 @@ fn a_selection_of_long_lines_fetches_no_more_than_it_sends() {
             &mut reader,
             &file,
             &["--clean", "--cmd", count],
-            &[motion, "sleep 400m", &report],
+            &[motion, "lua test_timers.advance(400)", &report],
         )
         .expect("an update must arrive");
         let selection = context.selection.expect("a selection");
@@ -951,7 +956,7 @@ fn drive_edit_key(
     let mut feed = EditorContextFeed::new().expect("the feed must bind");
     let mut reader = EditorContextReader::new(feed.take_listener().unwrap());
     let mut all: Vec<&str> = commands.to_vec();
-    all.extend(["doautocmd VimEnter", "sleep 100m"]);
+    all.extend(["doautocmd VimEnter", "lua test_timers.advance(100)"]);
     all.extend(after);
     let update = drive_nvim_update(&feed, &mut reader, file, &["--clean"], &all);
     feed.cleanup();
@@ -1060,7 +1065,8 @@ fn a_torn_down_snippet_takes_its_key_and_its_function_away() {
                 dir.join("none.sock").display()
             ),
         ])
-        .args(["-c", "doautocmd VimEnter", "-c", "sleep 100m"])
+        .args(["--cmd", &format!("lua {}", include_str!("support/manual_timers.lua"))])
+        .args(["-c", "doautocmd VimEnter", "-c", "lua test_timers.advance(100)"])
         .args([
             "-c",
             "lua _G.before = {vim.fn.maparg('\\\\ae', 'x') ~= '', type(_G.__eitri_edit_selection)}",
@@ -1100,7 +1106,7 @@ fn a_leader_that_changes_later_moves_only_the_snippets_own_mapping() {
         // nvim takes ten -c commands at most.
         &[
             theirs,
-            "let mapleader = ' ' | doautocmd User LazyLoad | sleep 100m",
+            "let mapleader = ' ' | doautocmd User LazyLoad | lua test_timers.advance(100)",
             &report,
         ],
     )

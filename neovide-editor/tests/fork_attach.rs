@@ -18,8 +18,9 @@
 //! `newuidmap` and an `/etc/subuid` entry); where that cannot be had it prints `NOT RUN` with the reason, and the
 //! fork's own unit test of the owner check (a stand-in uid) still holds the refusal.
 use std::os::unix::fs::MetadataExt;
+use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Command, Output, Stdio};
 use std::time::{Duration, Instant};
 
 use neovide::{
@@ -475,15 +476,32 @@ fn attach_refuses_a_socket_of_another_uid(scratch: &Scratch) {
     assert!(server.is_running());
 }
 
+fn held_command(entered: &Path, release: &Path, done: &Path, hang_guard: &str) -> String {
+    format!(
+        r#"touch {}; timeout {hang_guard} sh -c 'while ! test -e "$1"; do sleep 0.01; done' sh {}; touch {}"#,
+        entered.display(),
+        release.display(),
+        done.display(),
+    )
+}
+
 fn attach_setup_past_four_seconds_fails_the_launch(scratch: &Scratch) {
     let server = Server::start(scratch.path(), "s");
     let observer = Observer::on(&server.address());
     let done = scratch.path().join("held-done");
-    // The server runs a shell command for 6 s and answers nothing else meanwhile; the file marks its end.
-    observer.input(&format!(":silent !sleep 6; touch {}<CR>", done.display()));
-    std::thread::sleep(Duration::from_millis(500));
-    assert!(!done.exists());
-
+    let entered = scratch.path().join("held-entered");
+    let release = scratch.path().join("held-release");
+    // The fixture releases itself even if attach never returns to write the release file.
+    // This is a hang guard independent of the setup deadline whose error we assert below.
+    observer.input(&format!(
+        ":silent !{}<CR>",
+        held_command(&entered, &release, &done, "60s")
+    ));
+    let deadline = Instant::now() + WAIT;
+    while !entered.exists() {
+        assert!(Instant::now() < deadline, "server never entered its held command");
+        std::thread::yield_now();
+    }
     let started = Instant::now();
     let result = LiveHarness::with_options(options(&server.address()));
     let took = started.elapsed();
@@ -491,12 +509,13 @@ fn attach_setup_past_four_seconds_fails_the_launch(scratch: &Scratch) {
     let error = match result {
         Ok(mut harness) => {
             harness.shutdown();
-            panic!("the attach succeeded on a server held for 6 s (after {took:?})");
+            panic!("the attach succeeded while setup was held (after {took:?})");
         }
         Err(e) => format!("{e:#}"),
     };
     println!("fork_attach: the launch failed after {took:?}: {error}");
     assert!(held, "the launch ended only after the server came free ({took:?})");
+    std::fs::write(&release, b"go").unwrap();
     assert!(error.contains("4 s"), "the failure names the setup's bound: {error}");
 
     let deadline = Instant::now() + WAIT;
@@ -647,7 +666,6 @@ fn connect_in_attach_mode_reports_session_left_connect(scratch: &Scratch) {
     origin_observer.wait("the origin lost its UI", |o| o.uis() == 0);
     assert!(origin.is_running(), "the origin ended on :connect");
     // Not followed: the harness never reached the other server.
-    std::thread::sleep(Duration::from_millis(300));
     assert_eq!(
         other_observer.uis(),
         0,
@@ -727,11 +745,10 @@ fn restart_refused_by_an_unsaved_buffer_keeps_the_session(scratch: &Scratch) {
     observer.wait("nvim refused the restart", |o| {
         o.string("return vim.v.exitreason") == "" && o.string("return vim.v.errmsg").contains("E37")
     });
-    // Long enough for the harness's check of the refusal to have come back.
-    let until = Instant::now() + Duration::from_millis(1500);
-    while Instant::now() < until {
+    // Exercise repeated harness turns after nvim acknowledged the refusal.
+    for _ in 0..100 {
         editor.frame();
-        std::thread::sleep(Duration::from_millis(20));
+        assert!(!editor.harness.has_neovim_exited());
     }
     assert!(
         !editor.harness.has_neovim_exited(),
@@ -780,10 +797,14 @@ fn a_hang_up_while_a_refused_restart_waits_at_a_prompt_reports_nothing(scratch: 
     });
 
     editor.harness.send_text_input(":restart<CR>");
-    let until = Instant::now() + Duration::from_millis(1500);
-    while Instant::now() < until {
+    observer.wait("the refusal reached its prompt", |o| {
+        let mode = o.runtime.block_on(o.session.neovim.get_mode()).unwrap();
+        mode.iter()
+            .any(|(key, value)| key.as_str() == Some("blocking") && value.as_bool() == Some(true))
+    });
+    for _ in 0..100 {
         editor.frame();
-        std::thread::sleep(Duration::from_millis(20));
+        assert!(!editor.harness.has_neovim_exited());
     }
     assert!(
         !editor.harness.has_neovim_exited(),
@@ -959,6 +980,80 @@ fn run_case(case: &str) {
     }
 }
 
+/// Capture into files so neither a full pipe nor a descendant holding one open can block the parent.
+fn output_with_guard(command: &mut Command, dir: &Path, limit: Duration) -> (Output, bool) {
+    let stdout = dir.join("stdout");
+    let stderr = dir.join("stderr");
+    let mut child = command
+        .stdout(std::fs::File::create(&stdout).unwrap())
+        .stderr(std::fs::File::create(&stderr).unwrap())
+        .process_group(0)
+        .spawn()
+        .expect("spawn supervised child");
+    let pid = child.id() as libc::pid_t;
+    assert!(pid > 1, "the supervisor owns a child process group");
+    let deadline = Instant::now() + limit;
+    let mut killed_at = None;
+    let status = loop {
+        if let Some(status) = child.try_wait().expect("poll supervised child") {
+            break status;
+        }
+        if let Some(killed_at) = killed_at {
+            assert!(
+                Instant::now() < killed_at + WAIT,
+                "supervised child was not reaped after SIGKILL"
+            );
+        } else if Instant::now() >= deadline {
+            // try_wait just confirmed this child is unreaped; its process group cannot be reused.
+            assert_eq!(unsafe { libc::kill(-pid, libc::SIGKILL) }, 0);
+            killed_at = Some(Instant::now());
+        }
+        std::thread::yield_now();
+    };
+    (
+        Output {
+            status,
+            stdout: std::fs::read(stdout).unwrap(),
+            stderr: std::fs::read(stderr).unwrap(),
+        },
+        killed_at.is_some(),
+    )
+}
+
+fn supervision_self_test() {
+    let scratch = Scratch::new(CASES[0]);
+    let (out, expired) = output_with_guard(
+        Command::new("sh").args(["-c", "exec sleep 600"]),
+        scratch.path(),
+        Duration::ZERO,
+    );
+    assert!(expired, "an unresponsive child must trip the independent guard");
+    assert_eq!(out.status.signal(), Some(libc::SIGKILL));
+    let (out, expired) = output_with_guard(
+        Command::new("sh").args(["-c", "printf ok; printf err >&2"]),
+        scratch.path(),
+        WAIT,
+    );
+    assert!(!expired && out.status.success());
+    assert_eq!(out.stdout, b"ok");
+    assert_eq!(out.stderr, b"err");
+    let entered = scratch.path().join("held-entered");
+    let release = scratch.path().join("held-release");
+    let done = scratch.path().join("held-done");
+    let (out, expired) = output_with_guard(
+        Command::new("sh").args(["-c", &held_command(&entered, &release, &done, "0.01s")]),
+        scratch.path(),
+        WAIT,
+    );
+    assert!(
+        !expired && out.status.success(),
+        "the held fixture never released itself"
+    );
+    assert!(entered.exists() && done.exists());
+    assert!(!release.exists(), "nobody released the held fixture");
+    println!("fork_attach: supervision self-test ok");
+}
+
 fn main() {
     if let Some(case) = std::env::var_os(CASE_ENV) {
         let case = case.to_string_lossy().into_owned();
@@ -970,6 +1065,7 @@ fn main() {
         println!("fork_attach: ok {case}");
         return;
     }
+    supervision_self_test();
     let args: Vec<String> = std::env::args().collect();
     if !args.iter().any(|a| a == "--ignored" || a == "--include-ignored") {
         println!("fork_attach: ignored (spawns real nvims); run with `-- --ignored`");
@@ -981,13 +1077,15 @@ fn main() {
         if !filter.is_empty() && !filter.iter().any(|f| case.contains(f.as_str())) {
             continue;
         }
-        let out = Command::new(std::env::current_exe().unwrap())
-            .env(CASE_ENV, case)
-            .output()
-            .expect("re-exec of the test binary failed");
+        let capture = Scratch::new(case);
+        let (out, expired) = output_with_guard(
+            Command::new(std::env::current_exe().unwrap()).env(CASE_ENV, case),
+            capture.path(),
+            Duration::from_secs(180),
+        );
         let stdout = String::from_utf8_lossy(&out.stdout);
         print!("{stdout}");
-        if stdout.lines().any(|l| l == format!("fork_attach: ok {case}")) {
+        if !expired && out.status.success() && stdout.lines().any(|l| l == format!("fork_attach: ok {case}")) {
             println!("test {case} ... ok");
         } else {
             println!("test {case} ... FAILED ({})", out.status);

@@ -75,6 +75,15 @@ static FIRST: AtomicI32 = AtomicI32::new(0);
 static LAST: AtomicI32 = AtomicI32::new(0);
 static FIRST_AT_MS: AtomicU64 = AtomicU64::new(0);
 
+#[cfg(test)]
+static TEST_ELAPSED_MS: AtomicU64 = AtomicU64::new(u64::MAX);
+
+#[cfg(test)]
+#[allow(dead_code, reason = "called by the integration test that includes this module")]
+pub(crate) fn test_watchdog_elapsed(elapsed: Duration) {
+    TEST_ELAPSED_MS.store(elapsed.as_millis().try_into().unwrap(), Ordering::SeqCst);
+}
+
 fn epoch() -> Instant {
     static EPOCH: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
     *EPOCH.get_or_init(Instant::now)
@@ -214,6 +223,10 @@ unsafe extern "C" fn watched(data: ffi::gpointer) -> ffi::gboolean {
         FIRST_AT_MS.store(epoch().elapsed().as_millis() as u64, Ordering::SeqCst);
     }
     LAST.store(signum, Ordering::SeqCst);
+    #[cfg(test)]
+    if TEST_ELAPSED_MS.load(Ordering::SeqCst) != u64::MAX {
+        let _ = writeln!(std::io::stdout(), "WATCHDOG-SAW-{signum}");
+    }
     ffi::GTRUE
 }
 
@@ -284,13 +297,20 @@ fn start_watchdog() -> std::io::Result<()> {
             // a signal the window answered before this reading is seen answered.
             let now = epoch().elapsed();
             let first_at = Duration::from_millis(FIRST_AT_MS.load(Ordering::SeqCst));
+            #[cfg(test)]
+            let elapsed = match TEST_ELAPSED_MS.load(Ordering::SeqCst) {
+                u64::MAX => now.saturating_sub(first_at),
+                ms => Duration::from_millis(ms),
+            };
+            #[cfg(not(test))]
+            let elapsed = now.saturating_sub(first_at);
             let watch = Watch {
                 seen,
                 first: FIRST.load(Ordering::SeqCst),
                 last: LAST.load(Ordering::SeqCst),
                 answered: ANSWERED.load(Ordering::SeqCst),
                 closing: CLOSING.load(Ordering::SeqCst),
-                elapsed: now.saturating_sub(first_at),
+                elapsed,
             };
             if decide(watch) != Outcome::Wait {
                 // Read the flags once more just before acting: an answer that arrived meanwhile withdraws an end

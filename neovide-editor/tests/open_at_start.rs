@@ -179,15 +179,6 @@ fn ask(editor: &mut Editor, expr: &str) -> serde_json::Value {
     serde_json::from_str(&text).unwrap_or_else(|e| panic!("{expr}: not JSON ({e}): {text}"))
 }
 
-/// Renders for `span`.
-fn pump(editor: &mut Editor, span: Duration) {
-    let end = Instant::now() + span;
-    while Instant::now() < end {
-        frame(editor);
-        std::thread::sleep(Duration::from_millis(10));
-    }
-}
-
 fn ready(editor: &mut Editor) {
     wait_for(editor, "the editor ready", Duration::from_secs(20), |e| {
         e.harness.is_ready()
@@ -421,8 +412,11 @@ fn dirty_swap_case(dir: &Path, size: (u32, u32)) {
         if mode != "rm" {
             break;
         }
+        let batches = editor.harness.redraw_batches_seen();
         editor.harness.send_text_input(" ");
-        pump(&mut editor, Duration::from_millis(150));
+        wait_for(&mut editor, "the next prompt page", Duration::from_secs(60), |e| {
+            e.harness.redraw_batches_seen() > batches
+        });
         mode = nvim_mode(&mut editor).0;
     }
     assert_eq!(mode, question, "{case}: the question itself is up");

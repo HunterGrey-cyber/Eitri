@@ -238,6 +238,8 @@ pub(super) struct DevicesShared {
     connected: Mutex<BTreeSet<String>>,
     /// The phone-sent errands at work now, at most [`PHONE_ERRANDS_MAX`].
     pub(super) phone_errands: Arc<AtomicUsize>,
+    #[cfg(test)]
+    workers: Arc<AtomicUsize>,
 }
 
 impl DevicesShared {
@@ -261,6 +263,8 @@ impl DevicesShared {
             listing: Mutex::new(Listing::default()),
             connected: Mutex::new(BTreeSet::new()),
             phone_errands: Arc::new(AtomicUsize::new(0)),
+            #[cfg(test)]
+            workers: Arc::new(AtomicUsize::new(0)),
         }
     }
 }
@@ -678,7 +682,14 @@ fn started_off_the_tick(
     conn: u64,
     work: impl FnOnce(&Shared) -> DevicesInbound + Send + 'static,
 ) -> bool {
+    #[cfg(test)]
+    let worker = {
+        shared.devices.workers.fetch_add(1, Ordering::SeqCst);
+        ErrandSlot(Arc::clone(&shared.devices.workers))
+    };
     let spawned = std::thread::Builder::new().name("rv-devices".into()).spawn(move || {
+        #[cfg(test)]
+        let _worker = worker;
         let line = work(&shared);
         hand_to_tick(&shared, conn, line);
     });
@@ -1213,6 +1224,12 @@ impl RemoteSocket {
     #[cfg(test)]
     pub(super) fn note_lapsed_at(&self, now: Instant) {
         note_lapsed_now(&self.shared, now);
+    }
+
+    /// Whether a device worker still owes a result to the tick.
+    #[cfg(test)]
+    pub(super) fn devices_busy(&self) -> bool {
+        self.shared.devices.workers.load(Ordering::SeqCst) > 0
     }
 
     /// Reads the device list with `read` in place of [`device_rows`].

@@ -60,8 +60,9 @@ pub(crate) fn seed_for_resume(cwd: &str, conversation_id: &str, provider_session
 ///
 /// Split out for one reason: a test that drives the B-fails-to-A decision by setting
 /// `CLAUDE_CONFIG_DIR` would be mutating a process-wide environment variable inside a
-/// multi-threaded test binary, which this crate has a whole lock (`CLAUDE_CONFIG_DIR_TEST_LOCK`)
-/// to contain. Passing the path makes every branch reachable with an ordinary temporary file.
+/// multi-threaded test binary. Environment-dependent tests run in a child through
+/// `crate::testkit::environment::in_child`; passing the path makes every branch reachable with an
+/// ordinary temporary file.
 pub(crate) fn seed_from(
     transcript_path: std::io::Result<PathBuf>,
     conversation_id: &str,

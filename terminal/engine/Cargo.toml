@@ -1,7 +1,7 @@
 [package]
 name = "eitri-terminal"
 version.workspace = true
-edition.workspace = true
+edition = "2024"
 publish.workspace = true
 license = "MIT"
 description = "The bottom terminal's engine: an owned PTY, one session thread per terminal, and the Skia paint of a terminal-render PaintList. GTK-free by construction (src/manifest_guard.rs)."

@@ -38,7 +38,6 @@
 
 use std::cell::{Cell, RefCell};
 use std::rc::{Rc, Weak};
-use std::time::{Duration, Instant};
 
 use eitri_core::layout::{ModuleId, Size};
 use eitri_core::wm::conformance::{self, EventMatch, Expect, Fixture, GridObserve, RecordingSink, Script};
@@ -73,13 +72,12 @@ mod module_grid;
 #[path = "../src/web_host.rs"]
 mod web_host;
 
-fn pump(ms: u64) {
-    let context = gtk4::glib::MainContext::default();
-    let end = Instant::now() + Duration::from_millis(ms);
-    while Instant::now() < end {
-        while context.iteration(false) {}
-        std::thread::sleep(Duration::from_millis(2));
-    }
+#[allow(dead_code)]
+#[path = "support/frame_turns.rs"]
+mod frame_turns;
+
+fn pump() {
+    frame_turns::settle();
 }
 
 /// Builds each surface as a focusable button in the window's column, off screen until a `Map`, and adds its host
@@ -459,7 +457,7 @@ fn stage(f: &Fixture) -> Result<Stage, String> {
     window.set_child(Some(&column));
     host.adopt_window(f.win, &window);
     window.present();
-    pump(300);
+    pump();
     if !buttons[0].is_mapped() || !buttons[1].is_mapped() {
         return Err("the window's visible widgets were never mapped".into());
     }
@@ -467,7 +465,7 @@ fn stage(f: &Fixture) -> Result<Stage, String> {
         return Err("the child-invisible widget is mapped".into());
     }
     GtkWindowExt::set_focus(&window, None::<&gtk4::Widget>);
-    pump(50);
+    pump();
     if GtkWindowExt::focus(&window).is_some() {
         return Err("the window kept a focus widget after it was cleared".into());
     }
@@ -487,7 +485,7 @@ fn finish(stage: Stage) {
     if stage.window.is_visible() {
         stage.window.destroy();
     }
-    pump(50);
+    pump();
 }
 
 /// Scripts this host adds to the shared ones: behaviour GTK's signals alone would not give.
@@ -516,7 +514,7 @@ fn own_scripts(f: &Fixture) -> Vec<Script> {
 fn outside_close(f: &Fixture) -> Result<(), String> {
     let s = stage(f)?;
     s.window.close();
-    pump(50);
+    pump();
     let asked = s.sink.close_requests();
     if asked != 1 {
         return Err(format!("a close from outside asked the sink {asked} times, not once"));
@@ -528,7 +526,7 @@ fn outside_close(f: &Fixture) -> Result<(), String> {
 
     let s = stage(f)?;
     let answer = s.host.apply(&HostOp::CloseWindow { win: f.win });
-    pump(50);
+    pump();
     if answer != Applied::Done {
         return Err(format!("CloseWindow answered {answer:?}"));
     }
@@ -565,7 +563,7 @@ fn stopped_close(f: &Fixture) -> Result<(), String> {
     let erased: Rc<dyn HostSink> = stopper.clone();
     s.host.attach(Rc::downgrade(&erased));
     s.window.close();
-    pump(50);
+    pump();
     if stopper.0.close_requests() != 1 || !s.window.is_visible() {
         return Err("a close the sink stopped did not keep the window open".into());
     }
@@ -617,7 +615,7 @@ fn close_window_inside_the_request(f: &Fixture) -> Result<(), String> {
     let erased: Rc<dyn HostSink> = sink.clone();
     s.host.attach(Rc::downgrade(&erased));
     s.window.close();
-    pump(50);
+    pump();
     if sink.inner.close_requests() != 1 {
         return Err(format!(
             "a close from outside asked the sink {} times, not once",
@@ -661,7 +659,7 @@ fn closed_windows_are_forgotten(f: &Fixture) -> Result<(), String> {
             window.close();
         }
         drop(window);
-        pump(50);
+        pump();
         if host.knows_window(f.win) {
             let how = if by_op { "CloseWindow" } else { "a close from outside" };
             return Err(format!("the host still holds the window or its surfaces after {how}"));
@@ -687,7 +685,7 @@ fn unmapped_owner_keeps_no_keys(f: &Fixture) -> Result<(), String> {
     if s.host.apply(&focus) != Applied::Done || s.host.apply(&unmap) != Applied::Done {
         return Err("focus then unmap of a visible module was refused".into());
     }
-    pump(50);
+    pump();
     let a = &s.widgets[0];
     if GtkWindowExt::focus(&s.window).is_some_and(|w| w == *a || w.is_ancestor(a)) {
         return Err("the window's focus stayed on the hidden surface".into());
@@ -741,14 +739,14 @@ fn open_window_then_present(f: &Fixture) -> Result<(), String> {
     if host.apply(&present) != Applied::Done {
         return Err("Present was refused".into());
     }
-    pump(100);
+    pump();
     if !window.is_visible() {
         return Err("Present did not show the window".into());
     }
     window.destroy();
     // The window disposes, and the host forgets it, once the last reference to it is gone.
     drop(window);
-    pump(50);
+    pump();
     if host.knows_window(f.win) {
         return Err("the host still holds the destroyed window".into());
     }
@@ -1095,21 +1093,23 @@ fn prepared_grid() -> Result<
     window.set_child(Some(&grid));
     grid.apply();
     window.present();
-    pump(50);
+    pump();
     grid.prepare_page(&module, (500, 700))?;
     Ok((window, grid, host.upcast(), layout))
 }
 
 fn a_prepared_host_is_allocated_at_its_final_size_drawn_and_covered() -> Result<(), String> {
     let (window, grid, host, _) = prepared_grid()?;
-    let allocation = host.allocation();
+    let allocation = host
+        .compute_bounds(&grid)
+        .ok_or("prepared host has no bounds in the grid")?;
     // Drawn (a widget at zero opacity is not, and its page gets no animation frames) and below every other child.
     if !host.is_child_visible()
         || host.opacity() != 1.0
         || host.can_target()
         || grid.first_child().as_ref() != Some(&host)
-        || allocation.width() <= 0
-        || allocation.height() != 700
+        || allocation.width() <= 0.0
+        || allocation.height() != 700.0
     {
         return Err(format!(
             "prepared page: visible={} opacity={} first={} size={allocation:?}",
@@ -1185,7 +1185,7 @@ fn a_prepared_page_is_covered_with_the_grids_background_until_it_is_revealed() -
     tokens.bg = eitri_core::theme::color::Rgb { r: 64, g: 128, b: 191 };
     let cover = gtk4::gdk::RGBA::new(64.0 / 255.0, 128.0 / 255.0, 191.0 / 255.0, 1.0);
     grid.set_page_cover(&tokens);
-    pump(50);
+    pump();
     // Under its own cover, whether or not another host is drawn over its rectangle: a layout that shows only floats
     // leaves it under none.
     if !painted_over(&window, &grid, &host, &cover) {
@@ -1207,14 +1207,17 @@ fn the_swap_is_one_allocation_pass() -> Result<(), String> {
     layout.borrow_mut().set_away(&module, false).unwrap();
     grid.map_prepared(&module, true);
     grid.size_allocate(&gtk4::Allocation::new(0, 0, 1000, 800), -1);
+    let allocation = host
+        .compute_bounds(&grid)
+        .ok_or("mapped host has no bounds in the grid")?;
     if host.opacity() != 1.0
         || !host.can_target()
-        || host.allocation().x() <= 0
+        || allocation.x() <= 0.0
         || host.parent().as_ref() != Some(grid.upcast_ref())
     {
         return Err(format!(
             "the first committed allocation did not reveal the page: {:?}",
-            host.allocation()
+            allocation
         ));
     }
     window.close();
@@ -1363,9 +1366,9 @@ fn the_screen_is_driven_by_the_mouse_alone() -> Result<(), String> {
         screen.on_button(move |key| clicked.borrow_mut().push(key));
     }
     window.present();
-    pump(200);
+    pump();
     screen.show(Some(&long_view()));
-    pump(100);
+    pump();
     let all = descendants(screen.widget());
     let result = (|| {
         let both = all
@@ -1394,7 +1397,7 @@ fn the_screen_is_driven_by_the_mouse_alone() -> Result<(), String> {
         for button in &buttons {
             button.emit_clicked();
         }
-        pump(100);
+        pump();
         let got = clicked.borrow().clone();
         let want = [ViewKey::Char('1'), ViewKey::Char('p'), ViewKey::Enter, ViewKey::Esc];
         if got != want {
@@ -1403,7 +1406,7 @@ fn the_screen_is_driven_by_the_mouse_alone() -> Result<(), String> {
         Ok(())
     })();
     window.destroy();
-    pump(50);
+    pump();
     result
 }
 
@@ -1419,9 +1422,9 @@ fn the_screen_asks_for_no_width_of_its_own() -> Result<(), String> {
     overlay.add_overlay(screen.widget());
     window.set_child(Some(&overlay));
     window.present();
-    pump(200);
+    pump();
     screen.show(Some(&long_view()));
-    pump(300);
+    pump();
     let (min, _, _, _) = screen.widget().measure(gtk4::Orientation::Horizontal, -1);
     let result = if window.width() != 300 || window.height() != 200 {
         Err(format!(
@@ -1440,7 +1443,7 @@ fn the_screen_asks_for_no_width_of_its_own() -> Result<(), String> {
         Ok(())
     };
     window.destroy();
-    pump(50);
+    pump();
     result
 }
 
@@ -1495,10 +1498,10 @@ fn a_short_window_scrolls_to_the_choice_and_by_the_keys() -> Result<(), String> 
     overlay.add_overlay(screen.widget());
     window.set_child(Some(&overlay));
     window.present();
-    pump(200);
+    pump();
     let check = || -> Result<(), String> {
         screen.show(Some(&tall_view(4, 4)));
-        pump(300);
+        pump();
         let adjustment = screen_scroller(&screen)?.vadjustment();
         if adjustment.upper() <= adjustment.page_size() {
             return Err(format!(
@@ -1515,14 +1518,14 @@ fn a_short_window_scrolls_to_the_choice_and_by_the_keys() -> Result<(), String> 
             ));
         }
         screen.scroll(Scroll::PageUp);
-        pump(100);
+        pump();
         let scrolled = adjustment.value();
         if scrolled >= bottom {
             return Err("PageUp did not move the text".into());
         }
         // A detection row came in: the same page, the same choice.
         screen.show(Some(&tall_view(4, 4)));
-        pump(200);
+        pump();
         if (adjustment.value() - scrolled).abs() > 1.0 {
             return Err(format!(
                 "a row filling in moved the text from {scrolled} to {}",
@@ -1530,15 +1533,15 @@ fn a_short_window_scrolls_to_the_choice_and_by_the_keys() -> Result<(), String> 
             ));
         }
         screen.show(Some(&tall_view(4, 3)));
-        pump(200);
+        pump();
         let moved = adjustment.value();
         screen.scroll(Scroll::LineUp);
-        pump(100);
+        pump();
         if adjustment.value() >= moved {
             return Err(format!("LineUp did not move the text from {moved}"));
         }
         screen.scroll(Scroll::LineDown);
-        pump(100);
+        pump();
         if (adjustment.value() - moved).abs() > 1.0 {
             return Err(format!("LineDown did not bring it back to {moved}"));
         }
@@ -1549,7 +1552,7 @@ fn a_short_window_scrolls_to_the_choice_and_by_the_keys() -> Result<(), String> 
         review.rows.clear();
         review.body = (0..40).map(|line| format!("line {line}")).collect();
         screen.show(Some(&review));
-        pump(200);
+        pump();
         if adjustment.value() != 0.0 {
             return Err(format!("a new page starts at {}", adjustment.value()));
         }
@@ -1560,7 +1563,7 @@ fn a_short_window_scrolls_to_the_choice_and_by_the_keys() -> Result<(), String> 
         for _ in 0..100 {
             screen.scroll(Scroll::PageDown);
         }
-        pump(100);
+        pump();
         if (adjustment.value() - lines_below).abs() > 1.0 {
             return Err(format!(
                 "the keys stop at {} of the {lines_below} the last line needs",
@@ -1571,7 +1574,7 @@ fn a_short_window_scrolls_to_the_choice_and_by_the_keys() -> Result<(), String> 
     };
     let result = check();
     window.destroy();
-    pump(50);
+    pump();
     result
 }
 
@@ -1588,7 +1591,7 @@ fn a_row_filling_in_keeps_the_presets_in_view() -> Result<(), String> {
     overlay.add_overlay(screen.widget());
     window.set_child(Some(&overlay));
     window.present();
-    pump(200);
+    pump();
     // The question and the last preset's button, as the scroller shows them.
     let seen = |screen: &gtk_host::onboarding::OnboardingScreen| -> Result<(f32, f32, f32), String> {
         let scroller = screen_scroller(screen)?;
@@ -1608,9 +1611,9 @@ fn a_row_filling_in_keeps_the_presets_in_view() -> Result<(), String> {
     };
     let check = || -> Result<(), String> {
         screen.show(Some(&rows_view(3, 5, 5)));
-        pump(300);
+        pump();
         screen.show(Some(&rows_view(14, 5, 5)));
-        pump(400);
+        pump();
         let adjustment = screen_scroller(&screen)?.vadjustment();
         if adjustment.upper() <= adjustment.page_size() {
             return Err("the rows fit, so nothing here tests the presets being pushed down".into());
@@ -1626,7 +1629,7 @@ fn a_row_filling_in_keeps_the_presets_in_view() -> Result<(), String> {
         let at_presets = adjustment.value();
         screen.show(Some(&rows_view(15, 5, 5)));
         screen.scroll(Scroll::PageUp);
-        pump(400);
+        pump();
         if adjustment.value() >= at_presets - 2.0 {
             return Err(format!(
                 "a PageUp before the layout was undone: the text stands at {} again, as it did at the presets ({at_presets})",
@@ -1634,10 +1637,10 @@ fn a_row_filling_in_keeps_the_presets_in_view() -> Result<(), String> {
             ));
         }
         screen.scroll(Scroll::PageUp);
-        pump(100);
+        pump();
         let chosen = adjustment.value();
         screen.show(Some(&rows_view(15, 5, 5)));
-        pump(300);
+        pump();
         if (adjustment.value() - chosen).abs() > 1.0 {
             return Err(format!(
                 "a row filling in moved the text from {chosen} to {} after a scroll key",
@@ -1648,7 +1651,7 @@ fn a_row_filling_in_keeps_the_presets_in_view() -> Result<(), String> {
     };
     let result = check();
     window.destroy();
-    pump(50);
+    pump();
     result
 }
 
@@ -1663,9 +1666,9 @@ fn a_body_line_wraps_and_is_never_cut() -> Result<(), String> {
     overlay.add_overlay(screen.widget());
     window.set_child(Some(&overlay));
     window.present();
-    pump(200);
+    pump();
     screen.show(Some(&long_view()));
-    pump(200);
+    pump();
     let body: Vec<gtk4::Label> = descendants(screen.widget())
         .into_iter()
         .filter(|widget| widget.has_css_class("onboarding-body"))
@@ -1684,7 +1687,7 @@ fn a_body_line_wraps_and_is_never_cut() -> Result<(), String> {
         Ok(())
     };
     window.destroy();
-    pump(50);
+    pump();
     result
 }
 
@@ -1720,7 +1723,7 @@ fn the_focus_op_before_the_chrome_op_still_grabs(f: &Fixture) -> Result<(), Stri
     if s.host.apply(&HostOp::Chrome { win: f.win, rev: 2 }) != Applied::Done {
         return Err("the Chrome op that fills the screen was refused".into());
     }
-    pump(100);
+    pump();
     if !s.screen.widget().is_mapped() {
         return Err("the screen is not shown after the Chrome op".into());
     }
@@ -1742,9 +1745,9 @@ fn the_screen_takes_the_keys_with_no_input_context() -> Result<(), String> {
     overlay.add_overlay(screen.widget());
     window.set_child(Some(&overlay));
     window.present();
-    pump(200);
+    pump();
     screen.show(Some(&long_view()));
-    pump(100);
+    pump();
     let result = if !screen.grab_keys() {
         Err("grab_keys was refused".to_string())
     } else {
@@ -1754,7 +1757,7 @@ fn the_screen_takes_the_keys_with_no_input_context() -> Result<(), String> {
         }
     };
     window.destroy();
-    pump(50);
+    pump();
     result
 }
 

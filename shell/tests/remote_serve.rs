@@ -1052,8 +1052,8 @@ fn push_server() -> (std::net::SocketAddr, mpsc::Receiver<Vec<u8>>) {
                         break;
                     }
                 }
-                let _ = stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n");
                 let _ = tx.send(seen);
+                let _ = stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n");
             });
         }
     });
@@ -1105,7 +1105,21 @@ fn needs_you_reaches_the_endpoint_end_to_end(shell: &str, dir: &Path) -> Result<
         return Err(format!("the endpoint got {text:?}"));
     }
     wait_for_record(&home, "the push", |r| r["event"] == "push")?;
-    if let Ok(more) = posts.recv_timeout(Duration::from_millis(1500)) {
+    let turns = || {
+        std::fs::read_to_string(home.audit().join("notifier-turn-for-tests"))
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(0)
+    };
+    let target_turn = turns() + 20;
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while turns() < target_turn {
+        if Instant::now() >= deadline {
+            return Err("the notifier did not complete twenty idle turns".into());
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    for more in posts.try_iter() {
         return Err(format!("a second wake: {}", String::from_utf8_lossy(&more)));
     }
     let records = audit_records(&home);

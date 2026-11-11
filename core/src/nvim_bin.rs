@@ -368,6 +368,16 @@ const VERSION_PROBE_MAX_OUTPUT_BYTES: u64 = 4096;
 /// site) safe even if a probe from an earlier `resolve()` call is still outstanding: nothing here
 /// ever calls `getenv`/`setenv` concurrently with it.
 fn version_of_binary(path: &Path) -> Option<(u64, u64, u64)> {
+    version_of_binary_with_wait(path, |rx, _child| rx.recv_timeout(VERSION_PROBE_TIMEOUT))
+}
+
+fn version_of_binary_with_wait(
+    path: &Path,
+    wait: impl FnOnce(
+        std::sync::mpsc::Receiver<Vec<u8>>,
+        &mut std::process::Child,
+    ) -> Result<Vec<u8>, std::sync::mpsc::RecvTimeoutError>,
+) -> Option<(u64, u64, u64)> {
     let mut child = std::process::Command::new(path)
         .arg("--version")
         .stdin(std::process::Stdio::null())
@@ -385,7 +395,7 @@ fn version_of_binary(path: &Path) -> Option<(u64, u64, u64)> {
         let _ = tx.send(buf);
     });
 
-    let Ok(stdout_bytes) = rx.recv_timeout(VERSION_PROBE_TIMEOUT) else {
+    let Ok(stdout_bytes) = wait(rx, &mut child) else {
         let _ = child.kill();
         let _ = child.wait();
         return None;
@@ -933,11 +943,34 @@ mod tests {
     }
 
     #[test]
+    fn the_default_version_wait_accepts_output_released_after_the_probe_starts() {
+        let scratch = crate::test_scratch_dir::ScratchDir::new("nvim-version", "default-wait");
+        let script = scratch.join("nvim");
+        let ready = scratch.join("ready");
+        let release = scratch.join("release");
+        write_executable_script(&script, &format!(
+            "#!/bin/sh\ntouch '{}'; i=0; while [ ! -e '{}' ] && [ $i -lt 3000 ]; do i=$((i+1)); sleep 0.02; done\necho 'NVIM v0.11.4'\n",
+            ready.display(), release.display()));
+        let (answer, outcome) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let _ = answer.send(version_of_binary(&script));
+        });
+        let until = std::time::Instant::now() + Duration::from_secs(60);
+        while !ready.exists() {
+            if let Ok(answer) = outcome.try_recv() {
+                panic!("the default wait returned before the probe could answer: {answer:?}");
+            }
+            assert!(std::time::Instant::now() < until, "the probe never started");
+            std::thread::yield_now();
+        }
+        std::fs::write(release, b"").unwrap();
+        assert_eq!(outcome.recv_timeout(Duration::from_secs(60)).unwrap(), Some((0, 11, 4)));
+        worker.join().unwrap();
+    }
+
+    #[test]
     fn version_of_binary_caps_output_and_kills_a_binary_that_never_stops_printing() {
-        // An uncapped `Command::output()` lets a PATH `nvim` that never stops printing grow the
-        // buffer without bound. The capped reader must finish and reap the child well inside
-        // `VERSION_PROBE_TIMEOUT`, proving the byte cap bounds an endless printer, not just the
-        // timeout meant for a child that prints nothing.
+        // The reader must finish at the byte cap while the printer is still alive.
         let scratch = std::env::temp_dir().join(format!(
             "nvim-bin-test-version-infinite-{}-{}",
             std::process::id(),
@@ -946,18 +979,20 @@ mod tests {
         let _ = std::fs::remove_dir_all(&scratch);
         std::fs::create_dir_all(&scratch).unwrap();
         let script = scratch.join("nvim");
-        write_executable_script(&script, "#!/bin/sh\nwhile true; do printf '%01024d' 0; done\n");
-
-        let start = std::time::Instant::now();
-        let result = version_of_binary(&script);
-        let elapsed = start.elapsed();
-
-        assert_eq!(result, None);
-        assert!(
-            elapsed < VERSION_PROBE_TIMEOUT,
-            "an unbounded printer took {elapsed:?}, at or past the {VERSION_PROBE_TIMEOUT:?} timeout \
-             meant for the separate no-output case"
+        write_executable_script(
+            &script,
+            "#!/bin/sh\ntrap '' PIPE\nwhile true; do printf '%01024d' 0; done\n",
         );
+
+        let result = version_of_binary_with_wait(&script, |rx, child| {
+            let bytes = rx
+                .recv_timeout(Duration::from_secs(60))
+                .expect("the capped reader finishes");
+            assert_eq!(bytes.len(), VERSION_PROBE_MAX_OUTPUT_BYTES as usize);
+            assert!(child.try_wait().unwrap().is_none(), "the endless printer still runs");
+            Ok(bytes)
+        });
+        assert_eq!(result, None);
 
         let _ = std::fs::remove_dir_all(&scratch);
     }
@@ -971,16 +1006,21 @@ mod tests {
         let script = scratch.join("nvim");
         write_executable_script(&script, "#!/bin/sh\nwhile true; do sleep 1; done\n");
 
-        let start = std::time::Instant::now();
-        let result = version_of_binary(&script);
-        let elapsed = start.elapsed();
-
+        let mut pid = None;
+        let result = version_of_binary_with_wait(&script, |rx, child| {
+            assert!(rx.try_recv().is_err(), "no stdout was available");
+            assert!(child.try_wait().unwrap().is_none());
+            pid = Some(child.id());
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+        });
         assert_eq!(result, None);
-        assert!(elapsed >= VERSION_PROBE_TIMEOUT, "returned after only {elapsed:?}");
-        assert!(
-            elapsed < VERSION_PROBE_TIMEOUT + Duration::from_secs(2),
-            "took {elapsed:?} past the timeout -- the child was not reaped promptly"
+        let mut status = 0;
+        // SAFETY: this is the probe's child; a reaped child has no waitable status left.
+        assert_eq!(
+            unsafe { libc::waitpid(pid.unwrap() as i32, &mut status, libc::WNOHANG) },
+            -1
         );
+        assert_eq!(std::io::Error::last_os_error().raw_os_error(), Some(libc::ECHILD));
 
         let _ = std::fs::remove_dir_all(&scratch);
     }

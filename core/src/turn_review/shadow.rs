@@ -1855,6 +1855,16 @@ impl Shadow {
     }
 }
 
+#[cfg(any(test, feature = "test-support"))]
+thread_local! {
+    static LOCK_WAIT_OBSERVER: std::cell::RefCell<Option<(Box<dyn FnOnce()>, Box<dyn FnOnce()>)>> = const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(any(test, feature = "test-support"))]
+pub fn observe_lock_wait_for_tests(waiting: impl FnOnce() + 'static, acquired: impl FnOnce() + 'static) {
+    LOCK_WAIT_OBSERVER.with(|slot| *slot.borrow_mut() = Some((Box::new(waiting), Box::new(acquired))));
+}
+
 /// Takes an `flock` (`operation`) on `path`, creating it 0600. With a `deadline` it polls and gives
 /// up with [`ShadowError::TimedOut`] there; without one it waits as long as it takes.
 pub(crate) fn flock_file(
@@ -1877,6 +1887,23 @@ pub(crate) fn flock_file(
     // file, which another window's probe (it opens the file for writing) could not open, and every
     // revert would be refused.
     file.set_permissions(std::fs::Permissions::from_mode(agent::private_fs::PRIVATE_FILE_MODE))?;
+    #[cfg(any(test, feature = "test-support"))]
+    let mut acquired_observer = None;
+    #[cfg(any(test, feature = "test-support"))]
+    if deadline.is_none() && LOCK_WAIT_OBSERVER.with(|slot| slot.borrow().is_some()) {
+        // SAFETY: the open file owns the descriptor, and the nonblocking attempt changes no other lock.
+        if unsafe { libc::flock(file.as_raw_fd(), operation | libc::LOCK_NB) } == 0 {
+            return Ok(ShadowLock { file });
+        }
+        let error = std::io::Error::last_os_error();
+        if error.raw_os_error() != Some(libc::EWOULDBLOCK) {
+            return Err(error.into());
+        }
+        if let Some((waiting, acquired)) = LOCK_WAIT_OBSERVER.with(|slot| slot.borrow_mut().take()) {
+            waiting();
+            acquired_observer = Some(acquired);
+        }
+    }
     let flags = if deadline.is_some() {
         operation | libc::LOCK_NB
     } else {
@@ -1885,6 +1912,10 @@ pub(crate) fn flock_file(
     loop {
         // SAFETY: the descriptor is `file`'s own and open for the call; `flock` takes no pointers.
         if unsafe { libc::flock(file.as_raw_fd(), flags) } == 0 {
+            #[cfg(any(test, feature = "test-support"))]
+            if let Some(acquired) = acquired_observer.take() {
+                acquired();
+            }
             return Ok(ShadowLock { file });
         }
         let err = std::io::Error::last_os_error();

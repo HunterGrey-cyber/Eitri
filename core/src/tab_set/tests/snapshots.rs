@@ -271,6 +271,7 @@ fn a_turn_end_a_switch_snapshot_carried_still_flushes_the_queue() {
 /// started -- never the start of the turn before it, which the panel would take as exact.
 #[test]
 fn a_snapshot_names_the_start_of_the_turn_it_carries_even_before_a_tick_saw_it() {
+    let clock = TestWallClock::new();
     let dir = workspace("tabs-p1a2-turn-clock");
     let mut set = set();
     let tab = set.active();
@@ -279,7 +280,7 @@ fn a_snapshot_names_the_start_of_the_turn_it_carries_even_before_a_tick_saw_it()
     provider.queue(started("t1"));
     pump_until_running(&mut set, &dir, tab, true);
     let first = set.get(tab).unwrap().turn_started_at_ms().expect("t1 stamped");
-    std::thread::sleep(Duration::from_millis(20));
+    clock.advance(20);
 
     provider.queue(completed("t1", agent::TurnOutcome::Completed));
     provider.queue(started("t2"));
@@ -369,6 +370,7 @@ fn a_fold_between_a_resyncs_drain_and_its_snapshot_read_is_never_delivered_again
 /// cannot reach: right before this arm's own snapshot read.
 #[test]
 fn a_resyncs_snapshot_names_the_start_of_the_turn_it_carries_even_when_the_race_ends_it_first() {
+    let clock = TestWallClock::new();
     let dir = workspace("tabs-p1a2-round4-resync-clock");
     let mut set = set();
     let tab = set.active();
@@ -378,7 +380,7 @@ fn a_resyncs_snapshot_names_the_start_of_the_turn_it_carries_even_when_the_race_
     provider.queue(started("t1"));
     pump_until_running(&mut set, &dir, tab, true);
     let first = set.get(tab).unwrap().turn_started_at_ms().expect("t1 stamped");
-    std::thread::sleep(Duration::from_millis(20));
+    clock.advance(20);
 
     // Overflows the queue so this tick's drain is a `Resync`, with nothing draining it meanwhile.
     let base = set.get(tab).unwrap().live().unwrap().projection().last_revision;

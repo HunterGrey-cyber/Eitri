@@ -321,11 +321,18 @@ mod tests {
         let clients: Vec<_> = (0..4)
             .map(|_| UnixStream::connect(feed.socket_path()).unwrap())
             .collect();
-        let before = Instant::now();
         assert!(reader.poll().is_none());
-        let elapsed = before.elapsed();
-        eprintln!("theme-feed poll with four silent clients: {elapsed:?}");
-        assert!(elapsed < Duration::from_millis(200), "poll blocked for {elapsed:?}");
+        use std::os::fd::AsRawFd;
+        let pending: Vec<_> = reader.0.pending_streams().collect();
+        assert_eq!(pending.len(), 4, "every silent peer remains pending");
+        for stream in pending {
+            // SAFETY: the borrowed stream owns a live descriptor.
+            let flags = unsafe { libc::fcntl(stream.as_raw_fd(), libc::F_GETFL) };
+            assert!(
+                flags >= 0 && flags & libc::O_NONBLOCK != 0,
+                "a silent peer could block a poll"
+            );
+        }
         drop(clients);
         feed.cleanup();
     }
@@ -464,22 +471,23 @@ mod tests {
     #[test]
     #[ignore = "spawns a real nvim; run with: cargo test -p eitri-core theme::feed -- --ignored"]
     fn a_busy_nvim_main_loop_does_not_lose_a_payload() {
-        // A user's VimEnter handler can keep nvim busy after ours, registered first by `--cmd`.
-        // The synchronous send must finish before that handler's 400ms sleep; an asynchronous write
-        // could lose the payload. `NewestLineReader` may collapse ColorScheme and VimEnter sends
-        // before the first poll, dropping the older payload. Both carry the same colors, so this
-        // asserts delivery despite the busy loop rather than counting arrivals.
+        // The later VimEnter handler holds the loop; only a synchronous send can precede it.
         let mut feed = ThemeFeed::new().expect("feed");
         let mut reader = reader_for(&mut feed);
+        let held = feed.dir.join("held");
+        let fifo = feed.dir.join("release");
+        let path = std::ffi::CString::new(fifo.to_str().unwrap()).unwrap();
+        // SAFETY: the path is NUL-terminated and remains live for the call.
+        assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
+        let handler = format!(
+            "autocmd VimEnter * lua vim.fn.writefile({{'held'}}, '{}'); vim.fn.readfile('{}')",
+            held.display(),
+            fifo.display()
+        );
         let mut child = std::process::Command::new("nvim")
             .args(["--headless", "--clean"])
             .args(feed.nvim_args())
-            .args([
-                "-c",
-                "autocmd VimEnter * lua vim.uv.sleep(400)",
-                "-c",
-                "colorscheme retrobox",
-            ])
+            .args(["-c", &handler, "-c", "colorscheme retrobox"])
             .envs(feed.child_env())
             .stdin(Stdio::null())
             .stdout(Stdio::null())
@@ -487,7 +495,11 @@ mod tests {
             .spawn()
             .expect("nvim on PATH");
 
-        let deadline = Instant::now() + Duration::from_secs(10);
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while !held.exists() {
+            assert!(Instant::now() < deadline, "nvim never entered the later handler");
+            std::thread::yield_now();
+        }
         let mut seen = None;
         // Polled at POLL_INTERVAL, exactly as `EditorFeeds` polls it from the host's timer.
         while Instant::now() < deadline && seen.is_none() {
@@ -594,49 +606,46 @@ mod tests {
     /// (connections at 0.01/3.01/6.01/9.01s, one distinct payload), so no new connection may arrive
     /// after startup when the theme stays unchanged.
     #[test]
-    #[ignore = "spawns a real nvim, and waits past two resnapshot intervals; run with: cargo test -p eitri-core theme::feed -- --ignored"]
+    #[ignore = "spawns a real nvim; run with: cargo test -p eitri-core theme::feed -- --ignored"]
     fn an_unchanged_theme_is_not_resent_by_the_periodic_resnapshot() {
         let mut feed = ThemeFeed::new().expect("feed");
         let listener = feed.take_listener().expect("listener");
-        let mut child = std::process::Command::new("nvim")
-            .args(["--headless", "--clean"])
-            .args(feed.nvim_args())
-            .args(["-c", "colorscheme retrobox"])
-            .envs(feed.child_env())
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .expect("nvim on PATH");
-
-        let started = Instant::now();
-        let mut arrivals = Vec::new();
-        while started.elapsed() < Duration::from_millis(7_500) {
-            match listener.accept() {
-                Ok((mut stream, _)) => {
-                    let _ = stream.set_nonblocking(false);
-                    let _ = stream.set_read_timeout(Some(Duration::from_secs(1)));
-                    let mut line = String::new();
-                    let _ = std::io::Read::read_to_string(&mut stream, &mut line);
-                    arrivals.push((started.elapsed(), line));
-                }
-                Err(_) => std::thread::sleep(Duration::from_millis(10)),
-            }
-        }
-        let _ = child.kill();
-        let _ = child.wait();
-        feed.cleanup();
-
-        assert!(!arrivals.is_empty(), "nvim never sent its startup payload");
-        let late: Vec<_> = arrivals
-            .iter()
-            .filter(|(at, _)| *at > Duration::from_millis(2_000))
-            .map(|(at, _)| *at)
-            .collect();
-        assert!(
-            late.is_empty(),
-            "an unchanged theme was re-sent at {late:?} ({} connections in all)",
-            arrivals.len()
+        let mut nvim = super::embed_client::Embed::start(&feed.dir, &[], &[]);
+        nvim.manual_timers();
+        nvim.lua(
+            "local src, opts = ...; _G.theme_teardown = assert(loadstring(src))(opts)",
+            vec![
+                NVIM_THEME_LUA.into(),
+                rmpv::Value::Map(vec![("socket".into(), feed.socket_path().to_str().unwrap().into())]),
+            ],
         );
+        nvim.command("colorscheme retrobox");
+        nvim.flush_scheduled();
+        let drain = || {
+            let mut arrivals = Vec::new();
+            while let Ok((mut stream, _)) = listener.accept() {
+                stream.set_nonblocking(false).unwrap();
+                stream.set_read_timeout(Some(Duration::from_secs(60))).unwrap();
+                let mut text = String::new();
+                std::io::Read::read_to_string(&mut stream, &mut text).unwrap();
+                arrivals.push(text);
+            }
+            arrivals
+        };
+        let initial = drain();
+        assert!(!initial.is_empty(), "nvim never sent its startup payload");
+        for _ in 0..3 {
+            nvim.advance_timers(3000);
+            assert!(
+                drain().is_empty(),
+                "an unchanged periodic snapshot sent another payload"
+            );
+        }
+        nvim.quit();
+        feed.cleanup();
     }
 }
+
+#[cfg(test)]
+#[path = "../../tests/support/embed_client.rs"]
+mod embed_client;

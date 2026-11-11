@@ -823,12 +823,12 @@ mod tests {
     fn wildcard_matching_takes_linear_time_on_a_pathological_pattern() {
         let pattern = format!("{}z", "*".repeat(32));
         let name = "a".repeat(64);
-        let started = std::time::Instant::now();
-        assert!(!super::super::fnmatch(&pattern, &name));
+        let mut work = 4 * (pattern.len() + name.len());
+        let allowance = work;
+        assert_eq!(super::super::fnmatch_within(&pattern, &name, &mut work), Some(false));
         assert!(
-            started.elapsed() < std::time::Duration::from_secs(1),
-            "{:?}",
-            started.elapsed()
+            work > 0 && work < allowance,
+            "matching consumes a bounded number of steps"
         );
         assert!(super::super::fnmatch("a*b*c*", "aXbYc"));
         assert!(super::super::fnmatch("**x", "abx"));

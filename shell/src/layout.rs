@@ -13,11 +13,8 @@
 //! ratio, the first show giving it `BELOW_ROOT_SHARE`'s third (`show_puts_a_module_back_where_it_was`,
 //! `the_terminal_hides_and_shows_as_ctrl_a_t_did_on_main`).
 
+#[cfg(any(test, doc))]
 pub(crate) use eitri_core::layout::Direction;
-
-/// A cell's size, in logical px, when the editor cannot say (not ready yet, or hidden since
-/// before nvim started).
-pub(crate) const FALLBACK_CELL: (f64, f64) = (8.0, 16.0);
 
 /// The bottom terminal's minimum height, and a Lua `bottom` panel's: `build_vertical_split`'s
 /// `MIN_TERMINAL_HEIGHT`, kept for the reason that function gave -- a terminal dragged to zero
@@ -27,6 +24,7 @@ pub(crate) const BOTTOM_MIN_HEIGHT: i32 = 80;
 
 /// One resize step in pixels: `cells` editor cells, across for left/right, down for up/down. The
 /// sign is the geometry's (`eitri_core::layout::resize`).
+#[cfg(test)]
 pub(crate) fn resize_px(direction: Direction, cell: (f64, f64), cells: u16) -> i32 {
     let along = match direction {
         Direction::Left | Direction::Right => cell.0,

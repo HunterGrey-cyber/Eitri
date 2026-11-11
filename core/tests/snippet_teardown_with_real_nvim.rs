@@ -87,7 +87,20 @@ impl Lines {
 fn started(scratch: &Scratch) -> Embed {
     let mut nvim = Embed::start(scratch.path(), &[], &[]);
     nvim.wait_until("VimEnter", |n| n.eval("v:vim_did_enter").as_i64() == Some(1));
+    nvim.manual_timers();
+    nvim.lua("test_send_attempts = 0; local pipe, connect = vim.uv.new_pipe, vim.fn.sockconnect; vim.uv.new_pipe = function(...) test_send_attempts = test_send_attempts + 1; return pipe(...) end; vim.fn.sockconnect = function(...) test_send_attempts = test_send_attempts + 1; return connect(...) end", vec![]);
     nvim
+}
+
+fn attempts(nvim: &mut Embed) -> i64 {
+    nvim.lua("return test_send_attempts", vec![]).as_i64().unwrap()
+}
+
+fn no_more_sends(nvim: &mut Embed, before: i64) {
+    for _ in 0..3 {
+        nvim.advance_timers(3000);
+        assert_eq!(attempts(nvim), before, "a torn-down snippet tried to send");
+    }
 }
 
 #[test]
@@ -99,10 +112,8 @@ fn injected_theme_sends_at_once_after_vimenter_and_tears_down() {
     let baseline = nvim.footprint(&["EitriThemeFeed"]);
 
     nvim.inject(THEME_LUA, opts_map(&[("socket", lines.socket())]));
-    // The resnapshot tick is 3 s; a line inside 1 s is the immediate one.
-    let first = lines
-        .next(Duration::from_secs(1))
-        .expect("a snapshot within 1 s of the injection");
+    // The periodic timer has not advanced, so only the injection can send this line.
+    let first = lines.next(Duration::from_secs(60)).expect("the injection snapshot");
     assert!(first.contains("\"groups\""), "{first}");
     let running = nvim.footprint(&["EitriThemeFeed"]);
     assert!(running.autocmds > 0, "{running:?}");
@@ -111,19 +122,18 @@ fn injected_theme_sends_at_once_after_vimenter_and_tears_down() {
     // Control: a live feed does send on a colorscheme change.
     nvim.command("colorscheme desert");
     assert!(
-        lines.next(Duration::from_secs(1)).is_some(),
+        lines.next(Duration::from_secs(60)).is_some(),
         "the live feed ignored :colorscheme"
     );
 
-    // One :colorscheme fires both ColorScheme and OptionSet; let every line it caused arrive.
-    while lines.next(Duration::from_millis(400)).is_some() {}
+    let sent = attempts(&mut nvim);
 
     nvim.teardown();
     let after = nvim.footprint(&["EitriThemeFeed"]);
     assert_eq!(after.autocmds, 0, "{after:?}");
     assert_eq!(after.active_timers, baseline.active_timers, "{after:?}");
     nvim.command("colorscheme blue");
-    assert_eq!(lines.next(Duration::from_secs(1)), None, "a torn-down feed sent");
+    no_more_sends(&mut nvim, sent);
     nvim.quit();
 }
 
@@ -135,20 +145,21 @@ fn injected_keys_report_at_once_and_teardown_removes_the_watcher() {
     let mut nvim = started(&scratch);
 
     nvim.inject(KEYS_LUA, opts_map(&[("socket", lines.socket())]));
-    let first = lines
-        .next(Duration::from_secs(1))
-        .expect("a report within 1 s of the injection");
+    nvim.advance_timers(100);
+    let first = lines.next(Duration::from_secs(60)).expect("the first debounced report");
     assert!(first.contains("\"maps\""), "{first}");
     assert_eq!(nvim.eval("exists('*EitriKeysLeaderChanged')").as_i64(), Some(1));
     assert!(nvim.footprint(&["eitri_keys"]).autocmds > 0);
 
     // Control: a live watcher reports a leader change.
     nvim.command("let g:mapleader = ';'");
+    nvim.advance_timers(100);
     assert!(
-        lines.next(Duration::from_secs(1)).is_some(),
+        lines.next(Duration::from_secs(60)).is_some(),
         "the live watcher ignored mapleader"
     );
 
+    let sent = attempts(&mut nvim);
     nvim.teardown();
     assert_eq!(nvim.eval("exists('*EitriKeysLeaderChanged')").as_i64(), Some(0));
     assert_eq!(
@@ -160,7 +171,7 @@ fn injected_keys_report_at_once_and_teardown_removes_the_watcher() {
         Value::from(true)
     );
     nvim.command("let g:mapleader = ','");
-    assert_eq!(lines.next(Duration::from_secs(1)), None, "a torn-down watcher sent");
+    no_more_sends(&mut nvim, sent);
     assert_eq!(nvim.footprint(&["eitri_keys"]).autocmds, 0);
     nvim.quit();
 }
@@ -175,20 +186,19 @@ fn a_teardown_during_the_keys_debounce_sends_nothing() {
     let mut nvim = started(&scratch);
 
     nvim.inject(KEYS_LUA, opts_map(&[("socket", lines.socket())]));
-    lines.next(Duration::from_secs(1)).expect("the first report");
+    nvim.advance_timers(100);
+    lines.next(Duration::from_secs(60)).expect("the first report");
 
     // Control: a changed option plus a sourced file schedule a report that does arrive.
     let change = format!("vim.o.timeoutlen = %d vim.cmd('source {}')", empty.display());
     nvim.lua(&change.replace("%d", "1234"), vec![]);
-    lines.next(Duration::from_secs(1)).expect("the control report");
+    nvim.advance_timers(100);
+    lines.next(Duration::from_secs(60)).expect("the control report");
 
-    // The same change, then the teardown in the same request, well inside the 100 ms debounce.
+    let sent = attempts(&mut nvim);
+    // The timer stays paused between this change and its teardown.
     nvim.lua(&format!("{} _G.__test_td()", change.replace("%d", "1235")), vec![]);
-    assert_eq!(
-        lines.next(Duration::from_millis(500)),
-        None,
-        "a report went out after the teardown"
-    );
+    no_more_sends(&mut nvim, sent);
     nvim.quit();
 }
 

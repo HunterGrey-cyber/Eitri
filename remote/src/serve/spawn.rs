@@ -214,7 +214,6 @@ mod tests {
     use super::*;
     use eitri_core::lua::config::RemoteListen;
     use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
-    use std::os::unix::fs::PermissionsExt;
     use std::time::{Duration, Instant};
 
     fn scratch(name: &str) -> PathBuf {
@@ -283,8 +282,7 @@ mod tests {
         ] {
             let exe = dir.join("serve-stand-in");
             let _ = std::fs::remove_file(&exe);
-            std::fs::write(&exe, format!("#!/bin/sh\n{body}\n")).unwrap();
-            std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o700)).unwrap();
+            script_fixture::write_executable_script(&exe, format!("#!/bin/sh\n{body}\n"), 0o700).unwrap();
             let (tx, rx) = std::sync::mpsc::channel();
             let tx = std::sync::Mutex::new(tx);
             ServeSpawner::new(exe)
@@ -338,15 +336,15 @@ mod tests {
         let dir = scratch("env-fds");
         let out = dir.join("out");
         let exe = dir.join("serve-stand-in");
-        std::fs::write(
+        script_fixture::write_executable_script(
             &exe,
             format!(
                 "#!/bin/sh\nenv > '{0}.tmp'\nls /proc/self/fd >> '{0}.tmp'\nmv '{0}.tmp' '{0}'\n",
                 out.display()
             ),
+            0o700,
         )
         .unwrap();
-        std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o700)).unwrap();
         // A descriptor this process holds without close-on-exec, as a library might leave one.
         let file = std::fs::File::open(&exe).unwrap();
         // SAFETY: `dup` takes a valid descriptor and returns a new one (or -1, checked), owned below.
@@ -394,4 +392,9 @@ mod tests {
         assert!(fds.iter().filter(|fd| **fd > 2).count() <= 1, "{fds:?}");
         drop(leaked);
     }
+}
+
+#[cfg(test)]
+mod script_fixture {
+    include!(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/support/executable.rs"));
 }

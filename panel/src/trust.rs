@@ -1374,8 +1374,7 @@ mod tests {
         assert_eq!(again.len(), 1, "{:?}", out.payloads());
         assert_eq!(again[0].fingerprint, second.fingerprint);
 
-        std::thread::sleep(std::time::Duration::from_millis(50));
-        trust_events(&mut state.borrow_mut());
+        tick_until(&state, |_| !state.borrow().trust.is_busy());
         assert!(!fx.record_file().exists());
         assert!(fx.spawned.borrow().is_empty());
         for tab in [a, b] {
@@ -1461,8 +1460,7 @@ mod tests {
         state.borrow_mut().tabs.select(b);
         let out = answer_prompt(&state, "x2", &prompt, true);
         assert!(matches!(result_for(&out.payloads(), "x2"), Some(Err(_))));
-        std::thread::sleep(std::time::Duration::from_millis(50));
-        trust_events(&mut state.borrow_mut());
+        tick_until(&state, |_| !state.borrow().trust.is_busy());
         assert!(fx.spawned.borrow().is_empty());
         assert!(!fx.record_file().exists());
     }

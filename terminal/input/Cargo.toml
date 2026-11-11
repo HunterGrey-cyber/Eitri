@@ -1,7 +1,7 @@
 [package]
 name = "terminal-input"
 version.workspace = true
-edition = "2021"
+edition = "2024"
 license = "Apache-2.0"
 # Derived from Alacritty (NOTICE), so it must retain Apache-2.0; packaging/collect-licenses.py
 # ships its LICENSE-APACHE and NOTICE with the package.

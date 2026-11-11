@@ -640,6 +640,8 @@ struct HyprState {
     form: Mutex<Option<HyprForm>>,
     reprobed: AtomicBool,
     failures: Mutex<HashMap<String, u64>>,
+    #[cfg(test)]
+    entering_form: Option<Arc<dyn Fn() + Send + Sync>>,
 }
 
 fn locked<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -698,6 +700,10 @@ impl Commands {
         // Held through the probe, so two first dispatches on two workers probe once. A worker waits here for as
         // long as the probe runs; no timeout wraps `hyprctl`, whose own 5 s receive timeout bounds a compositor
         // that does not answer.
+        #[cfg(test)]
+        if let Some(entering) = &self.hypr.entering_form {
+            entering();
+        }
         let mut form = locked(&self.hypr.form);
         *form.get_or_insert_with(|| self.probe(log))
     }
@@ -1506,15 +1512,25 @@ mod tests {
     fn two_first_dispatches_at_once_probe_once() {
         let probes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let count = probes.clone();
+        let (entered, entering) = std::sync::mpsc::channel();
+        let entering = Mutex::new(entering);
         let exec: Exec = Arc::new(move |argv: Vec<String>| {
             if argv == probe() {
                 count.fetch_add(1, Ordering::SeqCst);
-                // Long enough that the other worker reaches the form while this probe is running.
-                thread::sleep(Duration::from_millis(100));
+                for _ in 0..2 {
+                    entering
+                        .lock()
+                        .unwrap()
+                        .recv_timeout(Duration::from_secs(60))
+                        .expect("both workers reached form");
+                }
             }
             Ok("ok".to_string())
         });
-        let commands = Commands::new(Wm::Hyprland, exec);
+        let mut commands = Commands::new(Wm::Hyprland, exec);
+        Arc::get_mut(&mut commands.hypr).unwrap().entering_form = Some(Arc::new(move || {
+            entered.send(()).unwrap();
+        }));
         let start = Arc::new(std::sync::Barrier::new(2));
         let workers: Vec<_> = [Direction::Left, Direction::Right]
             .into_iter()

@@ -838,6 +838,8 @@ pub trait AgentProvider {
 pub struct EventSignal {
     raised: std::sync::Mutex<u64>,
     changed: std::sync::Condvar,
+    #[cfg(test)]
+    waiting: std::sync::atomic::AtomicBool,
 }
 
 impl EventSignal {
@@ -869,10 +871,20 @@ impl EventSignal {
     pub fn wait_past_unless(&self, seen: u64, done: impl Fn() -> bool) {
         let mut raised = self.raised.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         while *raised == seen && !done() {
+            #[cfg(test)]
+            self.waiting.store(true, std::sync::atomic::Ordering::SeqCst);
             raised = self
                 .changed
                 .wait(raised)
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
+            #[cfg(test)]
+            self.waiting.store(false, std::sync::atomic::Ordering::SeqCst);
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn blocked_for_tests(&self, seen: u64) -> bool {
+        let raised = self.raised.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        *raised == seen && self.waiting.load(std::sync::atomic::Ordering::SeqCst)
     }
 }

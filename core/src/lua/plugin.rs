@@ -12,7 +12,7 @@ use std::rc::Rc;
 use mlua::{Lua, Table, Value};
 
 use super::panel::PanelSlot;
-use crate::layout::rules::{At, OpenRule, RuleSize};
+use crate::layout::rules::{At, OpenRule};
 use crate::plugin::load::{check_window_roots, load_plugin_with, LoadedPlugin};
 use crate::plugin::manifest::{id_ok, ModuleStart, SettingValue};
 use crate::plugin::search::{classify, find_plugin, LoadArg, SearchEnv};
@@ -413,6 +413,7 @@ pub fn refuse_plugins(lua: &Lua, eitri: &Table) -> mlua::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::layout::rules::RuleSize;
     use crate::plugin::search::SearchEnv;
     use crate::plugin::test_support::{demo_plugin, Scratch};
     use std::ffi::OsString;

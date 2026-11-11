@@ -32,10 +32,16 @@ impl Rig {
 
     /// nvim as a window starts it, in `dir`, with `extra` after the window's own arguments.
     fn nvim(&self, dir: &str, extra: &[&str]) -> Child {
+        let _ = std::fs::remove_file(self.root.join("quit"));
+        let _ = std::fs::remove_file(self.root.join("started"));
         Command::new("nvim")
             .args(["--headless", "--clean", "--cmd", "set updatetime=50"])
             .args(self.channel.nvim_args())
             .args(extra)
+            .args([
+                "-c",
+                &format!("call writefile(['started'], '{}')", self.root.join("started").display()),
+            ])
             .current_dir(self.root.join(dir))
             .envs(self.channel.child_env())
             .env("XDG_STATE_HOME", self.root.join("state"))
@@ -59,11 +65,41 @@ impl Rig {
         seen
     }
 
-    /// What is left on the socket once `child` has gone.
+    fn quit_command(&self, verb: &str) -> String {
+        format!("autocmd VimEnter * ++nested lua assert(vim.wait(60000, function() return vim.fn.filereadable('{}') == 1 end, 1)); vim.cmd('{}')", self.root.join("quit").display(), verb)
+    }
+
+    /// A sentinel accepted after the child's exit puts every earlier connection before the final drain.
     fn after_exit(&mut self, child: &mut Child) -> Vec<PaneMessage> {
+        std::fs::write(self.root.join("quit"), b"").unwrap();
         child.wait().expect("nvim ends");
-        std::thread::sleep(Duration::from_millis(100));
-        self.reader.poll()
+        self.drained()
+    }
+
+    fn drained(&mut self) -> Vec<PaneMessage> {
+        use std::io::Write;
+        let marker = PaneMessage::QuitCancelled(u32::MAX);
+        let mut stream = std::os::unix::net::UnixStream::connect(self.channel.socket_path()).unwrap();
+        writeln!(stream, "Q {}", u32::MAX).unwrap();
+        drop(stream);
+        let mut seen = self.read_until(|seen| seen.contains(&marker));
+        assert!(seen.contains(&marker), "the reader never reached the drain sentinel");
+        let deadline = Instant::now() + DEADLINE;
+        while self.reader.holds_connections() {
+            assert!(Instant::now() < deadline, "earlier connections never finished");
+            seen.extend(self.reader.poll());
+            std::thread::yield_now();
+        }
+        seen.retain(|message| message != &marker);
+        seen
+    }
+
+    fn started(&self) {
+        let deadline = Instant::now() + DEADLINE;
+        while !self.root.join("started").exists() {
+            assert!(Instant::now() < deadline, "nvim never finished its startup commands");
+            std::thread::yield_now();
+        }
     }
 
     /// An nvim left dead by SIGKILL with an unsaved line in `file`, its swap file written.
@@ -83,7 +119,7 @@ impl Rig {
             }
             std::thread::sleep(Duration::from_millis(20));
         }
-        std::thread::sleep(Duration::from_millis(200));
+        self.started();
         child.kill().unwrap();
         child.wait().unwrap();
     }
@@ -117,13 +153,7 @@ fn watched(seen: &[PaneMessage]) -> bool {
 #[ignore = "needs a real nvim on PATH; spends no tokens and needs no display"]
 fn a_quit_says_it_is_leaving_and_a_signal_does_not() {
     let mut rig = Rig::new("ends");
-    let mut child = rig.nvim(
-        "project",
-        &[
-            "-c",
-            "autocmd VimEnter * ++nested call timer_start(300, {-> execute('qa!')})",
-        ],
-    );
+    let mut child = rig.nvim("project", &["-c", &rig.quit_command("qa!")]);
     rig.read_until(watched);
     assert_eq!(
         rig.after_exit(&mut child),
@@ -131,13 +161,7 @@ fn a_quit_says_it_is_leaving_and_a_signal_does_not() {
         ":qa! is a quit"
     );
 
-    let mut child = rig.nvim(
-        "project",
-        &[
-            "-c",
-            "autocmd VimEnter * ++nested call timer_start(300, {-> execute('cquit')})",
-        ],
-    );
+    let mut child = rig.nvim("project", &["-c", &rig.quit_command("cquit")]);
     rig.read_until(watched);
     assert_eq!(
         rig.after_exit(&mut child),
@@ -162,7 +186,7 @@ fn a_config_that_clears_every_autocommand_leaves_the_exit_taken_as_a_quit() {
     let mut rig = Rig::new("cleared");
     let mut child = rig.nvim("project", &["-c", "autocmd!", "-c", "qa!"]);
     assert_eq!(child.wait().unwrap().code(), Some(0));
-    assert!(rig.read_until(|_| false).is_empty(), "no line says it is watched");
+    assert!(rig.drained().is_empty(), "no line says it is watched");
 }
 
 #[test]
@@ -180,17 +204,14 @@ fn a_start_names_the_projects_unsaved_files_and_recovers_nothing() {
     let swaps = rig.swap_count();
     assert_eq!(swaps, 2);
 
-    let mut child = rig.nvim(
-        "project",
-        &["--cmd", "autocmd VimEnter * call timer_start(400, {-> execute('qa!')})"],
-    );
+    let mut child = rig.nvim("project", &["--cmd", &rig.quit_command("qa!")]);
     let seen = rig.read_until(|seen| recoverable(seen).is_some());
     assert_eq!(
         recoverable(&seen),
         Some((1, "src/a.txt".to_string())),
         "not the other project's"
     );
-    child.wait().unwrap();
+    rig.after_exit(&mut child);
     assert_eq!(rig.swap_count(), swaps, "the swap files stay");
     assert_eq!(
         std::fs::read_to_string(rig.root.join("project/src/a.txt")).unwrap(),
@@ -206,13 +227,13 @@ fn a_file_another_nvim_is_editing_is_not_reported() {
     let script = "call append(0, 'UNSAVED') | preserve";
     let mut editing = rig.nvim("project", &["b.txt", "-c", script]);
     rig.read_until(watched);
-    std::thread::sleep(Duration::from_millis(300));
+    rig.started();
 
-    let mut second = rig.nvim(
-        "project",
-        &["--cmd", "autocmd VimEnter * call timer_start(400, {-> execute('qa!')})"],
-    );
+    let mut second = rig.nvim("project", &["--cmd", &rig.quit_command("qa!")]);
+    rig.started();
+    std::fs::write(rig.root.join("quit"), b"").unwrap();
     let seen = rig.read_until(|seen| seen.contains(&PaneMessage::EditorLeaving));
+    std::fs::write(rig.root.join("quit"), b"").unwrap();
     second.wait().unwrap();
     editing.kill().unwrap();
     editing.wait().unwrap();

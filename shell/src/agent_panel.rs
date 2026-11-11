@@ -8,6 +8,8 @@ use eitri_panel::agent_panel::{PanelInit, ShutdownWatch, CLOSE_WATCH_POLL};
 use eitri_panel::panel_document::PanelDocument;
 use eitri_panel::panel_page::{PageSurface, PanelHost, PanelPage};
 use eitri_panel::panel_wake::{NextTick, TickSchedule};
+#[cfg(test)]
+use gtk4::glib::translate::ToGlibPtr;
 use gtk4::prelude::*;
 use gtk4::Application;
 use std::cell::{Cell, RefCell};
@@ -512,15 +514,39 @@ struct PumpTimer {
     watch: RefCell<Option<gtk4::glib::SourceId>>,
     /// Each timer and the watch hold the pump through this, so it lives as long as something can run it.
     me: std::rc::Weak<PumpTimer>,
+    #[cfg(test)]
+    now: Cell<Instant>,
+    #[cfg(test)]
+    armed_wait: Cell<Option<Duration>>,
+    #[cfg(test)]
+    wake_wait: Cell<Option<Duration>>,
+}
+
+#[cfg(test)]
+thread_local! {
+    static TEST_PUMP: RefCell<Option<std::rc::Weak<PumpTimer>>> = const { RefCell::new(None) };
 }
 
 impl PumpTimer {
+    fn now(&self) -> Instant {
+        #[cfg(test)]
+        {
+            self.now.get()
+        }
+        #[cfg(not(test))]
+        {
+            Instant::now()
+        }
+    }
+
     /// The wake's descriptor is readable: take it and arm the timer if the tick is due sooner.
     fn on_wake(&self) -> gtk4::glib::ControlFlow {
-        if let Some(due) = self.handle.take_wake(Instant::now()) {
+        if let Some(due) = self.handle.take_wake(self.now()) {
             let armed = self.schedule.borrow_mut().on_wake(due);
             if let Some(at) = armed {
                 self.arm(at);
+                #[cfg(test)]
+                self.wake_wait.set(self.armed_wait.get());
             }
         }
         gtk4::glib::ControlFlow::Continue
@@ -530,7 +556,7 @@ impl PumpTimer {
     fn on_timer(&self) {
         *self.timer.borrow_mut() = None;
         self.schedule.borrow_mut().fired();
-        let next = self.handle.run_tick(Instant::now());
+        let next = self.handle.run_tick(self.now());
         trust_after_tick(&self.handle);
         if next == NextTick::Stop {
             if let Some(watch) = self.watch.borrow_mut().take() {
@@ -550,7 +576,10 @@ impl PumpTimer {
             old.remove();
         }
         let Some(pump) = self.me.upgrade() else { return };
-        let id = gtk4::glib::timeout_add_local_once(timer_wait(at, Instant::now()), move || pump.on_timer());
+        let wait = timer_wait(at, self.now());
+        #[cfg(test)]
+        self.armed_wait.set(Some(wait));
+        let id = gtk4::glib::timeout_add_local_once(wait, move || pump.on_timer());
         *self.timer.borrow_mut() = Some(id);
     }
 }
@@ -583,7 +612,15 @@ fn start_pump_timer(handle: AgentPanelHandle) {
         timer: RefCell::new(None),
         watch: RefCell::new(None),
         me: me.clone(),
+        #[cfg(test)]
+        now: Cell::new(Instant::now()),
+        #[cfg(test)]
+        armed_wait: Cell::new(None),
+        #[cfg(test)]
+        wake_wait: Cell::new(None),
     });
+    #[cfg(test)]
+    TEST_PUMP.with(|slot| *slot.borrow_mut() = Some(Rc::downgrade(&pump)));
     let watched = {
         let pump = pump.clone();
         neovide_editor::fd_watch::add_local(
@@ -995,66 +1032,36 @@ for (const first of [new Error('first'), undefined, null, false, 0]) {
         assert!(flat.contains(".load_html(html,Some(base_uri))"), "{flat}");
     }
 
-    /// The premise the whole close path now rests on: a `gio` application hold keeps
-    /// `Application::run` iterating the main loop with no window on screen, and dropping the guard
-    /// is what lets `run` return.
-    ///
-    /// **`#[ignore]`d, and the reason is not flakiness.** `g_application_run` iterates the DEFAULT
-    /// main context; two of these in two test threads would fight over it, and `cargo test` runs
-    /// this crate's tests in parallel. Run it alone:
-    /// `cargo test -p shell a_hold_keeps_the_application_running -- --ignored --exact ...`.
-    ///
-    /// It drives a plain `gio::Application` rather than a `gtk4::Application` deliberately -- the
-    /// latter needs a display, which is what stops `shell` from testing any of this -- and
-    /// `gtk4::Application` IS a `gio::Application`, which is where `hold` is defined and what
-    /// `hold_until_done` calls it through.
-    ///
-    /// The first half is a control: without the hold, `run` returns as soon as `activate` does. Its
-    /// point is that the second half's 300ms is the hold's doing and not the loop's own latency.
+    /// A hold keeps the application dispatching after activation until a source releases it.
     #[test]
     #[ignore = "runs a real gio main loop on the default main context; must not race the rest of the suite"]
     fn a_hold_keeps_the_application_running_after_its_last_window() {
+        let _turn = crate::layout_state::default_context_turn();
         use gtk4::gio;
-
-        let control = gio::Application::new(None, gio::ApplicationFlags::empty());
-        control.connect_activate(|_| {});
-        let started = std::time::Instant::now();
-        control.run_with_args(&["shell-hold-control"]);
-        let without_a_hold = started.elapsed();
-        assert!(
-            without_a_hold < std::time::Duration::from_millis(100),
-            "an application with nothing holding it must not stay in its main loop at all; it took {without_a_hold:?}"
-        );
-
-        let held = gio::Application::new(None, gio::ApplicationFlags::empty());
-        held.connect_activate(|app| {
-            let mut hold = Some(app.hold());
-            // The shape `hold_until_done` uses: a main-loop source, and a release from
-            // inside it once its work is done.
-            gtk4::glib::timeout_add_local(std::time::Duration::from_millis(50), move || {
-                if started_long_enough_ago() {
-                    hold.take();
-                    return gtk4::glib::ControlFlow::Break;
-                }
-                gtk4::glib::ControlFlow::Continue
+        let released = Rc::new(Cell::new(false));
+        let held = gio::Application::new(None, gio::ApplicationFlags::NON_UNIQUE);
+        let observed = released.clone();
+        held.connect_activate(move |app| {
+            let hold = app.hold();
+            let observed = observed.clone();
+            gtk4::glib::idle_add_local_once(move || {
+                observed.set(true);
+                drop(hold);
             });
         });
-        let started = std::time::Instant::now();
-        RELEASE_AT.with(|cell| cell.set(Some(started + std::time::Duration::from_millis(300))));
+        let expired = Rc::new(Cell::new(false));
+        let expired_in_timer = expired.clone();
+        let quitting = held.clone();
+        let guard = gtk4::glib::timeout_add_local_once(Duration::from_secs(60), move || {
+            expired_in_timer.set(true);
+            quitting.quit();
+        });
         held.run_with_args(&["shell-hold"]);
-        let with_a_hold = started.elapsed();
-        assert!(
-            with_a_hold >= std::time::Duration::from_millis(290),
-            "the hold did not keep the loop running: run() returned after {with_a_hold:?}"
-        );
-        assert!(
-            with_a_hold < std::time::Duration::from_secs(5),
-            "releasing the hold did not let run() return: it took {with_a_hold:?}"
-        );
-    }
-
-    fn started_long_enough_ago() -> bool {
-        RELEASE_AT.with(|cell| cell.get().is_some_and(|at| std::time::Instant::now() >= at))
+        if let Some(source) = gtk4::glib::MainContext::default().find_source_by_id(&guard) {
+            source.destroy();
+        }
+        assert!(!expired.get(), "the application never released its hold");
+        assert!(released.get(), "run returned before the hold's release source ran");
     }
 
     /// The document this panel loads -- at startup, and again on every `reload_document()` -- has to
@@ -1435,12 +1442,6 @@ for (const first of [new Error('first'), undefined, null, false, 0]) {
         assert_eq!(code.matches("fn build_chat_page(").count(), 1);
     }
 
-    thread_local! {
-        /// When the ignored hold test's source should release. A thread-local rather than a capture
-        /// so the closure above stays the same shape as the real one.
-        static RELEASE_AT: std::cell::Cell<Option<std::time::Instant>> = const { std::cell::Cell::new(None) };
-    }
-
     /// GLib's own SHA-256 and base64 are an independent oracle for the hash the policy pins.
     #[test]
     fn the_hash_matches_glibs() {
@@ -1473,18 +1474,85 @@ for (const first of [new Error('first'), undefined, null, false, 0]) {
         fn set_background(&self, _rgb: [u8; 3]) {}
     }
 
-    /// Runs glib's default main context for `ms`.
-    fn iterate_for(ms: u64) {
+    /// Advances the pump's clock and dispatches its actual GLib sources for a fixed number of turns.
+    fn iterate_for(turns: u64) {
         let context = gtk4::glib::MainContext::default();
-        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(ms);
-        while std::time::Instant::now() < deadline {
-            while context.iteration(false) {}
-            std::thread::sleep(std::time::Duration::from_millis(1));
+        for _ in 0..turns {
+            TEST_PUMP.with(|slot| {
+                let registered = slot.borrow();
+                let weak = registered.as_ref().expect("a watched pump was registered");
+                let Some(pump) = weak.upgrade() else {
+                    return;
+                };
+                pump.now.set(pump.now.get() + Duration::from_millis(100));
+                if let Some(id) = pump.timer.borrow().as_ref() {
+                    let source = context.find_source_by_id(id).expect("the armed timer exists");
+                    // SAFETY: the source is live and belongs to this context's owning thread.
+                    unsafe { gtk4::glib::ffi::g_source_set_ready_time(source.to_glib_none().0, 0) };
+                };
+            });
+            context.iteration(false);
+            std::thread::yield_now();
         }
     }
 
+    fn iterate_until(done: impl Fn() -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(60);
+        for _ in 0..100_000 {
+            if done() {
+                return;
+            }
+            assert!(Instant::now() < deadline, "the pump never handled its wake");
+            iterate_for(1);
+        }
+        panic!("the pump exceeded 100000 dispatch turns");
+    }
+
+    #[test]
+    fn the_pump_arms_a_due_deadline_without_debouncing() {
+        let _turn = crate::layout_state::default_context_turn();
+        let context = gtk4::glib::MainContext::default();
+        let _owner = context.acquire().expect("the default context");
+        let handle = AgentPanelHandle::for_host_test(Rc::new(CountingPage::default()));
+        handle.page_message(ViewId::BASE, r#"{"type":"ready","request_id":"r1"}"#);
+        start_pump_timer(handle.clone());
+        // Finish the startup tick before raising a wake: an earlier armed timer needs no replacement.
+        iterate_for(300);
+        assert!(handle.ticks_run() > 0, "the startup tick ran");
+        TEST_PUMP.with(|slot| {
+            let pump = slot.borrow().as_ref().unwrap().upgrade().unwrap();
+            assert_eq!(pump.schedule.borrow().armed(), None, "the startup schedule is idle");
+            assert!(pump.timer.borrow().is_none(), "no startup timer remains");
+            assert!(pump.watch.borrow().is_some(), "the wake descriptor is watched");
+            pump.now.set(pump.now() + Duration::from_secs(10));
+            pump.wake_wait.set(None);
+        });
+        handle.wake();
+        iterate_until(|| {
+            TEST_PUMP.with(|slot| {
+                slot.borrow()
+                    .as_ref()
+                    .unwrap()
+                    .upgrade()
+                    .unwrap()
+                    .wake_wait
+                    .get()
+                    .is_some()
+            })
+        });
+        TEST_PUMP.with(|slot| {
+            assert_eq!(
+                slot.borrow().as_ref().unwrap().upgrade().unwrap().wake_wait.get(),
+                Some(Duration::ZERO),
+                "the wake's due timer has no wait"
+            );
+        });
+        let _watch = handle.shutdown();
+        iterate_for(1);
+    }
+
     /// An idle panel (a ready page, one empty tab, nothing happening) on the real pump and glib's loop:
-    /// how many ticks run in one second.
+    /// no ticks across repeated timer opportunities.
     #[test]
     fn an_idle_panel_is_not_ticked() {
         let _turn = crate::layout_state::default_context_turn();
@@ -1498,14 +1566,43 @@ for (const first of [new Error('first'), undefined, null, false, 0]) {
         let before = handle.ticks_run();
         iterate_for(1000);
         let ticks = handle.ticks_run() - before;
-        eprintln!("idle panel: {ticks} ticks in 1 s");
-        assert!(ticks <= 1, "an idle panel ticked {ticks} times in a second");
+
+        assert!(ticks <= 1, "an idle panel ticked {ticks} times over 1000 turns");
 
         // A call into the panel is still answered by a tick, at once, and then it is quiet again.
         let sent = page.sent.borrow().len();
         let before = handle.ticks_run();
+        TEST_PUMP.with(|slot| {
+            let pump = slot.borrow().as_ref().unwrap().upgrade().unwrap();
+            assert_eq!(
+                pump.schedule.borrow().armed(),
+                None,
+                "the idle wake must arm a new timer"
+            );
+            assert!(pump.timer.borrow().is_none());
+            pump.wake_wait.set(None);
+        });
         handle.new_tab();
-        iterate_for(100);
+        iterate_until(|| {
+            TEST_PUMP.with(|slot| {
+                slot.borrow()
+                    .as_ref()
+                    .unwrap()
+                    .upgrade()
+                    .unwrap()
+                    .wake_wait
+                    .get()
+                    .is_some()
+            })
+        });
+        TEST_PUMP.with(|slot| {
+            assert_eq!(
+                slot.borrow().as_ref().unwrap().upgrade().unwrap().wake_wait.get(),
+                Some(Duration::ZERO),
+                "the wake arms an immediate tick"
+            );
+        });
+        iterate_until(|| handle.ticks_run() > before);
         assert!(handle.ticks_run() > before, "the call woke the tick");
         assert!(page.sent.borrow().len() > sent, "and what it changed reached the page");
         let before = handle.ticks_run();

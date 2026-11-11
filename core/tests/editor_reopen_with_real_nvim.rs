@@ -91,6 +91,7 @@ impl Rig {
         let stderr = std::fs::File::create(self.root.join("stderr")).unwrap();
         let mut command = Command::new("nvim");
         command.args(["--embed", "-i", "NONE", "--cmd", "set noswapfile"]);
+        command.args(["--cmd", &format!("lua {}", include_str!("support/manual_timers.lua"))]);
         command.args(self.channel.nvim_args());
         if config.is_empty() {
             command.arg("--clean");
@@ -266,13 +267,16 @@ impl Nvim {
     }
 
     fn done(&mut self) {
-        let deadline = Instant::now() + DEADLINE;
-        while self.lua("local s=package.loaded['eitri.reopen']; return type(s)=='table' and s.done=='0123456789abcdef'")
-            != true
-        {
-            assert!(Instant::now() < deadline, "the restore finishes");
-            std::thread::sleep(Duration::from_millis(10));
+        for _ in 0..10000 {
+            self.lua("test_timers.advance(100); return true");
+            if self
+                .lua("local s=package.loaded['eitri.reopen']; return type(s)=='table' and s.done=='0123456789abcdef'")
+                == true
+            {
+                return;
+            }
         }
+        panic!("the restore did not finish in 10000 timer turns");
     }
 
     fn capture(&mut self) -> Value {
@@ -437,7 +441,7 @@ fn a_server_restart_started_opens_nothing_of_the_start_record() {
     }
     assert_eq!(new.lua("return vim.v.startreason"), "restart!");
     // Phase 2 would build the record's split within a second of VimEnter.
-    std::thread::sleep(Duration::from_millis(1500));
+    new.lua("test_timers.advance(1500); return true");
     assert_eq!(
         new.lua("return {#vim.api.nvim_list_wins(), vim.api.nvim_buf_get_name(0)}"),
         json!([1, ""]),
@@ -505,7 +509,6 @@ fn a_server_restart_started_keeps_the_record_current() {
         );
         std::thread::sleep(Duration::from_millis(10));
     }
-    std::thread::sleep(Duration::from_millis(100));
     let record = rig.handoff()["record"].clone();
     let named: Vec<&Value> = record["tabs"]
         .as_array()
@@ -576,7 +579,7 @@ fn sizes_follow_shares_and_one_later_resize() {
     nvim.done();
     for (columns, lines) in [(160, 70), (200, 90)] {
         nvim.resize(columns, lines);
-        nvim.lua("vim.wait(200); return true");
+        nvim.lua("test_timers.advance(200); return true");
         let record = nvim.capture();
         let actual = leaves(&record["tabs"][0]["tree"]);
         let first = actual[0]["w"].as_f64().unwrap();
@@ -608,7 +611,7 @@ fn a_nested_subtree_keeps_its_share_after_a_later_resize() {
     nvim.done();
     // A narrower grid takes its columns from the rightmost window; the shares are then applied once more.
     nvim.resize(120, 50);
-    nvim.lua("vim.wait(200); return true");
+    nvim.lua("test_timers.advance(200); return true");
     let record = nvim.capture();
     let w: Vec<f64> = leaves(&record["tabs"][0]["tree"])
         .iter()
@@ -734,9 +737,16 @@ fn a_key_between_phases_lists_the_rest() {
 fn capture_before_vimenter_answers_nil() {
     let rig = Rig::new("early");
     rig.simple();
-    let mut nvim = rig.start("", &["--cmd", "lua vim.wait(1500)"]);
+    let mut nvim = rig.start(
+        "",
+        &[
+            "--cmd",
+            "lua assert(vim.wait(60000, function() return _G.test_enter_release == true end, 1))",
+        ],
+    );
     assert_eq!(nvim.lua("return vim.v.vim_did_enter"), 0);
     assert_eq!(nvim.capture(), Value::Null);
+    nvim.lua("_G.test_enter_release = true; return true");
     nvim.done();
     assert!(!nvim.capture().is_null());
 }
@@ -826,7 +836,7 @@ fn gone_and_fifo_files_are_counted_and_named() {
     nvim.done();
     let ended = rig.ended();
     assert_eq!((ended.0, ended.1, ended.2), (1, 2, 0));
-    nvim.lua("vim.wait(100); return true");
+    nvim.lua("test_timers.advance(100); return true");
     let names: Vec<_> = rig
         .messages()
         .iter()
@@ -848,7 +858,7 @@ fn an_unreadable_file_counts_failed_and_the_start_goes_on() {
     nvim.done();
     let ended = rig.ended();
     assert_eq!((ended.0, ended.1, ended.2), (1, 0, 1));
-    nvim.lua("vim.wait(100); return true");
+    nvim.lua("test_timers.advance(100); return true");
     assert!(rig
         .messages()
         .iter()
@@ -928,7 +938,10 @@ fn stand_aside_for_each_kind() {
         rig.simple();
         let mut nvim = rig.start(config, &[]);
         nvim.entered();
-        assert_eq!(nvim.lua("vim.wait(1200); return vim.api.nvim_buf_get_name(0)"), "");
+        assert_eq!(
+            nvim.lua("test_timers.advance(1200); return vim.api.nvim_buf_get_name(0)"),
+            ""
+        );
         nvim.quit();
         assert!(!rig.handoff_path().exists());
         assert!(
@@ -964,7 +977,7 @@ fn no_restore_with_args_a_config_file_or_no_input() {
             }
         };
         nvim.entered();
-        nvim.lua("vim.wait(1200); return true");
+        nvim.lua("test_timers.advance(1200); return true");
         nvim.quit();
         assert!(!rig.handoff_path().exists());
         assert!(
@@ -1004,7 +1017,10 @@ fn autocmd_bang_in_a_config_restores_nothing_and_says_nothing() {
     rig.simple();
     let mut nvim = rig.start("vim.cmd('autocmd!')", &[]);
     nvim.entered();
-    assert_eq!(nvim.lua("vim.wait(1200); return vim.api.nvim_buf_get_name(0)"), "");
+    assert_eq!(
+        nvim.lua("test_timers.advance(1200); return vim.api.nvim_buf_get_name(0)"),
+        ""
+    );
     nvim.quit();
     assert!(!rig.handoff_path().exists());
     assert!(!rig.messages().iter().any(|m| matches!(m, PaneMessage::Reopen(_))));
@@ -1039,7 +1055,7 @@ fn a_dirty_dead_swap_opens_read_only_and_e_asks_again() {
     assert_eq!(nvim.lua("return vim.bo.readonly"), true);
     assert_ne!(nvim.lua("return vim.api.nvim_buf_get_lines(0,0,1,false)[1]"), "UNSAVED");
     assert_eq!(nvim.lua("local n=0; local id=vim.api.nvim_create_autocmd('SwapExists',{callback=function() n=n+1; vim.v.swapchoice='q' end}); pcall(vim.cmd,'edit'); vim.api.nvim_del_autocmd(id); return n"),1);
-    nvim.lua("vim.wait(200); return true");
+    nvim.lua("test_timers.advance(200); return true");
     assert!(rig
         .messages()
         .iter()

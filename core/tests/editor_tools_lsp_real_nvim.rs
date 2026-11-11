@@ -15,7 +15,7 @@ use eitri_core::editor_context::feed::EditorContextFeed;
 use eitri_core::editor_context::EditorContext;
 use eitri_core::editor_rpc::EditorRpc;
 use eitri_core::editor_tools::broker::{Broker, BrokerEnv, BrokerOut, Caller, TabFacts};
-use eitri_core::editor_tools::stamp::{wall_ms, Sequencer, Stamp, EDITOR_BUDGET};
+use eitri_core::editor_tools::stamp::{Sequencer, Stamp, EDITOR_BUDGET};
 use eitri_core::editor_tools::step::ToolResult;
 use eitri_core::editor_tools::tools::lsp::{self, AskArgs, Asked, Collected, LspKind, RawPart, UsagePart, LSP_BUDGET};
 use eitri_core::editor_tools::way::{EditorWay, LocalWay};
@@ -98,6 +98,7 @@ impl Test {
         std::fs::write(&path, "foo\n").unwrap();
         let feed = EditorContextFeed::new().expect("the feed must bind");
         let mut nvim = Embed::start_fed(&dir, &feed, &[]);
+        nvim.lua(include_str!("support/manual_wall.lua"), vec![]);
         let buf = nvim.lua(OPEN, vec![path.to_string_lossy().as_ref().into()]);
         let mut t = Self {
             rpc: Rc::new(Rpc(RefCell::new(nvim))),
@@ -111,6 +112,18 @@ impl Test {
         t.answers(Value::Map(vec![]), &[], 0);
         t
     }
+    fn advance_wall(&self, ms: u64) {
+        self.lua("test_wall_ms = test_wall_ms + ...", vec![ms.into()]);
+    }
+
+    fn release_replies(&self) {
+        self.lua(
+            "for _, reply in ipairs(test_lsp_replies or {}) do reply() end; test_lsp_replies = {}",
+            vec![],
+        );
+        self.rpc.0.borrow_mut().flush_scheduled();
+    }
+
     fn lua(&self, code: &str, args: Vec<Value>) -> Value {
         self.rpc.0.borrow_mut().lua(code, args)
     }
@@ -206,15 +219,22 @@ impl Test {
         let out = broker.submit(TAB, caller, None, "usages", &text, &env, Instant::now());
         assert!(out.is_empty(), "{out:?}");
         let end = Instant::now() + LSP_BUDGET * 2;
-        loop {
-            for out in broker.tick(&env, Instant::now()) {
+        for _ in 0..10000 {
+            let fake = lsp::advance_test_budget_clock(Duration::from_millis(100));
+            if fake.is_some() {
+                self.rpc.0.borrow_mut().flush_scheduled();
+            }
+            for out in broker.tick(&env, fake.unwrap_or_else(Instant::now)) {
                 if let BrokerOut::Answer { result, .. } = out {
                     return result;
                 }
             }
             assert!(Instant::now() < end, "the agent was not answered");
-            std::thread::sleep(Duration::from_millis(10));
+            if fake.is_none() {
+                std::thread::sleep(Duration::from_millis(10));
+            }
         }
+        panic!("the usages run did not finish in 10000 polling turns");
     }
 }
 impl Drop for Test {
@@ -287,9 +307,11 @@ fn an_ask_answers_and_its_collect_takes_it_once() {
 fn pending_until_the_server_answers() {
     let mut t = Test::new();
     t.server();
+    t.lua("test_lsp_hold = true", vec![]);
     t.definitions(t.location(&t.path), 150);
     t.ask_definitions();
     assert!(matches!(t.collect("one", false), Collected::Pending));
+    t.release_replies();
     assert_eq!(t.parts()[0].items.len(), 1);
 }
 #[test]
@@ -297,6 +319,7 @@ fn pending_until_the_server_answers() {
 fn a_server_that_never_answers_gives_what_arrived_and_names_the_missing_part() {
     let mut t = Test::new();
     t.server();
+    t.lua("test_lsp_hold = true", vec![]);
     t.answers(
         map(&[("textDocument/definition", t.location(&t.path))]),
         &["textDocument/references"],
@@ -306,7 +329,7 @@ fn a_server_that_never_answers_gives_what_arrived_and_names_the_missing_part() {
     a.include = vec![UsagePart::Definitions, UsagePart::References];
     t.ask(&a);
     assert_eq!(t.lua("for _, r in ipairs(_G.__fake_lsp.seen) do if r.method == 'textDocument/references' then return r.params.context.includeDeclaration end end return false", vec![]), true.into());
-    std::thread::sleep(Duration::from_millis(30));
+    t.release_replies();
     match t.collect("one", true) {
         Collected::Done { parts, missing, .. } => {
             assert_eq!(parts[0].items.len(), 1);
@@ -323,7 +346,7 @@ fn an_entry_past_its_deadline_is_cleared_by_the_next_ask() {
     let mut a = t.args();
     a.budget_ms = 1;
     t.ask(&a);
-    std::thread::sleep(Duration::from_millis(20));
+    t.advance_wall(20);
     a.id = "two".into();
     a.budget_ms = 1000;
     t.ask(&a);
@@ -341,7 +364,7 @@ fn and_by_the_next_collect() {
     let mut a = t.args();
     a.budget_ms = 1;
     t.ask(&a);
-    std::thread::sleep(Duration::from_millis(20));
+    t.advance_wall(20);
     t.collect("another", false);
     assert_eq!(
         t.lua("return _G.__eitri_agent.lsp.entries['test:one'] == nil", vec![]),
@@ -359,7 +382,7 @@ fn a_last_collect_inside_the_margin_finds_the_entry() {
     a.budget_ms = lsp::COLLECT_MARGIN.as_millis() as u32 + 1;
     a.include = vec![UsagePart::Definitions];
     t.ask(&a);
-    std::thread::sleep(Duration::from_millis(20));
+    t.advance_wall(20);
     assert!(matches!(t.collect("one", true), Collected::Done { .. }));
 }
 #[test]
@@ -468,10 +491,11 @@ fn a_position_a_server_got_wrong_drops_that_item_only() {
 fn a_late_answer_after_the_entry_went_recreates_nothing() {
     let mut t = Test::new();
     t.server();
+    t.lua("test_lsp_hold = true", vec![]);
     t.definitions(t.location(&t.path), 100);
     t.ask_definitions();
     assert!(matches!(t.collect("one", true), Collected::Done { .. }));
-    std::thread::sleep(Duration::from_millis(150));
+    t.release_replies();
     assert!(matches!(t.collect("one", false), Collected::Gone));
     assert_eq!(t.lua("return _G.__eitri_agent.lsp.n", vec![]), 0.into());
 }
@@ -655,12 +679,21 @@ fn a_load_says_loaded_now_and_a_later_ask_finds_the_client() {
     let mut t = Test::new();
     let path = t.root.join("new.rs");
     std::fs::write(&path, "foo\n").unwrap();
+    t.lua("test_lsp_hold_init = true", vec![]);
     t.lua("local src, root = ... vim.api.nvim_create_autocmd('BufReadPost', {callback=function(ev) assert(loadstring(src))(ev.buf, {name='loaded',root=root,initialize_delay=50}) end})", vec![FAKE.into(),t.root.to_string_lossy().as_ref().into()]);
     let mut a = t.args();
     a.path = Some(path);
     a.load = true;
     assert!(matches!(t.ask(&a), Asked::NoClient { loaded_now: true }));
-    std::thread::sleep(Duration::from_millis(100));
+    t.lua("assert(test_lsp_init); test_lsp_init()", vec![]);
+    t.rpc.0.borrow_mut().wait_until("the delayed client to attach", |n| {
+        n.lua(
+            "return #vim.lsp.get_clients({name='loaded'}) > 0 and vim.lsp.get_clients({name='loaded'})[1].initialized",
+            vec![],
+        )
+        .as_bool()
+            == Some(true)
+    });
     assert!(matches!(t.ask(&a), Asked::Started { .. }));
 }
 #[test]
@@ -679,7 +712,7 @@ fn an_expired_stamp_starts_no_request() {
     let stamp = Stamp {
         scope: "expired".into(),
         seq: 1,
-        deadline_ms: wall_ms() - 1,
+        deadline_ms: t.lua("return test_wall_ms", vec![]).as_u64().unwrap() - 1,
     };
     let value = lsp::ask(&*t.rpc, &stamp, &a).try_take().unwrap().unwrap();
     assert_eq!(value, map(&[("expired", true.into())]));
@@ -986,9 +1019,9 @@ fn usages_with_a_hung_part_answers_what_arrived_when_the_budget_ends() {
         &["textDocument/references"],
         0,
     );
-    let began = Instant::now();
+    let _clock = lsp::TestBudgetClock::new();
+    lsp::reset_test_budget_expired();
     let result = t.usages(&json!({"path": "a.rs", "line": 1, "symbol": "foo"}));
-    let waited = began.elapsed();
     assert!(!result.is_error, "{}", result.text);
     let answer: serde_json::Value = serde_json::from_str(&result.text).unwrap();
     assert_eq!(answer["definitions"][0]["path"], "a.rs");
@@ -996,7 +1029,10 @@ fn usages_with_a_hung_part_answers_what_arrived_when_the_budget_ends() {
     assert_eq!(answer["definitions"][0]["text"], "foo");
     assert_eq!(answer["missing"], json!(["references"]));
     assert!(answer.get("references").is_none(), "{answer}");
-    assert!(waited >= LSP_BUDGET, "the budget was not given: {waited:?}");
+    assert!(
+        lsp::test_budget_expired(),
+        "the missing part is collected after its budget expires"
+    );
 }
 #[test]
 #[ignore = "needs a real nvim on PATH; spends no tokens and needs no display"]
@@ -1370,15 +1406,15 @@ fn action_edit_uses_the_actions_own_edit() {
 #[ignore = "needs a real nvim on PATH; spends no tokens and needs no display"]
 fn a_stored_action_answers_the_time_of_its_first_ask() {
     let mut t = Test::new();
-    let before = wall_ms();
+    let before = t.lua("return test_wall_ms", vec![]).as_u64().unwrap();
     let a = t.list_action("local e=... return {title='Fix',edit=e}");
-    std::thread::sleep(Duration::from_millis(20));
-    let later = wall_ms();
+    t.advance_wall(20);
+    let later = t.lua("return test_wall_ms", vec![]).as_u64().unwrap();
     assert!(matches!(t.ask(&t.action_args(&a.id)), Asked::Started { .. }));
     match t.done() {
         Collected::Done { asked_ms, .. } => {
             let asked = asked_ms.expect("the time of the ask");
-            assert!(before <= asked && asked <= later, "{before} {asked} {later}");
+            assert!(asked == before && asked < later, "{before} {asked} {later}");
         }
         other => panic!("{other:?}"),
     }
@@ -1486,20 +1522,25 @@ fn a_rename_answers_the_ticks_of_the_ask() {
         )
         .as_u64()
         .unwrap();
-    t.answers(map(&[("textDocument/rename", t.workspace_edit(false))]), &[], 30);
-    let before = wall_ms();
+    t.lua("test_lsp_hold = true", vec![]);
+    t.answers(map(&[("textDocument/rename", t.workspace_edit(false))]), &[], 0);
+    let before = t.lua("return test_wall_ms", vec![]).as_u64().unwrap();
     t.ask(&t.edit_args(LspKind::Rename));
-    let after = wall_ms();
+    t.advance_wall(10);
     t.lua(
         "local b=... vim.api.nvim_buf_set_lines(b,0,-1,true,{'moved'})",
         vec![other.clone()],
     );
+    t.release_replies();
     match t.done() {
         Collected::Done { ticks, asked_ms, .. } => {
             assert_eq!(ticks.get(&other.as_u64().unwrap()), Some(&tick));
             assert!(ticks.contains_key(&t.buf.as_u64().unwrap()));
             let asked = asked_ms.expect("the time of the ask");
-            assert!(before <= asked && asked <= after + 1, "{before} {asked} {after}");
+            assert_eq!(
+                asked, before,
+                "the timestamp belongs to the ask before the edit and answer"
+            );
         }
         v => panic!("{v:?}"),
     }
@@ -1832,6 +1873,7 @@ fn an_action_listed_before_an_edit_and_save_is_refused_end_to_end() {
 fn action_on_a_file_not_open(t: &mut Test) -> (eitri_core::editor_tools::memory::Memory, PathBuf, String) {
     let other = t.root.join("b.rs");
     std::fs::write(&other, "foo();\n").unwrap();
+    stamp_against_wall(t, &other, false);
     t.edit_server();
     let actions = t.lua(
         "local p=... return {{title='Rename',edit={changes={[vim.uri_from_fname(p)]={{range={start={line=0,character=0},['end']={line=0,character=3}},newText='bar'}}}}}}",
@@ -1844,9 +1886,24 @@ fn action_on_a_file_not_open(t: &mut Test) -> (eitri_core::editor_tools::memory:
         &t.root,
     )));
     let id = action_list(t, &memory);
-    // A file's time comes from a clock that may lag the one the ask read by a kernel tick.
-    std::thread::sleep(Duration::from_millis(20));
     (memory, other, id)
+}
+
+fn stamp_against_wall(t: &Test, path: &Path, after: bool) {
+    let wall = t.lua("return test_wall_ms", vec![]).as_u64().unwrap();
+    let ms = if after {
+        wall + 1000
+    } else {
+        wall.checked_sub(1000)
+            .expect("the ask clock must allow an earlier file mtime")
+    };
+    let time = std::time::UNIX_EPOCH + Duration::from_millis(ms);
+    std::fs::File::options()
+        .write(true)
+        .open(path)
+        .unwrap()
+        .set_times(std::fs::FileTimes::new().set_modified(time))
+        .unwrap();
 }
 
 const CHANGED_SINCE: &str = "b.rs changed since the language server answered; ask again";
@@ -1861,6 +1918,7 @@ fn a_file_opened_and_saved_after_its_action_was_listed_is_refused() {
         "local b=... vim.api.nvim_buf_set_lines(b,0,-1,true,{'// foo();'}) vim.api.nvim_buf_call(b,function() vim.cmd('silent write') end)",
         vec![buf],
     );
+    stamp_against_wall(&t, &other, true);
     assert_eq!(std::fs::read(&other).unwrap(), b"// foo();\n");
 
     let result = action_tool(&mut t, &memory, "apply_code_action", json!({"id":id}));
@@ -1875,6 +1933,7 @@ fn a_file_changed_on_disk_after_its_action_was_listed_is_refused() {
     let mut t = Test::new();
     let (memory, other, id) = action_on_a_file_not_open(&mut t);
     std::fs::write(&other, "// foo();\n").unwrap();
+    stamp_against_wall(&t, &other, true);
 
     let result = action_tool(&mut t, &memory, "apply_code_action", json!({"id":id}));
     assert!(result.is_error, "{}", result.text);

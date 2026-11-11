@@ -1232,8 +1232,18 @@ fn a_trailing_deletion_reverted_and_drawn_again_without_an_undo_stays_reverted()
     // the revert was undone. The close is heard only if a drain took it before the draw again was
     // answered; either way the file is drawn.
     let mut out = collect(&mut overlay, rpc, "the events", |o| kinds(o).contains(&"revert"));
-    std::thread::sleep(Duration::from_millis(700));
-    out.extend(overlay.tick(rpc, Instant::now()).mine);
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while overlay.draws_pending(&path) {
+        assert!(Instant::now() < deadline, "the replacement draw never answered");
+        out.extend(overlay.tick(rpc, Instant::now()).mine);
+        std::thread::yield_now();
+    }
+    let mut clock = Instant::now();
+    for _ in 0..20 {
+        clock += Duration::from_secs(1);
+        out.extend(overlay.tick(rpc, clock).mine);
+        nvim.flush_scheduled();
+    }
     assert_eq!(
         kinds(&out).into_iter().filter(|k| *k != "off").collect::<Vec<_>>(),
         vec!["revert"],

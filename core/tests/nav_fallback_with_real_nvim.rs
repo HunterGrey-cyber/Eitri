@@ -762,19 +762,18 @@ fn the_letter_is_already_written_before_the_mapping_returns_even_if_nvim_dies_ri
     let listener = channel.take_listener().expect("a fresh channel has its listener");
     let mut reader = PaneSwitchReader::new(listener);
 
-    // <C-l> fires from a deferred callback (as a real keypress would dispatch through nvim's own
-    // input queue); the marker is written the instant that call returns, i.e. after `send()` --
-    // synchronous or not -- has already been called and, if synchronous, has already completed. The
-    // busy-wait after the marker only keeps the process alive long enough for the harness to observe
-    // the marker and deliver the kill signal before nvim would otherwise move on.
+    let fifo = scratch.join("hold");
+    let name = std::ffi::CString::new(fifo.to_str().unwrap()).unwrap();
+    // SAFETY: the path is NUL-terminated and remains live for the call.
+    assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+    // After the mapping returns the callback blocks in a FIFO read, with no event-loop turn for a queued write.
     let trigger = format!(
         "lua vim.defer_fn(function() \
            vim.cmd.normal(vim.api.nvim_replace_termcodes('<C-l>', true, false, true)) \
            local f = io.open({marker:?}, 'w') \
            f:write('x') \
            f:close() \
-           local start = vim.uv.hrtime() \
-           while vim.uv.hrtime() - start < 5000 * 1000000 do end \
+           vim.fn.readfile({fifo:?}) \
          end, 10)"
     );
 
@@ -804,17 +803,23 @@ fn the_letter_is_already_written_before_the_mapping_returns_even_if_nvim_dies_ri
         }
         std::thread::sleep(Duration::from_millis(1));
     }
-    // Cut nvim off mid-busy-loop, well before its own 5s busy-wait would end on its own: a pending
-    // (not yet run) `pipe:connect` write callback never gets another event-loop turn to run in.
+    // The marker is followed by the held FIFO read, so no queued write can run before the kill.
     child.kill().expect("SIGKILL the nvim child");
     let status = child.wait().expect("wait for nvim");
     assert!(!status.success(), "expected nvim to die by signal, got {status}");
 
-    let poll_deadline = Instant::now() + Duration::from_millis(300);
+    let poll_deadline = Instant::now() + DEADLINE;
     let mut messages = Vec::new();
-    while Instant::now() < poll_deadline {
+    loop {
         messages.extend(reader.poll());
-        std::thread::sleep(Duration::from_millis(10));
+        if messages
+            .iter()
+            .any(|message| matches!(message, PaneMessage::Direction(_)))
+        {
+            break;
+        }
+        assert!(Instant::now() < poll_deadline, "the mapping's letter never arrived");
+        std::thread::yield_now();
     }
     // The editor watch's own events travel the same socket; the assertion is about the letters.
     messages.retain(|m| matches!(m, PaneMessage::Direction(_)));

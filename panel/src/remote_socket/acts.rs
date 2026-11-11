@@ -465,11 +465,10 @@ mod tests {
         for _ in 0..3 {
             rig.turn();
         }
-        assert_eq!(
-            client
-                .recv(Duration::from_millis(20))
-                .expect("the connection stays open"),
-            None,
+        client.send(&RvInbound::Ping { v: 1 }).unwrap();
+        let lines = rig.until(&mut client, "the held call's pong", |l| l["kind"] == "pong");
+        assert!(
+            lines.iter().all(|l| l["kind"] != "result"),
             "no result while the provider waits"
         );
         drop(release);
@@ -502,23 +501,34 @@ mod tests {
             std::thread::sleep(Duration::from_millis(2));
         }
         drop(gone);
+        let deadline = Instant::now() + PATIENCE;
+        loop {
+            let closed = rig.socket().conns.borrow().is_empty();
+            if closed {
+                break;
+            }
+            assert!(Instant::now() < deadline, "the closed connection was never forgotten");
+            rig.turn();
+            std::thread::yield_now();
+        }
         let mut other = rig.connect();
         drop(release);
         let deadline = Instant::now() + PATIENCE;
-        while provider.interrupts() == 0 {
-            assert!(Instant::now() < deadline, "the provider never answered");
+        loop {
+            let pending = rig.handle.state.borrow().remote.needs_polling();
+            if !pending {
+                break;
+            }
+            assert!(Instant::now() < deadline, "the provider's result was never consumed");
             rig.turn();
-            std::thread::sleep(Duration::from_millis(2));
+            std::thread::yield_now();
         }
-        for _ in 0..5 {
-            rig.turn();
-        }
+        assert_eq!(provider.interrupts(), 1);
         assert!(rig.handle.take_remote_results().is_empty(), "the pump took the result");
-        assert_eq!(
-            other
-                .recv(Duration::from_millis(20))
-                .expect("the connection stays open"),
-            None,
+        other.send(&RvInbound::Ping { v: 1 }).unwrap();
+        let lines = rig.until(&mut other, "the other connection's pong", |l| l["kind"] == "pong");
+        assert!(
+            lines.iter().all(|l| l["kind"] != "result"),
             "another connection is not told another's result"
         );
     }

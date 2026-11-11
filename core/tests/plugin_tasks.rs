@@ -157,13 +157,24 @@ fn a_runner_without_a_guard_starts_its_task_itself() {
 #[test]
 fn a_timeout_ends_the_whole_group() {
     let (mut r, _) = runner();
+    let (entered, waiting) = std::sync::mpsc::channel();
+    let (expire, expiry) = std::sync::mpsc::channel();
+    eitri_core::plugin::tasks::set_timeout_wait_for_tests(move |limit| {
+        assert_eq!(limit, Duration::from_millis(300));
+        entered.send(()).unwrap();
+        expiry.recv_timeout(HANG_GUARD).expect("release the timeout wait");
+        false
+    });
     let run = r
         .start(sh("t", "sleep 300 & echo $!; wait", Some(Duration::from_millis(300))))
         .unwrap();
-    // Collected whole: the line and the end may arrive in one poll.
-    let (events, kind, _, _) = until_exit(&mut r, run);
+    waiting
+        .recv_timeout(HANG_GUARD)
+        .expect("the timeout worker entered its wait");
+    let pid: i32 = first_line(&mut r, run).parse().unwrap();
+    expire.send(()).unwrap();
+    let (_, kind, _, _) = until_exit(&mut r, run);
     assert_eq!(kind, ExitKind::Timeout);
-    let pid: i32 = stdout_lines(&events)[0].parse().unwrap();
     wait_gone(pid);
 }
 
@@ -317,23 +328,41 @@ fn a_flood_of_empty_lines_is_bounded_like_any_other_output() {
 
 #[test]
 fn a_leader_that_exits_on_sigterm_does_not_cut_short_a_child_that_is_cleaning_up() {
-    let (mut r, _) = runner();
-    let dir = std::env::temp_dir().join(format!("eitri-tasks-grace-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
+    let dir = agent::state_dirs::test_workspace_dir("tasks-grace");
     let marker = dir.join("cleaned");
+    let cleanup = dir.join("cleanup");
+    let (mut r, _) = runner();
+    let (observed, inside) = std::sync::mpsc::channel();
+    let (release_grace, grace_gate) = std::sync::mpsc::channel();
     let script = format!(
-        "(trap 'sleep 0.5; echo ok > {m}; exit 0' TERM; echo ready; while :; do sleep 0.05; done) & \
-         trap 'exit 0' TERM; wait",
-        m = marker.display()
+        "(trap 'while [ ! -e {release} ]; do sleep 0.02; done; echo ok > {marker}; exit 0' TERM; echo ready; while :; do sleep 0.02; done) & trap 'exit 0' TERM; wait",
+        release = cleanup.display(), marker = marker.display(),
     );
     let run = r.start(sh("t", &script, None)).unwrap();
     assert_eq!(first_line(&mut r, run), "ready");
+    r.set_stop_grace_for_tests(run, HANG_GUARD);
+    r.observe_stop_grace_for_tests(run, move || {
+        observed.send(()).unwrap();
+        grace_gate.recv_timeout(HANG_GUARD).expect("release the grace wait");
+    });
     assert!(r.cancel(run));
+    let deadline = Instant::now() + HANG_GUARD;
+    inside
+        .recv_timeout(HANG_GUARD)
+        .expect("the runner never waited on the cleaning child after reaping its leader");
+    std::fs::write(&cleanup, b"").unwrap();
+    while !marker.exists() {
+        assert!(
+            Instant::now() < deadline,
+            "cleanup did not finish during the held grace"
+        );
+        std::thread::yield_now();
+    }
+    release_grace.send(()).unwrap();
     let (_, kind, _, _) = until_exit(&mut r, run);
     assert_eq!(kind, ExitKind::Cancelled);
-    let cleaned = marker.exists();
+    assert_eq!(std::fs::read_to_string(&marker).unwrap(), "ok\n");
     let _ = std::fs::remove_dir_all(&dir);
-    assert!(cleaned, "the child was killed before its cleanup finished");
 }
 
 #[test]
@@ -341,23 +370,29 @@ fn a_writer_outside_the_group_finds_the_pipes_closed_once_the_run_has_ended() {
     let (mut r, _) = runner();
     // `setsid` puts the writer in a session of its own, so the group's end does not reach it; it keeps the
     // pipes open past the grace and writes after the run is over. With the readers released its write is a
-    // broken pipe and it dies; with a reader left behind it would sleep on, filling a buffer nobody takes.
-    let script = "setsid sh -c 'echo $$; sleep 3; echo late; sleep 300' & sleep 0.3";
-    let run = r.start(sh("t", script, None)).unwrap();
-    let (events, kind, _, _) = until_exit(&mut r, run);
+    // broken pipe and it dies. The marker catches both an unreleased loop ending and a successful late write.
+    let dir = agent::state_dirs::test_workspace_dir("tasks-outside-writer");
+    let release = dir.join("release");
+    let writer_ready = dir.join("ready");
+    let leader_go = dir.join("leader-go");
+    let survived = dir.join("survived");
+    let script = format!("setsid sh -c 'echo $$; touch {ready}; i=0; while [ ! -e {release} ] && [ \"$i\" -lt 3000 ]; do i=$((i+1)); sleep 0.02; done; [ -e {release} ] || {{ touch {survived}; exit 0; }}; echo late; touch {survived}' & i=0; while [ ! -e {leader} ] && [ \"$i\" -lt 3000 ]; do i=$((i+1)); sleep 0.02; done", ready=writer_ready.display(), release=release.display(), survived=survived.display(), leader=leader_go.display());
+    let run = r.start(sh("t", &script, None)).unwrap();
+    let pid: i32 = first_line(&mut r, run).parse().unwrap();
+    std::fs::write(&leader_go, b"").unwrap();
+    let (_, kind, _, _) = until_exit(&mut r, run);
     assert_eq!(kind, ExitKind::Exited(0));
-    let pid: i32 = stdout_lines(&events)[0].parse().unwrap();
+    std::fs::write(&release, b"").unwrap();
     assert!(r.is_idle());
     let deadline = Instant::now() + Duration::from_secs(20);
     while !gone(pid) && Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(20));
     }
-    let died_alone = gone(pid);
-    unsafe {
-        libc::kill(pid, libc::SIGKILL);
-    }
-    wait_gone(pid);
-    assert!(died_alone, "the writer's output still had a reader after the run ended");
+    assert!(gone(pid), "the writer did not finish after its release");
+    assert!(
+        !survived.exists(),
+        "the writer ended without its release or its output still had a reader after the run ended"
+    );
     let (events, next) = r.poll(Instant::now() + Duration::from_secs(3600));
     assert!(events.is_empty());
     assert_eq!(next, None);

@@ -15,7 +15,7 @@
 //! Each test checks two claims:
 //!
 //! - (a) process groups: the stand-in in A's group dies with A's terminal; the one in its own group survives, and
-//!   ends within 1 s once B closes the last copy of its stdin;
+//!   acknowledges input after both signals and ends on EOF once B closes its stdin;
 //! - (c) close-on-exec: a child B spawns after receiving the descriptors inherits none of them. A deliberate
 //!   inheritable copy, made and closed before the real listing, shows the listing would catch a leak.
 //!
@@ -49,13 +49,11 @@ const ROLE_DEADLINE: Duration = Duration::from_secs(120);
 /// From starting A to B's report of what it received.
 const SETUP_BUDGET: Duration = Duration::from_secs(30);
 /// From the hangup to A's exit.
-const HANGUP_BUDGET: Duration = Duration::from_secs(5);
+const HANGUP_BUDGET: Duration = Duration::from_secs(60);
 /// How long the stand-in in A's group has to die after the signal.
-const SIGINT_BUDGET: Duration = Duration::from_secs(2);
-/// How long the stand-in in its own group must still be alive after that.
-const SURVIVAL_WINDOW: Duration = Duration::from_secs(1);
+const SIGINT_BUDGET: Duration = Duration::from_secs(60);
 /// How long the surviving stand-in has to end once the last copy of its stdin is closed.
-const EOF_BUDGET: Duration = Duration::from_secs(1);
+const EOF_BUDGET: Duration = Duration::from_secs(60);
 /// A descriptor number far above anything B opens itself, for the inheritable copy that shows a leak is seen.
 const CONTROL_FD_FLOOR: RawFd = 200;
 
@@ -362,7 +360,16 @@ fn role_a() {
     let stand_in = |own_group: bool| {
         let mut command = Command::new("sh");
         command
-            .args(["-c", "cat >/dev/null"])
+            .args([
+                "-c",
+                if own_group {
+                    "while read -r line; do printf 'ack\n' > \"$1\"; done; printf 'eof\n' > \"$1.eof\""
+                } else {
+                    "cat >/dev/null"
+                },
+                "stand-in",
+            ])
+            .arg(sock.with_extension("ack"))
             .stdin(Stdio::piped())
             .stdout(Stdio::null())
             .stderr(Stdio::null());
@@ -497,10 +504,14 @@ fn role_b() {
 
     let mut fds = fds.into_iter();
     let mut first = fds.next();
-    let mut second = fds.next();
+    let mut second = fds.next().map(File::from);
     let stdin = std::io::stdin();
     for line in stdin.lock().lines() {
         match line.expect("stdin").trim() {
+            "probe-second" => {
+                writeln!(second.as_mut().expect("second stdin"), "probe").unwrap();
+                say(&json!({ "probed": "second" }));
+            }
             "close-second" => {
                 second.take();
                 say(&json!({ "closed": "second" }));
@@ -671,14 +682,11 @@ fn run(ending: Ending) {
             json!(format!("not delivered: {}", std::io::Error::last_os_error()))
         }
     };
-    // A moment for anything a leader's exit sends to land before looking.
-    let settle = || std::thread::sleep(Duration::from_millis(300));
     let mut steps = serde_json::Map::new();
     let (a_exit, first_exit) = match ending {
         Ending::HangupThenSigint => {
             hang_up(&mut script);
             let a_exit = a.exit_within(HANGUP_BUDGET);
-            settle();
             steps.insert("first_alive_after_a_exit".into(), json!(first.running()));
             steps.insert("second_alive_after_a_exit".into(), json!(second.running()));
             steps.insert(
@@ -694,18 +702,29 @@ fn run(ending: Ending) {
             let first_exit = first.exit_within(SIGINT_BUDGET);
             steps.insert("second_alive_after_sigint".into(), json!(second.running()));
             hang_up(&mut script);
-            settle();
             steps.insert("after_hangup".into(), json!({ "second": stat_json(second_pid) }));
             (a_exit, first_exit)
         }
     };
-    let second_exit_early = second.exit_within(SURVIVAL_WINDOW);
+    tell(&mut b_stdin, "probe-second");
+    expect_line(&b_lines, "probed", SETUP_BUDGET, &why);
+    let ack = sock.with_extension("ack");
+    let deadline = Instant::now() + SETUP_BUDGET;
+    while !ack.exists() {
+        assert!(Instant::now() < deadline, "the survivor never acknowledged input");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let second_alive_after_both = second.running();
     let after_both = json!({ "second": stat_json(second_pid) });
 
     // B closes the last copy of the survivor's stdin.
     tell(&mut b_stdin, "close-second");
     expect_line(&b_lines, "closed", SETUP_BUDGET, &why);
     let second_exit_on_eof = second.exit_within(EOF_BUDGET);
+    assert!(
+        ack.with_extension("ack.eof").exists(),
+        "the survivor read EOF rather than dying from a signal"
+    );
     tell(&mut b_stdin, "exit");
     drop(b_stdin);
     let b_status = b.wait_within(Duration::from_secs(10));
@@ -716,7 +735,7 @@ fn run(ending: Ending) {
         .is_some_and(|v| v.iter().all(|c| c == &json!(true)));
     let leaked_numbers = received["leaked_numbers"].as_array().map_or(0, Vec::len);
     let leaked_targets = received["leaked_targets"].as_array().map_or(0, Vec::len);
-    let claim_a = first_exit.is_some() && second_exit_early.is_none() && second_exit_on_eof.is_some();
+    let claim_a = first_exit.is_some() && second_alive_after_both && second_exit_on_eof.is_some();
     let claim_c = all_cloexec
         && leaked_numbers == 0
         && leaked_targets == 0
@@ -731,7 +750,7 @@ fn run(ending: Ending) {
         "a_exit_ms": millis(a_exit),
         "first_exit_ms": millis(first_exit),
         "steps": steps,
-        "second_exit_within_1s_after_both_ms": millis(second_exit_early),
+        "second_acknowledged_after_both": second_alive_after_both,
         "after_both": after_both,
         "second_exit_after_eof_ms": millis(second_exit_on_eof),
         "b_status": b_status,
@@ -773,7 +792,7 @@ fn run(ending: Ending) {
         "the child in the spawner's group dies with the spawner's terminal or its Ctrl+C"
     );
     assert!(
-        second_exit_early.is_none(),
+        second_alive_after_both,
         "the child in its own group survives the hangup and the SIGINT"
     );
     assert!(

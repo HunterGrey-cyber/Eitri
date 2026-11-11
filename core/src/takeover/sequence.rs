@@ -267,6 +267,25 @@ pub fn prepare(
     runtime: &Path,
     install: &dyn Fn(&OriginLink) -> Result<GlueHandle, InstallError>,
 ) -> Result<Prepared, StepError> {
+    prepare_with_elapsed(origin, runtime, install, &|started| started.elapsed())
+}
+
+#[cfg(any(test, feature = "test-support"))]
+pub fn prepare_with_elapsed_for_tests(
+    origin: OriginLink,
+    runtime: &Path,
+    install: &dyn Fn(&OriginLink) -> Result<GlueHandle, InstallError>,
+    elapsed: Duration,
+) -> Result<Prepared, StepError> {
+    prepare_with_elapsed(origin, runtime, install, &|_| elapsed)
+}
+
+fn prepare_with_elapsed(
+    origin: OriginLink,
+    runtime: &Path,
+    install: &dyn Fn(&OriginLink) -> Result<GlueHandle, InstallError>,
+    elapsed: &dyn Fn(Instant) -> Duration,
+) -> Result<Prepared, StepError> {
     let facts = origin
         .link
         .exec_lua(FACTS_LUA, vec![])
@@ -320,7 +339,7 @@ pub fn prepare(
     let result = install(&origin);
     let _ = done.send(());
     let _ = timer.join();
-    let result = if started.elapsed() >= ANSWER_WITHIN {
+    let result = if elapsed(started) >= ANSWER_WITHIN {
         Err(InstallError::Malformed(
             "the takeover install did not answer within 2 s".into(),
         ))

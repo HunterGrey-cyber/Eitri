@@ -61,7 +61,7 @@ return state ~= nil and state.seq[(...)] ~= nil
 ";
 
 /// Keeps nvim busy while the test queues behind it.
-const HOLD_NVIM: &str = "vim.uv.sleep(...)";
+const HOLD_NVIM: &str = "local ready, fifo = ...; vim.fn.writefile({'ready'}, ready); vim.fn.readfile(fifo)";
 
 /// The same editor under whatever number the test gives it, as a restart would change it.
 struct Retargeted<'a> {
@@ -221,12 +221,17 @@ impl Session {
         assert_eq!(self.buffers(), 0);
     }
 
-    /// Goes on ticking for longer than a poll takes, and says what came of it.
+    /// Samples request turns, with a same-link barrier before every poll of the host's answers.
     fn settled(&mut self) -> Vec<(ConnId, RpcId, ToolAnswer)> {
-        let until = Instant::now() + Duration::from_millis(250);
-        while Instant::now() < until {
-            self.tick();
-            std::thread::sleep(STEP);
+        let mut clock = Instant::now();
+        for _ in 0..20 {
+            self.link
+                .exec_lua("return true", vec![])
+                .wait(PATIENCE)
+                .expect("the editor barrier")
+                .unwrap();
+            clock += Duration::from_millis(100);
+            self.host.tick(&self.link, clock, &mut self.out);
         }
         answered(std::mem::take(&mut self.out))
     }
@@ -433,7 +438,20 @@ fn accept_goes_on_as_the_edited_lines() {
 #[ignore = "needs a real nvim on PATH"]
 fn a_late_close_still_closes() {
     let mut session = start("late");
-    let _held = session.link.exec_lua(HOLD_NVIM, vec![Value::from(400)]);
+    let fifo = session.dir.join("release");
+    let name = std::ffi::CString::new(fifo.to_str().unwrap()).unwrap();
+    // SAFETY: the path is NUL-terminated and remains live for the call.
+    assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+    let ready = session.dir.join("held");
+    let _held = session.link.exec_lua(
+        HOLD_NVIM,
+        vec![ready.to_str().unwrap().into(), fifo.to_str().unwrap().into()],
+    );
+    let guard = Instant::now() + PATIENCE;
+    while !ready.exists() {
+        assert!(Instant::now() < guard, "the editor never entered its hold");
+        std::thread::yield_now();
+    }
     let open = session.open_diff(1, 1, "tab");
     session.event(open);
     // The host gives up on the open while nvim is still held: the open and then the close run after that.
@@ -442,6 +460,7 @@ fn a_late_close_still_closes() {
     let answers = answered(std::mem::take(&mut session.out));
     assert_eq!(answers.len(), 1, "{answers:?}");
     assert!(matches!(answers[0].2, ToolAnswer::Error(_)));
+    std::fs::write(&fifo, b"").unwrap();
     session.until("the open to run", |session| session.scope_ran(1));
     session.nothing_left();
     assert_eq!(session.settled(), vec![]);

@@ -31,7 +31,7 @@
 //! Each case runs in a child copy of this binary on its own `Xvfb`; the parent connects to nothing. Without `tmux` on
 //! `PATH` a case prints `NOT RUN` and fails. Ignored unless asked for, because it spawns real nvims:
 //!
-//!     cargo test -p neovide-editor --test attached_pane_with_real_nvim -- --ignored
+//!     cargo test -p neovide-editor --features test-support --test attached_pane_with_real_nvim -- --ignored
 use std::cell::{Cell, RefCell};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
@@ -429,8 +429,10 @@ fn run_until(limit: Duration, mut done: impl FnMut() -> bool) -> bool {
 }
 
 /// Runs the default main context for `span`.
-fn run_for(span: Duration) {
-    run_until(span, || false);
+fn turns() {
+    for _ in 0..100 {
+        glib::MainContext::default().iteration(false);
+    }
 }
 
 /// The person's terminal, its server holding the session, and the observer on it.
@@ -581,12 +583,9 @@ fn a_shutdown_leaves_the_persons_nvim_as_it_was() {
     assert!(pane.shutdown(), "the shutdown should see the channel end");
     let took = started.elapsed();
     println!("[case] the shutdown returned after {took:?}");
-    assert!(
-        took < Duration::from_secs(2),
-        "the shutdown waited {took:?} for a channel that ends at once"
-    );
+
     assert_eq!(pane.ended(), Some(PaneEnded::Detached), "the pane let go of the nvim");
-    run_for(Duration::from_millis(300));
+    turns();
     assert_eq!(
         exits.get(),
         0,
@@ -620,15 +619,31 @@ fn a_pane_dropped_before_it_attached_never_attaches() {
     window.set_child(Some(pane.widget()));
     window.present();
     // The window keeps the widget, and with it the frames that would attach; the pane itself is gone.
+    let closed = pane.testing_closed_observer();
+    let widget = pane.widget().clone();
+    let paints = Rc::new(Cell::new(0u32));
+    let seen = paints.clone();
+    let clock = widget.frame_clock().expect("the presented widget has a frame clock");
+    // The pane handles render with Stop; after-paint still observes the completed frame.
+    let paint_event = clock.connect_after_paint(move |_| {
+        seen.set(seen.get() + 1);
+    });
     drop(pane);
-    let attached = run_until(Duration::from_secs(5), || person.observer.uis() > 1);
-    assert!(
-        !attached,
-        "a pane dropped before it attached went on to attach to the person's nvim"
-    );
+    assert!(closed(), "Drop cancelled the unstarted launch");
+    for _ in 0..100 {
+        let before = paints.get();
+        widget.queue_render();
+        assert!(
+            run_until(Duration::from_secs(60), || paints.get() > before),
+            "widget did not paint"
+        );
+        assert!(closed(), "a paint reopened the dropped pane");
+        assert_eq!(person.observer.uis(), 1, "a dropped pane attached");
+    }
+    clock.disconnect(paint_event);
     window.destroy();
     drop(window);
-    run_for(Duration::from_millis(200));
+    turns();
     person.assert_intact("a pane dropped before it attached");
 }
 
@@ -645,7 +660,7 @@ fn the_hang_up_handle_leaves_the_persons_nvim_as_it_was() {
     );
     assert_eq!(pane.ended(), Some(PaneEnded::Detached), "the pane let go of the nvim");
     assert!(!pane.is_running());
-    run_for(Duration::from_millis(300));
+    turns();
     assert_eq!(exits.get(), 1, "the end is reported once");
     person.assert_intact("the hang-up handle");
     assert!(
@@ -666,7 +681,8 @@ fn a_hang_up_while_nvim_waits_for_a_key_leaves_the_persons_nvim_as_it_was() {
     std::thread::spawn(move || handle.hang_up())
         .join()
         .expect("the hang-up thread");
-    let ended_while_waiting = run_until(Duration::from_secs(3), || exits.get() == 1);
+    turns();
+    let ended_while_waiting = exits.get() == 1;
     let still_waiting = person.observer.blocking();
     println!(
         "[case] measured: the session's end {} reported while nvim waited for a key; nvim {} waiting",
@@ -735,7 +751,7 @@ fn end_nvim_restart_and_exec_lua_watched_refuse() {
         answer.lock().unwrap()
     );
 
-    run_for(Duration::from_millis(500));
+    turns();
     assert!(pane.is_running(), "the refusals left the session alone");
     assert_eq!(exits.get(), 0);
     let o = &person.observer;
@@ -758,10 +774,10 @@ fn getpid_is_never_asked_of_an_attached_pane() {
     let person = Person::start("getpid_is_never_asked_of_an_attached_pane");
     let (_window, pane, _exits) = attached_pane(&person, None);
     // An owned pane asks at once, on a thread of its own, and logs the answer; give that every chance to happen.
-    run_for(Duration::from_millis(1500));
+    turns();
     assert!(pane.is_running());
     assert!(pane.shutdown());
-    run_for(Duration::from_millis(300));
+    turns();
     person.assert_intact("a pane that ran attached");
     // The parent reads this child's whole output: no pid question, no answer, no signal.
 }

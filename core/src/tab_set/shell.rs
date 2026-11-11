@@ -352,22 +352,29 @@ mod tests {
     #[test]
     fn a_report_waits_out_a_turn_the_cli_started_while_the_line_ran() {
         let mut f = Fixture::new("shell-line-cli-turn");
-        f.line("!echo MARK; sleep 0.2").unwrap();
+        let finish = f.dir.join("finish");
+        let line = format!("!echo MARK; while [ ! -e '{}' ]; do sleep 0.02; done", finish.display());
+        f.line(&line).unwrap();
         f.start_turn();
+        std::fs::write(&finish, b"").unwrap();
         let ended = f.ended();
         assert!(ended.flush.is_none());
         assert!(f.provider.turns().is_empty());
         f.end_turn();
         assert!(f.set.flush_queue(f.tab).expect("it goes now").outcome.is_ok());
-        assert_eq!(f.rows().0, ["!echo MARK; sleep 0.2"], "its row was shown once");
+        assert_eq!(f.rows().0, [line], "its row was shown once");
     }
 
     #[test]
     fn stopping_a_line_starts_no_turn_and_puts_it_back() {
         let mut f = Fixture::new("shell-line-stop");
         let began = f.dir.join("began");
-        let line = format!("!echo PART; touch {}; sleep 20", began.display());
+        let line = format!(
+            "!echo PART; touch {}; i=0; while [ $i -lt 500 ]; do i=$((i+1)); sleep 0.02; done",
+            began.display()
+        );
         f.line(&line).unwrap();
+        let _cleanup = crate::shell_line::tests::GroupCleanup::new(&f.set.shells.running[&f.tab.0]);
         let deadline = Instant::now() + Duration::from_secs(10);
         while !began.exists() {
             assert!(Instant::now() < deadline, "the line never began");
@@ -410,15 +417,38 @@ mod tests {
     #[test]
     fn a_tab_that_goes_kills_its_line() {
         let mut f = Fixture::new("shell-line-close");
-        let marker = f.dir.join("late");
-        f.line(&format!("!sleep 1; touch {}", marker.display())).unwrap();
+        let pid_file = f.dir.join("pid");
+        f.line(&format!(
+            "!echo $$ > {}; i=0; while [ $i -lt 500 ]; do i=$((i+1)); sleep 0.02; done; touch survived",
+            pid_file.display()
+        ))
+        .unwrap();
+        let _cleanup = crate::shell_line::tests::GroupCleanup::new(&f.set.shells.running[&f.tab.0]);
+        let deadline = Instant::now() + Duration::from_secs(60);
+        let pid = loop {
+            if let Ok(pid) = std::fs::read_to_string(&pid_file)
+                .unwrap_or_default()
+                .trim()
+                .parse::<u32>()
+            {
+                break pid;
+            }
+            assert!(Instant::now() < deadline, "the shell never recorded its pid");
+            std::thread::yield_now();
+        };
         let tab = f.tab;
         let removed = f.set.remove(tab).expect("the tab goes");
         drop(removed);
         f.set.poll_shell_lines();
         assert!(!f.set.shell_line_runs(tab));
-        std::thread::sleep(Duration::from_millis(1300));
-        assert!(!marker.exists());
+        while agent::process_probe::pid_is_alive(pid) {
+            assert!(Instant::now() < deadline, "the removed tab's shell was not reaped");
+            std::thread::yield_now();
+        }
+        assert!(
+            !f.dir.join("survived").exists(),
+            "removing the tab kills the line before its natural end"
+        );
     }
 
     #[test]
@@ -477,7 +507,9 @@ mod tests {
     #[test]
     fn a_message_sent_while_a_line_runs_waits_for_it() {
         let mut f = Fixture::new("shell-line-holds-a-send");
-        f.line("!sleep 0.3").unwrap();
+        let finish = f.dir.join("finish");
+        f.line(&format!("!while [ ! -e '{}' ]; do sleep 0.02; done", finish.display()))
+            .unwrap();
         let turn = FirstTurn {
             wire: "words".into(),
             typed: "words".into(),
@@ -490,6 +522,7 @@ mod tests {
         ));
         assert!(f.provider.turns().is_empty());
         assert_eq!(f.set.get(f.tab).unwrap().session.queue.len(), 1);
+        std::fs::write(&finish, b"").unwrap();
         assert!(f.ended().flush.expect("the report").outcome.is_ok());
         assert!(f.provider.turns()[0].starts_with("<bash-input>"));
     }

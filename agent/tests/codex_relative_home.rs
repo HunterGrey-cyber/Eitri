@@ -3,11 +3,10 @@
 //! that name would become the user's configuration. The start is refused before the per-binary check or
 //! the session's child runs anything.
 //!
-//! The variable is set on this test process, so this file holds one test and nothing else reads it.
+//! The inherited variable is supplied to a fresh child test process.
 
 use agent::providers::codex::{CodexLaunch, CodexProvider};
 use agent::{ProviderError, ProviderErrorCode};
-use std::os::unix::fs::PermissionsExt;
 
 #[test]
 fn an_inherited_relative_codex_home_refuses_the_start_before_the_check_runs() {
@@ -19,16 +18,22 @@ fn an_inherited_relative_codex_home_refuses_the_start_before_the_check_runs() {
     std::fs::create_dir_all(&dir).unwrap();
     let marker = dir.join("ran");
     let program = dir.join("codex");
-    std::fs::write(&program, format!("#!/bin/sh\ntouch '{}'\nexit 1\n", marker.display())).unwrap();
-    std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
+    script_fixture::write_executable_script(
+        &program,
+        format!("#!/bin/sh\ntouch '{}'\nexit 1\n", marker.display()),
+        0o755,
+    )
+    .unwrap();
 
-    std::env::set_var("CODEX_HOME", ".codex");
+    if !agent::testkit::environment::in_child(&[("CODEX_HOME", Some(std::ffi::OsStr::new(".codex")))]) {
+        std::fs::remove_dir_all(&dir).unwrap();
+        return;
+    }
     let result = CodexProvider::connect(CodexLaunch {
         program,
         cwd: dir.clone(),
         state_home: dir.clone(),
     });
-    std::env::remove_var("CODEX_HOME");
 
     match result {
         Err(ProviderError::Provider { code, message }) => {
@@ -43,4 +48,9 @@ fn an_inherited_relative_codex_home_refuses_the_start_before_the_check_runs() {
     }
     assert!(!marker.exists(), "the self-check or the session ran a child");
     std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[cfg(test)]
+mod script_fixture {
+    include!(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/support/executable.rs"));
 }

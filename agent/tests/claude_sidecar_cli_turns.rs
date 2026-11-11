@@ -404,7 +404,7 @@ fn a_send_carries_the_prompts_client_id_and_the_typed_mark_only_where_the_sideca
         provider
             .send_turn(SendTurnRequest {
                 session_id: session.clone(),
-                text: "sleep 3000; end".to_string(),
+                text: "ask hold; end".to_string(),
             })
             .expect("the turn is taken");
         let turn = started(&provider);
@@ -471,7 +471,7 @@ fn a_mention_reaches_the_cli_as_one_only_in_what_a_person_typed() {
     provider
         .send_turn(SendTurnRequest {
             session_id: session.clone(),
-            text: "sleep 3000; end".to_string(),
+            text: "ask hold; end".to_string(),
         })
         .expect("the turn is taken");
     let turn = started(&provider);

@@ -266,9 +266,12 @@ fn a_handoff_that_never_appears_answers_none_after_its_wait() {
     let writer = RecordWriter::start(file.clone(), root(), Some(rec("a.rs")));
     let waited = Duration::from_millis(200);
     let asked = Instant::now();
+    *writer.shared().handoff_clock.lock().unwrap() = Some((asked, 0));
     writer.read_handoff(1, T1.to_string(), channel.join(format!("reopen-out-{T1}.json")), waited);
     assert!(writer.flush(LONG));
-    assert!(asked.elapsed() >= waited, "it waits for the file");
+    let (now, turns) = writer.shared().handoff_clock.lock().unwrap().unwrap();
+    assert_eq!(now, asked + waited, "it waits for the entire allowance");
+    assert!(turns > 1, "a missing file is polled again before giving up");
     assert_eq!(handoffs(&writer.take_answers()), [(T1.to_string(), None)]);
     assert_eq!(on_disk(&file), None, "the timed record, here none, stands");
 }
@@ -360,9 +363,17 @@ fn flush_returns_true_when_the_queue_drains_and_false_at_its_bound() {
     writer.offer(1, rec("a.rs"), false);
     assert!(writer.flush(LONG));
     assert_eq!(on_disk(&file), Some(rec("a.rs")));
+    let (entered, inside) = std::sync::mpsc::channel();
+    let (release, held) = std::sync::mpsc::channel();
+    *writer.shared().handoff_clock.lock().unwrap() = Some((Instant::now(), 0));
+    *writer.shared().handoff_park.lock().unwrap() = Some((entered, held));
     writer.read_handoff(2, T1.to_string(), channel.join(format!("reopen-out-{T1}.json")), LONG);
+    inside
+        .recv_timeout(Duration::from_secs(60))
+        .expect("writer entered the handoff wait");
     assert!(!writer.flush(Duration::from_millis(50)), "a handoff still awaited");
     put_handoff(&channel, T1, &rec("b.rs"), false);
+    release.send(()).unwrap();
     assert!(writer.flush(LONG));
     assert_eq!(on_disk(&file), Some(rec("b.rs")));
 }

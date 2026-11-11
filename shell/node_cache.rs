@@ -2,13 +2,6 @@ use std::ffi::OsString;
 use std::path::Path;
 use std::process::Command;
 
-pub(crate) fn out_dir() -> std::path::PathBuf {
-    std::env::var_os("OUT_DIR")
-        .or_else(|| option_env!("OUT_DIR").map(OsString::from))
-        .expect("Cargo supplies OUT_DIR")
-        .into()
-}
-
 /// Node tooling shares a cache under Cargo's target instead of leaving one in each run's TMPDIR.
 pub(crate) fn command(program: impl AsRef<std::ffi::OsStr>, out_dir: &Path) -> Command {
     command_with_env(program, out_dir, |key| std::env::var_os(key))

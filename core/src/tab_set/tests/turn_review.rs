@@ -504,7 +504,19 @@ fn removing_a_running_tab_drops_its_running_file() {
     set.open(AgentId::Claude);
     let mut closed = set.remove(tab).unwrap();
     // Its backend may still be writing until its shutdown returns: the file stays until then.
-    std::thread::sleep(Duration::from_millis(100));
+    assert!(
+        closed.retired.is_some(),
+        "the running backend still owes its retirement"
+    );
+    assert_eq!(
+        set.presence
+            .as_ref()
+            .unwrap()
+            .applied()
+            .recv_timeout(Duration::from_secs(60))
+            .unwrap(),
+        crate::turn_review::Held::Yes
+    );
     assert_eq!(seen_from_elsewhere(&review), Some(Busy::TurnRunning { pid: 4242 }));
     if let Some(retired) = closed.retired.take() {
         retired.into_backend().shutdown();

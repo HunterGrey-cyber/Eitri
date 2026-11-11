@@ -355,6 +355,10 @@ const SHARED_LOCK_PAUSE: std::time::Duration = std::time::Duration::from_millis(
 /// start's exclusive lock in between; that one holds it only while it empties the file, so waiting a moment
 /// gets the shared lock. False once the tries run out or on any other error.
 pub fn hold_shared(fd: RawFd, tries: u32, pause: std::time::Duration) -> bool {
+    hold_shared_with(fd, tries, || std::thread::sleep(pause))
+}
+
+fn hold_shared_with(fd: RawFd, tries: u32, mut pause: impl FnMut()) -> bool {
     for n in 0..tries {
         // SAFETY: `flock` on a descriptor the caller keeps open for the call.
         if unsafe { libc::flock(fd, libc::LOCK_SH | libc::LOCK_NB) } == 0 {
@@ -364,7 +368,7 @@ pub fn hold_shared(fd: RawFd, tries: u32, pause: std::time::Duration) -> bool {
             return false;
         }
         if n + 1 < tries {
-            std::thread::sleep(pause);
+            pause();
         }
     }
     false
@@ -1119,6 +1123,7 @@ mod tests {
     /// holding the exclusive lock for its truncation asks again until it is let go.
     #[test]
     fn the_shared_lock_is_asked_for_again_while_another_start_truncates() {
+        let _quiet = crate::spawn_gate::quiet();
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("log");
         std::fs::write(&path, "").unwrap();
@@ -1134,12 +1139,18 @@ mod tests {
             !hold_shared(ours.as_raw_fd(), 1, pause),
             "one ask is refused while it truncates"
         );
-        let release = std::thread::spawn(move || {
-            std::thread::sleep(std::time::Duration::from_millis(100));
-            drop(theirs);
-        });
-        assert!(hold_shared(ours.as_raw_fd(), 400, pause), "asking again gets it");
-        release.join().unwrap();
+        let mut theirs = Some(theirs);
+        let mut pauses = 0;
+        assert!(
+            hold_shared_with(ours.as_raw_fd(), 3, || {
+                pauses += 1;
+                if pauses == 2 {
+                    drop(theirs.take());
+                }
+            }),
+            "asking again gets it"
+        );
+        assert_eq!(pauses, 2, "two refusals before the shared lock is taken");
     }
 
     #[test]
@@ -1154,9 +1165,9 @@ mod tests {
             unsafe { libc::flock(theirs.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
             0
         );
-        let started = std::time::Instant::now();
-        assert!(!hold_shared(ours.as_raw_fd(), 3, std::time::Duration::from_millis(1)));
-        assert!(started.elapsed() < std::time::Duration::from_secs(1));
+        let mut pauses = 0;
+        assert!(!hold_shared_with(ours.as_raw_fd(), 3, || pauses += 1));
+        assert_eq!(pauses, 2, "three attempts, with a pause only between attempts");
     }
 
     /// A log left at a mode nobody can read (a umask of 0477 makes one) is repaired at the start, not given up

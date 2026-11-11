@@ -20,6 +20,10 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+#[path = "support/script_gate.rs"]
+mod script_gate;
+use script_gate::{until, ScriptGate};
+
 const UA: &str = "eitri-probe/0.161.0 (Arch Linux Rolling Release; x86_64) tmux-256color (eitri-probe; 0)";
 
 // ---------------------------------------------------------------- the stand-in and its log
@@ -132,10 +136,6 @@ fn write(message: Value) -> Value {
     json!({ "write": message.to_string() })
 }
 
-fn sleep_ms(ms: u64) -> Value {
-    json!({ "sleep_ms": ms })
-}
-
 fn item_started(thread: &str, turn: &str, item: Value) -> Value {
     write(json!({"method": "item/started", "params": {"threadId": thread, "turnId": turn, "item": item}}))
 }
@@ -243,7 +243,9 @@ fn running(dir: &Path, thread: &str, turn: &str, rest: Vec<Value>) -> CodexProvi
 
 /// Freezes `source`, carries both records through JSON, and adopts and commits them in a new provider.
 fn moved(source: &CodexProvider) -> CodexProvider {
-    let (handoff, link, fds) = source.freeze_for_move().expect("the provider freezes");
+    let (handoff, link, fds) = source
+        .freeze_with_clock_for_tests(Instant::now, |_| panic!("a settled provider must not wait for a start"))
+        .expect("the provider freezes");
     let handoff: CodexProviderHandoff =
         serde_json::from_str(&serde_json::to_string(&handoff).expect("the provider's record is data"))
             .expect("the provider's record reads back");
@@ -360,6 +362,7 @@ fn a_codex_turn_with_an_approval_pending_completes_after_adoption() {
 
 #[test]
 fn an_interrupt_sent_just_before_the_freeze_resolves_after_adoption() {
+    let gate = ScriptGate::new();
     let dir = scratch("interrupt");
     let (thread, turn) = ("th-m2", "tu-m2");
     let source = running(
@@ -369,7 +372,7 @@ fn an_interrupt_sent_just_before_the_freeze_resolves_after_adoption() {
         vec![
             expect_request(5, "turn/interrupt"),
             // The refusal comes once the source has stopped reading.
-            sleep_ms(400),
+            gate.step(),
             write(json!({"id": 5, "error": {"code": -32600, "message": "no active turn to interrupt"}})),
             // Only a provider that read the refusal sends the interrupt again, under the next id.
             expect_request(6, "turn/interrupt"),
@@ -385,8 +388,14 @@ fn an_interrupt_sent_just_before_the_freeze_resolves_after_adoption() {
             session_id: thread.to_string(),
         })
         .expect("the interrupt is sent");
+    gate.wait();
     let destination = moved(&source);
-    let after = pump_until(&destination, |events| completed(events).is_some());
+    destination.pause_time_for_tests();
+    gate.release();
+    until(|| destination.lines_read_for_tests() >= 1);
+    let mut after = destination.pump();
+    destination.advance_time_for_tests(Duration::from_millis(100));
+    after.extend(pump_until(&destination, |events| completed(events).is_some()));
     assert_eq!(completed(&after), Some(TurnOutcome::Interrupted));
     close(&destination, thread);
 
@@ -405,6 +414,8 @@ fn an_interrupt_sent_just_before_the_freeze_resolves_after_adoption() {
 
 #[test]
 fn a_steer_answer_read_after_the_last_pump_reaches_the_destination_once() {
+    let answer = ScriptGate::new();
+    let end = ScriptGate::new();
     let dir = scratch("steer");
     let (thread, turn) = ("th-m3", "tu-m3");
     let source = running(
@@ -414,10 +425,10 @@ fn a_steer_answer_read_after_the_last_pump_reaches_the_destination_once() {
         vec![
             expect_request(5, "turn/steer"),
             // After the source's last pump, before its link stops.
-            sleep_ms(200),
+            answer.step(),
             write(json!({"id": 5, "error": {"code": -32000, "message": "not now"}})),
             // Only once the move is over.
-            sleep_ms(1500),
+            end.step(),
             turn_completed(thread, turn, "completed"),
         ],
     );
@@ -435,8 +446,12 @@ fn a_steer_answer_read_after_the_last_pump_reaches_the_destination_once() {
         .expect("the message is sent");
     let last_pump = source.pump();
     // The answer is read off the pipe into the source's waiting slot, and nobody looks at it there.
-    std::thread::sleep(Duration::from_millis(700));
+    answer.wait();
+    answer.release();
+    end.wait();
+    until(|| source.lines_read_for_tests() >= 5);
     let destination = moved(&source);
+    end.release();
     let after = pump_until(&destination, |events| completed(events).is_some());
     let dropped = |events: &[AgentDomainEvent]| {
         events
@@ -462,6 +477,7 @@ fn a_steer_answer_read_after_the_last_pump_reaches_the_destination_once() {
 
 #[test]
 fn an_interrupt_deadline_runs_out_in_the_destination_only_after_the_commit() {
+    let gate = ScriptGate::new();
     let dir = scratch("deadline");
     let (thread, turn) = ("th-m9", "tu-m9");
     let source = running(
@@ -473,27 +489,55 @@ fn an_interrupt_deadline_runs_out_in_the_destination_only_after_the_commit() {
             write(json!({"id": 5, "result": {}})),
             // The turn ends later than the interrupt's grace counted from the interrupt, but within it
             // counted from the commit.
-            sleep_ms(4500),
+            gate.step(),
             turn_completed(thread, turn, "interrupted"),
         ],
     );
     pump_until(&source, |events| {
         events.iter().any(|e| matches!(e, AgentDomainEvent::TurnStarted { .. }))
     });
+    let interrupted_at = source.pause_time_for_tests();
     source
         .interrupt_turn(InterruptTurnRequest {
             session_id: thread.to_string(),
         })
         .expect("the interrupt is sent");
-    let (handoff, link, fds) = source.freeze_for_move().expect("the provider freezes");
+    let remaining = source
+        .interrupt_deadline_for_tests()
+        .unwrap()
+        .duration_since(interrupted_at);
+    let (handoff, link, fds) = source
+        .freeze_with_clock_for_tests(Instant::now, |_| panic!("a settled provider must not wait for a start"))
+        .expect("the provider freezes");
     let destination = CodexProvider::adopt(handoff, link, fds).expect("the destination adopts");
     // Pumped past the grace before the commit: nothing is read meanwhile, so nothing may run out.
-    let until = Instant::now() + agent::providers::codex::provider::INTERRUPT_SETTLE + Duration::from_millis(500);
-    while Instant::now() < until {
-        before_commit(&destination);
-        std::thread::sleep(Duration::from_millis(50));
-    }
+    let paused = destination.pause_time_for_tests();
+    let parked_for = agent::providers::codex::provider::INTERRUPT_SETTLE + Duration::from_millis(500);
+    destination.advance_time_for_tests(parked_for);
+    before_commit(&destination);
     destination.commit().expect("the adopted link starts");
+    gate.wait();
+    assert_eq!(
+        destination
+            .interrupt_deadline_for_tests()
+            .unwrap()
+            .checked_duration_since(paused + parked_for),
+        Some(remaining),
+        "commit rebases the live deadline before the child can finish the turn"
+    );
+    let gated = destination.pump();
+    assert!(
+        !gated.iter().any(|e| matches!(
+            e,
+            AgentDomainEvent::SessionUnavailable { .. } | AgentDomainEvent::TurnCompleted { .. }
+        )),
+        "the rebased interrupt deadline is still live while turn completion is held: {gated:#?}"
+    );
+    assert!(
+        !destination.closed_for_tests(),
+        "the rebased deadline did not stop the session"
+    );
+    gate.release();
     let after = pump_until(&destination, |events| completed(events).is_some());
     assert_eq!(completed(&after), Some(TurnOutcome::Interrupted), "{after:#?}");
     assert!(
@@ -541,7 +585,7 @@ fn a_provider_that_is_stopping_refuses_the_move() {
         .stop_background(thread, shown, &[])
         .expect("the background is stopped");
     let refused = source
-        .freeze_for_move()
+        .freeze_with_clock_for_tests(Instant::now, |_| panic!("this refusal must not wait for a start"))
         .map(|_| ())
         .expect_err("a stopping provider does not freeze");
     assert_eq!(refused, MoveRefusedWhy::Stopping);
@@ -556,9 +600,10 @@ fn a_provider_that_is_stopping_refuses_the_move() {
 
 #[test]
 fn a_turn_start_unanswered_for_two_seconds_refuses_the_move_and_the_turn_goes_on() {
+    let gate = ScriptGate::new();
     let dir = scratch("starting");
     let (thread, turn) = ("th-m5", "tu-m5");
-    let mut rest = vec![expect_request(4, "turn/start"), sleep_ms(3000)];
+    let mut rest = vec![expect_request(4, "turn/start"), gate.step()];
     rest.push(write(json!({"id": 4, "result": {"turn": {
         "id": turn, "items": [], "itemsView": "notLoaded", "status": "inProgress", "error": null,
     }}})));
@@ -568,17 +613,24 @@ fn a_turn_start_unanswered_for_two_seconds_refuses_the_move_and_the_turn_goes_on
         let source = Arc::clone(&source);
         std::thread::spawn(move || send(&source, thread))
     };
-    std::thread::sleep(Duration::from_millis(200));
-    let asked = Instant::now();
+    gate.wait();
+    let start = Instant::now();
+    let clock = std::cell::Cell::new(start);
+    let pauses = std::cell::Cell::new(0);
     let refused = source
-        .freeze_for_move()
+        .freeze_with_clock_for_tests(
+            || clock.get(),
+            |by| {
+                pauses.set(pauses.get() + 1);
+                assert!(pauses.get() <= 201, "start wait ignored its deadline");
+                clock.set(clock.get() + by);
+            },
+        )
         .map(|_| ())
         .expect_err("a turn still starting holds the move");
     assert_eq!(refused, MoveRefusedWhy::Starting);
-    assert!(
-        asked.elapsed() >= Duration::from_secs(2),
-        "the freeze waited for the start's answer first"
-    );
+    assert_eq!(clock.get() - start, Duration::from_secs(2));
+    gate.release();
     assert_eq!(
         sender.join().expect("the sender"),
         turn,
@@ -609,9 +661,13 @@ fn an_idle_tab_moves_and_its_next_turn_starts_in_the_destination() {
     );
     pump_until(&source, |events| completed(events).is_some());
     // An idle agent writes nothing more; the freeze stops its reader anyway.
-    let asked = Instant::now();
+    let probe = source.reader_wait_probe_for_tests();
+    until(|| probe.waiting());
     let destination = moved(&source);
-    assert!(asked.elapsed() < Duration::from_secs(1), "an idle tab freezes at once");
+    assert!(
+        probe.stopped_on_signal(),
+        "the idle reader stops on its stop fd, without a polling deadline"
+    );
     assert_eq!(send(&destination, thread), "tu-m7b");
     let after = pump_until(&destination, |events| completed(events).is_some());
     assert_eq!(completed(&after), Some(TurnOutcome::Completed));
@@ -650,7 +706,9 @@ fn a_move_given_back_before_its_commit_leaves_the_source_as_it_was() {
             _ => None,
         })
         .expect("a card");
-    let (handoff, link, fds) = source.freeze_for_move().expect("the provider freezes");
+    let (handoff, link, fds) = source
+        .freeze_with_clock_for_tests(Instant::now, |_| panic!("a settled provider must not wait for a start"))
+        .expect("the provider freezes");
     // A destination that took the records up and was dropped before the commit wrote nothing.
     let (h2, l2) = (
         serde_json::to_value(&handoff).unwrap(),

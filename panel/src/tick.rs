@@ -1102,19 +1102,15 @@ mod tests {
         handle.set_typing_cadence(Some(2));
         handle.set_editor_has_keys(true);
         let at = std::time::Instant::now();
+        let clock = crate::panel_pacer::TestClock::new(at);
         handle.take_wake(at);
         handle.run_tick(at);
         handle.note_editor_key();
-        let due = handle
-            .take_wake(std::time::Instant::now())
-            .expect("the first key wakes the tick");
+        let due = handle.take_wake(at).expect("the first key wakes the tick");
         handle.note_editor_key();
-        assert_eq!(
-            handle.take_wake(std::time::Instant::now()),
-            None,
-            "a later key does not"
-        );
+        assert_eq!(handle.take_wake(at), None, "a later key does not");
         let sent = page.sent.borrow().len();
+        clock.set(due);
         let NextTick::At(end) = handle.run_tick(due) else {
             panic!("the window's end is due")
         };
@@ -1122,8 +1118,8 @@ mod tests {
             page.sent.borrow()[sent..].iter().any(|p| p.contains("\"typing\":true")),
             "the page was told"
         );
-        assert!(end > due && end <= std::time::Instant::now() + eitri_core::panel_cadence::TYPING_WINDOW);
-        std::thread::sleep(end.saturating_duration_since(std::time::Instant::now()));
+        assert_eq!(end, at + eitri_core::panel_cadence::TYPING_WINDOW);
+        clock.set(end);
         let next = handle.run_tick(end);
         assert!(
             page.sent.borrow().iter().any(|p| p.contains("\"typing\":false")),
@@ -1796,7 +1792,6 @@ mod tests {
     fn tick_a_few(handle: &AgentPanelHandle) {
         for _ in 0..4 {
             handle.tick();
-            std::thread::sleep(std::time::Duration::from_millis(5));
         }
     }
 
@@ -1960,11 +1955,12 @@ mod tests {
             usage: None,
             detail: Default::default(),
         });
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
-        while std::time::Instant::now() < deadline {
-            handle.tick();
-            std::thread::sleep(std::time::Duration::from_millis(5));
-        }
+        tick_handle_until(&handle, "the review hint", || {
+            page.sent
+                .borrow()
+                .iter()
+                .any(|p| serde_json::from_str::<serde_json::Value>(p).unwrap()["kind"] == "review_hint")
+        });
         let sent = page.sent.borrow();
         let kinds: Vec<serde_json::Value> = sent.iter().map(|p| serde_json::from_str(p).unwrap()).collect();
         let ended = kinds

@@ -209,6 +209,32 @@ pub(crate) fn watch_priority() -> Option<std::ffi::c_int> {
     REGISTRY.with(|registry| registry.borrow().watch.as_ref().and_then(fd_watch::source_priority))
 }
 
+#[cfg(feature = "test-support")]
+pub(crate) fn hold_watch() -> impl FnOnce() {
+    let fd = REGISTRY.with(|registry| {
+        let mut registry = registry.borrow_mut();
+        assert!(registry.watch.is_some(), "a live shared watch");
+        // The last settling render may have queued a sweep even though every pane is idle.
+        // Cancel that old work too; a pump after the hold must still be able to queue a new sweep.
+        registry.stand_down();
+        registry
+            .panes
+            .iter()
+            .find_map(Weak::upgrade)
+            .expect("a registered pane")
+            .fd
+    });
+    move || {
+        let context = glib::MainContext::default();
+        let _held = context.acquire().expect("the watch's thread owns the context");
+        REGISTRY.with(|registry| {
+            let mut registry = registry.borrow_mut();
+            assert!(registry.watch.is_none());
+            registry.watch = Some(fd_watch::add_event_loop_watch(fd, on_wake).expect("the owning thread"));
+        });
+    }
+}
+
 fn on_wake(condition: glib::IOCondition) -> glib::ControlFlow {
     if condition.intersects(glib::IOCondition::ERR | glib::IOCondition::HUP | glib::IOCondition::NVAL) {
         let drivers = REGISTRY.with(|registry| {
@@ -265,6 +291,64 @@ mod tests {
             .acquire()
             .expect("tests that run the default main context take DEFAULT_CONTEXT_TEST_LOCK first");
         body()
+    }
+
+    #[cfg(feature = "test-support")]
+    #[test]
+    fn a_held_watch_is_restored_between_main_context_dispatches() {
+        use std::os::fd::AsRawFd;
+
+        let _serial = crate::DEFAULT_CONTEXT_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (read, _write) = std::io::pipe().unwrap();
+        let driver = Rc::new(TickDriver::default());
+        let pane = PaneLive::new(read.as_raw_fd(), &driver);
+        let context = glib::MainContext::default();
+        {
+            let _held = context.acquire().unwrap();
+            register(Rc::downgrade(&pane));
+        }
+        assert!(!context.is_owner(), "the caller is between dispatches");
+        let release = hold_watch();
+        assert!(!watching(), "no fd dispatch can precede the paint");
+        release();
+        assert_eq!(watch_priority(), Some(fd_watch::EVENT_LOOP_WATCH_PRIORITY));
+        unregister(Rc::as_ptr(&pane));
+        assert!(!watching());
+    }
+
+    #[cfg(feature = "test-support")]
+    #[test]
+    fn holding_the_watch_cancels_an_old_sweep_but_allows_the_next_pumps_sweep() {
+        use std::os::fd::AsRawFd;
+
+        owning_the_default_context(|| {
+            let (read, _write) = std::io::pipe().unwrap();
+            let driver = Rc::new(TickDriver::default());
+            let pane = PaneLive::new(read.as_raw_fd(), &driver);
+            register(Rc::downgrade(&pane));
+            after_outside_pump(None);
+            let context = glib::MainContext::default();
+            let old_source = REGISTRY.with(|r| context.find_source_by_id(r.borrow().sweep.as_ref().unwrap()).unwrap());
+            let release = hold_watch();
+            assert!(
+                old_source.is_destroyed(),
+                "the settling sweep could dispatch before paint"
+            );
+            assert!(REGISTRY.with(|r| r.borrow().sweep.is_none()));
+            after_outside_pump(None);
+            let new_source = REGISTRY.with(|r| context.find_source_by_id(r.borrow().sweep.as_ref().unwrap()).unwrap());
+            for _ in 0..100 {
+                if new_source.is_destroyed() {
+                    break;
+                }
+                context.iteration(false);
+            }
+            assert!(new_source.is_destroyed(), "the new pump's sweep must still dispatch");
+            release();
+            unregister(Rc::as_ptr(&pane));
+        });
     }
 
     #[test]

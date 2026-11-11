@@ -19,7 +19,7 @@ use std::os::unix::net::{UnixDatagram, UnixStream};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::rc::Rc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -330,6 +330,7 @@ struct Journal {
     got: Arc<Mutex<Vec<Vec<u8>>>>,
     stop: Arc<AtomicBool>,
     thread: Option<std::thread::JoinHandle<()>>,
+    barriers: Arc<AtomicU64>,
 }
 
 impl Journal {
@@ -341,12 +342,17 @@ impl Journal {
             .map_err(|e| e.to_string())?;
         let got = Arc::new(Mutex::new(Vec::new()));
         let stop = Arc::new(AtomicBool::new(false));
+        let barriers = Arc::new(AtomicU64::new(0));
         let thread = std::thread::spawn({
-            let (got, stop) = (got.clone(), stop.clone());
+            let (got, stop, barriers) = (got.clone(), stop.clone(), barriers.clone());
             move || {
                 let mut buf = vec![0u8; 64 * 1024];
                 while !stop.load(Ordering::SeqCst) {
                     if let Ok(n) = bound.recv(&mut buf) {
+                        if &buf[..n] == b"EITRI-TEST-BARRIER" {
+                            barriers.fetch_add(1, Ordering::SeqCst);
+                            continue;
+                        }
                         got.lock().unwrap().push(buf[..n].to_vec());
                     }
                 }
@@ -357,10 +363,24 @@ impl Journal {
             got,
             stop,
             thread: Some(thread),
+            barriers,
         })
     }
 
     fn datagrams(&self) -> Vec<Vec<u8>> {
+        let target = self.barriers.load(Ordering::SeqCst) + 1;
+        UnixDatagram::unbound()
+            .unwrap()
+            .send_to(b"EITRI-TEST-BARRIER", &self.socket)
+            .unwrap();
+        let deadline = Instant::now() + PATIENCE;
+        while self.barriers.load(Ordering::SeqCst) < target {
+            assert!(
+                Instant::now() < deadline,
+                "the journal did not drain its earlier datagrams"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
         self.got.lock().unwrap().clone()
     }
 
@@ -416,13 +436,11 @@ fn decode(mut bytes: &[u8]) -> Option<Vec<(String, Vec<u8>)>> {
 /// A directory with a `journalctl` that prints the lines of `<dir>/entries.jsonl` and nothing else, so
 /// `eitri remote log --verify` reads the test's journal and never the machine's. Its path.
 fn journalctl_stub(dir: &Path) -> Result<PathBuf, String> {
-    use std::os::unix::fs::PermissionsExt;
     let bin = dir.join("bin");
     std::fs::create_dir_all(&bin).map_err(|e| e.to_string())?;
     let script = bin.join("journalctl");
     let body = format!("#!/bin/sh\ncat '{}'\n", dir.join("entries.jsonl").display());
-    std::fs::write(&script, body).map_err(|e| e.to_string())?;
-    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).map_err(|e| e.to_string())?;
+    script_fixture::write_executable_script(&script, body, 0o755).map_err(|e| e.to_string())?;
     Ok(bin)
 }
 
@@ -672,7 +690,12 @@ impl Window {
 impl Drop for Window {
     fn drop(&mut self) {
         // As a window's close does: the socket goes with the panel.
-        let _watch = self.handle.shutdown();
+        let mut watch = self.handle.shutdown();
+        let deadline = Instant::now() + PATIENCE;
+        while watch.step(Instant::now()) {
+            assert!(Instant::now() < deadline, "the panel did not finish shutting down");
+            std::thread::sleep(Duration::from_millis(1));
+        }
         if let Some(publisher) = self.publisher.take() {
             publisher.stop();
         }
@@ -867,6 +890,7 @@ impl Phone {
         key: &RowKey,
         cmd: Value,
         logged: impl Fn() -> bool,
+        serve_logs: impl Fn() -> usize,
     ) -> Result<(Value, usize), String> {
         let until = Instant::now() + PATIENCE;
         let id = cmd["command_id"].as_str().unwrap_or_default().to_owned();
@@ -874,19 +898,25 @@ impl Phone {
         for attempt in 0.. {
             let mut cmd = cmd.clone();
             cmd["command_id"] = json!(format!("{id}-{attempt}"));
+            let before = serve_logs();
             let result = self.act(windows, key, cmd)?;
             if result["why"] != "no such tab" {
                 return Ok((result, by_serve));
             }
-            let settle = Instant::now() + Duration::from_secs(1);
-            while Instant::now() < settle {
+            while serve_logs() == before {
                 if logged() {
                     return Ok((result, by_serve));
                 }
                 for window in windows {
                     window.turn();
                 }
-                std::thread::sleep(Duration::from_millis(20));
+                if Instant::now() > until {
+                    return Err("neither writer recorded the act's refusal".into());
+                }
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            if logged() {
+                return Ok((result, by_serve));
             }
             by_serve += 1;
             if Instant::now() > until {
@@ -1021,12 +1051,10 @@ fn remote_off_writes_nothing(shell: &str, dir: &Path) -> Result<(), String> {
         window.tab(RecordingProvider::interruptible());
         for _ in 0..100 {
             window.turn();
-            std::thread::sleep(Duration::from_millis(2));
         }
     }
     let revoked = run(home.remote(shell, &["revoke", "nobody"]))?;
     check(revoked.code == Some(1), || format!("revoke: {}", revoked.says()))?;
-    std::thread::sleep(Duration::from_millis(300));
     check(!home.audit().exists(), || {
         format!("{} exists with remote control off", home.audit().display())
     })?;
@@ -1321,6 +1349,11 @@ fn the_audit_trail_end_to_end(shell: &str, dir: &Path) -> Result<(), String> {
             key,
             json!({ "type": "send", "command_id": id, "text": format!("{SENTINEL} {id}") }),
             logged,
+            || {
+                count(&records(&home), By::Serve, "refused", |r| {
+                    field(r, "reason") == "tab_not_live"
+                })
+            },
         )?;
         serve_refused += by_serve;
         result_refused(&refused, what)?;
@@ -1818,4 +1851,9 @@ fn the_audit_trail_end_to_end(shell: &str, dir: &Path) -> Result<(), String> {
     check(clean.code == Some(0) && clean.stdout.trim() == "clean", || {
         format!("verify after the log was put back: {}", clean.says())
     })
+}
+
+#[cfg(test)]
+mod script_fixture {
+    include!(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/support/executable.rs"));
 }

@@ -383,6 +383,15 @@ impl ReviewFlow {
             && self.live_is_idle()
     }
 
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn file_jobs_in_flight_for_tests(&self) -> bool {
+        !self.opens.is_empty()
+            || !self.redraws.is_empty()
+            || self.recovery_job.is_some()
+            || !self.live_jobs.is_empty()
+            || self.live_resolver.busy()
+    }
+
     /// The live drawings have nothing to follow, ask, run or hand out.
     pub fn live_is_idle(&self) -> bool {
         !self.live.wants_ticks()

@@ -283,8 +283,7 @@ fn attach_install_and_nvim_quit_reach_detached_and_cancel_drafts_once() {
     );
     assert_eq!(driver.band().text, "editor detached: run :EitriPanel to attach again");
     // A second of further polling must not ask again.
-    let until = Instant::now() + Duration::from_secs(1);
-    while Instant::now() < until {
+    for _ in 0..20 {
         if driver.poll(Instant::now()).cancel_drafts {
             cancels += 1;
         }
@@ -334,30 +333,30 @@ fn close_does_not_wait_for_a_blocked_nvim() {
         &mut cancels,
         |driver, _| matches!(driver.state(), LinkState::Attached { .. }).then_some(()),
     );
-    // Settled: the editor-context and keys snippets keep a timer for a moment after they load.
-    std::thread::sleep(Duration::from_millis(500));
+    poll("the glue is installed", TEARDOWN_WITHIN, || {
+        (footprint(&obs) != baseline).then_some(())
+    });
     assert_ne!(footprint(&obs), baseline, "the glue is installed");
 
     ui.keys("f");
     poll("nvim waiting for the character", Duration::from_secs(2), || {
         is_blocking(&obs).then_some(())
     });
-    let started = Instant::now();
     driver.shutdown();
-    let took = started.elapsed();
-    assert!(took < Duration::from_millis(50), "shutdown took {took:?}");
+    assert!(
+        is_blocking(&obs),
+        "shutdown returned while teardown was still queued behind the key"
+    );
     assert!(driver.is_shut());
 
     // While nvim waits, nothing is served: the glue cannot be seen going, and the request waits.
     let queued = obs.exec_lua(FOOTPRINT_LUA, vec![]);
-    let until = Instant::now() + Duration::from_secs(1);
-    while Instant::now() < until {
+    for _ in 0..20 {
         assert!(is_blocking(&obs), "nvim stopped waiting by itself");
         assert!(
             queued.try_take().is_none(),
             "a request was answered during the char-wait"
         );
-        std::thread::sleep(Duration::from_millis(100));
     }
 
     ui.keys("x");
@@ -401,8 +400,7 @@ fn a_page_install_pending_on_a_key_is_not_failed() {
             .then_some(())
         },
     );
-    let until = Instant::now() + Duration::from_secs(1);
-    while Instant::now() < until {
+    for _ in 0..20 {
         driver.poll(Instant::now());
         assert!(matches!(driver.state(), LinkState::Attaching { .. }));
         std::thread::sleep(Duration::from_millis(50));

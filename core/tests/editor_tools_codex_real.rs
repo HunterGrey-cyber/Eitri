@@ -894,14 +894,17 @@ fn a_steer_leaves_the_card_and_the_call_runs() {
     session.peer.call(method::TURN_STEER, params).expect("turn/steer");
 
     // A message into the running turn gives no call up, so no cancel comes and the card stays.
-    let settled = Instant::now() + Duration::from_millis(500);
-    let waited = drive(&mut session.peer, &mut rig, TURN_BUDGET, |p, rig| {
-        Instant::now() >= settled || !rig.cancelled.is_empty() || p.turn_status(&session.thread, &turn).is_some()
-    });
-    assert!(waited, "Codex stopped; stderr: {}", session.peer.stderr_tail());
-    assert!(rig.cancelled.is_empty(), "the steer cancelled the call");
-    assert_eq!(rig.broker.cards(TAB).len(), 1, "the steer took the card");
-    assert_eq!(session.peer.turn_status(&session.thread, &turn), None);
+    for _ in 0..20 {
+        session
+            .peer
+            .call("thread/read", json!({"threadId": session.thread, "includeTurns": true}))
+            .expect("thread/read barrier after steer");
+        session.peer.pump();
+        rig.service();
+        assert!(rig.cancelled.is_empty(), "the steer cancelled the call");
+        assert_eq!(rig.broker.cards(TAB).len(), 1, "the steer took the card");
+        assert_eq!(session.peer.turn_status(&session.thread, &turn), None);
+    }
 
     // The person's answer still counts: the call runs and the model reads its result.
     let card = rig.broker.cards(TAB).remove(0).id;

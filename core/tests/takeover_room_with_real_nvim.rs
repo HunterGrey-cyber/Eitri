@@ -39,6 +39,9 @@ impl Case {
     }
     /// `origin_name` makes the origin listen on one more address, and the room is told that one.
     fn start_at(moved: bool, origin_name: Option<&str>) -> Self {
+        Self::start_at_with_timers(moved, origin_name, false)
+    }
+    fn start_at_with_timers(moved: bool, origin_name: Option<&str>, manual: bool) -> Self {
         let tui = TmuxTui::start(&nvim());
         let (origin, origin_events) = NvimLink::connect(tui.server_addr(), Duration::from_secs(2)).unwrap();
         tui.lua(
@@ -48,6 +51,14 @@ impl Case {
         );
         let dir = RoomDir::create(&tui.dir).unwrap();
         let (room, pid) = RoomLink::start(&nvim(), &dir, (0, 12)).unwrap();
+        if manual {
+            let (clock, _) = NvimLink::connect(dir.socket(), Duration::from_secs(60)).unwrap();
+            clock
+                .exec_lua(include_str!("support/manual_timers.lua"), vec![])
+                .wait(Duration::from_secs(60))
+                .unwrap()
+                .unwrap();
+        }
         let origin_addr = match origin_name {
             Some(name) => {
                 let path = tui.dir.join(name);
@@ -213,11 +224,13 @@ fn the_rooms_own_connect_bang_sends_no_ui_false() {
 #[test]
 #[ignore = "needs nvim 0.12 and tmux"]
 fn eitri_link_closing_after_moving_waits_then_returns_a_late_tui() {
-    let mut c = Case::start(false);
+    let mut c = Case::start_at_with_timers(false, None, true);
+    let (clock, _) = NvimLink::connect(c.dir.as_ref().unwrap().socket(), Duration::from_secs(60)).unwrap();
     c.room().moving().unwrap();
     c.room().pending().unwrap();
+    let channel = c.room().chan();
     c.room.take();
-    std::thread::sleep(Duration::from_millis(600));
+    clock.exec_lua("local chan = ...; assert(vim.wait(60000, function() return vim.api.nvim_get_chan_info(chan).id == nil end, 1)); test_timers.advance(1000)", vec![channel.into()]).wait(Duration::from_secs(60)).unwrap().unwrap();
     assert!(agent::process_probe::pid_is_alive(c.pid));
     c.origin
         .exec_lua(
@@ -227,6 +240,16 @@ fn eitri_link_closing_after_moving_waits_then_returns_a_late_tui() {
         .wait(Duration::from_secs(2))
         .unwrap()
         .unwrap();
+    clock
+        .exec_lua(
+            "assert(vim.wait(60000, function() return #vim.api.nvim_list_uis() > 0 end, 1), 'the late TUI never attached to the waiting room')",
+            vec![],
+        )
+        .wait(Duration::from_secs(65))
+        .expect("the late TUI attachment wait never answered")
+        .unwrap_or_else(|error| panic!("late TUI attachment: {error}"));
+    // Returning the UI also closes the room's RPC; the origin's screen is the completion signal.
+    let _returning = clock.exec_lua("test_timers.advance(250)", vec![]);
     c.returned();
     c.exited();
 }

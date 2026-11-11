@@ -177,8 +177,22 @@ impl Group {
 
     /// Pumps every link for a moment, for what must not happen.
     fn quiet(&self, windows: &[&ChatWindow]) {
-        let until = std::time::Instant::now() + Duration::from_millis(150);
-        self.until(windows, || std::time::Instant::now() >= until);
+        for _ in 0..20 {
+            for window in windows {
+                for name in self.pair.module_names() {
+                    if self.pair.module_peer(&name) != Some(window.peer) {
+                        continue;
+                    }
+                    let Some(link) = self.pair.module_link(&name) else {
+                        continue;
+                    };
+                    link.read_through_for_test(&window.link);
+                    window.link.read_through_for_test(&link);
+                    link.pump();
+                }
+                window.link.pump();
+            }
+        }
     }
 }
 

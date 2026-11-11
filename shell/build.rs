@@ -45,7 +45,7 @@ fn main() {
     // The rule: a sha256 fingerprint over every build input, not an
     // mtime walk of src/ alone -- see build_web.rs's own doc comment for why an mtime rule missed a
     // package.json/package-lock.json/index.html/config-only change and a deleted source file.
-    for path in web_build_watch_paths(&web_dir) {
+    for path in web_build_watch_paths(&web_dir, "dist/index.html") {
         println!("cargo:rerun-if-changed={}", path.display());
     }
     println!("cargo:rerun-if-env-changed=EITRI_WEB_CLEAN_BUILD");
@@ -62,7 +62,7 @@ fn main() {
             kit_dir.display()
         );
     }
-    for path in web_build_watch_paths(&kit_dir) {
+    for path in web_build_watch_paths(&kit_dir, "dist/keys.js") {
         println!("cargo:rerun-if-changed={}", path.display());
     }
     ensure_web_bundle_built(&kit_dir, "dist/keys.js", None, clean_build);
@@ -76,7 +76,7 @@ fn main() {
             agents_kit_dir.display()
         );
     }
-    for path in web_build_watch_paths(&agents_kit_dir) {
+    for path in web_build_watch_paths(&agents_kit_dir, "dist/agents.js") {
         println!("cargo:rerun-if-changed={}", path.display());
     }
     ensure_web_bundle_built(&agents_kit_dir, "dist/agents.js", None, clean_build);
@@ -90,7 +90,7 @@ fn main() {
             pass_dir.display()
         );
     }
-    for path in web_build_watch_paths(&pass_dir) {
+    for path in web_build_watch_paths(&pass_dir, "dist/index.html") {
         println!("cargo:rerun-if-changed={}", path.display());
     }
     ensure_web_bundle_built(&pass_dir, "dist/index.html", None, clean_build);
@@ -105,7 +105,7 @@ fn main() {
             markdown_dir.display()
         );
     }
-    for path in web_build_watch_paths(&markdown_dir) {
+    for path in web_build_watch_paths(&markdown_dir, "dist/index.html") {
         println!("cargo:rerun-if-changed={}", path.display());
     }
     ensure_web_bundle_built(&markdown_dir, "dist/index.html", None, clean_build);
@@ -119,14 +119,14 @@ fn main() {
             strips_dir.display()
         );
     }
-    for path in web_build_watch_paths(&strips_dir) {
+    for path in web_build_watch_paths(&strips_dir, "dist/index.html") {
         println!("cargo:rerun-if-changed={}", path.display());
     }
     ensure_web_bundle_built(&strips_dir, "dist/index.html", None, clean_build);
 
     // The agents table is served from its plugin directory under the same freshness rule.
     let agents_top_dir = workspace_root.join("plugins/agents-top/web");
-    for path in web_build_watch_paths(&agents_top_dir) {
+    for path in web_build_watch_paths(&agents_top_dir, "dist/index.html") {
         println!("cargo:rerun-if-changed={}", path.display());
     }
     ensure_web_bundle_built(&agents_top_dir, "dist/index.html", None, clean_build);

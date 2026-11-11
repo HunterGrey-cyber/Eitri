@@ -9,6 +9,7 @@ name = "neovide_editor"
 
 [features]
 fault-injection = []
+test-support = []
 
 [dependencies]
 gtk4 = { version = "0.11.4", features = ["v4_14"] }
@@ -44,6 +45,7 @@ wayland-protocols = { version = "=0.32.13", features = ["client", "staging"] }
 # connection that lives on a tokio runtime, as the fork's does. Both crates are already in the tree
 # through the fork (nvim-rs 0.9.2 with `use_tokio`, tokio "full"), so this adds no package.
 [dev-dependencies]
+neovide-editor = { path = ".", features = ["test-support"] }
 tokio = { version = "1", features = ["rt-multi-thread", "process"] }
 # `tests/no_force_quit.rs` reads `cargo metadata` to find the pinned fork's source. Already in
 # Cargo.lock through `eitri-core`, so nothing new is downloaded.
@@ -73,6 +75,7 @@ harness = false
 [[test]]
 name = "cursor_animation"
 harness = false
+required-features = ["test-support"]
 
 [[test]]
 name = "os_scale_factor"
@@ -96,10 +99,12 @@ harness = false
 [[test]]
 name = "shared_watch"
 harness = false
+required-features = ["test-support"]
 
 [[test]]
 name = "realized_restart"
 harness = false
+required-features = ["test-support"]
 
 [[test]]
 name = "subsurface_x11"
@@ -122,8 +127,10 @@ harness = false
 [[test]]
 name = "attached_pane_with_real_nvim"
 harness = false
+required-features = ["test-support"]
 
 # The editor following its own nvim's `:restart` and `:connect`; each case runs in a child copy on its own `Xvfb`.
 [[test]]
 name = "owned_follow"
 harness = false
+required-features = ["test-support"]

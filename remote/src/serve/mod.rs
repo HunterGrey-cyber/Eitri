@@ -411,15 +411,28 @@ mod linux {
     /// ([`live_windows`](super::report::live_windows): a socket whose window's rows name a live process; one a
     /// crashed window left behind is none). The sockets are not connected to, so the windows are not woken.
     pub fn wait_for_no_window(control: &Path, idle: Duration, poll: Duration) {
-        let mut last_seen = Instant::now();
+        wait_for_no_window_with(
+            idle,
+            || !super::report::live_windows(control).is_empty(),
+            Instant::now,
+            || std::thread::sleep(poll),
+        );
+    }
+
+    fn wait_for_no_window_with(
+        idle: Duration,
+        mut any: impl FnMut() -> bool,
+        mut now: impl FnMut() -> Instant,
+        mut pause: impl FnMut(),
+    ) {
+        let mut last_seen = now();
         loop {
-            let any = !super::report::live_windows(control).is_empty();
-            if any {
-                last_seen = Instant::now();
-            } else if last_seen.elapsed() >= idle {
+            if any() {
+                last_seen = now();
+            } else if now().saturating_duration_since(last_seen) >= idle {
                 return;
             }
-            std::thread::sleep(poll);
+            pause();
         }
     }
 
@@ -428,15 +441,23 @@ mod linux {
     const LOCK_PATIENCE: Duration = Duration::from_millis(300);
 
     fn take_lock(lock: &PrivateLock) -> io::Result<bool> {
-        let until = Instant::now() + LOCK_PATIENCE;
+        take_lock_with(lock, Instant::now, || std::thread::sleep(Duration::from_millis(20)))
+    }
+
+    fn take_lock_with(
+        lock: &PrivateLock,
+        mut now: impl FnMut() -> Instant,
+        mut pause: impl FnMut(),
+    ) -> io::Result<bool> {
+        let until = now() + LOCK_PATIENCE;
         loop {
             if lock.try_lock()? {
                 return Ok(true);
             }
-            if Instant::now() >= until {
+            if now() >= until {
                 return Ok(false);
             }
-            std::thread::sleep(Duration::from_millis(20));
+            pause();
         }
     }
 
@@ -906,27 +927,29 @@ mod linux {
                 assert!(Instant::now() < until, "the window's rows never showed");
                 std::thread::sleep(Duration::from_millis(10));
             }
-            let (done_tx, done) = std::sync::mpsc::channel();
-            let watched = control.clone();
-            std::thread::spawn(move || {
-                wait_for_no_window(&watched, Duration::from_millis(300), Duration::from_millis(10));
-                let _ = done_tx.send(());
-            });
-            assert!(
-                done.recv_timeout(Duration::from_millis(900)).is_err(),
-                "it ended while a window was up"
+            let clock = std::cell::Cell::new(Instant::now());
+            let mut polls = 0;
+            let mut rows = Some(rows);
+            wait_for_no_window_with(
+                Duration::from_millis(300),
+                || !super::super::report::live_windows(&control).is_empty(),
+                || clock.get(),
+                || {
+                    polls += 1;
+                    assert!(polls <= 6, "the idle deadline never ended");
+                    if polls == 3 {
+                        assert_eq!(
+                            window.accept().unwrap_err().kind(),
+                            io::ErrorKind::WouldBlock,
+                            "looking for windows connected to one"
+                        );
+                        rows.take().unwrap().stop();
+                        assert!(socket.exists());
+                    }
+                    clock.set(clock.get() + Duration::from_millis(100));
+                },
             );
-            assert_eq!(
-                window.accept().map(|_| ()).unwrap_err().kind(),
-                io::ErrorKind::WouldBlock,
-                "looking for windows connected to one"
-            );
-            // The window's rows go (a crashed window's name a dead process, which counts the same) while its socket
-            // stays, and here would even take a connection.
-            rows.stop();
-            assert!(socket.exists());
-            done.recv_timeout(Duration::from_secs(30))
-                .expect("it did not end after the last window went");
+            assert_eq!(polls, 5, "idle time starts at the last live-window observation");
             drop(window);
         }
 
@@ -938,13 +961,14 @@ mod linux {
                 state: dir.join("state"),
             };
             eitri_core::panel_control::ensure_dir(&dirs.control).unwrap();
-            let looked = std::time::SystemTime::now();
+            let looked = std::time::UNIX_EPOCH;
             assert!(!stopped_since(&dirs, looked), "no stop was noted yet");
             mark_stopped(&dirs).unwrap();
-            assert!(stopped_since(&dirs, looked));
-            std::thread::sleep(Duration::from_millis(5));
+            let text = std::fs::read_to_string(dirs.control.join(STOPPED_FILE)).unwrap();
+            let marked = looked + Duration::from_nanos(text.trim().parse().unwrap());
+            assert!(stopped_since(&dirs, marked), "the exact stop counts");
             assert!(
-                !stopped_since(&dirs, std::time::SystemTime::now()),
+                !stopped_since(&dirs, marked + Duration::from_nanos(1)),
                 "a stop before the look counted"
             );
             std::fs::write(dirs.control.join(STOPPED_FILE), b"not a time\n").unwrap();
@@ -956,16 +980,22 @@ mod linux {
             let path = scratch("moment").join(LOCK_FILE);
             let probe = PrivateLock::open(&path).unwrap();
             assert!(probe.try_lock().unwrap());
-            let release = std::thread::spawn(move || {
-                std::thread::sleep(Duration::from_millis(60));
-                drop(probe);
-            });
             let lock = PrivateLock::open(&path).unwrap();
-            assert!(
-                take_lock(&lock).unwrap(),
-                "a lock held only for a look was taken as a running serve"
-            );
-            release.join().unwrap();
+            let clock = std::cell::Cell::new(Instant::now());
+            let mut probe = Some(probe);
+            let guard = Instant::now() + Duration::from_secs(60);
+            assert!(take_lock_with(
+                &lock,
+                || clock.get(),
+                || {
+                    drop(probe.take());
+                    // A concurrent fork can hold a copy until it execs.
+                    assert!(Instant::now() < guard, "the released lock never came free");
+                    std::thread::yield_now();
+                }
+            )
+            .unwrap());
+            assert!(probe.is_none(), "the held lock was released before it was taken");
         }
 
         #[test]
@@ -1112,10 +1142,20 @@ mod linux {
             assert!(!is_running(&dirs).unwrap(), "a look's shared hold read as serve");
             drop(look);
             let serve = PrivateLock::open(&path).unwrap();
-            assert!(serve.try_lock().unwrap());
+            // A child forked by another test shares the dropped look's description until exec.
+            // Wait for the exclusive take itself: a shared probe can still succeed in that interval.
+            let until = Instant::now() + Duration::from_secs(60);
+            while !serve.try_lock().unwrap() {
+                assert!(Instant::now() < until, "the shared hold was never let go");
+                std::thread::sleep(Duration::from_millis(2));
+            }
             assert!(is_running(&dirs).unwrap());
             drop(serve);
-            assert!(!is_running(&dirs).unwrap());
+            let until = Instant::now() + Duration::from_secs(60);
+            while is_running(&dirs).unwrap() {
+                assert!(Instant::now() < until, "the exclusive hold was never let go");
+                std::thread::sleep(Duration::from_millis(2));
+            }
         }
 
         #[test]

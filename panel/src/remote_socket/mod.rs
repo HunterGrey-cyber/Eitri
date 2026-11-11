@@ -50,7 +50,6 @@ use eitri_core::tab_set::{ObserveError, ObserverFrame, ObserverId, ObserverReape
 use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::io::{self, Read, Write};
-use std::net::Shutdown;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -66,8 +65,10 @@ mod feed;
 mod tests;
 
 use acts::ActInbound;
+#[cfg(test)]
+use conn::CONTROL_LINES_MAX;
+pub use conn::WRITER_BYTES;
 use conn::{start_connection, CloseWhy, Conn, Deadlines, Gauge};
-pub use conn::{CONTROL_LINES_MAX, WRITER_BYTES};
 use devices::DevicesInbound;
 pub use devices::Pairing;
 use feed::FeedInbound;
@@ -162,6 +163,12 @@ pub struct RemoteSocket {
 }
 
 impl RemoteSocket {
+    /// Readers still occupying the connection cap, including those whose peer has just closed.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn live_readers_for_host_test(&self) -> usize {
+        self.shared.live.load(Ordering::SeqCst)
+    }
+
     /// Binds `rv-<instance>.sock` in `control_dir` and starts accepting. `act` lines are checked against the device
     /// store at `store_path`, read again for each, so a device taken out of it can no longer steer. `wake` is raised
     /// whenever a line waits for [`pump`](Self::pump) and whenever a writer that was full has room again.

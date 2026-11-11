@@ -217,8 +217,14 @@ fn main() {
         let reached = reached.clone();
         std::thread::spawn(move || {
             for conn in listener.incoming() {
-                reached.fetch_add(1, Ordering::SeqCst);
-                drop(conn);
+                let mut conn = conn.unwrap();
+                conn.set_read_timeout(Some(Duration::from_secs(60))).unwrap();
+                let mut marker = [0];
+                if std::io::Read::read(&mut conn, &mut marker).ok() == Some(1) && marker == *b"M" {
+                    std::io::Write::write_all(&mut conn, b"ok").unwrap();
+                } else {
+                    reached.fetch_add(1, Ordering::SeqCst);
+                }
             }
         });
     }
@@ -227,7 +233,14 @@ fn main() {
     std::fs::write(&cookie, b"the desktop's cookie").expect("write the stand-in cookie");
     std::env::set_var("XAUTHORITY", &cookie);
     // A stand-in the fallback reaches is counted before any check reads the count.
-    let settle = || std::thread::sleep(Duration::from_millis(200));
+    let settle = || {
+        let mut marker = UnixStream::connect(STAND_IN).unwrap();
+        marker.set_read_timeout(Some(Duration::from_secs(60))).unwrap();
+        std::io::Write::write_all(&mut marker, b"M").unwrap();
+        let mut ack = [0; 2];
+        std::io::Read::read_exact(&mut marker, &mut ack).expect("the stand-in never drained earlier accepts");
+        assert_eq!(&ack, b"ok");
+    };
     // Three numbers the helper would otherwise take first, each claimed a different way it must
     // honour: a lock file, a file at the socket path, an abstract socket in this namespace.
     let first = own_x_server::FIRST_DISPLAY;
@@ -301,6 +314,7 @@ fn main() {
     }
 
     // 3. From this namespace, while it runs: the helper's server, by its own pid.
+    let disconnects_before = server.client_disconnects();
     match connect_like_libxcb(n) {
         Ok(Reached::Abstract(mut stream)) => {
             if peer_pid(&stream) != server.pid() {
@@ -341,11 +355,22 @@ fn main() {
     }
 
     // 5. After its only client has come and gone: still running, still the only thing there.
-    std::thread::sleep(Duration::from_millis(1500));
-    if !server.is_running() {
-        failures.push(format!(
-            "{display}'s server ended once its last client left (-terminate)"
-        ));
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    while server.client_disconnects() <= disconnects_before {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "Xvfb never acknowledged its client's disconnect"
+        );
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    for _ in 0..100 {
+        if !server.is_running() {
+            failures.push(format!(
+                "{display}'s server ended once its last client left (-terminate)"
+            ));
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(1));
     }
     let before = reached.load(Ordering::SeqCst);
     match connect_like_libxcb(n) {

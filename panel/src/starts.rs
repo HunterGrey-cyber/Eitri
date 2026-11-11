@@ -1033,11 +1033,10 @@ mod tests {
 
     /// A stand-in `codex` that prints `version` for `--version`, in a fresh scratch directory.
     fn fake_codex(label: &str, version: &str) -> (PathBuf, PathBuf) {
-        use std::os::unix::fs::PermissionsExt;
         let dir = agent::state_dirs::test_workspace_dir(label);
         let program = dir.join("codex");
-        std::fs::write(&program, format!("#!/bin/sh\necho 'codex-cli {version}'\n")).unwrap();
-        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
+        script_fixture::write_executable_script(&program, format!("#!/bin/sh\necho 'codex-cli {version}'\n"), 0o755)
+            .unwrap();
         (dir, program)
     }
 
@@ -1211,4 +1210,9 @@ mod tests {
             assert!(handle.state.borrow().owed.is_empty(), "the answer is spent");
         }
     }
+}
+
+#[cfg(test)]
+mod script_fixture {
+    include!(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/support/executable.rs"));
 }

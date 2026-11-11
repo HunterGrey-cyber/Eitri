@@ -762,13 +762,12 @@ fn an_older_sequence_changes_nothing() {
 #[ignore = "needs a real nvim on PATH"]
 fn a_late_close_still_closes() {
     let mut nvim = start("late-close");
-    let deadline = wall_ms() + 1_000;
+    nvim.embed.lua(include_str!("support/manual_wall.lua"), vec![]);
+    let deadline = nvim.embed.lua("return test_wall_ms", vec![]).as_u64().unwrap() + 1_000;
     let stamp = nvim.stamp(deadline);
     let request = diff(&nvim, "x.txt", b"one\n", b"two\n");
     assert_eq!(nvim.open_stamped(stamp, 1, request), Opened::Opened);
-    while wall_ms() <= deadline {
-        std::thread::sleep(Duration::from_millis(50));
-    }
+    nvim.embed.lua("test_wall_ms = ...", vec![Value::from(deadline + 1)]);
     nvim.close(1);
     assert_eq!(nvim.windows(), 1, "the close carries no stamp");
 }

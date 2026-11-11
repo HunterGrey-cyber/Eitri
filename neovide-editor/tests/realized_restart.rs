@@ -33,7 +33,7 @@
 //! connect to a display); the parent connects to nothing. Ignored unless asked for, because it spawns
 //! real nvims:
 //!
-//!     cargo test -p neovide-editor --test realized_restart -- --ignored
+//!     cargo test -p neovide-editor --features test-support --test realized_restart -- --ignored
 use std::cell::Cell;
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
@@ -72,26 +72,20 @@ fn run_until(limit: Duration, mut done: impl FnMut() -> bool) -> bool {
     }
 }
 
-/// Frames the pane has handed to GTK, by either presentation path.
-fn frames(pane: &NeovideEditorPane) -> u64 {
-    let counts = pane.presentation_counts();
-    counts.own_frames + counts.fallback_frames
-}
-
 /// Runs the main context until the pane has presented no frame for `quiet`, so its tick has
 /// stopped and only something that asks for a frame makes it draw again.
-fn settle(pane: &NeovideEditorPane, quiet: Duration) {
-    let mut last = frames(pane);
-    let mut since = Instant::now();
-    let settled = run_until(Duration::from_secs(20), || {
-        let now = frames(pane);
-        if now != last {
-            last = now;
-            since = Instant::now();
-        }
-        since.elapsed() >= quiet
-    });
-    assert!(settled, "the pane never stopped drawing (frames {last})");
+fn settle(pane: &NeovideEditorPane, _quiet: Duration) {
+    assert!(
+        run_until(Duration::from_secs(60), || pane.testing_idle()),
+        "pane never became idle"
+    );
+}
+
+fn turns(mut sample: impl FnMut()) {
+    for _ in 0..100 {
+        glib::MainContext::default().iteration(false);
+        sample();
+    }
 }
 
 /// A shown window holding one editor pane whose nvim is running, and a count of the pane widget's
@@ -319,19 +313,26 @@ fn a_restarted_pane_hears_nothing_from_its_ended_harness() {
 
     // Redraws and the quit in one burst, with the main loop held, so the ended nvim's batches and
     // its exit are queued together on the shared loop.
+    let old = ask(&pane, "return vim.fn.getpid()", Duration::from_secs(60))
+        .unwrap()
+        .unwrap()
+        .as_u64()
+        .unwrap() as u32;
     pane.send_keys("ihello<Esc>:redraw!<CR>:q!<CR>");
-    std::thread::sleep(Duration::from_millis(300));
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while running_nvims().contains(&old) {
+        assert!(Instant::now() < deadline, "old nvim never exited");
+        std::thread::yield_now();
+    }
     assert!(
         run_until(Duration::from_secs(10), || restarted.get()),
         "the first nvim should report its exit and the pane restart"
     );
 
+    assert!(run_until(Duration::from_secs(60), || pane.is_running()));
+    settle(&pane, Duration::ZERO);
     let mut exited_seen = false;
-    let quiet_until = Instant::now() + Duration::from_secs(1);
-    run_until(Duration::from_secs(2), || {
-        exited_seen |= pane.nvim_exited();
-        Instant::now() >= quiet_until
-    });
+    turns(|| exited_seen |= pane.nvim_exited());
     assert!(
         !exited_seen,
         "the restarted pane reported nvim exited while the ended harness's events drained"
@@ -347,11 +348,8 @@ fn a_restarted_pane_hears_nothing_from_its_ended_harness() {
         "the new nvim should be running"
     );
     let mut exited_seen = false;
-    let quiet_until = Instant::now() + Duration::from_secs(1);
-    run_until(Duration::from_secs(2), || {
-        exited_seen |= pane.nvim_exited();
-        Instant::now() >= quiet_until
-    });
+    settle(&pane, Duration::ZERO);
+    turns(|| exited_seen |= pane.nvim_exited());
     assert!(!exited_seen, "the new nvim is reported exited although it is running");
     assert_eq!(exits.get(), 1);
     assert!(pane.shutdown(), "the new nvim should exit when shut down");
@@ -438,24 +436,23 @@ fn an_ending_timer_leaves_the_restarted_nvim_alone() {
         pane.exec_lua_watched("vim.fn.getchar()"),
         "the watched request should be sent"
     );
-    run_until(Duration::from_millis(200), || false);
-    let ended_at = Instant::now();
+    assert!(run_until(Duration::from_secs(60), || pane
+        .watched_call()
+        .is_some_and(|call| call.last_answer.is_some() && !call.done)));
+    neovide_editor::test_support::hold_ending_timer();
     assert!(pane.end_nvim(), "a running nvim can be ended");
 
     assert!(
         run_until(Duration::from_secs(5), || restarted.get() && pane.is_running()),
         "the ended nvim should exit and the pane restart"
     );
-    let running_after = ended_at.elapsed();
-    assert!(
-        running_after < Duration::from_millis(900),
-        "the new nvim must be running before the ending's one-second hang-up for this case to test \
-         anything; it took {running_after:?}"
-    );
-
-    // Past the hang-up's second, with room for it to take effect.
-    let until = ended_at + Duration::from_millis(2500);
-    run_until(Duration::from_secs(3), || Instant::now() >= until);
+    settle(&pane, Duration::ZERO);
+    neovide_editor::test_support::fire_ending_timer();
+    assert!(run_until(
+        Duration::from_secs(60),
+        neovide_editor::test_support::ending_timer_finished
+    ));
+    turns(|| assert!(pane.is_running(), "the late ending affected the restarted session"));
     assert!(
         pane.is_running(),
         "the ended nvim's late hang-up must not close the new nvim's stdin"
@@ -502,16 +499,11 @@ fn a_pane_shut_down_while_restarting_leaves_no_nvim() {
         left.is_empty()
     });
     assert!(gone, "an nvim outlived the pane's shutdown: pids {left:?}");
-    // The widget is still shown, so frames keep coming if anything asks for them: none may start
-    // the nvim the restart asked for.
-    let quiet_until = Instant::now() + Duration::from_secs(2);
-    run_until(Duration::from_secs(3), || {
+    assert!(run_until(Duration::from_secs(60), || pane.testing_idle()));
+    turns(|| {
         started |= pane.is_ready();
-        if looked.elapsed() >= Duration::from_millis(100) {
-            looked = Instant::now();
-            left = running_nvims();
-        }
-        !left.is_empty() || Instant::now() >= quiet_until
+        left = running_nvims();
+        assert!(left.is_empty(), "a child started after shutdown: {left:?}");
     });
     assert!(
         left.is_empty(),

@@ -119,6 +119,19 @@ struct HubGuard {
     link: Mutex<Option<LinkSender>>,
     waiting: Mutex<BTreeMap<u64, mpsc::Sender<Result<(), String>>>>,
     jobs: AtomicU64,
+    #[cfg(test)]
+    wait: Mutex<
+        Option<
+            Arc<
+                dyn Fn(
+                        &mpsc::Receiver<Result<(), String>>,
+                        Duration,
+                    ) -> Result<Result<(), String>, mpsc::RecvTimeoutError>
+                    + Send
+                    + Sync,
+            >,
+        >,
+    >,
 }
 
 impl HubGuard {
@@ -166,6 +179,19 @@ impl GroupGuard for HubGuard {
         } else {
             self.gave_up(job);
             None
+        }
+    }
+
+    #[cfg(test)]
+    fn wait_for_answer_for_tests(
+        &self,
+        answer: &mpsc::Receiver<Result<(), String>>,
+        within: Duration,
+    ) -> Result<Result<(), String>, mpsc::RecvTimeoutError> {
+        let hook = self.wait.lock().unwrap().clone();
+        match hook {
+            Some(hook) => hook(answer, within),
+            None => answer.recv_timeout(within),
         }
     }
 
@@ -754,7 +780,10 @@ impl GroupReview {
         // is gone.
         self.apply_partner_edges(&state);
         // Whatever it still ran ends now for the windows that heard it started: nobody else will say so.
+        #[cfg(not(test))]
         let at_ns = eitri_core::turn_review::monotonic_ns();
+        #[cfg(test)]
+        let at_ns = tests::mono_now();
         let ended: Vec<TurnEdge> = std::mem::take(&mut *state.turns_running.borrow_mut())
             .into_keys()
             .map(|session| TurnEdge {
@@ -1054,6 +1083,17 @@ impl GroupReview {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_guard_without_a_hook_uses_the_supplied_deadline() {
+        let guard = HubGuard::default();
+        let (_send, answer) = mpsc::channel();
+        assert_eq!(
+            guard.wait_for_answer_for_tests(&answer, Duration::ZERO),
+            Err(mpsc::RecvTimeoutError::Timeout)
+        );
+    }
+
     use crate::linked_window::driver::Partner as LinkPartner;
     use crate::linked_window::editor::Window2Editor;
     use crate::linked_window::tests::Scratch;
@@ -1317,6 +1357,20 @@ mod tests {
         )
     }
 
+    thread_local! {
+        static MONOTONIC: Arc<AtomicU64> = Arc::new(AtomicU64::new(0));
+    }
+
+    pub(super) fn mono_now() -> u64 {
+        MONOTONIC.with(|clock| eitri_core::turn_review::monotonic_ns() + clock.load(Ordering::SeqCst))
+    }
+
+    fn advance_mono() {
+        MONOTONIC.with(|clock| {
+            clock.fetch_add(500_000_000, Ordering::SeqCst);
+        });
+    }
+
     fn until(what: &str, mut done: impl FnMut() -> bool) {
         let deadline = Instant::now() + Duration::from_secs(20);
         while !done() {
@@ -1340,6 +1394,11 @@ mod tests {
             let options = ReviewOptions {
                 excludes: Some(None),
                 trim_every: Duration::MAX,
+                monotonic: Some(MONOTONIC.with(|clock| {
+                    let clock = clock.clone();
+                    Arc::new(move || eitri_core::turn_review::monotonic_ns() + clock.load(Ordering::SeqCst))
+                        as eitri_core::turn_review::MonotonicClock
+                })),
                 ..ReviewOptions::default()
             };
             tabs.install_turn_review(TurnReview::with_options(
@@ -1922,11 +1981,12 @@ mod tests {
 
         // A turn that ran alone carries none: it starts once window 2 has heard window 1's turn end, and later
         // than the start's scan looks back.
-        let settled_at = Instant::now();
-        while settled_at.elapsed() < Duration::from_millis(300) {
+        for _ in 0..20 {
+            p.one_link.read_through_for_test(&p.two_link);
+            p.two_link.read_through_for_test(&p.one_link);
             p.step();
-            std::thread::sleep(Duration::from_millis(5));
         }
+        advance_mono();
         let (alone, _) = p.start_turn(Window::Two);
         p.end_turn(Window::Two);
         for _ in 0..20 {
@@ -2025,7 +2085,6 @@ mod tests {
         }
         for _ in 0..20 {
             p.two.tick(Some(&p.two_review));
-            std::thread::sleep(Duration::from_millis(5));
         }
         assert!(
             p.two.provider.turns().is_empty(),
@@ -2074,7 +2133,6 @@ mod tests {
         });
         for _ in 0..20 {
             p.two.tick(None);
-            std::thread::sleep(Duration::from_millis(5));
         }
         assert!(p.two.provider.turns().is_empty(), "and it is not sent later either");
         p.shut_down();
@@ -2086,8 +2144,8 @@ mod tests {
         p.one_presence();
         // Window 2's turn ran and ended before window 1's turn began; both its edges reach window 1 only later,
         // together.
-        let partner_end = eitri_core::turn_review::monotonic_ns();
-        std::thread::sleep(Duration::from_millis(20));
+        let partner_end = mono_now();
+        advance_mono();
         let (later, _) = p.start_turn(Window::One);
         for (edge, at_ns) in [
             (EdgeKind::Started, partner_end - 1_000_000),
@@ -2104,8 +2162,7 @@ mod tests {
                 )
                 .unwrap();
         }
-        // Long enough for both to be read off the socket before window 1 next drains it.
-        std::thread::sleep(Duration::from_millis(300));
+        p.one_link.read_through_for_test(&p.two_link);
         p.end_turn(Window::One);
         for _ in 0..20 {
             p.step();
@@ -2635,11 +2692,14 @@ mod tests {
 
     /// Lets every edge on its way arrive, and takes a turn that starts afterwards past what its start's scan looks at.
     fn let_edges_settle(g: &Group) {
-        let settled_at = Instant::now();
-        while settled_at.elapsed() < Duration::from_millis(300) {
+        for _ in 0..20 {
+            for member in g.members() {
+                member.hub_link.read_through_for_test(&member.link);
+                member.link.read_through_for_test(&member.hub_link);
+            }
             g.step();
-            std::thread::sleep(Duration::from_millis(5));
         }
+        advance_mono();
     }
 
     #[test]
@@ -2839,11 +2899,30 @@ mod tests {
     #[test]
     fn a_window_1_that_does_not_answer_refuses_the_revert_at_the_end_of_the_wait() {
         let mut g = Group::new("no-answer", false, false);
-        let (id, asked) = waiting_for_the_guard(&mut g);
+        let (release, held) = mpsc::channel();
+        let held = Mutex::new(held);
+        let (observed, wait_started) = mpsc::channel();
+        *g.c1.review.hub.as_ref().unwrap().wait.lock().unwrap() = Some(Arc::new(move |_, within| {
+            observed.send(within).unwrap();
+            held.lock()
+                .unwrap()
+                .recv_timeout(Duration::from_secs(60))
+                .expect("release the simulated deadline");
+            Err(mpsc::RecvTimeoutError::Timeout)
+        }));
+        let (id, _) = waiting_for_the_guard(&mut g);
+        assert_eq!(
+            wait_started.recv_timeout(Duration::from_secs(60)).unwrap(),
+            eitri_core::turn_review::GUARD_WAIT
+        );
+        assert!(
+            result_of(&g.c1.win.side.outs.borrow(), id).is_none(),
+            "still inside the guard wait"
+        );
+        release.send(()).unwrap();
         g.settle("the revert's answer", |g| {
             result_of(&g.c1.win.side.outs.borrow(), id).is_some()
         });
-        assert!(asked.elapsed() >= eitri_core::turn_review::GUARD_WAIT);
         let refused = result_of(&g.c1.win.side.outs.borrow(), id).unwrap();
         assert!(
             refused

@@ -4867,6 +4867,7 @@ mod tests {
     fn the_queue_timer_drops_the_open_message_when_no_follow_up_comes() {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_time()
+            .start_paused(true)
             .build()
             .unwrap();
         let queue = Arc::new(EventQueue::with_follow_up_wait(Duration::from_millis(20)));
@@ -4880,7 +4881,9 @@ mod tests {
             // Other work on the same runtime goes on while the hold waits.
             tokio::time::sleep(Duration::from_millis(5)).await;
             assert!(queue.take().is_empty());
-            tokio::time::sleep(Duration::from_millis(100)).await;
+            tokio::time::sleep(Duration::from_millis(14)).await;
+            assert!(queue.take().is_empty(), "the hold lasts until the configured wait");
+            tokio::time::sleep(Duration::from_millis(2)).await;
         });
         assert_ne!(queue.signal.seen(), seen);
         assert_eq!(
@@ -4903,49 +4906,71 @@ mod tests {
     /// re-opening releases the end with the follow-up and the delivery.
     #[test]
     fn the_queue_does_not_give_up_on_a_follow_up_while_the_stream_reconnects() {
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_time()
-            .build()
-            .unwrap();
-        let queue = Arc::new(EventQueue::with_follow_up_wait(Duration::from_millis(20)));
-        queue
-            .open_steer("m1", "typed".into(), ProtoSteerTurnRequest::default())
-            .unwrap();
-        queue.steer_accepted("m1");
-        let started = AgentDomainEvent::TurnStarted { turn_id: "t2".into() };
-        runtime.block_on(async {
-            queue.push(turn_completed("t1"));
-            queue.stream_lost();
-            // A reconnect slower than the wait.
-            tokio::time::sleep(Duration::from_millis(100)).await;
-        });
-        assert!(
-            queue.take().is_empty(),
-            "nothing given up while the stream is down, so the host has nothing to send again"
-        );
-        runtime.block_on(async {
-            queue.stream_back();
-            queue.push(started.clone());
-            queue.push(AgentDomainEvent::UserMessageDelivered {
-                client_message_id: "m1".into(),
-                turn_id: "t2".into(),
-                text: String::new(),
+        for replay in [true, false] {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_time()
+                .start_paused(true)
+                .build()
+                .unwrap();
+            let queue = Arc::new(EventQueue::with_follow_up_wait(Duration::from_millis(20)));
+            queue
+                .open_steer("m1", "typed".into(), ProtoSteerTurnRequest::default())
+                .unwrap();
+            queue.steer_accepted("m1");
+            let started = AgentDomainEvent::TurnStarted { turn_id: "t2".into() };
+            runtime.block_on(async {
+                queue.push(turn_completed("t1"));
+                queue.stream_lost();
+                // A reconnect slower than the wait.
+                tokio::time::sleep(Duration::from_millis(21)).await;
             });
-            // The wait armed on re-opening finds nothing held.
-            tokio::time::sleep(Duration::from_millis(100)).await;
-        });
-        assert_eq!(
-            queue.take(),
-            [
-                turn_completed("t1"),
-                started,
-                AgentDomainEvent::UserMessageDelivered {
-                    client_message_id: "m1".into(),
-                    turn_id: "t2".into(),
-                    text: "typed".into(),
-                },
-            ]
-        );
+            assert!(
+                queue.take().is_empty(),
+                "nothing given up while the stream is down, so the host has nothing to send again"
+            );
+            runtime.block_on(async {
+                queue.stream_back();
+                tokio::time::sleep(Duration::from_millis(19)).await;
+                assert!(
+                    queue.take().is_empty(),
+                    "the fresh hold lasts until the configured wait"
+                );
+                if replay {
+                    queue.push(started.clone());
+                    queue.push(AgentDomainEvent::UserMessageDelivered {
+                        client_message_id: "m1".into(),
+                        turn_id: "t2".into(),
+                        text: String::new(),
+                    });
+                }
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            });
+            if replay {
+                assert_eq!(
+                    queue.take(),
+                    [
+                        turn_completed("t1"),
+                        started,
+                        AgentDomainEvent::UserMessageDelivered {
+                            client_message_id: "m1".into(),
+                            turn_id: "t2".into(),
+                            text: "typed".into(),
+                        },
+                    ]
+                );
+            } else {
+                assert_eq!(
+                    queue.take(),
+                    [
+                        AgentDomainEvent::UserMessageDropped {
+                            client_message_id: "m1".into(),
+                            reason: steer::UNREPORTED.into(),
+                        },
+                        turn_completed("t1"),
+                    ]
+                );
+            }
+        }
     }
 
     /// Re-opened, a stream first has its waiting questions read, and the replay is not read meanwhile:
@@ -4953,49 +4978,72 @@ mod tests {
     /// would be reported dropped while its delivery is still in the replay, and sent again.
     #[test]
     fn a_slow_question_list_read_after_a_re_open_does_not_use_up_the_follow_up_wait() {
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_time()
-            .build()
-            .unwrap();
-        let queue = Arc::new(EventQueue::with_follow_up_wait(Duration::from_millis(20)));
-        queue
-            .open_steer("m1", "typed".into(), ProtoSteerTurnRequest::default())
-            .unwrap();
-        queue.steer_accepted("m1");
-        let mut state = WatchState::fresh(true, crate::RequestedCliMode::Default);
-        let started = AgentDomainEvent::TurnStarted { turn_id: "t2".into() };
-        runtime.block_on(async {
-            queue.push(turn_completed("t1"));
-            queue.stream_lost();
-            let slow_read = async {
-                tokio::time::sleep(Duration::from_millis(100)).await;
-                Some(crate::InteractionState {
-                    through_sequence: 0,
-                    pending: Vec::new(),
-                })
-            };
-            stream_reopened(&queue, &mut state, Some(slow_read)).await;
-            // The replay, read once the list was.
-            queue.push(started.clone());
-            queue.push(AgentDomainEvent::UserMessageDelivered {
-                client_message_id: "m1".into(),
-                turn_id: "t2".into(),
-                text: String::new(),
+        for replay in [true, false] {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_time()
+                .start_paused(true)
+                .build()
+                .unwrap();
+            let queue = Arc::new(EventQueue::with_follow_up_wait(Duration::from_millis(20)));
+            queue
+                .open_steer("m1", "typed".into(), ProtoSteerTurnRequest::default())
+                .unwrap();
+            queue.steer_accepted("m1");
+            let mut state = WatchState::fresh(true, crate::RequestedCliMode::Default);
+            let started = AgentDomainEvent::TurnStarted { turn_id: "t2".into() };
+            runtime.block_on(async {
+                queue.push(turn_completed("t1"));
+                queue.stream_lost();
+                let slow_read = async {
+                    tokio::time::sleep(Duration::from_millis(21)).await;
+                    Some(crate::InteractionState {
+                        through_sequence: 0,
+                        pending: Vec::new(),
+                    })
+                };
+                stream_reopened(&queue, &mut state, Some(slow_read)).await;
+                tokio::time::sleep(Duration::from_millis(19)).await;
+                assert!(
+                    queue.take().is_empty(),
+                    "the fresh hold lasts until the configured wait"
+                );
+                if replay {
+                    // The replay, read once the list was.
+                    queue.push(started.clone());
+                    queue.push(AgentDomainEvent::UserMessageDelivered {
+                        client_message_id: "m1".into(),
+                        turn_id: "t2".into(),
+                        text: String::new(),
+                    });
+                }
+                tokio::time::sleep(Duration::from_millis(2)).await;
             });
-            tokio::time::sleep(Duration::from_millis(100)).await;
-        });
-        assert_eq!(
-            queue.take(),
-            [
-                turn_completed("t1"),
-                started,
-                AgentDomainEvent::UserMessageDelivered {
-                    client_message_id: "m1".into(),
-                    turn_id: "t2".into(),
-                    text: "typed".into(),
-                },
-            ]
-        );
+            if replay {
+                assert_eq!(
+                    queue.take(),
+                    [
+                        turn_completed("t1"),
+                        started,
+                        AgentDomainEvent::UserMessageDelivered {
+                            client_message_id: "m1".into(),
+                            turn_id: "t2".into(),
+                            text: "typed".into(),
+                        },
+                    ]
+                );
+            } else {
+                assert_eq!(
+                    queue.take(),
+                    [
+                        AgentDomainEvent::UserMessageDropped {
+                            client_message_id: "m1".into(),
+                            reason: steer::UNREPORTED.into(),
+                        },
+                        turn_completed("t1"),
+                    ]
+                );
+            }
+        }
     }
 
     /// Re-opened, a stream whose replay brings no follow-up is given up on after a whole new wait.
@@ -5003,6 +5051,7 @@ mod tests {
     fn the_queue_gives_up_after_a_new_wait_once_the_stream_is_back() {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_time()
+            .start_paused(true)
             .build()
             .unwrap();
         let queue = Arc::new(EventQueue::with_follow_up_wait(Duration::from_millis(20)));
@@ -5013,9 +5062,17 @@ mod tests {
         runtime.block_on(async {
             queue.push(turn_completed("t1"));
             queue.stream_lost();
-            tokio::time::sleep(Duration::from_millis(60)).await;
+            tokio::time::sleep(Duration::from_millis(21)).await;
+            assert!(queue.take().is_empty(), "the disconnected wait cannot release the hold");
             queue.stream_back();
-            tokio::time::sleep(Duration::from_millis(100)).await;
+            tokio::time::sleep(Duration::from_millis(5)).await;
+            assert!(queue.take().is_empty(), "reopening starts a fresh wait");
+            tokio::time::sleep(Duration::from_millis(14)).await;
+            assert!(
+                queue.take().is_empty(),
+                "the fresh hold lasts until the configured wait"
+            );
+            tokio::time::sleep(Duration::from_millis(2)).await;
         });
         assert_eq!(
             queue.take(),

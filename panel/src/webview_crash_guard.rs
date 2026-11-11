@@ -129,14 +129,10 @@ so Eitri stopped trying to reload it automatically.</p><p>{recovery}</p></body><
 mod tests {
     use super::*;
 
-    fn t(secs: u64) -> Instant {
-        // `Instant` has no public constructor from an arbitrary point; anchor every test's
-        // timeline to one real `now()` and offset from there.
-        Instant::now() + Duration::from_secs(secs)
-    }
-
     #[test]
     fn crashes_within_the_budget_are_reloaded() {
+        let now = Instant::now();
+        let t = |secs| now + Duration::from_secs(secs);
         let mut guard = WebViewCrashGuard::new(3, Duration::from_secs(60));
         assert_eq!(guard.on_crash_at(t(0)), CrashResponse::Reload);
         assert_eq!(guard.on_crash_at(t(1)), CrashResponse::Reload);
@@ -145,6 +141,8 @@ mod tests {
 
     #[test]
     fn the_crash_that_crosses_the_limit_gives_up_once() {
+        let now = Instant::now();
+        let t = |secs| now + Duration::from_secs(secs);
         let mut guard = WebViewCrashGuard::new(3, Duration::from_secs(60));
         assert_eq!(guard.on_crash_at(t(0)), CrashResponse::Reload);
         assert_eq!(guard.on_crash_at(t(1)), CrashResponse::Reload);
@@ -155,6 +153,8 @@ mod tests {
 
     #[test]
     fn after_giving_up_every_further_crash_is_ignored_even_much_later() {
+        let now = Instant::now();
+        let t = |secs| now + Duration::from_secs(secs);
         let mut guard = WebViewCrashGuard::new(1, Duration::from_secs(60));
         assert_eq!(guard.on_crash_at(t(0)), CrashResponse::Reload);
         assert_eq!(guard.on_crash_at(t(1)), CrashResponse::GiveUp);
@@ -166,6 +166,8 @@ mod tests {
 
     #[test]
     fn a_crash_older_than_the_window_rolls_off_and_does_not_count_toward_the_limit() {
+        let now = Instant::now();
+        let t = |secs| now + Duration::from_secs(secs);
         let mut guard = WebViewCrashGuard::new(1, Duration::from_secs(10));
         assert_eq!(guard.on_crash_at(t(0)), CrashResponse::Reload);
         // 11s later the first crash is outside the 10s window, so this is the only one counted --
@@ -175,6 +177,8 @@ mod tests {
 
     #[test]
     fn exactly_at_the_limit_still_reloads_only_the_next_one_gives_up() {
+        let now = Instant::now();
+        let t = |secs| now + Duration::from_secs(secs);
         let mut guard = WebViewCrashGuard::new(2, Duration::from_secs(60));
         assert_eq!(guard.on_crash_at(t(0)), CrashResponse::Reload);
         assert_eq!(
@@ -191,6 +195,8 @@ mod tests {
 
     #[test]
     fn with_defaults_uses_the_published_constants() {
+        let now = Instant::now();
+        let t = |secs| now + Duration::from_secs(secs);
         let mut guard = WebViewCrashGuard::with_defaults();
         for i in 0..MAX_CRASHES_PER_WINDOW {
             assert_eq!(guard.on_crash_at(t(i as u64)), CrashResponse::Reload);
@@ -203,6 +209,8 @@ mod tests {
 
     #[test]
     fn a_reset_guard_forgets_given_up_and_its_crash_history() {
+        let now = Instant::now();
+        let t = |secs| now + Duration::from_secs(secs);
         let mut guard = WebViewCrashGuard::new(1, Duration::from_secs(60));
         assert_eq!(guard.on_crash_at(t(0)), CrashResponse::Reload);
         assert_eq!(guard.on_crash_at(t(1)), CrashResponse::GiveUp);
@@ -218,6 +226,8 @@ mod tests {
 
     #[test]
     fn a_reset_guard_also_forgets_crashes_that_had_not_yet_crossed_the_limit() {
+        let now = Instant::now();
+        let t = |secs| now + Duration::from_secs(secs);
         let mut guard = WebViewCrashGuard::new(2, Duration::from_secs(60));
         assert_eq!(guard.on_crash_at(t(0)), CrashResponse::Reload);
         guard.reset();

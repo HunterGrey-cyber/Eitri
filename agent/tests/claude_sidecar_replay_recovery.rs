@@ -12,11 +12,8 @@
 //! (`VERDANDI_CLAUDE_SIDECAR_FAULT_DROP_WATCH_AFTER`) that breaks one watch and deliberately leaves
 //! the session alive.
 //!
-//! **Environment, and why `--test-threads=1` is not optional here.** These set process-global
-//! environment variables that the sidecar inherits (`spawn.rs` never calls `env_clear`, so the Node
-//! child gets the whole parent environment). Two tests in one binary setting different values would
-//! interfere, and the symptom would be a flaky PASS -- a test whose ring was not actually small
-//! never evicts, and never gapping looks exactly like correct behaviour.
+//! Each seam configuration is passed to a fresh child test process, so provider workers can
+//! continue reading the environment without a concurrent mutation.
 
 use agent::{
     AgentDomainEvent, AgentProvider, ClaudeSidecarProvider, ContentKind, CreateSessionRequest, ProjectionStatus,
@@ -29,23 +26,18 @@ use std::time::{Duration, Instant};
 const STREAMING_PROMPT: &str =
     "Write about 600 words on why distributed version control won. Continuous prose, no headings.";
 
-/// Sets the sidecar's configuration for this test, then connects.
-///
-/// SAFETY-ish note: `std::env::set_var` is process-global. Every test in this file must run
-/// single-threaded (see the module doc) or they will overwrite each other's configuration and pass
-/// for the wrong reason.
-fn connect_with(vars: &[(&str, &str)]) -> ClaudeSidecarProvider {
-    std::env::set_var("EITRI_SIDECAR_TEST_SEAMS", "1");
-    for (key, value) in vars {
-        std::env::set_var(key, value);
-    }
-    let provider = ClaudeSidecarProvider::connect(&uuid::Uuid::new_v4().to_string())
-        .expect("connecting to a real sidecar should succeed");
-    for (key, _) in vars {
-        std::env::remove_var(key);
-    }
-    std::env::remove_var("EITRI_SIDECAR_TEST_SEAMS");
-    provider
+fn with_seams(vars: &[(&str, &str)]) -> bool {
+    let mut env: Vec<(&str, Option<&std::ffi::OsStr>)> = vars
+        .iter()
+        .map(|(key, value)| (*key, Some(std::ffi::OsStr::new(value))))
+        .collect();
+    env.push(("EITRI_SIDECAR_TEST_SEAMS", Some(std::ffi::OsStr::new("1"))));
+    agent::testkit::environment::in_child(&env)
+}
+
+fn connect() -> ClaudeSidecarProvider {
+    ClaudeSidecarProvider::connect(&uuid::Uuid::new_v4().to_string())
+        .expect("connecting to a real sidecar should succeed")
 }
 
 fn open(provider: &ClaudeSidecarProvider) -> String {
@@ -114,7 +106,10 @@ fn turn_ended(events: &[AgentDomainEvent]) -> bool {
 fn a_broken_watch_stream_recovers_without_loss_or_duplication() {
     // Break the first watch after 5 live events. The ring stays at its default capacity, so the
     // events produced during the reconnect are all still retained and the gap path is not involved.
-    let provider = connect_with(&[("VERDANDI_CLAUDE_SIDECAR_FAULT_DROP_WATCH_AFTER", "5")]);
+    if !with_seams(&[("VERDANDI_CLAUDE_SIDECAR_FAULT_DROP_WATCH_AFTER", "5")]) {
+        return;
+    }
+    let provider = connect();
     let session_id = open(&provider);
 
     provider
@@ -214,10 +209,13 @@ fn a_broken_watch_stream_recovers_without_loss_or_duplication() {
 #[test]
 #[ignore]
 fn a_gap_too_large_to_replay_ends_the_session_visibly() {
-    let provider = connect_with(&[
+    if !with_seams(&[
         ("VERDANDI_CLAUDE_SIDECAR_RING_CAPACITY", "1"),
         ("VERDANDI_CLAUDE_SIDECAR_FAULT_DROP_WATCH_AFTER", "3"),
-    ]);
+    ]) {
+        return;
+    }
+    let provider = connect();
     assert!(
         provider.info().event_buffer_policy.contains("bounded-1"),
         "the sidecar did not take the configured ring capacity, so this test would prove nothing. \
@@ -367,7 +365,10 @@ fn a_conversation_keeps_ingesting_while_its_ui_is_stalled() {
 #[test]
 #[ignore]
 fn a_stalled_consumer_is_lossless_and_its_cost_is_measured() {
-    let provider = connect_with(&[]);
+    if !with_seams(&[]) {
+        return;
+    }
+    let provider = connect();
     let sidecar_pid = provider.sidecar_pid();
     let session_id = open(&provider);
 
@@ -381,17 +382,21 @@ fn a_stalled_consumer_is_lossless_and_its_cost_is_measured() {
         })
         .unwrap();
 
-    // Deliberately do not pump. Everything produced in this window has to be held somewhere.
-    eprintln!("stalling the consumer for 20s");
+    // Sample without pumping until the queue proves a backlog has accumulated.
+    let deadline = Instant::now() + Duration::from_secs(180);
     let mut samples = Vec::new();
-    for _ in 0..20 {
-        std::thread::sleep(Duration::from_secs(1));
+    loop {
+        assert!(Instant::now() < deadline, "no event backlog accumulated");
         let stats = provider.backpressure_stats();
         samples.push((
             stats.pending_events,
             stats.max_delivery_lag_ms,
             sidecar_rss_kib(sidecar_pid),
         ));
+        if stats.pending_events > 50 {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(25));
     }
 
     let stalled = provider.backpressure_stats();
@@ -400,10 +405,10 @@ fn a_stalled_consumer_is_lossless_and_its_cost_is_measured() {
     let catch_up = resumed_at.elapsed();
     let after = provider.backpressure_stats();
 
-    eprintln!("---- backpressure under a 20s stall ----");
+    eprintln!("---- backpressure under a consumer stall ----");
     for (i, (pending, lag, rss)) in samples.iter().enumerate() {
         eprintln!(
-            "  t+{:>2}s  pending={:>5}  max_lag={:>6}ms  sidecar_rss={}",
+            "  sample {:>2}  pending={:>5}  max_lag={:>6}ms  sidecar_rss={}",
             i + 1,
             pending,
             lag,

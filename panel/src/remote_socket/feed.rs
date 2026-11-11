@@ -293,6 +293,7 @@ mod tests {
     use super::*;
     use crate::agent_panel::tests::*;
     use std::io::{BufRead, BufReader};
+    use std::net::Shutdown;
 
     /// `turns` completed turns, each a prompt and a reply of `reply_bytes`.
     fn turns(turns: usize, reply_bytes: usize) -> Vec<agent::AgentDomainEvent> {
@@ -514,10 +515,17 @@ mod tests {
             before_turn: 1,
         });
         let mut peak = 0;
-        for _ in 0..50 {
+        let deadline = Instant::now() + PATIENCE;
+        while peak == 0 {
+            assert!(Instant::now() < deadline, "the page never reached the writer");
             rig.turn();
             peak = peak.max(rig.writer_bytes());
-            std::thread::sleep(Duration::from_millis(2));
+            std::thread::yield_now();
+        }
+        for _ in 0..256 {
+            rig.turn();
+            peak = peak.max(rig.writer_bytes());
+            std::thread::yield_now();
         }
         assert!(peak > 0, "the page is on its way");
         assert!(
@@ -583,9 +591,9 @@ mod tests {
             rig.turn();
         }
         for peer in [&following, &quiet] {
-            while let Ok(line) = peer.lines.recv_timeout(Duration::from_millis(20)) {
-                assert_ne!(line["kind"], "theme", "{line}");
-            }
+            peer.send(&RvInbound::Ping { v: 1 });
+            let lines = peer.until(&rig, "the font change's pong", |l| l["kind"] == "pong");
+            assert!(lines.iter().all(|line| line["kind"] != "theme"), "{lines:?}");
         }
 
         // A greeting after the change carries the new colours.

@@ -36,6 +36,8 @@ pub struct Step {
     needs: Vec<String>,
     lacks: Vec<String>,
     hang: Option<Duration>,
+    #[cfg(feature = "test-support")]
+    hold_until_drop: bool,
 }
 
 impl Step {
@@ -47,6 +49,8 @@ impl Step {
             needs: Vec::new(),
             lacks: Vec::new(),
             hang: None,
+            #[cfg(feature = "test-support")]
+            hold_until_drop: false,
         }
     }
 
@@ -105,6 +109,13 @@ impl Step {
     /// After the events, the stream is held open this long (or until the model is dropped): a turn in progress.
     pub fn then_hang(mut self, how_long: Duration) -> Step {
         self.hang = Some(how_long);
+        self
+    }
+
+    /// Holds the stream until the fixture is dropped, without a timer ending the turn.
+    #[cfg(feature = "test-support")]
+    pub fn then_hold(mut self) -> Step {
+        self.hold_until_drop = true;
         self
     }
 
@@ -334,6 +345,8 @@ fn serve(stream: TcpStream, inner: &Mutex<Inner>, stop: &AtomicBool) -> io::Resu
         let chosen = inner.script.iter().position(|s| s.fits(&text));
         (chosen.map(|i| inner.script.remove(i)), response_id)
     };
+    #[cfg(feature = "test-support")]
+    let hold_until_drop = step.as_ref().is_some_and(|step| step.hold_until_drop);
     let (events, hang) = match step {
         Some(step) => (step.events, step.hang),
         None => (Step::say("done").events, None),
@@ -344,6 +357,13 @@ fn serve(stream: TcpStream, inner: &Mutex<Inner>, stop: &AtomicBool) -> io::Resu
     )?;
     writer.write_all(&sse(&events, &response_id))?;
     writer.flush()?;
+    #[cfg(feature = "test-support")]
+    if hold_until_drop {
+        while !stop.load(Ordering::SeqCst) {
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        return writer.shutdown(Shutdown::Both);
+    }
     if let Some(how_long) = hang {
         let end = Instant::now() + how_long;
         while Instant::now() < end && !stop.load(Ordering::SeqCst) {

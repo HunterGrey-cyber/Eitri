@@ -312,6 +312,21 @@ pub(crate) fn nonblocking_connect_outcome(path: &Path) -> ConnectOutcome {
 /// How long to wait before asking a full accept queue again.
 const FULL_QUEUE_RETRY: Duration = Duration::from_millis(20);
 
+#[cfg(test)]
+thread_local! {
+    static CONNECT_WAITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(any(test, feature = "test-support"))]
+thread_local! {
+    static CONNECT_SOCKET_OBSERVER: std::cell::RefCell<Option<Box<dyn FnOnce(std::os::fd::RawFd)>>> = const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(any(test, feature = "test-support"))]
+pub fn observe_connect_socket_for_tests(observer: impl FnOnce(std::os::fd::RawFd) + 'static) {
+    CONNECT_SOCKET_OBSERVER.with(|slot| *slot.borrow_mut() = Some(Box::new(observer)));
+}
+
 /// A connected stream to the listener at `path`, or why not, giving up at `deadline`. A blocking
 /// `connect(2)` to a listener whose accept queue is full sleeps until the queue has room, which
 /// for a listener that never accepts is forever, and a thread left to wait it out is never
@@ -328,6 +343,10 @@ pub(crate) fn connect_by(path: &Path, deadline: Instant) -> io::Result<UnixStrea
     // SAFETY: `raw` was just opened by this call and nothing else owns it; owning it at once closes
     // it on every return below.
     let fd = unsafe { OwnedFd::from_raw_fd(raw) };
+    #[cfg(any(test, feature = "test-support"))]
+    if let Some(observer) = CONNECT_SOCKET_OBSERVER.with(|slot| slot.borrow_mut().take()) {
+        observer(raw);
+    }
     loop {
         // SAFETY: `fd` is open for the call; `addr` is a fully initialized `sockaddr_un` and its
         // exact size is passed.
@@ -352,10 +371,14 @@ pub(crate) fn connect_by(path: &Path, deadline: Instant) -> io::Result<UnixStrea
                 if remaining.is_zero() {
                     return Err(io::ErrorKind::TimedOut.into());
                 }
+                #[cfg(test)]
+                CONNECT_WAITS.set(CONNECT_WAITS.get() + 1);
                 std::thread::sleep(remaining.min(FULL_QUEUE_RETRY));
             }
             // The connection is being made in the background (the BSDs may say so): wait for it.
             Some(e) if e == libc::EINPROGRESS || e == libc::EALREADY => {
+                #[cfg(test)]
+                CONNECT_WAITS.set(CONNECT_WAITS.get() + 1);
                 wait_until_connected(&fd, deadline)?;
                 break;
             }
@@ -898,10 +921,10 @@ pub(crate) mod tests {
     fn connect_by_reports_a_missing_socket_at_once_with_its_errno() {
         let dir = connect_dir("missing");
         let sock = agent::socket_path::in_dir(&dir, "s.sock").expect("under the cap");
-        let started = std::time::Instant::now();
+        CONNECT_WAITS.set(0);
         let error = connect_by(&sock, soon()).expect_err("nothing is there");
         assert_eq!(error.raw_os_error(), Some(libc::ENOENT), "{error}");
-        assert!(started.elapsed() < std::time::Duration::from_millis(500));
+        assert_eq!(CONNECT_WAITS.get(), 0, "the errno returns without entering a wait");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -910,10 +933,10 @@ pub(crate) mod tests {
         let dir = connect_dir("dead");
         let sock = agent::socket_path::in_dir(&dir, "s.sock").expect("under the cap");
         drop(UnixListener::bind(&sock).expect("bind the fixture"));
-        let started = std::time::Instant::now();
+        CONNECT_WAITS.set(0);
         let error = connect_by(&sock, soon()).expect_err("nothing listens");
         assert_eq!(error.raw_os_error(), Some(libc::ECONNREFUSED), "{error}");
-        assert!(started.elapsed() < std::time::Duration::from_millis(500));
+        assert_eq!(CONNECT_WAITS.get(), 0, "the errno returns without entering a wait");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

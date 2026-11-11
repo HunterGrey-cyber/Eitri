@@ -272,6 +272,23 @@ pub(crate) fn observe_gestures(view: &WebView, clock: Rc<GestureClock>) {
     view.add_controller(observe);
 }
 
+#[cfg(test)]
+thread_local! {
+    static CONTENT_FOR_TESTS: RefCell<Option<UserContentManager>> = const { RefCell::new(None) };
+}
+
+#[cfg(test)]
+#[allow(dead_code, reason = "called by the integration test that includes this module")]
+pub(crate) fn build_with_content(
+    spec: &PageSpec,
+    hooks: PageHooks,
+    theme: &PageTheme,
+    content: UserContentManager,
+) -> WebView {
+    CONTENT_FOR_TESTS.with(|slot| assert!(slot.replace(Some(content)).is_none()));
+    build(spec, hooks, theme)
+}
+
 pub(crate) fn build(spec: &PageSpec, hooks: PageHooks, theme: &PageTheme) -> WebView {
     let context = WebContext::new();
     if let Some(security) = context.security_manager() {
@@ -287,6 +304,8 @@ pub(crate) fn build(spec: &PageSpec, hooks: PageHooks, theme: &PageTheme) -> Web
     }
 
     let content = UserContentManager::new();
+    #[cfg(test)]
+    let content = CONTENT_FOR_TESTS.with(|slot| slot.take()).unwrap_or(content);
     content.add_script(&UserScript::new(
         BRIDGE_JS,
         UserContentInjectedFrames::TopFrame,

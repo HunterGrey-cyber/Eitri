@@ -331,6 +331,18 @@ enum WriteItem {
 }
 
 struct Shared {
+    #[cfg(feature = "test-support")]
+    lines_read: AtomicU64,
+    #[cfg(feature = "test-support")]
+    blocking_waits: AtomicU64,
+    #[cfg(feature = "test-support")]
+    wait_clock: Mutex<Option<Arc<dyn Fn() -> Instant + Send + Sync>>>,
+    #[cfg(feature = "test-support")]
+    before_shutdown: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    #[cfg(feature = "test-support")]
+    exited_during_grace: AtomicBool,
+    #[cfg(feature = "test-support")]
+    shutdown_grace: Mutex<Option<Duration>>,
     framing: Framing,
     over_cap: OverCapAnswer,
     next_id: AtomicU64,
@@ -351,6 +363,18 @@ struct Shared {
 impl Shared {
     fn new(framing: Framing, over_cap: OverCapAnswer, next_id: u64, writer: Option<SyncSender<WriteItem>>) -> Shared {
         Shared {
+            #[cfg(feature = "test-support")]
+            lines_read: AtomicU64::new(0),
+            #[cfg(feature = "test-support")]
+            blocking_waits: AtomicU64::new(0),
+            #[cfg(feature = "test-support")]
+            wait_clock: Mutex::new(None),
+            #[cfg(feature = "test-support")]
+            before_shutdown: Mutex::new(None),
+            #[cfg(feature = "test-support")]
+            exited_during_grace: AtomicBool::new(false),
+            #[cfg(feature = "test-support")]
+            shutdown_grace: Mutex::new(None),
             framing,
             over_cap,
             next_id: AtomicU64::new(next_id),
@@ -456,6 +480,11 @@ fn json_text(value: &Value) -> String {
     serde_json::to_string(value).unwrap_or_else(|_| "null".to_string())
 }
 
+#[cfg(all(feature = "test-support", not(test)))]
+const RPC_WAIT_SPIN_LIMIT: usize = 1_000_000;
+#[cfg(all(feature = "test-support", test))]
+const RPC_WAIT_SPIN_LIMIT: usize = 64;
+
 /// An answer on its way. Dropping it forgets the request: a late answer is discarded.
 pub struct Pending {
     id: u64,
@@ -468,8 +497,20 @@ impl Pending {
         self.id
     }
 
+    #[cfg(feature = "test-support")]
+    pub fn wait_now_for_tests(&self) -> Option<Instant> {
+        let clock = lock(&self.shared.wait_clock).clone();
+        clock.map(|now| now())
+    }
+
     /// Waits for the answer until `deadline`.
     pub fn wait(self, deadline: Instant) -> Result<Value, LinkError> {
+        #[cfg(feature = "test-support")]
+        self.shared.blocking_waits.fetch_add(1, Ordering::SeqCst);
+        #[cfg(feature = "test-support")]
+        let clock = lock(&self.shared.wait_clock).clone();
+        #[cfg(feature = "test-support")]
+        let mut spins = 0usize;
         self.slot.waited.store(true, Ordering::SeqCst);
         let mut value = lock(&self.slot.value);
         loop {
@@ -477,8 +518,22 @@ impl Pending {
                 return result;
             }
             let now = Instant::now();
+            #[cfg(feature = "test-support")]
+            let now = clock.as_ref().map_or(now, |clock| clock());
             if now >= deadline {
                 return Err(LinkError::Timeout);
+            }
+            #[cfg(feature = "test-support")]
+            if clock.is_some() {
+                spins += 1;
+                assert!(
+                    spins <= RPC_WAIT_SPIN_LIMIT,
+                    "injected RPC wait clock did not reach its deadline or receive an answer"
+                );
+                drop(value);
+                thread::yield_now();
+                value = lock(&self.slot.value);
+                continue;
             }
             value = match self.slot.ready.wait_timeout(value, deadline - now) {
                 Ok((guard, _)) => guard,
@@ -517,9 +572,29 @@ impl Drop for Pending {
     }
 }
 
+#[cfg(feature = "test-support")]
+#[derive(Clone, Default)]
+pub struct ReaderWaitProbe {
+    polling: Arc<AtomicBool>,
+    outcome: Arc<Mutex<Option<(i32, bool)>>>,
+}
+
+#[cfg(feature = "test-support")]
+impl ReaderWaitProbe {
+    pub fn waiting(&self) -> bool {
+        self.polling.load(Ordering::SeqCst)
+    }
+
+    pub fn stopped_on_signal(&self) -> bool {
+        *lock(&self.outcome) == Some((-1, true))
+    }
+}
+
 /// Asks one of the link's threads to stop, and wakes it wherever it waits: a flag for the loop's own
 /// checks, and a socket whose end of file its `poll` sees.
 struct StopSignal {
+    #[cfg(feature = "test-support")]
+    probe: ReaderWaitProbe,
     raised: AtomicBool,
     wake: UnixStream,
     watch: UnixStream,
@@ -529,6 +604,8 @@ impl StopSignal {
     fn new() -> io::Result<Arc<StopSignal>> {
         let (wake, watch) = UnixStream::pair()?;
         Ok(Arc::new(StopSignal {
+            #[cfg(feature = "test-support")]
+            probe: ReaderWaitProbe::default(),
             raised: AtomicBool::new(false),
             wake,
             watch,
@@ -548,7 +625,18 @@ impl StopSignal {
     /// which wins when both are ready.
     fn wait_readable(&self, fd: RawFd) -> bool {
         let mut fds = [pollin(fd), pollin(self.watch.as_raw_fd())];
-        if poll(&mut fds, -1).is_err() {
+        #[cfg(feature = "test-support")]
+        self.probe.polling.store(true, Ordering::SeqCst);
+        let result = poll(&mut fds, -1);
+        #[cfg(feature = "test-support")]
+        {
+            self.probe.polling.store(false, Ordering::SeqCst);
+            *lock(&self.probe.outcome) = result
+                .as_ref()
+                .ok()
+                .map(|&timeout_ms| (timeout_ms, fds[1].revents != 0));
+        }
+        if result.is_err() {
             // The read that follows reports whatever is wrong with the descriptor.
             return !self.raised();
         }
@@ -572,12 +660,12 @@ fn pollin(fd: RawFd) -> libc::pollfd {
     }
 }
 
-fn poll(fds: &mut [libc::pollfd], timeout_ms: i32) -> io::Result<()> {
+fn poll(fds: &mut [libc::pollfd], timeout_ms: i32) -> io::Result<i32> {
     loop {
         // SAFETY: `fds` is a valid, writable array of `fds.len()` `pollfd`s for the call.
         let r = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, timeout_ms) };
         if r >= 0 {
-            return Ok(());
+            return Ok(timeout_ms);
         }
         let e = io::Error::last_os_error();
         if e.kind() != io::ErrorKind::Interrupted {
@@ -1052,11 +1140,13 @@ impl JsonRpcLink {
     }
 
     fn stop_reader(&mut self) -> Result<ReaderStopped, String> {
+        let joined;
         let Some((handle, stop)) = self.reader.take() else {
             return Err("the agent's output is no longer read".to_string());
         };
         stop.raise();
-        match handle.join() {
+        joined = handle.join();
+        match joined {
             Ok(Some(stopped)) => Ok(stopped),
             // The reader had ended on its own, and the owner has been told through the queue.
             Ok(None) => Err("the agent's connection closed".to_string()),
@@ -1181,6 +1271,67 @@ impl JsonRpcLink {
         held.take()
     }
 
+    #[cfg(feature = "test-support")]
+    pub fn reader_waiting_for_tests(&self) -> bool {
+        self.shared.reader_waiting.load(Ordering::SeqCst)
+    }
+
+    #[cfg(feature = "test-support")]
+    pub fn reader_wait_probe_for_tests(&self) -> ReaderWaitProbe {
+        self.reader.as_ref().expect("reader is running").1.probe.clone()
+    }
+
+    #[cfg(feature = "test-support")]
+    pub fn requests_for_tests(&self) -> u64 {
+        self.shared.next_id.load(Ordering::SeqCst) - 1
+    }
+
+    #[cfg(feature = "test-support")]
+    pub fn blocking_waits_for_tests(&self) -> u64 {
+        self.shared.blocking_waits.load(Ordering::SeqCst)
+    }
+
+    #[cfg(feature = "test-support")]
+    pub fn lines_read_for_tests(&self) -> u64 {
+        self.shared.lines_read.load(Ordering::SeqCst)
+    }
+
+    /// Parks shutdown before it closes stdin, until the sender is used or dropped.
+    #[cfg(feature = "test-support")]
+    pub fn shutdown_checkpoint_for_tests(&self) -> (Receiver<()>, std::sync::mpsc::Sender<()>) {
+        let (entered, parked) = std::sync::mpsc::channel();
+        let (release, go) = std::sync::mpsc::channel();
+        *lock(&self.shared.before_shutdown) = Some(Box::new(move || {
+            let _ = entered.send(());
+            let _ = go.recv();
+        }));
+        (parked, release)
+    }
+
+    #[cfg(feature = "test-support")]
+    pub fn shutdown_for_tests(mut self, grace: Duration) -> bool {
+        self.finish(grace);
+        self.shared.exited_during_grace.load(Ordering::SeqCst)
+    }
+
+    #[cfg(feature = "test-support")]
+    pub fn set_wait_clock_for_tests(&self, now: Arc<dyn Fn() -> Instant + Send + Sync>) {
+        *lock(&self.shared.wait_clock) = Some(now);
+    }
+
+    #[cfg(feature = "test-support")]
+    pub fn grace_outcome_for_tests(&self) -> impl Fn() -> bool + use<> {
+        let shared = self.shared.clone();
+        move || shared.exited_during_grace.load(Ordering::SeqCst)
+    }
+
+    /// Observes elapsed shutdown grace at the signal point, even after the link is consumed.
+    #[cfg(feature = "test-support")]
+    pub fn shutdown_grace_for_tests(&self) -> impl Fn() -> Option<Duration> + use<> {
+        let shared = self.shared.clone();
+        move || *lock(&shared.shutdown_grace)
+    }
+
     /// The end of what the child wrote to stderr, bounded, with email addresses replaced.
     pub fn stderr_tail(&self) -> String {
         let bytes: Vec<u8> = lock(&self.shared.stderr).iter().copied().collect();
@@ -1193,6 +1344,10 @@ impl JsonRpcLink {
     }
 
     pub(crate) fn finish(&mut self, grace: Duration) {
+        #[cfg(feature = "test-support")]
+        if let Some(checkpoint) = lock(&self.shared.before_shutdown).take() {
+            checkpoint();
+        }
         // Dropping the sender ends the writer thread, which drops stdin: the child sees EOF.
         lock(&self.shared.writer).take();
         // A child handed over for a move is the taker's to end.
@@ -1200,7 +1355,8 @@ impl JsonRpcLink {
             return;
         }
         let child = self.child.take();
-        let end = Instant::now() + grace;
+        let start = Instant::now();
+        let end = start + grace;
         let exited = loop {
             match child_state(self.pid) {
                 ChildState::Running if Instant::now() < end => thread::sleep(Duration::from_millis(10)),
@@ -1224,6 +1380,11 @@ impl JsonRpcLink {
         // and neither can belong to anything else. The group is killed even when the child exited
         // on its own: a grandchild left in it would keep our pipes open, and with them the reader
         // and stderr threads, for good.
+        #[cfg(feature = "test-support")]
+        {
+            *lock(&self.shared.shutdown_grace) = Some(start.elapsed());
+            self.shared.exited_during_grace.store(exited, Ordering::SeqCst);
+        }
         kill_group(self.pid);
         match child {
             Some(mut child) => {
@@ -1589,7 +1750,10 @@ fn read_loop(
         };
         line.clear();
         match verdict {
-            Ok(()) => {}
+            Ok(()) => {
+                #[cfg(feature = "test-support")]
+                end.shared.lines_read.fetch_add(1, Ordering::SeqCst);
+            }
             Err(Halt::Failed(reason)) => break reason,
             // The line was read whole: the message is all that is left of it.
             Err(Halt::Stopped(item)) => return stopped(&mut end, &buf, line, None, Some(item), stdout),
@@ -2123,6 +2287,23 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "test-support")]
+    #[should_panic(expected = "injected RPC wait clock did not reach its deadline or receive an answer")]
+    fn a_frozen_rpc_wait_clock_hits_its_spin_guard() {
+        let shared = shared_for_test();
+        let start = Instant::now();
+        let calls = Arc::new(AtomicU64::new(0));
+        *lock(&shared.wait_clock) = Some(Arc::new(move || {
+            assert!(
+                calls.fetch_add(1, Ordering::SeqCst) <= RPC_WAIT_SPIN_LIMIT as u64,
+                "the RPC spin guard was bypassed"
+            );
+            start
+        }));
+        let _ = pending_in(&shared, 7).wait(start + Duration::from_secs(10));
+    }
+
+    #[test]
     fn oversized_acp_updates_keep_the_session_kind_and_tool_id_when_readable() {
         for (prefix, expected) in [
             (&br#"{"method":"session/update","params":{"sessionId":"s1","update":{"sessionUpdate":"tool_call_update","toolCallId":"c1","padding":""#[..],
@@ -2350,11 +2531,13 @@ mod tests {
 
     /// Stops `link` on a thread, so a reader that cannot be stopped fails the test instead of hanging it.
     fn stop(link: JsonRpcLink) -> (LinkHandoff, [OwnedFd; 3]) {
+        let stopped;
         let (tx, rx) = mpsc::channel();
         thread::spawn(move || {
             let _ = tx.send(link.stop_for_move());
         });
-        match rx.recv_timeout(PATIENCE).expect("the stop returned") {
+        stopped = rx.recv_timeout(PATIENCE).expect("the stop returned");
+        match stopped {
             Ok(stopped) => stopped,
             Err(refused) => panic!("the stop was refused: {}", refused.reason),
         }
@@ -2433,10 +2616,35 @@ mod tests {
     }
 
     #[test]
+    fn a_stop_fd_ends_an_unbounded_read_wait() {
+        use std::io::Write;
+        let stop = StopSignal::new().unwrap();
+        let (input, _held) = UnixStream::pair().unwrap();
+        let reader_stop = stop.clone();
+        let reader = thread::spawn(move || reader_stop.wait_readable(input.as_raw_fd()));
+        wait_until("the idle reader's poll", || stop.probe.waiting());
+        stop.raised.store(true, Ordering::SeqCst);
+        // A byte also makes the stop descriptor readable, without needing a socket shutdown.
+        let mut wake = File::from(OwnedFd::from(stop.wake.try_clone().unwrap()));
+        wake.write_all(b"x").unwrap();
+        assert!(!crate::test_tmp::completed(move || reader.join().unwrap()));
+        assert!(
+            stop.probe.stopped_on_signal(),
+            "the read wait ended on readiness with no polling deadline"
+        );
+    }
+
+    #[test]
     fn an_idle_reader_stops_on_its_stop_fd_with_no_input_pending() {
         let link = stand_in("while read -r l; do :; done");
         let pid = link.pid();
+        let probe = link.reader_wait_probe_for_tests();
+        wait_until("the idle reader's poll", || probe.waiting());
         let (handoff, fds) = stop(link);
+        assert!(
+            probe.stopped_on_signal(),
+            "the unbounded read wait ended on stop-fd readiness"
+        );
         assert_eq!(handoff.pid, pid);
         assert!(handoff.unread.is_empty() && handoff.partial_line.is_empty() && !handoff.over_cap);
         assert!(handoff.incoming.is_empty(), "{:?}", handoff.incoming);
@@ -2865,12 +3073,12 @@ mod tests {
         let script = if leader_exits {
             "sleep 30 & echo started"
         } else {
-            "sleep 30 & echo started; exec sleep 30"
+            "sleep 30 & echo started; while read -r line; do echo pong; done; wait"
         };
         let mut child = std::process::Command::new("sh")
             .args(["-c", script])
             .process_group(0)
-            .stdin(Stdio::null())
+            .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .spawn()
             .unwrap();
@@ -2886,7 +3094,7 @@ mod tests {
     /// Whether every holder of the pipe's write end is gone within a few seconds.
     #[cfg(target_os = "linux")]
     fn pipe_closed_soon(mut out: std::process::ChildStdout) -> bool {
-        let (tx, rx) = std::sync::mpsc::channel();
+        let (tx, rx) = mpsc::channel();
         thread::spawn(move || {
             let mut rest = Vec::new();
             let _ = tx.send(std::io::Read::read_to_end(&mut out, &mut rest).is_ok());
@@ -2899,11 +3107,18 @@ mod tests {
     fn a_foreign_child_is_signalled_only_as_the_process_its_start_time_names() {
         let (mut child, pid, start, out) = group_with_grandchild(false);
         end_foreign_child(pid, start + 1, Instant::now());
-        thread::sleep(Duration::from_millis(100));
-        assert!(
-            child.try_wait().unwrap().is_none(),
-            "another start time names another process: nothing signalled"
-        );
+        use std::io::{BufRead, Write};
+        writeln!(child.stdin.as_mut().unwrap(), "ping").expect("the wrong-start child still reads");
+        let out = crate::test_tmp::completed(move || {
+            let mut out = std::io::BufReader::new(out);
+            let mut answer = String::new();
+            out.read_line(&mut answer).unwrap();
+            assert_eq!(
+                answer, "pong\n",
+                "the child must answer after the wrong-start signal check"
+            );
+            out.into_inner()
+        });
         end_foreign_child(pid, start, Instant::now());
         assert!(
             std::os::unix::process::ExitStatusExt::signal(&child.wait().unwrap()).is_some(),

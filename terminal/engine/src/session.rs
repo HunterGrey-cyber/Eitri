@@ -684,21 +684,33 @@ enum Flow {
     ChildGone,
 }
 
+#[cfg(test)]
+thread_local! {
+    static READ_WAIT: std::cell::RefCell<Option<Box<dyn FnMut()>>> = Default::default();
+}
+
 impl Worker<'_> {
-    fn run(mut self) -> Option<ExitInfo> {
+    fn run(self) -> Option<ExitInfo> {
+        self.run_with(Instant::now, |fds, timeout| {
+            // SAFETY: two initialized pollfds remain live for the call.
+            unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, timeout) }
+        })
+    }
+
+    fn run_with(
+        mut self,
+        mut now: impl FnMut() -> Instant,
+        mut poll: impl FnMut(&mut [libc::pollfd; 2], libc::c_int) -> libc::c_int,
+    ) -> Option<ExitInfo> {
         let mut buf = vec![0u8; READ_CHUNK];
         // The first frame, so a pane whose program prints nothing yet still shows its background.
-        self.render_if_due(Instant::now());
+        self.render_if_due(now());
         loop {
             let mut fds = [
                 libc::pollfd {
                     // A negative fd is ignored by poll: a master whose every user is gone would
                     // report POLLHUP forever, and one in the middle of a move is not read.
-                    fd: if self.detached || self.report_due.is_some() || !self.live() {
-                        -1
-                    } else {
-                        self.pty.master_fd().as_raw_fd()
-                    },
+                    fd: self.output_fd(),
                     events: libc::POLLIN | if self.outbox.is_empty() { 0 } else { libc::POLLOUT },
                     revents: 0,
                 },
@@ -708,9 +720,8 @@ impl Worker<'_> {
                     revents: 0,
                 },
             ];
-            let timeout = self.poll_timeout(Instant::now());
-            // SAFETY: `fds` is a live array of two initialised pollfds for the duration of the call.
-            let polled = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, timeout) };
+            let timeout = self.poll_timeout(now());
+            let polled = poll(&mut fds, timeout);
             self.shared.thread_wakeups.fetch_add(1, Ordering::SeqCst);
             if polled < 0 {
                 if io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
@@ -741,14 +752,14 @@ impl Worker<'_> {
                 // renders, which nothing reads from the PTY for.
                 if matches!(self.phase, Phase::Adopted { .. }) {
                     self.publish_mouse_modes();
-                    self.render_if_due(Instant::now());
+                    self.render_if_due(now());
                 }
                 continue;
             }
             if let Some(due) = self.report_due {
                 match self.pty.try_wait() {
                     Ok(Some(status)) => return Some(self.show_end(ExitInfo::from_status(status))),
-                    _ if Instant::now() < due => {}
+                    _ if now() < due => {}
                     _ => {
                         self.show_end(ExitInfo::UNKNOWN);
                         return None;
@@ -772,7 +783,7 @@ impl Worker<'_> {
                 if fds[0].revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR) != 0 {
                     let flow = self.read_output(&mut buf);
                     // Before acting on EOF: the last read before it can carry a title or a copy.
-                    self.publish_events(Instant::now());
+                    self.publish_events(now());
                     if let Flow::ChildGone = flow {
                         match self.wait_after_eof() {
                             Ok(Some(status)) => return Some(self.show_end(ExitInfo::from_status(status))),
@@ -791,9 +802,17 @@ impl Worker<'_> {
             }
             // In both states: a deadline left armed when the child detached would otherwise stay
             // in the past and turn `poll` into a busy loop.
-            self.track_sync(Instant::now());
+            self.track_sync(now());
             self.publish_mouse_modes();
-            self.render_if_due(Instant::now());
+            self.render_if_due(now());
+        }
+    }
+
+    fn output_fd(&self) -> libc::c_int {
+        if self.detached || self.report_due.is_some() || !self.live() {
+            -1
+        } else {
+            self.pty.master_fd().as_raw_fd()
         }
     }
 
@@ -1135,6 +1154,12 @@ impl Worker<'_> {
             revents: 0,
         };
         let ms = (until - now).as_micros().div_ceil(1000).min(i32::MAX as u128) as libc::c_int;
+        #[cfg(test)]
+        READ_WAIT.with(|hook| {
+            if let Some(hook) = hook.borrow_mut().as_mut() {
+                hook();
+            }
+        });
         // SAFETY: one live pollfd for the duration of the call.
         let polled = unsafe { libc::poll(&mut fd, 1, ms) };
         polled > 0 || (polled < 0 && io::Error::last_os_error().kind() == io::ErrorKind::Interrupted)
@@ -1388,13 +1413,17 @@ impl Worker<'_> {
 
     /// The host asked (or went away): hang up, give the child [`HANGUP_GRACE`], then kill it by
     /// the pid captured at spawn.
-    fn shut_down(mut self) -> Option<ExitInfo> {
+    fn shut_down(self) -> Option<ExitInfo> {
+        self.shut_down_with(Instant::now, || std::thread::sleep(Duration::from_millis(10)))
+    }
+
+    fn shut_down_with(mut self, mut now: impl FnMut() -> Instant, mut wait: impl FnMut()) -> Option<ExitInfo> {
         self.pty.hangup();
-        let deadline = Instant::now() + HANGUP_GRACE;
+        let deadline = now() + HANGUP_GRACE;
         loop {
             match self.pty.try_wait() {
                 Ok(Some(status)) => return Some(ExitInfo::from_status(status)),
-                Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(10)),
+                Ok(None) if now() < deadline => wait(),
                 Ok(None) => {
                     self.pty.kill();
                     return self.pty.wait().ok().map(ExitInfo::from_status);
@@ -1408,6 +1437,540 @@ impl Worker<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // The production turn functions receive explicit instants; the PTY stays quiet while tests
+    // advance them. The wake gate is reopened each turn, just as a host taking updates does.
+    fn worker(wake: &dyn Fn()) -> (Worker<'_>, Sender<SessionCommand>, PipeWriter) {
+        let size = PtySize {
+            cols: 80,
+            rows: 5,
+            cell_width_px: 9,
+            cell_height_px: 18,
+        };
+        let pty = PtyChild::spawn(
+            &SpawnSpec {
+                program: "/bin/sh".into(),
+                args: vec!["-c".into(), "read x".into()],
+                cwd: std::env::temp_dir(),
+                env: vec![],
+                extra_env: vec![],
+            },
+            size,
+        )
+        .unwrap();
+        let (doorbell, bell) = std::io::pipe().unwrap();
+        set_nonblocking(doorbell.as_fd()).unwrap();
+        let (commands, receiver) = mpsc::channel();
+        (
+            Worker {
+                pty,
+                screen: Screen::new(size, TerminalColors::default()),
+                size,
+                colors: TerminalColors::default(),
+                focused: true,
+                visible: true,
+                detached: false,
+                report_due: None,
+                phase: Phase::Live,
+                commands: receiver,
+                doorbell,
+                shared: Arc::new(Shared::new()),
+                wake,
+                tap: None,
+                clock: RenderClock::new(FRAME_INTERVAL),
+                outbox: Outbox::new(),
+                sync_deadline: None,
+                events_pending: false,
+                frame_owed: false,
+                last_mouse: None,
+            },
+            commands,
+            bell,
+        )
+    }
+
+    fn take(worker: &Worker<'_>) -> Update {
+        worker.shared.wake_pending.store(false, Ordering::SeqCst);
+        std::mem::take(&mut *worker.shared.update())
+    }
+
+    fn settle(worker: &mut Worker<'_>, now: Instant) {
+        worker.publish_mouse_modes();
+        worker.render_if_due(now);
+        take(worker);
+    }
+
+    #[test]
+    fn osc52_copy_reaches_the_host_and_osc52_paste_is_refused() {
+        let (mut w, _commands, _bell) = worker(&|| {});
+        let t = Instant::now();
+        settle(&mut w, t);
+        w.screen.feed(b"\x1b]52;c;aGk=\x07\x1b]52;c;?\x07");
+        w.publish_events(t);
+        assert_eq!(take(&w).events.clipboard.as_deref(), Some("hi"));
+        for turn in 1..=100 {
+            assert!(w.screen.take_replies().is_empty(), "OSC 52 paste emitted a reply");
+            assert!(w.outbox.take_unwritten().is_empty());
+            w.render_if_due(t + FRAME_INTERVAL * turn);
+        }
+    }
+
+    #[test]
+    fn idle_renders_nothing() {
+        let wakes = AtomicUsize::new(0);
+        let wake = || {
+            wakes.fetch_add(1, Ordering::SeqCst);
+        };
+        let (mut w, _commands, _bell) = worker(&wake);
+        let t = Instant::now();
+        settle(&mut w, t);
+        let baseline = (w.shared.renders.load(Ordering::SeqCst), wakes.load(Ordering::SeqCst));
+        for turn in 1..=100 {
+            let now = t + FRAME_INTERVAL * turn;
+            settle(&mut w, now);
+            assert_eq!(w.poll_timeout(now), -1, "idle poll must wait for an event");
+            assert_eq!(
+                (w.shared.renders.load(Ordering::SeqCst), wakes.load(Ordering::SeqCst)),
+                baseline
+            );
+        }
+    }
+
+    #[test]
+    fn a_flood_is_coalesced_to_about_one_render_per_frame() {
+        let (mut w, _commands, _bell) = worker(&|| {});
+        let t = Instant::now();
+        settle(&mut w, t);
+        let before = w.shared.renders.load(Ordering::SeqCst);
+        for turn in 1..=200 {
+            w.screen.feed(b"y\r\n");
+            w.render_if_due(t + Duration::from_millis(turn));
+            take(&w);
+            assert_eq!(
+                w.shared.renders.load(Ordering::SeqCst) - before,
+                turn / 16,
+                "turn {turn}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_bell_flood_is_coalesced_to_about_one_host_wake_per_frame() {
+        let wakes = AtomicUsize::new(0);
+        let wake = || {
+            wakes.fetch_add(1, Ordering::SeqCst);
+        };
+        let (mut w, _commands, _bell) = worker(&wake);
+        let t = Instant::now();
+        settle(&mut w, t);
+        let baseline = wakes.load(Ordering::SeqCst);
+        let renders = w.shared.renders.load(Ordering::SeqCst);
+        for turn in 1..=200 {
+            w.screen.feed(b"\x07");
+            let now = t + Duration::from_millis(turn);
+            w.publish_events(now);
+            w.render_if_due(now);
+            let update = take(&w);
+            assert!(update.events.bell);
+            assert_eq!(
+                wakes.load(Ordering::SeqCst) - baseline,
+                (turn / 16) as usize,
+                "turn {turn}"
+            );
+            assert_eq!(w.shared.renders.load(Ordering::SeqCst), renders);
+        }
+    }
+
+    #[test]
+    fn a_hidden_bell_flood_rings_the_host_not_at_all() {
+        let wakes = AtomicUsize::new(0);
+        let wake = || {
+            wakes.fetch_add(1, Ordering::SeqCst);
+        };
+        let (mut w, _commands, _bell) = worker(&wake);
+        w.visible = false;
+        for turn in 0..100 {
+            let now = Instant::now() + FRAME_INTERVAL * turn;
+            w.screen.feed(b"\x07");
+            w.publish_events(now);
+            w.render_if_due(now);
+            assert!(take(&w).events.bell, "the bell was parsed");
+            assert_eq!(wakes.load(Ordering::SeqCst), 0, "turn {turn}");
+            assert_eq!(w.shared.renders.load(Ordering::SeqCst), 0);
+            assert_eq!(w.poll_timeout(now), -1);
+        }
+    }
+
+    #[test]
+    fn an_unterminated_synchronized_update_is_published_after_the_deadline() {
+        for bytes in [b"\x1b[?2026hvisible".as_slice(), b"before\x1b[?2026h\x1bcafter"] {
+            let (mut w, _commands, _bell) = worker(&|| {});
+            let t = Instant::now();
+            settle(&mut w, t);
+            w.screen.feed(bytes);
+            w.track_sync(t);
+            let due = t + SYNC_UPDATE_TIMEOUT;
+            assert_eq!(w.sync_deadline.map(|(_, d)| d), Some(due));
+            for turn in 1..150 {
+                let now = t + Duration::from_millis(turn);
+                w.track_sync(now);
+                w.render_if_due(now);
+                assert!(w.screen.open_update().is_some(), "premature publication at turn {turn}");
+            }
+            w.track_sync(due);
+            w.render_if_due(due);
+            assert!(w.screen.open_update().is_none());
+            assert!(take(&w).frame.is_some(), "deadline publishes the held content");
+            assert_eq!(w.sync_deadline, None);
+        }
+    }
+
+    #[test]
+    fn a_key_that_changes_nothing_on_screen_renders_nothing() {
+        let (mut w, commands, _bell) = worker(&|| {});
+        let t = Instant::now();
+        settle(&mut w, t);
+        let before = w.shared.renders.load(Ordering::SeqCst);
+        for turn in 1..=100 {
+            commands
+                .send(SessionCommand::Input(NormalizedInput::Paste {
+                    text: "abc".into(),
+                    bracketed: false,
+                }))
+                .unwrap();
+            assert!(matches!(w.handle_commands(), Next::Continue));
+            w.render_if_due(t + FRAME_INTERVAL * turn);
+            assert!(take(&w).frame.is_none(), "turn {turn}");
+            assert_eq!(w.shared.renders.load(Ordering::SeqCst), before);
+        }
+    }
+
+    #[test]
+    fn titles_and_bells_reach_the_host_without_a_frame() {
+        let (mut w, _commands, _bell) = worker(&|| {});
+        let t = Instant::now();
+        settle(&mut w, t);
+        for turn in 1..=100 {
+            let title = format!("t{turn}");
+            w.screen.feed(format!("\x1b]2;{title}\x07\x07").as_bytes());
+            let now = t + FRAME_INTERVAL * turn;
+            w.publish_events(now);
+            w.render_if_due(now);
+            let update = take(&w);
+            assert_eq!(update.events.title, Some(Some(title)));
+            assert!(update.events.bell);
+            assert!(update.frame.is_none(), "turn {turn}");
+        }
+    }
+
+    #[test]
+    fn no_frame_is_published_from_the_read_term() {
+        let (w, commands, _bell) = worker(&|| {});
+        let pid = w.pty.pid() as libc::pid_t;
+        assert!(pid > 1, "the fixture owns a child pid");
+        let shared = w.shared.clone();
+        let (reply, answer) = mpsc::channel();
+        commands.send(SessionCommand::Detach(reply)).unwrap();
+        let t = Instant::now();
+        let clock = std::cell::Cell::new(t);
+        let mut turns = 0;
+        let mut detached = None;
+        let mut renders = 0;
+        w.run_with(
+            || clock.get(),
+            |fds, timeout| {
+                assert!(turns < 102, "detached worker did not finish");
+                if turns == 1 {
+                    detached = Some(answer.try_recv().expect("detach completed").unwrap());
+                    renders = shared.renders.load(Ordering::SeqCst);
+                    shared.wake_pending.store(false, Ordering::SeqCst);
+                    std::mem::take(&mut *shared.update());
+                }
+                if turns > 0 {
+                    assert_eq!(fds[0].fd, -1, "detached output must not be polled");
+                    assert_eq!(timeout, -1, "detached idle has no deadline");
+                    assert_eq!(shared.renders.load(Ordering::SeqCst), renders, "turn {turns}");
+                    assert!(shared.update().frame.is_none());
+                }
+                if turns == 101 {
+                    commands.send(SessionCommand::Committed).unwrap();
+                } else if turns > 0 {
+                    for command in [
+                        SessionCommand::Visible(false),
+                        SessionCommand::Visible(true),
+                        SessionCommand::Focus(false),
+                        SessionCommand::Resize(PtySize {
+                            cols: 60,
+                            rows: 20,
+                            cell_width_px: 9,
+                            cell_height_px: 18,
+                        }),
+                        SessionCommand::Scroll(ScrollRequest::Lines(3)),
+                        SessionCommand::CopyMode(true),
+                        SessionCommand::SetColors(TerminalColors::default()),
+                    ] {
+                        commands.send(command).unwrap();
+                    }
+                }
+                turns += 1;
+                clock.set(clock.get() + FRAME_INTERVAL);
+                fds[1].revents = libc::POLLIN;
+                1
+            },
+        );
+        assert_eq!(turns, 102, "100 completed detached turns were sampled");
+        drop(detached);
+        // Committing relinquishes wait ownership. With every master closed, this test
+        // must reap its own child rather than leave it for the process to exit.
+        let deadline = Instant::now() + Duration::from_secs(60);
+        let mut killed = false;
+        loop {
+            let mut status = 0;
+            let rc = unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) };
+            if rc == pid {
+                break;
+            }
+            assert_eq!(rc, 0, "waitpid: {}", io::Error::last_os_error());
+            if !killed {
+                assert_eq!(unsafe { libc::kill(pid, libc::SIGKILL) }, 0);
+                killed = true;
+            }
+            assert!(Instant::now() < deadline, "committed fixture was not reaped");
+            std::thread::yield_now();
+        }
+        assert_eq!(unsafe { libc::waitpid(pid, std::ptr::null_mut(), libc::WNOHANG) }, -1);
+        assert_eq!(io::Error::last_os_error().raw_os_error(), Some(libc::ECHILD));
+    }
+
+    #[test]
+    fn shutdown_kills_only_after_the_complete_grace() {
+        let (mut w, _commands, _bell) = worker(&|| {});
+        // Replace the quiet fixture with a child whose HUP handler is installed before ready.
+        w.pty = PtyChild::spawn(
+            &SpawnSpec {
+                program: "/bin/sh".into(),
+                args: vec!["-c".into(), "trap '' HUP; printf ready; read x".into()],
+                cwd: std::env::temp_dir(),
+                env: vec![],
+                extra_env: vec![],
+            },
+            w.size,
+        )
+        .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(60);
+        let mut bytes = [0; 32];
+        loop {
+            if w.pty.read(&mut bytes).is_ok_and(|n| n > 0) {
+                break;
+            }
+            assert!(Instant::now() < deadline, "child never ready");
+            std::thread::yield_now();
+        }
+        let at = std::cell::Cell::new(Instant::now());
+        let start = at.get();
+        let exit = w
+            .shut_down_with(
+                || at.get(),
+                || {
+                    assert!(at.get() < start + HANGUP_GRACE, "grace never ended");
+                    at.set(at.get() + Duration::from_millis(10));
+                },
+            )
+            .unwrap();
+        assert_eq!(at.get() - start, HANGUP_GRACE, "no early kill or needless grace");
+        assert_eq!(exit.signal, Some(libc::SIGKILL));
+    }
+
+    #[cfg(target_os = "linux")]
+    fn at_read_wait(prefix: &[u8], suffix: &'static [u8], check: impl FnOnce(&mut Worker<'_>)) {
+        let (mut w, _commands, _bell) = worker(&|| {});
+        let (reader, mut writer) = std::io::pipe().unwrap();
+        let (pidfd, _held) = std::io::pipe().unwrap();
+        w.pty = PtyChild::adopt_uncommitted(reader.into(), pidfd.into(), 0).unwrap();
+        w.shared.boundary_wait_us.store(60_000_000, Ordering::SeqCst);
+        w.screen.feed(prefix);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let observed = calls.clone();
+        READ_WAIT.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move || {
+                assert_eq!(
+                    observed.fetch_add(1, Ordering::SeqCst),
+                    0,
+                    "unexpected extra boundary wait"
+                );
+                writer.write_all(suffix).unwrap();
+            }))
+        });
+        struct Clear;
+        impl Drop for Clear {
+            fn drop(&mut self) {
+                READ_WAIT.with(|hook| hook.borrow_mut().take());
+            }
+        }
+        let _clear = Clear;
+        check(&mut w);
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "bytes were released inside the boundary wait"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn replies_made_while_feeding_read_ahead_follow_the_carried_outbox_after_the_commit() {
+        at_read_wait(b"\x1b[31", b"mY\x1b[6n", |w| {
+            w.outbox.push_input(b"carried-input");
+            let (reply, answer) = mpsc::channel();
+            w.detach(reply);
+            let detached = answer.try_recv().unwrap().unwrap();
+            assert_eq!(detached.tail, Tail::ReadAhead(b"Y\x1b[6n".to_vec()));
+            assert_eq!(detached.outbox, b"carried-input");
+            // The child records one complete input line, so missing or reordered pieces are
+            // observable without waiting for a read of some assumed byte count to time out.
+            let mut child = PtyChild::spawn(
+                &SpawnSpec {
+                    program: "/bin/sh".into(),
+                    args: vec![
+                        "-c".into(),
+                        r#"stty -icanon -echo min 1 time 0
+printf READY
+IFS= read -r line
+printf '%s' "$line" | od -An -tx1
+printf DONE
+read hold"#
+                            .into(),
+                    ],
+                    cwd: std::env::temp_dir(),
+                    env: vec![],
+                    extra_env: vec![],
+                },
+                w.size,
+            )
+            .unwrap();
+            let deadline = Instant::now() + Duration::from_secs(60);
+            let mut ready = Vec::new();
+            while !ready.ends_with(b"READY") {
+                assert!(Instant::now() < deadline, "child never became ready");
+                let mut fd = libc::pollfd {
+                    fd: child.master_fd().as_raw_fd(),
+                    events: libc::POLLIN,
+                    revents: 0,
+                };
+                assert!(unsafe { libc::poll(&mut fd, 1, 1000) } >= 0);
+                let mut bytes = [0; 128];
+                if let Ok(n) = child.read(&mut bytes) {
+                    ready.extend_from_slice(&bytes[..n]);
+                }
+            }
+            let pid = child.pid();
+            assert!(pid > 1);
+            let raw = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) };
+            assert!(raw >= 0, "{}", io::Error::last_os_error());
+            use std::os::fd::FromRawFd;
+            let pidfd = unsafe { OwnedFd::from_raw_fd(raw as _) };
+            let detached = Detached {
+                master: child.master_fd().try_clone_to_owned().unwrap(),
+                pid,
+                start: crate::pty::start_time(pid).unwrap(),
+                ..detached
+            };
+            let (output, observed) = mpsc::channel();
+            let adopted = TerminalSession::adopt(
+                detached,
+                pidfd,
+                SessionConfig {
+                    spawn: SpawnSpec::shell("/bin/sh".into(), std::env::temp_dir()),
+                    size: w.size,
+                    colors: w.colors,
+                    focused: true,
+                    tap: Some(Box::new(move |bytes| {
+                        output.send(bytes.to_vec()).unwrap();
+                    })),
+                },
+                || {},
+            )
+            .unwrap();
+            adopted.send(SessionCommand::Input(NormalizedInput::Paste {
+                text: "held-input\n".into(),
+                bracketed: false,
+            }));
+            adopted.commit();
+            let mut received = Vec::new();
+            while !received.ends_with(b"DONE") {
+                received.extend(
+                    observed
+                        .recv_timeout(Duration::from_secs(60))
+                        .expect("child never recorded committed input"),
+                );
+                assert!(received.len() < 4096, "unexpected child output");
+            }
+            let hex = String::from_utf8(received).unwrap().replace("DONE", "");
+            let bytes: Vec<u8> = hex
+                .split_whitespace()
+                .map(|word| u8::from_str_radix(word, 16).unwrap())
+                .collect();
+            assert_eq!(
+                bytes, b"carried-input\x1b[1;2Rheld-input",
+                "bytes the child actually read"
+            );
+            // The source retains wait ownership; the destination sees the same exit through its pidfd.
+            drop(adopted);
+            let _ = child.wait().unwrap();
+        });
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_move_refused_after_reading_past_the_boundary_still_draws_what_it_read() {
+        let mut prefix = b"\x1b[>1u".repeat(4095);
+        prefix.extend_from_slice(b"START\x1b[>1");
+        at_read_wait(&prefix, b"uHELLO", |w| {
+            let t = Instant::now();
+            settle(w, t);
+            let (reply, answer) = mpsc::channel();
+            w.detach(reply);
+            assert_eq!(answer.try_recv().unwrap().err(), Some(DetachRefused::TooDeep));
+            w.render_if_due(t + FRAME_INTERVAL);
+            let frame = take(w)
+                .frame
+                .expect("refusal must publish the bytes read past the boundary");
+            assert_eq!(frame, {
+                let mut expected = Screen::new(w.size, w.colors);
+                expected.feed(b"STARTHELLO");
+                expected.render(true)
+            });
+        });
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_move_refused_for_a_deep_keyboard_stack_reads_nothing_first() {
+        let (mut w, _commands, _bell) = worker(&|| {});
+        w.screen.feed(&b"\x1b[>1u".repeat(4096));
+        w.screen.feed(b"START\x1b[31");
+        READ_WAIT.with(|hook| *hook.borrow_mut() = Some(Box::new(|| panic!("deep stack must refuse before waiting"))));
+        let (reply, answer) = mpsc::channel();
+        w.detach(reply);
+        READ_WAIT.with(|hook| hook.borrow_mut().take());
+        assert_eq!(answer.try_recv().unwrap().err(), Some(DetachRefused::TooDeep));
+        assert!(w.live());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_synchronized_update_opened_by_the_wait_for_a_boundary_closes_before_the_move() {
+        at_read_wait(b"A\x1b[?2026", b"hPARTIAL REST\x1b[?2026l", |w| {
+            let (reply, answer) = mpsc::channel();
+            w.detach(reply);
+            let detached = answer.try_recv().unwrap().unwrap();
+            assert_eq!(detached.tail, Tail::ReadAhead(vec![]));
+            let (mut screen, _) = rebuild(&detached.replay, &detached.tail, &detached.view, w.size, w.colors);
+            let mut expected = Screen::new(w.size, w.colors);
+            expected.feed(b"APARTIAL REST");
+            assert_eq!(screen.render(true), expected.render(true));
+        });
+    }
 
     #[cfg(target_os = "linux")]
     #[test]

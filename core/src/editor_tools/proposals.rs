@@ -1468,13 +1468,12 @@ pub(crate) mod tests {
     #[test]
     fn a_worker_that_died_ends_the_run() {
         let work = Work::<()>::start(|| panic!("a worker's panic stays on its thread"));
-        let why = loop {
-            match work.poll() {
-                Ok(_) => std::thread::sleep(Duration::from_millis(1)),
-                Err(why) => break why,
-            }
-        };
-        assert_eq!(why, UNREADABLE);
+        assert_eq!(
+            work.answer.recv_timeout(Duration::from_secs(60)),
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected),
+            "the worker has unwound and dropped its sender"
+        );
+        assert_eq!(work.poll().unwrap_err(), UNREADABLE);
     }
 
     #[test]

@@ -86,7 +86,6 @@ impl PanelPump {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::Duration;
 
     #[derive(Default)]
     struct Page {
@@ -104,42 +103,6 @@ mod tests {
         fn set_background(&self, _rgb: [u8; 3]) {}
     }
 
-    /// The host's loop, as the AppKit half will run it: wait on the descriptor until the timer is due, act on
-    /// what each call returns. Runs for `run`; `between` is called once per round so a test can act on the
-    /// panel as the window would.
-    fn run_loop(pump: &PanelPump, armed: &mut Option<Instant>, run: Duration, mut between: impl FnMut()) {
-        let fd = pump.wake_fd().expect("a wake");
-        let end = Instant::now() + run;
-        loop {
-            between();
-            let now = Instant::now();
-            if now >= end {
-                return;
-            }
-            let until = armed.map_or(end, |at| at.min(end));
-            let wait_ms = until.saturating_duration_since(now).as_millis().min(i32::MAX as u128) as i32;
-            let mut polled = libc::pollfd {
-                fd,
-                events: libc::POLLIN,
-                revents: 0,
-            };
-            // SAFETY: one live `pollfd` for the call.
-            let ready = unsafe { libc::poll(&mut polled, 1, wait_ms) };
-            let act = |timer: Timer, armed: &mut Option<Instant>| match timer {
-                Timer::Arm(at) => *armed = Some(at),
-                Timer::Keep => {}
-                Timer::Stop => *armed = None,
-            };
-            if ready > 0 {
-                act(pump.on_wake(Instant::now()), armed);
-            }
-            if armed.is_some_and(|at| Instant::now() >= at) {
-                *armed = None;
-                act(pump.on_timer(Instant::now()), armed);
-            }
-        }
-    }
-
     /// An idle panel driven the way the Mac window drives it is not ticked; a call into it still is, at
     /// once, and the close stops the pump.
     #[test]
@@ -151,35 +114,31 @@ mod tests {
             r#"{"type":"ready","request_id":"r1"}"#,
         );
         let pump = PanelPump::new(handle.clone());
-        let mut armed = match pump.start(Instant::now()) {
-            Timer::Arm(at) => Some(at),
-            other => panic!("the first tick is armed, not {other:?}"),
-        };
-        run_loop(&pump, &mut armed, Duration::from_millis(300), || {});
+        let now = Instant::now();
+        assert_eq!(pump.start(now), Timer::Arm(now));
+        assert_eq!(pump.on_wake(now), Timer::Keep, "the ready wake shares the first tick");
+        assert_eq!(pump.on_timer(now), Timer::Keep, "idle leaves no timer armed");
         let before = handle.ticks_run();
-        run_loop(&pump, &mut armed, Duration::from_secs(1), || {});
-        let ticks = handle.ticks_run() - before;
-        eprintln!("idle panel (mac pump): {ticks} ticks in 1 s");
-        assert!(ticks <= 1, "an idle panel ticked {ticks} times in a second");
+        let later = now + std::time::Duration::from_secs(3600);
+        assert_eq!(pump.on_wake(later), Timer::Keep);
+        assert_eq!(handle.ticks_run(), before);
 
         let sent = page.sent.borrow().len();
-        let before = handle.ticks_run();
-        let mut once = Some(());
-        run_loop(&pump, &mut armed, Duration::from_millis(200), || {
-            if once.take().is_some() {
-                handle.new_tab();
-            }
-        });
-        assert!(handle.ticks_run() > before, "the call woke the tick");
+        handle.new_tab();
+        let Timer::Arm(due) = pump.on_wake(later) else {
+            panic!("the call arms a tick")
+        };
+        assert_eq!(pump.on_timer(due), Timer::Keep);
+        assert_eq!(handle.ticks_run(), before + 1, "the call woke one tick");
         assert!(page.sent.borrow().len() > sent, "and what it changed reached the page");
 
         let _watch = handle.shutdown();
-        assert_ne!(
-            pump.on_wake(Instant::now()),
+        assert_ne!(pump.on_wake(later), Timer::Stop, "the close's wake asks for a tick");
+        assert_eq!(
+            pump.on_timer(later + AgentPanelHandle::TICK),
             Timer::Stop,
-            "the close's wake asks for a tick"
+            "which stops the pump"
         );
-        assert_eq!(pump.on_timer(Instant::now()), Timer::Stop, "which stops the pump");
-        assert_eq!(pump.on_wake(Instant::now()), Timer::Stop, "stopped for good");
+        assert_eq!(pump.on_wake(later), Timer::Stop, "stopped for good");
     }
 }

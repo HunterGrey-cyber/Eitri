@@ -10,6 +10,7 @@
 //! A turn's text is a script of steps separated by `;`:
 //! - `text <message id> <words>`: a text delta of that message;
 //! - `sleep <ms>`;
+//! - `gate <directory>`: publish `ready`, wait for `release`, then remove the directory;
 //! - `ask <permission id>`: a permission request; the rest of the script runs once it is answered;
 //! - `ask-unknown <permission id>`: the same, with a `PermissionOrigin` no client knows;
 //! - `unknown-event`: a session event whose only arm is a field no client knows;
@@ -31,7 +32,7 @@
 //! `<rpc> <client id, or -> <typed_by_person>`.
 //!
 //! A steered message's text is the number of milliseconds after which it is delivered (500 if it is
-//! not a number).
+//! not a number), or `gate <directory>` to hold delivery behind a file gate.
 //!
 //! With `--client-tools` the stand-in offers protocol 3.23's `client_tools`, and answers its two RPCs as
 //! the sidecar does: the first answer to a call wins and settles it, a later one is refused with
@@ -353,6 +354,18 @@ fn cause(kind: Option<&str>) -> Option<TurnCause> {
     Some(cause)
 }
 
+/// Publishes readiness and waits for the fixture to release this gate.
+async fn wait_for_gate(directory: &str) {
+    let dir = std::path::Path::new(directory);
+    std::fs::write(dir.join("ready"), b"").unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(180);
+    while !dir.join("release").exists() {
+        assert!(std::time::Instant::now() < deadline, "gate was never released");
+        tokio::time::sleep(Duration::from_millis(2)).await;
+    }
+    let _ = std::fs::remove_dir_all(dir);
+}
+
 /// Runs a turn's script from `steps`, until its end or a permission request.
 fn run(shared: Arc<Shared>, session_id: String, mut turn_id: String, mut steps: Vec<String>) {
     tokio::spawn(async move {
@@ -373,6 +386,9 @@ fn run(shared: Arc<Shared>, session_id: String, mut turn_id: String, mut steps: 
                             ..Default::default()
                         }),
                     );
+                }
+                Some("gate") => {
+                    wait_for_gate(words.next().expect("gate directory")).await;
                 }
                 Some("sleep") => {
                     let ms = words.next().and_then(|ms| ms.parse().ok()).unwrap_or(0);
@@ -428,7 +444,8 @@ fn run(shared: Arc<Shared>, session_id: String, mut turn_id: String, mut steps: 
                     shared.holding_answers.send_replace(false);
                 }
                 Some("drop-watches") => {
-                    if let Some(session) = shared.sessions.lock().unwrap().get_mut(&session_id) {
+                    let mut sessions = shared.sessions.lock().unwrap();
+                    if let Some(session) = sessions.get_mut(&session_id) {
                         session.watchers.clear();
                     }
                 }
@@ -695,7 +712,11 @@ impl Service<http::Request<Body>> for StandIn {
                         let turn_id = request.expected_turn_id.clone();
                         let shared = Arc::clone(&shared);
                         tokio::spawn(async move {
-                            tokio::time::sleep(Duration::from_millis(after)).await;
+                            if let Some(dir) = request.text.strip_prefix("gate ") {
+                                wait_for_gate(dir).await;
+                            } else {
+                                tokio::time::sleep(Duration::from_millis(after)).await;
+                            }
                             shared.emit(
                                 &request.session_id,
                                 Some(&request.expected_turn_id),

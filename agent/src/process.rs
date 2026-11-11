@@ -391,12 +391,16 @@ fn spawn_hook_listener(
     cli_mode_noted: Arc<AtomicBool>,
 ) -> std::io::Result<(JoinHandle<()>, Arc<AtomicBool>)> {
     listener.set_nonblocking(true)?;
+    #[cfg(test)]
+    tests::LISTENERS_STARTED.with(|count| count.set(count.get() + 1));
     let stop = Arc::new(AtomicBool::new(false));
     let stop_flag = stop.clone();
     let handle = std::thread::spawn(move || loop {
         if stop_flag.load(Ordering::Relaxed) {
             break;
         }
+        #[cfg(test)]
+        tests::listener_checkpoint(&listener, "accept");
         let stream = match listener.accept() {
             Ok((stream, _addr)) => stream,
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
@@ -417,7 +421,16 @@ fn spawn_hook_listener(
         // See `HOOK_CONNECTION_READ_TIMEOUT`'s doc: without this, a connection that starts but
         // never completes its line would block this thread forever, never re-checking `stop`.
         let _ = stream.set_read_timeout(Some(HOOK_CONNECTION_READ_TIMEOUT));
-        let mut reader = BufReader::new(stream.try_clone().expect("clone hook stream"));
+        #[cfg(test)]
+        tests::listener_checkpoint(&listener, "read");
+        let read_stream = stream.try_clone().expect("clone hook stream");
+        #[cfg(test)]
+        let read_stream = tests::RelayRead {
+            stream: read_stream,
+            path: listener.local_addr().unwrap(),
+            first: true,
+        };
+        let mut reader = BufReader::new(read_stream);
         let mut line = String::new();
         // Every failure branch below denies explicitly rather than dropping the connection -- see
         // this function's own doc on why a dropped connection is a real allow, not a no-op.
@@ -1132,6 +1145,7 @@ impl AgentProcess {
 
     fn send_signal(&self, sig: i32) -> std::io::Result<()> {
         let pid = self.child.id() as i32;
+        // SAFETY: kill takes integer arguments and no pointers; this is the owned child's pid.
         let ret = unsafe { libc_kill(pid, sig) };
         if ret == 0 {
             Ok(())
@@ -1145,7 +1159,8 @@ impl AgentProcess {
 const SIGTERM: i32 = 15;
 
 #[cfg(feature = "legacy-backend")]
-extern "C" {
+// The C ABI's pid_t and int are signed 32-bit integers on the supported Unix hosts.
+unsafe extern "C" {
     #[link_name = "kill"]
     fn libc_kill(pid: i32, sig: i32) -> i32;
 }
@@ -1297,6 +1312,105 @@ mod deny_list_tests {
 mod tests {
     use super::*;
 
+    thread_local! { pub(super) static LISTENERS_STARTED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) }; }
+    type ListenerHook = Arc<dyn Fn() + Send + Sync>;
+    static LISTENER_HOOKS: Mutex<Vec<(std::path::PathBuf, &'static str, ListenerHook)>> = Mutex::new(Vec::new());
+
+    pub(super) fn listener_checkpoint(listener: &UnixListener, stage: &str) {
+        let path = listener.local_addr().unwrap();
+        let hook = LISTENER_HOOKS
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|(p, s, _)| Some(p.as_path()) == path.as_pathname() && *s == stage)
+            .map(|(_, _, hook)| hook.clone());
+        if let Some(hook) = hook {
+            hook();
+        }
+    }
+
+    pub(super) struct RelayRead {
+        pub stream: UnixStream,
+        pub path: std::os::unix::net::SocketAddr,
+        pub first: bool,
+    }
+
+    impl std::io::Read for RelayRead {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            if std::mem::take(&mut self.first) {
+                let hook = LISTENER_HOOKS
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .find(|(path, stage, _)| Some(path.as_path()) == self.path.as_pathname() && *stage == "empty-read")
+                    .map(|(_, _, hook)| hook.clone());
+                if let Some(hook) = hook {
+                    use std::os::fd::AsRawFd;
+                    let fd = self.stream.as_raw_fd();
+                    // The first read_line has entered its Read call before the writer is released.
+                    // SAFETY: fcntl reads descriptor flags; recv peeks into a live one-byte buffer.
+                    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+                    assert!(
+                        flags >= 0 && flags & libc::O_NONBLOCK == 0,
+                        "the accepted relay must read in blocking mode"
+                    );
+                    let mut byte = 0u8;
+                    let n = unsafe {
+                        libc::recv(
+                            fd,
+                            (&mut byte as *mut u8).cast(),
+                            1,
+                            libc::MSG_PEEK | libc::MSG_DONTWAIT,
+                        )
+                    };
+                    assert_eq!(n, -1, "read_line must begin with no payload available");
+                    assert_eq!(std::io::Error::last_os_error().kind(), std::io::ErrorKind::WouldBlock);
+                    hook();
+                }
+            }
+            std::io::Read::read(&mut self.stream, buf)
+        }
+    }
+
+    struct ListenerProbe {
+        path: std::path::PathBuf,
+        parked: std::sync::mpsc::Receiver<()>,
+        go: Option<std::sync::mpsc::Sender<()>>,
+    }
+
+    impl ListenerProbe {
+        fn new(path: &std::path::Path, stage: &'static str) -> Self {
+            let (tx, parked) = std::sync::mpsc::channel();
+            let (go, rx) = std::sync::mpsc::channel();
+            let rx = Mutex::new(rx);
+            LISTENER_HOOKS.lock().unwrap().push((
+                path.into(),
+                stage,
+                Arc::new(move || {
+                    let _ = tx.send(());
+                    let _ = rx.lock().unwrap().recv();
+                }),
+            ));
+            Self {
+                path: path.into(),
+                parked,
+                go: Some(go),
+            }
+        }
+        fn parked(&self) {
+            self.parked
+                .recv_timeout(Duration::from_secs(60))
+                .expect("listener never reached checkpoint");
+        }
+    }
+
+    impl Drop for ListenerProbe {
+        fn drop(&mut self) {
+            LISTENER_HOOKS.lock().unwrap().retain(|(path, _, _)| path != &self.path);
+            self.go.take();
+        }
+    }
+
     /// Once per conversation: the flag is what `AgentProcess` shares with its listener.
     #[test]
     fn a_stricter_hook_mode_is_noted_once() {
@@ -1335,16 +1449,8 @@ mod tests {
 
         // Neither turn above ever triggers a real tool call (CONSERVATIVE_DISALLOWED_TOOLS blocks
         // the tool-using tools, and both prompts are plain text anyway), so the hook socket never
-        // received a single connection -- exactly the case that used to hang `shutdown()` forever
-        // (see `spawn_hook_listener`'s doc). Assert real, bounded shutdown latency, not just that
-        // it eventually returns (which a suite-level timeout would also "catch", six hours later).
-        let shutdown_started = Instant::now();
-        process.shutdown();
-        assert!(
-            shutdown_started.elapsed() < Duration::from_secs(5),
-            "shutdown() must return in bounded time even when nothing ever connected to the hook socket, took {:?}",
-            shutdown_started.elapsed()
-        );
+        // received a single connection. The result wait guards shutdown against a stuck listener.
+        crate::test_tmp::completed(move || process.shutdown());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1365,17 +1471,14 @@ mod tests {
         process
             .send_turn("write a very long story, at least 2000 words, about a journey")
             .unwrap();
-        std::thread::sleep(Duration::from_millis(1500));
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while process.poll_events().is_empty() {
+            assert!(Instant::now() < deadline, "the turn never produced an event");
+            std::thread::yield_now();
+        }
         process.interrupt().unwrap();
-        std::thread::sleep(Duration::from_millis(1500));
 
-        let shutdown_started = Instant::now();
-        process.shutdown();
-        assert!(
-            shutdown_started.elapsed() < Duration::from_secs(5),
-            "shutdown() must return in bounded time, took {:?}",
-            shutdown_started.elapsed()
-        );
+        crate::test_tmp::completed(move || process.shutdown());
         assert!(
             !crate::process_probe::pid_is_alive(pid),
             "pid {pid} outlived shutdown()"
@@ -1439,29 +1542,17 @@ mod tests {
     fn hook_listener_stops_quickly_when_nothing_ever_connects() {
         let socket_path = temp_socket_path();
         let listener = UnixListener::bind(&socket_path).unwrap();
+        let checkpoint = ListenerProbe::new(&socket_path, "accept");
         let (tx, _rx) = std::sync::mpsc::channel();
         let pending = Arc::new(Mutex::new(std::collections::HashMap::new()));
         let (handle, stop) = spawn_hook_listener(listener, tx, pending, not_noted()).unwrap();
 
-        // Give the thread a moment to actually enter its poll loop before asking it to stop.
-        std::thread::sleep(Duration::from_millis(50));
-        let stop_requested = Instant::now();
+        checkpoint.parked();
         stop.store(true, Ordering::Relaxed);
+        drop(checkpoint);
 
-        let deadline = Instant::now() + Duration::from_secs(2);
-        while !handle.is_finished() && Instant::now() < deadline {
-            std::thread::sleep(Duration::from_millis(10));
-        }
-        assert!(
-            handle.is_finished(),
-            "hook-listener thread did not stop within 2s of the stop flag being set"
-        );
-        handle.join().unwrap();
-        assert!(
-            stop_requested.elapsed() < Duration::from_secs(2),
-            "hook-listener thread took {:?} to stop -- should be ~HOOK_LISTENER_POLL_INTERVAL",
-            stop_requested.elapsed()
-        );
+        crate::test_tmp::completed(move || handle.join().unwrap());
+
         let _ = std::fs::remove_file(&socket_path);
     }
 
@@ -1480,6 +1571,7 @@ mod tests {
     fn hook_listener_does_not_hang_when_a_connection_stalls_without_completing_its_line() {
         let socket_path = temp_socket_path();
         let listener = UnixListener::bind(&socket_path).unwrap();
+        let checkpoint = ListenerProbe::new(&socket_path, "read");
         let (tx, _rx) = std::sync::mpsc::channel();
         let pending = Arc::new(Mutex::new(std::collections::HashMap::new()));
         let (handle, stop) = spawn_hook_listener(listener, tx, pending, not_noted()).unwrap();
@@ -1490,24 +1582,11 @@ mod tests {
         let mut stalled_client = UnixStream::connect(&socket_path).unwrap();
         write!(stalled_client, "{{\"incomplete").unwrap();
 
-        std::thread::sleep(Duration::from_millis(50));
-        let stop_requested = Instant::now();
+        checkpoint.parked();
         stop.store(true, Ordering::Relaxed);
+        drop(checkpoint);
 
-        let deadline = Instant::now() + Duration::from_secs(3);
-        while !handle.is_finished() && Instant::now() < deadline {
-            std::thread::sleep(Duration::from_millis(10));
-        }
-        assert!(
-            handle.is_finished(),
-            "hook-listener thread hung on a connection that connected but never completed its line"
-        );
-        handle.join().unwrap();
-        assert!(
-            stop_requested.elapsed() < Duration::from_secs(3),
-            "hook-listener thread took {:?} to stop after a stalled connection -- should be bounded by HOOK_CONNECTION_READ_TIMEOUT",
-            stop_requested.elapsed()
-        );
+        crate::test_tmp::completed(move || handle.join().unwrap());
 
         drop(stalled_client);
         let _ = std::fs::remove_file(&socket_path);
@@ -1517,9 +1596,11 @@ mod tests {
     /// accepted fd, while macOS inherits it from the non-blocking listener. Without resetting it,
     /// `read_line` can return `WouldBlock` before the payload arrives and wrongly trigger a denial.
     ///
-    /// Waits several poll intervals before writing so the listener reads an empty stream first.
-    /// The payload exceeds 16 KiB to require multiple reads with macOS's 8 KiB Unix stream buffer.
-    /// The result must be a `PermissionRequest`, not a denial.
+    /// The other relay tests write immediately after connecting. This one parks inside the first
+    /// `read_line` with an empty socket, checks that the accepted descriptor is blocking, then
+    /// releases the read and writes a payload larger than 16 KiB, so the line cannot arrive in one
+    /// read either (macOS's AF_UNIX stream buffer is 8 KiB). It must come out as a
+    /// `PermissionRequest`, not a denial.
     #[test]
     fn a_relayed_request_written_after_a_poll_interval_and_larger_than_16_kib_is_not_denied() {
         let fixture = std::fs::read_to_string(format!(
@@ -1534,15 +1615,17 @@ mod tests {
 
         let socket_path = temp_socket_path();
         let listener = UnixListener::bind(&socket_path).unwrap();
+        let checkpoint = ListenerProbe::new(&socket_path, "empty-read");
         let (tx, rx) = std::sync::mpsc::channel();
         let pending = Arc::new(Mutex::new(std::collections::HashMap::new()));
         let (handle, stop) = spawn_hook_listener(listener, tx, pending.clone(), not_noted()).unwrap();
 
         let client = UnixStream::connect(&socket_path).unwrap();
-        std::thread::sleep(HOOK_LISTENER_POLL_INTERVAL * 5);
+        checkpoint.parked();
         // From another thread: 32 KiB does not fit the socket buffer, so this write blocks until
         // the listener reads, and a listener that has already given up would leave it blocked.
         let mut writer = client.try_clone().unwrap();
+        drop(checkpoint);
         let write = std::thread::spawn(move || writeln!(writer, "{line}"));
 
         match rx.recv_timeout(Duration::from_secs(2)) {
@@ -1771,17 +1854,13 @@ mod tests {
             (decision, bytes_after)
         });
 
-        // It must genuinely be blocked -- otherwise this test would prove nothing about stranding.
-        std::thread::sleep(Duration::from_millis(200));
-        assert!(
-            !peer.is_finished(),
-            "the peer should still be blocked waiting for a decision"
-        );
+        // The pending map owns the only response stream until it is drained.
+        assert!(pending.lock().unwrap().contains_key("toolu_01CtdezhmhUCrBaswxW5HYmC"));
 
         // Exactly what `shutdown()` now does.
         release_pending_hook_connections(&pending);
 
-        let deadline = Instant::now() + Duration::from_secs(2);
+        let deadline = Instant::now() + Duration::from_secs(60);
         while !peer.is_finished() && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(10));
         }
@@ -1898,12 +1977,11 @@ mod tests {
                 "the deny names the mode: {reason}"
             );
 
+            stop.store(true, Ordering::Relaxed);
+            handle.join().unwrap();
             let event = rx.recv_timeout(Duration::from_secs(2)).expect("an event within 2s");
             assert_eq!(event, AgentEvent::UngatedCliMode { reported: mode.into() });
-            assert!(
-                rx.recv_timeout(Duration::from_millis(100)).is_err(),
-                "{mode}: no PermissionRequest follows the trip"
-            );
+            assert!(rx.try_recv().is_err(), "{mode}: no PermissionRequest follows the trip");
             assert!(
                 pending.lock().unwrap().is_empty(),
                 "{mode}: nothing is filed to approve"
@@ -1925,8 +2003,6 @@ mod tests {
                 }]
             );
 
-            stop.store(true, Ordering::Relaxed);
-            handle.join().unwrap();
             let _ = std::fs::remove_file(&socket_path);
         }
     }
@@ -2016,7 +2092,7 @@ mod tests {
             .expect("agent-hook must be built for this test to exercise the cmd.spawn() failure path");
 
         let sockets_before = temp_hook_socket_names();
-        let threads_before = live_thread_count();
+        let listeners_before = LISTENERS_STARTED.with(|count| count.get());
         for _ in 0..5 {
             let outcome = AgentProcess::spawn_with_binary(
                 &dir,
@@ -2050,30 +2126,13 @@ mod tests {
             "a failed spawn must not leave its socket file behind: {new_sockets:?}"
         );
 
-        // A leaked listener thread never exits, so five leaks would be five permanently-extra
-        // threads. Threads that other tests in this same binary hold are, by contrast, transient
-        // -- so poll until the count settles rather than trusting one sample. A single sample
-        // failed deterministically at --test-threads=4 (and so on any 4-core machine, with no
-        // flags at all) once this crate gained env-var-serialized tests whose sleeps overlap
-        // this one's sampling window.
-        let settle_deadline = std::time::Instant::now() + Duration::from_secs(5);
-        let mut threads_after = live_thread_count();
-        while threads_after > threads_before + 2 && std::time::Instant::now() < settle_deadline {
-            std::thread::sleep(Duration::from_millis(100));
-            threads_after = live_thread_count();
-        }
-        assert!(
-            threads_after <= threads_before + 2,
-            "five failed spawns leaked threads: {threads_before} before, {threads_after} after"
+        assert_eq!(
+            LISTENERS_STARTED.with(|count| count.get()),
+            listeners_before,
+            "failed process spawns start no listener thread"
         );
 
         let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// Live thread count for this test process, straight from the kernel -- `/proc/self/task` on
-    /// Linux, `proc_pidinfo` on macOS (see `crate::process_probe`).
-    fn live_thread_count() -> usize {
-        crate::process_probe::thread_count(std::process::id()).expect("this process's thread count must be readable")
     }
 
     /// Every per-conversation hook socket currently sitting in the temp dir, by name.

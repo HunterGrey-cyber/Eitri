@@ -82,19 +82,22 @@ use std::time::Duration;
 /// resumed session opened empty. With no account configured this function is byte-identical to
 /// what it always was, and that is the shipped default.
 pub fn claude_projects_dir() -> std::io::Result<PathBuf> {
-    projects_dir_for(crate::account::configured())
+    projects_dir_for(crate::account::configured(), |key| std::env::var(key).ok())
 }
 
 /// The half that takes the account as a parameter, so the two branches can be tested without
 /// pinning a process-global account inside a shared test binary.
-fn projects_dir_for(account: Option<&crate::account::ClaudeAccount>) -> std::io::Result<PathBuf> {
+fn projects_dir_for(
+    account: Option<&crate::account::ClaudeAccount>,
+    env: impl Fn(&str) -> Option<String>,
+) -> std::io::Result<PathBuf> {
     if let Some(account) = account {
         return Ok(account.config_dir().join("projects"));
     }
-    let base = match std::env::var("CLAUDE_CONFIG_DIR") {
-        Ok(v) => PathBuf::from(v),
-        Err(_) => {
-            let home = std::env::var("HOME").map_err(|_| {
+    let base = match env("CLAUDE_CONFIG_DIR") {
+        Some(v) => PathBuf::from(v),
+        None => {
+            let home = env("HOME").ok_or_else(|| {
                 std::io::Error::new(
                     std::io::ErrorKind::NotFound,
                     "neither CLAUDE_CONFIG_DIR nor HOME is set",
@@ -124,9 +127,13 @@ pub fn sanitize_cwd_for_claude_projects(cwd: &str) -> String {
 }
 
 pub fn transcript_path(cwd: &str, provider_session_id: &str) -> std::io::Result<PathBuf> {
-    Ok(claude_projects_dir()?
+    Ok(transcript_path_in(&claude_projects_dir()?, cwd, provider_session_id))
+}
+
+fn transcript_path_in(projects: &Path, cwd: &str, provider_session_id: &str) -> PathBuf {
+    projects
         .join(sanitize_cwd_for_claude_projects(cwd))
-        .join(format!("{provider_session_id}.jsonl")))
+        .join(format!("{provider_session_id}.jsonl"))
 }
 
 /// A short stability probe before a resume, which is refused while the transcript is still being
@@ -136,8 +143,12 @@ pub fn transcript_path(cwd: &str, provider_session_id: &str) -> std::io::Result<
 /// missing file is a real `Err` (not `Ok(false)`) -- the caller has a different, more specific
 /// problem than "unstable" if the transcript doesn't exist at all.
 pub fn is_transcript_stable(path: &Path, probe_delay: Duration) -> std::io::Result<bool> {
+    probe_with_wait(path, || std::thread::sleep(probe_delay))
+}
+
+fn probe_with_wait(path: &Path, wait: impl FnOnce()) -> std::io::Result<bool> {
     let before = std::fs::metadata(path)?.modified()?;
-    std::thread::sleep(probe_delay);
+    wait();
     let after = std::fs::metadata(path)?.modified()?;
     Ok(before == after)
 }
@@ -254,18 +265,6 @@ pub fn newest_ai_title(path: &Path) -> Option<String> {
     crate::persistence::title_from_prompt(&newest?)
 }
 
-/// Serializes every test in this crate that mutates the process-wide `CLAUDE_CONFIG_DIR` env
-/// var -- this file's own one such test, plus `external_writer.rs`'s three. Both files
-/// independently need a controlled value for it, and cargo's default parallel test runner would
-/// otherwise let one test's mutation interleave with another's -- exactly the real, reproduced
-/// race already found and fixed for a different env var
-/// (`XDG_STATE_HOME` in `persistence.rs`). That fix merged same-file tests into one; this race
-/// spans two different files, so a shared lock is the right shape instead. `std::sync::Mutex::new`
-/// is a `const fn` (stable since Rust 1.63) -- no `OnceLock`/`lazy_static` needed for a bare
-/// `static`, and no new crate dependency (e.g. `serial_test`) for one shared guard.
-#[cfg(test)]
-pub(crate) static CLAUDE_CONFIG_DIR_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -355,16 +354,15 @@ mod tests {
 
     #[test]
     fn transcript_path_joins_projects_dir_sanitized_cwd_and_session_id() {
-        // Propagate poisoning from the shared test-only environment lock: a failed mutation
-        // must not silently affect another test.
-        let _guard = CLAUDE_CONFIG_DIR_TEST_LOCK.lock().unwrap();
-        unsafe { std::env::set_var("CLAUDE_CONFIG_DIR", "/tmp/fake-claude-config") };
-        let path = transcript_path("/tmp/project", "prov-1").unwrap();
+        let projects = projects_dir_for(None, |key| {
+            (key == "CLAUDE_CONFIG_DIR").then(|| "/tmp/fake-claude-config".to_string())
+        })
+        .unwrap();
+        let path = transcript_path_in(&projects, "/tmp/project", "prov-1");
         assert_eq!(
             path,
             PathBuf::from("/tmp/fake-claude-config/projects/-tmp-project/prov-1.jsonl")
         );
-        unsafe { std::env::remove_var("CLAUDE_CONFIG_DIR") };
     }
 
     /// The defect this pair exists for: the host's own variable said `.claude-personal` while the
@@ -372,33 +370,31 @@ mod tests {
     /// A configured account wins over the inherited variable -- that is the whole fix.
     #[test]
     fn a_configured_account_decides_the_projects_dir_not_this_processs_own_variable() {
-        let _guard = CLAUDE_CONFIG_DIR_TEST_LOCK.lock().unwrap();
-        unsafe { std::env::set_var("CLAUDE_CONFIG_DIR", "/home/user/.claude-personal") };
         let account =
             crate::account::ClaudeAccount::resolve_from("work", |k| (k == "HOME").then(|| "/home/user".to_string()))
                 .unwrap();
         assert_eq!(
-            projects_dir_for(Some(&account)).unwrap(),
+            projects_dir_for(Some(&account), |key| (key == "CLAUDE_CONFIG_DIR")
+                .then(|| "/home/user/.claude-personal".to_string()))
+            .unwrap(),
             PathBuf::from("/home/user/.claude-work/projects")
         );
-        unsafe { std::env::remove_var("CLAUDE_CONFIG_DIR") };
     }
 
     /// The other direction, and the one that matters for everyone who configures nothing: with no
     /// account pinned, this function is the function it was before accounts existed.
     #[test]
     fn with_no_account_the_resolution_is_byte_identical_to_the_environment_only_rule() {
-        let _guard = CLAUDE_CONFIG_DIR_TEST_LOCK.lock().unwrap();
-        unsafe { std::env::set_var("CLAUDE_CONFIG_DIR", "/home/user/.claude-personal") };
         assert_eq!(
-            projects_dir_for(None).unwrap(),
+            projects_dir_for(None, |key| (key == "CLAUDE_CONFIG_DIR")
+                .then(|| "/home/user/.claude-personal".to_string()))
+            .unwrap(),
             PathBuf::from("/home/user/.claude-personal/projects")
         );
         // ... and the `$HOME/.claude` fallback underneath it, unchanged.
-        unsafe { std::env::remove_var("CLAUDE_CONFIG_DIR") };
-        let home = std::env::var("HOME").unwrap();
+        let home = "/home/test";
         assert_eq!(
-            projects_dir_for(None).unwrap(),
+            projects_dir_for(None, |key| (key == "HOME").then(|| home.to_string())).unwrap(),
             PathBuf::from(home).join(".claude").join("projects")
         );
     }
@@ -409,7 +405,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("test.jsonl");
         std::fs::write(&path, "{}\n").unwrap();
-        let stable = is_transcript_stable(&path, Duration::from_millis(50)).unwrap();
+        let stable = probe_with_wait(&path, || {}).unwrap();
         assert!(stable);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -420,12 +416,16 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("test.jsonl");
         std::fs::write(&path, "{}\n").unwrap();
-        let path_clone = path.clone();
-        std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_millis(20));
-            std::fs::write(&path_clone, "{}\n{}\n").unwrap();
-        });
-        let stable = is_transcript_stable(&path, Duration::from_millis(80)).unwrap();
+        let stable = probe_with_wait(&path, || {
+            std::fs::write(&path, "{}\n{}\n").unwrap();
+            std::fs::File::options()
+                .write(true)
+                .open(&path)
+                .unwrap()
+                .set_modified(std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(123))
+                .unwrap();
+        })
+        .unwrap();
         assert!(!stable);
         let _ = std::fs::remove_dir_all(&dir);
     }

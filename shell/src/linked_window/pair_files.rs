@@ -567,6 +567,10 @@ pub struct PairWriter {
     writing: bool,
     shared: Arc<Shared>,
     thread: Option<std::thread::JoinHandle<()>>,
+    #[cfg(test)]
+    clock: Option<Box<dyn Fn() -> Instant>>,
+    #[cfg(test)]
+    flush_wait: Option<Box<dyn Fn(Duration)>>,
 }
 
 impl PairWriter {
@@ -582,6 +586,10 @@ impl PairWriter {
                 changed: Condvar::new(),
             }),
             thread: None,
+            #[cfg(test)]
+            clock: None,
+            #[cfg(test)]
+            flush_wait: None,
         }
     }
 
@@ -730,14 +738,27 @@ impl PairWriter {
         }
     }
 
+    fn now(&self) -> Instant {
+        #[cfg(test)]
+        if let Some(clock) = &self.clock {
+            return clock();
+        }
+        Instant::now()
+    }
+
     /// Waits up to `bound` for every write handed over; whether they all finished.
     pub fn flush(&self, bound: Duration) -> bool {
-        let deadline = Instant::now() + bound;
+        let deadline = self.now() + bound;
         let mut slot = self.shared.lock();
         while slot.next.is_some() || slot.busy {
-            let left = deadline.saturating_duration_since(Instant::now());
+            let left = deadline.saturating_duration_since(self.now());
             if left.is_zero() {
                 return false;
+            }
+            #[cfg(test)]
+            if let Some(wait) = &self.flush_wait {
+                wait(left);
+                continue;
             }
             slot = self
                 .shared
@@ -818,11 +839,21 @@ mod tests {
         let mut writer = PairWriter::new(&dir.0, &root(), file.clone(), true);
         writer.shared.lock().busy = true;
         writer.shared.lock().next = Some(PairFile::default());
-        let start = Instant::now();
+        let clock = std::rc::Rc::new(std::cell::Cell::new(Instant::now()));
+        let reading = clock.clone();
+        writer.clock = Some(Box::new(move || reading.get()));
+        let waits = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let recorded = waits.clone();
+        writer.flush_wait = Some(Box::new(move |left| {
+            assert!(recorded.borrow().len() < 2, "flush did not finish after its deadline");
+            recorded.borrow_mut().push(left);
+            clock.set(clock.get() + left);
+        }));
         assert!(!writer.hand_over());
-        assert!(
-            start.elapsed() >= HAND_OVER_WAIT,
-            "an active write is given the handover interval"
+        assert_eq!(
+            *waits.borrow(),
+            [HAND_OVER_WAIT],
+            "the active write gets its full budget"
         );
         assert!(!writer.writing());
         writer.keep_ownership();

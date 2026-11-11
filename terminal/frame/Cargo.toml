@@ -1,7 +1,7 @@
 [package]
 name = "terminal-frame"
 version.workspace = true
-edition = "2021"
+edition = "2024"
 publish = false
 license = "MIT"
 # Eitri is the only product consumer; this library is MIT-licensed with Eitri.

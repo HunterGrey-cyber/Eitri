@@ -1008,7 +1008,13 @@ mod tests {
         drop(peer);
         assert_eq!(next_msg(&rx).0, Msg::MoveDone { mv: 3 });
         assert!(matches!(next(&rx), Inbound::Closed));
-        assert!(rx.recv_timeout(LONG).is_err(), "nothing after the end");
+        assert!(
+            matches!(
+                rx.recv_timeout(LONG),
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected)
+            ),
+            "the closed reader releases its sender"
+        );
     }
 
     /// Drains the wake and says how many messages were passed on since the last drain.

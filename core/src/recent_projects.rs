@@ -227,6 +227,18 @@ impl Drop for Busy {
 }
 
 pub fn read_with(sources: &Sources, probe: Box<dyn Probe>, deadline: Duration, busy: &'static AtomicBool) -> Vec<Row> {
+    read_with_wait(sources, probe, deadline, busy, |receiver, start, deadline| {
+        receiver.recv_timeout(deadline.checked_sub(start.elapsed())?).ok()
+    })
+}
+
+fn read_with_wait(
+    sources: &Sources,
+    probe: Box<dyn Probe>,
+    deadline: Duration,
+    busy: &'static AtomicBool,
+    mut receive: impl FnMut(&mpsc::Receiver<(usize, Fact)>, Instant, Duration) -> Option<(usize, Fact)>,
+) -> Vec<Row> {
     let (candidates, home) = candidates_under(sources);
     let now = SystemTime::now();
     let mut rows: Vec<_> = candidates
@@ -265,10 +277,7 @@ pub fn read_with(sources: &Sources, probe: Box<dyn Probe>, deadline: Duration, b
             }
         });
         if worker.is_ok() {
-            while let Some(left) = deadline.checked_sub(start.elapsed()) {
-                let Ok((index, fact)) = receiver.recv_timeout(left) else {
-                    break;
-                };
+            while let Some((index, fact)) = receive(&receiver, start, deadline) {
                 rows[index].fact = fact;
             }
         }

@@ -125,6 +125,12 @@ impl PanelTicker {
         }
     }
 
+    /// Whether a timer can run another tick without a wake.
+    #[cfg(any(test, debug_assertions, feature = "test-support"))]
+    pub fn timer_armed(&self) -> bool {
+        self.timer.borrow().is_some() || self.steady.borrow().is_some()
+    }
+
     /// Whether the tick is still driven.
     pub fn is_running(&self) -> bool {
         self.source.borrow().is_some() || self.steady.borrow().is_some()

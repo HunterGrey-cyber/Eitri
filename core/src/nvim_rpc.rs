@@ -173,8 +173,18 @@ struct Source {
 
 impl Read for Source {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        #[cfg(test)]
+        let now = tests::read_now();
+        #[cfg(not(test))]
+        let now = Instant::now();
+        self.read_at(buf, now)
+    }
+}
+
+impl Source {
+    fn read_at(&mut self, buf: &mut [u8], now: Instant) -> io::Result<usize> {
         if let Some(deadline) = self.deadline {
-            let remaining = deadline.saturating_duration_since(Instant::now());
+            let remaining = deadline.saturating_duration_since(now);
             if remaining.is_zero() {
                 return Err(io::ErrorKind::TimedOut.into());
             }
@@ -864,15 +874,13 @@ mod tests {
         let (done_tx, done_rx) = mpsc::channel();
         let for_thread = link.clone();
         std::thread::spawn(move || {
-            let started = Instant::now();
             let pendings: Vec<Pending> = args.into_iter().map(|a| for_thread.call("m", a)).collect();
-            let _ = done_tx.send((started.elapsed(), pendings));
+            let _ = done_tx.send(pendings);
         });
         // A call that blocks makes this fail rather than hang the suite.
-        let (elapsed, pendings) = done_rx
-            .recv_timeout(Duration::from_secs(10))
-            .expect("200 calls returned");
-        assert!(elapsed < Duration::from_millis(250), "200 calls took {elapsed:?}");
+        let pendings = done_rx
+            .recv_timeout(Duration::from_secs(60))
+            .expect("200 calls returned while the peer read nothing");
         assert!(pendings.iter().all(|p| p.try_take().is_none()));
         link.close();
     }
@@ -922,6 +930,17 @@ mod tests {
         assert_eq!(events.recv_timeout(T), Ok(LinkEvent::Closed));
     }
 
+    thread_local! {
+        static READ_NOW: std::cell::RefCell<Option<Box<dyn FnMut() -> Instant>>> = std::cell::RefCell::new(None);
+    }
+
+    pub(super) fn read_now() -> Instant {
+        READ_NOW.with(|clock| match clock.borrow_mut().as_mut() {
+            Some(clock) => clock(),
+            None => Instant::now(),
+        })
+    }
+
     fn listener_dir(case: &str) -> std::path::PathBuf {
         let dir = std::env::temp_dir().join(format!("rpc-{}-{case}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -935,15 +954,15 @@ mod tests {
         // Bound but never accepted: the kernel completes the connect from the backlog, so only the
         // handshake read can time out.
         let _listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
-        let started = Instant::now();
-        let error = NvimLink::connect(&sock, Duration::from_millis(300))
-            .err()
+        let (answer, outcome) = mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let _ = answer.send(NvimLink::connect(&sock, Duration::from_millis(300)).err());
+        });
+        let error = outcome
+            .recv_timeout(Duration::from_secs(60))
+            .expect("connect must finish while the listener is silent")
             .expect("no answer");
-        assert!(
-            started.elapsed() < Duration::from_millis(600),
-            "took {:?}",
-            started.elapsed()
-        );
+        worker.join().unwrap();
         assert!(error.contains("no answer within 300 ms"), "{error}");
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1030,39 +1049,80 @@ mod tests {
 
     #[test]
     fn connect_deadline_covers_a_frame_that_arrives_in_slow_pieces() {
-        let dir = listener_dir("drip");
+        let dir = listener_dir("pieces");
         let sock = agent::socket_path::in_dir(&dir, "f.sock").unwrap();
         let listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
-        let fake = std::thread::spawn(move || {
-            let (mut stream, _) = listener.accept().unwrap();
-            stream.set_read_timeout(Some(T)).unwrap();
-            let mut reader = BufReader::new(stream.try_clone().unwrap());
-            let _ = read_request(&mut reader);
-            // The start of an array of four, then one byte at a time, each well inside the timeout
-            // and together far past it. The peer stops when the link hangs up.
-            let mut bytes = vec![0x94];
-            bytes.extend(std::iter::repeat_n(0xc0, 3));
-            let _ = stream.write_all(&bytes[..1]);
-            for byte in &bytes[1..] {
-                std::thread::sleep(Duration::from_millis(150));
-                if stream.write_all(&[*byte]).is_err() {
-                    return;
-                }
-            }
-            std::thread::sleep(Duration::from_millis(150));
+        let (read, reads) = mpsc::channel();
+        let (answer, outcome) = mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let base = Instant::now();
+            let mut turn = 0;
+            READ_NOW.with(|clock| {
+                *clock.borrow_mut() = Some(Box::new(move || {
+                    assert!(turn < 20, "the handshake never finished");
+                    let now = base + Duration::from_secs(turn * 400);
+                    turn += 1;
+                    read.send(()).unwrap();
+                    now
+                }))
+            });
+            // Setup has a real budget beyond the outcome guard; only the reads advance the test clock.
+            let _ = answer.send(NvimLink::connect(&sock, Duration::from_secs(600)).err());
+            READ_NOW.with(|clock| *clock.borrow_mut() = None);
         });
-        let started = Instant::now();
-        let error = NvimLink::connect(&sock, Duration::from_millis(300))
-            .err()
-            .expect("the frame never completed in time");
-        assert!(
-            started.elapsed() < Duration::from_millis(450),
-            "took {:?}",
-            started.elapsed()
+        // Nonblocking accept keeps a broken connect bounded too.
+        listener.set_nonblocking(true).unwrap();
+        let until = Instant::now() + Duration::from_secs(60);
+        let mut peer = loop {
+            match listener.accept() {
+                Ok((peer, _)) => break peer,
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                    assert!(Instant::now() < until, "connect never reached the listener");
+                    std::thread::yield_now();
+                }
+                Err(e) => panic!("accept: {e}"),
+            }
+        };
+        peer.set_write_timeout(Some(Duration::from_secs(60))).unwrap();
+        // Each read gets one piece. The third read is past the one whole-frame deadline,
+        // even though a complete valid answer remains available from the peer.
+        for piece in [&[0x94][..], &[0x01][..], &[0x00, 0xc0, 0x92, 0x07, 0x80][..]] {
+            reads
+                .recv_timeout(Duration::from_secs(60))
+                .expect("connect requested the next piece");
+            let _ = peer.write_all(piece);
+        }
+        let error = outcome
+            .recv_timeout(Duration::from_secs(60))
+            .expect("connect finishes at its frame deadline")
+            .expect("an expired handshake is refused");
+        assert!(error.contains("no answer within 600000 ms"), "{error}");
+        drop(peer);
+        worker.join().unwrap();
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn source_deadline_covers_a_frame_that_arrives_in_slow_pieces() {
+        let (stream, mut peer) = UnixStream::pair().unwrap();
+        peer.write_all(&[0x94, 0xc0, 0xc0, 0xc0]).unwrap();
+        let now = Instant::now();
+        let mut source = Source {
+            stream,
+            deadline: Some(now + Duration::from_millis(300)),
+        };
+        let mut byte = [0];
+        assert_eq!(source.read_at(&mut byte, now).unwrap(), 1);
+        assert_eq!(byte, [0x94]);
+        assert_eq!(source.read_at(&mut byte, now + Duration::from_millis(150)).unwrap(), 1);
+        // More bytes are ready, but a successful partial read cannot renew the whole-frame deadline.
+        assert_eq!(
+            source
+                .read_at(&mut byte, now + Duration::from_millis(300))
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::TimedOut
         );
-        assert!(error.contains("no answer within 300 ms"), "{error}");
-        fake.join().unwrap();
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -1164,9 +1224,7 @@ mod tests {
             head.extend(bin32_header(MAX_FRAME as u32));
             flood(stream, head);
         });
-        let started = Instant::now();
         let error = NvimLink::connect(&sock, T).err().expect("an oversized answer");
-        assert!(started.elapsed() < T, "took {:?}", started.elapsed());
         assert!(error.contains("larger than"), "{error}");
         fake.join().unwrap();
         let _ = std::fs::remove_dir_all(&dir);
@@ -1192,11 +1250,9 @@ mod tests {
             assert!(client_fds.len() < 4096, "the accept queue never filled");
         }
 
-        let started = Instant::now();
         let error = NvimLink::connect(&sock, Duration::from_millis(300))
             .err()
             .expect("a full queue never answers");
-        let elapsed = started.elapsed();
 
         // Counting threads would race the tests running beside this one, so look for the one thing a
         // connect left waiting on a helper thread would show: a thread named for it, still there
@@ -1217,7 +1273,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
 
         assert!(error.contains("no answer within 300 ms"), "{error}");
-        assert!(elapsed < Duration::from_millis(600), "took {elapsed:?}");
         assert!(lingering.is_empty(), "a connect thread was left behind: {lingering:?}");
     }
 

@@ -261,15 +261,12 @@ fn from_visual_and_terminal_mode_too() {
     nvim.embed.wait_until("terminal mode", |embed| {
         get(&embed.lua(PERSON, vec![]), "mode").as_str() == Some("t")
     });
-    // nvim's own first refresh of the terminal moves its cursor some milliseconds after the mode changes: the
-    // person's state is read once it has stopped moving, so only the open can be what changes it afterwards.
-    let (mut last, mut since) = (None, std::time::Instant::now());
-    nvim.embed.wait_until("the terminal to settle", |embed| {
-        let now = sorted(embed.lua(PERSON, vec![]));
-        if last.as_ref() != Some(&now) {
-            (last, since) = (Some(now), std::time::Instant::now());
-        }
-        since.elapsed() >= std::time::Duration::from_millis(200)
+    nvim.embed.lua(
+        "vim.api.nvim_chan_send(vim.b.terminal_job_id, 'terminal ready\\n')",
+        vec![],
+    );
+    nvim.embed.wait_until("cat echoes its input after the initial terminal refresh", |embed| {
+        embed.lua("local n=0; for _,line in ipairs(vim.api.nvim_buf_get_lines(0,0,-1,true)) do if line:find('terminal ready',1,true) then n=n+1 end end; return n", vec![]).as_i64() == Some(2)
     });
     let before = nvim.person();
     let answer = nvim.open(&mine, Some(4), None, true);
@@ -464,10 +461,19 @@ fn attach_ui(nvim: &mut Nvim) {
         .request("nvim_ui_attach", vec![Value::from(120), Value::from(40), options]);
 }
 
-/// The mode after a settle time: a hit-enter prompt starts to wait a moment after the chunk returned.
+/// Samples completed scheduling turns so a delayed hit-enter prompt cannot hide.
 fn settled_mode(nvim: &mut Nvim) -> Value {
-    std::thread::sleep(Duration::from_millis(600));
-    nvim.embed.request("nvim_get_mode", vec![])
+    let mut mode = Value::Nil;
+    for _ in 0..20 {
+        nvim.embed.flush_scheduled();
+        mode = nvim.embed.request("nvim_get_mode", vec![]);
+        assert_eq!(
+            find(&mode, "blocking").and_then(Value::as_bool),
+            Some(false),
+            "{mode:?}"
+        );
+    }
+    mode
 }
 
 #[test]
@@ -710,8 +716,10 @@ fn from_insert_mode_a_printing_hook_changes_nothing_of_the_persons() {
     assert_eq!(find(&before, "mode"), Some(&Value::from("i")), "{before:?}");
     let answer = nvim.open(&target, Some(2), None, true);
     assert_eq!(place(&answer), "new_split", "{answer:?}");
-    std::thread::sleep(Duration::from_millis(600));
-    assert_eq!(nvim.person(), before);
+    for _ in 0..20 {
+        nvim.embed.flush_scheduled();
+        assert_eq!(nvim.person(), before);
+    }
 }
 
 #[test]
@@ -825,14 +833,15 @@ fn a_given_up_load_wipes_only_the_buffer_it_added() {
 #[ignore = "needs nvim on PATH"]
 fn a_load_that_outlasts_the_deadline_shows_no_window() {
     let mut nvim = start("slow-load");
+    nvim.embed.lua(include_str!("support/manual_wall.lua"), vec![]);
     let target = nvim.numbered("slow.rs", 5);
     nvim.embed.lua(
-        "vim.api.nvim_create_autocmd('BufReadPost', { callback = function() vim.uv.sleep(800) end })",
+        "vim.api.nvim_create_autocmd('BufReadPost', { callback = function() test_wall_ms = test_wall_ms + 800 end })",
         vec![],
     );
     let before = nvim.counts();
     let stamp = Stamp {
-        deadline_ms: wall_ms() + 400,
+        deadline_ms: nvim.embed.lua("return test_wall_ms", vec![]).as_u64().unwrap() + 400,
         scope: "open".to_owned(),
         seq: 1,
     };
@@ -913,16 +922,14 @@ fn a_chunk_past_its_deadline_changes_nothing() {
     nvim.edit(&mine);
     let before = (nvim.person(), nvim.counts());
 
-    // nvim cannot read its socket while a callback sleeps: the chunk waits in the pipe past its deadline.
-    nvim.embed
-        .lua("vim.schedule(function() vim.uv.sleep(1500) end)", vec![]);
-    std::thread::sleep(Duration::from_millis(150));
+    nvim.embed.lua(include_str!("support/manual_wall.lua"), vec![]);
     let mut raw = Raw::connect(&probe);
     let stamp = Stamp {
-        deadline_ms: wall_ms() + 200,
+        deadline_ms: nvim.embed.lua("return test_wall_ms", vec![]).as_u64().unwrap() + 200,
         scope: "open".to_owned(),
         seq: 1,
     };
+    nvim.embed.lua("test_wall_ms = test_wall_ms + 1000", vec![]);
     raw.send_lua(
         OPEN_FILE_LUA,
         vec![stamp.to_value(), arguments(&other, Some(2), None, true)],
@@ -1019,13 +1026,16 @@ fn the_highlight_clears_on_entering_the_window() {
 #[ignore = "needs nvim on PATH"]
 fn the_highlight_clears_after_four_seconds() {
     let mut nvim = start("highlight-timer");
+    nvim.embed.manual_timers();
     let mine = nvim.numbered("mine.rs", 5);
     let other = nvim.numbered("other.rs", 20);
     nvim.edit(&mine);
     nvim.open(&other, Some(5), None, true);
     let name = Value::from("other.rs");
     assert_eq!(nvim.embed.lua(EXTMARKS, vec![name.clone()]).as_i64(), Some(1));
-    std::thread::sleep(Duration::from_millis(4600));
+    nvim.embed.advance_timers(3999);
+    assert_eq!(nvim.embed.lua(EXTMARKS, vec![name.clone()]).as_i64(), Some(1));
+    nvim.embed.advance_timers(1);
     assert_eq!(nvim.embed.lua(EXTMARKS, vec![name]).as_i64(), Some(0));
 }
 

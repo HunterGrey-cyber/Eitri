@@ -755,7 +755,7 @@ pub fn parse_manifest(text: &str) -> Result<Manifest, String> {
                 SettingKind::Choice(values.clone())
             }
             "int" => match (setting.min, setting.max) {
-                (Some(min), Some(max)) if !(-MAX_SAFE_INT..=MAX_SAFE_INT).contains(&min) => {
+                (Some(min), Some(_)) if !(-MAX_SAFE_INT..=MAX_SAFE_INT).contains(&min) => {
                     return fail(
                         &format!("settings.{name}.min"),
                         format!("min and max are within +-{MAX_SAFE_INT}, which a page reads back unchanged"),

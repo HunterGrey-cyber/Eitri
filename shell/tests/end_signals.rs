@@ -11,7 +11,7 @@
 mod end_signals;
 
 use std::cell::RefCell;
-use std::io::{BufRead, BufReader, Read};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::process::{Command, Stdio};
 use std::rc::Rc;
 use std::time::{Duration, Instant};
@@ -21,6 +21,7 @@ const READY: &str = "END-SIGNALS-CHILD-READY";
 
 #[test]
 fn each_termination_signal_reaches_the_handler_and_the_process_goes_on() {
+    end_signals::test_watchdog_elapsed(Duration::ZERO);
     let context = glib::MainContext::default();
     let _owner = context
         .acquire()
@@ -58,39 +59,94 @@ fn blocked_window_child() {
     }
     let context = glib::MainContext::default();
     let _owner = context.acquire().expect("the child owns its default main context");
+    end_signals::test_watchdog_elapsed(Duration::ZERO);
     end_signals::install(|_| {}).expect("installed on the owning thread");
+    std::thread::spawn(|| {
+        let mut line = String::new();
+        loop {
+            line.clear();
+            match std::io::stdin().read_line(&mut line) {
+                Ok(0) | Err(_) => std::process::exit(0),
+                Ok(_) if line.trim() == "advance" => {
+                    end_signals::test_watchdog_elapsed(Duration::from_secs(3600));
+                }
+                Ok(_) => {}
+            }
+        }
+    });
     println!("{READY}");
-    std::thread::sleep(Duration::from_secs(120));
-    std::process::exit(0);
+    loop {
+        std::thread::park();
+    }
+}
+
+struct ChildGuard(std::process::Child);
+impl std::ops::Deref for ChildGuard {
+    type Target = std::process::Child;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+impl std::ops::DerefMut for ChildGuard {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+impl Drop for ChildGuard {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
 }
 
 /// Starts the blocked window, sends `signals` (a pause between them), and returns its exit code and stderr.
 fn end_a_blocked_window(signals: &[i32]) -> (Option<i32>, String) {
-    let mut child = Command::new(std::env::current_exe().expect("this test binary"))
-        .args(["blocked_window_child", "--exact", "--nocapture", "--test-threads=1"])
-        .env(CHILD_ENV, "1")
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("the child starts");
+    let mut child = ChildGuard(
+        Command::new(std::env::current_exe().expect("this test binary"))
+            .args(["blocked_window_child", "--exact", "--nocapture", "--test-threads=1"])
+            .env(CHILD_ENV, "1")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("the child starts"),
+    );
     let pid = child.id() as i32;
-    let mut out = BufReader::new(child.stdout.take().expect("its stdout"));
-    let mut line = String::new();
+    let out = BufReader::new(child.stdout.take().expect("its stdout"));
+    let (said, lines) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        for line in out.lines() {
+            if said.send(line.unwrap()).is_err() {
+                break;
+            }
+        }
+    });
+    let mut line;
     loop {
-        line.clear();
-        let n = out.read_line(&mut line).expect("reading the child's stdout");
-        assert!(n > 0, "the child ended before it was ready");
+        line = lines
+            .recv_timeout(Duration::from_secs(60))
+            .expect("the child never became ready");
         if line.contains(READY) {
             break;
         }
     }
-    for (i, &signum) in signals.iter().enumerate() {
-        if i > 0 {
-            std::thread::sleep(Duration::from_millis(300));
-        }
-        // SAFETY: a signal to the child this test started and has not reaped.
+    for &signum in signals {
+        // SAFETY: a signal to this test's own unreaped child.
         assert_eq!(unsafe { libc::kill(pid, signum) }, 0);
+        let expected = format!("WATCHDOG-SAW-{signum}");
+        loop {
+            line = lines
+                .recv_timeout(Duration::from_secs(60))
+                .expect("the watchdog never observed the signal");
+            if line.contains(&expected) {
+                break;
+            }
+        }
+    }
+    if signals.is_empty() {
+        drop(child.stdin.take());
+    } else if signals.len() == 1 {
+        child.stdin.as_mut().unwrap().write_all(b"advance\n").unwrap();
     }
     // Only a guard against a child that never ends; no time is asserted.
     let deadline = Instant::now() + Duration::from_secs(60);
@@ -128,4 +184,10 @@ fn a_second_signal_ends_a_blocked_window_without_waiting_for_the_bound() {
     let (code, err) = end_a_blocked_window(&[libc::SIGTERM, libc::SIGINT]);
     assert_eq!(code, Some(128 + libc::SIGINT), "stderr: {err}");
     assert!(err.contains("a second termination signal"), "stderr: {err}");
+}
+
+#[test]
+fn a_blocked_child_exits_when_its_parent_pipe_closes() {
+    let (code, err) = end_a_blocked_window(&[]);
+    assert_eq!(code, Some(0), "stderr: {err}");
 }

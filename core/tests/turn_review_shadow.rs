@@ -305,11 +305,12 @@ fn no_filter_or_fsmonitor_runs() {
     let trace_marker = scratch.path("trace-written");
     let markers = [&filter_marker, &fsmonitor_marker, &trace2_marker, &trace_marker];
     let fsmonitor = scratch.path("fsmonitor.sh");
-    write(
+    script_fixture::write_executable_script(
         &fsmonitor,
         format!("#!/bin/sh\ntouch '{}'\n", fsmonitor_marker.display()).as_bytes(),
-    );
-    std::fs::set_permissions(&fsmonitor, std::fs::Permissions::from_mode(0o755)).unwrap();
+        0o755,
+    )
+    .unwrap();
     let fsmonitor = fsmonitor.display().to_string();
     // Unquoted, so it can sit inside GIT_CONFIG_PARAMETERS' own single quotes.
     let clean = format!("touch {}", filter_marker.display());
@@ -673,15 +674,29 @@ fn trim_waits_for_a_running_snapshot() {
     let running = shadow.lock_shared().unwrap();
     let (done_tx, done_rx) = mpsc::channel();
     let trimmer = shadow.clone();
+    let (waiting, contended) = mpsc::channel();
+    let lock_path = scratch.review_dir(&project).join("lock");
     let worker = std::thread::spawn(move || {
+        eitri_core::turn_review::shadow::observe_lock_wait_for_tests(
+            move || waiting.send(()).unwrap(),
+            move || {
+                use std::os::fd::AsRawFd;
+                let probe = std::fs::File::open(lock_path).unwrap();
+                // An independent reader must conflict with the exclusive lock just acquired.
+                // SAFETY: the file owns its descriptor for the duration of the nonblocking call.
+                let result = unsafe { libc::flock(probe.as_raw_fd(), libc::LOCK_SH | libc::LOCK_NB) };
+                let error = std::io::Error::last_os_error();
+                assert_eq!(result, -1, "trim returned from flock without exclusive ownership");
+                assert_eq!(error.raw_os_error(), Some(libc::EWOULDBLOCK));
+            },
+        );
         let result = trimmer.trim(0, Duration::from_millis(500), 2_000, "now");
         done_tx.send(()).unwrap();
         result
     });
-    assert!(
-        done_rx.recv_timeout(Duration::from_millis(400)).is_err(),
-        "trim ran while a snapshot held the lock"
-    );
+    contended
+        .recv_timeout(Duration::from_secs(60))
+        .expect("trim never reached the held store lock");
     // Other readers still get the lock while trim waits for it.
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
     drop(shadow.lock_shared_until(deadline).unwrap());
@@ -1271,51 +1286,35 @@ fn a_timed_out_git_is_stopped_with_its_children() {
     let exec = scratch.path("exec");
     let pid_file = scratch.path("grandchild.pid");
     let helper = exec.join("git-eitri-test-hang");
-    write(
+    std::fs::create_dir_all(&exec).unwrap();
+    script_fixture::write_executable_script(
         &helper,
         format!("#!/bin/sh\nsleep 60 &\necho $! > '{}'\nwait\n", pid_file.display()).as_bytes(),
-    );
-    std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o755)).unwrap();
-    // Linux starts the helper well inside the timeout. macOS's `git` is an `xcrun` shim whose start-up
-    // can outlast 500 ms, so the helper has not written its pid yet when the group is killed and
-    // there is nothing to check: that attempt proves nothing and is retried with a longer timeout.
-    // The helper only ever ends by being killed (`sleep 60` and `wait`), so a `TimedOut` is always
-    // the timeout's doing, never a normal exit.
-    #[cfg(target_os = "macos")]
-    let timeouts = [1u64, 2, 4, 8];
-    #[cfg(not(target_os = "macos"))]
-    let timeouts = [500u64];
-    let mut pid = None;
-    for ms in timeouts {
-        let _ = std::fs::remove_file(&pid_file);
-        let mut cmd = git::user_read_only(&scratch.0);
-        cmd.arg(format!("--exec-path={}", exec.display()))
-            .arg("eitri-test-hang");
-        let started = std::time::Instant::now();
-        let timeout = if cfg!(target_os = "macos") {
-            Duration::from_secs(ms)
-        } else {
-            Duration::from_millis(ms)
-        };
-        // Linux keeps its original 10 s bound; on macOS the bound is the timeout plus 5 s.
-        let bound = if cfg!(target_os = "macos") {
-            timeout + Duration::from_secs(5)
-        } else {
-            Duration::from_secs(10)
-        };
-        let result = git::run(cmd, timeout);
-        assert!(matches!(result, Err(git::GitError::TimedOut)), "{result:?}");
-        assert!(started.elapsed() < bound, "the run outlived its timeout");
-        if let Ok(text) = std::fs::read_to_string(&pid_file) {
-            pid = Some(text.trim().to_owned());
-            break;
+        0o755,
+    )
+    .unwrap();
+    let mut cmd = git::user_read_only(&scratch.0);
+    cmd.arg(format!("--exec-path={}", exec.display()))
+        .arg("eitri-test-hang");
+    let base = std::time::Instant::now();
+    let clock_reads = std::cell::Cell::new(0);
+    let timeout = Duration::from_secs(1);
+    let result = git::run_with_clock_for_tests(cmd, timeout, &|| {
+        let reads = clock_reads.get();
+        assert!(reads < 10000, "the git deadline loop did not finish");
+        clock_reads.set(reads + 1);
+        if reads == 0 {
+            return base;
         }
-        assert!(
-            cfg!(target_os = "macos"),
-            "the helper never wrote its pid before the timeout"
-        );
-    }
-    let pid = pid.expect("git never got as far as the helper, even with an 8 s timeout");
+        let guard = std::time::Instant::now() + Duration::from_secs(60);
+        while !std::fs::read_to_string(&pid_file).is_ok_and(|text| text.trim().parse::<u32>().is_ok()) {
+            assert!(std::time::Instant::now() < guard, "git never started its held helper");
+            std::thread::yield_now();
+        }
+        base + timeout + Duration::from_millis(reads)
+    });
+    assert!(matches!(result, Err(git::GitError::TimedOut)), "{result:?}");
+    let pid = std::fs::read_to_string(&pid_file).unwrap().trim().to_owned();
     #[cfg(not(target_os = "macos"))]
     let gone = {
         let proc_dir = PathBuf::from(format!("/proc/{pid}"));
@@ -1818,4 +1817,9 @@ fn measure_a_large_collection() {
     backdate(&shadow.git_dir().join("objects"), Duration::from_secs(2 * 3600));
     measured_trim(&shadow, "second trim (packed once)", KEEP, now_ms + 60_000);
     sgit(&shadow, &["fsck", "--connectivity-only", "--no-dangling"]);
+}
+
+#[cfg(test)]
+mod script_fixture {
+    include!(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/support/executable.rs"));
 }

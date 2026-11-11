@@ -51,6 +51,8 @@ type WakeHandler = Rc<dyn Fn(&LinkDriver)>;
 struct Inner {
     handle: RefCell<Option<LinkHandle>>,
     inbound: Receiver<Inbound>,
+    #[cfg(test)]
+    queued_for_test: RefCell<std::collections::VecDeque<Inbound>>,
     handlers: RefCell<BTreeMap<&'static str, Handler>>,
     on_end: RefCell<Vec<EndHandler>>,
     on_closing: RefCell<Vec<ClosingHandler>>,
@@ -88,6 +90,8 @@ impl LinkDriver {
             inner: Rc::new(Inner {
                 handle: RefCell::new(Some(handle)),
                 inbound,
+                #[cfg(test)]
+                queued_for_test: RefCell::default(),
                 handlers: RefCell::default(),
                 on_end: RefCell::default(),
                 on_closing: RefCell::default(),
@@ -195,7 +199,17 @@ impl LinkDriver {
         }
         let mut handed = false;
         loop {
-            match self.inner.inbound.try_recv() {
+            #[cfg(test)]
+            let incoming = self
+                .inner
+                .queued_for_test
+                .borrow_mut()
+                .pop_front()
+                .map(Ok)
+                .unwrap_or_else(|| self.inner.inbound.try_recv());
+            #[cfg(not(test))]
+            let incoming = self.inner.inbound.try_recv();
+            match incoming {
                 Ok(Inbound::Msg { msg, fds }) => {
                     handed = true;
                     self.dispatch(msg, fds);
@@ -216,6 +230,46 @@ impl LinkDriver {
                     self.woke();
                     return;
                 }
+            }
+        }
+    }
+
+    /// Reads through a marker sent after all earlier packets, keeping those packets for the next ordinary drain.
+    /// The marker has no handler and never reaches a window's state.
+    #[cfg(test)]
+    pub(crate) fn read_through_for_test(&self, sender: &LinkDriver) {
+        if !self.is_up() || !sender.is_up() {
+            return;
+        }
+        let handle = sender.inner.handle.borrow();
+        self.read_handle_through_for_test(handle.as_ref().unwrap());
+    }
+
+    #[cfg(test)]
+    pub(crate) fn read_handle_through_for_test(&self, sender: &LinkHandle) {
+        sender
+            .send(Msg::IdePort { port: Some(u16::MAX) }, Vec::new())
+            .expect("the marker is queued");
+        let deadline = Instant::now() + Duration::from_secs(60);
+        loop {
+            let packet = self
+                .inner
+                .inbound
+                .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+                .expect("the link never delivered its marker");
+            if matches!(
+                &packet,
+                Inbound::Msg {
+                    msg: Msg::IdePort { port: Some(u16::MAX) },
+                    ..
+                }
+            ) {
+                return;
+            }
+            let closed = matches!(&packet, Inbound::Closed);
+            self.inner.queued_for_test.borrow_mut().push_back(packet);
+            if closed {
+                return;
             }
         }
     }

@@ -24,6 +24,50 @@
 
 use std::time::Instant;
 
+pub(crate) fn now() -> Instant {
+    #[cfg(any(test, feature = "test-support"))]
+    if let Some(now) = TEST_NOW.with(std::cell::Cell::get) {
+        return now;
+    }
+    Instant::now()
+}
+
+#[cfg(any(test, feature = "test-support"))]
+thread_local! {
+    static TEST_NOW: std::cell::Cell<Option<Instant>> = const { std::cell::Cell::new(None) };
+}
+
+/// A thread-local pacing clock for host tests. Dropping it restores the previous clock.
+#[cfg(any(test, feature = "test-support"))]
+pub struct TestClock {
+    previous: Option<Instant>,
+    _thread: std::marker::PhantomData<std::rc::Rc<()>>,
+}
+
+#[cfg(any(test, feature = "test-support"))]
+impl TestClock {
+    pub fn new(now: Instant) -> Self {
+        Self {
+            previous: TEST_NOW.with(|clock| clock.replace(Some(now))),
+            _thread: std::marker::PhantomData,
+        }
+    }
+
+    pub fn set(&self, now: Instant) {
+        TEST_NOW.with(|clock| {
+            assert!(now >= clock.get().unwrap(), "the pacing clock must advance");
+            clock.set(Some(now));
+        });
+    }
+}
+
+#[cfg(any(test, feature = "test-support"))]
+impl Drop for TestClock {
+    fn drop(&mut self) {
+        TEST_NOW.with(|clock| clock.set(self.previous));
+    }
+}
+
 use eitri_core::panel_cadence::{EnvelopeClass, PanelCadence, Route};
 use eitri_core::tabs::TabId;
 

@@ -564,7 +564,7 @@ mod tests {
         agent::state_dirs::redirect_state_to_a_test_root();
         let dir = agent::state_dirs::test_workspace_dir("views-idle");
         let (handle, _base, second) = handle_with_two_pages();
-        let (_bound, provider) = live_tab(&handle, &dir);
+        let (bound, provider) = live_tab(&handle, &dir);
         handle.break_out(view(2)).unwrap();
         provider.queue(write_card("perm-1"));
         tick_handle_until(&handle, "its card in page 2", || {
@@ -591,10 +591,18 @@ mod tests {
         assert!(handle.state.borrow().page(view(2)).is_none(), "its record is gone");
         clear(&[&second]);
         provider.queue(write_card("perm-2"));
-        for _ in 0..20 {
-            handle.tick();
-            std::thread::sleep(std::time::Duration::from_millis(5));
-        }
+        tick_handle_until(&handle, "the idle tab's second card", || {
+            handle
+                .state
+                .borrow()
+                .tabs
+                .get(bound)
+                .unwrap()
+                .attention
+                .attention()
+                .pending
+                == 2
+        });
         handle.set_pane_focused(view(2), true);
         handle.arrive(view(2));
         handle.page_message(view(2), READY);

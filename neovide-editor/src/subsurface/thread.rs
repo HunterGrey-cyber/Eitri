@@ -168,9 +168,9 @@ enum Command {
 #[doc(hidden)]
 pub enum TestCommand {
     /// Keeps the thread busy between two steps, holding no read intention; reports the instant the
-    /// hold starts and the instant it ends.
+    /// hold starts and the instant it ends; the caller releases it explicitly.
     Hold {
-        span: Duration,
+        release: mpsc::Receiver<()>,
         report: mpsc::Sender<Instant>,
     },
     /// Panics inside the loop.
@@ -181,10 +181,13 @@ pub enum TestCommand {
         count: u64,
         done: mpsc::Sender<()>,
     },
-    /// Sends a roundtrip's `wl_display.sync` and flushes it, stays busy for `hold` (long enough
-    /// for another reader to read the reply into the queue), then waits for the `done` as the
-    /// startup does, and reports.
-    Roundtrip { hold: Duration, done: mpsc::Sender<()> },
+    /// Sends and flushes a roundtrip, then parks inside its wait until another reader has read
+    /// the reply. The caller releases the wait and receives its completion.
+    Roundtrip {
+        entered: mpsc::Sender<()>,
+        release: mpsc::Receiver<()>,
+        done: mpsc::Sender<()>,
+    },
 }
 
 /// The user data of the thread's own `wl_display.sync` callbacks.
@@ -703,7 +706,12 @@ impl Loop {
     }
 
     fn wait_roundtrip(&mut self, token: u64) -> Result<(), End> {
+        self.wait_roundtrip_with(token, || {})
+    }
+
+    fn wait_roundtrip_with(&mut self, token: u64, mut before_step: impl FnMut()) -> Result<(), End> {
         while self.state.roundtrips_done < token {
+            before_step();
             self.step()?;
         }
         Ok(())
@@ -821,9 +829,11 @@ impl Loop {
 
     fn test(&mut self, command: TestCommand) -> Result<(), End> {
         match command {
-            TestCommand::Hold { span, report } => {
+            TestCommand::Hold { release, report } => {
                 let _ = report.send(Instant::now());
-                std::thread::sleep(span);
+                release
+                    .recv_timeout(Duration::from_secs(60))
+                    .expect("release the presentation worker");
                 let _ = report.send(Instant::now());
             }
             TestCommand::Panic => panic!("a test asked the presentation thread to panic"),
@@ -833,11 +843,18 @@ impl Loop {
                     .post((0..count).map(|seq| PresentEvent::FrameDone { pane, seq, at }));
                 let _ = done.send(());
             }
-            TestCommand::Roundtrip { hold, done } => {
+            TestCommand::Roundtrip { entered, release, done } => {
                 let token = self.send_roundtrip();
                 self.flush()?;
-                std::thread::sleep(hold);
-                self.wait_roundtrip(token)?;
+                let mut first = true;
+                self.wait_roundtrip_with(token, || {
+                    if std::mem::take(&mut first) {
+                        entered.send(()).unwrap();
+                        release
+                            .recv_timeout(Duration::from_secs(60))
+                            .expect("release the roundtrip wait");
+                    }
+                })?;
                 let _ = done.send(());
             }
         }

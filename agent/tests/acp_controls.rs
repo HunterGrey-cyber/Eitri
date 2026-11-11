@@ -3,6 +3,10 @@
 //! runs and no model turn is spent. The option shapes follow `codex-acp`'s: a `mode` select, a `model` select
 //! (category `model`) and a `reasoning_effort` select (category `thought_level`).
 
+#[path = "support/script_gate.rs"]
+mod script_gate;
+use script_gate::until;
+
 use agent::providers::acp::{AcpAgentSpec, AcpProvider};
 use agent::{
     AgentDomainEvent, AgentProvider, DirTrust, ExternalProvider, ExternalStart, ProviderError, ProviderErrorCode,
@@ -393,16 +397,11 @@ fn a_move_is_refused_at_once_while_a_change_waits_for_its_answer() {
     let provider = started(script, None);
     pump_all(&provider);
     let _waiting = provider.set_model("s1", "m-2").unwrap();
-    let began = Instant::now();
-    match provider.freeze_for_move() {
+    match provider.freeze_with_clock_for_tests(Instant::now, |_| panic!("this refusal must not wait for a start")) {
         Err(agent::MoveRefusedWhy::Link(why)) => assert!(why.contains("model or the effort"), "{why}"),
         Err(other) => panic!("refused for another reason: {other}"),
         Ok(_) => panic!("a chat with a change waiting moved"),
     }
-    assert!(
-        began.elapsed() < Duration::from_millis(1500),
-        "the refusal did not wait out the start's 2 s"
-    );
 }
 
 #[test]
@@ -561,11 +560,37 @@ fn an_agent_that_lists_no_sessions_is_not_asked() {
         script.extend([
             expect_request(2, "session/new", json!({"cwd": "/work", "mcpServers": []})),
             reply(2, json!({"sessionId": "s1"})),
+            expect_request(
+                3,
+                "session/prompt",
+                json!({"sessionId": "s1", "prompt": [{"type": "text", "text": "go"}]}),
+            ),
+            reply(3, json!({"stopReason": "end_turn"})),
         ]);
         let provider = started(script, None);
         provider.refresh_sessions();
-        std::thread::sleep(Duration::from_millis(100));
-        let events = provider.pump();
+        provider
+            .send_turn_with(
+                agent::SendTurnRequest {
+                    session_id: "s1".into(),
+                    text: "go".into(),
+                },
+                TurnPolicy {
+                    reviewer: Reviewer::Agent,
+                    sandbox: agent::Sandbox::Project,
+                },
+            )
+            .unwrap();
+        let mut events = Vec::new();
+        until(|| {
+            events.extend(provider.pump());
+            events.iter().any(|e| {
+                matches!(
+                    e,
+                    AgentDomainEvent::TurnCompleted { .. } | AgentDomainEvent::SessionUnavailable { .. }
+                )
+            })
+        });
         assert!(provider.listed_sessions().is_empty());
         assert!(
             !events
@@ -587,7 +612,7 @@ fn a_refused_list_leaves_the_held_one_and_the_session_alone() {
     let provider = started(script, None);
     until_listed(&provider, 1);
     provider.refresh_sessions();
-    std::thread::sleep(Duration::from_millis(100));
+    until(|| provider.lines_read_for_tests() >= 4);
     let events = provider.pump();
     assert_eq!(provider.listed_sessions().len(), 1);
     assert!(!events

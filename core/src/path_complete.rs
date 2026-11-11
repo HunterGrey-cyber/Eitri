@@ -134,13 +134,29 @@ pub fn suffix_wanted(wanted: &str) -> Option<&str> {
 /// Finds every file with this exact name or path suffix, using Git's ignores when available.
 /// Disk access and child-process waiting belong on a worker thread.
 pub fn find_by_suffix(root: &Path, wanted: &str, limits: SuffixLimits) -> SuffixLookup {
+    find_by_suffix_with_git(
+        root,
+        wanted,
+        limits,
+        crate::turn_review::git::run,
+        &std::time::Instant::now,
+    )
+}
+
+fn find_by_suffix_with_git(
+    root: &Path,
+    wanted: &str,
+    limits: SuffixLimits,
+    run: impl FnOnce(std::process::Command, Duration) -> Result<std::process::Output, crate::turn_review::git::GitError>,
+    now: &dyn Fn() -> std::time::Instant,
+) -> SuffixLookup {
     let mut result = SuffixLookup::default();
     let Some(wanted) = suffix_wanted(wanted) else {
         return result;
     };
-    let started = std::time::Instant::now();
+    let started = now();
     let mut listed = 0;
-    if started.elapsed() >= limits.deadline {
+    if now().saturating_duration_since(started) >= limits.deadline {
         result.stopped = Some(Stopped::Time);
         return result;
     }
@@ -158,9 +174,12 @@ pub fn find_by_suffix(root: &Path, wanted: &str, limits: SuffixLimits) -> Suffix
         "--exclude-standard",
         "-z",
     ]);
-    let listing = crate::turn_review::git::run(git, limits.deadline.saturating_sub(started.elapsed()));
+    let listing = run(
+        git,
+        limits.deadline.saturating_sub(now().saturating_duration_since(started)),
+    );
     // Keep the time budget shared by Git and the fallback walk.
-    if started.elapsed() >= limits.deadline {
+    if now().saturating_duration_since(started) >= limits.deadline {
         result.stopped = Some(Stopped::Time);
         return result;
     }
@@ -177,7 +196,7 @@ pub fn find_by_suffix(root: &Path, wanted: &str, limits: SuffixLimits) -> Suffix
         .filter(|output| output.status.success() && output.stdout.iter().any(|byte| *byte != 0))
     {
         for bytes in output.stdout.split(|b| *b == 0).filter(|bytes| !bytes.is_empty()) {
-            if started.elapsed() >= limits.deadline {
+            if now().saturating_duration_since(started) >= limits.deadline {
                 result.stopped = Some(Stopped::Time);
                 break;
             }
@@ -193,13 +212,13 @@ pub fn find_by_suffix(root: &Path, wanted: &str, limits: SuffixLimits) -> Suffix
     } else {
         let mut pending = vec![root.to_path_buf()];
         'walk: while let Some(dir) = pending.pop() {
-            if started.elapsed() >= limits.deadline {
+            if now().saturating_duration_since(started) >= limits.deadline {
                 result.stopped = Some(Stopped::Time);
                 break;
             }
             let Ok(entries) = std::fs::read_dir(dir) else { continue };
             for entry in entries.flatten() {
-                if started.elapsed() >= limits.deadline {
+                if now().saturating_duration_since(started) >= limits.deadline {
                     result.stopped = Some(Stopped::Time);
                     break 'walk;
                 }
@@ -224,7 +243,7 @@ pub fn find_by_suffix(root: &Path, wanted: &str, limits: SuffixLimits) -> Suffix
             }
         }
     }
-    if result.stopped.is_none() && started.elapsed() >= limits.deadline {
+    if result.stopped.is_none() && now().saturating_duration_since(started) >= limits.deadline {
         result.stopped = Some(Stopped::Time);
     }
     result
@@ -306,9 +325,8 @@ mod tests {
         git(&["add", "a.txt"]);
         let marker = dir.path().join("ran");
         let program = dir.path().join("monitor.sh");
-        std::fs::write(&program, format!("#!/bin/sh\ntouch {}\n", marker.display())).unwrap();
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
+        script_fixture::write_executable_script(&program, format!("#!/bin/sh\ntouch {}\n", marker.display()), 0o755)
+            .unwrap();
         git(&["config", "core.fsmonitor", program.to_str().unwrap()]);
         assert!(list_paths(dir.path()).contains(&"a.txt".to_string()));
         assert!(!marker.exists(), "the repository's fsmonitor ran");
@@ -597,9 +615,8 @@ mod tests {
         std::fs::write(root.join(".gitignore"), "ignored/\n").unwrap();
         let marker = root.join("ran");
         let program = root.join("monitor.sh");
-        std::fs::write(&program, format!("#!/bin/sh\ntouch {}\n", marker.display())).unwrap();
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
+        script_fixture::write_executable_script(&program, format!("#!/bin/sh\ntouch {}\n", marker.display()), 0o755)
+            .unwrap();
         assert!(Command::new("git")
             .arg("-C")
             .arg(root)
@@ -762,13 +779,37 @@ mod tests {
         const CHILD: &str = "EITRI_SUFFIX_SLOW_GIT_CHILD";
         if let Some(root) = std::env::var_os(CHILD) {
             let root = Path::new(&root);
-            let result = find_by_suffix(
+            let lookup_clock = std::cell::Cell::new(std::time::Instant::now());
+            let result = find_by_suffix_with_git(
                 root,
                 "a.rs",
                 SuffixLimits {
                     max_files: 100,
-                    deadline: Duration::from_secs(1),
+                    deadline: Duration::from_secs(60),
                 },
+                |command, within| {
+                    let base = std::time::Instant::now();
+                    let reads = std::cell::Cell::new(0u64);
+                    let result = crate::turn_review::git::run_with_clock_for_tests(command, within, &|| {
+                        let read = reads.get();
+                        assert!(read < 10000, "git's deadline loop did not stop");
+                        reads.set(read + 1);
+                        if read == 0 {
+                            return base;
+                        }
+                        let guard = std::time::Instant::now() + Duration::from_secs(60);
+                        while !std::fs::read_to_string(root.join("pid"))
+                            .is_ok_and(|text| text.trim().parse::<u32>().is_ok())
+                        {
+                            assert!(std::time::Instant::now() < guard, "the stand-in never started");
+                            std::thread::yield_now();
+                        }
+                        base + within + Duration::from_millis(read)
+                    });
+                    lookup_clock.set(lookup_clock.get() + Duration::from_secs(60));
+                    result
+                },
+                &|| lookup_clock.get(),
             );
             assert_eq!(result.stopped, Some(Stopped::Time));
             assert!(result.matches.is_empty(), "a timed-out git must not start the walk");
@@ -791,14 +832,13 @@ mod tests {
             }
             return;
         }
-        use std::os::unix::fs::PermissionsExt;
         let dir = TempDir::new();
         write_names(dir.path(), &["src/a.rs"]);
         let bin = dir.path().join("bin");
         std::fs::create_dir(&bin).unwrap();
         let fake = bin.join("git");
-        std::fs::write(&fake, "#!/bin/sh\necho $$ > pid\nexec /bin/sleep 60\n").unwrap();
-        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+        script_fixture::write_executable_script(&fake, "#!/bin/sh\necho $$ > pid\nexec /bin/sleep 60\n", 0o755)
+            .unwrap();
         let status = Command::new(std::env::current_exe().unwrap())
             .args([
                 "--exact",
@@ -811,4 +851,9 @@ mod tests {
             .unwrap();
         assert!(status.success());
     }
+}
+
+#[cfg(test)]
+mod script_fixture {
+    include!(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/support/executable.rs"));
 }

@@ -197,11 +197,29 @@ pub fn run(cmd: Command, timeout: Duration) -> Result<Output, GitError> {
 /// captured at spawn, while the child is known not to have been reaped -- and reported as
 /// [`GitError::TimedOut`]. A zero `timeout` starts nothing. A finished run is `Ok` whatever its exit
 /// status; [`GitError::check`] turns a failure into an error.
-pub fn run_with_input(mut cmd: Command, input: Option<&[u8]>, timeout: Duration) -> Result<Output, GitError> {
+pub fn run_with_input(cmd: Command, input: Option<&[u8]>, timeout: Duration) -> Result<Output, GitError> {
+    run_with_clock(cmd, input, timeout, &Instant::now)
+}
+
+#[cfg(any(test, feature = "test-support"))]
+pub fn run_with_clock_for_tests(
+    cmd: Command,
+    timeout: Duration,
+    now: &dyn Fn() -> Instant,
+) -> Result<Output, GitError> {
+    run_with_clock(cmd, None, timeout, now)
+}
+
+fn run_with_clock(
+    mut cmd: Command,
+    input: Option<&[u8]>,
+    timeout: Duration,
+    now: &dyn Fn() -> Instant,
+) -> Result<Output, GitError> {
     if timeout.is_zero() {
         return Err(GitError::TimedOut);
     }
-    let deadline = Instant::now() + timeout;
+    let deadline = now() + timeout;
     if input.is_some() {
         cmd.stdin(Stdio::piped());
     }
@@ -218,7 +236,7 @@ pub fn run_with_input(mut cmd: Command, input: Option<&[u8]>, timeout: Duration)
         _ => None,
     };
 
-    let status = match wait_until(&mut child, deadline) {
+    let status = match wait_until(&mut child, deadline, now) {
         Ok(Some(status)) => status,
         Ok(None) => {
             kill_group(pid);
@@ -369,13 +387,13 @@ fn join_quietly(writer: Option<std::thread::JoinHandle<std::io::Result<()>>>, ou
 /// Polls the child until it exits or `deadline` passes (`Ok(None)`). Polling rather than a waiting
 /// thread keeps this thread the only one that can reap the child, so the pid a timeout kills is
 /// still the child's.
-fn wait_until(child: &mut Child, deadline: Instant) -> std::io::Result<Option<ExitStatus>> {
+fn wait_until(child: &mut Child, deadline: Instant, now: &dyn Fn() -> Instant) -> std::io::Result<Option<ExitStatus>> {
     let mut pause = Duration::from_micros(200);
     loop {
         if let Some(status) = child.try_wait()? {
             return Ok(Some(status));
         }
-        let now = Instant::now();
+        let now = now();
         if now >= deadline {
             return Ok(None);
         }

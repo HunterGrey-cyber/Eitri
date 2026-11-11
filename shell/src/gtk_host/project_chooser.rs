@@ -70,6 +70,8 @@ pub(crate) struct ProjectChooserView {
     scroll: gtk4::ScrolledWindow,
     /// The frame tick that fits the panel again; it runs only while the chooser is up.
     tick: RefCell<Option<gtk4::TickCallbackId>>,
+    #[cfg(test)]
+    tick_runs: Rc<Cell<u32>>,
 }
 
 impl ProjectChooserView {
@@ -226,6 +228,8 @@ impl ProjectChooserView {
             panel,
             scroll,
             tick: RefCell::new(None),
+            #[cfg(test)]
+            tick_runs: Rc::default(),
         }
     }
 
@@ -237,7 +241,11 @@ impl ProjectChooserView {
         }
         let panel = self.panel.downgrade();
         let scroll = self.scroll.downgrade();
+        #[cfg(test)]
+        let tick_runs = self.tick_runs.clone();
         let id = self.root.add_tick_callback(move |root, _| {
+            #[cfg(test)]
+            tick_runs.set(tick_runs.get() + 1);
             if let (Some(panel), Some(scroll)) = (panel.upgrade(), scroll.upgrade()) {
                 let width = (root.width() - 32).clamp(0, 640);
                 if panel.width_request() != width {
@@ -256,6 +264,11 @@ impl ProjectChooserView {
             glib::ControlFlow::Continue
         });
         *self.tick.borrow_mut() = Some(id);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn tick_runs(&self) -> u32 {
+        self.tick_runs.get()
     }
 
     pub(crate) fn widget(&self) -> &gtk4::Widget {
@@ -936,6 +949,34 @@ mod tests {
         assert!(compact(&show).contains("set_value(&self.message_path,path)"));
     }
 
+    fn raw_shipped_source(source: &str) -> String {
+        let code = scan::code_only(source);
+        let tests = scan::modules(&code, "tests");
+        assert_eq!(tests.len(), 1, "one test module is excluded from the raw-text scan");
+        let offset = tests[0].as_ptr() as usize - code.as_ptr() as usize;
+        // The scanner preserves byte offsets, including the width of blanked Unicode.
+        let mut shipped = source.to_owned();
+        shipped.replace_range(offset..offset + tests[0].len(), "");
+        shipped
+    }
+
+    #[test]
+    fn raw_source_exclusion_preserves_unicode_before_the_test_module() {
+        let prefix = "// é日本語\nfn α() {}\n";
+        let source = format!("{prefix}#[cfg(test)] mod tests {{ const S: &str = \"é\"; }}\nfn after() {{}}\n");
+        let shipped = raw_shipped_source(&source);
+        assert!(shipped.starts_with(prefix), "the complete prefix survives");
+        assert!(
+            shipped.ends_with("\nfn after() {}\n"),
+            "code following the test module survives"
+        );
+        assert_eq!(
+            shipped,
+            format!("{prefix}#[cfg(test)] mod tests \nfn after() {{}}\n"),
+            "only the balanced test-module body is excluded"
+        );
+    }
+
     /// The line is what the person edits and what the model reads back as a path: no isolate may ever reach it.
     #[test]
     fn the_entry_text_never_holds_an_isolate() {
@@ -949,7 +990,7 @@ mod tests {
         }
         let (_, show) = scan::function_in(std::slice::from_ref(&source), "show");
         assert!(compact(&show).contains("self.entry.set_text(&view.line)"));
-        let shipped = &source.text[..source.text.find("#[cfg(test)]").unwrap()];
+        let shipped = raw_shipped_source(&source.text);
         assert!(!shipped.contains('\u{2068}'), "no isolate written as a raw character");
         assert_eq!(
             shipped.matches("\\u{2068}").count(),

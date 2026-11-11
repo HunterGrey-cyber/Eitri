@@ -134,9 +134,14 @@ fn self_check_passes_on_this_codex() {
     assert_eq!(verdicts(&scratch.state()), 1);
 
     // The verdict answers the next start without a second run.
-    let again = Instant::now();
+    let before = agent::providers::codex::self_check::runs_for_tests(&scratch.state());
+    assert_eq!(before, 1, "the first self-check ran exactly once");
     ensure_checked(&codex, &scratch.state()).expect("the cached verdict passes");
-    assert!(again.elapsed().as_secs() < 5, "a recorded pass is not run again");
+    assert_eq!(
+        agent::providers::codex::self_check::runs_for_tests(&scratch.state()),
+        before
+    );
+    assert_eq!(verdicts(&scratch.state()), 1);
 }
 
 /// A check that cannot tell the read-only sandbox from the workspace one proves nothing about it.

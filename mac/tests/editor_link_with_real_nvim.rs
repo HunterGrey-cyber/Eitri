@@ -217,19 +217,6 @@ fn attached(editor: &Editor, seen: &mut Vec<String>) {
     });
 }
 
-/// Nothing arrives within `quiet`.
-fn nothing_for(editor: &Editor, quiet: Duration, what: &str) {
-    let until = Instant::now() + quiet;
-    while Instant::now() < until {
-        for event in editor.poll(Instant::now()) {
-            if let EditorEvent::PaneSwitch(_) = event {
-                panic!("{what}: {}", describe(&event));
-            }
-        }
-        std::thread::sleep(TICK);
-    }
-}
-
 #[test]
 #[ignore = "needs a real nvim on PATH; spends no tokens and needs no display"]
 fn attaches_and_switches_panes_at_nvims_right_edge() {
@@ -249,15 +236,28 @@ fn attaches_and_switches_panes_at_nvims_right_edge() {
     probe.command("vsplit");
     assert_eq!(probe.winnr(), 1);
 
+    probe.lua(
+        r#"
+        _G.__eitri_test_right_sends = 0
+        local send = vim.fn.chansend
+        vim.fn.chansend = function(channel, bytes)
+            if type(bytes) == 'string' and bytes:match('R\n$') then
+                _G.__eitri_test_right_sends = _G.__eitri_test_right_sends + 1
+            end
+            return send(channel, bytes)
+        end
+        return true
+    "#,
+    );
     editor.send_keys("<C-l>").expect("the keys went");
     until("nvim moving to the right window", Duration::from_secs(2), || {
         let _ = editor.poll(Instant::now());
         (probe.winnr() == 2).then_some(())
     });
-    nothing_for(
-        &editor,
-        Duration::from_millis(300),
-        "a move inside nvim must not switch panes",
+    assert_eq!(
+        probe.lua("return _G.__eitri_test_right_sends").as_i64(),
+        Some(0),
+        "a move inside nvim sends no pane switch"
     );
 
     editor.send_keys("<C-l>").expect("the keys went");
@@ -267,6 +267,11 @@ fn attaches_and_switches_panes_at_nvims_right_edge() {
         Duration::from_secs(2),
         &mut seen,
         |event| matches!(event, EditorEvent::PaneSwitch(Direction::Right)).then_some(()),
+    );
+    assert_eq!(
+        probe.lua("return _G.__eitri_test_right_sends").as_i64(),
+        Some(1),
+        "the same send counter observes the edge switch"
     );
     editor.shutdown();
 }
@@ -302,12 +307,6 @@ fn a_colorscheme_change_is_a_theme_event() {
     let editor = editor_at(&nvim.listen);
     let mut seen = Vec::new();
     attached(&editor, &mut seen);
-    // The install's first theme, if it comes.
-    let quiet = Instant::now() + Duration::from_millis(500);
-    while Instant::now() < quiet {
-        let _ = editor.poll(Instant::now());
-        std::thread::sleep(TICK);
-    }
     probe.command("colorscheme blue");
     pump(
         "a theme event",
@@ -385,27 +384,45 @@ fn an_attach_before_nvim_listens_is_tried_again_and_not_reported_failed() {
     let reserved = Reserved::new("late");
     let editor = editor_at(&reserved.listen);
     let mut seen = Vec::new();
-    editor.attach();
-    // Nothing listens yet: every connect is refused, and the band must not say "failed" meanwhile.
-    let quiet = Instant::now() + Duration::from_millis(600);
-    while Instant::now() < quiet {
-        for event in editor.poll(Instant::now()) {
+    let start = Instant::now();
+    editor.attach_at(start);
+    let inside = start + eitri_mac::editor::ATTACH_RETRY_FOR / 4;
+    let guard = Instant::now() + Duration::from_secs(60);
+    while editor.attach_attempts() < 2 {
+        for event in editor.poll(inside) {
             seen.push(describe(&event));
             assert!(
                 !matches!(&event, EditorEvent::LinkChanged(band) if band.state == "failed"),
                 "reported failed inside the retry window: {seen:?}"
             );
         }
-        std::thread::sleep(TICK);
+        assert!(Instant::now() < guard, "the failed attach never retried");
+        std::thread::yield_now();
     }
     let nvim = reserved.spawn();
-    pump(
-        "the panel attached once nvim listened",
-        &editor,
-        Duration::from_secs(5),
-        &mut seen,
-        |event| matches!(event, EditorEvent::LinkChanged(band) if band.state == "attached").then_some(()),
-    );
+    // The retry is queued: let nvim listen before the next poll starts its connect.
+    let _probe = nvim.probe();
+    let guard = Instant::now() + Duration::from_secs(60);
+    let mut now = inside;
+    loop {
+        let events = editor.poll(now);
+        now += eitri_core::companion::link::CompanionLink::POLL_INTERVAL;
+        let attached = events.iter().any(|event| {
+            matches!(event,
+            EditorEvent::LinkChanged(band) if band.state == "attached")
+        });
+        assert!(
+            !events.iter().any(|event| matches!(event,
+            EditorEvent::LinkChanged(band) if band.state == "failed")),
+            "{:?}",
+            events.iter().map(describe).collect::<Vec<_>>()
+        );
+        if attached {
+            break;
+        }
+        assert!(Instant::now() < guard, "the retry never attached once nvim listened");
+        std::thread::yield_now();
+    }
     editor.shutdown();
     drop(nvim);
 }
@@ -415,17 +432,22 @@ fn an_attach_before_nvim_listens_is_tried_again_and_not_reported_failed() {
 fn an_attach_that_never_succeeds_is_reported_failed_after_the_retry_window() {
     let reserved = Reserved::new("never");
     let editor = editor_at(&reserved.listen);
-    let mut seen = Vec::new();
-    let started = Instant::now();
-    editor.attach();
-    pump("a failed band", &editor, Duration::from_secs(5), &mut seen, |event| {
-        matches!(event, EditorEvent::LinkChanged(band) if band.state == "failed").then_some(())
-    });
-    assert!(
-        started.elapsed() >= eitri_mac::editor::ATTACH_RETRY_FOR,
-        "failed was reported after {:?}",
-        started.elapsed()
-    );
+    let start = Instant::now();
+    editor.attach_at(start);
+    let expired = start + eitri_mac::editor::ATTACH_RETRY_FOR;
+    let guard = Instant::now() + Duration::from_secs(60);
+    loop {
+        let events = editor.poll(expired);
+        if events.iter().any(|event| {
+            matches!(event,
+            EditorEvent::LinkChanged(band) if band.state == "failed")
+        }) {
+            break;
+        }
+        assert!(Instant::now() < guard, "the expired attach never reported its failure");
+        std::thread::yield_now();
+    }
+    assert_eq!(editor.attach_attempts(), 1, "no retry at the deadline");
     editor.shutdown();
     let _ = std::fs::remove_dir_all(&reserved.run_dir);
 }

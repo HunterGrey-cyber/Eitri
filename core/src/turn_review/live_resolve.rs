@@ -250,9 +250,16 @@ mod tests {
     #[test]
     fn batches_come_out_in_the_order_they_were_pushed() {
         // The first batch's worker is slow, the second's would be fast: the second waits its turn.
-        let resolve: Resolve = Arc::new(|root: &Path, named: &Path| {
+        let (entered, ready) = std::sync::mpsc::channel();
+        let (release, gate) = std::sync::mpsc::channel();
+        let gate = std::sync::Mutex::new(gate);
+        let resolve: Resolve = Arc::new(move |root: &Path, named: &Path| {
             if named.to_string_lossy().contains("slow") {
-                std::thread::sleep(Duration::from_millis(100));
+                entered.send(()).unwrap();
+                gate.lock()
+                    .unwrap()
+                    .recv_timeout(Duration::from_secs(60))
+                    .expect("release the first batch");
             }
             Some(root.join(named.file_name()?))
         });
@@ -263,6 +270,13 @@ mod tests {
         assert!(r.poll(now).is_empty());
         r.push(root.clone(), vec![edit("b.txt")]);
         r.push(root.clone(), vec![edit("fast/../c.txt"), edit("d.txt")]);
+        ready
+            .recv_timeout(Duration::from_secs(60))
+            .expect("first resolver entered");
+        for _ in 0..20 {
+            assert!(r.poll(now).is_empty(), "later batches cannot pass the held first batch");
+        }
+        release.send(()).unwrap();
         let out = drain(&mut r, now, 4);
         assert_eq!(
             paths(&out),

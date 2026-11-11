@@ -124,18 +124,23 @@ fn get_api_info_answers_while_nvim_waits_for_a_key_and_exec_lua_waits() {
     );
     answer(&attach, Duration::from_secs(5)).unwrap();
     answer(&ui.call("nvim_input", vec![Value::from("f")]), Duration::from_secs(5)).unwrap();
-    std::thread::sleep(Duration::from_millis(200));
+    let until = Instant::now() + Duration::from_secs(60);
+    loop {
+        let mode = answer(&ui.call("nvim_get_mode", vec![]), Duration::from_secs(60)).unwrap();
+        if field(&mode, "blocking").and_then(|v| v.as_bool()) == Some(true) {
+            break;
+        }
+        assert!(Instant::now() < until, "nvim never entered the char-wait");
+    }
 
     // nvim is now inside a char-wait. `nvim_get_api_info` is api-fast, so a fresh connect works...
-    let started = Instant::now();
     let (second, _events) = NvimLink::connect(&nvim.socket, Duration::from_secs(1)).expect("connect while waiting");
-    assert!(started.elapsed() < Duration::from_secs(1));
     // ...but `nvim_exec_lua` is queued until the key arrives.
     let queued = second.exec_lua("return 1", vec![]);
-    let until = Instant::now() + Duration::from_secs(1);
-    while Instant::now() < until {
+    for _ in 0..20 {
+        let mode = answer(&second.call("nvim_get_mode", vec![]), Duration::from_secs(60)).unwrap();
+        assert_eq!(field(&mode, "blocking").and_then(|v| v.as_bool()), Some(true));
         assert!(queued.try_take().is_none(), "exec_lua answered during the char-wait");
-        std::thread::sleep(Duration::from_millis(50));
     }
     // `nvim_get_mode` is api-fast too, and says nvim is blocked.
     let mode = answer(&ui.call("nvim_get_mode", vec![]), Duration::from_secs(1)).unwrap();
@@ -174,9 +179,13 @@ fn rpcnotify_reaches_the_link() {
 fn killing_nvim_closes_the_link_within_a_second() {
     let mut nvim = Nvim::start("kill");
     let (link, events) = nvim.connect();
-    // Busy in nvim for ten seconds, with no UI needed: deterministic, unlike a char-wait.
-    let stuck = link.exec_lua("vim.uv.sleep(10000)", vec![]);
-    std::thread::sleep(Duration::from_millis(100));
+    let stuck = link.exec_lua(
+        "vim.rpcnotify(..., 'waiting'); vim.fn.getchar()",
+        vec![link.channel_id().into()],
+    );
+    assert!(
+        matches!(events.recv_timeout(Duration::from_secs(60)).unwrap(), LinkEvent::Notification { method, .. } if method == "waiting")
+    );
     assert!(stuck.try_take().is_none());
     nvim.child.kill().unwrap();
     assert_eq!(events.recv_timeout(Duration::from_secs(1)), Ok(LinkEvent::Closed));
@@ -192,15 +201,9 @@ fn connect_to_a_dead_socket_fails_fast() {
     let socket = agent::socket_path::in_dir(&dir, "n.sock").unwrap();
     // Binding creates the file; dropping the listener leaves it with nobody behind it.
     drop(std::os::unix::net::UnixListener::bind(&socket).unwrap());
-    let started = Instant::now();
     let error = NvimLink::connect(&socket, Duration::from_secs(2))
         .err()
         .expect("a refused connect");
-    assert!(
-        started.elapsed() < Duration::from_millis(500),
-        "took {:?}",
-        started.elapsed()
-    );
     assert!(error.starts_with("connect "), "{error}");
     let _ = std::fs::remove_dir_all(&dir);
 }

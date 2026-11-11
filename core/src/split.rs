@@ -397,9 +397,8 @@ mod tests {
     fn a_child_that_exits_early_is_reported_before_the_deadline() {
         let dir = scratch("early");
         let mut child = Command::new("false").spawn().unwrap();
-        let started = Instant::now();
-        let err = wait_for_socket(&dir.join("nothing"), &mut child, 0, Duration::from_secs(10)).unwrap_err();
-        assert!(started.elapsed() < Duration::from_secs(5));
+        child.wait().unwrap();
+        let err = wait_for_socket(&dir.join("nothing"), &mut child, 0, Duration::ZERO).unwrap_err();
         assert!(err.starts_with("eitri split: neovide exited ("), "{err}");
         assert!(err.contains("before nvim listened on"), "{err}");
     }

@@ -18,8 +18,8 @@
 //! - The posture is the registration's: `auto_mode = "workspace-write"`, a scratch root under the test target's
 //!   directory (never `/tmp`) with no `.git` and no `.codex/`. A real model may not do what the prompt asks; a turn
 //!   that does not try says so and fails rather than passing on nothing.
-//! - `TMUX` and `TMUX_PANE` are removed from this process before the agent starts, so the account's own status hook
-//!   exits at once. The test therefore changes its own environment and must run on one thread.
+//! - A fresh child test starts without `TMUX` and `TMUX_PANE`, so the account's own status hook
+//!   exits at once. Its adapter settings are also passed through the child's initial environment.
 
 #[path = "support/codex_peer.rs"]
 mod codex_peer;
@@ -174,11 +174,16 @@ fn codex_acp_as_a_registered_agent_in_a_trusted_scratch_root() {
     std::fs::write(root.join("README.txt"), "scratch root for the codex-acp check\n").expect("README");
     let target = outside.join("not-written.txt");
 
-    let config = adapter_config(&codex, &root);
-    std::env::remove_var("TMUX");
-    std::env::remove_var("TMUX_PANE");
-    std::env::set_var("CODEX_PATH", &codex);
-    std::env::set_var("CODEX_CONFIG", &config);
+    let config = std::env::var("EITRI_ACP_ADAPTER_CONFIG").unwrap_or_else(|_| adapter_config(&codex, &root));
+    if !agent::testkit::environment::in_child(&[
+        ("TMUX", None),
+        ("TMUX_PANE", None),
+        ("CODEX_PATH", Some(codex.as_os_str())),
+        ("CODEX_CONFIG", Some(std::ffi::OsStr::new(&config))),
+        ("EITRI_ACP_ADAPTER_CONFIG", Some(std::ffi::OsStr::new(&config))),
+    ]) {
+        return;
+    }
 
     // The registration `init.lua` would make: the argv, and the one mode Eitri sets in both of its modes.
     let spec = AcpAgentSpec {

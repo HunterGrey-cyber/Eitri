@@ -387,3 +387,22 @@ fn saved_tab_named(session: &str) -> SavedTab {
         row_key: None,
     }
 }
+
+struct TestWallClock;
+
+impl TestWallClock {
+    fn new() -> Self {
+        TEST_WALL_MS.set(Some(1_000_000));
+        Self
+    }
+
+    fn advance(&self, ms: u64) {
+        TEST_WALL_MS.set(Some(TEST_WALL_MS.get().expect("clock installed") + ms));
+    }
+}
+
+impl Drop for TestWallClock {
+    fn drop(&mut self) {
+        TEST_WALL_MS.set(None);
+    }
+}

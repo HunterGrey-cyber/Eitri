@@ -34,19 +34,16 @@ type UnderTest = StdSyncHandler;
 
 const FRAMES: usize = 5;
 
-/// Five synchronized updates. Each one home-and-clears the top line three times and sleeps
-/// between the writes, so a PTY read almost always ends in the middle of an update.
+/// Five updates, each longer than the fixed thirteen-byte read buffer. A read must end inside
+/// each update even if the child writes the entire stream before the parent runs.
 const SCRIPT: &str = r#"
 i=1
 while [ "$i" -le 5 ]; do
   printf '\033[?2026h'
   printf '\033[H\033[Kframe-%s-aaa' "$i"
-  sleep 0.05
   printf '\033[H\033[Kframe-%s-bbb' "$i"
-  sleep 0.05
   printf '\033[H\033[Kframe-%s-final' "$i"
   printf '\033[?2026l'
-  sleep 0.05
   i=$((i+1))
 done
 "#;

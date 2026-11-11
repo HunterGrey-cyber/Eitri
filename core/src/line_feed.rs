@@ -124,6 +124,11 @@ impl NewestLineReader {
         std::os::fd::AsRawFd::as_raw_fd(&self.listener)
     }
 
+    #[cfg(test)]
+    pub(crate) fn pending_streams(&self) -> impl Iterator<Item = &UnixStream> {
+        self.pending.iter().map(|pending| &pending.stream)
+    }
+
     /// The newest complete line whose `accept` returned true, or None for no news.
     pub fn poll_with(&mut self, mut accept: impl FnMut(&[u8]) -> bool) -> Option<Vec<u8>> {
         self.poll_parsed(|line| accept(line).then(|| line.to_vec()))
@@ -259,21 +264,26 @@ mod tests {
         assert_eq!(context.file, "/partial.rs");
     }
 
-    /// A coarse guard against the old four successive 100ms socket waits. This is a real Unix
-    /// socket check, not a claim about GUI frame time or input-to-photon latency.
     #[test]
     fn four_silent_connections_do_not_hold_the_ui_poll() {
+        use std::os::fd::AsRawFd;
         let mut feed = EditorContextFeed::new().expect("bind the test feed");
         let mut reader = reader_for(&mut feed);
         let clients: Vec<_> = (0..4)
             .map(|_| UnixStream::connect(feed.socket_path()).unwrap())
             .collect();
-        let before = Instant::now();
         assert!(reader.poll().is_none());
-        let elapsed = before.elapsed();
-        eprintln!("line-feed poll with four silent clients: {elapsed:?}");
-        assert!(elapsed < Duration::from_millis(200), "poll blocked for {elapsed:?}");
-        drop(clients);
+        assert_eq!(reader.pending.len(), clients.len());
+        for pending in &reader.pending {
+            // SAFETY: each stream is owned here and F_GETFL reads only its flags.
+            let flags = unsafe { libc::fcntl(pending.stream.as_raw_fd(), libc::F_GETFL) };
+            assert!(flags >= 0 && flags & libc::O_NONBLOCK != 0, "silent reads cannot wait");
+            let mut byte = [0];
+            assert_eq!(
+                (&pending.stream).read(&mut byte).unwrap_err().kind(),
+                ErrorKind::WouldBlock
+            );
+        }
     }
 
     #[test]

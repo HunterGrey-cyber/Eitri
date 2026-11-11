@@ -80,8 +80,6 @@ impl Drop for Scratch {
 #[derive(Clone, Default)]
 struct Jobs {
     inner: Arc<(Mutex<JobsState>, Condvar)>,
-    /// Slept on the worker before every end snapshot.
-    slow_end: Option<Duration>,
 }
 
 #[derive(Default)]
@@ -111,11 +109,6 @@ impl Jobs {
                 state = cvar.wait(state).unwrap();
             }
             drop(state);
-            if *kind == SnapshotKind::End {
-                if let Some(pause) = self.slow_end {
-                    std::thread::sleep(pause);
-                }
-            }
         }
     }
 
@@ -436,8 +429,12 @@ fn a_turn_ended_by_session_closed_gets_an_end() {
         now(),
     );
     poll_until(&mut review, "s1", "the base", |t| has_base(t, "t1"));
-    std::thread::sleep(Duration::from_millis(100));
-    review.poll();
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while review.has_work_in_flight() {
+        assert!(Instant::now() < deadline, "review workers did not finish");
+        review.poll();
+        std::thread::yield_now();
+    }
     assert!(!jobs.seen().iter().any(|e| matches!(
         e,
         JobEvent::Starting {
@@ -451,14 +448,25 @@ fn a_turn_ended_by_session_closed_gets_an_end() {
 #[test]
 fn end_then_base_run_in_order_on_one_index() {
     let scratch = Scratch::new("order");
-    let jobs = Jobs {
-        slow_end: Some(Duration::from_millis(200)),
-        ..Jobs::default()
-    };
+    let jobs = Jobs::default();
+    jobs.hold(SnapshotKind::End, 1);
     let mut review = scratch.review(&jobs);
     review.observe(1, "s1", &started("t1"), now());
     review.observe(1, "s1", &completed("t1"), now());
     review.observe(1, "s1", &started("t2"), now());
+    jobs.wait_started(SnapshotKind::End, 1);
+    assert!(
+        !jobs.seen().iter().any(|event| matches!(
+            event,
+            JobEvent::Starting {
+                kind: SnapshotKind::Base,
+                position: 2,
+                ..
+            }
+        )),
+        "the next base passed the held end"
+    );
+    jobs.release(SnapshotKind::End, 1);
     poll_until(&mut review, "s1", "the second base", |t| {
         is_ok(t, "t1") && has_base(t, "t2")
     });
@@ -1106,7 +1114,10 @@ fn the_first_turn_of_a_new_session_waits_for_its_session_id() {
     let mut review = scratch.review(&jobs);
     review.observe(1, "", &started("t1"), now());
     review.observe(1, "", &tool("t1"), now());
-    std::thread::sleep(Duration::from_millis(50));
+    assert!(
+        !review.has_work_in_flight(),
+        "no snapshot was enqueued without a session id"
+    );
     assert!(
         jobs.seen().is_empty(),
         "nothing can be snapshotted before the session has an id"
@@ -1389,10 +1400,16 @@ fn rows(review: &TurnReview, turn: TurnRef, scope: Scope) -> Vec<(String, bool)>
         .collect()
 }
 
-/// Lets the file system's clock move on, so a rewrite within a turn cannot carry the time of the
-/// base snapshot's look at the file.
-fn tick() {
-    std::thread::sleep(Duration::from_millis(30));
+/// Makes a rewrite distinct from its base even on a filesystem with coarse timestamps.
+fn rewrite(path: &Path, bytes: &[u8]) {
+    let before = std::fs::metadata(path).unwrap().modified().unwrap();
+    std::fs::write(path, bytes).unwrap();
+    std::fs::File::options()
+        .write(true)
+        .open(path)
+        .unwrap()
+        .set_times(std::fs::FileTimes::new().set_modified(before + Duration::from_secs(2)))
+        .unwrap();
 }
 
 fn row(path: &str) -> Vec<(String, bool)> {
@@ -1408,7 +1425,6 @@ fn a_cli_turns_edit_lands_in_its_own_record() {
     let mut review = scratch.review(&jobs);
     review.observe(1, "s1", &opened("s1"), now());
     run_turn(&mut review, "t1", || {});
-    tick();
     // The CLI's own turn: its start says so, and it writes a file.
     review.observe(1, "s1", &started("cli-1"), now());
     review.observe(
@@ -1426,7 +1442,6 @@ fn a_cli_turns_edit_lands_in_its_own_record() {
     std::fs::write(scratch.project().join("woken.txt"), "written by the woken turn\n").unwrap();
     review.observe(1, "s1", &completed("cli-1"), now());
     poll_until(&mut review, "s1", "the CLI turn's end", |t| is_ok(t, "cli-1"));
-    tick();
     run_turn(&mut review, "t2", || {});
 
     let turns = review.turns("s1");
@@ -1490,19 +1505,16 @@ fn a_too_large_file_that_changed_during_the_turn_is_listed() {
 
     // Different size.
     run_turn(&mut review, "t1", || {
-        tick();
-        std::fs::write(&big, vec![b'y'; LARGE + 50]).unwrap();
+        rewrite(&big, &vec![b'y'; LARGE + 50]);
     });
     assert_eq!(rows(&review, TurnRef::N(1), Scope::Turn), row("huge.txt"));
     // The same size, other bytes.
     run_turn(&mut review, "t2", || {
-        tick();
-        std::fs::write(&big, vec![b'z'; LARGE + 50]).unwrap();
+        rewrite(&big, &vec![b'z'; LARGE + 50]);
     });
     assert_eq!(rows(&review, TurnRef::N(2), Scope::Turn), row("huge.txt"));
     // Replaced by a file of the same size and bytes: another inode.
     run_turn(&mut review, "t3", || {
-        tick();
         let copy = scratch.project().join("copy.tmp");
         std::fs::write(&copy, vec![b'z'; LARGE + 50]).unwrap();
         std::fs::rename(&copy, &big).unwrap();
@@ -1606,8 +1618,7 @@ fn a_running_turn_lists_a_too_large_file_only_once_it_differs_from_its_base() {
     review.observe(1, "s1", &started("t1"), now());
     poll_until(&mut review, "s1", "the base", |t| has_base(t, "t1"));
     assert_eq!(rows(&review, TurnRef::Latest, Scope::Turn), vec![]);
-    tick();
-    std::fs::write(&big, vec![b'y'; LARGE]).unwrap();
+    rewrite(&big, &vec![b'y'; LARGE]);
     assert_eq!(rows(&review, TurnRef::Latest, Scope::Turn), row("huge.txt"));
 }
 

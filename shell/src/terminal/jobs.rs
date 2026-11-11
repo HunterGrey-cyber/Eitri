@@ -168,6 +168,7 @@ mod tests {
     struct Shell {
         child: PtyChild,
         dir: PathBuf,
+        output: Vec<u8>,
     }
 
     impl Shell {
@@ -187,7 +188,11 @@ mod tests {
             };
             let child = PtyChild::spawn(&SpawnSpec::shell(PathBuf::from("/bin/sh"), dir.clone()), size)
                 .expect("/bin/sh starts on a PTY");
-            Shell { child, dir }
+            Shell {
+                child,
+                dir,
+                output: Vec::new(),
+            }
         }
 
         fn pid(&self) -> u32 {
@@ -212,7 +217,12 @@ mod tests {
         /// Reads what the shell printed, so its writes never wait on a full PTY.
         fn drain(&mut self) {
             let mut buf = [0u8; 4096];
-            while matches!(self.child.read(&mut buf), Ok(n) if n > 0) {}
+            while let Ok(n) = self.child.read(&mut buf) {
+                if n == 0 {
+                    break;
+                }
+                self.output.extend_from_slice(&buf[..n]);
+            }
         }
 
         /// The shell's children, from procfs.
@@ -419,8 +429,23 @@ mod tests {
         let mut shell = Shell::spawn("background");
         shell.type_line("sleep 30 &");
         assert!(shell.wait_for_a_child(), "the background sleep never started");
-        // The prompt is back and the sleep runs behind it: the terminal is the shell's.
-        std::thread::sleep(Duration::from_millis(200));
+        shell.type_line("printf '\\036background-ready\\037'");
+        let deadline = Instant::now() + Duration::from_secs(60);
+        loop {
+            shell.drain();
+            if shell
+                .output
+                .windows(b"\x1ebackground-ready\x1f".len())
+                .any(|part| part == b"\x1ebackground-ready\x1f")
+            {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the shell never reached the marker after starting its background job"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
         assert!(
             !has_foreground_job(shell.pid()),
             "a job left in the background at a prompt holds no terminal"

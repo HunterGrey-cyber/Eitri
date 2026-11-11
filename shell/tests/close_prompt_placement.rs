@@ -20,8 +20,6 @@
 //! A plain `main` (`harness = false`), because GTK must own the main thread. It used to refuse only a
 //! missing `GDK_BACKEND=x11`, which XWayland's `DISPLAY=:0` on a desktop session satisfies. About 1s.
 
-use std::time::{Duration, Instant};
-
 use gtk4::prelude::*;
 
 // The display this test runs on: its own Xvfb, never an inherited one (2026-09-29).
@@ -53,13 +51,12 @@ const BAR_HEIGHT: i32 = 38;
 /// The `.close-prompt` rule as `theme/gtk_css.rs` writes it, so the label measures what it will.
 const CSS: &str = ".close-prompt { border: 1px solid #888888; border-radius: 4px; padding: 2px 8px; font-size: 12px; }";
 
-fn pump(ms: u64) {
-    let context = gtk4::glib::MainContext::default();
-    let end = Instant::now() + Duration::from_millis(ms);
-    while Instant::now() < end {
-        while context.iteration(false) {}
-        std::thread::sleep(Duration::from_millis(2));
-    }
+#[allow(dead_code)]
+#[path = "support/frame_turns.rs"]
+mod frame_turns;
+
+fn pump() {
+    frame_turns::settle();
 }
 
 /// `(top, bottom)` of the prompt's label in the overlay's coordinates, once it shows and is placed.
@@ -93,7 +90,7 @@ fn prompt_box() -> Result<(f32, f32), String> {
     overlay.set_child(Some(&column));
     window.set_child(Some(&overlay));
     window.present();
-    pump(300);
+    pump();
 
     let prompt = close_prompt::ClosePrompt::install(&overlay, &window, bar.upcast_ref(), strip.upcast_ref());
     // What the chrome's reconcile does for a model whose prompt changed: show, then measure, then place.
@@ -101,7 +98,7 @@ fn prompt_box() -> Result<(f32, f32), String> {
     let at = prompt.measures();
     let (x, y) = eitri_core::wm::close::prompt_origin(at.bar_shown, at.strip_x, at.bar_height, at.label_height.max(0));
     prompt.place(x, y);
-    pump(300);
+    pump();
 
     let label = overlay
         .observe_children()
@@ -122,7 +119,7 @@ fn prompt_box() -> Result<(f32, f32), String> {
     let read = (bounds.y(), bounds.y() + bounds.height());
     window.destroy();
     gtk4::style_context_remove_provider_for_display(&display, &provider);
-    pump(50);
+    pump();
     Ok(read)
 }
 

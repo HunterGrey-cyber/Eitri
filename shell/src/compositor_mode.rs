@@ -44,6 +44,17 @@ impl Liveness {
         exec: Exec,
         within: Duration,
     ) -> Liveness {
+        Self::start_with_clock(wm, env, exists, exec, within, Arc::new(Instant::now))
+    }
+
+    fn start_with_clock(
+        wm: Wm,
+        env: &dyn Fn(&str) -> Option<OsString>,
+        exists: &dyn Fn(&Path) -> bool,
+        exec: Exec,
+        within: Duration,
+        now: Arc<dyn Fn() -> Instant + Send + Sync>,
+    ) -> Liveness {
         let answer = Arc::new(Mutex::new(None));
         let liveness = Liveness {
             answer: answer.clone(),
@@ -53,12 +64,12 @@ impl Liveness {
         let Some(argv) = liveness_argv(wm).filter(|_| socket_present(wm, env, exists)) else {
             return liveness;
         };
-        let began = Instant::now();
+        let began = now();
         let spawned = std::thread::Builder::new()
             .name("compositor-liveness".into())
             .spawn(move || {
                 let reply = exec(argv);
-                if began.elapsed() > within {
+                if now().duration_since(began) > within {
                     println!("[mode] the compositor's reply came after {within:?}; it is not used");
                     return;
                 }
@@ -269,6 +280,17 @@ mod tests {
         })
     }
 
+    fn start_liveness(
+        wm: Wm,
+        env: &dyn Fn(&str) -> Option<OsString>,
+        exists: &dyn Fn(&Path) -> bool,
+        exec: Exec,
+        within: Duration,
+    ) -> Liveness {
+        let now = Instant::now();
+        Liveness::start_with_clock(wm, env, exists, exec, within, Arc::new(move || now))
+    }
+
     #[test]
     fn the_liveness_answer_is_read_without_waiting() {
         let (release, released) = mpsc::channel::<()>();
@@ -282,7 +304,16 @@ mod tests {
         });
         let env = env_of(&[("SWAYSOCK", "/run/user/1000/sway-ipc")]);
         let within = Duration::from_millis(20);
-        let live = Liveness::start_with(Wm::Sway, &env, &|_| true, exec, within);
+        let clock = Arc::new(Mutex::new(Instant::now()));
+        let reading = clock.clone();
+        let live = Liveness::start_with_clock(
+            Wm::Sway,
+            &env,
+            &|_| true,
+            exec,
+            within,
+            Arc::new(move || *reading.lock().unwrap()),
+        );
         // The command is held, so a read that waited for it would never return.
         assert_eq!(live.now(), None);
         let argv = started
@@ -291,7 +322,7 @@ mod tests {
         assert_eq!(argv.join(" "), "swaymsg -t get_version");
         assert_eq!(live.now(), None);
         // The answer comes after the bound: it is thrown away.
-        std::thread::sleep(within * 3);
+        *clock.lock().unwrap() += within * 3;
         release.send(()).unwrap();
         live.finish();
         assert_eq!(live.now(), None, "a reply past the bound counts for nothing");
@@ -307,8 +338,17 @@ mod tests {
         });
         let env = env_of(&[("SWAYSOCK", "/run/user/1000/sway-ipc")]);
         let within = Duration::from_millis(20);
-        let live = Liveness::start_with(Wm::Sway, &env, &|_| true, exec, within);
-        std::thread::sleep(within * 3);
+        let clock = Arc::new(Mutex::new(Instant::now()));
+        let reading = clock.clone();
+        let live = Liveness::start_with_clock(
+            Wm::Sway,
+            &env,
+            &|_| true,
+            exec,
+            within,
+            Arc::new(move || *reading.lock().unwrap()),
+        );
+        *clock.lock().unwrap() += within * 3;
         release.send(()).unwrap();
         live.finish();
         let (tiling, mode, why) = early(Wm::Sway).tiling(false, live.now());
@@ -337,7 +377,7 @@ mod tests {
         let pairs = [("SWAYSOCK", socket.as_str())];
         let env = env_of(&pairs);
         let asked = Arc::default();
-        let live = Liveness::start_with(
+        let live = start_liveness(
             Wm::Sway,
             &env,
             &Path::exists,
@@ -360,7 +400,7 @@ mod tests {
         let pairs = [("NIRI_SOCKET", socket.as_str())];
         let env = env_of(&pairs);
         let asked = Arc::default();
-        let live = Liveness::start_with(
+        let live = start_liveness(
             Wm::Niri,
             &env,
             &Path::exists,
@@ -379,7 +419,7 @@ mod tests {
     #[test]
     fn no_socket_asks_nothing_and_a_dead_one_is_not_live() {
         let asked = Arc::default();
-        let gone = Liveness::start_with(
+        let gone = start_liveness(
             Wm::Sway,
             &env_of(&[("SWAYSOCK", "/run/user/1000/sway-ipc")]),
             &|_| false,
@@ -390,7 +430,7 @@ mod tests {
         assert!(asked.lock().unwrap().is_empty());
         assert_eq!(gone.now(), None);
         // A desktop with nothing to ask is never asked.
-        let gnome = Liveness::start_with(
+        let gnome = start_liveness(
             Wm::Gnome,
             &env_of(&[]),
             &|_| true,
@@ -401,7 +441,7 @@ mod tests {
         assert!(asked.lock().unwrap().is_empty());
         // A reply that is no version, or a command that fails, says not live.
         let socket = env_of(&[("SWAYSOCK", "/s")]);
-        let wrong = Liveness::start_with(
+        let wrong = start_liveness(
             Wm::Sway,
             &socket,
             &|_| true,
@@ -411,7 +451,7 @@ mod tests {
         wrong.finish();
         assert_eq!(wrong.now(), Some(false));
         let failing: Exec = Arc::new(|_| Err("no such program".into()));
-        let failed = Liveness::start_with(Wm::Sway, &socket, &|_| true, failing, LIVENESS_WITHIN);
+        let failed = start_liveness(Wm::Sway, &socket, &|_| true, failing, LIVENESS_WITHIN);
         failed.finish();
         assert_eq!(failed.now(), Some(false));
         assert_eq!(
@@ -439,7 +479,7 @@ mod tests {
         let socket = socket.to_string_lossy().into_owned();
         let pairs = [("SWAYSOCK", socket.as_str())];
         let env = env_of(&pairs);
-        let live = Liveness::start_with(
+        let live = start_liveness(
             Wm::Sway,
             &env,
             &Path::exists,

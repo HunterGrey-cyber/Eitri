@@ -1,6 +1,10 @@
 //! Resuming a Codex thread by pages, the policy echo and the trust tripwires, against the scripted
 //! stand-in for `codex app-server` (`eitri-agent-standin`). No real Codex runs and no model turn is spent.
 
+#[path = "support/script_gate.rs"]
+mod script_gate;
+use script_gate::until;
+
 use agent::providers::codex::config::expected_echo;
 use agent::providers::codex::tripwire::{check_echo, check_instruction_sources, TrustWatch};
 use agent::providers::codex::wire::ThreadEcho;
@@ -415,7 +419,7 @@ fn a_turn_after_an_unread_tripwire_is_refused() {
         }}))],
     );
     // The notification is in, not yet pumped.
-    std::thread::sleep(std::time::Duration::from_millis(300));
+    until(|| provider.lines_read_for_tests() >= 4);
     let started = std::time::Instant::now();
     let sent = provider.send_turn_with(
         SendTurnRequest {
@@ -827,15 +831,16 @@ fn a_resume_that_continues_another_thread_is_not_taken() {
     script.push(expect_request(3, "thread/resume"));
     script.push(thread_answer(3, "th-other", json!({})));
     let provider = connect(script);
-    let started = std::time::Instant::now();
+    let requests = provider.requests_for_tests();
     let id = provider
         .start(request(Some("th-old"), &[]))
         .expect("a verdict, not a failure to start");
-    assert!(
-        started.elapsed() < std::time::Duration::from_secs(5),
-        "the other thread's history was asked for"
-    );
     assert_eq!(id, "th-old");
+    assert_eq!(
+        provider.requests_for_tests(),
+        requests + 1,
+        "only resume is requested; no foreign history request"
+    );
     let events = provider.pump();
     assert!(
         events.iter().any(|e| matches!(
@@ -903,7 +908,7 @@ fn a_tripwire_behind_a_flood_still_stops_the_next_turn() {
         .start(request(Some("th-old"), &[]))
         .expect("the resume completes");
     let _ = std::fs::remove_file(&file);
-    std::thread::sleep(Duration::from_millis(300));
+
     let sent = provider.send_turn_with(
         SendTurnRequest {
             session_id: "th-old".into(),
@@ -950,16 +955,10 @@ fn a_flood_while_the_history_is_read_stops_it_and_keeps_the_live_messages() {
     std::fs::write(&file, Value::Array(script).to_string()).expect("the script file");
     let provider = CodexProvider::connect_with_args(launch(), vec![OsString::from(format!("@{}", file.display()))])
         .expect("the handshake passes");
-    let started = Instant::now();
     provider
         .start(request(Some("th-old"), &[]))
         .expect("the resume completes");
     let _ = std::fs::remove_file(&file);
-    assert!(
-        started.elapsed() < Duration::from_secs(5),
-        "the start waited out a page: {:?}",
-        started.elapsed()
-    );
     let history = provider.take_history();
     let note = history
         .iter()

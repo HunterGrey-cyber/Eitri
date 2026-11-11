@@ -756,6 +756,17 @@ pub fn relink_at_start(
     }
 }
 
+#[cfg(test)]
+static TEST_WAITS: std::sync::OnceLock<std::sync::Mutex<BTreeMap<PathBuf, mpsc::Sender<&'static str>>>> =
+    std::sync::OnceLock::new();
+
+#[cfg(test)]
+fn observed_wait(path: &Path, how: &'static str) {
+    if let Some(send) = TEST_WAITS.get_or_init(Default::default).lock().unwrap().get(path) {
+        let _ = send.send(how);
+    }
+}
+
 fn relink_on(
     path: &Path,
     lock_file: &Path,
@@ -765,9 +776,13 @@ fn relink_on(
     waiting: &Waiting,
 ) -> Result<Relinked, String> {
     let who = waiting.who();
-    let conn = connect_to(path).map_err(|e| match e.raw_os_error() {
-        Some(libc::ENOENT) | Some(libc::ECONNREFUSED) => NO_ORPHAN_TEXT.to_string(),
-        _ => format!("{} could not be reached ({e})", path.display()),
+    let conn = connect_to(path).map_err(|e| {
+        #[cfg(test)]
+        observed_wait(path, "connect_failed");
+        match e.raw_os_error() {
+            Some(libc::ENOENT) | Some(libc::ECONNREFUSED) => NO_ORPHAN_TEXT.to_string(),
+            _ => format!("{} could not be reached ({e})", path.display()),
+        }
     })?;
     let (pid, uid) = fdpass::peer_cred(conn.as_fd()).map_err(|e| format!("the listener names no peer ({e})"))?;
     if uid != euid() {
@@ -784,7 +799,17 @@ fn relink_on(
         .send(hello_as_window_1(build, me, my_start), Vec::new())
         .map_err(|e| format!("hello could not be sent ({e})"))?;
     let left = || deadline.saturating_duration_since(Instant::now());
-    let (window, running, holders, fds) = match inbound.recv_timeout(left()) {
+    let answer = inbound.recv_timeout(left());
+    #[cfg(test)]
+    observed_wait(
+        path,
+        match &answer {
+            Ok(_) => "ready",
+            Err(RecvTimeoutError::Timeout) => "deadline",
+            Err(RecvTimeoutError::Disconnected) => "disconnected",
+        },
+    );
+    let (window, running, holders, fds) = match answer {
         Ok(Inbound::Msg {
             msg:
                 Msg::Welcome {

@@ -10,7 +10,6 @@ use agent::{
 use claude_runtime_protocol::v1::CreateSessionRequest as ProtoCreateSessionRequest;
 use prost::Message;
 
-use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -114,8 +113,7 @@ fn grpc_fresh_resume_and_adopt_preserve_the_prompt_choice() {
             quote(&record),
             if offered { "" } else { "--without-system-prompt-preset" }
         );
-        agent::private_fs::write_private(&launcher, script.as_bytes()).unwrap();
-        std::fs::set_permissions(&launcher, std::fs::Permissions::from_mode(0o700)).unwrap();
+        script_fixture::write_executable_script(&launcher, script.as_bytes(), 0o700).unwrap();
         let source = ClaudeSidecarProvider::connect_to_program(&uuid::Uuid::new_v4().to_string(), &launcher).unwrap();
         assert!(source.capabilities().resume, "the peer must offer resume_session");
         assert_diagnostic(&source, offered);
@@ -168,4 +166,9 @@ fn grpc_fresh_resume_and_adopt_preserve_the_prompt_choice() {
         close_and_await_watch(&destination, session);
         drop(destination);
     }
+}
+
+#[cfg(test)]
+mod script_fixture {
+    include!(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/support/executable.rs"));
 }

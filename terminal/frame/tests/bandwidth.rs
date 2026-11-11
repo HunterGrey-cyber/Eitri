@@ -92,16 +92,20 @@ fn sane(measurement: &Measurement) {
 // ===========================================================================
 
 fn typing_script() -> Vec<Step> {
-    let mut script = vec![Step::Wait(Duration::from_millis(600))];
+    let mut script = vec![Step::Text("verdandi$".into())];
     // 40 keystrokes at ~60 ms, i.e. a fast human typing a command, then Enter.
     const KEYS: &[&[u8]] = &[
         b"e", b"c", b"h", b"o", b" ", b"t", b"h", b"e", b" ", b"q", b"u", b"i", b"c", b"k", b" ", b"b", b"r", b"o",
         b"w", b"n", b" ", b"f", b"o", b"x", b" ", b"j", b"u", b"m", b"p", b"s", b" ", b"o", b"v", b"e", b"r", b" ",
         b"i", b"t", b"\r",
     ];
+    let mut prefix = String::new();
     for key in KEYS {
         script.push(Step::Send(key));
-        script.push(Step::Wait(Duration::from_millis(60)));
+        if *key != b"\r" {
+            prefix.push_str(std::str::from_utf8(key).unwrap());
+            script.push(Step::Text(format!("verdandi$ {prefix}")));
+        }
     }
     script.push(Step::Wait(Duration::from_millis(400)));
     script
@@ -158,6 +162,7 @@ fn command_script() -> Vec<Step> {
         script.push(Step::Send(command));
         script.push(Step::Wait(Duration::from_millis(250)));
     }
+    script.push(Step::Text("last".into()));
     script
 }
 
@@ -196,30 +201,21 @@ fn workload_a2_shell_running_commands_is_dominated_by_full_frames() {
 fn workload_b_redraw_heavy_tui_nvim() {
     let mut env = base_env();
     env.push(("NVIM_APPNAME", "terminal-frame-bandwidth"));
-    // Generate a file to scroll, then scroll it hard.
-    let mut script = vec![Step::Wait(Duration::from_millis(1200))];
-    // 400 lines of content.
-    script.push(Step::Send(b"i"));
-    script.push(Step::Wait(Duration::from_millis(200)));
+    let mut script = vec![Step::Text("~".into()), Step::Fence, Step::Send(b"i")];
     for _ in 0..40 {
         script.push(Step::Send(
             b"the quick brown fox jumps over the lazy dog 0123456789 abcdefghij\r",
         ));
-        script.push(Step::Wait(Duration::from_millis(30)));
+        script.push(Step::Fence);
     }
-    script.push(Step::Send(b"\x1b"));
-    script.push(Step::Wait(Duration::from_millis(200)));
-    script.push(Step::Send(b"yy200p"));
-    script.push(Step::Wait(Duration::from_millis(1500)));
-    script.push(Step::Send(b"gg"));
-    script.push(Step::Wait(Duration::from_millis(300)));
-    // Page down repeatedly: whole-screen redraws, which is the point.
-    for _ in 0..60 {
-        script.push(Step::Send(b"\x06")); // Ctrl-F
-        script.push(Step::Wait(Duration::from_millis(40)));
+    script.push(Step::Send(b"\x1b[27u"));
+    script.push(Step::Fence);
+    script.push(Step::Send(b"yy200pgg"));
+    script.push(Step::Fence);
+    for _ in 0..100 {
+        script.push(Step::Send(b"\x06"));
+        script.push(Step::Fence);
     }
-    script.push(Step::Wait(Duration::from_millis(400)));
-
     let measurement = measure(
         "(b) nvim: page-down burst",
         "nvim",
@@ -252,12 +248,14 @@ fn workload_b_redraw_heavy_tui_spinner() {
     // the sync-update count is non-zero and the "frames per read vs frames per
     // update" difference is visible.
     const SCRIPT: &str = r#"
+stty -echo
 printf '\033[2J\033[H'
 i=0
 while [ $i -lt 400 ]; do
   i=$((i+1))
   printf '\033[?2026h\033[5;10Hframe %04d  \033[6;10H[%s]\033[?2026l' "$i" "$(printf '#%.0s' $(seq 1 $((i % 40))))"
-  sleep 0.01
+  printf '\033]2;spin-%s\007' "$i"
+  read ack
 done
 "#;
     let measurement = measure(
@@ -266,7 +264,10 @@ done
         &["-c", SCRIPT],
         &base_env(),
         SIZE,
-        &[Step::Wait(Duration::from_secs(9))],
+        &(1..=400)
+            .flat_map(|n| [Step::Title(format!("spin-{n}")), Step::Send(b"go\n")])
+            .chain([Step::Exit])
+            .collect::<Vec<_>>(),
         Duration::from_millis(200),
     )
     .expect("spawn sh");
@@ -318,7 +319,7 @@ fn workload_c_scrolling_burst() {
         &["-c", "seq 1 20000"],
         &base_env(),
         SIZE,
-        &[Step::Wait(Duration::from_secs(6))],
+        &[Step::Exit],
         Duration::from_millis(300),
     )
     .expect("spawn sh");
@@ -342,123 +343,12 @@ fn workload_c_scrolling_burst() {
 #[test]
 #[ignore = "runs every workload; this is the one that produces the README table"]
 fn all_workloads() {
-    let mut out = Vec::new();
-
-    let mut env = base_env();
-    env.push(("PS1", "verdandi$ "));
-    out.push(
-        measure(
-            "(a) shell: idle typing",
-            "bash",
-            &["--norc", "--noprofile", "-i"],
-            &env,
-            SIZE,
-            &typing_script(),
-            Duration::from_millis(300),
-        )
-        .expect("bash"),
-    );
-
-    out.push(
-        measure(
-            "(a2) shell: commands",
-            "bash",
-            &["--norc", "--noprofile", "-i"],
-            &env,
-            SIZE,
-            &command_script(),
-            Duration::from_millis(300),
-        )
-        .expect("bash"),
-    );
-
-    const SPINNER: &str = r#"
-printf '\033[2J\033[H'
-i=0
-while [ $i -lt 400 ]; do
-  i=$((i+1))
-  printf '\033[?2026h\033[5;10Hframe %04d  \033[6;10H[%s]\033[?2026l' "$i" "$(printf '#%.0s' $(seq 1 $((i % 40))))"
-  sleep 0.01
-done
-"#;
-    out.push(
-        measure(
-            "(b) spinner: small deltas",
-            "sh",
-            &["-c", SPINNER],
-            &base_env(),
-            SIZE,
-            &[Step::Wait(Duration::from_secs(9))],
-            Duration::from_millis(200),
-        )
-        .expect("sh"),
-    );
-
-    let mut nvim_env = base_env();
-    nvim_env.push(("NVIM_APPNAME", "terminal-frame-bandwidth"));
-    let mut nvim_script = vec![Step::Wait(Duration::from_millis(1200)), Step::Send(b"i")];
-    nvim_script.push(Step::Wait(Duration::from_millis(200)));
-    for _ in 0..40 {
-        nvim_script.push(Step::Send(
-            b"the quick brown fox jumps over the lazy dog 0123456789 abcdefghij\r",
-        ));
-        nvim_script.push(Step::Wait(Duration::from_millis(30)));
-    }
-    nvim_script.push(Step::Send(b"\x1b"));
-    nvim_script.push(Step::Wait(Duration::from_millis(200)));
-    nvim_script.push(Step::Send(b"yy200p"));
-    nvim_script.push(Step::Wait(Duration::from_millis(1500)));
-    nvim_script.push(Step::Send(b"gg"));
-    nvim_script.push(Step::Wait(Duration::from_millis(300)));
-    for _ in 0..60 {
-        nvim_script.push(Step::Send(b"\x06"));
-        nvim_script.push(Step::Wait(Duration::from_millis(40)));
-    }
-    out.push(
-        measure(
-            "(b) nvim: page-down burst",
-            "nvim",
-            &["--clean", "-n", "-i", "NONE"],
-            &nvim_env,
-            SIZE,
-            &nvim_script,
-            Duration::from_millis(500),
-        )
-        .expect("nvim"),
-    );
-
-    let mut claude_env = base_env();
-    claude_env.push(("PATH", "/home/user/.local/bin:/usr/bin:/bin:/usr/local/bin"));
-    out.push(
-        measure(
-            "(b) claude: TUI idling",
-            "claude",
-            &[],
-            &claude_env,
-            SIZE,
-            &[Step::Wait(Duration::from_secs(12))],
-            Duration::from_millis(500),
-        )
-        .expect("claude"),
-    );
-
-    out.push(
-        measure(
-            "(c) seq 1 20000",
-            "sh",
-            &["-c", "seq 1 20000"],
-            &base_env(),
-            SIZE,
-            &[Step::Wait(Duration::from_secs(6))],
-            Duration::from_millis(300),
-        )
-        .expect("seq"),
-    );
-
-    report(&out);
-    for measurement in &out {
-        sane(measurement);
-    }
+    workload_a_idle_typing_at_a_shell_prompt();
+    workload_a2_shell_running_commands_is_dominated_by_full_frames();
+    workload_b_redraw_heavy_tui_nvim();
+    workload_b_redraw_heavy_tui_spinner();
+    workload_b_redraw_heavy_tui_claude_code();
+    workload_c_scrolling_burst();
 }
 
 // ===========================================================================
@@ -489,10 +379,10 @@ fn the_meter_actually_meters() {
     let measurement = measure(
         "sentinel",
         "sh",
-        &["-c", "printf 'hello from a real pty\\n'; sleep 0.2"],
+        &["-c", "printf 'hello from a real pty\\n'"],
         &base_env(),
         Size { cols: 40, rows: 6 },
-        &[Step::Wait(Duration::from_millis(600))],
+        &[Step::Exit],
         Duration::from_millis(100),
     )
     .expect("spawn sh");

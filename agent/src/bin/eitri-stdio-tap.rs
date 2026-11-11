@@ -31,7 +31,7 @@ use std::{
         mpsc, Arc, Mutex, PoisonError,
     },
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 /// How long the stdout pump may sit idle after the child exits before the tap stops waiting for it.
@@ -228,6 +228,23 @@ impl Counter {
 struct Activity {
     writing: AtomicBool,
     forwarded: AtomicUsize,
+    write_gate: Option<std::path::PathBuf>,
+}
+
+fn wait_for_gate(path: &Path) {
+    wait_for_gate_with_pause(path, thread::sleep);
+}
+
+fn wait_for_gate_with_pause(path: &Path, mut pause: impl FnMut(Duration)) {
+    let end = Instant::now() + Duration::from_secs(60);
+    for _ in 0..12_000 {
+        if path.exists() {
+            return;
+        }
+        assert!(Instant::now() < end, "tap gate was never released: {}", path.display());
+        pause(Duration::from_millis(5));
+    }
+    panic!("tap gate exhausted its polling budget: {}", path.display());
 }
 
 /// Copies `from` to `to` unchanged and logs each line (and a final unterminated one) with the shared index.
@@ -252,6 +269,10 @@ fn pump(mut from: impl Read, mut to: impl Write, mut log: File, counter: &Counte
         }
         if sink_open {
             activity.writing.store(true, Ordering::SeqCst);
+            if let Some(gate) = &activity.write_gate {
+                fs::write(gate.with_extension("writing"), b"").unwrap();
+                wait_for_gate(&gate.with_extension("write"));
+            }
             if to.write_all(&buf[..n]).and_then(|_| to.flush()).is_err() {
                 sink_open = false;
             }
@@ -329,7 +350,11 @@ fn main() {
     thread::spawn(move || pump(io::stdin(), child_stdin, stdin_log, &c, &stdin_activity));
     let (done_tx, done_rx) = mpsc::channel();
     let c = counter.clone();
-    let out_activity = Arc::new(Activity::default());
+    let gate = std::env::var_os("EITRI_TAP_DRAIN_GATE").map(std::path::PathBuf::from);
+    let out_activity = Arc::new(Activity {
+        write_gate: gate.clone(),
+        ..Activity::default()
+    });
     let a = out_activity.clone();
     thread::spawn(move || {
         pump(child_stdout, io::stdout(), stdout_log, &c, &a);
@@ -346,14 +371,91 @@ fn main() {
     // A grandchild that kept the stdout pipe open must not hold the tap past the child's exit, but a
     // consumer that is merely slow to take the last output must not lose it: the wait ends only when
     // the pump is idle in a read that delivered nothing for the whole period.
+    let mut waits = 0;
+    drain_output(&out_activity, || {
+        waits += 1;
+        if let Some(gate) = &gate {
+            if waits == 1 {
+                wait_for_gate(&gate.with_extension("writing"));
+                return Err(mpsc::RecvTimeoutError::Timeout);
+            }
+            fs::write(gate.with_extension("continued"), b"").unwrap();
+            wait_for_gate(&gate.with_extension("drain"));
+        }
+        done_rx.recv_timeout(DRAIN_IDLE)
+    });
+    if let Some(gate) = &gate {
+        fs::write(gate.with_extension("finished"), b"").unwrap();
+    }
+    process::exit(exit_code(status));
+}
+
+fn drain_output(activity: &Activity, mut wait: impl FnMut() -> Result<(), mpsc::RecvTimeoutError>) {
     loop {
-        let before = out_activity.forwarded.load(Ordering::SeqCst);
-        match done_rx.recv_timeout(DRAIN_IDLE) {
+        let before = activity.forwarded.load(Ordering::SeqCst);
+        match wait() {
             Err(mpsc::RecvTimeoutError::Timeout)
-                if out_activity.writing.load(Ordering::SeqCst)
-                    || out_activity.forwarded.load(Ordering::SeqCst) != before => {}
+                if activity.writing.load(Ordering::SeqCst) || activity.forwarded.load(Ordering::SeqCst) != before => {}
             _ => break,
         }
     }
-    process::exit(exit_code(status));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn an_unreleased_gate_pauses_before_checking_again() {
+        let gate = agent::state_dirs::test_workspace_dir("tap-gate").join("release");
+        let mut pauses = 0;
+        wait_for_gate_with_pause(&gate, |duration| {
+            assert_eq!(duration, Duration::from_millis(5));
+            pauses += 1;
+            assert_eq!(pauses, 1);
+            fs::write(&gate, b"").unwrap();
+        });
+        assert_eq!(
+            pauses, 1,
+            "the gate cannot finish before its pause callback releases it"
+        );
+    }
+
+    #[test]
+    fn a_timeout_keeps_output_that_is_still_being_written_or_forwarded() {
+        for writing in [false, true] {
+            let activity = Activity::default();
+            activity.writing.store(writing, Ordering::SeqCst);
+            let mut calls = 0;
+            drain_output(&activity, || {
+                calls += 1;
+                if calls == 1 {
+                    if !writing {
+                        activity.forwarded.fetch_add(16, Ordering::SeqCst);
+                    }
+                    Err(mpsc::RecvTimeoutError::Timeout)
+                } else {
+                    Ok(())
+                }
+            });
+            assert_eq!(calls, 2, "a timeout while output moves must wait again");
+        }
+    }
+
+    #[test]
+    fn an_idle_timeout_or_a_finished_pump_ends_the_drain() {
+        for result in [
+            Ok(()),
+            Err(mpsc::RecvTimeoutError::Timeout),
+            Err(mpsc::RecvTimeoutError::Disconnected),
+        ] {
+            let mut calls = 0;
+            drain_output(&Activity::default(), || {
+                calls += 1;
+                assert_eq!(calls, 1);
+                result
+            });
+            assert_eq!(calls, 1);
+        }
+    }
 }

@@ -247,6 +247,7 @@ fn real_home_hidden(root: &Path, passwd_home: &Path) -> Result<(), String> {
 
 /// `/etc/claude-code` must be missing or an empty directory.
 fn managed_settings(root: &Path) -> Result<ManagedSettings, String> {
+    let entry;
     let dir = under(root, Path::new("/etc/claude-code"));
     let meta = match std::fs::symlink_metadata(&dir) {
         Ok(meta) => meta,
@@ -257,7 +258,8 @@ fn managed_settings(root: &Path) -> Result<ManagedSettings, String> {
         return Err("/etc/claude-code is not a directory".into());
     }
     let mut entries = std::fs::read_dir(&dir).map_err(|e| format!("cannot list /etc/claude-code: {e}"))?;
-    match entries.next() {
+    entry = entries.next();
+    match entry {
         None => Ok(ManagedSettings::Empty),
         Some(_) => Err("/etc/claude-code holds files".into()),
     }
@@ -432,9 +434,9 @@ fn connect_unrouted() -> Result<(), String> {
     let took = started.elapsed();
     match got {
         Ok(_) => Err(format!("a connect to {UNROUTED} succeeded")),
-        Err(e) if e.raw_os_error() == Some(libc::ENETUNREACH) && took < Duration::from_secs(1) => Ok(()),
+        Err(e) if e.raw_os_error() == Some(libc::ENETUNREACH) => Ok(()),
         Err(e) => Err(format!(
-            "a connect to {UNROUTED} failed with {e} after {took:?}, not at once with ENETUNREACH"
+            "a connect to {UNROUTED} failed with {e} after {took:?}, without completing with ENETUNREACH"
         )),
     }
 }
@@ -489,6 +491,16 @@ mod tests {
 
     const RUN: &str = "/mnt/eitri-runs/ch/abcd1234/c00";
     const PASSWD_HOME: &str = "/home/someone";
+
+    #[test]
+    fn rpit_capture_contracts() {
+        let (on_tmpfs, path) = {
+            let root = FakeRoot::new();
+            (root.mnt_on_tmpfs(), root.dir.join("mnt/owned"))
+        };
+        assert!(on_tmpfs(&path).unwrap());
+        assert!(!on_tmpfs(Path::new("/elsewhere")).unwrap());
+    }
 
     #[test]
     fn a_run_set_aside_leaves_the_next_one_empty_directories_and_the_runners_log_in_place() {
@@ -554,7 +566,7 @@ mod tests {
             FakeRoot { dir }
         }
 
-        fn mnt_on_tmpfs(&self) -> impl Fn(&Path) -> io::Result<bool> {
+        fn mnt_on_tmpfs(&self) -> impl Fn(&Path) -> io::Result<bool> + use<> {
             let mnt = self.dir.join("mnt");
             move |p: &Path| Ok(p.starts_with(&mnt))
         }

@@ -1326,41 +1326,53 @@ mod tests {
 
     #[test]
     fn the_deadline_is_the_answer_plus_five_seconds_less_the_margin() {
+        let _clock = crate::editor_tools::testing::clock::Clock::new();
         let world = World::local(PermissionMode::Manual);
         let mut broker = Broker::new();
         world.submit(&mut broker, "a", &lua("return 1"));
-        broker.tick(&world, Instant::now());
+        broker.tick(&world, crate::editor_tools::stamp::monotonic_now());
         let card = world.cards(&broker)[0].id.clone();
 
         let before = wall_ms();
         broker
-            .answer_card(TAB_ID, &card, CardDecision::Allow, CardOrigin::Key, Instant::now())
+            .answer_card(
+                TAB_ID,
+                &card,
+                CardDecision::Allow,
+                CardOrigin::Key,
+                crate::editor_tools::stamp::monotonic_now(),
+            )
             .unwrap();
         let after = wall_ms();
-        std::thread::sleep(Duration::from_secs(3));
-        broker.tick(&world, Instant::now());
+        crate::editor_tools::testing::clock::advance(Duration::from_secs(3));
+        broker.tick(&world, crate::editor_tools::stamp::monotonic_now());
 
-        // Wide enough for a slow machine, and far under the 3 s a count from the admission would add.
-        let slack = 1_000;
         let stamped = (APPROVAL_WINDOW - STAMP_MARGIN).as_millis() as u64;
         let deadline = deadline_of(&world);
-        assert!(deadline + slack >= before + stamped, "{deadline} {before}");
-        assert!(deadline <= after + stamped + slack, "{deadline} {after}");
+        assert_eq!(before, after);
+        assert_eq!(deadline, before + stamped);
     }
 
     #[test]
     fn an_approval_with_little_left_sends_nothing() {
+        let _clock = crate::editor_tools::testing::clock::Clock::new();
         let world = World::local(PermissionMode::Manual);
         let mut broker = Broker::new();
         world.submit(&mut broker, "a", &lua("return 1"));
-        broker.tick(&world, Instant::now());
+        broker.tick(&world, crate::editor_tools::stamp::monotonic_now());
         let card = world.cards(&broker)[0].id.clone();
 
         broker
-            .answer_card(TAB_ID, &card, CardDecision::Allow, CardOrigin::Key, Instant::now())
+            .answer_card(
+                TAB_ID,
+                &card,
+                CardDecision::Allow,
+                CardOrigin::Key,
+                crate::editor_tools::stamp::monotonic_now(),
+            )
             .unwrap();
-        std::thread::sleep(APPROVAL_WINDOW - STAMP_MARGIN + Duration::from_millis(50));
-        let out = broker.tick(&world, Instant::now());
+        crate::editor_tools::testing::clock::advance(APPROVAL_WINDOW - STAMP_MARGIN + Duration::from_millis(50));
+        let out = broker.tick(&world, crate::editor_tools::stamp::monotonic_now());
 
         assert_eq!(only_answer(&out).text, NOT_ANSWERED);
         assert!(world.rpc.0.borrow().is_empty(), "nothing was sent");
@@ -1992,11 +2004,8 @@ mod tests {
     #[ignore = "needs nvim on PATH"]
     fn a_chunk_past_its_deadline_runs_nothing() {
         let mut nvim = Nvim::start("deadline");
-        // `vim.uv.sleep` holds the main loop, and what is scheduled here runs ahead of the next request. A
-        // `getchar()` would hold nothing: nvim answers requests while one waits.
-        nvim.embed.lua("vim.schedule(function() vim.uv.sleep(800) end)", vec![]);
         let stamp = Stamp {
-            deadline_ms: wall_ms() + 200,
+            deadline_ms: wall_ms() - 1_000,
             scope: "exec".to_owned(),
             seq: 1,
         };

@@ -7,7 +7,7 @@
 //! pin field names by substring, and only running nvim checks the values (`keytrans`'d leader and
 //! lhs, a callback's `desc`, a string rhs) and the "send only a difference" rule.
 //!
-//! `-c` commands run before `VimEnter` (nvim `:help startup`), and `:sleep` lets timers fire, so the
+//! `-c` commands run before `VimEnter`; manual timer advancement dispatches each debounce, so the
 //! test drives `FocusLost` by hand. Lines are counted off a raw listener, not the newest-wins
 //! reader, so "nothing re-sent" is observable.
 //!
@@ -46,6 +46,7 @@ fn a_real_nvim_reports_its_leader_and_buffer_maps_and_only_on_change() {
     let listener = feed.take_listener().unwrap();
     let mut command = std::process::Command::new("nvim");
     command.args(["--clean", "--headless"]);
+    command.args(["--cmd", &format!("lua {}", include_str!("support/manual_timers.lua"))]);
     for arg in feed.nvim_args() {
         command.arg(arg);
     }
@@ -58,16 +59,23 @@ fn a_real_nvim_reports_its_leader_and_buffer_maps_and_only_on_change() {
             "-c",
             "lua vim.keymap.set('n', '<leader>bd', function() end, { desc = 'Delete Buffer' })",
         ])
-        .args(["-c", "doautocmd FocusLost", "-c", "sleep 400m"])
+        .args(["-c", "doautocmd FocusLost", "-c", "lua test_timers.advance(400)"])
         .args([
             "-c",
             "nnoremap H :bnext<CR>",
             "-c",
             "doautocmd FocusLost",
             "-c",
-            "sleep 400m",
+            "lua test_timers.advance(400)",
         ])
-        .args(["-c", "doautocmd FocusLost", "-c", "sleep 400m", "-c", "qa!"])
+        .args([
+            "-c",
+            "doautocmd FocusLost",
+            "-c",
+            "lua test_timers.advance(400)",
+            "-c",
+            "qa!",
+        ])
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())

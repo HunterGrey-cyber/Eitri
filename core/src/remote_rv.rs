@@ -26,6 +26,7 @@ use agent::private_fs::{remove_if_same, FileIdentity};
 use serde::{Deserialize, Serialize};
 use std::ffi::OsString;
 use std::io::{self, Read, Write};
+use std::net::Shutdown;
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::MetadataExt;
 use std::os::unix::net::{UnixListener, UnixStream};
@@ -853,6 +854,21 @@ pub struct RvClient {
     scanned: usize,
 }
 
+/// Shuts both directions of an rv connection, at either end, freeing a writer held in a write the peer never reads.
+/// macOS refuses `SHUT_RDWR` with ENOTCONN once the peer has shut its own writing side, and then shuts nothing, so
+/// there the writing side is shut first, alone, which macOS always does, and then the reading side.
+pub fn shut_both_ways(stream: &UnixStream) {
+    #[cfg(target_os = "macos")]
+    {
+        let _ = stream.shutdown(Shutdown::Write);
+        let _ = stream.shutdown(Shutdown::Read);
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = stream.shutdown(Shutdown::Both);
+    }
+}
+
 impl RvClient {
     /// Connects to the socket at `path`, waiting at most two seconds for the server to accept, and checks that it
     /// is served by this user before anything is written.
@@ -873,7 +889,7 @@ impl RvClient {
     }
 
     /// A second handle on the same connection, for a thread that writes lines while another receives; shutting it
-    /// down ends a [`recv`](Self::recv) waiting on the other.
+    /// down with [`shut_both_ways`] ends a [`recv`](Self::recv) waiting on the other and any blocked write.
     pub fn writer(&self) -> io::Result<UnixStream> {
         self.stream.try_clone()
     }
@@ -975,16 +991,76 @@ mod tests {
     use super::*;
 
     #[test]
+    fn shut_both_ways_shuts_both_directions() {
+        let (mut stream, mut peer) = UnixStream::pair().unwrap();
+        let patience = Some(Duration::from_secs(60));
+        stream.set_read_timeout(patience).unwrap();
+        peer.set_read_timeout(patience).unwrap();
+        shut_both_ways(&stream);
+        let mut byte = [0];
+        assert_eq!(stream.read(&mut byte).unwrap(), 0);
+        assert_eq!(peer.read(&mut byte).unwrap(), 0);
+        assert!(stream.write_all(b"x").is_err());
+        assert!(peer.write_all(b"x").is_err());
+    }
+
+    #[test]
+    fn shut_both_ways_releases_a_blocked_writer_after_the_peer_half_closes() {
+        use std::sync::mpsc::{self, RecvTimeoutError};
+
+        let (stream, peer) = UnixStream::pair().unwrap();
+        peer.shutdown(Shutdown::Write).unwrap();
+        let mut writer = stream.try_clone().unwrap();
+        let (full_tx, full_rx) = mpsc::channel();
+        let (done_tx, done_rx) = mpsc::channel();
+        let writing = std::thread::spawn(move || {
+            writer.set_nonblocking(true).unwrap();
+            let bytes = [0u8; 64 * 1024];
+            let mut sent = 0;
+            loop {
+                match writer.write(&bytes) {
+                    Ok(0) => panic!("the open peer stopped accepting bytes"),
+                    Ok(n) => sent += n,
+                    Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
+                    Err(e) => panic!("could not fill the socket buffer: {e}"),
+                }
+            }
+            writer.set_nonblocking(false).unwrap();
+            full_tx.send(sent).unwrap();
+            done_tx.send(writer.write_all(&bytes)).unwrap();
+        });
+        let patience = Duration::from_secs(60);
+        assert!(full_rx.recv_timeout(patience).unwrap() > 0);
+        // The peer never reads: the full buffer must keep the blocking write pending until shutdown.
+        assert!(matches!(
+            done_rx.recv_timeout(Duration::from_millis(50)),
+            Err(RecvTimeoutError::Timeout)
+        ));
+        shut_both_ways(&stream);
+        assert!(done_rx
+            .recv_timeout(patience)
+            .expect("shutdown left the writer held")
+            .is_err());
+        writing.join().unwrap();
+    }
+
+    #[test]
     fn read_when_ready_returns_within_its_wait_on_an_open_quiet_socket() {
         let (a, _b) = UnixStream::pair().unwrap();
-        let mut chunk = [0u8; 16];
-        let started = Instant::now();
+        let (done, answer) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut chunk = [0u8; 16];
+            done.send(read_when_ready(&a, &mut chunk, Duration::from_millis(30)))
+                .unwrap();
+        });
         assert_eq!(
-            read_when_ready(&a, &mut chunk, Duration::from_millis(30)).unwrap(),
+            answer
+                .recv_timeout(Duration::from_secs(60))
+                .expect("quiet poll returns")
+                .unwrap(),
             None
         );
-        // Generous: only "it came back" matters, not how fast.
-        assert!(started.elapsed() < Duration::from_secs(5));
     }
 
     #[test]

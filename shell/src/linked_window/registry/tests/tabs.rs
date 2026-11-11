@@ -78,7 +78,10 @@ fn a_respawned_chat_window_gets_its_tabs_again() {
     let (_, their, _fds) = group.link(&c(2));
     let link = group.pair.module_link(&c(2)).unwrap();
     assert_eq!(
-        given_within(&their, Duration::from_millis(100)),
+        before_marker(&link, &their.inbound, |msg| match msg {
+            Msg::TabsGiven { tabs, adopt } => Some((tabs, adopt)),
+            _ => None,
+        }),
         None,
         "a window nothing is kept for is given nothing"
     );
@@ -139,7 +142,14 @@ fn a_clean_close_of_a_linked_window_takes_its_tabs_out_of_the_file() {
     assert!(pump_until(&first, || sessions_on_disk(&group) == ["s-1"]));
     let (_, again, _fds) = group.link(&c(2));
     assert_eq!(
-        given_within(&again, Duration::from_millis(100)),
+        before_marker(
+            &group.pair.module_link(&c(2)).unwrap(),
+            &again.inbound,
+            |msg| match msg {
+                Msg::TabsGiven { tabs, adopt } => Some((tabs, adopt)),
+                _ => None,
+            }
+        ),
         None,
         "tabs the user closed are not reopened"
     );
@@ -218,7 +228,17 @@ fn a_window_reopened_inside_its_burst_starts_empty() {
     two.handle.close("window c2 closed");
     assert!(pump_until(&second, || second.ended().is_some()));
     let (_, again, _fds) = group.link(&c(2));
-    assert_eq!(given_within(&again, Duration::from_millis(100)), None);
+    assert_eq!(
+        before_marker(
+            &group.pair.module_link(&c(2)).unwrap(),
+            &again.inbound,
+            |msg| match msg {
+                Msg::TabsGiven { tabs, adopt } => Some((tabs, adopt)),
+                _ => None,
+            }
+        ),
+        None
+    );
     assert!(pump_until(&first, || sessions_on_disk(&group) == ["s-1"]));
 }
 
@@ -505,10 +525,16 @@ impl ChatWindow {
         }
     }
 
-    /// Each set window 1 hears within a moment, and whether it heard `bye` after them.
+    /// Each set window 1 hears before the ordered marker or goodbye.
     fn reports(&self) -> (Vec<Vec<String>>, bool) {
         let mut heard = Vec::new();
-        while let Ok(inbound) = self.inbound.recv_timeout(Duration::from_millis(200)) {
+        let _ = self.link.send(Msg::IdePort { port: Some(u16::MAX) }, Vec::new());
+        let deadline = Instant::now() + Duration::from_secs(60);
+        loop {
+            let inbound = self
+                .inbound
+                .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+                .expect("window 1 never heard the report boundary");
             match inbound {
                 Inbound::Msg {
                     msg: Msg::TabsReport { tabs },
@@ -520,10 +546,13 @@ impl ChatWindow {
                 Inbound::Msg {
                     msg: Msg::Bye { .. }, ..
                 } => return (heard, true),
+                Inbound::Msg {
+                    msg: Msg::IdePort { port: Some(u16::MAX) },
+                    ..
+                } => return (heard, false),
                 _ => {}
             }
         }
-        (heard, false)
     }
 }
 

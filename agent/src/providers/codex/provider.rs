@@ -766,6 +766,14 @@ fn steer_refusal(e: &LinkError) -> String {
 }
 
 pub struct CodexProvider {
+    #[cfg(feature = "test-support")]
+    clock: std::sync::OnceLock<Mutex<Instant>>,
+    #[cfg(feature = "test-support")]
+    editor_waits: std::sync::atomic::AtomicUsize,
+    #[cfg(feature = "test-support")]
+    editor_wait_end: Mutex<Option<&'static str>>,
+    #[cfg(feature = "test-support")]
+    close_stop_joined: Mutex<Option<bool>>,
     link: Mutex<Option<JsonRpcLink>>,
     state: Mutex<State>,
     pid: u32,
@@ -971,6 +979,119 @@ fn from_json<T: serde::de::DeserializeOwned>(value: Value, what: &str) -> Result
 }
 
 impl CodexProvider {
+    #[cfg(feature = "test-support")]
+    pub fn lines_read_for_tests(&self) -> u64 {
+        lock(&self.link).as_ref().map_or(0, JsonRpcLink::lines_read_for_tests)
+    }
+
+    #[cfg(feature = "test-support")]
+    pub fn reader_wait_probe_for_tests(&self) -> crate::jsonrpc_link::ReaderWaitProbe {
+        lock(&self.link).as_ref().unwrap().reader_wait_probe_for_tests()
+    }
+
+    #[cfg(feature = "test-support")]
+    pub fn requests_for_tests(&self) -> u64 {
+        lock(&self.link).as_ref().unwrap().requests_for_tests()
+    }
+
+    #[cfg(feature = "test-support")]
+    pub fn blocking_waits_for_tests(&self) -> u64 {
+        lock(&self.link).as_ref().expect("live link").blocking_waits_for_tests()
+    }
+
+    #[cfg(feature = "test-support")]
+    pub fn editor_wait_outcome_for_tests(&self) -> Option<&'static str> {
+        *lock(&self.editor_wait_end)
+    }
+
+    #[cfg(feature = "test-support")]
+    pub fn editor_wait_count_for_tests(&self) -> usize {
+        self.editor_waits.load(Ordering::Relaxed)
+    }
+
+    #[cfg(feature = "test-support")]
+    pub fn session_dead_for_tests(&self) -> bool {
+        lock(&self.state).dead
+    }
+
+    #[cfg(feature = "test-support")]
+    pub fn settling_for_tests(&self) -> bool {
+        lock(&self.state).turn.as_ref().is_some_and(|turn| turn.settling)
+    }
+
+    #[cfg(feature = "test-support")]
+    pub fn steer_accepted_for_tests(&self, client_id: &str) -> bool {
+        lock(&self.state)
+            .steers
+            .iter()
+            .any(|steer| steer.client_id == client_id && steer.answer.is_none() && steer.waiting.is_none())
+    }
+
+    #[cfg(feature = "test-support")]
+    pub fn shutdown_checkpoint_for_tests(&self) -> (std::sync::mpsc::Receiver<()>, std::sync::mpsc::Sender<()>) {
+        lock(&self.link)
+            .as_ref()
+            .expect("live link")
+            .shutdown_checkpoint_for_tests()
+    }
+
+    #[cfg(feature = "test-support")]
+    pub fn set_rpc_clock_for_tests(&self, start: Instant, now: std::sync::Arc<dyn Fn() -> Instant + Send + Sync>) {
+        *lock(self.clock.get_or_init(|| Mutex::new(start))) = start;
+        lock(&self.link).as_ref().unwrap().set_wait_clock_for_tests(now);
+    }
+
+    #[cfg(feature = "test-support")]
+    pub fn close_on_eof_for_tests(&self, request: CloseSessionRequest) -> bool {
+        let outcome = lock(&self.link).as_ref().unwrap().grace_outcome_for_tests();
+        self.close_session(request).expect("closes");
+        outcome()
+    }
+
+    #[cfg(feature = "test-support")]
+    pub fn close_stop_joined_for_tests(&self) -> Option<bool> {
+        *lock(&self.close_stop_joined)
+    }
+
+    #[cfg(feature = "test-support")]
+    pub fn closed_for_tests(&self) -> bool {
+        lock(&self.state).closed
+    }
+
+    #[cfg(feature = "test-support")]
+    pub fn interrupt_deadline_for_tests(&self) -> Option<Instant> {
+        let st = lock(&self.state);
+        let turn = st.turn.as_ref()?;
+        turn.told_to_stop
+            .values()
+            .map(|at| *at + INTERRUPT_SETTLE)
+            .chain(turn.settle_until)
+            .min()
+    }
+
+    fn now(&self) -> Instant {
+        #[cfg(feature = "test-support")]
+        if let Some(clock) = self.clock.get() {
+            return *lock(clock);
+        }
+        Instant::now()
+    }
+
+    /// Freezes the pump's deadline clock. I/O waits keep their real hang guards.
+    #[cfg(feature = "test-support")]
+    pub fn pause_time_for_tests(&self) -> Instant {
+        let now = self.now();
+        *lock(self.clock.get_or_init(|| Mutex::new(now))) = now;
+        now
+    }
+
+    /// Advances a previously paused pump clock without waiting on the host scheduler.
+    #[cfg(feature = "test-support")]
+    pub fn advance_time_for_tests(&self, by: Duration) {
+        let mut clock = lock(self.clock.get().expect("pause the clock before advancing"));
+        *clock += by;
+    }
+
     /// Starts `codex app-server` on stdio, runs the handshake, checks the version, and checks that Codex has
     /// an account when it needs one. Every failure is a sentence for the tab, and no child outlives it.
     ///
@@ -1058,6 +1179,14 @@ impl CodexProvider {
         let (version, codex_home) = Self::handshake(&link, checked.map(|c| &c.key))?;
         let pid = link.pid();
         Ok(CodexProvider {
+            #[cfg(feature = "test-support")]
+            clock: std::sync::OnceLock::new(),
+            #[cfg(feature = "test-support")]
+            editor_waits: std::sync::atomic::AtomicUsize::new(0),
+            #[cfg(feature = "test-support")]
+            editor_wait_end: Mutex::new(None),
+            #[cfg(feature = "test-support")]
+            close_stop_joined: Mutex::new(None),
             link: Mutex::new(Some(link)),
             state: Mutex::new(State::default()),
             pid,
@@ -1150,7 +1279,17 @@ impl CodexProvider {
     /// Waits for an answer outside every lock but the link's own. The link is only needed to describe a
     /// closed connection, so a missing link is a plain closed error.
     fn wait(&self, pending: Pending, within: Duration, what: &str) -> Result<Value, ProviderError> {
-        pending.wait(Instant::now() + within).map_err(|e| self.failure(e, what))
+        // A paused pump clock only controls pump deadlines. RPCs use real time unless their wait
+        // clock was explicitly installed too, so their deadline and comparison share an origin.
+        let now = Instant::now();
+        #[cfg(feature = "test-support")]
+        let now = self.rpc_now_for_tests(&pending, now);
+        pending.wait(now + within).map_err(|e| self.failure(e, what))
+    }
+
+    #[cfg(feature = "test-support")]
+    fn rpc_now_for_tests(&self, pending: &Pending, real_now: Instant) -> Instant {
+        pending.wait_now_for_tests().unwrap_or(real_now)
     }
 
     /// A failed call as the error the host shows.
@@ -1188,7 +1327,7 @@ impl CodexProvider {
             if turn_id == UNREAD_TURN || !turn.interrupted.insert(turn_id.clone()) {
                 continue;
             }
-            turn.told_to_stop.entry(turn_id.clone()).or_insert_with(Instant::now);
+            turn.told_to_stop.entry(turn_id.clone()).or_insert_with(|| self.now());
             if let Some(sent) = self.request_interrupt(thread_id, turn_id, 0) {
                 st.interrupts.push(sent);
             }
@@ -1204,7 +1343,7 @@ impl CodexProvider {
             }
             turn.told_to_stop
                 .entry(turn_id.to_string())
-                .or_insert_with(Instant::now);
+                .or_insert_with(|| self.now());
         }
         if let Some(sent) = self.request_interrupt(thread_id.to_string(), turn_id.to_string(), 0) {
             st.interrupts.push(sent);
@@ -1234,7 +1373,7 @@ impl CodexProvider {
         if st.interrupts.is_empty() || st.dead || st.closed {
             return;
         }
-        let now = Instant::now();
+        let now = self.now();
         let running = st.family.as_ref().map(Family::running_turns).unwrap_or_default();
         let mut again = Vec::new();
         st.interrupts.retain_mut(|sent| {
@@ -1279,7 +1418,7 @@ impl CodexProvider {
         if st.dead || st.closed || st.stopping.is_some() {
             return;
         }
-        let now = Instant::now();
+        let now = self.now();
         let overdue = match (st.turn.as_ref(), st.family.as_ref()) {
             (Some(turn), Some(family)) if turn.interrupting => family.running_turns().iter().any(|(_, id)| {
                 turn.told_to_stop
@@ -1320,8 +1459,7 @@ impl CodexProvider {
                 }
             }
             turn.interrupting = true;
-            turn.settle_until
-                .get_or_insert_with(|| Instant::now() + INTERRUPT_SETTLE);
+            turn.settle_until.get_or_insert_with(|| self.now() + INTERRUPT_SETTLE);
         }
         for (permission_id, card) in std::mem::take(&mut st.cards) {
             if card.form.ends_the_turn(CardAnswer::Interrupt) {
@@ -1335,7 +1473,7 @@ impl CodexProvider {
                         // A stand-in for a turn whose start could not be read has no id of its own: a time
                         // kept for it would stand for whichever such turn runs next.
                         if ended != UNREAD_TURN {
-                            turn.told_to_stop.entry(ended.clone()).or_insert_with(Instant::now);
+                            turn.told_to_stop.entry(ended.clone()).or_insert_with(|| self.now());
                         }
                         turn.cancelled.insert(ended);
                     }
@@ -2644,7 +2782,7 @@ impl CodexProvider {
             return;
         }
         let until = st.turn.as_ref().and_then(|t| t.settle_until);
-        if until.is_some_and(|until| Instant::now() < until) {
+        if until.is_some_and(|until| self.now() < until) {
             return;
         }
         let unread = st.running_unread.then_some(Running::Unread);
@@ -2669,7 +2807,8 @@ impl CodexProvider {
         self.drop_cards(st, PermissionOutcome::CancelledByInterrupt);
         let done = Arc::new(AtomicBool::new(false));
         let mut worker = None;
-        if let Some(link) = lock(&self.link).take() {
+        let mut link_slot = lock(&self.link);
+        if let Some(link) = link_slot.take() {
             let set = SetOnDrop(Arc::clone(&done));
             // Without a thread the closure, and the link in it, is dropped inside `spawn`, which kills the
             // group at once; the flag is set as it goes. The pump cannot read it before: it holds `st`.
@@ -2683,6 +2822,7 @@ impl CodexProvider {
         } else {
             done.store(true, Ordering::Release);
         }
+        drop(link_slot);
         st.stopping = Some(Stopping { done, worker, reason });
     }
 
@@ -2801,8 +2941,114 @@ fn end_added_row(st: &mut State, card: WaitingCard, outcome: PermissionOutcome) 
     });
 }
 
-/// Whether a message means the start need not wait for `server` any more: its status left `starting`, or
-/// the child is gone.
+/// Polls readiness under one deadline, with the pause capped to the remaining budget.
+fn wait_for_editor_status(
+    mut ready: impl FnMut() -> bool,
+    now: impl Fn() -> Instant,
+    pause: impl Fn(Duration),
+) -> bool {
+    let until = now() + EDITOR_SERVER_WAIT;
+    loop {
+        if ready() {
+            return true;
+        }
+        let at = now();
+        if at >= until {
+            return false;
+        }
+        pause(EDITOR_SERVER_POLL.min(until - at));
+    }
+}
+
+#[cfg(test)]
+mod editor_wait_tests {
+    use super::*;
+    use std::cell::Cell;
+
+    #[test]
+    fn readiness_ends_the_wait_before_its_deadline() {
+        let start = Instant::now();
+        let clock = Cell::new(start);
+        let ticks = Cell::new(0);
+        let ready_at = start + Duration::from_millis(400);
+        wait_for_editor_status(
+            || clock.get() >= ready_at,
+            || {
+                ticks.set(ticks.get() + 1);
+                assert!(ticks.get() < 1000, "editor wait ignored readiness/deadline");
+                clock.get()
+            },
+            |by| clock.set(clock.get() + by),
+        );
+        assert_eq!(clock.get(), ready_at);
+    }
+
+    #[test]
+    fn a_server_that_never_leaves_starting_uses_exactly_the_budget() {
+        let start = Instant::now();
+        let clock = Cell::new(start);
+        let ticks = Cell::new(0);
+        wait_for_editor_status(
+            || false,
+            || {
+                ticks.set(ticks.get() + 1);
+                assert!(ticks.get() < 1000, "editor wait ignored readiness/deadline");
+                clock.get()
+            },
+            |by| clock.set(clock.get() + by),
+        );
+        assert_eq!(clock.get(), start + EDITOR_SERVER_WAIT);
+    }
+
+    #[test]
+    fn only_the_requested_servers_final_status_ends_startup() {
+        let start = Instant::now();
+        let clock = Cell::new(start);
+        let ticks = Cell::new(0);
+        let mut statuses = [("eitri", "starting"), ("another", "ready"), ("eitri", "ready")].into_iter();
+        let mut read = 0;
+        wait_for_editor_status(
+            || {
+                let (name, status) = statuses.next().expect("startup consumed the final status");
+                read += 1;
+                ends_editor_wait(
+                    &Incoming::Notification {
+                        method: method::MCP_STARTUP_STATUS.into(),
+                        params: serde_json::json!({"threadId": "th", "name": name, "status": status,
+                        "error": null, "failureReason": null}),
+                    },
+                    "eitri",
+                )
+            },
+            || {
+                ticks.set(ticks.get() + 1);
+                assert!(ticks.get() < 1000, "editor wait ignored readiness/deadline");
+                clock.get()
+            },
+            |by| clock.set(clock.get() + by),
+        );
+        assert_eq!(read, 3);
+        assert_eq!(clock.get(), start + EDITOR_SERVER_POLL * 2);
+        for status in ["ready", "failed"] {
+            assert!(ends_editor_wait(
+                &Incoming::Notification {
+                    method: method::MCP_STARTUP_STATUS.into(),
+                    params: serde_json::json!({"threadId": "th", "name": "eitri", "status": status,
+                    "error": null, "failureReason": null}),
+                },
+                "eitri"
+            ));
+        }
+        assert!(ends_editor_wait(&Incoming::Closed { reason: "EOF".into() }, "eitri"));
+    }
+
+    #[test]
+    fn a_ready_server_needs_no_pause() {
+        wait_for_editor_status(|| true, Instant::now, |_| panic!("ready status must end the wait"));
+    }
+}
+
+/// Whether a message ends startup's wait for this server, including a closed connection.
 fn ends_editor_wait(message: &Incoming, server: &str) -> bool {
     match message {
         Incoming::Closed { .. } => true,
@@ -2943,15 +3189,32 @@ impl CodexProvider {
     /// The provider stays locked while the link stops, so that nothing is pumped from a half-stopped
     /// link: its other calls wait for up to those 2 s, and a caller on a UI thread freezes from another.
     pub fn freeze_for_move(&self) -> Result<(CodexProviderHandoff, LinkHandoff, [OwnedFd; 3]), MoveRefusedWhy> {
-        let deadline = Instant::now() + START_WAIT;
+        self.freeze_with_clock(Instant::now, std::thread::sleep)
+    }
+
+    #[cfg(feature = "test-support")]
+    pub fn freeze_with_clock_for_tests(
+        &self,
+        now: impl Fn() -> Instant,
+        pause: impl Fn(Duration),
+    ) -> Result<(CodexProviderHandoff, LinkHandoff, [OwnedFd; 3]), MoveRefusedWhy> {
+        self.freeze_with_clock(now, pause)
+    }
+
+    fn freeze_with_clock(
+        &self,
+        now: impl Fn() -> Instant,
+        pause: impl Fn(Duration),
+    ) -> Result<(CodexProviderHandoff, LinkHandoff, [OwnedFd; 3]), MoveRefusedWhy> {
+        let deadline = now() + START_WAIT;
         let mut st = loop {
             let st = lock(&self.state);
             match self.move_blocker(&st) {
                 None => break st,
                 // The start's caller waits outside this lock and takes it again once its answer comes.
-                Some(MoveRefusedWhy::Starting) if Instant::now() < deadline => {
+                Some(MoveRefusedWhy::Starting) if now() < deadline => {
                     drop(st);
-                    std::thread::sleep(Duration::from_millis(10));
+                    pause(Duration::from_millis(10));
                 }
                 Some(why) => return Err(why),
             }
@@ -2973,11 +3236,19 @@ impl CodexProvider {
             ..State::default()
         };
         let state = std::mem::replace(&mut *st, gone);
-        Ok((self.handoff_of(state, Instant::now()), link_handoff, fds))
+        Ok((self.handoff_of(state, self.now()), link_handoff, fds))
     }
 
     fn handoff_of(&self, state: State, now: Instant) -> CodexProviderHandoff {
         let CodexProvider {
+            #[cfg(feature = "test-support")]
+                clock: _,
+            #[cfg(feature = "test-support")]
+                editor_waits: _,
+            #[cfg(feature = "test-support")]
+                editor_wait_end: _,
+            #[cfg(feature = "test-support")]
+                close_stop_joined: _,
             // Stopped and handed over as the link's own record.
             link: _,
             // Taken apart below.
@@ -3108,7 +3379,7 @@ impl CodexProvider {
         // Pumping resumes even when the link's threads could not start: the tab then learns that the
         // session ended, instead of waiting for good.
         if let Some(adopted_at) = st.adopted_at.take() {
-            later_deadlines(&mut st, adopted_at.elapsed());
+            later_deadlines(&mut st, self.now().duration_since(adopted_at));
         }
         started
     }
@@ -3125,6 +3396,14 @@ impl CodexProvider {
         let handed = handed_ids(&link);
         let link = JsonRpcLink::resume_after_move(link, fds, approvals::over_cap_reply)?;
         let CodexProvider {
+            #[cfg(feature = "test-support")]
+                clock: _,
+            #[cfg(feature = "test-support")]
+                editor_waits: _,
+            #[cfg(feature = "test-support")]
+                editor_wait_end: _,
+            #[cfg(feature = "test-support")]
+                close_stop_joined: _,
             link,
             state,
             // The source's own, unchanged by the move.
@@ -3268,6 +3547,14 @@ impl CodexProvider {
             adopted_at: Some(now),
         };
         Ok(CodexProvider {
+            #[cfg(feature = "test-support")]
+            clock: std::sync::OnceLock::new(),
+            #[cfg(feature = "test-support")]
+            editor_waits: std::sync::atomic::AtomicUsize::new(0),
+            #[cfg(feature = "test-support")]
+            editor_wait_end: Mutex::new(None),
+            #[cfg(feature = "test-support")]
+            close_stop_joined: Mutex::new(None),
             link: Mutex::new(Some(link)),
             state: Mutex::new(state),
             pid,
@@ -3529,7 +3816,13 @@ impl AgentProvider for CodexProvider {
             st.thread_id.clone()
         };
         if let Some(worker) = stop_worker {
-            let _ = worker.join();
+            let joined = worker.join().is_ok();
+            #[cfg(feature = "test-support")]
+            {
+                *lock(&self.close_stop_joined) = Some(joined);
+            }
+            #[cfg(not(feature = "test-support"))]
+            let _ = joined;
         }
         let dead = lock(&self.state).dead;
         if let (Some(thread_id), false) = (thread_id, dead) {
@@ -3754,40 +4047,55 @@ impl CodexProvider {
     /// session with no tool. This runs on the connect worker, before anything pumps the session, so what
     /// Codex says meanwhile is only moved aside, in order, for the first pump to read.
     fn wait_for_editor_server(&self, server: &str) {
-        let until = Instant::now() + EDITOR_SERVER_WAIT;
+        #[cfg(feature = "test-support")]
+        self.editor_waits.fetch_add(1, Ordering::Relaxed);
         let mut seen = 0;
-        loop {
-            {
+        #[cfg(feature = "test-support")]
+        let mut status = "other";
+        let ended_on_status = wait_for_editor_status(
+            || {
                 let mut st = lock(&self.state);
                 if st.blocked.is_some() {
-                    return;
+                    return true;
                 }
                 let link = lock(&self.link);
-                let Some(link) = link.as_ref() else { return };
+                let Some(link) = link.as_ref() else { return true };
                 while st.held.len() < PUMP_BATCH {
                     let Some(message) = link.try_recv() else { break };
                     st.held.push_back(message);
                 }
-                if st
+                if let Some(_message) = st
                     .held
                     .iter()
                     .skip(seen)
-                    .any(|message| ends_editor_wait(message, server))
+                    .find(|message| ends_editor_wait(message, server))
                 {
-                    return;
+                    #[cfg(feature = "test-support")]
+                    {
+                        status = match _message {
+                            Incoming::Notification { params, .. } => match params.get("status").and_then(Value::as_str)
+                            {
+                                Some("ready") => "ready",
+                                Some("failed") => "failed",
+                                _ => "other",
+                            },
+                            _ => "closed",
+                        };
+                    }
+                    return true;
                 }
                 seen = st.held.len();
-                // What does not fit stays in the link's queue, so nothing more can be read here.
-                if seen >= PUMP_BATCH {
-                    return;
-                }
-            }
-            let now = Instant::now();
-            if now >= until {
-                return;
-            }
-            std::thread::sleep(EDITOR_SERVER_POLL.min(until - now));
+                seen >= PUMP_BATCH
+            },
+            Instant::now,
+            std::thread::sleep,
+        );
+        #[cfg(feature = "test-support")]
+        {
+            *lock(&self.editor_wait_end) = Some(if ended_on_status { status } else { "deadline" });
         }
+        #[cfg(not(feature = "test-support"))]
+        let _ = ended_on_status;
     }
 
     /// A resume that did not continue the conversation asked for (Codex refused it, or continued another),
@@ -4014,12 +4322,17 @@ mod process_tests {
     use super::*;
     use crate::external_link::test_support::{read_pid, running, wait_for, Scratch};
 
-    #[test]
-    fn a_closed_stream_stops_codex_before_ending_background_rows() {
-        let scratch = Scratch::new();
-        let link = scratch.link("sleep 30 >/dev/null & echo $! > child; exec 1>&-; wait");
+    fn provider_on(link: JsonRpcLink, scratch: &Scratch) -> CodexProvider {
         let pid = link.pid();
-        let provider = CodexProvider {
+        CodexProvider {
+            #[cfg(feature = "test-support")]
+            clock: std::sync::OnceLock::new(),
+            #[cfg(feature = "test-support")]
+            editor_waits: std::sync::atomic::AtomicUsize::new(0),
+            #[cfg(feature = "test-support")]
+            editor_wait_end: Mutex::new(None),
+            #[cfg(feature = "test-support")]
+            close_stop_joined: Mutex::new(None),
             link: Mutex::new(Some(link)),
             state: Mutex::new(State::default()),
             pid,
@@ -4029,7 +4342,90 @@ mod process_tests {
             steer_unsupported: AtomicBool::new(false),
             editor_server_lever: false,
             editor_note_due: AtomicBool::new(false),
-        };
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "test-support")]
+    fn a_paused_pump_clock_does_not_expire_a_real_rpc_wait() {
+        let scratch = Scratch::new();
+        let link = scratch.link(
+            "read -r request; touch ready; while [ ! -f release ]; do sleep 0.01; done; \
+             echo '{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{}}'; cat >/dev/null",
+        );
+        let provider = provider_on(link, &scratch);
+        *lock(provider.clock.get_or_init(|| Mutex::new(Instant::now()))) = Instant::now() - Duration::from_secs(60);
+        let pending = provider.request("probe", json!({})).unwrap();
+        let real_now = Instant::now();
+        assert_eq!(provider.rpc_now_for_tests(&pending, real_now), real_now);
+        std::thread::scope(|scope| {
+            let waiting = scope.spawn(|| provider.wait(pending, Duration::from_secs(10), "probe"));
+            wait_for(|| scratch.0.join("ready").exists());
+            std::fs::write(scratch.0.join("release"), b"").unwrap();
+            assert_eq!(waiting.join().unwrap().unwrap(), json!({}));
+        });
+    }
+
+    #[test]
+    #[cfg(feature = "test-support")]
+    fn successive_rpcs_each_get_the_full_advancing_clock_budget() {
+        let scratch = Scratch::new();
+        let provider = provider_on(scratch.link("cat >/dev/null"), &scratch);
+        let start = Instant::now();
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let counted = calls.clone();
+        provider.set_rpc_clock_for_tests(
+            start,
+            std::sync::Arc::new(move || {
+                let tick = counted.fetch_add(1, Ordering::SeqCst);
+                assert!(tick < 24, "RPC wait ignored its deadline");
+                start + Duration::from_secs(tick)
+            }),
+        );
+        for rpc in 1..=2 {
+            let pending = provider.request("probe", json!({})).unwrap();
+            assert!(matches!(
+                provider.wait(pending, Duration::from_secs(10), "probe"),
+                Err(ProviderError::Timeout)
+            ));
+            assert_eq!(
+                calls.load(Ordering::SeqCst),
+                rpc * 11,
+                "each RPC gets ten fresh seconds after its origin read"
+            );
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "test-support")]
+    fn commit_keeps_the_interrupt_budget_while_completion_is_pending() {
+        let scratch = Scratch::new();
+        let provider = provider_on(scratch.link("cat >/dev/null"), &scratch);
+        let start = provider.pause_time_for_tests();
+        {
+            let mut st = lock(&provider.state);
+            let mut turn = ActiveTurn::new(Some("turn".into()));
+            turn.settle_until = Some(start + INTERRUPT_SETTLE);
+            turn.told_to_stop.insert("turn".into(), start);
+            st.turn = Some(turn);
+            st.adopted_at = Some(start);
+        }
+        let parked_for = INTERRUPT_SETTLE + Duration::from_millis(500);
+        provider.advance_time_for_tests(parked_for);
+        assert!(provider.pump().is_empty());
+        provider.commit().unwrap();
+        let st = lock(&provider.state);
+        let turn = st.turn.as_ref().expect("completion is still pending");
+        assert_eq!(turn.settle_until, Some(start + parked_for + INTERRUPT_SETTLE));
+        assert_eq!(turn.told_to_stop.get("turn"), Some(&(start + parked_for)));
+    }
+
+    #[test]
+    fn a_closed_stream_stops_codex_before_ending_background_rows() {
+        let scratch = Scratch::new();
+        let link = scratch.link("sleep 30 >/dev/null & echo $! > child; exec 1>&-; wait");
+        let pid = link.pid();
+        let provider = provider_on(link, &scratch);
         let key = ("thread".into(), "command".into());
         {
             let mut st = lock(&provider.state);

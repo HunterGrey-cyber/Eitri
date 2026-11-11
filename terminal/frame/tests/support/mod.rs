@@ -163,12 +163,13 @@ impl Dimensions for Size {
 /// this, nvim stalls on its unanswered queries and the measurement is of a
 /// hung program.
 #[derive(Clone, Default)]
-pub struct Replies(Arc<Mutex<Vec<u8>>>);
+pub struct Replies(Arc<Mutex<Vec<u8>>>, Arc<Mutex<Option<String>>>);
 
 impl EventListener for Replies {
     fn send_event(&self, event: Event) {
         let mut buf = self.0.lock().unwrap();
         match event {
+            Event::Title(title) => *self.1.lock().unwrap() = Some(title),
             Event::PtyWrite(text) => buf.extend_from_slice(text.as_bytes()),
             Event::ColorRequest(_, fmt) => {
                 let rgb = alacritty_terminal::vte::ansi::Rgb {
@@ -301,6 +302,10 @@ pub enum Step {
     Send(&'static [u8]),
     /// Wait, still reading and metering.
     Wait(Duration),
+    Text(String),
+    Title(String),
+    Fence,
+    Exit,
 }
 
 /// Run one workload and measure it.
@@ -324,7 +329,11 @@ pub fn measure(
     let mut term = Term::new(config, &size, replies.clone());
     let mut parser: Processor = Processor::new();
     let mut projector = Projector::new();
-    let mut pty = Pty::spawn(program, args, env, size.cols as u16, size.rows as u16)?;
+    let mut args = args.to_vec();
+    if program == "nvim" {
+        args.extend(["--cmd", "lua local n=0; vim.keymap.set({'n','i'},'<C-G>',function() vim.schedule(function() n=n+1; vim.o.titlestring='fence-'..n; vim.o.title=true; vim.cmd('redraw!') end) end)"]);
+    }
+    let mut pty = Pty::spawn(program, &args, env, size.cols as u16, size.rows as u16)?;
 
     let mut measurement = Measurement {
         name: name.to_string(),
@@ -352,7 +361,7 @@ pub fn measure(
     const MAX_FRAMES: u64 = 500_000;
     const MAX_WALL: Duration = Duration::from_secs(180);
     macro_rules! check_budget {
-        ($m:expr, $start:expr) => {
+        ($m:expr_2021, $start:expr_2021) => {
             if $m.pty_bytes > MAX_PTY_BYTES || $m.frames > MAX_FRAMES || $start.elapsed() > MAX_WALL {
                 panic!(
                     "bandwidth harness exceeded its resource budget and was stopped before it \
@@ -377,10 +386,11 @@ pub fn measure(
                     projector: &mut Projector,
                     measurement: &mut Measurement,
                     carry: &mut Vec<u8>,
-                    until: Instant| {
-        while Instant::now() < until {
+                    done: &mut dyn FnMut(&Term<Replies>, &Measurement, &mut Pty, bool) -> bool| {
+        loop {
             check_budget!(measurement, start);
-            match pty.read(&mut buf) {
+            let read = pty.read(&mut buf);
+            match read {
                 Some(n) => {
                     measurement.pty_reads += 1;
                     measurement.pty_bytes += n as u64;
@@ -414,11 +424,25 @@ pub fn measure(
                         pty.write(&answer);
                     }
                 }
-                None => std::thread::sleep(Duration::from_millis(1)),
+                None => std::thread::yield_now(),
+            }
+            if done(term, measurement, pty, read.is_some()) {
+                return;
             }
         }
     };
 
+    // The first output is an event, even for a workload whose subsequent waits only pace input.
+    pump(
+        &mut pty,
+        &mut term,
+        &mut parser,
+        &mut projector,
+        &mut measurement,
+        &mut carry,
+        &mut |_, m, _, _| m.frames > 0,
+    );
+    let mut fence = 0;
     for step in script {
         match step {
             Step::Send(bytes) => pty.write(bytes),
@@ -431,7 +455,72 @@ pub fn measure(
                     &mut projector,
                     &mut measurement,
                     &mut carry,
-                    until,
+                    &mut |_, _, _, _| Instant::now() >= until,
+                );
+            }
+            Step::Text(expected) => {
+                pump(
+                    &mut pty,
+                    &mut term,
+                    &mut parser,
+                    &mut projector,
+                    &mut measurement,
+                    &mut carry,
+                    &mut |term, _, _, _| {
+                        use alacritty_terminal::index::{Column, Line, Point};
+                        (0..size.rows).any(|row| {
+                            let line: String = (0..size.cols)
+                                .map(|col| term.grid()[Point::new(Line(row as i32), Column(col))].c)
+                                .collect();
+                            line.contains(expected)
+                        })
+                    },
+                );
+            }
+            Step::Title(expected) => {
+                pump(
+                    &mut pty,
+                    &mut term,
+                    &mut parser,
+                    &mut projector,
+                    &mut measurement,
+                    &mut carry,
+                    &mut |_, _, _, _| replies.1.lock().unwrap().as_deref() == Some(expected.as_str()),
+                );
+            }
+            Step::Fence => {
+                fence += 1;
+                let expected = format!("fence-{fence}");
+                pty.write(b"\x07");
+                pump(
+                    &mut pty,
+                    &mut term,
+                    &mut parser,
+                    &mut projector,
+                    &mut measurement,
+                    &mut carry,
+                    &mut |_, _, _, _| replies.1.lock().unwrap().as_deref() == Some(expected.as_str()),
+                );
+            }
+            Step::Exit => {
+                pump(
+                    &mut pty,
+                    &mut term,
+                    &mut parser,
+                    &mut projector,
+                    &mut measurement,
+                    &mut carry,
+                    &mut |_, _, pty, read| {
+                        if read {
+                            return false;
+                        }
+                        if let Some(status) = pty.child.try_wait().unwrap() {
+                            assert!(status.success(), "workload failed: {status}");
+                            true
+                        } else {
+                            false
+                        }
+                    },
                 );
             }
         }
@@ -444,7 +533,7 @@ pub fn measure(
         &mut projector,
         &mut measurement,
         &mut carry,
-        until,
+        &mut |_, _, _, _| Instant::now() >= until,
     );
 
     measurement.seconds = start.elapsed().as_secs_f64();

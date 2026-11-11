@@ -154,10 +154,19 @@ pub(crate) fn finish_closing_notice(
     agent: &str,
     link: &Mutex<Option<JsonRpcLink>>,
 ) -> Option<String> {
+    finish_closing_notice_with_clock(notice, agent, link, Instant::now)
+}
+
+fn finish_closing_notice_with_clock(
+    notice: &mut Option<ClosingNotice>,
+    agent: &str,
+    link: &Mutex<Option<JsonRpcLink>>,
+    now: impl FnOnce() -> Instant,
+) -> Option<String> {
     let waiting = notice.as_ref()?;
     let tail = current_tail(link);
     let fresh = !tail.is_empty() && tail != waiting.stderr_at_close;
-    if !fresh && !waiting.due(Instant::now()) {
+    if !fresh && !waiting.due(now()) {
         return None;
     }
     let reason = notice.take()?.reason;
@@ -191,10 +200,8 @@ pub(crate) mod test_support {
         }
 
         pub fn script(&self, body: &str) -> PathBuf {
-            use std::os::unix::fs::PermissionsExt;
             let path = self.0.join("stand-in");
-            std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
-            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+            script_fixture::write_executable_script(&path, format!("#!/bin/sh\n{body}\n"), 0o700).unwrap();
             path
         }
 
@@ -267,70 +274,57 @@ mod tests {
 
     #[test]
     fn a_notice_without_a_link_goes_once_its_wait_is_over_and_only_once() {
+        let now = Instant::now();
         let link: Mutex<Option<JsonRpcLink>> = Mutex::new(None);
-        let mut waiting = Some(ClosingNotice::new(
-            "end of output",
-            Instant::now() + Duration::from_secs(60),
-        ));
-        assert_eq!(finish_closing_notice(&mut waiting, "Codex", &link), None);
+        let mut waiting = Some(ClosingNotice::new("end of output", now + Duration::from_secs(60)));
+        assert_eq!(
+            finish_closing_notice_with_clock(&mut waiting, "Codex", &link, || now),
+            None
+        );
         assert!(waiting.is_some(), "a notice still waiting is kept");
         let mut over = Some(ClosingNotice {
             reason: "end of output".to_string(),
-            until: Instant::now(),
+            until: now,
             stderr_at_close: String::new(),
         });
         assert_eq!(
-            finish_closing_notice(&mut over, "Codex", &link).as_deref(),
+            finish_closing_notice_with_clock(&mut over, "Codex", &link, || now).as_deref(),
             Some("Codex ended unexpectedly (end of output)")
         );
         assert!(over.is_none(), "a finished notice is taken");
-        assert_eq!(finish_closing_notice(&mut over, "Codex", &link), None);
+        assert_eq!(
+            finish_closing_notice_with_clock(&mut over, "Codex", &link, || now),
+            None
+        );
     }
 
     /// A child that logged to stderr before it ended: the notice waits for what it says after its end,
     /// rather than going at once with the earlier lines.
     #[test]
     fn a_notice_waits_for_stderr_written_after_the_end_even_when_earlier_stderr_exists() {
-        fn refuse(_: &str) -> crate::jsonrpc_link::OverCapReply {
-            crate::jsonrpc_link::OverCapReply::Error {
-                code: -32600,
-                message: "too large",
-            }
-        }
-        let link = JsonRpcLink::spawn(crate::jsonrpc_link::LinkSpec {
-            program: std::path::PathBuf::from("/bin/sh"),
-            args: vec![
-                "-c".into(),
-                "echo early >&2; sleep 0.2; exec 1>&-; sleep 0.03; echo final-reason >&2; sleep 1".into(),
-            ],
-            cwd: std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")),
-            framing: crate::jsonrpc_link::Framing::Bare,
-            env: Vec::new(),
-            env_remove: Vec::new(),
-            over_cap: refuse,
-        })
-        .expect("the stand-in starts");
+        use test_support::{wait_for, Scratch};
+        let scratch = Scratch::new();
+        let link = scratch.link(
+            "echo early >&2; while [ ! -f close ]; do sleep 0.002; done; exec 1>&-; \
+             while [ ! -f final ]; do sleep 0.002; done; echo final-reason >&2; cat >/dev/null",
+        );
+        wait_for(|| link.stderr_tail().contains("early"));
+        std::fs::write(scratch.0.join("close"), b"").unwrap();
         let slot = Mutex::new(Some(link));
-        let deadline = Instant::now() + Duration::from_secs(10);
-        let reason = loop {
-            if let Some(Incoming::Closed { reason }) = try_recv(&slot) {
-                break reason;
+        let mut reason = None;
+        wait_for(|| {
+            if let Some(Incoming::Closed { reason: ended }) = try_recv(&slot) {
+                reason = Some(ended);
             }
-            assert!(Instant::now() < deadline, "the link never ended");
-            std::thread::sleep(Duration::from_millis(2));
-        };
-        // A long wait, so only the stderr that comes after the end can let the notice go early.
-        let mut notice = Some(ClosingNotice {
-            until: Instant::now() + Duration::from_secs(8),
-            ..ClosingNotice::after(&reason, Instant::now(), &slot)
+            reason.is_some()
         });
-        let said = loop {
-            if let Some(said) = finish_closing_notice(&mut notice, "Codex", &slot) {
-                break said;
-            }
-            assert!(Instant::now() < deadline, "the notice never went");
-            std::thread::sleep(Duration::from_millis(2));
-        };
+        let now = Instant::now();
+        let mut notice = Some(ClosingNotice::after(&reason.unwrap(), now, &slot));
+        assert!(finish_closing_notice_with_clock(&mut notice, "Codex", &slot, || now).is_none());
+        std::fs::write(scratch.0.join("final"), b"").unwrap();
+        wait_for(|| current_tail(&slot).contains("final-reason"));
+        let said =
+            finish_closing_notice_with_clock(&mut notice, "Codex", &slot, || now).expect("fresh stderr ends the wait");
         assert!(said.contains("final-reason"), "{said}");
         stop_linked_child(&slot);
     }
@@ -341,4 +335,9 @@ mod tests {
         assert_eq!(notice_tail(&long), "b".repeat(NOTICE_TAIL_CHARS));
         assert_eq!(notice_tail("  short \n"), "short");
     }
+}
+
+#[cfg(test)]
+mod script_fixture {
+    include!(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/support/executable.rs"));
 }

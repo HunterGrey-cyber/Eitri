@@ -45,6 +45,8 @@ mod stdin;
 mod subsurface;
 #[cfg(test)]
 mod test_nvim;
+#[cfg(feature = "test-support")]
+pub mod test_support;
 mod tick_driver;
 
 /// Unit tests that acquire the default main context take this first: two at once would make the
@@ -877,6 +879,8 @@ type FollowedCallbackSlot = Rc<RefCell<Option<Box<dyn Fn(PaneFollowed)>>>>;
 /// call `.widget()` to place this pane's `GLArea` into its own window, `.grab_focus()` once that
 /// window is shown, and wire its own window's `connect_close_request` to `.shutdown()`.
 pub struct NeovideEditorPane {
+    #[cfg(feature = "test-support")]
+    testing_remap_pending: Rc<Cell<bool>>,
     widget: GLArea,
     shared: Rc<PaneShared>,
     hole_changed_callbacks: Rc<RefCell<Vec<Rc<dyn Fn()>>>>,
@@ -1224,7 +1228,11 @@ impl RemapKick {
             earlier.remove();
         }
         let pending = self.pending.clone();
-        let id = glib::timeout_add_local_once(delay, move || {
+        #[cfg(not(test))]
+        use glib::timeout_add_local_once as add_timeout;
+        #[cfg(test)]
+        use record_remap_timeout as add_timeout;
+        let id = add_timeout(delay, move || {
             // This source is finished once it fires; taking its id here is what stops a later map
             // from `remove`-ing a source glib no longer has.
             pending.borrow_mut().take();
@@ -1232,6 +1240,17 @@ impl RemapKick {
         });
         *self.pending.borrow_mut() = Some(id);
     }
+}
+
+#[cfg(test)]
+thread_local! {
+    static REMAP_SCHEDULED_DELAY: Cell<Option<Duration>> = const { Cell::new(None) };
+}
+
+#[cfg(test)]
+fn record_remap_timeout(delay: Duration, callback: impl FnOnce() + 'static) -> glib::SourceId {
+    REMAP_SCHEDULED_DELAY.with(|record| record.set(Some(delay)));
+    glib::timeout_add_local_once(delay, callback)
 }
 
 /// Whether the tick callback's `Ready` arm should queue another render this frame, given each
@@ -1915,10 +1934,14 @@ impl NeovideEditorPane {
             });
         }
 
+        #[cfg(feature = "test-support")]
+        let testing_remap_pending = Rc::new(Cell::new(false));
         // --- map: one more frame ~50ms after this pane is back on screen. See `RemapKick` for why
         // a host that hides panes by `set_child_visible` needs it, and for what was measured.
         {
             let live_state = live_state.clone();
+            #[cfg(feature = "test-support")]
+            let testing_remap_pending = testing_remap_pending.clone();
             let kick = RemapKick::new();
             gl_area.connect_map(move |widget| {
                 // A pane hidden mid-animation must not simulate the entire hidden interval on
@@ -1932,7 +1955,14 @@ impl NeovideEditorPane {
                 }
                 let widget = widget.downgrade();
                 let live_state = live_state.clone();
+                #[cfg(feature = "test-support")]
+                let pending = {
+                    testing_remap_pending.set(true);
+                    testing_remap_pending.clone()
+                };
                 kick.schedule(REMAP_RENDER_DELAY, move || {
+                    #[cfg(feature = "test-support")]
+                    pending.set(false);
                     let Some(widget) = widget.upgrade() else {
                         return;
                     };
@@ -3029,6 +3059,8 @@ impl NeovideEditorPane {
         }
 
         Self {
+            #[cfg(feature = "test-support")]
+            testing_remap_pending,
             widget: gl_area,
             shared,
             hole_changed_callbacks,
@@ -3463,7 +3495,7 @@ impl NeovideEditorPane {
             // delay, and a host may release the pane and restart it before the timer fires: the
             // session it finds then is a new nvim, whose stdin it must leave open.
             let ending = session.serial;
-            glib::timeout_add_local_once(schedule.hang_up_after, move || {
+            let ending_source = glib::timeout_add_local_once(schedule.hang_up_after, move || {
                 let Some(live) = live.upgrade() else { return };
                 let mut live = live.borrow_mut();
                 match &mut *live {
@@ -3475,6 +3507,10 @@ impl NeovideEditorPane {
                     _ => println!("[live] end_nvim: the session it was to end has gone; nothing to close"),
                 }
             });
+            #[cfg(feature = "test-support")]
+            test_support::ending_source(&ending_source);
+            #[cfg(not(feature = "test-support"))]
+            let _ = ending_source;
             println!(
                 "[live] end_nvim: nvim may be in its prompt: SIGTERM first, stdin closed in {:?}; watching pid \
                  {watched:?} until it has gone",
@@ -4069,34 +4105,42 @@ mod tests {
         let _owner = context
             .acquire()
             .expect("tests that run the default main context take DEFAULT_CONTEXT_TEST_LOCK first");
-        // Longer than the product's 50ms on purpose: "nothing in the same turn" is checked by running
-        // the loop once without blocking, and a test thread descheduled for longer than the delay
-        // would see the render fire there and fail for a reason that is not the code's.
-        let delay = Duration::from_millis(300);
         let renders = Rc::new(Cell::new(0));
         let kick = RemapKick::new();
-        let start = Instant::now();
+        let mut sources = Vec::new();
         for _ in 0..3 {
             let renders = renders.clone();
-            kick.schedule(delay, move || renders.set(renders.get() + 1));
+            kick.schedule(REMAP_RENDER_DELAY, move || renders.set(renders.get() + 1));
+            assert_eq!(
+                super::REMAP_SCHEDULED_DELAY.with(Cell::get),
+                Some(REMAP_RENDER_DELAY),
+                "the timeout must receive the requested delay before readiness is overridden"
+            );
+            let source = context
+                .find_source_by_id(kick.pending.borrow().as_ref().unwrap())
+                .unwrap();
+            // Disable readiness only after checking the duration passed to GLib.
+            unsafe { glib::ffi::g_source_set_ready_time(glib::translate::ToGlibPtr::to_glib_none(&source).0, -1) };
+            sources.push(source);
         }
-        while context.iteration(false) {}
-        assert_eq!(
-            renders.get(),
-            0,
-            "nothing in the turn the show happens in: it would coalesce into the first frame (6 of 8 right)"
-        );
-        while renders.get() == 0 && start.elapsed() < Duration::from_secs(2) {
-            context.iteration(true);
-        }
-        assert_eq!(renders.get(), 1, "three maps in a row ask for one render");
-        assert!(start.elapsed() >= delay);
-        let after = Instant::now();
-        while after.elapsed() < Duration::from_millis(150) {
+        for _ in 0..100 {
             context.iteration(false);
-            std::thread::sleep(Duration::from_millis(5));
         }
-        assert_eq!(renders.get(), 1, "and nothing after it");
+        assert_eq!(renders.get(), 0, "maps only schedule the render");
+        assert!(
+            sources[0].is_destroyed() && sources[1].is_destroyed(),
+            "a later map replaces its predecessor"
+        );
+        let source = sources.last().unwrap();
+        unsafe { glib::ffi::g_source_set_ready_time(glib::translate::ToGlibPtr::to_glib_none(source).0, 0) };
+        context.iteration(false);
+        assert_eq!(renders.get(), 1, "three maps ask for one render");
+        assert!(source.is_destroyed());
+        assert!(kick.pending.borrow().is_none());
+        for _ in 0..100 {
+            context.iteration(false);
+        }
+        assert_eq!(renders.get(), 1, "the completed source never fires again");
     }
 
     #[test]

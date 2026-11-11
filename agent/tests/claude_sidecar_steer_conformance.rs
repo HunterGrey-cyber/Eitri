@@ -165,17 +165,17 @@ fn print_commands(events: &[AgentDomainEvent]) {
     }
 }
 
-/// Starts a turn whose Bash call sleeps, and returns the turn's id once the call has started.
-fn start_a_sleeping_turn(
+/// Holds a Bash call until the test releases its file gate or interrupts it.
+fn start_a_gated_turn(
     provider: &ClaudeSidecarProvider,
     session_id: &str,
     batches: &mut Vec<Vec<AgentDomainEvent>>,
+    release: &std::path::Path,
 ) -> String {
     let turn = provider
         .send_turn(SendTurnRequest {
             session_id: session_id.to_string(),
-            text: "Run exactly this Bash command: sleep 8 && echo slept. Then reply with one short sentence."
-                .to_string(),
+            text: format!("Run exactly this Bash command: while [ ! -f '{}' ]; do sleep 0.01; done; echo released. Then reply with one short sentence.", release.display()),
         })
         .expect("send_turn should be accepted");
     pump_until(
@@ -201,20 +201,41 @@ fn steer(provider: &ClaudeSidecarProvider, session_id: &str, turn: &str, id: &st
         .expect("the sidecar takes a message while a tool runs");
 }
 
+fn wait_for_steer_ack(provider: &ClaudeSidecarProvider, session: &str, batches: &mut Vec<Vec<AgentDomainEvent>>) {
+    const FENCE: &str = "stale-turn-fence";
+    provider
+        .steer_turn(SteerTurnRequest {
+            session_id: session.into(),
+            expected_turn_id: "a-turn-that-does-not-exist".into(),
+            client_message_id: FENCE.into(),
+            text: "fence".into(),
+            as_typed: "fence".into(),
+        })
+        .expect("the fence waits behind the preceding steer");
+    pump_until(provider, session, batches, 120, "the stale turn's refusal", |all| {
+        all.iter().any(|event| matches!(event, AgentDomainEvent::UserMessageDropped { client_message_id, .. } if client_message_id == FENCE))
+    });
+    let all = flat(batches);
+    assert!(!all.iter().any(|event| matches!(event, AgentDomainEvent::UserMessageDropped { client_message_id, .. } if client_message_id != FENCE)), "the preceding steer must be accepted: {all:#?}");
+    for batch in batches {
+        batch.retain(|event| !matches!(event, AgentDomainEvent::UserMessageDropped { client_message_id, .. } if client_message_id == FENCE));
+    }
+}
+
 #[test]
 #[ignore]
-fn real_steer_during_a_bash_sleep_is_delivered_into_the_running_turn() {
+fn real_steer_during_a_gated_bash_is_delivered_into_the_running_turn() {
     let provider = connect();
     let session_id = create_session(&provider);
     let mut batches = Vec::new();
-    let turn = start_a_sleeping_turn(&provider, &session_id, &mut batches);
+    let gate = agent::state_dirs::test_workspace_dir("steer-bash-gate").join("release");
+    let turn = start_a_gated_turn(&provider, &session_id, &mut batches, &gate);
     steer(&provider, &session_id, &turn, "steer-tool-1");
+    wait_for_steer_ack(&provider, &session_id, &mut batches);
+    std::fs::write(&gate, b"").unwrap();
     pump_until(&provider, &session_id, &mut batches, 120, "the turn's end", |all| {
-        !turn_completed(all).is_empty()
+        !turn_completed(all).is_empty() && !outcomes(all).is_empty()
     });
-    // Anything left in flight lands too.
-    std::thread::sleep(Duration::from_millis(500));
-    batches.push(provider.pump());
     let all = flat(&batches);
     print_commands(&all);
 
@@ -245,11 +266,10 @@ fn real_steer_then_interrupt_runs_as_a_follow_up_whose_start_comes_with_the_end(
     let provider = connect();
     let session_id = create_session(&provider);
     let mut batches = Vec::new();
-    let turn = start_a_sleeping_turn(&provider, &session_id, &mut batches);
+    let gate = agent::state_dirs::test_workspace_dir("steer-bash-gate").join("release");
+    let turn = start_a_gated_turn(&provider, &session_id, &mut batches, &gate);
     steer(&provider, &session_id, &turn, "steer-interrupt-1");
-    // `steer_turn` returns before the message is sent (the provider's runtime sends it); give it time to
-    // reach the CLI, or the interrupt could end the turn first and the message would be refused.
-    std::thread::sleep(Duration::from_secs(1));
+    wait_for_steer_ack(&provider, &session_id, &mut batches);
     provider
         .interrupt_turn(InterruptTurnRequest {
             session_id: session_id.clone(),
@@ -261,10 +281,8 @@ fn real_steer_then_interrupt_runs_as_a_follow_up_whose_start_comes_with_the_end(
         &mut batches,
         120,
         "the follow-up's end",
-        |all| turn_completed(all).len() >= 2,
+        |all| turn_completed(all).len() >= 2 && !outcomes(all).is_empty(),
     );
-    std::thread::sleep(Duration::from_millis(500));
-    batches.push(provider.pump());
     let all = flat(&batches);
 
     let started = turn_started(&all);

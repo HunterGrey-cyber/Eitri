@@ -37,7 +37,7 @@ fn start_colored(script: &str, focused: bool, colors: TerminalColors) -> Harness
 #[test]
 fn printed_text_paints_ink_in_every_cell_on_the_themes_background() {
     const HELLO: &str = "hello-eitri";
-    let mut h = start(&format!("printf '{HELLO}\\n'; exec sleep 5"), true);
+    let mut h = start(&format!("printf '{HELLO}\\n'; read x"), true);
     h.wait_for(WAIT, |h| h.text().first().is_some_and(|l| l == HELLO));
     let list = h.frame.clone().unwrap();
     assert_eq!(list.surface_background, BG, "the theme's background, not xterm's black");
@@ -55,7 +55,7 @@ fn printed_text_paints_ink_in_every_cell_on_the_themes_background() {
 /// `eitri_core::wm::focus`).
 #[test]
 fn an_unfocused_cursor_is_hollow() {
-    let mut h = start("exec sleep 5", true);
+    let mut h = start("read x", true);
     h.wait_for(WAIT, |h| h.frame.is_some());
     let m = metrics();
     let bg = (BG.r, BG.g, BG.b);
@@ -75,7 +75,7 @@ fn an_unfocused_cursor_is_hollow() {
 /// white on near-white. It follows the theme's foreground instead.
 #[test]
 fn bold_default_text_stays_readable_on_a_light_background() {
-    let mut h = start(r"printf '\033[1mBOLD\033[0m'; exec sleep 5", true);
+    let mut h = start(r"printf '\033[1mBOLD\033[0m'; read x", true);
     h.wait_for(WAIT, |h| h.text().first().is_some_and(|l| l == "BOLD"));
     let colors = h.frame.as_ref().unwrap().ops.iter().find_map(|op| match op {
         terminal_render::PaintOp::DrawText {
@@ -98,7 +98,7 @@ fn a_block_cursor_on_a_cell_a_program_painted_takes_that_cells_colours_swapped()
         cursor: None,
     };
     // rose-pine dawn's own pair, painted by the program, then the cursor put back onto it.
-    let script = r"printf '\033[48;2;250;244;237m\033[38;2;87;82;121mX\033[0m\033[1;1H'; exec sleep 5";
+    let script = r"printf '\033[48;2;250;244;237m\033[38;2;87;82;121mX\033[0m\033[1;1H'; read x";
     let mut h = start_colored(script, true, dark_theme);
     let cursor_home = |h: &Harness| {
         h.frame.as_ref().is_some_and(|list| {

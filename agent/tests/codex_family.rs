@@ -17,6 +17,10 @@ use std::ffi::OsString;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
+#[path = "support/script_gate.rs"]
+mod script_gate;
+use script_gate::{until, ScriptGate};
+
 const UA: &str = "eitri-probe/0.160.0 (Arch Linux Rolling Release; x86_64) tmux-256color (eitri-probe; 0)";
 const FIXTURES: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/codex");
 
@@ -220,39 +224,6 @@ fn pump_on(
         assert!(Instant::now() < end, "timed out; the events so far: {seen:#?}");
         std::thread::sleep(Duration::from_millis(5));
     }
-}
-
-/// Pumps until a turn completes; the pump that reads it must return no earlier than `not_before`, the first
-/// instant the stand-in can have written it. An earlier completion is the provider ending the turn on its
-/// own; a later one is only a test thread that was held up, which cannot tell the two apart by what it read.
-fn until_completed_not_before(provider: &CodexProvider, not_before: Instant, why: &str) -> Vec<AgentDomainEvent> {
-    let mut seen = Vec::new();
-    let end = Instant::now() + Duration::from_secs(20);
-    loop {
-        let read = provider.pump();
-        let at = Instant::now();
-        seen.extend(read);
-        if seen.iter().any(is_completed) {
-            assert!(
-                at >= not_before,
-                "the turn ended before it could have: {why}: {seen:#?}"
-            );
-            return seen;
-        }
-        assert!(Instant::now() < end, "timed out; the events so far: {seen:#?}");
-        std::thread::sleep(Duration::from_millis(5));
-    }
-}
-
-/// Pumps for a fixed time, for the cases where what must not happen yet is the point.
-fn pump_for(provider: &CodexProvider, time: Duration) -> Vec<AgentDomainEvent> {
-    let mut seen = Vec::new();
-    let end = Instant::now() + time;
-    while Instant::now() < end {
-        seen.extend(provider.pump());
-        std::thread::sleep(Duration::from_millis(5));
-    }
-    seen
 }
 
 fn is_completed(e: &AgentDomainEvent) -> bool {
@@ -672,7 +643,9 @@ fn collab_receivers_join_from_members_only_and_an_early_turn_is_kept() {
     let early = pump_until(&provider, |events| events.iter().any(tool_started(child_cmd.clone())));
     let early = {
         let mut all = early;
-        all.extend(pump_for(&provider, Duration::from_millis(150)));
+        provider.pause_time_for_tests();
+        until(|| provider.lines_read_for_tests() >= 11);
+        all.extend(provider.pump());
         all
     };
     assert!(
@@ -684,7 +657,13 @@ fn collab_receivers_join_from_members_only_and_an_early_turn_is_kept() {
         "a receiver named from outside the family is not a member: {early:#?}"
     );
     interrupt(&provider, &thread);
-    let events = until_turn_completed(&provider);
+    until(|| provider.lines_read_for_tests() >= 12);
+    let mut events = provider.pump();
+    provider.advance_time_for_tests(agent::providers::codex::provider::INTERRUPT_SETTLE);
+    until(|| {
+        events.extend(provider.pump());
+        events.iter().any(is_completed)
+    });
     let (turn, outcome, _) = ended(&events);
     assert_eq!(turn, "t1");
     assert_eq!(outcome, TurnOutcome::Interrupted);
@@ -1114,7 +1093,9 @@ fn interrupting_a_family_running_only_unnamed_turns_ends_the_tabs_turn() {
             turn_response(5, "t2"),
         ],
     );
-    let early = pump_for(&provider, Duration::from_millis(300));
+    provider.pause_time_for_tests();
+    until(|| provider.lines_read_for_tests() >= 7);
+    let early = provider.pump();
     assert!(
         !early.iter().any(is_completed),
         "the tab's turn ended while its child ran: {early:#?}"
@@ -1143,7 +1124,9 @@ fn an_unnamed_turn_is_not_waited_on_once_the_named_ones_ended_after_an_interrupt
             turn_response(6, "t2"),
         ],
     );
-    pump_for(&provider, Duration::from_millis(300));
+    provider.pause_time_for_tests();
+    until(|| provider.lines_read_for_tests() >= 6);
+    provider.pump();
     interrupt(&provider, &thread);
     let events = until_turn_completed(&provider);
     let (turn, outcome, _) = ended(&events);
@@ -1191,6 +1174,7 @@ fn interrupting_the_tabs_own_unnamed_turn_ends_it() {
 
 #[test]
 fn interrupt_reaches_every_running_family_turn() {
+    let gate = ScriptGate::new();
     let (provider, thread) = running(
         "tab",
         "t1",
@@ -1201,7 +1185,7 @@ fn interrupt_reaches_every_running_family_turn() {
             expect_interrupt(5, "tab", "t1"),
             expect_interrupt(6, "child", "c1"),
             turn_completed("child", "c1", "interrupted"),
-            json!({"sleep_ms": 400}),
+            gate.step(),
             turn_completed("tab", "t1", "interrupted"),
             // A third interrupt would have taken id 7.
             expect_request(7, "turn/start"),
@@ -1212,16 +1196,20 @@ fn interrupt_reaches_every_running_family_turn() {
         events.iter().any(|e| matches!(e, AgentDomainEvent::TurnStarted { .. }))
     });
     // Let the announcement and the child's start be read.
-    pump_for(&provider, Duration::from_millis(100));
-    let interrupted_at = Instant::now();
+    provider.pause_time_for_tests();
+    until(|| provider.lines_read_for_tests() >= 6);
+    provider.pump();
+    provider.pause_time_for_tests();
     for _ in 0..3 {
         interrupt(&provider, &thread);
     }
-    let events = until_completed_not_before(
-        &provider,
-        interrupted_at + Duration::from_millis(400),
-        "the child ended",
-    );
+    gate.wait();
+    provider.pause_time_for_tests();
+    until(|| provider.lines_read_for_tests() >= 7);
+    let before = provider.pump();
+    assert!(!before.iter().any(is_completed), "the parent's turn is still running");
+    gate.release();
+    let events = pump_on(&provider, before, |events| events.iter().any(is_completed));
     match &events[position(&events, is_completed)] {
         AgentDomainEvent::TurnCompleted { turn_id, outcome, .. } => {
             assert_eq!(turn_id, "t1");
@@ -1249,7 +1237,9 @@ fn interrupting_after_the_parent_ended_stops_the_child_and_ends_interrupted() {
             turn_completed("child", "c1", "interrupted"),
         ],
     );
-    pump_for(&provider, Duration::from_millis(150));
+    provider.pause_time_for_tests();
+    until(|| provider.lines_read_for_tests() >= 7);
+    provider.pump();
     interrupt(&provider, &thread);
     let events = until_turn_completed(&provider);
     match &events[position(&events, is_completed)] {
@@ -1475,6 +1465,7 @@ fn stranger_thread_request_is_declined_and_logged() {
 
 #[test]
 fn closing_mid_child_interrupts_the_family() {
+    let gate = ScriptGate::new();
     let (provider, thread) = running(
         "tab",
         "t1",
@@ -1491,9 +1482,9 @@ fn closing_mid_child_interrupts_the_family() {
             expect_interrupt(5, "tab", "t1"),
             expect_interrupt(6, "child", "c1"),
             expect_exact(r#"{"id":7,"method":"thread/unsubscribe","params":{"threadId":"tab"}}"#),
-            // The answer comes late. A script that did not see all three lines in order has already
-            // exited, so a close that comes back sooner than this saw something else.
-            json!({"sleep_ms": 700}),
+            // Reaching the gate proves all three requests arrived in order. Hold the answer while
+            // observing whether close has returned.
+            gate.step(),
             write(json!({"id": 7, "result": {"status": "unsubscribed"}})),
         ],
     );
@@ -1502,17 +1493,17 @@ fn closing_mid_child_interrupts_the_family() {
     });
     let pid = provider.pid();
     assert!(alive(pid));
-    let began = Instant::now();
-    provider
-        .close_session(CloseSessionRequest { session_id: thread })
-        .expect("closes");
-    let took = began.elapsed();
-    assert!(
-        took >= Duration::from_millis(600),
-        "the interrupts and the unsubscribe were all read in order (took {took:?})"
-    );
-    // After the answer the stand-in reads stdin until EOF: only an EOF lets it go before the 6 s grace.
-    assert!(took < Duration::from_secs(4), "took {took:?}");
+    std::thread::scope(|scope| {
+        let closing = scope.spawn(|| provider.close_on_eof_for_tests(CloseSessionRequest { session_id: thread }));
+        gate.wait();
+        assert!(alive(pid), "the child still holds the unsubscribe answer");
+        assert!(
+            !closing.is_finished(),
+            "close has not returned at the child's unsubscribe checkpoint"
+        );
+        gate.release();
+        assert!(closing.join().unwrap(), "the child exits on EOF before grace expires");
+    });
     assert!(!alive(pid), "the child is gone and reaped");
     let events = provider.pump();
     assert_eq!(
@@ -1586,6 +1577,7 @@ fn more_early_turns_than_are_kept_end_the_session() {
 /// meanwhile too, not only the tab's own turn.
 #[test]
 fn an_interrupt_before_the_turn_id_reaches_the_family() {
+    let gate = ScriptGate::new();
     let (provider, thread) = running(
         "tab",
         "t1",
@@ -1595,7 +1587,7 @@ fn an_interrupt_before_the_turn_id_reaches_the_family() {
             expect_request(5, "turn/start"),
             // Read while the answer is awaited, so held until it comes.
             turn_started("child", "c2"),
-            json!({"sleep_ms": 400}),
+            gate.step(),
             turn_response(5, "t2"),
             expect_interrupt(6, "tab", "t2"),
             expect_interrupt(7, "child", "c2"),
@@ -1606,12 +1598,13 @@ fn an_interrupt_before_the_turn_id_reaches_the_family() {
     pump_until(&provider, |events| events.iter().any(is_completed));
     std::thread::scope(|scope| {
         let sending = scope.spawn(|| send(&provider, &thread, "again"));
-        std::thread::sleep(Duration::from_millis(200));
+        gate.wait();
         provider
             .interrupt_turn(InterruptTurnRequest {
                 session_id: thread.clone(),
             })
             .expect("taken while the start is awaited");
+        gate.release();
         assert_eq!(sending.join().expect("the send").expect("the turn starts"), "t2");
     });
     let events = pump_until(&provider, |events| events.iter().any(is_completed));
@@ -1702,6 +1695,7 @@ fn a_subagent_key_in_the_tab_s_own_item_is_not_shown() {
 /// subagent's turn opened the tab's turn first; the subagent's own turn is left alone.
 #[test]
 fn a_timed_out_turn_that_joins_a_subagent_turn_is_interrupted() {
+    let gate = ScriptGate::new();
     let (provider, thread) = running(
         "tab",
         "t1",
@@ -1709,7 +1703,7 @@ fn a_timed_out_turn_that_joins_a_subagent_turn_is_interrupted() {
             announce("tab", "t1", "child", "/root/child"),
             turn_completed("tab", "t1", "completed"),
             expect_request(5, "turn/start"),
-            json!({"sleep_ms": agent::UNARY_RPC_TIMEOUT.as_millis() as u64 + 500}),
+            gate.step(),
             turn_started("child", "c3"),
             turn_started("tab", "t2"),
             expect_interrupt(6, "tab", "t2"),
@@ -1720,6 +1714,7 @@ fn a_timed_out_turn_that_joins_a_subagent_turn_is_interrupted() {
     );
     pump_until(&provider, |events| events.iter().any(is_completed));
     assert!(matches!(send(&provider, &thread, "again"), Err(ProviderError::Timeout)));
+    gate.release();
     let events = pump_until(&provider, |events| events.iter().any(is_completed));
     assert!(
         events.iter().any(|e| matches!(
@@ -1764,8 +1759,12 @@ fn a_child_that_does_not_end_after_its_interrupt_stops_the_session_and_the_turn_
             // The child never ends; the stand-in reads its input to the end and answers nothing more.
         ],
     );
-    pump_for(&provider, Duration::from_millis(300));
+    provider.pause_time_for_tests();
+    until(|| provider.lines_read_for_tests() >= 6);
+    provider.pump();
+    provider.pause_time_for_tests();
     interrupt(&provider, &thread);
+    provider.advance_time_for_tests(agent::providers::codex::provider::INTERRUPT_SETTLE);
     let events = pump_until(&provider, |events| {
         events
             .iter()
@@ -1780,6 +1779,7 @@ fn a_child_that_does_not_end_after_its_interrupt_stops_the_session_and_the_turn_
 /// saying so, rather than sent to Codex to be refused as "no active turn".
 #[test]
 fn a_message_while_only_a_subagent_runs_is_refused_unsent() {
+    let gate = ScriptGate::new();
     let (provider, thread) = running(
         "th-sub",
         "t-own",
@@ -1790,7 +1790,7 @@ fn a_message_while_only_a_subagent_runs_is_refused_unsent() {
             turn_completed("th-sub", "t-own", "completed"),
             json!({"sleep_ms": 100}),
             turn_started("child", "c-2"),
-            json!({"sleep_ms": 1500}),
+            gate.step(),
             turn_completed("child", "c-2", "completed"),
         ],
     );
@@ -1814,5 +1814,6 @@ fn a_message_while_only_a_subagent_runs_is_refused_unsent() {
         }
         other => panic!("expected a refusal, got {other:?}"),
     }
+    gate.release();
     until_turn_completed(&provider);
 }

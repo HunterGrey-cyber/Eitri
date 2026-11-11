@@ -1,8 +1,6 @@
 //! The shell's transparent editor rectangle and themed surroundings, rendered on a private Xvfb.
 //! Run with `cargo test -p shell --test editor_hole_pixels -- --ignored`.
 
-use std::time::{Duration, Instant};
-
 use gtk4::prelude::*;
 use gtk4::{gdk, graphene};
 
@@ -54,13 +52,12 @@ const OUTSIDE: [(usize, usize); 16] = [
     (790, 590),
 ];
 
+#[allow(dead_code)]
+#[path = "support/frame_turns.rs"]
+mod frame_turns;
+
 fn pump() {
-    let context = gtk4::glib::MainContext::default();
-    let end = Instant::now() + Duration::from_millis(150);
-    while Instant::now() < end {
-        while context.iteration(false) {}
-        std::thread::sleep(Duration::from_millis(2));
-    }
+    frame_turns::settle();
 }
 
 fn rgba(bytes: [u8; 4]) -> gdk::RGBA {

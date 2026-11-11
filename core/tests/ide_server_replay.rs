@@ -33,7 +33,6 @@ use serde_json::{json, Value as Json};
 /// How long the test waits for something that must happen. Never an expected time.
 const PATIENCE: Duration = Duration::from_secs(20);
 /// How long a test listens for something that must not happen.
-const QUIET: Duration = Duration::from_millis(300);
 const STEP: Duration = Duration::from_millis(5);
 
 /// How many windows of proposal views stand, in every tabpage.
@@ -245,14 +244,19 @@ impl Replay {
         }
     }
 
-    /// Everything the server sends for `within`, notes first.
-    fn listen(&mut self, client: &mut IdeClient, within: Duration) -> Vec<Json> {
-        let until = Instant::now() + within;
+    /// Sample completed request turns, with the editor's scheduled work drained before each ping.
+    fn listen(&mut self, client: &mut IdeClient) -> Vec<Json> {
         let mut heard = std::mem::take(&mut self.notes);
-        while Instant::now() < until {
+        for _ in 0..20 {
+            self.nvim.flush_scheduled();
             self.pump();
-            if client.waiting_within(STEP) {
-                heard.push(client.read_message());
+            client.request(99999, "ping", json!({}));
+            loop {
+                let message = self.message(client);
+                if message["id"] == 99999 {
+                    break;
+                }
+                heard.push(message);
             }
         }
         heard
@@ -437,7 +441,7 @@ fn a_turn_goes_frame_for_frame() {
     let all: Json = serde_json::from_str(&texts(&all)[0]).expect("JSON text");
     assert_eq!(all[0]["uri"], baseline[0]["uri"], "{all}");
 
-    let again = replay.listen(&mut client, QUIET);
+    let again = replay.listen(&mut client);
     assert!(
         !again.iter().any(|message| is_push(message, "selection_changed")),
         "the first push came once: {again:?}"
@@ -474,7 +478,7 @@ fn a_closed_view_leaves_the_prompt_to_the_terminal() {
     replay.open_diff(&mut client, 2, &edited, "one\n2\n", "tab one");
     replay.press(",q");
     replay.pump_until("the view to go", |replay| replay.view_windows() == 0);
-    let heard = replay.listen(&mut client, QUIET);
+    let heard = replay.listen(&mut client);
     assert!(
         heard.iter().all(|message| message.get("id").is_none()),
         "the person closing a view answers nothing: {heard:?}"
@@ -597,7 +601,7 @@ fn the_first_push_comes_on_connect() {
             && (replay.facts)().is_some_and(|facts| facts.cursor_line == Some(3))
     });
     let mut client = replay.attach();
-    let early = replay.listen(&mut client, QUIET);
+    let early = replay.listen(&mut client);
     assert!(
         early.is_empty(),
         "nothing is pushed before the client says it is ready: {early:?}"
@@ -607,7 +611,7 @@ fn the_first_push_comes_on_connect() {
     assert_eq!(first, cursor_form(&path, 2));
     // `ide_connected` comes after the push, and a second readiness signal does not push again.
     client.notify("ide_connected", json!({"pid": std::process::id()}));
-    let more = replay.listen(&mut client, QUIET);
+    let more = replay.listen(&mut client);
     assert!(more.is_empty(), "one push, once: {more:?}");
 }
 
@@ -684,7 +688,7 @@ fn a_mention_outside_sends_nothing() {
     let mut client = replay.connect();
     replay.pump_until("the command", |replay| replay.mention_command_defined());
     replay.nvim.command("EitriMention");
-    let heard = replay.listen(&mut client, QUIET);
+    let heard = replay.listen(&mut client);
     assert!(
         !heard.iter().any(|message| is_push(message, "at_mentioned")),
         "nothing was sent: {heard:?}"

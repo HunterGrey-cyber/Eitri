@@ -105,3 +105,16 @@ mod tests {
 pub(crate) fn write_private(path: impl AsRef<Path>, bytes: impl AsRef<[u8]>) -> std::io::Result<()> {
     crate::private_fs::write_private(path.as_ref(), bytes.as_ref())
 }
+
+/// Waits for a result; the deadline only prevents a broken operation hanging the suite.
+pub(crate) fn completed<T: Send + 'static>(work: impl FnOnce() -> T + Send + 'static) -> T {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let worker = std::thread::spawn(move || {
+        let _ = tx.send(work());
+    });
+    let result = rx
+        .recv_timeout(std::time::Duration::from_secs(60))
+        .expect("operation hung");
+    worker.join().unwrap();
+    result
+}

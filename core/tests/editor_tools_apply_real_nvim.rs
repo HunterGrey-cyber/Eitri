@@ -136,7 +136,8 @@ impl Test {
         std::fs::write(&b, "foo\n").unwrap();
 
         let feed = EditorContextFeed::new().expect("the feed must bind");
-        let mut nvim = Embed::start_fed(&dir, &feed, &["--cmd", RELOAD_CMD]);
+        let manual = format!("lua {}", include_str!("support/manual_timers.lua"));
+        let mut nvim = Embed::start_fed(&dir, &feed, &["--cmd", &manual, "--cmd", RELOAD_CMD]);
         let path = |file: &Path| Value::from(file.to_string_lossy().as_ref());
         let buf = nvim.lua(OPEN, vec![path(&a)]);
         let config = map(&[
@@ -313,7 +314,7 @@ fn a_buffer_in_no_window_catches_up_when_it_is_shown() {
     t.allow(&card);
     let result = t.answered();
     assert!(!result.is_error, "{}", result.text);
-    std::thread::sleep(RELOADED_WITHIN);
+    t.rpc.0.borrow_mut().advance_timers(RELOADED_WITHIN.as_millis() as u64);
     assert_eq!(t.lines(), Value::Array(vec!["foo".into()]), "two ticks passed it by");
     t.show();
     assert_eq!(t.lines(), Value::Array(vec!["bar".into()]));

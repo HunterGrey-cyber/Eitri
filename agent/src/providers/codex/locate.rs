@@ -171,9 +171,21 @@ mod tests {
     use super::*;
     use std::collections::HashSet;
 
-    fn files(list: &[&str]) -> impl Fn(&Path) -> bool {
+    fn files(list: &[&str]) -> impl Fn(&Path) -> bool + use<> {
         let set: HashSet<PathBuf> = list.iter().map(PathBuf::from).collect();
         move |p| set.contains(p)
+    }
+
+    #[test]
+    fn rpit_capture_contracts() {
+        let (is_file, env) = {
+            let path = String::from("/owned/codex");
+            let key = String::from("HOME");
+            let value = String::from("/owned");
+            (files(&[&path]), env_of(&[(&key, &value)]))
+        };
+        assert!(is_file(Path::new("/owned/codex")));
+        assert_eq!(env("HOME"), Some(std::ffi::OsString::from("/owned")));
     }
 
     #[test]
@@ -248,7 +260,7 @@ mod tests {
         // No PATH at all.
         assert_eq!(decide_codex(None, None, None, &is_file), Err(LocateError::NotOnPath));
     }
-    fn env_of(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<std::ffi::OsString> {
+    fn env_of(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<std::ffi::OsString> + use<> {
         let owned: Vec<(String, String)> = pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();
         move |name| {
             owned

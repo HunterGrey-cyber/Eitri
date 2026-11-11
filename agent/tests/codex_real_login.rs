@@ -203,7 +203,7 @@ fn reviewer_rows_appear_in_auto() {
     eprintln!("model: {model}, effort {}", effort());
     let thread = login_thread(&mut peer, &project, DirTrust::Untrusted, Reviewer::Agent, &model);
     let status = login_turn(&mut peer, &thread.id, Reviewer::Agent, &escalate_prompt(&target));
-    peer.pump_for(Duration::from_secs(1));
+    peer.pump();
     eprintln!("turn {status}; target created: {}", target.exists());
 
     let started = peer.note(method::AUTO_REVIEW_STARTED).cloned();
@@ -249,7 +249,7 @@ fn decline_continues_on_a_real_model() {
     eprintln!("model: {model}, effort {}", effort());
     let thread = login_thread(&mut peer, &project, DirTrust::Untrusted, Reviewer::User, &model);
     let status = login_turn(&mut peer, &thread.id, Reviewer::User, &escalate_prompt(&target));
-    peer.pump_for(Duration::from_secs(1));
+    peer.pump();
     assert!(
         model_tried(&peer),
         "the model never asked to leave the sandbox, so nothing was declined: {:?}",
@@ -308,7 +308,7 @@ fn mcp_approval_card_with_a_local_server() {
         "Call the `ping` tool of the `eitri_local` tool server exactly once, with no arguments, then reply with \
          what it returned.",
     );
-    peer.pump_for(Duration::from_secs(1));
+    peer.pump();
     let forms: Vec<Req> = peer
         .requests
         .iter()

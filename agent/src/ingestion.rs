@@ -1415,8 +1415,16 @@ fn ingest_loop(
         // The stop is looked at again under the signal's lock: one that landed after the check above
         // already raised the signal before `seen` was read, so the count alone would not end this
         // wait.
-        (Some(signal), Some(seen)) => signal.wait_past_unless(seen, || stop.load(Ordering::SeqCst)),
-        _ => std::thread::sleep(INGEST_POLL_INTERVAL),
+        (Some(signal), Some(seen)) => {
+            #[cfg(test)]
+            idle_wakeups::at_idle(&context.conversation_id, true);
+            signal.wait_past_unless(seen, || stop.load(Ordering::SeqCst));
+        }
+        _ => {
+            #[cfg(test)]
+            idle_wakeups::at_idle(&context.conversation_id, false);
+            std::thread::sleep(INGEST_POLL_INTERVAL);
+        }
     };
     let mut record_tried_at = None;
     while !stop.load(Ordering::SeqCst) {
@@ -3665,7 +3673,7 @@ mod history_snapshot_cost {
 }
 
 #[cfg(test)]
-mod idle_wakeups {
+pub(crate) mod idle_wakeups {
     use super::*;
     use crate::provider::*;
     use std::sync::atomic::AtomicUsize;
@@ -3793,17 +3801,80 @@ mod idle_wakeups {
         }
     }
 
-    fn start(provider: Arc<dyn AgentProvider + Send + Sync>) -> ConversationIngest {
-        ConversationIngest::start(
+    type IdleHook = Arc<dyn Fn(bool) + Send + Sync>;
+    static IDLE_HOOKS: Mutex<Vec<(String, IdleHook)>> = Mutex::new(Vec::new());
+
+    pub(super) fn at_idle(id: &str, event_wait: bool) {
+        let hook = IDLE_HOOKS
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|(key, _)| key == id)
+            .map(|(_, hook)| hook.clone());
+        if let Some(hook) = hook {
+            hook(event_wait);
+        }
+    }
+
+    // Parks at the actual wait branch, after releasing the batch gate. Dropping the probe
+    // releases a parked worker even when an assertion unwinds.
+    pub(crate) struct IdleProbe {
+        id: String,
+        parked: std::sync::mpsc::Receiver<bool>,
+        resume: Option<std::sync::mpsc::Sender<()>>,
+    }
+
+    impl IdleProbe {
+        pub(crate) fn new(id: &str) -> Self {
+            let (park_tx, parked) = std::sync::mpsc::channel();
+            let (resume, go) = std::sync::mpsc::channel();
+            let go = Mutex::new(go);
+            IDLE_HOOKS.lock().unwrap().push((
+                id.into(),
+                Arc::new(move |event_wait| {
+                    let _ = park_tx.send(event_wait);
+                    let _ = go.lock().unwrap().recv();
+                }),
+            ));
+            Self {
+                id: id.into(),
+                parked,
+                resume: Some(resume),
+            }
+        }
+
+        pub(crate) fn parked(&self) -> bool {
+            self.parked
+                .recv_timeout(std::time::Duration::from_secs(60))
+                .expect("worker never reached idle")
+        }
+
+        pub(crate) fn resume(&self) {
+            self.resume.as_ref().unwrap().send(()).unwrap();
+        }
+    }
+
+    impl Drop for IdleProbe {
+        fn drop(&mut self) {
+            IDLE_HOOKS.lock().unwrap().retain(|(id, _)| id != &self.id);
+            self.resume.take();
+        }
+    }
+
+    fn observed(provider: Arc<dyn AgentProvider + Send + Sync>) -> (ConversationIngest, IdleProbe) {
+        let id = uuid::Uuid::new_v4().to_string();
+        let probe = IdleProbe::new(&id);
+        let ingest = ConversationIngest::start(
             provider,
             "claude",
-            "c".into(),
+            id,
             "/tmp/ws".into(),
             false,
             None,
             None,
             AgentSessionProjection::default(),
-        )
+        );
+        (ingest, probe)
     }
 
     fn wait_for(what: &str, done: impl Fn() -> bool) {
@@ -3820,11 +3891,15 @@ mod idle_wakeups {
     #[test]
     fn an_announcing_provider_is_not_polled_while_it_is_quiet() {
         let provider = Arc::new(Announcing::default());
-        let mut ingest = start(provider.clone());
-        wait_for("the first pump", || provider.quiet.pumps.load(Ordering::Relaxed) >= 1);
-        std::thread::sleep(std::time::Duration::from_millis(500));
-        let idle = provider.quiet.pumps.load(Ordering::Relaxed);
-        assert!(idle <= 2, "asked {idle} times in half a second of silence");
+        let (mut ingest, probe) = observed(provider.clone());
+        assert!(probe.parked(), "an announcing provider waits on its signal");
+        let seen = provider.signal.seen();
+        probe.resume();
+        wait_for("the unchanged signal's condvar wait", || {
+            provider.signal.blocked_for_tests(seen)
+        });
+        assert_eq!(provider.signal.seen(), seen);
+        assert_eq!(provider.quiet.pumps.load(Ordering::Relaxed), 1);
 
         provider
             .quiet
@@ -3833,16 +3908,13 @@ mod idle_wakeups {
             .unwrap()
             .push(AgentDomainEvent::UserPromptSubmitted { text: "hi".into() });
         provider.signal.raise();
+        assert!(probe.parked());
         wait_for("the announced event's fold", || {
             ingest.projection().user_prompts.len() == 1
         });
 
-        let started = std::time::Instant::now();
-        ingest.stop();
-        assert!(
-            started.elapsed() < std::time::Duration::from_secs(1),
-            "a sleeping thread is woken to stop"
-        );
+        drop(probe);
+        crate::test_tmp::completed(move || ingest.stop());
     }
 
     /// The UI is told after a fold, so it need not poll for deliveries: once when it installs its wake (for
@@ -3850,8 +3922,8 @@ mod idle_wakeups {
     #[test]
     fn the_ui_is_woken_by_a_fold_and_only_by_one() {
         let provider = Arc::new(Announcing::default());
-        let ingest = start(provider.clone());
-        wait_for("the first pump", || provider.quiet.pumps.load(Ordering::Relaxed) >= 1);
+        let (ingest, probe) = observed(provider.clone());
+        assert!(probe.parked());
         let wakes = Arc::new(AtomicUsize::new(0));
         assert!(!ingest.has_ui_wake());
         {
@@ -3862,7 +3934,7 @@ mod idle_wakeups {
         }
         assert!(ingest.has_ui_wake());
         assert_eq!(wakes.load(Ordering::SeqCst), 1, "installing it wakes once");
-        std::thread::sleep(std::time::Duration::from_millis(200));
+
         assert_eq!(wakes.load(Ordering::SeqCst), 1, "a quiet provider wakes nothing");
 
         provider
@@ -3872,6 +3944,8 @@ mod idle_wakeups {
             .unwrap()
             .push(AgentDomainEvent::UserPromptSubmitted { text: "hi".into() });
         provider.signal.raise();
+        probe.resume();
+        assert!(probe.parked());
         wait_for("the wake after the fold", || wakes.load(Ordering::SeqCst) == 2);
         assert!(
             matches!(ingest.take_delivery(), UiDelivery::Events(ref events) if events.len() == 1),
@@ -3880,8 +3954,9 @@ mod idle_wakeups {
 
         ingest.fold_locally(AgentDomainEvent::UserPromptSubmitted { text: "again".into() });
         assert_eq!(wakes.load(Ordering::SeqCst), 3, "a local fold wakes at once");
-        std::thread::sleep(std::time::Duration::from_millis(100));
+
         assert_eq!(wakes.load(Ordering::SeqCst), 3);
+        drop(probe);
     }
 
     /// A freeze asked while the thread has a batch in hand is refused at once instead of waiting for the
@@ -3890,7 +3965,8 @@ mod idle_wakeups {
     #[test]
     fn a_freeze_never_waits_for_a_batch_in_hand() {
         let provider = Arc::new(Stalling::default());
-        let ingest = start(provider.clone());
+        let (ingest, probe) = observed(provider.clone());
+        assert!(probe.parked());
         wait_for("the first pump", || {
             provider.announcing.quiet.pumps.load(Ordering::Relaxed) >= 1
         });
@@ -3898,6 +3974,7 @@ mod idle_wakeups {
         let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
         *provider.stall.lock().unwrap() = Some((inside_tx, release_rx));
         provider.announcing.signal.raise();
+        probe.resume();
         inside_rx
             .recv_timeout(std::time::Duration::from_secs(5))
             .expect("the thread takes a batch");
@@ -3918,7 +3995,8 @@ mod idle_wakeups {
             "a refused freeze changes nothing"
         );
 
-        wait_for("the freeze once the batch is done", || ingest.try_freeze());
+        assert!(probe.parked());
+        assert!(ingest.try_freeze());
         provider
             .announcing
             .quiet
@@ -3927,15 +4005,19 @@ mod idle_wakeups {
             .unwrap()
             .push(AgentDomainEvent::UserPromptSubmitted { text: "hi".into() });
         provider.announcing.signal.raise();
-        std::thread::sleep(std::time::Duration::from_millis(100));
+        probe.resume();
+        assert!(probe.parked());
         assert!(
             ingest.projection().user_prompts.is_empty(),
             "nothing is folded while frozen"
         );
         ingest.unfreeze();
+        probe.resume();
+        assert!(probe.parked());
         wait_for("the fold after the freeze is let go", || {
             ingest.projection().user_prompts.len() == 1
         });
+        drop(probe);
     }
 
     type Hook = Arc<dyn Fn() + Send + Sync>;
@@ -4020,11 +4102,16 @@ mod idle_wakeups {
     #[test]
     fn a_provider_that_announces_nothing_is_still_polled() {
         let provider = Arc::new(Quiet::default());
-        let mut ingest = start(provider.clone());
-        std::thread::sleep(std::time::Duration::from_millis(200));
-        let pumps = provider.pumps.load(Ordering::Relaxed);
+        let (mut ingest, probe) = observed(provider.clone());
+        for expected in 1..=10 {
+            assert!(!probe.parked(), "a quiet provider uses the polling branch");
+            assert_eq!(provider.pumps.load(Ordering::Relaxed), expected);
+            if expected < 10 {
+                probe.resume();
+            }
+        }
+        drop(probe);
         ingest.stop();
-        assert!(pumps >= 10, "asked only {pumps} times in 200 ms");
     }
 }
 

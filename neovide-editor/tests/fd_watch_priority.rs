@@ -9,7 +9,6 @@
 use std::cell::Cell;
 use std::os::fd::RawFd;
 use std::rc::Rc;
-use std::time::{Duration, Instant};
 
 use neovide_editor::fd_watch;
 
@@ -17,10 +16,9 @@ const GDK_PRIORITY_REDRAW: i32 = 120;
 
 type Wake = Box<dyn FnMut(glib::IOCondition) -> glib::ControlFlow>;
 
-/// Runs the default context for `span` with an always-readable pipe watched by the source `add`
-/// makes, and a 5 ms timer at the paint priority; returns (paints, watch dispatches, the watch's
+/// Runs 100 context turns with an always-readable pipe and an always-ready paint source; returns (paints, watch dispatches, the watch's
 /// priority as the context holds it).
-fn run(add: impl FnOnce(RawFd, Wake) -> glib::SourceId, span: Duration) -> (u32, u32, Option<i32>) {
+fn run(add: impl FnOnce(RawFd, Wake) -> glib::SourceId) -> (u32, u32, Option<i32>) {
     let mut fds = [0 as RawFd; 2];
     // SAFETY: a valid two-int array.
     assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
@@ -42,22 +40,15 @@ fn run(add: impl FnOnce(RawFd, Wake) -> glib::SourceId, span: Duration) -> (u32,
     let priority = fd_watch::source_priority(&watch);
     let paint = {
         let paints = paints.clone();
-        glib::timeout_add_local_full(
-            Duration::from_millis(5),
-            glib::Priority::from(GDK_PRIORITY_REDRAW),
-            move || {
-                paints.set(paints.get() + 1);
-                glib::ControlFlow::Continue
-            },
-        )
+        glib::idle_add_local_full(glib::Priority::from(GDK_PRIORITY_REDRAW), move || {
+            paints.set(paints.get() + 1);
+            glib::ControlFlow::Continue
+        })
     };
 
     let context = glib::MainContext::default();
-    let start = Instant::now();
-    while start.elapsed() < span {
-        // Never blocks for long: the watch is always ready when it is allowed to run.
+    for _ in 0..100 {
         context.iteration(false);
-        std::thread::sleep(Duration::from_micros(200));
     }
 
     // The contract: the source is removed before its fd closes.
@@ -86,24 +77,22 @@ fn a_readable_fd_watch_below_the_paint_priority_never_starves_a_paint() {
 
     // The control: at the default priority the flood wins, which is Codex's measurement (200
     // dispatches, 0 paints) -- if this stops holding the probe below proves nothing.
-    let (paints, dispatches, _) = run(at(glib::ffi::G_PRIORITY_DEFAULT), Duration::from_millis(200));
+    let (paints, dispatches, _) = run(at(glib::ffi::G_PRIORITY_DEFAULT));
     assert!(
-        paints < 3,
+        paints == 0,
         "control: a watch at G_PRIORITY_DEFAULT should starve a priority-120 source ({paints} paints, {dispatches} dispatches)"
     );
 
     // The watch the editors' event loop gets, made by the same function, its priority read back.
-    let (paints, dispatches, priority) = run(
-        |fd, wake| fd_watch::add_event_loop_watch(fd, wake).expect("this thread owns the default context"),
-        Duration::from_millis(200),
-    );
+    let (paints, dispatches, priority) =
+        run(|fd, wake| fd_watch::add_event_loop_watch(fd, wake).expect("this thread owns the default context"));
     assert_eq!(
         priority,
         Some(glib::ffi::G_PRIORITY_DEFAULT_IDLE),
         "the event-loop watch runs at G_PRIORITY_DEFAULT_IDLE (200), below the paint priority"
     );
     assert!(
-        paints >= 10,
+        paints == 100,
         "the event-loop watch must leave the paint priority its rate ({paints} paints, {dispatches} dispatches)"
     );
 }

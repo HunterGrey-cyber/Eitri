@@ -10,7 +10,7 @@ use std::net::{Ipv4Addr, TcpListener, TcpStream};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicUsize, Ordering};
-use std::sync::mpsc::{channel, Receiver, RecvTimeoutError, Sender, TryRecvError};
+use std::sync::mpsc::{channel, Receiver, Sender, TryRecvError};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -33,10 +33,6 @@ use ide_client::{
 
 const MIB: usize = 1024 * 1024;
 const TOOL_ERROR: i64 = -32000;
-/// A short wait for something that must not come. A slow machine can only make these tests pass more easily, and each
-/// has a positive check beside it.
-const QUIET: Duration = Duration::from_millis(100);
-
 /// Built at run time, so no such literal sits in the tree.
 fn token_text() -> String {
     "ab".repeat(32)
@@ -199,6 +195,47 @@ impl Syscalls for Faults {
     }
 }
 
+/// Reports a poll with no ready descriptors after all queued work has been consumed.
+struct Observed<C> {
+    inner: C,
+    requests: Receiver<Sender<(i32, Vec<RawFd>)>>,
+    pending: Option<Sender<(i32, Vec<RawFd>)>>,
+    turns: usize,
+}
+
+impl<C: Syscalls> Syscalls for Observed<C> {
+    fn poll(&mut self, fds: &mut [libc::pollfd], timeout_ms: i32) -> io::Result<()> {
+        if self.pending.is_none() {
+            self.pending = self.requests.try_recv().ok();
+            self.turns = 0;
+        }
+        if self.pending.is_some() {
+            self.turns += 1;
+            assert!(
+                self.turns <= 10000,
+                "the worker did not reach an idle poll in 10000 turns"
+            );
+            self.inner.poll(fds, 0)?;
+            if fds.iter().any(|fd| fd.revents != 0) {
+                return Ok(());
+            }
+            self.pending
+                .take()
+                .unwrap()
+                .send((timeout_ms, fds.iter().map(|fd| fd.fd).collect()))
+                .unwrap();
+        }
+        self.inner.poll(fds, timeout_ms)
+    }
+
+    fn accept(&mut self, listener: &TcpListener) -> io::Result<TcpStream> {
+        self.inner.accept(listener)
+    }
+    fn log(&mut self, line: &str) {
+        self.inner.log(line);
+    }
+}
+
 /// Keeps the worker's log lines for a test to read.
 #[derive(Clone, Default)]
 struct KeptLog(Arc<Mutex<Vec<String>>>);
@@ -258,6 +295,8 @@ struct Rig {
     done: Option<Sender<Done>>,
     done_wake: Arc<Wake>,
     thread: Option<JoinHandle<()>>,
+    polls: Sender<Sender<(i32, Vec<RawFd>)>>,
+    listener_fd: RawFd,
 }
 
 impl Rig {
@@ -289,6 +328,14 @@ impl Rig {
         let commands_wake = Arc::new(Wake::new().unwrap());
         let done_wake = Arc::new(Wake::new().unwrap());
         let events_waiting = Arc::new(AtomicUsize::new(0));
+        let listener_fd = listener.as_raw_fd();
+        let (polls, requests) = channel();
+        let calls = Observed {
+            inner: calls,
+            requests,
+            pending: None,
+            turns: 0,
+        };
         let parts = WorkerParts {
             listener,
             token,
@@ -318,6 +365,8 @@ impl Rig {
             done: Some(done),
             done_wake,
             thread: Some(thread::spawn(move || run_on(parts, calls))),
+            polls,
+            listener_fd,
         }
     }
 
@@ -368,11 +417,21 @@ impl Rig {
         events
     }
 
+    fn settled(&self) -> (i32, Vec<RawFd>) {
+        let (done, answer) = channel();
+        self.polls.send(done).unwrap();
+        self.nudge();
+        answer
+            .recv_timeout(WAIT)
+            .expect("the worker never reached an idle poll")
+    }
+
     fn no_event(&self) {
-        match self.events.recv_timeout(QUIET) {
-            Err(RecvTimeoutError::Timeout) => {}
-            other => panic!("nothing should have come: {other:?}"),
-        }
+        self.settled();
+        assert!(
+            matches!(self.events.try_recv(), Err(TryRecvError::Empty)),
+            "an unexpected event was queued"
+        );
     }
 
     fn next_job(&self) -> Job {
@@ -380,6 +439,7 @@ impl Rig {
     }
 
     fn no_job(&self) {
+        self.settled();
         assert!(matches!(
             self.jobs.as_ref().unwrap().try_recv(),
             Err(TryRecvError::Empty)
@@ -641,11 +701,11 @@ fn a_client_part_way_through_its_head_outlasts_connections_that_sent_nothing() {
     // Time for the worker to read what came, and then for it to take the ones that follow. Two lots, each smaller than a
     // pass's accepts: a connection accepted in a pass is not evicted in it, so a full pass of newcomers evicts what was
     // there before them, whatever it holds.
-    thread::sleep(QUIET);
+    rig.settled();
     let _silent: Vec<TcpStream> = (0..7).map(|_| dial(rig.port)).collect();
-    thread::sleep(QUIET);
+    rig.settled();
     let _more: Vec<TcpStream> = (0..7).map(|_| dial(rig.port)).collect();
-    thread::sleep(QUIET);
+    rig.settled();
     let answer = finish_the_upgrade(&mut client, rest);
     assert!(answer.starts_with("HTTP/1.1 101 "), "not upgraded: {answer:?}");
 }
@@ -661,7 +721,7 @@ fn the_connection_with_the_fewest_bytes_goes_first() {
     for other in &mut others {
         other.write_all(b"GET").unwrap();
     }
-    thread::sleep(QUIET);
+    rig.settled();
     let _ninth = dial(rig.port);
     assert_eq!(
         read_to_end(&mut others[0]),
@@ -687,7 +747,7 @@ fn a_client_accepted_into_full_slots_gets_its_read_before_the_next_one_can_evict
     for filler in &mut fillers {
         filler.write_all(b"G").unwrap();
     }
-    thread::sleep(QUIET);
+    rig.settled();
     faults.hold_at_poll(&rig);
     let mut client = IdeClient::try_attach(rig.port, &Upgrade::proper(rig.port, &rig.token));
     let _follower = dial(rig.port);
@@ -1700,7 +1760,7 @@ fn mention_lines(rig: &Rig, count: u32) {
     };
     rig.mentions.lines.lock().unwrap().extend((0..count).map(line));
     rig.mentions.readable.signal();
-    thread::sleep(QUIET);
+    rig.settled();
 }
 
 /// A mention outside the project is an event for each line on the socket, and nvim writes those lines whether or not the
@@ -1715,7 +1775,7 @@ fn what_a_mention_tells_the_window_stops_while_the_window_is_behind() {
     for _ in 0..10 {
         rig.done(Done::Host(Event::MentionOutside));
     }
-    thread::sleep(QUIET);
+    rig.settled();
     let told = rig.take_events();
     assert_eq!(told.len(), 4, "{told:?}");
 
@@ -1736,7 +1796,7 @@ fn mention_lines_are_dropped_while_the_window_is_behind() {
     for _ in 0..4 {
         rig.done(Done::Host(Event::MentionOutside));
     }
-    thread::sleep(QUIET);
+    rig.settled();
     mention_lines(&rig, 3);
     rig.no_job();
 
@@ -1759,7 +1819,7 @@ fn mention_lines_are_held_to_what_the_judge_may_have_out() {
     rig.no_job();
 
     rig.done(Done::Mention(json!({"lineStart": 1})));
-    thread::sleep(QUIET);
+    rig.settled();
     mention_lines(&rig, 1);
     assert!(matches!(rig.next_job(), Job::Mention(_)), "given back, there is room");
 }
@@ -1974,14 +2034,14 @@ fn a_failing_accept_does_not_spin() {
 
     faults.accept_errno.store(libc::EMFILE, Ordering::SeqCst);
     let _waiting = dial(rig.port);
-    let before = faults.polls.load(Ordering::SeqCst);
-    let watched = Duration::from_millis(1500);
-    thread::sleep(watched);
-    let wakes = faults.polls.load(Ordering::SeqCst) - before;
-    assert!(
-        wakes <= 8,
-        "{wakes} wakes in {watched:?}: the loop is spinning on the waiting connection"
-    );
+    for _ in 0..20 {
+        let (timeout, fds) = rig.settled();
+        assert!(
+            !fds.contains(&rig.listener_fd),
+            "a failing listener stayed in the poll set"
+        );
+        assert!(timeout > 0, "a failing accept must leave a retry wait");
+    }
 
     open.round_trip();
     faults.accept_errno.store(0, Ordering::SeqCst);

@@ -492,20 +492,55 @@ fn a_call_not_answered_in_time_fails_without_calling_the_extension_absent() {
         return;
     };
     let service = FakeExtension::start(&bus.address);
-    service.stalled.store(true, Ordering::SeqCst);
     on_own_context(async {
         let shell = caller(&bus.address);
-        let started = Instant::now();
+        shell.probe();
+        until("the verified extension", 60_000, || {
+            shell.completed_call_for_tests("Version").is_some()
+        })
+        .await;
+        service.stalled.store(true, Ordering::SeqCst);
+        let (timed_out, timeout_event) = futures_channel::oneshot::channel();
+        let timed_out = RefCell::new(Some(timed_out));
+        shell.on_call_completed_for_tests(Box::new(move |method| {
+            if method == "ActivateOwn" {
+                timed_out
+                    .borrow_mut()
+                    .take()
+                    .expect("exactly one call completes")
+                    .send(())
+                    .unwrap();
+            }
+        }));
         let (slot, done) = answer();
         shell.activate_own(done);
-        until("the call to give up", 5000, || slot.borrow().is_some()).await;
-        let waited = started.elapsed();
-        assert_eq!(*slot.borrow(), Some(None));
-        let timeout = Duration::from_millis(CALL_TIMEOUT_MS as u64);
-        assert_eq!(CALL_TIMEOUT_MS, 1000);
+        for _ in 0..2 {
+            glib::timeout_future(Duration::ZERO).await;
+        }
+        assert_eq!(
+            shell.started_calls_for_tests("ActivateOwn"),
+            1,
+            "the request starts without a debounce"
+        );
+        glib::future_with_timeout(Duration::from_secs(60), timeout_event)
+            .await
+            .expect("the bus call never completed")
+            .expect("the timeout observer was dropped");
         assert!(
-            waited >= timeout - Duration::from_millis(100) && waited < timeout + Duration::from_millis(1500),
-            "gave up after {waited:?}"
+            slot.borrow().is_some(),
+            "the first timeout event delivers the give-up answer"
+        );
+        assert_eq!(
+            shell.started_calls_for_tests("ActivateOwn"),
+            1,
+            "no retry follows the timeout"
+        );
+        assert_eq!(*slot.borrow(), Some(None));
+        assert_eq!(CALL_TIMEOUT_MS, 1000);
+        assert_eq!(
+            shell.completed_call_for_tests("ActivateOwn"),
+            Some((1000, true)),
+            "the call must finish through GIO's timeout, with the configured budget"
         );
         // The service is there, only slow: that is not the absence the notice is about.
         assert_ne!(shell.present(), Some(false));

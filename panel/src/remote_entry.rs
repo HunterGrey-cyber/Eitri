@@ -1936,10 +1936,7 @@ mod tests {
             settle(&handle, &phone(), &key, &interrupt("c1", turn(&handle, tab, "t1"))),
             Ok(())
         );
-        for _ in 0..5 {
-            handle.tick();
-            std::thread::sleep(std::time::Duration::from_millis(5));
-        }
+        handle.tick();
         let decisions = provider.decisions();
         assert!(
             decisions.iter().all(|(_, decision)| !decision.allows()),
@@ -2830,13 +2827,25 @@ mod tests {
             Ok(RemoteAccepted::Pending)
         );
         drop(release);
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-        while provider.interrupts() == 0 {
-            assert!(std::time::Instant::now() < deadline, "the provider never answered");
-            std::thread::sleep(std::time::Duration::from_millis(2));
+        {
+            let mut state = handle.state.borrow_mut();
+            let Answer::Spawned(rx) = &state.remote.calls[0].answer else {
+                panic!("a spawned stop")
+            };
+            let outcome = rx
+                .recv_timeout(std::time::Duration::from_secs(60))
+                .expect("the provider answered");
+            assert!(
+                matches!(
+                    rx.recv_timeout(std::time::Duration::from_secs(60)),
+                    Err(mpsc::RecvTimeoutError::Disconnected)
+                ),
+                "the callback returned after raising its wake"
+            );
+            let (tx, ready) = mpsc::channel();
+            tx.send(outcome).unwrap();
+            state.remote.calls[0].answer = Answer::Spawned(ready);
         }
-        // The call's own wake has been raised by now; the socket's pump may have run before this tick.
-        std::thread::sleep(std::time::Duration::from_millis(50));
         let woken = || handle.state.borrow().wake.as_ref().unwrap().take();
         woken();
         handle.tick();

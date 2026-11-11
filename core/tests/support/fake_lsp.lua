@@ -15,13 +15,19 @@ return vim.lsp.start({
         local fake = _G.__fake_lsp
         fake.seen[#fake.seen + 1] = { method = method, params = params, client = config.name or 'fake' }
         if method == 'initialize' then
-          vim.defer_fn(function() cb(nil, { capabilities = capabilities }) end, config.initialize_delay or 0)
+          local answer = function() cb(nil, { capabilities = capabilities }) end
+          if _G.test_lsp_hold_init then _G.test_lsp_init = answer
+          else vim.defer_fn(answer, config.initialize_delay or 0) end
         elseif method == 'shutdown' then
           cb(nil, nil)
         else
           if not fake.hang[method] then
             local answer = vim.deepcopy(fake.answers[method])
-            vim.defer_fn(function() cb(nil, answer, { method = method }) end, fake.delay or 0)
+            local reply = function() cb(nil, answer, { method = method }) end
+            if _G.test_lsp_hold then
+              _G.test_lsp_replies = _G.test_lsp_replies or {}
+              table.insert(_G.test_lsp_replies, reply)
+            else vim.defer_fn(reply, fake.delay or 0) end
           end
         end
         return true, serial

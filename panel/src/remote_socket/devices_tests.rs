@@ -222,12 +222,13 @@ impl Window {
         }
     }
 
-    /// Turns a while, for anything on its way to arrive.
-    fn settle(&self) {
-        for _ in 0..25 {
-            self.turn();
-            std::thread::sleep(Duration::from_millis(4));
-        }
+    /// A pong bounds the preceding messages in this connection's FIFO.
+    fn assert_no_answer(&self, client: &mut RvClient) {
+        client.send(&RvInbound::Ping { v: 1 }).unwrap();
+        self.until(client, "the pong", |line| {
+            assert_eq!(line["kind"], "pong", "an unanswered errand sent a line: {line}");
+            true
+        });
     }
 
     /// The next `result` `client` receives.
@@ -365,10 +366,7 @@ fn no_token_without_a_desk_yes() {
     for _ in 0..20 {
         window.turn();
     }
-    assert!(
-        client.recv(Duration::from_millis(20)).unwrap().is_none(),
-        "nothing reached the phone"
-    );
+    window.assert_no_answer(&mut client);
     assert!(devices_in(&scratch.store()).is_empty());
     assert_eq!(window.handle.state.borrow().remote_desk.enroll_nonce(), Some(nonce));
 
@@ -834,11 +832,7 @@ fn grant_change_needs_a_desk_yes() {
     covered.set(false);
     window.answer("other", nonce, true, "watch");
     assert!(matches!(result_for(&window.base.sent.borrow(), "other"), Some(Err(_))));
-    window.settle();
-    assert!(
-        client.recv(Duration::from_millis(20)).unwrap().is_none(),
-        "nothing decided yet"
-    );
+    window.assert_no_answer(&mut client);
     assert_eq!(grant_of(), Grant::Watch);
     assert_eq!(window.handle.state.borrow().remote_desk.grant_nonce(), Some(nonce));
 
@@ -1018,8 +1012,7 @@ fn last_seen_and_host_follow_devices_connected() {
     assert_eq!(devices_in(&store).len(), 2);
 
     // A report is not answered.
-    window.settle();
-    assert!(client.recv(Duration::from_millis(20)).unwrap().is_none());
+    window.assert_no_answer(&mut client);
 }
 
 #[test]
@@ -1053,12 +1046,19 @@ fn a_report_older_than_the_last_one_taken_is_dropped() {
     assert_eq!(latest().unwrap()["devices"].as_array().unwrap().len(), 1);
 
     // Its first report, the empty one, read late: dropped, the phone stays listed.
-    let _late = send(&[], 2000, 0);
+    let mut late = send(&[], 2000, 0);
     // A report of an earlier serve, read after the newer serve's: dropped too.
-    let _dead = send(&[], 1000, 9);
+    let mut dead = send(&[], 1000, 9);
     // The same report again: nothing new.
-    let _again = send(&[(&a, "127.0.0.1:43117")], 2000, 1);
-    window.settle();
+    let mut again = send(&[(&a, "127.0.0.1:43117")], 2000, 1);
+    for client in [&mut late, &mut dead, &mut again] {
+        // A stale report ends its reader without an answer; EOF marks that it has been processed.
+        let end = client
+            .recv(PATIENCE)
+            .expect_err("a stale report closes its connection unanswered");
+        assert_eq!(end.kind(), io::ErrorKind::UnexpectedEof);
+    }
+    window.turn();
     assert_eq!(sent(), 1, "{:?}", latest());
 
     // The next report of that serve, and the first of a later one, are taken.
@@ -1068,7 +1068,7 @@ fn a_report_older_than_the_last_one_taken_is_dropped() {
     let _newer = send(&[(&a, "127.0.0.1:43117")], 3000, 0);
     window.turn_until("the later serve's report", || sent() >= 3);
     assert_eq!(latest().unwrap()["devices"].as_array().unwrap().len(), 1);
-    window.settle();
+    window.turn();
     assert_eq!(sent(), 3, "no dropped report was taken late");
 }
 
@@ -1227,7 +1227,7 @@ fn device_without_confirmation_is_flagged_once_per_process() {
         update(&store, |s| s.get_mut(&planted).unwrap().last_seen = Some(0)).unwrap();
         report(client, &[(&planted, "127.0.0.1:43117")]);
         window.turn_until("the report", || stored(&store, &planted).unwrap().last_seen != Some(0));
-        window.settle();
+        window.assert_no_answer(client);
     }
     assert_eq!(a.flagged(&planted) + b.flagged(&planted), 1);
     assert_eq!(
@@ -1615,7 +1615,7 @@ fn start_enroll_only_from_the_base_page() {
             "{request}"
         );
     }
-    window.settle();
+    window.turn();
     assert_eq!(window.count("remote_pairing"), 0, "another page makes no code");
 
     window.page(ViewId::BASE, "remote_start_enroll", "s1", r#""recipe":"direct""#);
@@ -1687,7 +1687,8 @@ fn revoke_from_the_list_closes_the_phone() {
     // A covered chat's yes takes nothing out.
     covered.set(true);
     window.revoke_from_the_list(&device);
-    window.settle();
+    window.turn_until("device workers idle", || !window.socket.devices_busy());
+    window.turn();
     assert!(stored(&scratch.store(), &device).is_some());
     covered.set(false);
 
@@ -1797,7 +1798,8 @@ fn device_list_reads_run_one_at_a_time_and_coalesce() {
     drop(release);
     let devices = window.listed(0);
     assert_eq!(devices[0]["id"], device.as_str());
-    window.settle();
+    window.turn_until("device workers idle", || !window.socket.devices_busy());
+    window.turn();
     assert_eq!(
         reads.load(Ordering::SeqCst),
         2,

@@ -69,6 +69,7 @@ impl Deref for LuaEngine {
 }
 
 impl LuaEngine {
+    #[cfg(test)]
     pub(crate) fn new(config_dir: PathBuf) -> mlua::Result<Self> {
         Self::showing(config_dir, None)
     }

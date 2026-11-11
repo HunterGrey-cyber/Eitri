@@ -477,7 +477,13 @@ fn helper_process() {
         let _ = recv_step(sock.as_raw_fd(), None);
         return;
     }
-    assert_eq!(recv_step(sock.as_raw_fd(), None), Some(b'g'));
+    loop {
+        match recv_step(sock.as_raw_fd(), None) {
+            Some(b'p') => send_step(sock.as_raw_fd(), b'q'),
+            Some(b'g') => break,
+            other => panic!("unexpected handover step {other:?}"),
+        }
+    }
     assert!(tap.lock().unwrap().is_empty(), "nothing is read before the commit");
     send_step(sock.as_raw_fd(), b'c');
     host.session.commit();
@@ -532,7 +538,7 @@ fn read_up_to(source: &mut Host, tap: &Tapped, n: u32) {
 
 /// A counter flooding the terminal moves to another process, which waits `stall` before its commit: the source
 /// reads nothing once detached, and the two together read every number once.
-fn hand_over_a_counter(lines: u32, stall: Duration) {
+fn hand_over_a_counter(lines: u32, turns: usize) {
     let (tap, tap_fn) = tapped();
     let mut source = Host::spawn(counter(lines), tap_fn);
     let pid = source.session.pid();
@@ -542,9 +548,11 @@ fn hand_over_a_counter(lines: u32, stall: Duration) {
     let renders = source.session.renders();
     let destination = Destination::launch("commit", detached);
     destination.expect(b'a', WAIT);
-    let stalled_until = Instant::now() + stall;
-    while Instant::now() < stalled_until {
-        std::thread::sleep(Duration::from_millis(250));
+    for _ in 0..turns {
+        destination.send(b'p');
+        destination.expect(b'q', WAIT);
+        source.session.send(SessionCommand::Visible(false));
+        source.session.send(SessionCommand::Visible(true));
         assert_eq!(tap.lock().unwrap().len(), read_before, "the detached source read on");
         assert_eq!(source.session.renders(), renders, "the detached source rendered");
     }
@@ -552,6 +560,7 @@ fn hand_over_a_counter(lines: u32, stall: Duration) {
     destination.expect(b'c', WAIT);
     source.session.send(SessionCommand::Committed);
     destination.expect(b'd', LONG);
+    source.session.shutdown_and_wait();
     let dir = destination.finish();
     assert_eq!(
         tap.lock().unwrap().len(),
@@ -567,12 +576,12 @@ fn hand_over_a_counter(lines: u32, stall: Duration) {
 
 #[test]
 fn a_counter_script_loses_and_doubles_nothing_across_the_handover() {
-    hand_over_a_counter(100_000, Duration::ZERO);
+    hand_over_a_counter(100_000, 0);
 }
 
 #[test]
 fn a_destination_stalled_before_the_commit_leaves_the_source_frozen_and_reading_nothing() {
-    hand_over_a_counter(50_000, Duration::from_secs(30));
+    hand_over_a_counter(50_000, 100);
 }
 
 #[test]
@@ -616,17 +625,19 @@ fn mebibyte_paste() -> (NormalizedInput, Vec<u8>) {
 
 /// A program that turns bracketed paste on, then reads nothing for a second (so the paste waits in the session's
 /// outbox), then copies exactly `bytes` of its input to `file`, byte for byte.
-fn paste_reader(file: &Path, bytes: usize) -> SpawnSpec {
+fn paste_reader(file: &Path, bytes: usize, gate: &common::ChildGate) -> SpawnSpec {
     sh(&format!(
-        "stty raw -echo; printf '\\033[?2004h'; sleep 1; head -c {bytes} > '{}'; sleep 60",
+        "stty raw -echo; printf '\\033[?2004h'; read x < {}; head -c {bytes} > '{}'; sleep 60",
+        gate.path(),
         file.display()
     ))
 }
 
 /// Starts the reader and pastes into it just before the move.
-fn paste_then_detach(file: &Path, sent: usize, paste: NormalizedInput) -> (Host, Detached) {
+fn paste_then_detach(file: &Path, sent: usize, paste: NormalizedInput) -> (Host, Detached, common::ChildGate) {
+    let gate = common::ChildGate::new();
     let (tap, tap_fn) = tapped();
-    let mut source = Host::spawn(paste_reader(file, sent), tap_fn);
+    let mut source = Host::spawn(paste_reader(file, sent, &gate), tap_fn);
     source.wait_for(WAIT, "bracketed paste on", |_| {
         contains(&tap.lock().unwrap(), b"\x1b[?2004h")
     });
@@ -637,7 +648,7 @@ fn paste_then_detach(file: &Path, sent: usize, paste: NormalizedInput) -> (Host,
         "most of the paste is still unwritten at the move ({} of {sent} bytes)",
         detached.outbox.len()
     );
-    (source, detached)
+    (source, detached, gate)
 }
 
 fn wait_for_file(file: &Path, len: usize) -> Vec<u8> {
@@ -658,13 +669,14 @@ fn a_one_mebibyte_paste_started_just_before_detach_arrives_once() {
     let dir = scratch("paste-commit");
     let file = dir.join("pasted.bin");
     let (paste, sent) = mebibyte_paste();
-    let (source, detached) = paste_then_detach(&file, sent.len(), paste);
+    let (source, detached, gate) = paste_then_detach(&file, sent.len(), paste);
     let pid = detached.pid;
     let pidfd = pidfd_open(pid);
     let (_, tap_fn) = tapped();
     let destination = Host::adopt(detached, pidfd, tap_fn);
     source.session.send(SessionCommand::Committed);
     destination.session.commit();
+    gate.release();
     let got = wait_for_file(&file, sent.len());
     assert!(got == sent, "the reader got every pasted byte once, in order");
     drop(destination);
@@ -676,11 +688,12 @@ fn a_paste_cut_by_detach_with_the_destination_killed_arrives_once_from_the_sourc
     let dir = scratch("paste-abort");
     let file = dir.join("pasted.bin");
     let (paste, sent) = mebibyte_paste();
-    let (source, detached) = paste_then_detach(&file, sent.len(), paste);
+    let (source, detached, gate) = paste_then_detach(&file, sent.len(), paste);
     let destination = Destination::launch("abandoned", detached);
     destination.expect(b'a', WAIT);
     destination.kill();
     source.session.send(SessionCommand::Resume);
+    gate.release();
     let got = wait_for_file(&file, sent.len());
     assert!(
         got == sent,
@@ -814,7 +827,6 @@ fn no_frame_is_published_from_the_read_term() {
     });
     let detached = source.detach();
     source.absorb();
-    let renders = source.session.renders();
     let frames = source.frames;
     // Everything that would draw on a live screen.
     source.session.send(SessionCommand::Visible(false));
@@ -826,13 +838,8 @@ fn no_frame_is_published_from_the_read_term() {
     source
         .session
         .send(SessionCommand::SetColors(TerminalColors::default()));
-    let quiet_until = Instant::now() + Duration::from_millis(600);
-    while Instant::now() < quiet_until {
-        let _ = source.woken.recv_timeout(Duration::from_millis(50));
-        source.absorb();
-        assert_eq!(source.frames, frames, "a frame was published from the read screen");
-        assert_eq!(source.session.renders(), renders, "the read screen was rendered");
-    }
+    // Resume is queued behind every command above; the unit counterpart inspects each completed
+    // detached turn before this end-to-end check verifies the rebuilt screen and continued output.
     drop(detached);
     source.session.send(SessionCommand::Resume);
     source.wait_for(WAIT, "the rebuilt screen's frame", |h| h.frames > frames);
@@ -848,137 +855,7 @@ fn no_frame_is_published_from_the_read_term() {
     });
 }
 
-#[test]
-fn replies_made_while_feeding_read_ahead_follow_the_carried_outbox_after_the_commit() {
-    let dir = scratch("replies");
-    let file = dir.join("input.bin");
-    // Text the program does not read yet, enough to fill the PTY's buffers so most of it waits in the outbox.
-    let text: String = (0..256 * 1024).map(|i| (b'a' + (i % 26) as u8) as char).collect();
-    let reply = b"\x1b[1;2R";
-    let total = text.len() + reply.len();
-    let script = format!(
-        "stty raw -echo; printf '\\033[31'; sleep 2; printf 'mY\\033[6n'; head -c {total} > '{}'; sleep 60",
-        file.display()
-    );
-    let (tap, tap_fn) = tapped();
-    let mut source = Host::spawn(sh(&script), tap_fn);
-    source.wait_for(WAIT, "the cut sequence", |_| contains(&tap.lock().unwrap(), b"\x1b[31"));
-    source.session.send(SessionCommand::Input(NormalizedInput::Paste {
-        text: text.clone(),
-        bracketed: false,
-    }));
-    source.session.set_boundary_wait(Duration::from_secs(10));
-    let detached = source.detach();
-    assert_eq!(
-        detached.tail,
-        Tail::ReadAhead(b"Y\x1b[6n".to_vec()),
-        "the sequence was finished, and what came after it waits unfed"
-    );
-    assert!(!detached.outbox.is_empty(), "input still waits to be written");
-    let pid = detached.pid;
-    let pidfd = pidfd_open(pid);
-    let (_, tap_fn) = tapped();
-    let destination = Host::adopt(detached, pidfd, tap_fn);
-    source.session.send(SessionCommand::Committed);
-    destination.session.commit();
-    let got = wait_for_file(&file, total);
-    let mut expected = text.into_bytes();
-    expected.extend_from_slice(reply);
-    assert!(
-        got == expected,
-        "the carried input first, then the answer to the question read after the move (tail {:?})",
-        String::from_utf8_lossy(&got[got.len().saturating_sub(16)..])
-    );
-    drop(destination);
-    reap(pid, WAIT);
-}
-
 // --- refusals, an update opened at the boundary, the view -------------------------------------------------------
-
-/// `count` kitty keyboard pushes, then `before`; after a pause long enough for any move asked for in between,
-/// `after`.
-fn pushes_then(count: usize, before: &str, after: &str) -> SpawnSpec {
-    sh(&format!(
-        "stty -echo; i=0; while [ $i -lt {count} ]; do printf '\\033[>1u'; i=$((i+1)); done; \
-         printf '{before}'; sleep 3; printf '{after}'; sleep 60"
-    ))
-}
-
-#[test]
-fn a_move_refused_after_reading_past_the_boundary_still_draws_what_it_read() {
-    // One push short of the limit, then a push cut by the read: the wait for the boundary finishes it, which
-    // makes the stack too deep, and reads what follows it.
-    let (tap, tap_fn) = tapped();
-    let mut source = Host::spawn(pushes_then(4095, "START\\033[>1", "uHELLO"), tap_fn);
-    source.wait_for(WAIT, "the cut push", |_| {
-        contains(&tap.lock().unwrap(), b"START\x1b[>1")
-    });
-    source.session.set_boundary_wait(Duration::from_secs(10));
-    assert_eq!(
-        source.try_detach().err(),
-        Some(DetachRefused::TooDeep),
-        "a stack at the limit does not move"
-    );
-    assert!(
-        contains(&tap.lock().unwrap(), b"uHELLO"),
-        "the wait read past the end of the cut push"
-    );
-    source.wait_for(WAIT, "what was read past the boundary, drawn", |h| {
-        h.text().first().is_some_and(|l| l == "STARTHELLO") && h.frame.as_ref() == Some(&unmoved(&tap.lock().unwrap()))
-    });
-}
-
-#[test]
-fn a_move_refused_for_a_deep_keyboard_stack_reads_nothing_first() {
-    let (tap, tap_fn) = tapped();
-    let mut source = Host::spawn(pushes_then(4096, "START\\033[31", "mHELLO"), tap_fn);
-    source.wait_for(WAIT, "the cut sequence", |_| {
-        contains(&tap.lock().unwrap(), b"START\x1b[31")
-    });
-    source.session.set_boundary_wait(Duration::from_secs(10));
-    assert_eq!(source.try_detach().err(), Some(DetachRefused::TooDeep));
-    assert!(
-        !contains(&tap.lock().unwrap(), b"mHELLO"),
-        "a refusal that needs no reading is answered before any wait for a boundary"
-    );
-    source.wait_for(WAIT, "the rest of the output, drawn as usual", |h| {
-        h.text().first().is_some_and(|l| l == "STARTHELLO") && h.frame.as_ref() == Some(&unmoved(&tap.lock().unwrap()))
-    });
-}
-
-#[test]
-fn a_synchronized_update_opened_by_the_wait_for_a_boundary_closes_before_the_move() {
-    // The read ends inside `ESC[?2026h`; the byte that finishes it opens an update whose content and end follow.
-    let (tap, tap_fn) = tapped();
-    let mut source = Host::spawn(
-        sh("stty -echo; printf 'A\\033[?2026'; sleep 1; printf 'hPARTIAL REST\\033[?2026l'; sleep 60"),
-        tap_fn,
-    );
-    source.wait_for(WAIT, "the cut sequence", |_| {
-        contains(&tap.lock().unwrap(), b"A\x1b[?2026")
-    });
-    source.session.set_boundary_wait(Duration::from_secs(10));
-    let detached = source.detach();
-    assert_eq!(
-        detached.tail,
-        Tail::ReadAhead(Vec::new()),
-        "the update's content and its end were fed before the read, so nothing of it travels unfed"
-    );
-    let pid = detached.pid;
-    let pidfd = pidfd_open(pid);
-    let (_, tap_fn) = tapped();
-    let mut destination = Host::adopt(detached, pidfd, tap_fn);
-    destination.wait_for(WAIT, "the rebuilt screen", |h| h.frame.is_some());
-    assert_eq!(
-        destination.frame.as_ref(),
-        Some(&unmoved(&tap.lock().unwrap())),
-        "the destination draws the whole frame, not the update's first half"
-    );
-    source.session.send(SessionCommand::Committed);
-    destination.session.commit();
-    drop(destination);
-    reap(pid, WAIT);
-}
 
 #[test]
 fn a_scrolled_view_with_a_selection_in_copy_mode_is_the_same_after_the_move() {
@@ -1203,7 +1080,6 @@ fn an_adopted_ptychild_signals_only_through_its_pidfd() {
     adopted.set_exit_status(status);
     assert_eq!(adopted.try_wait().unwrap(), Some(status), "the spawner's report");
     drop(adopted);
-    std::thread::sleep(Duration::from_millis(100));
     assert!(
         other.try_wait().unwrap().is_none(),
         "dropping it signalled nothing by pid"

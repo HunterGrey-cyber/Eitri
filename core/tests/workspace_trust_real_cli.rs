@@ -24,8 +24,8 @@
 //!
 //! **What it measures.** A scratch git project that ships its own `.claude/settings.json` (a
 //! `SessionStart` and a `UserPromptSubmit` hook) and an `.mcp.json` stdio server, each of which
-//! touches a marker file outside the project. One turn is run per arm and the markers are polled
-//! for 20 s afterwards:
+//! touches a marker file outside the project. One turn is run per arm. The trusted arm waits for
+//! every marker; the untrusted arm checks their absence after the backend has shut down:
 //!
 //! - `Untrusted` (`[USER]`; on the legacy argv `--setting-sources user`): no marker, and the turn
 //!   still completes;
@@ -50,8 +50,7 @@ use std::time::{Duration, Instant};
 /// `UserPromptSubmit` hook and a stdio MCP server. Each touches a file of its own.
 const MARKERS: [&str; 3] = ["hook", "prompt", "mcp"];
 
-/// How long the markers are polled after the turn: an MCP server and a hook are started by the
-/// CLI on its own schedule, so a missing marker proves nothing the moment the turn ends.
+/// Hang guard while the trusted positive control waits for every configured process to start.
 const MARKER_WAIT: Duration = Duration::from_secs(20);
 
 /// One arm's scratch tree: a git project and, outside it, the directory the markers land in.
@@ -204,22 +203,29 @@ fn run_arm(kind: BackendKind, trust: ProjectTrust, fx: &Fixture, expect_all: boo
             projection.turn_endings
         );
     }
-    let seen = wait_for_markers(fx, expect_all);
+    if expect_all {
+        wait_for_markers(fx);
+    }
     drop(live);
-    seen
+    markers(fx)
 }
 
-fn wait_for_markers(fx: &Fixture, expect_all: bool) -> Vec<&'static str> {
+fn markers(fx: &Fixture) -> Vec<&'static str> {
+    MARKERS
+        .into_iter()
+        .filter(|name| fx.markers.join(name).exists())
+        .collect()
+}
+
+fn wait_for_markers(fx: &Fixture) {
     let deadline = Instant::now() + MARKER_WAIT;
-    loop {
-        let seen: Vec<&'static str> = MARKERS
-            .into_iter()
-            .filter(|name| fx.markers.join(name).exists())
-            .collect();
-        if (expect_all && seen.len() == MARKERS.len()) || Instant::now() >= deadline {
-            return seen;
-        }
-        std::thread::sleep(Duration::from_millis(250));
+    while markers(fx).len() != MARKERS.len() {
+        assert!(
+            Instant::now() < deadline,
+            "configured process markers missing: {:?}",
+            markers(fx)
+        );
+        std::thread::yield_now();
     }
 }
 

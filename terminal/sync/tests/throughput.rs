@@ -31,29 +31,39 @@ fn tui_like_stream(frames: usize) -> Vec<u8> {
 
 #[test]
 fn byte_at_a_time_throughput() {
+    use alacritty_terminal::vte::ansi::Processor;
+    // The same stream and byte-at-a-time parser calibrate the driver against the host running it.
     let stream = tui_like_stream(400);
-    let mut term = new_term();
-    let mut driver = SyncDriver::new();
-    let mut publications = 0usize;
-
-    let start = Instant::now();
-    for chunk in stream.chunks(4096) {
-        driver.feed(&mut term, chunk, |_, _| publications += 1);
-    }
-    let elapsed = start.elapsed();
-
-    let mib = stream.len() as f64 / (1024.0 * 1024.0);
-    let rate = mib / elapsed.as_secs_f64();
-    println!(
-        "terminal-sync byte-at-a-time: {} bytes ({mib:.2} MiB) in {elapsed:?} => {rate:.1} MiB/s \
-         ({publications} publications)",
-        stream.len()
-    );
-
-    assert_eq!(publications, 400, "one publication per synchronized update");
+    let sample = |driver: bool| {
+        (0..5)
+            .map(|_| {
+                let mut term = new_term();
+                let mut sync = SyncDriver::new();
+                let mut parser: Processor = Processor::new();
+                let mut publications = 0;
+                let start = Instant::now();
+                if driver {
+                    for chunk in stream.chunks(4096) {
+                        sync.feed(&mut term, chunk, |_, _| publications += 1);
+                    }
+                } else {
+                    for byte in &stream {
+                        parser.advance(&mut term, std::slice::from_ref(byte));
+                    }
+                }
+                let elapsed = start.elapsed();
+                if driver {
+                    assert_eq!(publications, 400, "one publication per synchronized update");
+                }
+                elapsed
+            })
+            .min()
+            .unwrap()
+    };
+    let calibration = sample(false);
+    let driver = sample(true);
     assert!(
-        rate > 1.0,
-        "byte-at-a-time driving collapsed to {rate:.2} MiB/s; if this is real, the driver needs \
-         an escape-aware fast path"
+        driver < calibration * 8,
+        "driver {driver:?}, byte-at-a-time parser {calibration:?}"
     );
 }

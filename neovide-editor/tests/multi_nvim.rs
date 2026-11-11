@@ -85,7 +85,6 @@ fn settle(editors: &mut [&mut Editor]) {
         for editor in editors.iter_mut() {
             frame(editor);
         }
-        std::thread::sleep(Duration::from_millis(10));
     }
 }
 

@@ -8,6 +8,7 @@ use rmpv::Value;
 #[ignore = "needs nvim on PATH; uses stdio and no display"]
 fn the_embed_harness_needs_no_socket() {
     let nvim = EmbedNvim::start();
+    nvim.manual_timers();
     let first = nvim.helper_channel();
     let second = nvim.helper_channel();
     assert_ne!(first, second);
@@ -77,13 +78,14 @@ fn teardown(nvim: &EmbedNvim, chan: u64, id: Option<&str>) -> Value {
 }
 
 fn settle(nvim: &EmbedNvim) {
-    nvim.exec_lua("vim.wait(180)", vec![]);
+    nvim.advance_timers(180);
 }
 
 #[test]
 #[ignore = "needs nvim on PATH; uses stdio and no display"]
 fn an_agent_and_a_page_slot_coexist() {
     let nvim = EmbedNvim::start();
+    nvim.manual_timers();
     let agent = nvim.helper_channel();
     let p = nvim.helper_channel();
     install(&nvim, agent, InstallKind::Agent);
@@ -106,6 +108,7 @@ return type(a) == 'table' and type(p) == 'table' and a.timer ~= p.timer
 #[ignore = "needs nvim on PATH; uses stdio and no display"]
 fn theme_groups_of_two_slots_coexist() {
     let nvim = EmbedNvim::start();
+    nvim.manual_timers();
     install(&nvim, nvim.helper_channel(), InstallKind::Agent);
     let before = nvim.exec_lua("return #vim.api.nvim_get_autocmds({group='EitriThemeFeed'})", vec![]);
     page(&nvim, nvim.helper_channel(), "markdown");
@@ -127,6 +130,7 @@ fn theme_groups_of_two_slots_coexist() {
 #[ignore = "needs nvim on PATH; uses stdio and no display"]
 fn an_agent_install_leaves_page_slots_alone() {
     let nvim = EmbedNvim::start();
+    nvim.manual_timers();
     page(&nvim, nvim.helper_channel(), "markdown");
     nvim.exec_lua("_G.saved_page = __eitri_pages.markdown", vec![]);
     install(&nvim, nvim.helper_channel(), InstallKind::Agent);
@@ -145,6 +149,7 @@ fn an_agent_install_leaves_page_slots_alone() {
 #[ignore = "needs nvim on PATH; uses stdio and no display"]
 fn a_second_page_install_of_one_id_tears_the_first_slot_down() {
     let nvim = EmbedNvim::start();
+    nvim.manual_timers();
     install(&nvim, nvim.helper_channel(), InstallKind::Agent);
     let first = nvim.helper_channel();
     page(&nvim, first, "markdown");
@@ -173,7 +178,9 @@ return was_torn and saved_page.torn and saved_page.timer:is_closing()
 #[ignore = "needs nvim on PATH; uses stdio and no display"]
 fn two_page_slots_in_two_nvims_are_independent() {
     let first = EmbedNvim::start();
+    first.manual_timers();
     let second = EmbedNvim::start();
+    second.manual_timers();
     let a = first.helper_channel();
     let b = second.helper_channel();
     assert_eq!(a, b, "channel numbers are local to each nvim");
@@ -182,7 +189,7 @@ fn two_page_slots_in_two_nvims_are_independent() {
     install(&second, second.helper_channel(), InstallKind::Agent);
     first.close_channel(a);
     first.exec_lua(
-        "assert(vim.wait(1000, function() return __eitri_pages == nil end, 10))",
+        "assert(test_timers.until_ready(function() return __eitri_pages == nil end))",
         vec![],
     );
     assert_eq!(
@@ -200,6 +207,7 @@ fn two_page_slots_in_two_nvims_are_independent() {
 #[ignore = "needs nvim on PATH; uses stdio and no display"]
 fn page_teardown_and_slot_call_from_another_channel_change_nothing() {
     let nvim = EmbedNvim::start();
+    nvim.manual_timers();
     let chan = nvim.helper_channel();
     let other = nvim.helper_channel();
     page(&nvim, chan, "markdown");
@@ -228,13 +236,14 @@ fn page_teardown_and_slot_call_from_another_channel_change_nothing() {
 #[ignore = "needs nvim on PATH; uses stdio and no display"]
 fn a_closed_page_channel_takes_its_slot_within_one_second() {
     let nvim = EmbedNvim::start();
+    nvim.manual_timers();
     let chan = nvim.helper_channel();
     page(&nvim, chan, "markdown");
     nvim.exec_lua("_G.saved_page = __eitri_pages.markdown", vec![]);
     nvim.close_channel(chan);
     nvim.exec_lua(
         r#"
-assert(vim.wait(1000, function() return __eitri_pages == nil end, 10))
+assert(test_timers.until_ready(function() return __eitri_pages == nil end))
 assert(saved_page.torn and saved_page.timer:is_closing())
 assert(not pcall(vim.api.nvim_get_autocmds, {group='EitriThemeFeed_page_markdown'}))
 "#,
@@ -248,6 +257,7 @@ assert(not pcall(vim.api.nvim_get_autocmds, {group='EitriThemeFeed_page_markdown
 #[ignore = "needs nvim on PATH; uses stdio and no display"]
 fn a_closed_channel_answered_as_a_typed_empty_dict_takes_the_slot() {
     let nvim = EmbedNvim::start();
+    nvim.manual_timers();
     let chan = nvim.helper_channel();
     page(&nvim, chan, "markdown");
     nvim.exec_lua(
@@ -259,7 +269,7 @@ vim.api.nvim_get_chan_info = function(c)
   if c == chan then return { [vim.type_idx] = vim.types.dictionary } end
   return real(c)
 end
-local gone = vim.wait(1000, function() return __eitri_pages == nil end, 10)
+local gone = test_timers.until_ready(function() return __eitri_pages == nil end)
 vim.api.nvim_get_chan_info = real
 assert(gone, 'the slot of a channel answered as an empty dictionary is still there')
 assert(saved_page.torn and saved_page.timer:is_closing())
@@ -283,6 +293,7 @@ fn a_takeover_glue_refuses_a_page_install() {
 
 fn refusal(setup: &str, expected: InstallRefusal) {
     let nvim = EmbedNvim::start();
+    nvim.manual_timers();
     let chan = nvim.helper_channel();
     nvim.exec_lua(setup, vec![]);
     settle(&nvim);
@@ -299,6 +310,7 @@ fn refusal(setup: &str, expected: InstallRefusal) {
 #[ignore = "needs nvim on PATH; uses stdio and no display"]
 fn a_bad_page_id_raises() {
     let nvim = EmbedNvim::start();
+    nvim.manual_timers();
     let chan = nvim.helper_channel();
     let before = snapshot(&|code| nvim.exec_lua(code, vec![]));
     for id in ["", "-a", "a-", &"a".repeat(41), "A", "a/b", "a_b", "你好"] {
@@ -324,6 +336,7 @@ fn leftover_snapshot_cases() {
         "agent-replaced",
     ] {
         let nvim = EmbedNvim::start();
+        nvim.manual_timers();
         settle(&nvim);
         let before = snapshot(&|code| nvim.exec_lua(code, vec![]));
         let p = nvim.helper_channel();
@@ -359,7 +372,7 @@ fn leftover_snapshot_cases() {
             nvim.close_channel(a);
         }
         nvim.exec_lua(
-            "assert(vim.wait(1000, function() return __eitri_pages == nil and __eitri_companion == nil end, 10))",
+            "assert(test_timers.until_ready(function() return __eitri_pages == nil and __eitri_companion == nil end))",
             vec![],
         );
         settle(&nvim);
@@ -371,6 +384,7 @@ fn leftover_snapshot_cases() {
 #[ignore = "needs nvim on PATH; uses stdio and no display"]
 fn parts_export_calls_and_adopted_teardowns_run_in_reverse_order() {
     let nvim = EmbedNvim::start();
+    nvim.manual_timers();
     let chan = nvim.helper_channel();
     let mut args = install_args(chan, &Sockets::default(), &InstallKind::Agent);
     let part = |name: &str, source: &str| {
@@ -472,6 +486,7 @@ return {s.slot_chan, s.following, s.buf, s.seq, s.torn, vim.api.nvim_win_get_cur
 #[ignore = "needs nvim on PATH; uses stdio and no display"]
 fn follow_install_without_a_matching_slot_defines_nothing() {
     let nvim = EmbedNvim::start();
+    nvim.manual_timers();
     let chan = nvim.helper_channel();
     for present in [false, true] {
         if present {
@@ -488,6 +503,7 @@ fn follow_install_without_a_matching_slot_defines_nothing() {
 #[ignore = "needs nvim on PATH; uses stdio and no display"]
 fn follow_install_in_a_slot_records_its_channel_and_adopts() {
     let nvim = EmbedNvim::start();
+    nvim.manual_timers();
     let chan = nvim.helper_channel();
     settle(&nvim);
     let before = snapshot(&|code| nvim.exec_lua(code, vec![]));
@@ -515,6 +531,7 @@ fn follow_install_in_a_slot_records_its_channel_and_adopts() {
 #[ignore = "needs nvim on PATH; uses stdio and no display"]
 fn a_page_slots_ops_never_touch_another_channels_state() {
     let nvim = EmbedNvim::start();
+    nvim.manual_timers();
     let chan = nvim.helper_channel();
     let foreign = nvim.helper_channel();
     page(&nvim, chan, "markdown");
@@ -567,6 +584,7 @@ fn a_page_slots_ops_never_touch_another_channels_state() {
 #[ignore = "needs nvim on PATH; uses stdio and no display"]
 fn a_live_slot_of_another_id_cannot_drive_a_pages_follow_state() {
     let nvim = EmbedNvim::start();
+    nvim.manual_timers();
     let chan = nvim.helper_channel();
     page(&nvim, chan, "markdown");
     page(&nvim, chan, "other");
@@ -600,6 +618,7 @@ fn a_live_slot_of_another_id_cannot_drive_a_pages_follow_state() {
 #[ignore = "needs nvim on PATH; uses stdio and no display"]
 fn the_adopted_teardown_leaves_a_state_another_holder_installed() {
     let nvim = EmbedNvim::start();
+    nvim.manual_timers();
     let chan = nvim.helper_channel();
     page(&nvim, chan, "markdown");
     install_follow(&nvim, Some(follow_slot(chan)), None);
@@ -610,13 +629,14 @@ fn the_adopted_teardown_leaves_a_state_another_holder_installed() {
         vec![],
     );
     nvim.close_channel(chan);
-    nvim.exec_lua("assert(vim.wait(1000, function() return __eitri_pages == nil end, 10)); assert(__eitri_plugin_follow.markdown == new_follow and not new_follow.torn); assert(vim.fn.exists(':EitriMarkdown') == 2); assert(new_follow.following and not new_follow.timer:is_closing()); assert(#vim.api.nvim_get_autocmds({group='EitriPluginFollow_markdown'}) > 0)", vec![]);
+    nvim.exec_lua("assert(test_timers.until_ready(function() return __eitri_pages == nil end)); assert(__eitri_plugin_follow.markdown == new_follow and not new_follow.torn); assert(vim.fn.exists(':EitriMarkdown') == 2); assert(new_follow.following and not new_follow.timer:is_closing()); assert(#vim.api.nvim_get_autocmds({group='EitriPluginFollow_markdown'}) > 0)", vec![]);
 }
 
 #[test]
 #[ignore = "needs nvim on PATH; uses stdio and no display"]
 fn his_own_command_of_the_same_name_survives_the_slot() {
     let nvim = EmbedNvim::start();
+    nvim.manual_timers();
     nvim.exec_lua("vim.api.nvim_create_user_command('EitriMarkdown', function() _G.own_command_ran = true end, {desc='my preview'})", vec![]);
     let chan = nvim.helper_channel();
     page(&nvim, chan, "markdown");
@@ -633,13 +653,14 @@ fn his_own_command_of_the_same_name_survives_the_slot() {
         vec![],
     );
     nvim.close_channel(chan);
-    nvim.exec_lua("assert(vim.wait(1000, function() return __eitri_pages == nil end, 10)); assert(not __eitri_plugin_follow or not __eitri_plugin_follow.markdown); vim.cmd.EitriMarkdown(); assert(own_command_ran); assert(vim.api.nvim_get_commands({}).EitriMarkdown.definition == 'my preview')", vec![]);
+    nvim.exec_lua("assert(test_timers.until_ready(function() return __eitri_pages == nil end)); assert(not __eitri_plugin_follow or not __eitri_plugin_follow.markdown); vim.cmd.EitriMarkdown(); assert(own_command_ran); assert(vim.api.nvim_get_commands({}).EitriMarkdown.definition == 'my preview')", vec![]);
 }
 
 #[test]
 #[ignore = "needs nvim on PATH; uses stdio and no display"]
 fn a_buffer_under_the_scratch_prefix_is_never_followed() {
     let nvim = EmbedNvim::start();
+    nvim.manual_timers();
     let chan = nvim.helper_channel();
     page(&nvim, chan, "markdown");
     let prefix = std::env::temp_dir().join("nv-sc-");
@@ -667,6 +688,7 @@ fn a_buffer_under_the_scratch_prefix_is_never_followed() {
 #[ignore = "needs nvim on PATH; uses stdio and no display"]
 fn an_agent_slot_can_adopt_follow_glue() {
     let nvim = EmbedNvim::start();
+    nvim.manual_timers();
     let chan = nvim.helper_channel();
     install(&nvim, chan, InstallKind::Agent);
     let slot = Value::Map(vec![("chan".into(), chan.into())]);
@@ -685,7 +707,7 @@ fn an_agent_slot_can_adopt_follow_glue() {
     nvim.close_channel(chan);
     nvim.exec_lua(
         r#"
-assert(vim.wait(1000, function() return __eitri_companion == nil end, 10))
+assert(test_timers.until_ready(function() return __eitri_companion == nil end))
 assert(not __eitri_plugin_follow or not __eitri_plugin_follow.markdown)
 assert(vim.fn.exists(':EitriMarkdown') == 0)
 "#,

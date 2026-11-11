@@ -74,6 +74,8 @@ pub struct Notifier<P: Poster> {
     sources: Sources,
     post: P,
     audit: Arc<Audit>,
+    #[cfg(feature = "remote-test-hooks")]
+    pending: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl<P: Poster> Notifier<P> {
@@ -83,16 +85,22 @@ impl<P: Poster> Notifier<P> {
             sources,
             post,
             audit,
+            #[cfg(feature = "remote-test-hooks")]
+            pending: Arc::default(),
         }
     }
 
     /// One change of the agents layer, at `now`.
     pub fn on_change(&mut self, change: &Change, now: Instant) {
+        self.on_change_at(change, now, SystemTime::now);
+    }
+
+    fn on_change_at(&mut self, change: &Change, now: Instant, wall: impl FnOnce() -> SystemTime) {
         let (targets, connected) = ((self.sources.targets)(), (self.sources.connected)());
         let ctx = Ctx {
             targets: &targets,
             connected: &connected,
-            desk_active_until: desk_active_until(&self.sources.presence, SystemTime::now(), now),
+            desk_active_until: desk_active_until(&self.sources.presence, wall(), now),
         };
         let due = self.rules.on_change(change, now, &ctx);
         self.send(due);
@@ -100,11 +108,15 @@ impl<P: Poster> Notifier<P> {
 
     /// The once-a-second step: wakes held or coalesced until now.
     pub fn tick(&mut self, now: Instant) {
+        self.tick_at(now, SystemTime::now);
+    }
+
+    fn tick_at(&mut self, now: Instant, wall: impl FnOnce() -> SystemTime) {
         let (targets, connected) = ((self.sources.targets)(), (self.sources.connected)());
         let ctx = Ctx {
             targets: &targets,
             connected: &connected,
-            desk_active_until: desk_active_until(&self.sources.presence, SystemTime::now(), now),
+            desk_active_until: desk_active_until(&self.sources.presence, wall(), now),
         };
         let due = self.rules.tick(now, &ctx);
         self.send(due);
@@ -123,13 +135,17 @@ impl<P: Poster> Notifier<P> {
             };
             let record = {
                 let (audit, device, host) = (self.audit.clone(), device.clone(), host.clone());
+                #[cfg(feature = "remote-test-hooks")]
+                let pending = self.pending.clone();
                 move |status: String| {
                     audit.record(AuditEvent::Push {
                         device,
                         host,
                         wake: wake.to_owned(),
                         status,
-                    })
+                    });
+                    #[cfg(feature = "remote-test-hooks")]
+                    pending.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
                 }
             };
             let still_due: StillDue = {
@@ -142,7 +158,11 @@ impl<P: Poster> Notifier<P> {
                             .any(|t| t.device_id == device && t.endpoint == endpoint)
                 })
             };
+            #[cfg(feature = "remote-test-hooks")]
+            self.pending.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             if self.post.post(&target.endpoint, still_due, Box::new(record)).is_err() {
+                #[cfg(feature = "remote-test-hooks")]
+                self.pending.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
                 self.audit.record(AuditEvent::Push {
                     device,
                     host,
@@ -166,10 +186,16 @@ pub fn start_with(control: &Path, sources: Sources, post: impl Poster, audit: Ar
         let _ = tx.send(event);
     })?;
     let mut notifier = Notifier::new(sources, post, audit);
+    #[cfg(feature = "remote-test-hooks")]
+    let turn_file = notifier.audit.notifier_turn_path_for_tests();
+    #[cfg(feature = "remote-test-hooks")]
+    let observe_turns = std::env::var_os(crate::notify::post::POST_ALLOW_TEST_VAR).is_some();
     std::thread::Builder::new()
         .name("eitri-remote-notify".into())
         .spawn(move || {
             let _reader = reader;
+            #[cfg(feature = "remote-test-hooks")]
+            let mut turns = 0u64;
             loop {
                 match rx.recv_timeout(NOTIFY_TICK) {
                     Ok(ReaderEvent::Change(change)) => notifier.on_change(&change, Instant::now()),
@@ -177,11 +203,35 @@ pub fn start_with(control: &Path, sources: Sources, post: impl Poster, audit: Ar
                         eprintln!("[remote] no more wakes: the rows are no longer read: {why}");
                         return;
                     }
-                    Err(mpsc::RecvTimeoutError::Timeout) => notifier.tick(Instant::now()),
+                    Err(mpsc::RecvTimeoutError::Timeout) => {
+                        notifier.tick(Instant::now());
+                        #[cfg(feature = "remote-test-hooks")]
+                        if observe_turns && notifier.pending.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+                            turns += 1;
+                            // The count follows the rules step and completion of all earlier posts.
+                            if let Some(path) = &turn_file {
+                                record_turn_for_tests(path, turns)
+                                    .expect("the notifier marker is writable inside the audit directory");
+                            }
+                        }
+                    }
                     Err(mpsc::RecvTimeoutError::Disconnected) => return,
                 }
             }
         })?;
+    Ok(())
+}
+
+#[cfg(feature = "remote-test-hooks")]
+fn record_turn_for_tests(path: &Path, turns: u64) -> io::Result<()> {
+    // The sandbox allows creation and replacement inside audit, but forbids truncation.
+    // Publish whole counts so a reader cannot mistake a partial update for completed turns.
+    let dir = agent::private_fs::open_dir(path.parent().expect("the marker has an audit directory"))?;
+    agent::private_fs::publish_private_file(
+        &dir,
+        path.file_name().expect("the marker has a file name"),
+        turns.to_string().as_bytes(),
+    )?;
     Ok(())
 }
 
@@ -264,18 +314,76 @@ mod tests {
         file.set_modified(at).unwrap();
     }
 
+    #[cfg(feature = "remote-test-hooks")]
+    #[test]
+    fn idle_turn_markers_use_the_writable_audit_directory() {
+        let dir = scratch("turn-marker");
+        let audit_dir = dir.join("audit");
+        let log = eitri_core::remote_audit::AuditLog::open(
+            &audit_dir,
+            eitri_core::remote_audit::WriterKind::Serve,
+            Some(90),
+            eitri_core::remote_audit::JournalTarget::Off,
+        )
+        .unwrap();
+        let audit = Audit::new(log, &audit_dir);
+        let notifier = Notifier::new(sources(&dir.join(PRESENCE_DIR)), Posted::default(), audit);
+        let marker = notifier.audit.notifier_turn_path_for_tests().unwrap();
+        assert_eq!(
+            marker.parent(),
+            Some(audit_dir.as_path()),
+            "only the audit directory permits creation"
+        );
+        // Landlock confines just this worker and its descendants, leaving libtest unchanged.
+        // Use serve's audit-directory rights, which allow replacement but no truncation.
+        std::thread::spawn(move || {
+            use landlock::{
+                path_beneath_rules, Access, AccessFs, Ruleset, RulesetAttr, RulesetCreatedAttr, RulesetStatus, ABI,
+            };
+            let status = Ruleset::default()
+                .handle_access(AccessFs::from_all(ABI::V9))
+                .unwrap()
+                .create()
+                .unwrap()
+                .add_rules(path_beneath_rules(
+                    [audit_dir.as_path()],
+                    AccessFs::ReadFile
+                        | AccessFs::ReadDir
+                        | AccessFs::WriteFile
+                        | AccessFs::MakeReg
+                        | AccessFs::RemoveFile,
+                ))
+                .unwrap()
+                .restrict_self()
+                .unwrap();
+            for turns in [1, 9, 10, 20, 100, 1] {
+                record_turn_for_tests(&marker, turns).unwrap();
+                assert_eq!(std::fs::read_to_string(&marker).unwrap(), turns.to_string());
+            }
+            let file = std::fs::File::options().write(true).open(&marker).unwrap();
+            if status.ruleset == RulesetStatus::FullyEnforced {
+                // A supporting kernel must also reject the operation the marker avoids.
+                assert_eq!(file.set_len(0).unwrap_err().kind(), io::ErrorKind::PermissionDenied);
+            }
+        })
+        .join()
+        .unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn presence_file_holds_needs_you() {
         let dir = scratch("presence");
         let presence = dir.join(PRESENCE_DIR);
         std::fs::create_dir_all(&presence).unwrap();
-        touch(&presence.join("a3f09c1d2e4b5f60"), SystemTime::now());
+        let wall = SystemTime::now();
+        touch(&presence.join("a3f09c1d2e4b5f60"), wall);
         let posted = Posted::default();
         let mut notifier = Notifier::new(sources(&presence), posted.clone(), Audit::off());
         let start = Instant::now();
-        notifier.on_change(&Change::Reset { view: View::default() }, start);
-        notifier.on_change(&row("k-1", Class::Needs), start);
-        notifier.tick(start + Duration::from_secs(1));
+        notifier.on_change_at(&Change::Reset { view: View::default() }, start, || wall);
+        notifier.on_change_at(&row("k-1", Class::Needs), start, || wall);
+        notifier.tick_at(start + Duration::from_secs(1), || wall + Duration::from_secs(1));
         assert!(
             posted.0.lock().unwrap().is_empty(),
             "a needs-you went while the desk was in use"
@@ -283,9 +391,9 @@ mod tests {
         // The desk last touched long enough ago: the held wake goes.
         touch(
             &presence.join("a3f09c1d2e4b5f60"),
-            SystemTime::now() - DESK_ACTIVE_HOLD - Duration::from_secs(1),
+            wall - DESK_ACTIVE_HOLD - Duration::from_secs(1),
         );
-        notifier.tick(start + Duration::from_secs(2));
+        notifier.tick_at(start + Duration::from_secs(2), || wall + Duration::from_secs(2));
         assert_eq!(*posted.0.lock().unwrap(), ["https://push.example/up/d1"]);
         let _ = std::fs::remove_dir_all(&dir);
     }

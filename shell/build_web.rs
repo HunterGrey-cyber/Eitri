@@ -27,8 +27,8 @@
 // `PROFILE=release` -- the LGPL source asset's offline rebuild (an LGPL 4(d)(0) obligation) is itself a
 // release build with no network, and must not reach npm.
 
-// `Path`/`PathBuf`/`Command` are deliberately not `use`d here: this file is `include!`d into both
-// `build.rs` and `tests/web_bundle_freshness.rs`, and each already imports all three at its own top
+// `Path`/`PathBuf` are deliberately not `use`d here: this file is `include!`d into both
+// `build.rs` and `tests/web_bundle_freshness.rs`, and each already imports both at its own top
 // -- importing them a second time here would be a duplicate-import error (E0252), not merely dead
 // code, since `include!` splices this text into the very same module scope.
 mod node_cache {
@@ -110,9 +110,12 @@ fn web_build_inputs(web_dir: &Path) -> Vec<PathBuf> {
 
 /// What `build.rs` should ask Cargo to watch: the `src` directory itself (so Cargo notices an
 /// added or removed file under it, not only an edited one) plus every currently-present top-level
-/// input file [`web_build_inputs`] also folds into the fingerprint. Never the two state files
-/// (`FINGERPRINT_REL`/`LOCK_SHA_REL`) -- watching a file this same build script writes would make
-/// Cargo think its own output changed the input, rerunning on every build.
+/// input file [`web_build_inputs`] also folds into the fingerprint, then the caller's output and
+/// its fingerprint file, even when missing. Deleting either must rerun the script so it can rebuild.
+/// After npm writes these watched files, Cargo may rerun the script once because they are newer
+/// than that run's start. A matching bundle writes neither file and runs no npm, so that extra
+/// pass reaches steady state instead of looping (unless a clean build is explicitly forced).
+/// The install marker (`LOCK_SHA_REL`) is not watched: missing node_modules alone needs no build.
 ///
 /// **Known limitation:** a *brand-new* top-level
 /// `vite.config.*`/`tsconfig*.json` that did not exist at the last build -- e.g. adding
@@ -120,13 +123,13 @@ fn web_build_inputs(web_dir: &Path) -> Vec<PathBuf> {
 /// watched, so Cargo will not rerun this script for its addition alone; the fingerprint only
 /// notices it once something else already-watched changes too. Watching `web_dir` itself would
 /// catch it, but is deliberately not done: Cargo's own `rerun-if-changed` scans a directory path
-/// recursively, which would pull in `dist/` (this script's own output) and `node_modules/`
-/// (rewritten by every `npm ci`), rerunning the script on every single build. Pre-registering the
+/// recursively, which would pull in all of `dist/` and `node_modules/` (including unrelated
+/// generated files and caches), rather than just the two required output files. Pre-registering the
 /// plausible names ahead of their creation does not work either: `watch_git_head` in `build.rs`
 /// documents the same fact from the other side -- Cargo treats a `rerun-if-changed` path that does
 /// not yet exist as *always* changed, so watching e.g. `vite.config.js` before it exists would
 /// rerun this script on every build until the day someone actually creates it.
-fn web_build_watch_paths(web_dir: &Path) -> Vec<PathBuf> {
+fn web_build_watch_paths(web_dir: &Path, output: &str) -> Vec<PathBuf> {
     let src_dir = web_dir.join("src");
     let mut paths = vec![src_dir.clone()];
     paths.extend(
@@ -134,6 +137,8 @@ fn web_build_watch_paths(web_dir: &Path) -> Vec<PathBuf> {
             .into_iter()
             .filter(|p| !p.starts_with(&src_dir)),
     );
+    paths.push(web_dir.join(output));
+    paths.push(web_dir.join(FINGERPRINT_REL));
     paths
 }
 
@@ -261,6 +266,13 @@ fn write_state_file(path: &Path, content: &str) {
     fs::write(path, content).unwrap_or_else(|e| panic!("failed to write {}: {e}", path.display()));
 }
 
+fn out_dir() -> std::path::PathBuf {
+    std::env::var_os("OUT_DIR")
+        .or_else(|| option_env!("OUT_DIR").map(std::ffi::OsString::from))
+        .expect("Cargo supplies OUT_DIR")
+        .into()
+}
+
 /// `program args...` in `dir`. `override_dir.join(program)` when given (an explicit path, never
 /// searched for on `PATH` -- see [`ensure_web_bundle_built`]'s own doc comment for why), the bare
 /// `program` name (searched on the inherited `PATH`, as ever) otherwise.
@@ -269,7 +281,7 @@ fn run(dir: &Path, program: &str, args: &[&str], override_dir: Option<&Path>) {
         Some(bin_dir) => bin_dir.join(program),
         None => PathBuf::from(program),
     };
-    let status = node_cache::command(&resolved, &node_cache::out_dir())
+    let status = node_cache::command(&resolved, &out_dir())
         .args(args)
         .current_dir(dir)
         .status()

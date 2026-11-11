@@ -363,6 +363,16 @@ fn live_backend(project: &Path) -> (Arc<RecordingProvider>, AgentBackend) {
 }
 
 impl Fixture {
+    fn settle_file_jobs(&mut self, rpc: Option<&dyn EditorRpc>) -> Vec<Out> {
+        let mut out = Vec::new();
+        until("file workers to finish", || {
+            self.pump();
+            out.extend(self.flow.tick(&mut self.tabs, rpc, Instant::now()));
+            !self.flow.file_jobs_in_flight_for_tests()
+        });
+        out
+    }
+
     fn new(name: &str) -> Fixture {
         let mut f = Fixture::bare(name);
         f.give_session();
@@ -1392,6 +1402,7 @@ fn nothing_is_offered_when_nothing_was_interrupted() {
         assert!(offered(&outs).is_none());
         std::thread::sleep(Duration::from_millis(5));
     }
+    f.settle_file_jobs(None);
     assert!(f.flow.document_ready(&f.tabs).is_empty());
     assert_eq!(f.flow.jobs_started(), 1);
     f.shut_down();
@@ -2161,6 +2172,7 @@ fn showing_another_turn_replaces_the_overlay() {
         f.flow.tick(&mut f.tabs, editor.rpc(), Instant::now());
         std::thread::sleep(Duration::from_millis(5));
     }
+    f.settle_file_jobs(editor.rpc());
     assert_eq!(editor.count(SHOW_LUA), 0, "the same turn is not drawn twice");
 
     // Another turn's diff for that file replaces what is drawn.
@@ -2237,6 +2249,7 @@ fn an_open_still_reading_its_file_never_reaches_an_editor_that_replaced_the_one_
         outs.extend(f.tick(new.rpc()));
         std::thread::sleep(Duration::from_millis(5));
     }
+    outs.extend(f.settle_file_jobs(new.rpc()));
     let why = result_of(&outs, "o1").unwrap_err();
     assert!(why.contains("editor changed"), "{why}");
     assert_eq!(
@@ -3204,6 +3217,7 @@ mod live_review {
             step(&mut f, editor.rpc(), at);
             std::thread::sleep(Duration::from_millis(5));
         }
+        f.settle_file_jobs(editor.rpc());
         let after: Vec<&str> = editor.asked.borrow()[before..].iter().map(|(code, _)| *code).collect();
         assert!(
             !after
@@ -3236,6 +3250,7 @@ mod live_review {
             step(&mut f, editor.rpc(), at);
             std::thread::sleep(Duration::from_millis(5));
         }
+        f.settle_file_jobs(editor.rpc());
         assert_eq!(editor.count(SHOW_LUA), 0, "the read the panel left never draws");
         f.shut_down();
     }

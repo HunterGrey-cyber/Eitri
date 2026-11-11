@@ -13,7 +13,7 @@ use rmpv::Value;
 
 use super::cards::{CardAnswer, CardDecision, CardLine, CardOrigin, CardProposal, EditorCardWire};
 use super::memory::Memory;
-use super::stamp::{wall_ms, Sequencer, STAMP_MARGIN};
+use super::stamp::{monotonic_now, wall_ms, Sequencer, STAMP_MARGIN};
 use super::step::{
     encoded_len, AgentCall, BridgeCallId, EditorFailure, EditorReach, EditorSight, Step, StepEvent, Tool, ToolCx,
     ToolError, ToolResult, ToolRun, ANSWER_MAX_ENCODED,
@@ -450,7 +450,7 @@ impl Round<'_> {
                     // up, and the agent is never told nothing was shown while a window opens. The give-up counts
                     // from the tick's `now` and the stamp from the wall clock as it reads it here, so what the
                     // tick has spent since `now` comes off the stamp too: a stall cannot push it past the give-up.
-                    let spent = Instant::now().saturating_duration_since(self.now);
+                    let spent = monotonic_now().saturating_duration_since(self.now);
                     let chunk_budget = budget.saturating_sub(STAMP_MARGIN).saturating_sub(spent);
                     // Its stamp would already be past: the chunk could only answer that it did nothing.
                     if chunk_budget.is_zero() {
@@ -796,7 +796,6 @@ mod tests {
     use serde_json::json;
     use std::cell::RefCell;
     use std::path::PathBuf;
-    use std::thread;
     use std::time::Duration;
 
     const TAB: TabId = TabId(1);
@@ -1299,8 +1298,9 @@ mod tests {
 
     #[test]
     fn the_stamp_gives_up_before_the_broker_does() {
+        let _clock = super::super::testing::clock::Clock::new();
         let before = wall_ms();
-        let (mut broker, env, t0) = (Broker::new(), FakeEnv::new(), Instant::now());
+        let (mut broker, env, t0) = (Broker::new(), FakeEnv::new(), monotonic_now());
         submit(&mut broker, &env, TAB, sidecar("a"), &["call"], t0);
         broker.tick(&env, t0);
         let wall_after = wall_ms();
@@ -1333,7 +1333,8 @@ mod tests {
 
     #[test]
     fn a_budget_just_over_the_margin_sends_its_chunk() {
-        let (mut broker, env, t0) = (Broker::new(), FakeEnv::new(), Instant::now());
+        let _clock = super::super::testing::clock::Clock::new();
+        let (mut broker, env, t0) = (Broker::new(), FakeEnv::new(), monotonic_now());
         let budget = STAMP_MARGIN.as_millis() as u64 + 1;
         submit(&mut broker, &env, TAB, sidecar("a"), &[&format!("call {budget}")], t0);
         let before = wall_ms();
@@ -1346,8 +1347,9 @@ mod tests {
 
     #[test]
     fn a_tick_that_runs_late_stamps_from_the_moment_the_broker_counts_from() {
+        let _clock = super::super::testing::clock::Clock::new();
         let late = Duration::from_secs(1);
-        let (mut broker, env, now) = (Broker::new(), FakeEnv::new(), Instant::now() - late);
+        let (mut broker, env, now) = (Broker::new(), FakeEnv::new(), monotonic_now() - late);
         submit(&mut broker, &env, TAB, sidecar("a"), &["call"], now);
         broker.tick(&env, now);
         let stamped = (EDITOR_BUDGET - STAMP_MARGIN - late).as_millis() as u64;
@@ -1359,7 +1361,8 @@ mod tests {
 
     #[test]
     fn a_tick_later_than_the_budget_sends_no_chunk() {
-        let (mut broker, env, now) = (Broker::new(), FakeEnv::new(), Instant::now() - EDITOR_BUDGET);
+        let _clock = super::super::testing::clock::Clock::new();
+        let (mut broker, env, now) = (Broker::new(), FakeEnv::new(), monotonic_now() - EDITOR_BUDGET);
         submit(&mut broker, &env, TAB, sidecar("a"), &["call"], now);
         assert_eq!(only_answer(&broker.tick(&env, now)).text, "start NotAnswered");
         assert!(env.sent_by().is_empty());
@@ -1814,7 +1817,8 @@ mod tests {
 
     #[test]
     fn answered_ms_is_when_the_person_answered_not_when_the_run_resumed() {
-        let (mut broker, env, t0) = (Broker::new(), FakeEnv::new(), Instant::now());
+        let _clock = super::super::testing::clock::Clock::new();
+        let (mut broker, env, t0) = (Broker::new(), FakeEnv::new(), monotonic_now());
         submit(&mut broker, &env, TAB, sidecar("a"), &["ask"], t0);
         submit(&mut broker, &env, TAB, sidecar("flying"), &["call"], t0);
         broker.tick(&env, t0);
@@ -1825,7 +1829,7 @@ mod tests {
             .answer_card(TAB, &id, CardDecision::Allow, CardOrigin::Key, t0)
             .unwrap();
         let answered = wall_ms();
-        thread::sleep(Duration::from_millis(20));
+        super::super::testing::clock::advance(Duration::from_secs(1));
         broker.tick(&env, t0);
         env.ok(0);
         let out = broker.tick(&env, t0);

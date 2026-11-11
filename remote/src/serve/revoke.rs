@@ -182,19 +182,27 @@ impl StoreView {
 /// Watches `dir`, the store's directory, on a thread of its own, and calls `changed` after every change in it and every
 /// [`STORE_RECHECK`]. The thread ends when `changed` returns `false`.
 pub fn watch_store(dir: &Path, changed: impl FnMut() -> bool + Send + 'static) -> io::Result<()> {
+    watch_store_with_recheck(dir, STORE_RECHECK, changed)
+}
+
+fn watch_store_with_recheck(
+    dir: &Path,
+    recheck: Duration,
+    changed: impl FnMut() -> bool + Send + 'static,
+) -> io::Result<()> {
     let watch = Inotify::on(dir).map_err(|e| eprintln!("[remote] the device store is looked at every 2 s only: {e}"));
     std::thread::Builder::new()
         .name("eitri-remote-store".into())
-        .spawn(move || run_watch(watch.ok(), changed))?;
+        .spawn(move || run_watch(watch.ok(), recheck, changed))?;
     Ok(())
 }
 
-fn run_watch(watch: Option<Inotify>, mut changed: impl FnMut() -> bool) {
+fn run_watch(watch: Option<Inotify>, recheck: Duration, mut changed: impl FnMut() -> bool) {
     loop {
         if let Some(watch) = &watch {
-            watch.wait(STORE_RECHECK);
+            watch.wait(recheck);
         } else {
-            std::thread::sleep(STORE_RECHECK);
+            std::thread::sleep(recheck);
         }
         if !changed() {
             return;
@@ -314,12 +322,16 @@ mod tests {
         let view = Arc::new(StoreView::new(&path));
         let seen = view.clone();
         assert!(seen.verify("d1", "tok").is_some());
-        watch_store(&dir, move || tx.send(seen.verify("d1", "tok")).is_ok()).unwrap();
+        // Only an inotify event can wake this watch before the hang guard.
+        watch_store_with_recheck(&dir, Duration::from_secs(3600), move || {
+            tx.send(seen.verify("d1", "tok")).is_ok()
+        })
+        .unwrap();
         update(&path, |store| store.remove("d1")).unwrap();
-        // The periodic look would also find it; within a recheck an event must have come.
-        let deadline = std::time::Instant::now() + STORE_RECHECK * 10;
+        let deadline = std::time::Instant::now() + Duration::from_secs(60);
         loop {
-            let got = rx.recv_timeout(STORE_RECHECK * 2).expect("the watch calls back");
+            let left = deadline.saturating_duration_since(std::time::Instant::now());
+            let got = rx.recv_timeout(left).expect("the watch calls back on the rename");
             if got.is_none() {
                 break;
             }

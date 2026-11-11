@@ -4061,28 +4061,17 @@ mod tests {
         dir
     }
 
-    /// Drives the pump until what the provider queued has been delivered, or the deadline passes.
-    /// The sidecar's events cross the ingestion thread, so the first call after a queue is normally
-    /// empty.
-    ///
-    /// Everything queued, not only the first batch (seen 2026-09-28): the ingestion thread folds
-    /// every 5 ms, so under a loaded test run events queued together can arrive in two deliveries,
-    /// and a helper that returned the first left a test's later events undelivered -- a forced 30 ms
-    /// pause between two `queue` calls reproduced `left: 1, right: 3` in
-    /// `approve_pending_never_answers_a_prompt_only_a_human_answers`. Collected until 100 ms pass
-    /// with nothing new, as the panel's own pump keeps taking deliveries; the same fix `deliver()`
-    /// got.
+    /// Samples twenty UI turns, each after ingestion has folded the provider's queued events.
+    /// A later empty provider pump proves a preceding batch has left the folding gate.
     fn pump_until_delivery(
+        provider: &RecordingProvider,
         backend: &mut AgentBackend,
         project_root: &Path,
         mode: PermissionMode,
     ) -> Vec<AgentDomainEvent> {
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        let quiet = std::time::Duration::from_millis(100);
         let mut delivered = Vec::new();
-        let mut last_new: Option<std::time::Instant> = None;
-        loop {
-            let now = std::time::Instant::now();
+        for _ in 0..20 {
+            provider.wait_until_folded();
             match backend
                 .take_revised_ui_delivery(
                     project_root,
@@ -4096,12 +4085,11 @@ mod tests {
             {
                 UiDelivery::Events(events) if !events.is_empty() => {
                     delivered.extend(events);
-                    last_new = Some(now);
                 }
-                _ if last_new.is_some_and(|at| now.duration_since(at) >= quiet) || now > deadline => return delivered,
-                _ => std::thread::sleep(std::time::Duration::from_millis(5)),
+                _ => {}
             }
         }
+        delivered
     }
 
     /// An in-project Read must produce no card and actually be answered. Merely hiding its
@@ -4132,7 +4120,7 @@ mod tests {
             input: serde_json::json!({ "file_path": "main.rs" }),
         });
 
-        let delivered = pump_until_delivery(&mut backend, &dir, PermissionMode::Auto);
+        let delivered = pump_until_delivery(&provider, &mut backend, &dir, PermissionMode::Auto);
         assert!(
             !delivered
                 .iter()
@@ -4173,7 +4161,7 @@ mod tests {
             provider_prompt: None,
         });
 
-        let delivered = pump_until_delivery(&mut backend, &dir, PermissionMode::Auto);
+        let delivered = pump_until_delivery(&provider, &mut backend, &dir, PermissionMode::Auto);
         assert!(
             delivered.iter().any(|e| matches!(
                 e,
@@ -4211,7 +4199,7 @@ mod tests {
             provider_prompt: None,
         });
 
-        let delivered = pump_until_delivery(&mut backend, &dir, PermissionMode::Auto);
+        let delivered = pump_until_delivery(&provider, &mut backend, &dir, PermissionMode::Auto);
         assert!(
             delivered
                 .iter()
@@ -4299,7 +4287,7 @@ mod tests {
             input: serde_json::json!({ "file_path": ".git/main.rs", "content": "" }), // still cards under the fast path
             provider_prompt: None,
         });
-        let delivered = pump_until_delivery(&mut backend, &dir, PermissionMode::Auto);
+        let delivered = pump_until_delivery(&provider, &mut backend, &dir, PermissionMode::Auto);
         tracker.observe(&delivered, false);
         tracker.retain_pending(|id| backend.projection().pending_permissions.contains_key(id));
 
@@ -4320,7 +4308,7 @@ mod tests {
             permission_id: "perm-write".into(),
             outcome: agent::PermissionOutcome::Allowed,
         });
-        let delivered = pump_until_delivery(&mut backend, &dir, PermissionMode::Auto);
+        let delivered = pump_until_delivery(&provider, &mut backend, &dir, PermissionMode::Auto);
         tracker.observe(&delivered, false);
         tracker.retain_pending(|id| backend.projection().pending_permissions.contains_key(id));
         assert_eq!(tracker.attention().pending, 0);
@@ -4396,7 +4384,7 @@ mod tests {
         );
 
         provider.queue(read("later"));
-        let later = pump_until_delivery(&mut backend, &dir, PermissionMode::Auto);
+        let later = pump_until_delivery(&provider, &mut backend, &dir, PermissionMode::Auto);
         assert!(
             later.iter().any(
                 |e| matches!(e, AgentDomainEvent::PermissionRequested { permission_id, .. } if permission_id == "later")
@@ -4534,7 +4522,7 @@ mod tests {
         );
 
         provider.queue(read("later"));
-        let later = pump_until_delivery(&mut backend, &dir, PermissionMode::Bypass);
+        let later = pump_until_delivery(&provider, &mut backend, &dir, PermissionMode::Bypass);
         assert!(later.iter().any(
             |e| matches!(e, AgentDomainEvent::PermissionRequested { permission_id, .. } if permission_id == "later")
         ));
@@ -4568,7 +4556,7 @@ mod tests {
             input: serde_json::json!({ "file_path": "main.rs" }),
             provider_prompt: None,
         });
-        let delivered = pump_until_delivery(&mut backend, &dir, PermissionMode::Auto);
+        let delivered = pump_until_delivery(&provider, &mut backend, &dir, PermissionMode::Auto);
         assert!(delivered
             .iter()
             .any(|e| matches!(e, AgentDomainEvent::PermissionRequested { .. })));
@@ -4688,8 +4676,9 @@ mod tests {
         });
 
         let mut host_answered = BTreeSet::new();
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        loop {
+        let mut delivered = false;
+        for _ in 0..20 {
+            provider.wait_until_folded();
             match backend
                 .take_revised_ui_delivery(
                     &dir,
@@ -4701,13 +4690,14 @@ mod tests {
                 )
                 .without_revisions()
             {
-                UiDelivery::Events(_) => break,
-                _ => {
-                    assert!(std::time::Instant::now() < deadline, "nothing was delivered");
-                    std::thread::sleep(std::time::Duration::from_millis(5));
+                UiDelivery::Events(_) => {
+                    delivered = true;
+                    break;
                 }
+                _ => {}
             }
         }
+        assert!(delivered, "nothing was delivered within twenty UI samples");
         assert_eq!(host_answered, BTreeSet::from(["perm-read".to_string()]));
         backend.shutdown();
     }
@@ -4738,12 +4728,9 @@ mod tests {
         provider.queue_all(vec![read.clone(), read]);
 
         let mut host_answered = BTreeSet::new();
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        let quiet = std::time::Duration::from_millis(100);
         let mut delivered = Vec::new();
-        let mut last_new: Option<std::time::Instant> = None;
-        loop {
-            let now = std::time::Instant::now();
+        for _ in 0..20 {
+            provider.wait_until_folded();
             match backend
                 .take_revised_ui_delivery(
                     &dir,
@@ -4757,10 +4744,8 @@ mod tests {
             {
                 UiDelivery::Events(events) if !events.is_empty() => {
                     delivered.extend(events);
-                    last_new = Some(now);
                 }
-                _ if last_new.is_some_and(|at| now.duration_since(at) >= quiet) || now > deadline => break,
-                _ => std::thread::sleep(std::time::Duration::from_millis(5)),
+                _ => {}
             }
         }
 
@@ -4800,7 +4785,7 @@ mod tests {
 
         provider.queue(write("a"));
         provider.queue(write("b"));
-        let delivered = pump_until_delivery(&mut backend, &dir, PermissionMode::Auto);
+        let delivered = pump_until_delivery(&provider, &mut backend, &dir, PermissionMode::Auto);
         assert_eq!(delivered.len(), 2, "both must card in Auto: {delivered:?}");
 
         provider.queue(AgentDomainEvent::PermissionResolved {
@@ -4891,7 +4876,7 @@ mod tests {
         };
 
         provider.queue(write("still-pending"));
-        let delivered = pump_until_delivery(&mut backend, &dir, PermissionMode::Auto);
+        let delivered = pump_until_delivery(&provider, &mut backend, &dir, PermissionMode::Auto);
         assert_eq!(delivered.len(), 1, "the premise: it really is a delivered card");
 
         provider.queue(AgentDomainEvent::UngatedCliMode {
@@ -4936,7 +4921,7 @@ mod tests {
             input: serde_json::json!({ "file_path": "main.rs", "content": "" }),
             provider_prompt: None,
         });
-        let delivered = pump_until_delivery(&mut backend, &dir, PermissionMode::Bypass);
+        let delivered = pump_until_delivery(&provider, &mut backend, &dir, PermissionMode::Bypass);
         assert!(
             delivered.iter().any(
                 |e| matches!(e, AgentDomainEvent::PermissionRequested { permission_id, .. } if permission_id == "perm-write")
@@ -4983,6 +4968,7 @@ mod tests {
     /// One delivery through the CLI-prompt entry point, with the tab's human approvals; returns what was
     /// delivered and the CLI prompts answered without a card (for the row notes).
     fn deliver(
+        provider: &crate::test_providers::RecordingProvider,
         backend: &mut AgentBackend,
         dir: &Path,
         rules: &agent::PrefixRules,
@@ -4990,32 +4976,22 @@ mod tests {
         host_answered: &mut BTreeSet<String>,
         approvals: &mut HumanApprovals,
     ) -> (Vec<AgentDomainEvent>, Vec<PromptAnsweredForYou>) {
-        // Everything the provider queued, not only the first batch: the ingestion thread folds every
-        // 5 ms, so under a loaded test run the queued events can arrive in two deliveries, and a
-        // helper that returned the first one left a test's later events undelivered (seen failing
-        // about one run in three in the full suite, never alone). Collected until 100 ms pass with
-        // nothing new, as the panel's own pump keeps taking deliveries.
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        let quiet = std::time::Duration::from_millis(100);
+        // Sample repeated UI turns only after each queued batch has finished folding.
         let mut answered = AnsweredForYou::default();
         let mut delivered = Vec::new();
-        let mut last_new: Option<std::time::Instant> = None;
-        loop {
-            let now = std::time::Instant::now();
+        for _ in 0..20 {
+            provider.wait_until_folded();
             match backend
                 .take_revised_ui_delivery(dir, rules, mode, host_answered, approvals, &mut answered)
                 .without_revisions()
             {
                 UiDelivery::Events(events) if !events.is_empty() => {
                     delivered.extend(events);
-                    last_new = Some(now);
                 }
-                _ if last_new.is_some_and(|at| now.duration_since(at) >= quiet) || now > deadline => {
-                    return (delivered, answered.prompts)
-                }
-                _ => std::thread::sleep(std::time::Duration::from_millis(5)),
+                _ => {}
             }
         }
+        (delivered, answered.prompts)
     }
 
     #[test]
@@ -5238,6 +5214,7 @@ mod tests {
         ));
         let mut host_answered = BTreeSet::new();
         let (delivered, _) = deliver(
+            &provider,
             &mut backend,
             &dir,
             &agent::PrefixRules::default(),
@@ -5265,6 +5242,7 @@ mod tests {
             None,
         ));
         let (delivered, _) = deliver(
+            &provider,
             &mut backend,
             &dir,
             &rules,
@@ -5292,6 +5270,7 @@ mod tests {
         });
         let mut host_answered = BTreeSet::new();
         let (delivered, answered) = deliver(
+            &provider,
             &mut backend,
             &dir,
             &agent::PrefixRules::default(),
@@ -5395,6 +5374,7 @@ mod tests {
             provider.queue(event);
             let mut host_answered = BTreeSet::new();
             let (delivered, answered) = deliver(
+                &provider,
                 &mut backend,
                 &dir,
                 &agent::PrefixRules::default(),
@@ -5430,6 +5410,7 @@ mod tests {
             approvals.record("tu-1", "Bash", &cat);
             let mut host_answered = BTreeSet::new();
             let (delivered, answered) = deliver(
+                &provider,
                 &mut backend,
                 &dir,
                 &agent::PrefixRules::default(),
@@ -5478,6 +5459,7 @@ mod tests {
         let mut host_answered = BTreeSet::new();
         let mut approvals = HumanApprovals::default();
         let (delivered, answered) = deliver(
+            &provider,
             &mut backend,
             &dir,
             &agent::PrefixRules::default(),
@@ -5553,6 +5535,7 @@ mod tests {
         approvals.record("tu-approved", "Write", &probe_write());
         let mut host_answered = BTreeSet::new();
         let (delivered, answered) = deliver(
+            &provider,
             &mut backend,
             &dir,
             &agent::PrefixRules::default(),
@@ -5597,6 +5580,7 @@ mod tests {
             approvals.record("tu-1", "Write", &probe_write());
             let mut host_answered = BTreeSet::new();
             let (delivered, answered) = deliver(
+                &provider,
                 &mut backend,
                 &dir,
                 &agent::PrefixRules::default(),
@@ -5642,7 +5626,7 @@ mod tests {
             probe_write(),
             None,
         ));
-        let delivered = pump_until_delivery(&mut backend, &dir, PermissionMode::Auto);
+        let delivered = pump_until_delivery(&provider, &mut backend, &dir, PermissionMode::Auto);
         assert_eq!(delivered.len(), 4, "all card in Auto with no approval: {delivered:?}");
         let ids: Vec<String> = ["perm-ask", "perm-unknown", "perm-silent", "perm-plain"]
             .map(str::to_string)
@@ -5684,7 +5668,7 @@ mod tests {
             input: serde_json::json!({ "command": "rm -rf build" }),
             provider_prompt: None,
         });
-        let delivered = pump_until_delivery(&mut backend, &dir, PermissionMode::Auto);
+        let delivered = pump_until_delivery(&provider, &mut backend, &dir, PermissionMode::Auto);
         assert_eq!(delivered.len(), 4, "{delivered:?}");
         let ids: Vec<String> = ["perm-ask", "perm-silent", "perm-noid", "perm-gate"]
             .map(str::to_string)
@@ -5722,7 +5706,7 @@ mod tests {
             Some("cat:*"),
         ));
         provider.queue(provider_prompt("perm-2", Some("tu-2"), "Write", probe_write(), None));
-        let delivered = pump_until_delivery(&mut backend, &dir, PermissionMode::Auto);
+        let delivered = pump_until_delivery(&provider, &mut backend, &dir, PermissionMode::Auto);
         assert_eq!(delivered.len(), 2, "{delivered:?}");
         provider.fold_after_next_resolution(vec![AgentDomainEvent::UngatedCliMode {
             reported: "acceptEdits".into(),
@@ -5790,6 +5774,7 @@ mod tests {
 
     /// One delivery, keeping everything `AnsweredForYou` recorded (`deliver` keeps the prompts only).
     fn deliver_noting(
+        provider: &RecordingProvider,
         backend: &mut AgentBackend,
         dir: &Path,
         rules: &agent::PrefixRules,
@@ -5797,27 +5782,21 @@ mod tests {
         host_answered: &mut BTreeSet<String>,
         approvals: &mut HumanApprovals,
     ) -> (Vec<AgentDomainEvent>, AnsweredForYou) {
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        let quiet = std::time::Duration::from_millis(100);
         let mut answered = AnsweredForYou::default();
         let mut delivered = Vec::new();
-        let mut last_new: Option<std::time::Instant> = None;
-        loop {
-            let now = std::time::Instant::now();
+        for _ in 0..20 {
+            provider.wait_until_folded();
             match backend
                 .take_revised_ui_delivery(dir, rules, mode, host_answered, approvals, &mut answered)
                 .without_revisions()
             {
                 UiDelivery::Events(events) if !events.is_empty() => {
                     delivered.extend(events);
-                    last_new = Some(now);
                 }
-                _ if last_new.is_some_and(|at| now.duration_since(at) >= quiet) || now > deadline => {
-                    return (delivered, answered)
-                }
-                _ => std::thread::sleep(std::time::Duration::from_millis(5)),
+                _ => {}
             }
         }
+        (delivered, answered)
     }
 
     #[test]
@@ -5829,6 +5808,7 @@ mod tests {
         provider.queue_all(batch);
         let mut host_answered = BTreeSet::new();
         let (delivered, answered) = deliver_noting(
+            &provider,
             &mut backend,
             &dir,
             &agent::PrefixRules::default(),
@@ -5903,6 +5883,7 @@ mod tests {
         provider.queue_all(batch);
         let mut host_answered = BTreeSet::new();
         let (delivered, answered) = deliver_noting(
+            &provider,
             &mut backend,
             &dir,
             &agent::PrefixRules::default(),
@@ -5934,6 +5915,7 @@ mod tests {
             gate("perm-ci", "tu-ci", "Bash", serde_json::json!({ "command": "npm ci" })),
         ]);
         let (delivered, answered) = deliver_noting(
+            &provider,
             &mut backend,
             &dir,
             &rules,
@@ -5955,6 +5937,7 @@ mod tests {
         batch.extend(three_gates());
         provider.queue_all(batch);
         let (delivered, _) = deliver_noting(
+            &provider,
             &mut backend,
             &dir,
             &agent::PrefixRules::default(),
@@ -5980,6 +5963,7 @@ mod tests {
         batch.extend(three_gates());
         provider.queue_all(batch);
         let (delivered, _) = deliver_noting(
+            &provider,
             &mut backend,
             &dir,
             &agent::PrefixRules::default(),
@@ -6003,6 +5987,7 @@ mod tests {
         batch.extend(three_gates());
         provider.queue_all(batch);
         let (delivered, _) = deliver_noting(
+            &provider,
             &mut backend,
             &dir,
             &agent::PrefixRules::default(),
@@ -6028,6 +6013,7 @@ mod tests {
         batch.extend(three_gates());
         provider.queue_all(batch);
         let (delivered, _) = deliver_noting(
+            &provider,
             &mut backend,
             &dir,
             &agent::PrefixRules::default(),
@@ -6082,6 +6068,7 @@ mod tests {
         ]);
         provider.queue_all(batch);
         let (delivered, _) = deliver_noting(
+            &provider,
             &mut backend,
             &dir,
             &agent::PrefixRules::default(),
@@ -6167,6 +6154,7 @@ mod tests {
             ),
         ]);
         let (_, answered) = deliver_noting(
+            &provider,
             &mut backend,
             &dir,
             &rules,
@@ -6209,6 +6197,7 @@ mod tests {
             provider_prompt("perm-prov", Some("tu-1"), "Write", probe_write(), None),
         ]);
         let (delivered, _) = deliver_noting(
+            &provider,
             &mut backend,
             &dir,
             &agent::PrefixRules::default(),
@@ -6228,6 +6217,7 @@ mod tests {
         let mut approvals = HumanApprovals::default();
         approvals.record("tu-1", "Write", &probe_write());
         let (delivered, _) = deliver_noting(
+            &provider,
             &mut backend,
             &dir,
             &agent::PrefixRules::default(),
@@ -6252,6 +6242,7 @@ mod tests {
             let mut approvals = HumanApprovals::default();
             approvals.record("tu-2", "Bash", &cat);
             let (delivered, _) = deliver_noting(
+                &provider,
                 &mut backend,
                 &dir,
                 &agent::PrefixRules::default(),
@@ -6301,6 +6292,7 @@ mod tests {
             batch.extend(three_gates());
             provider.queue_all(batch);
             let (delivered, _) = deliver_noting(
+                &provider,
                 &mut backend,
                 &dir,
                 &agent::PrefixRules::default(),
@@ -6332,6 +6324,7 @@ mod tests {
         provider.queue_all(batch);
         let mut host_answered = BTreeSet::new();
         let (delivered, _) = deliver_noting(
+            &provider,
             &mut backend,
             &dir,
             &agent::PrefixRules::default(),
@@ -6357,6 +6350,7 @@ mod tests {
         provider.queue_all(batch);
         for mode in [PermissionMode::Auto, PermissionMode::Bypass] {
             let _ = deliver_noting(
+                &provider,
                 &mut backend,
                 &dir,
                 &agent::PrefixRules::default(),
@@ -6396,6 +6390,7 @@ mod tests {
         ]);
         provider.fold_after_next_resolution(vec![cli_reports("default")]);
         let (delivered, _) = deliver_noting(
+            &provider,
             &mut backend,
             &dir,
             &agent::PrefixRules::default(),
@@ -6437,6 +6432,7 @@ mod tests {
                 detail: "SessionReady".into(),
             }]);
             let (delivered, _) = deliver_noting(
+                &provider,
                 &mut backend,
                 &dir,
                 &agent::PrefixRules::default(),
@@ -6519,6 +6515,7 @@ mod tests {
         provider.queue_all(batch);
         let mut host_answered = BTreeSet::new();
         let (delivered, answered) = deliver_noting(
+            &provider,
             &mut backend,
             &dir,
             &cargo_test_rule(),
@@ -6565,6 +6562,7 @@ mod tests {
                 batch.extend(manual_gates());
                 provider.queue_all(batch);
                 let (delivered, _) = deliver_noting(
+                    &provider,
                     &mut backend,
                     &dir,
                     &cargo_test_rule(),
@@ -6642,6 +6640,7 @@ mod tests {
         approvals.record("tu-ok", "Write", &probe_write());
         approvals.record("tu-rule", "Write", &probe_write());
         let (delivered, answered) = deliver_noting(
+            &provider,
             &mut backend,
             &dir,
             &agent::PrefixRules::default(),
@@ -6684,6 +6683,7 @@ mod tests {
             ),
         ]);
         let (delivered, _) = deliver_noting(
+            &provider,
             &mut backend,
             &dir,
             &agent::PrefixRules::default(),
@@ -6760,19 +6760,18 @@ mod external_tests {
         }
     }
 
-    /// Every delivery until `want` requests have reached the projection and 100 ms pass quietly.
+    /// Samples twenty deliveries, each after the queued batch has finished folding.
     fn deliver(
+        provider: &crate::test_providers::RecordingProvider,
         backend: &mut AgentBackend,
         dir: &Path,
         rules: &agent::PrefixRules,
         mode: PermissionMode,
         host_answered: &mut BTreeSet<String>,
     ) -> Vec<AgentDomainEvent> {
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         let mut delivered = Vec::new();
-        let mut last_new: Option<std::time::Instant> = None;
-        loop {
-            let now = std::time::Instant::now();
+        for _ in 0..20 {
+            provider.wait_until_folded();
             match backend
                 .take_revised_ui_delivery(
                     dir,
@@ -6786,16 +6785,11 @@ mod external_tests {
             {
                 UiDelivery::Events(events) if !events.is_empty() => {
                     delivered.extend(events);
-                    last_new = Some(now);
                 }
-                _ if last_new.is_some_and(|at| now.duration_since(at) >= std::time::Duration::from_millis(100))
-                    || now > deadline =>
-                {
-                    return delivered
-                }
-                _ => std::thread::sleep(std::time::Duration::from_millis(5)),
+                _ => {}
             }
         }
+        delivered
     }
 
     fn carded(delivered: &[AgentDomainEvent], id: &str) -> bool {
@@ -6824,7 +6818,14 @@ mod external_tests {
             serde_json::json!({ "changes": [{ "path": "main.rs" }] }),
         ));
         let mut answered = BTreeSet::new();
-        let delivered = deliver(&mut backend, &dir, &rules, PermissionMode::Auto, &mut answered);
+        let delivered = deliver(
+            &provider.inner,
+            &mut backend,
+            &dir,
+            &rules,
+            PermissionMode::Auto,
+            &mut answered,
+        );
         assert!(carded(&delivered, "a1") && carded(&delivered, "a2"), "{delivered:?}");
         assert!(
             provider.inner.decisions().is_empty(),
@@ -6838,7 +6839,14 @@ mod external_tests {
             "commandExecution",
             serde_json::json!({ "command": "curl https://example.org" }),
         ));
-        let delivered = deliver(&mut backend, &dir, &rules, PermissionMode::Bypass, &mut answered);
+        let delivered = deliver(
+            &provider.inner,
+            &mut backend,
+            &dir,
+            &rules,
+            PermissionMode::Bypass,
+            &mut answered,
+        );
         assert!(!carded(&delivered, "b1"), "{delivered:?}");
         assert_eq!(
             provider.inner.decisions(),
@@ -6865,6 +6873,7 @@ mod external_tests {
         ));
         let mut answered = BTreeSet::new();
         let delivered = deliver(
+            &provider.inner,
             &mut backend,
             &dir,
             &agent::PrefixRules::default().with(agent::PrefixRule::parse("Bash(ls *)").unwrap()),
@@ -6920,7 +6929,14 @@ mod external_tests {
             "fileChange",
             serde_json::json!({ "changes": [{ "path": "main.rs" }] }),
         ));
-        let delivered = deliver(&mut backend, &dir, &rules, PermissionMode::Auto, &mut host_answered);
+        let delivered = deliver(
+            &provider.inner,
+            &mut backend,
+            &dir,
+            &rules,
+            PermissionMode::Auto,
+            &mut host_answered,
+        );
         assert!(carded(&delivered, "a1"), "{delivered:?}");
         let approved = backend.approve_pending(&["a1".to_string()], "on entering bypass");
         assert_eq!(approved.ids, vec!["a1".to_string()]);
@@ -6953,7 +6969,14 @@ mod external_tests {
             serde_json::json!({ "command": "ls -la" }),
         ));
         let mut answered = BTreeSet::new();
-        let delivered = deliver(&mut backend, &dir, &rules, PermissionMode::Auto, &mut answered);
+        let delivered = deliver(
+            &provider.inner,
+            &mut backend,
+            &dir,
+            &rules,
+            PermissionMode::Auto,
+            &mut answered,
+        );
         for id in ["r1", "r2", "r3"] {
             assert!(carded(&delivered, id), "{id} must be a card: {delivered:?}");
         }
@@ -6980,7 +7003,14 @@ mod external_tests {
             serde_json::json!({ "command": "ls" }),
         ));
         let mut answered = BTreeSet::new();
-        let delivered = deliver(&mut backend, &dir, &rules, PermissionMode::Auto, &mut answered);
+        let delivered = deliver(
+            &provider.inner,
+            &mut backend,
+            &dir,
+            &rules,
+            PermissionMode::Auto,
+            &mut answered,
+        );
         assert!(carded(&delivered, "a1"), "{delivered:?}");
         assert!(provider.inner.decisions().is_empty());
         provider.inner.queue(request(
@@ -6988,7 +7018,14 @@ mod external_tests {
             "commandExecution",
             serde_json::json!({ "command": "ls" }),
         ));
-        let delivered = deliver(&mut backend, &dir, &rules, PermissionMode::Bypass, &mut answered);
+        let delivered = deliver(
+            &provider.inner,
+            &mut backend,
+            &dir,
+            &rules,
+            PermissionMode::Bypass,
+            &mut answered,
+        );
         assert!(!carded(&delivered, "b1"), "{delivered:?}");
         assert_eq!(
             provider.inner.decisions(),
@@ -8297,9 +8334,21 @@ mod eitri_gate_tests {
         let tab = tab_over(&mut set, backend);
         set.get_mut(tab).unwrap().set_mode_for_test(SessionModeChoice::Bypass);
         provider.queue_all(left_auto());
+        let deadline = Instant::now() + Duration::from_secs(60);
+        loop {
+            set.pump(&dir, true);
+            let TabBackend::Live(backend) = set.get(tab).unwrap().backend() else {
+                panic!("the tab lost its session");
+            };
+            if backend.cli_left_auto() {
+                break;
+            }
+            assert!(Instant::now() < deadline, "the CLI report never folded");
+            std::thread::yield_now();
+        }
         for _ in 0..50 {
             set.pump(&dir, true);
-            std::thread::sleep(Duration::from_millis(2));
+            assert_eq!(set.get(tab).unwrap().mode(), SessionModeChoice::Bypass);
         }
         assert_eq!(set.get(tab).unwrap().mode(), SessionModeChoice::Bypass);
         assert_eq!(set.take_left_auto_notes(), []);

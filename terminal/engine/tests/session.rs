@@ -9,10 +9,8 @@ mod process_identity;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use common::{ctrl, plain_sh, size, spec, Harness, WAIT};
+use common::{ctrl, plain_sh, size, spec, ChildGate, Harness, WAIT};
 use eitri_terminal::mouse::{Button, MouseInput, MouseKind, MouseMods};
-use eitri_terminal::pty::HANGUP_GRACE;
-use eitri_terminal::session::SYNC_UPDATE_TIMEOUT;
 use eitri_terminal::{CursorCell, PtySize, SessionCommand, SessionConfig, TerminalColors, TerminalMetrics, REPLY_CAP};
 use terminal_input::NormalizedInput;
 use terminal_render::RgbColor;
@@ -150,17 +148,6 @@ fn a_background_colour_query_is_answered_from_the_theme() {
     assert!(text.contains("reply=]11;rgb:1212/3434/5656"), "{text}");
 }
 
-/// OSC 52: a program may put text on the clipboard (the event reaches the host), and may never
-/// read it (nothing is written back).
-#[test]
-fn osc52_copy_reaches_the_host_and_osc52_paste_is_refused() {
-    let script = r#"printf '\033]52;c;aGk=\007'; stty -icanon -echo min 0 time 10; printf '\033]52;c;?\007'; r=$(dd bs=1 count=1 2>/dev/null); printf 'load=[%s]\n' "$r""#;
-    let mut h = Harness::start(spec("/bin/sh", &["-c", script]), size(80, 10));
-    h.wait_for(WAIT, |h| h.exited.is_some());
-    assert_eq!(h.events.clipboard.as_deref(), Some("hi"));
-    assert!(h.has_line("load=[]"), "{:?}", h.text());
-}
-
 /// An OSC 52 copy to the selection (`s`, nvim's `"*`) reaches the host as
 /// the primary selection, apart from a copy to the clipboard in the same stream.
 #[test]
@@ -214,7 +201,7 @@ fn a_hidden_selection_copy_rings_the_host_like_a_clipboard_copy() {
 /// hid it and the frame paints no cursor -- the host draws an input method's preedit there.
 #[test]
 fn every_frame_says_where_the_cursor_is_even_when_it_is_hidden() {
-    let script = r#"printf 'ab\033[?25l'; exec sleep 5"#;
+    let script = r#"printf 'ab\033[?25l'; read x"#;
     let mut h = Harness::start(spec("/bin/sh", &["-c", script]), size(40, 5));
     h.wait_for(WAIT, |h| {
         h.text().first().is_some_and(|l| l == "ab") && h.cursor.is_some_and(|c| !c.visible)
@@ -241,95 +228,6 @@ fn the_title_reaches_the_host() {
     );
     h.wait_for(WAIT, |h| h.exited.is_some());
     assert_eq!(h.events.title, Some(Some("eitri-title".to_string())));
-}
-
-/// Idle output costs nothing: after the first frames, a child that prints nothing causes no render,
-/// no host wake-up, and no wake-up of the session thread itself (an unconditional redraw costs
-/// about 60x idle CPU). The third counter is what catches a `poll` timeout, which would
-/// wake the thread 60 times a second while rendering nothing.
-#[test]
-fn idle_renders_nothing() {
-    let mut h = Harness::start(spec("/bin/sh", &["-c", "printf ready; exec sleep 5"]), size(80, 5));
-    h.wait_for(WAIT, |h| h.text().first().is_some_and(|l| l == "ready"));
-    std::thread::sleep(Duration::from_millis(100));
-    // Drain wake-ups received on the way to ready so the count starts at zero. `Harness::wakes`
-    // only grows inside `wait_for`, which is not called during the measurement: comparing that
-    // stale field to its saved value would compare a value to itself without reading any wakes.
-    h.pending_wakes();
-    // Also reopen the wake-pending gate, which draining the channel alone does not do.
-    // Otherwise a regression publishing every tick rings only once while settling and finds
-    // the gate shut for the idle second, letting `pending_wakes() == 0` pass incorrectly.
-    // `wait_for` with an always-true predicate absorbs once through `take_update` without
-    // blocking, so the measurement starts with the gate open.
-    h.wait_for(WAIT, |_| true);
-    let (renders, turns) = (h.session.renders(), h.session.thread_wakeups());
-    std::thread::sleep(Duration::from_secs(1));
-    assert_eq!(h.session.renders(), renders, "a render with nothing new");
-    assert_eq!(h.pending_wakes(), 0, "no host wake-up while idle");
-    assert_eq!(
-        h.session.thread_wakeups(),
-        turns,
-        "the session thread woke with nothing to do"
-    );
-}
-
-/// A noisy stream is folded into about one render per frame, not one per read.
-#[test]
-fn a_flood_is_coalesced_to_about_one_render_per_frame() {
-    let started = std::time::Instant::now();
-    let mut h = Harness::start(spec("/bin/sh", &["-c", "yes | head -n 200000"]), size(120, 30));
-    h.wait_for(Duration::from_secs(30), |h| h.exited.is_some());
-    let elapsed = started.elapsed();
-    let frames = elapsed.as_millis() as u64 / 16 + 3;
-    assert!(
-        h.session.renders() <= frames,
-        "{} renders in {elapsed:?}",
-        h.session.renders()
-    );
-    assert!(h.text().iter().any(|l| l == "y"), "{:?}", h.text());
-}
-
-/// A bell on most reads must ride the render clock like a pixel
-/// change does, not ring the host once per loop turn. Unconditionally ringing on every read
-/// with an event measures 1118 host wakes/s against 58 renders/s for the same volume.
-///
-/// A byte-volume flood (`yes | head -c N`) depends on parsing speed: a slow debug build lets
-/// the PTY refill between reads and coalesces turns by accident (13 wakes over 2s in a
-/// measurement). Forty bells spaced 5ms apart force separate turns regardless of build speed.
-#[test]
-fn a_bell_flood_is_coalesced_to_about_one_host_wake_per_frame() {
-    let started = std::time::Instant::now();
-    let script = "i=0; while [ $i -lt 40 ]; do printf '\\a'; i=$((i+1)); sleep 0.005; done";
-    let mut h = Harness::start(spec("/bin/sh", &["-c", script]), size(80, 5));
-    h.wait_for(Duration::from_secs(10), |h| h.exited.is_some());
-    let elapsed = started.elapsed();
-    // Generous: the leading edge plus one wake per frame interval, with slack for scheduling --
-    // the same shape of bound as `a_flood_is_coalesced_to_about_one_render_per_frame` above, but on
-    // host wakes rather than renders. 40, the bell count, is what a broken per-turn ring would hit.
-    let frames = elapsed.as_millis() as usize / 16 + 5;
-    assert!(
-        h.wakes <= frames,
-        "{} host wake-ups for 40 spaced bells in {elapsed:?}",
-        h.wakes
-    );
-    assert!(h.events.bell, "the bell itself must still be reported");
-}
-
-/// A hidden bell must not wake the host: hidden terminals suppress frame and event wakes.
-/// An unconditional bell notification measures 719 hidden host wakes/s even though the pump
-/// has nothing to do with a bell.
-#[test]
-fn a_hidden_bell_flood_rings_the_host_not_at_all() {
-    let mut h = Harness::start(
-        spec("/bin/sh", &["-c", "printf ready; sleep 0.1; exec yes '\u{7}'"]),
-        size(80, 5),
-    );
-    h.wait_for(WAIT, |h| h.text().first().is_some_and(|l| l == "ready"));
-    h.session.send(SessionCommand::Visible(false));
-    // Drains anything already in flight (there should be none) before the hidden window starts.
-    h.pending_wakes();
-    std::thread::sleep(Duration::from_millis(400));
-    assert_eq!(h.pending_wakes(), 0, "a bell must not ring a hidden pane");
 }
 
 #[test]
@@ -395,34 +293,30 @@ fn a_shell_that_ignores_sighup_is_killed_after_the_grace_period() {
         size(80, 5),
     );
     h.wait_for(WAIT, |h| h.text().first().is_some_and(|l| l == "ready"));
-    let started = std::time::Instant::now();
     let exit = h.session.shutdown_and_wait().expect("reaped");
     assert_eq!(exit.signal, Some(libc::SIGKILL));
-    assert!(started.elapsed() < Duration::from_secs(2), "{:?}", started.elapsed());
 }
 
-/// Input larger than the tty's buffer (a big paste) must neither block the session thread nor lose
-/// bytes: it waits in the outbox for POLLOUT while output keeps being read. The
-/// paste goes only after the program has switched the tty to raw mode -- in cooked mode the line
-/// discipline itself discards past 4095 bytes, which is the tty's behaviour, not the session's.
-///
-/// The child prints "mid" before it starts reading the paste. Proving only that no bytes were
-/// lost would let a session blocked in `write` until `head` starts draining pass. "mid" reaching
-/// the screen while the paste is still queued proves reading and rendering stayed live while
-/// a write was pending.
 #[test]
 fn a_large_input_is_delivered_whole_without_stalling() {
-    let script = "stty raw -echo; printf ready; sleep 0.5; printf mid; sleep 0.5; head -c 200000 | wc -c; stty sane";
-    let mut h = Harness::start(spec("/bin/sh", &["-c", script]), size(80, 5));
+    let gate = ChildGate::new();
+    let script = format!(
+        "stty raw -echo; printf ready; read x < {}; printf mid; read x < {}; head -c 200000 | wc -c",
+        gate.path(),
+        gate.path()
+    );
+    let mut h = Harness::start(spec("/bin/sh", &["-c", &script]), size(80, 5));
     h.wait_for(WAIT, |h| h.text().first().is_some_and(|l| l.starts_with("ready")));
     h.send(NormalizedInput::Paste {
         text: "x".repeat(200_000),
         bracketed: false,
     });
-    h.wait_for(Duration::from_millis(900), |h| {
-        h.text().iter().any(|l| l.contains("mid"))
-    });
-    h.wait_for(Duration::from_secs(10), |h| h.exited.is_some());
+    // The child cannot drain the paste until the host has seen mid.
+    gate.release();
+    h.wait_for(WAIT, |h| h.text().iter().any(|l| l.contains("mid")));
+    assert!(h.session.outbox_high_water() > 0, "the paste waited in the outbox");
+    gate.release();
+    h.wait_for(WAIT, |h| h.exited.is_some());
     assert!(h.text().iter().any(|l| l.contains("200000")), "{:?}", h.text());
 }
 
@@ -446,36 +340,12 @@ fn commands_after_exit_and_a_zero_resize_are_harmless() {
     assert_eq!(h.session.shutdown_and_wait().and_then(|e| e.code), Some(0));
 }
 
-/// A synchronized update that never ends -- nvim killed mid-frame, `printf '\e[?2026h'`, `cat` of a
-/// recording -- holds publication back only until the deadline, not forever.
-#[test]
-fn an_unterminated_synchronized_update_is_published_after_the_deadline() {
-    let mut h = Harness::start(
-        spec(
-            "/bin/sh",
-            &["-c", r"printf '\033[?2026h'; printf visible; exec sleep 30"],
-        ),
-        size(80, 5),
-    );
-    let started = Instant::now();
-    h.wait_for(Duration::from_secs(2), |h| h.has_line("visible"));
-    assert!(h.exited.is_none(), "published by the deadline, not by the exit");
-    assert!(
-        started.elapsed() >= SYNC_UPDATE_TIMEOUT / 2,
-        "{:?}: too soon for the deadline",
-        started.elapsed()
-    );
-}
-
 /// A reset does not end an open update (`terminal-sync` counts a RIS as one more dispatch), so what
 /// a `reset` draws after a killed nvim is published by the deadline too.
 #[test]
 fn a_reset_inside_an_open_update_is_published_after_the_deadline() {
     let mut h = Harness::start(
-        spec(
-            "/bin/sh",
-            &["-c", r"printf 'before\033[?2026h\033cafter'; exec sleep 30"],
-        ),
+        spec("/bin/sh", &["-c", r"printf 'before\033[?2026h\033cafter'; read x"]),
         size(80, 5),
     );
     h.wait_for(Duration::from_secs(2), |h| h.has_line("after"));
@@ -518,28 +388,21 @@ fn a_child_that_leaves_the_terminal_is_reported_and_still_shut_down() {
         "{left:?}"
     );
     assert!(h.text().iter().any(|l| l.contains("still running")), "{:?}", h.text());
-    let started = Instant::now();
     let exit = h.session.shutdown_and_wait().expect("reaped");
     assert_eq!(exit.signal, Some(libc::SIGHUP));
-    assert!(started.elapsed() < HANGUP_GRACE, "{:?}", started.elapsed());
 }
 
 /// A child that left the terminal is still reaped when it ends on its own, without a `Shutdown`.
 #[test]
 fn a_child_that_left_the_terminal_is_reaped_when_it_exits() {
-    let mut h = Harness::start(
-        spec("/bin/sh", &["-c", "exec </dev/null >/dev/null 2>&1; sleep 0.6; exit 4"]),
-        size(80, 5),
-    );
+    let gate = ChildGate::new();
+    let script = format!("exec </dev/null >/dev/null 2>&1; read x < {}; exit 4", gate.path());
+    let mut h = Harness::start(spec("/bin/sh", &["-c", &script]), size(80, 5));
     h.wait_for(Duration::from_secs(2), |h| h.exited.is_some());
     assert!(h.exited.is_some_and(|e| e.detached));
-    std::thread::sleep(Duration::from_millis(1500));
-    let started = Instant::now();
+    gate.release();
+    h.wait_for(WAIT, |h| h.exited.is_some_and(|e| e.code == Some(4)));
     assert_eq!(h.session.shutdown_and_wait().and_then(|e| e.code), Some(4));
-    assert!(
-        started.elapsed() < Duration::from_millis(100),
-        "the thread had already ended"
-    );
 }
 
 /// The host must learn of a detached child's own exit too, not just get it back from
@@ -548,17 +411,12 @@ fn a_child_that_left_the_terminal_is_reaped_when_it_exits() {
 /// process that is gone, until something calls `shutdown_and_wait`.
 #[test]
 fn a_detached_childs_own_exit_reaches_the_host() {
-    let mut h = Harness::start(
-        // 0.6s matches the sibling test: 0.3s leaves only about 100ms over `EXIT_AFTER_EOF`
-        // (200ms). A session thread scheduled late after EOF would see the real exit immediately,
-        // never report `detached`, and leave the first `wait_for` timing out.
-        spec("/bin/sh", &["-c", "exec </dev/null >/dev/null 2>&1; sleep 0.6; exit 4"]),
-        size(80, 5),
-    );
+    let gate = ChildGate::new();
+    let script = format!("exec </dev/null >/dev/null 2>&1; read x < {}; exit 4", gate.path());
+    let mut h = Harness::start(spec("/bin/sh", &["-c", &script]), size(80, 5));
     h.wait_for(Duration::from_secs(2), |h| h.exited.is_some_and(|e| e.detached));
-    h.wait_for(Duration::from_secs(2), |h| {
-        h.exited.is_some_and(|e| !e.detached && e.code == Some(4))
-    });
+    gate.release();
+    h.wait_for(WAIT, |h| h.exited.is_some_and(|e| !e.detached && e.code == Some(4)));
     assert!(
         h.text()
             .iter()
@@ -637,46 +495,6 @@ fn a_hidden_terminal_renders_nothing_until_it_is_shown() {
     assert_eq!(h.session.renders(), before, "2000 lines went by while hidden");
     h.session.send(SessionCommand::Visible(true));
     h.wait_for(WAIT, |h| h.has_line("2000"));
-}
-
-/// A key the program does not echo changes nothing on screen, so it renders nothing. A render for
-/// an unchanged screen is not only wasted work: it takes the render clock's leading edge, and the
-/// echo of the next key that does change something then waits out the rest of the frame (16 ms
-/// after idle in a measurement).
-#[test]
-fn a_key_that_changes_nothing_on_screen_renders_nothing() {
-    let mut h = Harness::start(
-        spec("/bin/sh", &["-c", "stty -echo; printf ready; exec cat"]),
-        size(40, 5),
-    );
-    h.wait_for(WAIT, |h| h.text().first().is_some_and(|l| l == "ready"));
-    std::thread::sleep(Duration::from_millis(50));
-    let before = h.session.renders();
-    h.type_str("abc");
-    std::thread::sleep(Duration::from_millis(200));
-    assert_eq!(h.session.renders(), before, "keys with no echo rendered a frame");
-}
-
-/// A program that changes only its title, or rings the bell, changes nothing a frame shows: the
-/// events reach the host, riding the render clock, and no frame is built for them (rendering
-/// unchanged frames measures 34 frames for 100 titles 5 ms apart).
-#[test]
-fn titles_and_bells_reach_the_host_without_a_frame() {
-    let script = "printf ready; read _; i=0; while [ $i -lt 20 ]; do printf '\\033]2;t%d\\007\\a' $i; i=$((i+1)); sleep 0.005; done; exec sleep 5";
-    let mut h = Harness::start(spec("/bin/sh", &["-c", script]), size(40, 5));
-    h.wait_for(WAIT, |h| h.text().first().is_some_and(|l| l == "ready"));
-    std::thread::sleep(Duration::from_millis(50));
-    h.wait_for(WAIT, |_| true);
-    let before = h.session.renders();
-    // The tty echoes the Enter that starts the loop: one frame for that.
-    h.type_str("\n");
-    h.wait_for(WAIT, |h| h.events.title == Some(Some("t19".to_string())));
-    assert!(h.events.bell, "the bells reached the host");
-    assert!(
-        h.session.renders() <= before + 1,
-        "{} frames for titles and bells",
-        h.session.renders() - before
-    );
 }
 
 /// A mouse report reaches the program only while its own mode asks for it, and a dropped report

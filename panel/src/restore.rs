@@ -2328,8 +2328,8 @@ mod tests {
             panic!("a bypass tab is asked about first")
         };
         assert!(state.borrow().tabs.awaiting_trust().is_empty());
-        std::thread::sleep(std::time::Duration::from_millis(50));
-        assert!(prompts(&trust_events(&mut state.borrow_mut()).payloads()).is_empty());
+        let seen = tick_until(&state, |_| !state.borrow().trust.is_busy());
+        assert!(prompts(&all_payloads(&seen)).is_empty());
 
         let answered = answer_restore_question(&mut state.borrow_mut(), question.nonce, true);
         assert!(matches!(answered, RestoreResult::Deferred));

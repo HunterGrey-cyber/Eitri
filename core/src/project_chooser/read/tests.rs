@@ -654,7 +654,10 @@ fn later_makes_no_call_when_the_deadline_passed_while_touch_waited() {
     f.link("link", "child");
     let (_, entries, _, _) = parts(f.listing(&local_mounts()));
     f.calls.lock().unwrap().clear();
-    let (marks, kinds) = later(
+    let now = std::cell::Cell::new(Instant::now());
+    let until = now.get() + Duration::from_millis(30);
+    let mut touched = 0;
+    let (marks, kinds) = later_with_clock(
         &f,
         Path::new("/work"),
         &entries,
@@ -662,11 +665,14 @@ fn later_makes_no_call_when_the_deadline_passed_while_touch_waited() {
         &local_mounts(),
         &mut |_| {
             // Another reader held this mount past the deadline; touch answers yes only afterwards.
-            std::thread::sleep(Duration::from_millis(60));
+            touched += 1;
+            now.set(until);
             true
         },
-        Instant::now() + Duration::from_millis(30),
+        until,
+        &|| now.get(),
     );
+    assert_eq!(touched, 1, "touch was reached before the deadline");
     assert!(f.calls().is_empty(), "{:?}", f.calls());
     assert!(marks.is_empty() && kinds.is_empty());
 }

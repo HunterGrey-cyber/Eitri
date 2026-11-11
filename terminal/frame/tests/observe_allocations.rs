@@ -20,12 +20,12 @@ static ALLOCATIONS: AtomicUsize = AtomicUsize::new(0);
 unsafe impl GlobalAlloc for Counting {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         ALLOCATIONS.fetch_add(1, Ordering::SeqCst);
-        // SAFETY: forwarded unchanged to the system allocator.
+        // SAFETY: the caller supplies a valid allocation layout, forwarded unchanged to System.
         unsafe { System.alloc(layout) }
     }
 
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-        // SAFETY: `ptr` came from `alloc` above, which is the system allocator's.
+        // SAFETY: the caller supplies a live pointer from System via `alloc` above and its original layout.
         unsafe { System.dealloc(ptr, layout) }
     }
 }

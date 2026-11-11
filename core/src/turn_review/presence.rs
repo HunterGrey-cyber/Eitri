@@ -322,6 +322,15 @@ pub trait GroupGuard: Send + Sync {
     /// link ended. `None`: there is no link to ask on.
     fn ask(&self) -> Option<(u64, mpsc::Receiver<Result<(), String>>)>;
 
+    #[cfg(feature = "test-support")]
+    fn wait_for_answer_for_tests(
+        &self,
+        answer: &mpsc::Receiver<Result<(), String>>,
+        within: Duration,
+    ) -> Result<Result<(), String>, mpsc::RecvTimeoutError> {
+        answer.recv_timeout(within)
+    }
+
     /// The worker that asked `job` has stopped waiting: nobody takes its answer any more.
     fn gave_up(&self, job: u64);
 }
@@ -425,6 +434,14 @@ impl PresenceHolder {
             let _ = answer.send(Held::No(why));
         }
         answered
+    }
+
+    #[cfg(test)]
+    pub(crate) fn applied(&self) -> mpsc::Receiver<Held> {
+        let running = self.last_sent.lock().unwrap().clone().unwrap_or_default();
+        let (answer, applied) = mpsc::channel();
+        self.sender.send(Message::Running(running, Some(answer))).unwrap();
+        applied
     }
 
     pub fn guard(&self) -> PresenceGuard {

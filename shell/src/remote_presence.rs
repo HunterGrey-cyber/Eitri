@@ -32,16 +32,52 @@ static LAST_EVENT: AtomicU64 = AtomicU64::new(0);
 
 /// Notes that the person did something at the desk now.
 pub(crate) fn stamp() {
+    #[cfg(test)]
+    if TEST_STAMP.with(|stamp| {
+        if let Some(last) = stamp.get() {
+            stamp.set(Some(last + 1));
+            true
+        } else {
+            false
+        }
+    }) {
+        return;
+    }
     LAST_EVENT.store(mark_now(), Ordering::Relaxed);
 }
 
 /// The mark of the last [`stamp`]; 0 before the first.
 pub(crate) fn last_stamp() -> u64 {
+    #[cfg(test)]
+    if let Some(last) = TEST_STAMP.with(std::cell::Cell::get) {
+        return last;
+    }
     LAST_EVENT.load(Ordering::Relaxed)
 }
 
 fn mark_now() -> u64 {
     EPOCH.get_or_init(Instant::now).elapsed().as_millis() as u64 + 1
+}
+
+#[cfg(test)]
+thread_local! {
+    static TEST_STAMP: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+pub(crate) struct StampClock;
+#[cfg(test)]
+impl StampClock {
+    pub(crate) fn new() -> Self {
+        TEST_STAMP.with(|stamp| stamp.set(Some(0)));
+        Self
+    }
+}
+#[cfg(test)]
+impl Drop for StampClock {
+    fn drop(&mut self) {
+        TEST_STAMP.with(|stamp| stamp.set(None));
+    }
 }
 
 /// What the controller does with an event of `kind`: stamps the ones a person makes and lets every one go on.
@@ -146,6 +182,7 @@ mod tests {
 
     #[test]
     fn presence_controllers_never_claim_an_event() {
+        let _clock = StampClock::new();
         for kind in [
             gdk::EventType::KeyPress,
             gdk::EventType::KeyRelease,
@@ -159,13 +196,13 @@ mod tests {
             assert_eq!(seen(kind), glib::Propagation::Proceed, "{kind:?} was stopped");
         }
         let before = last_stamp();
-        std::thread::sleep(Duration::from_millis(2));
         let _ = seen(gdk::EventType::KeyPress);
         assert!(last_stamp() > before, "a key press was not noted");
     }
 
     #[test]
     fn the_file_is_touched_only_after_an_event_and_removed_at_the_end() {
+        let _clock = StampClock::new();
         let control = scratch("touch");
         let path = control.join(PRESENCE_DIR).join("a3f09c1d2e4b5f60");
         let mut looked = last_stamp();
@@ -174,7 +211,6 @@ mod tests {
             "touched with no event since"
         );
         assert!(!path.exists());
-        std::thread::sleep(Duration::from_millis(2));
         stamp();
         assert!(step(&control, &path, &mut looked).unwrap());
         use std::os::unix::fs::PermissionsExt;

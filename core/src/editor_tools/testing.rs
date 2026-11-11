@@ -153,7 +153,14 @@ pub fn drive_with_cards(
 ) -> Vec<Step> {
     let mut steps = Vec::new();
     let mut event = StepEvent::Start;
+    #[cfg(test)]
+    let mut turns = 0;
     loop {
+        #[cfg(test)]
+        if clock::now().is_some() {
+            turns += 1;
+            assert!(turns <= 1_000_000, "tool did not finish within 1,000,000 logical turns");
+        }
         let step = run.step(event, cx);
         event = match &step {
             Step::Done(_) => {
@@ -166,8 +173,52 @@ pub fn drive_with_cards(
                 let (decision, origin) = cards(request);
                 StepEvent::Card(CardAnswer::for_tests(request, decision, origin, cx.call))
             }
-            Step::PollAfter(_) => StepEvent::Poll,
+            Step::PollAfter(_wait) => {
+                #[cfg(test)]
+                clock::advance(*_wait);
+                std::thread::yield_now();
+                StepEvent::Poll
+            }
         };
         steps.push(step);
+    }
+}
+
+/// A thread-local clock for synchronous tool tests; other tests and worker threads keep real time.
+#[cfg(test)]
+pub(crate) mod clock {
+    use std::cell::Cell;
+    use std::time::{Duration, Instant};
+
+    thread_local! {
+        static TIME: Cell<Option<(Instant, u64)>> = const { Cell::new(None) };
+    }
+
+    pub struct Clock(Option<(Instant, u64)>);
+
+    impl Clock {
+        pub fn new() -> Self {
+            Self(TIME.replace(Some((Instant::now(), 1_700_000_000_000))))
+        }
+    }
+
+    impl Drop for Clock {
+        fn drop(&mut self) {
+            TIME.set(self.0);
+        }
+    }
+
+    pub fn now() -> Option<Instant> {
+        TIME.get().map(|time| time.0)
+    }
+
+    pub fn wall_ms() -> Option<u64> {
+        TIME.get().map(|time| time.1)
+    }
+
+    pub fn advance(by: Duration) {
+        if let Some((now, wall)) = TIME.get() {
+            TIME.set(Some((now + by, wall + by.as_millis() as u64)));
+        }
     }
 }

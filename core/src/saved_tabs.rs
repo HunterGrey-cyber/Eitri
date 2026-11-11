@@ -2182,16 +2182,31 @@ mod tests {
     fn a_dropped_writer_ends_its_thread() {
         let dir = ScratchDir::new("nv-saved-tabs", "writer-drop");
         let mut writer = TabWriter::new(Some(dir.to_path_buf()), root());
+        let (entered, ready) = std::sync::mpsc::channel();
+        let (release, gate) = std::sync::mpsc::channel();
+        let gate = std::sync::Mutex::new(gate);
+        writer.set_before_write(std::sync::Arc::new(move || {
+            entered.send(()).unwrap();
+            // The sender's drop also releases the worker if the outcome check panics.
+            let _ = gate.lock().unwrap().recv();
+        }));
         writer.observe(Some(numbered(4)));
+        ready
+            .recv_timeout(std::time::Duration::from_secs(60))
+            .expect("writer entered the write");
         let done = writer.worker.as_mut().unwrap().done.take().unwrap();
-        let started = std::time::Instant::now();
-        drop(writer);
-        assert!(
-            started.elapsed() < std::time::Duration::from_millis(100),
-            "the drop waited"
-        );
-        done.recv_timeout(std::time::Duration::from_secs(5))
+        let (dropped, did_drop) = std::sync::mpsc::channel();
+        let dropper = std::thread::spawn(move || {
+            drop(writer);
+            let _ = dropped.send(());
+        });
+        did_drop
+            .recv_timeout(std::time::Duration::from_secs(60))
+            .expect("drop returns while the write is still held");
+        release.send(()).unwrap();
+        done.recv_timeout(std::time::Duration::from_secs(60))
             .expect("the thread ended");
+        dropper.join().unwrap();
         assert_eq!(load(&dir, &root()), Loaded::Saved(numbered(4)));
     }
 

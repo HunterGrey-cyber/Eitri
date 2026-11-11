@@ -7,6 +7,10 @@
 //! runs the giving side as a process of its own, under a pseudo-terminal of its own.
 #![cfg(target_os = "linux")]
 
+#[path = "support/script_gate.rs"]
+mod script_gate;
+use script_gate::ScriptGate;
+
 use agent::child::{process_group, start_time, ExitCode, PidFd};
 use agent::lease::SessionLease;
 use agent::providers::claude_sidecar::{ClaudeProviderHandoff, MoveRefusedWhy, SidecarFds};
@@ -164,14 +168,21 @@ fn adopt_with_a_stand_in_that_sends_nothing_commits_at_once() {
 
 #[test]
 fn a_move_between_two_text_messages_keeps_two_messages() {
+    let between = ScriptGate::new();
     let source = stand_in();
     let session = open_session(&source);
     let mut folded = Vec::new();
     pump_until(&source, &mut folded, "the session opening", opened);
-    send(&source, &session, "text m1 one;sleep 600;text m2 two;end");
+    send(
+        &source,
+        &session,
+        &format!("text m1 one; {}; text m2 two; end", between.command()),
+    );
     pump_until(&source, &mut folded, "the first message", |seen| {
         seen.iter().any(|event| text_of(event) == Some("one"))
     });
+    between.wait();
+    between.release();
     // The watch reads ahead of the fold: the second message's delta (and the boundary it opens here)
     // arrives and is translated, and nobody takes it.
     let started = Instant::now();
@@ -220,18 +231,19 @@ fn a_move_between_two_text_messages_keeps_two_messages() {
 
 #[test]
 fn a_move_is_refused_while_a_steer_is_open_and_goes_through_once_it_is_answered() {
+    let turn_gate = ScriptGate::new();
+    let steer_gate = ScriptGate::new();
     let source = stand_in();
     let session = open_session(&source);
     let mut seen = Vec::new();
     pump_until(&source, &mut seen, "the session opening", opened);
-    let turn = send(&source, &session, "text m1 one;sleep 1500;end");
+    let turn = send(&source, &session, &format!("text m1 one; {}; end", turn_gate.command()));
     source
         .steer_turn(SteerTurnRequest {
             session_id: session.clone(),
             expected_turn_id: turn,
             client_message_id: "steer-1".to_string(),
-            // The stand-in delivers the message this many milliseconds after it took it.
-            text: "400".to_string(),
+            text: steer_gate.command(),
             as_typed: "and also this".to_string(),
         })
         .unwrap();
@@ -241,12 +253,14 @@ fn a_move_is_refused_while_a_steer_is_open_and_goes_through_once_it_is_answered(
         matches!(refused, MoveRefusedWhy::SteerOpen | MoveRefusedWhy::SteerInFlight),
         "{refused:?}"
     );
+    steer_gate.release();
     // A refused freeze leaves the source handing events over: the delivery below is pumped here.
     pump_until(&source, &mut seen, "the steered message's delivery", |seen| {
         seen.iter()
             .any(|event| matches!(event, AgentDomainEvent::UserMessageDelivered { .. }))
     });
     let (destination, _) = hand_over(&source);
+    turn_gate.release();
     let mut moved = Vec::new();
     pump_until(
         &destination,
@@ -260,11 +274,12 @@ fn a_move_is_refused_while_a_steer_is_open_and_goes_through_once_it_is_answered(
 /// no record of it and would drop its delivery.
 #[test]
 fn a_frozen_source_sends_nothing_to_the_sidecar_until_it_is_unfrozen() {
+    let turn_gate = ScriptGate::new();
     let source = stand_in();
     let session = open_session(&source);
     let mut seen = Vec::new();
     pump_until(&source, &mut seen, "the session opening", opened);
-    let turn = send(&source, &session, "text m1 one;sleep 800;end");
+    let turn = send(&source, &session, &format!("text m1 one; {}; end", turn_gate.command()));
     let (_handoff, fds) = source.freeze_for_move().unwrap();
     drop(fds);
     let steer = SteerTurnRequest {
@@ -285,6 +300,7 @@ fn a_frozen_source_sends_nothing_to_the_sidecar_until_it_is_unfrozen() {
         "refused while frozen"
     );
     source.unfreeze().unwrap();
+    turn_gate.release();
     pump_until(&source, &mut seen, "the turn's end after the thaw", turn_completed);
     assert!(
         !seen

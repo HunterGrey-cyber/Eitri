@@ -66,8 +66,7 @@ impl Case {
         std::fs::set_permissions(&runtime, std::fs::Permissions::from_mode(0o700)).unwrap();
         // Anything that could start the agent's sidecar finds this first, and it answers nothing.
         let claude = scratch.join("bin/claude");
-        std::fs::write(&claude, "#!/bin/sh\nexit 1\n").unwrap();
-        std::fs::set_permissions(&claude, std::fs::Permissions::from_mode(0o755)).unwrap();
+        script_fixture::write_executable_script(&claude, "#!/bin/sh\nexit 1\n", 0o755).unwrap();
         let target_addr = runtime.join("t.sock");
         let state = scratch.join("target-state");
         let target = Command::new("nvim")
@@ -226,6 +225,7 @@ impl Case {
                 "--name",
                 ".",
                 "windowfocus",
+                "--sync",
                 "%1",
             ])
             .env("DISPLAY", &display)
@@ -242,7 +242,6 @@ impl Case {
                 ))
             }
         }
-        std::thread::sleep(Duration::from_millis(300));
         let out = Command::new("timeout")
             .arg("20")
             .arg("xdotool")
@@ -496,4 +495,9 @@ fn main() {
     }
     println!("followed_connect: {} passed; {failed} failed", cases.len() - failed);
     server.exit(if failed == 0 { 0 } else { 1 });
+}
+
+#[cfg(test)]
+mod script_fixture {
+    include!(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/support/executable.rs"));
 }

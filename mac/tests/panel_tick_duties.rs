@@ -1,5 +1,5 @@
 //! The panel's tick as the Mac window drives it, without AppKit: the assembled panel (the real `init.lua`, trust
-//! gate, saved tabs and review under a scratch state home) run by `PanelPump` in a poll(2) loop, which is what the
+//! gate, saved tabs and review under a scratch state home) run by `PanelPump` with an advancing clock, driving the same actions the
 //! AppKit half's dispatch source and one-shot timer do. Each duty the window drives is checked here: the first
 //! tick at the start, nothing while idle, a call into the panel, a page message, a new editor context read by the
 //! editor's own poll, the typing cadence's deadline with no wake at all, and the close stopping it.
@@ -64,14 +64,14 @@ impl Recording {
     }
 }
 
-/// The window's loop: wait on the wake's descriptor until the armed timer is due, and do what each call says.
-/// `between` runs once per round, as the window's other sources would.
+/// The host's loop with an explicit clock. Worker completion is observed with a bounded hang guard.
 struct Loop<'a> {
     pump: &'a PanelPump,
     armed: Option<Instant>,
     stopped: bool,
-    /// How many ticks [`run_on_the_timer_alone`](Self::run_on_the_timer_alone) ran for a due timer.
     timer_ticks: u64,
+    now: Instant,
+    clock: eitri_panel::panel_pacer::TestClock,
 }
 
 impl Loop<'_> {
@@ -86,56 +86,35 @@ impl Loop<'_> {
         }
     }
 
-    fn run(&mut self, run: Duration, mut between: impl FnMut()) {
-        let fd = self.pump.wake_fd().expect("a wake");
-        let end = Instant::now() + run;
-        while !self.stopped {
-            between();
-            let now = Instant::now();
-            if now >= end {
-                return;
-            }
-            let until = self.armed.map_or(end, |at| at.min(end));
-            let wait_ms = until.saturating_duration_since(now).as_millis().min(i32::MAX as u128) as i32;
-            let mut polled = libc::pollfd {
-                fd,
-                events: libc::POLLIN,
-                revents: 0,
-            };
-            // SAFETY: one live `pollfd` for the call.
-            let ready = unsafe { libc::poll(&mut polled, 1, wait_ms) };
-            if ready > 0 {
-                let timer = self.pump.on_wake(Instant::now());
-                self.act(timer);
-            }
-            if self.armed.is_some_and(|at| Instant::now() >= at) {
-                self.armed = None;
-                let timer = self.pump.on_timer(Instant::now());
-                self.act(timer);
-            }
+    fn timer(&mut self) {
+        let at = self.armed.take().expect("a timer is armed");
+        self.now = self.now.max(at);
+        self.clock.set(self.now);
+        self.timer_ticks += 1;
+        self.act(self.pump.on_timer(self.now));
+    }
+
+    fn step(&mut self) {
+        self.act(self.pump.on_wake(self.now));
+        if self.armed.is_some() {
+            self.timer();
         }
     }
-}
 
-impl Loop<'_> {
-    /// As [`run`](Self::run) with the wake's descriptor left unread: the tick runs only when the armed timer is due.
-    fn run_on_the_timer_alone(&mut self, run: Duration) {
-        let end = Instant::now() + run;
-        while !self.stopped {
-            let now = Instant::now();
-            if now >= end {
+    fn until(&mut self, what: &str, done: impl Fn(&Self) -> bool) {
+        let guard = Instant::now() + Duration::from_secs(60);
+        loop {
+            self.step();
+            if done(self) {
                 return;
             }
-            let Some(at) = self.armed.filter(|at| *at < end) else {
-                std::thread::sleep(end - now);
-                return;
-            };
-            std::thread::sleep(at.saturating_duration_since(now));
-            self.armed = None;
-            self.timer_ticks += 1;
-            let timer = self.pump.on_timer(Instant::now());
-            self.act(timer);
+            assert!(Instant::now() < guard, "never observed {what}");
+            std::thread::yield_now();
         }
+    }
+
+    fn idle(&mut self) {
+        self.until("the idle pump", |l| l.armed.is_none());
     }
 }
 
@@ -180,17 +159,20 @@ fn every_duty_of_the_panels_tick_is_driven_by_the_macs_pump() {
     );
 
     let pump = PanelPump::new(panel.clone());
+    let now = Instant::now();
     let mut looped = Loop {
         pump: &pump,
         armed: None,
         stopped: false,
         timer_ticks: 0,
+        now,
+        clock: eitri_panel::panel_pacer::TestClock::new(now),
     };
     // The first tick runs at once: what the window set up before its loop (the hello the ready asked for) is sent.
-    let first = pump.start(Instant::now());
+    let first = pump.start(looped.now);
     assert!(matches!(first, Timer::Arm(_)), "{first:?}");
     looped.act(first);
-    looped.run(Duration::from_millis(100), || {});
+    looped.until("the first tick", |_| panel.ticks_run() >= 1);
     assert!(panel.ticks_run() >= 1, "the first tick ran");
     assert!(
         surface.any_since(0, "\"kind\":\"hello\""),
@@ -199,20 +181,18 @@ fn every_duty_of_the_panels_tick_is_driven_by_the_macs_pump() {
 
     // Settled (the start's trust check and the like answer on workers meanwhile, and are polled until they do),
     // the panel is not ticked.
-    looped.run(Duration::from_secs(2), || {});
+    looped.idle();
     let before = panel.ticks_run();
-    looped.run(Duration::from_secs(1), || {});
-    let idle = panel.ticks_run() - before;
-    assert!(idle <= 1, "an idle panel ticked {idle} times in a second");
+    looped.now += Duration::from_secs(3600);
+    looped.clock.set(looped.now);
+    looped.step();
+    assert!(looped.armed.is_none());
+    assert_eq!(panel.ticks_run(), before, "idle leaves no timer to fire");
 
     // A call the window makes into the panel wakes it, and the tick sends what it changed.
     let (before, sent) = (panel.ticks_run(), surface.len());
-    let mut once = Some(());
-    looped.run(Duration::from_millis(300), || {
-        if once.take().is_some() {
-            panel.new_tab();
-        }
-    });
+    panel.new_tab();
+    looped.until("the new tab", |_| surface.any_since(sent, "\"kind\":\"tabs\""));
     assert!(panel.ticks_run() > before, "a call woke the tick");
     assert!(
         surface.any_since(sent, "\"kind\":\"tabs\""),
@@ -221,26 +201,18 @@ fn every_duty_of_the_panels_tick_is_driven_by_the_macs_pump() {
 
     // A page message wakes it.
     let before = panel.ticks_run();
-    let mut once = Some(());
-    looped.run(Duration::from_millis(300), || {
-        if once.take().is_some() {
-            panel.page_message(
-                eitri_panel::agent_panel::ViewId::BASE,
-                r#"{"type":"ready","request_id":"r2"}"#,
-            );
-        }
-    });
+    panel.page_message(
+        eitri_panel::agent_panel::ViewId::BASE,
+        r#"{"type":"ready","request_id":"r2"}"#,
+    );
+    looped.until("the page message's tick", |_| panel.ticks_run() > before);
     assert!(panel.ticks_run() > before, "a page message woke the tick");
 
     // A new editor context, read by the editor's own poll (the window's editor tick), raises the panel's wake:
     // nothing else would, and its next send would carry a stale file and selection. Looked at on the wake itself,
     // outside the loop, since other work can tick the panel meanwhile.
-    looped.run(Duration::from_secs(1), || {});
-    assert_eq!(
-        panel.take_wake(Instant::now()),
-        None,
-        "nothing raised before the context"
-    );
+    looped.idle();
+    assert_eq!(panel.take_wake(looped.now), None, "nothing raised before the context");
     let path = editor.context_socket().expect("the context feed").to_path_buf();
     let mut stream = std::os::unix::net::UnixStream::connect(&path).expect("connect to the context feed");
     stream
@@ -249,14 +221,14 @@ fn every_duty_of_the_panels_tick_is_driven_by_the_macs_pump() {
     drop(stream);
     // The editor's poll as the window's editor tick runs it (`Assembly::poll_editor`), one event at a time, so
     // the wake is seen to come from the context and not from another event of the same poll.
-    let deadline = Instant::now() + Duration::from_secs(2);
+    let deadline = Instant::now() + Duration::from_secs(60);
     let mut woke = None;
     while woke.is_none() && Instant::now() < deadline {
         for event in editor.poll(Instant::now()) {
             let context = matches!(event, eitri_mac::editor::EditorEvent::ContextChanged);
-            let _ = panel.take_wake(Instant::now());
+            let _ = panel.take_wake(looped.now);
             assembly.handle(event);
-            let due = panel.take_wake(Instant::now());
+            let due = panel.take_wake(looped.now);
             if context {
                 woke = Some(due.expect("the editor's context woke the panel"));
             }
@@ -265,19 +237,16 @@ fn every_duty_of_the_panels_tick_is_driven_by_the_macs_pump() {
     }
     let due = woke.expect("the editor said its context changed");
     // The tick that wake asks for, as the pump would run it.
+    let before = panel.ticks_run();
     looped.act(Timer::Arm(due));
-    looped.run(Duration::from_millis(200), || {});
+    looped.until("the context tick", |_| panel.ticks_run() > before);
 
     // The typing cadence: a key in the editor opens a typing window, which the page is told of; its end is a
     // deadline the tick named, reached by the timer alone (nothing raises the wake for it).
     assembly.report_keys(Pane::Editor, true);
     let sent = surface.len();
-    let mut once = Some(());
-    looped.run(Duration::from_millis(200), || {
-        if once.take().is_some() {
-            panel.note_editor_key();
-        }
-    });
+    panel.note_editor_key();
+    looped.until("the typing window", |_| surface.any_since(sent, "\"typing\":true"));
     assert!(surface.any_since(sent, "\"typing\":true"), "the typing window was told");
     assert!(looped.armed.is_some(), "and its end is armed");
     // From here the wake is not listened to: only the armed timer can tick the panel, so the end can be told only
@@ -286,7 +255,12 @@ fn every_duty_of_the_panels_tick_is_driven_by_the_macs_pump() {
     // count as the timer's (a tick the panel ran on its own, or one this loop ran for another reason).
     let ticks = panel.ticks_run();
     let timer_ticks = looped.timer_ticks;
-    looped.run_on_the_timer_alone(Duration::from_secs(2));
+    for _ in 0..1000 {
+        if surface.any_since(sent, "\"typing\":false") {
+            break;
+        }
+        looped.timer();
+    }
     assert!(
         surface.any_since(sent, "\"typing\":false"),
         "its end was told on the timer"
@@ -301,7 +275,7 @@ fn every_duty_of_the_panels_tick_is_driven_by_the_macs_pump() {
     // The close stops the pump for good.
     editor.shutdown();
     let watch = panel.shutdown();
-    looped.run(Duration::from_millis(300), || {});
+    looped.until("the stopped pump", |l| l.stopped);
     assert!(looped.stopped, "the close stopped the pump");
     assert_eq!(pump.on_wake(Instant::now()), Timer::Stop);
     eitri_mac::quit::wait_for_the_close(watch);

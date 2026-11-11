@@ -21,7 +21,7 @@
 //! Each case runs in a child copy of this binary on its own `Xvfb`; the parent connects to nothing. Ignored unless asked
 //! for, because it spawns real nvims (0.12 or later on `PATH`):
 //!
-//!     cargo test -p neovide-editor --test owned_follow -- --ignored
+//!     cargo test -p neovide-editor --features test-support --test owned_follow -- --ignored
 use std::cell::{Cell, RefCell};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -334,7 +334,7 @@ fn run_until(limit: Duration, mut done: impl FnMut() -> bool) -> bool {
     let context = gtk4::glib::MainContext::default();
     let deadline = Instant::now() + limit;
     loop {
-        while context.iteration(false) {}
+        context.iteration(false);
         if done() {
             return true;
         }
@@ -345,8 +345,15 @@ fn run_until(limit: Duration, mut done: impl FnMut() -> bool) -> bool {
     }
 }
 
-fn run_for(span: Duration) {
-    run_until(span, || false);
+fn sample(pane: &NeovideEditorPane) {
+    assert!(
+        run_until(Duration::from_secs(60), || pane.testing_idle()),
+        "pane did not become idle"
+    );
+    for _ in 0..100 {
+        glib::MainContext::default().iteration(false);
+        assert!(pane.is_running());
+    }
 }
 
 /// An editor of its own in a shown window, with what its callbacks reported.
@@ -490,6 +497,50 @@ fn restart_in_an_owned_editor_follows_the_new_server_and_leaves_no_orphan(scratc
     );
 }
 
+fn wait_for_blocking_mode(
+    within: Duration,
+    mut query: impl FnMut(Box<dyn FnOnce(Option<neovide_editor::NvimMode>) + Send>) -> bool,
+) {
+    let mode = Arc::new(Mutex::new(None::<Option<neovide_editor::NvimMode>>));
+    let mut pending = false;
+    assert!(
+        run_until(within, || {
+            if pending {
+                let Some(answer) = mode.lock().unwrap().take() else {
+                    return false;
+                };
+                if answer.is_some_and(|mode| mode.blocking) {
+                    return true;
+                }
+            }
+            let reply = mode.clone();
+            pending = query(Box::new(move |answer| *reply.lock().unwrap() = Some(answer)));
+            assert!(pending, "the session stopped accepting mode queries");
+            false
+        }),
+        "nvim never reached the restart refusal prompt"
+    );
+}
+
+fn mode_retry_self_test() {
+    let mut queries = 0;
+    wait_for_blocking_mode(WAIT, |reply| {
+        queries += 1;
+        assert!(
+            queries <= 2,
+            "more than one request outstanding or no prompt recognized"
+        );
+        reply(Some(neovide_editor::NvimMode {
+            at: Instant::now(),
+            mode: "n".into(),
+            blocking: queries == 2,
+        }));
+        true
+    });
+    assert_eq!(queries, 2, "the first nonblocking answer must trigger a fresh query");
+    println!("test mode_retry_self_test ... ok");
+}
+
 fn restart_refused_by_an_unsaved_buffer_keeps_the_session(scratch: &Scratch) {
     let marker = marker();
     let _reaper = Reaper(marker.clone());
@@ -497,10 +548,11 @@ fn restart_refused_by_an_unsaved_buffer_keeps_the_session(scratch: &Scratch) {
     let old = editor.pid();
     editor.keys_until("ikept<Esc>", "the edit", || editor.string(LINE_LUA) == "kept");
     editor.pane.send_keys(":restart<CR>");
-    run_for(Duration::from_millis(1500));
+    wait_for_blocking_mode(WAIT, |reply| editor.pane.ask_mode(WAIT, reply));
     // A refusal on a short grid waits at a hit-enter prompt; Esc ends it, and nvim answers again.
     editor.pane.send_keys("<Esc>");
-    run_for(Duration::from_millis(1500));
+    assert_eq!(editor.pid(), old);
+    sample(&editor.pane);
     assert!(editor.followed().is_empty(), "a refused restart was followed");
     assert!(editor.pane.is_running(), "the session ended");
     assert_eq!(editor.exits.get(), 0, "the refused restart ended the session");
@@ -700,7 +752,7 @@ fn a_followed_connect_never_asks_getpid_and_refuses_end_nvim(scratch: &Scratch) 
         }
     })));
     assert_eq!(editor.string(ONE_SHOT_LUA), "one shot");
-    run_for(Duration::from_millis(500));
+    sample(&editor.pane);
     assert_eq!(observer.uis(), 1, "the editor left the target");
     assert!(target.is_running(), "the target ended");
     editor.pane.shutdown();
@@ -742,7 +794,10 @@ fn connect_to_nowhere_keeps_the_session(scratch: &Scratch) {
     let own = editor.pid();
     let nowhere = scratch.path().join("nowhere.sock");
     editor.pane.send_keys(&format!(":connect {}<CR>", nowhere.display()));
-    run_for(Duration::from_secs(2));
+    editor.keys_until("ikept<Esc>", "the failed connect left nvim taking keys", || {
+        editor.string(LINE_LUA) == "kept"
+    });
+    sample(&editor.pane);
     assert!(
         editor.followed().is_empty(),
         "a connect that went nowhere was reported as followed"
@@ -751,9 +806,7 @@ fn connect_to_nowhere_keeps_the_session(scratch: &Scratch) {
     assert!(!editor.pane.is_attached(), "the editor's own nvim is attached to");
     assert_eq!(editor.exits.get(), 0, "the failed connect was reported as an exit");
     assert_eq!(editor.pid(), own, "another nvim answers");
-    editor.keys_until("ikept<Esc>", "the editor's nvim takes keys", || {
-        editor.string(LINE_LUA) == "kept"
-    });
+
     editor.pane.shutdown();
     let left = left_running(&marker, Duration::from_secs(8));
     assert!(
@@ -786,6 +839,7 @@ fn run_case(case: &str) {
 }
 
 fn main() {
+    mode_retry_self_test();
     if let Some(case) = std::env::var_os(CASE_ENV) {
         let case = case.to_string_lossy().into_owned();
         if let Ok(Some(kind)) = neovide_editor::detach_stdin_from_nvim() {

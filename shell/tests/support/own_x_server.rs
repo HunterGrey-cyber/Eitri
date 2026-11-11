@@ -110,6 +110,7 @@ pub struct OwnXServer {
     child: Option<Child>,
     display: String,
     xauthority: PathBuf,
+    log: PathBuf,
 }
 
 /// Whether nothing else has, or could fall back to, display `:n`: no socket file and no lock file for
@@ -183,6 +184,8 @@ impl OwnXServer {
                 "-nolisten",
                 "unix",
                 "-noreset",
+                "-audit",
+                "4",
                 "-screen",
                 "0",
                 screen,
@@ -217,6 +220,7 @@ impl OwnXServer {
         });
         let mut server = OwnXServer {
             child: Some(child),
+            log: log.clone(),
             display: String::new(),
             // Set by `start` once it keeps this server: until then the file is not this server's to
             // remove when it stops.
@@ -257,6 +261,15 @@ impl OwnXServer {
     /// This server's display name, e.g. `:500`.
     pub fn display(&self) -> &str {
         &self.display
+    }
+
+    /// Number of client-disconnect events the server has acknowledged in its audit log.
+    pub fn client_disconnects(&self) -> usize {
+        std::fs::read_to_string(&self.log)
+            .unwrap_or_default()
+            .lines()
+            .filter(|line| line.contains("client ") && line.contains(" disconnected"))
+            .count()
     }
 
     /// The server's pid while it is this process's unreaped child.

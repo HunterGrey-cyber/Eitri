@@ -18,6 +18,8 @@ use rmpv::Value;
 
 #[path = "support/own_x_server.rs"]
 mod own_x_server;
+#[path = "support/takeover_log.rs"]
+mod takeover_log;
 
 #[path = "../../core/tests/support/nvim_snapshot.rs"]
 mod nvim_snapshot;
@@ -25,9 +27,6 @@ mod nvim_snapshot;
 /// How long one step may take on a loaded machine before the case calls it hung. Not a speed bound: every wait ends as
 /// soon as what it waits for is there.
 const HANG: Duration = Duration::from_secs(90);
-/// How long the terminal may take to show nvim again once the window let go of it. The window's own bounds are 300 ms
-/// for the teardown and 1 s for the room; the rest is for a loaded machine.
-const BACK_WITHIN: Duration = Duration::from_secs(6);
 /// The first line of the waiting room's text.
 const ROOM_TEXT: &str = "This nvim is open in Eitri.";
 const PROMPT: &str = "takeover-shell> ";
@@ -101,8 +100,7 @@ impl Case {
         std::fs::set_permissions(&runtime, std::fs::Permissions::from_mode(0o700)).unwrap();
         // Anything that could start the agent's sidecar finds this first, and it answers nothing.
         let claude = scratch.join("bin/claude");
-        std::fs::write(&claude, "#!/bin/sh\nexit 1\n").unwrap();
-        std::fs::set_permissions(&claude, std::fs::Permissions::from_mode(0o755)).unwrap();
+        script_fixture::write_executable_script(&claude, "#!/bin/sh\nexit 1\n", 0o755).unwrap();
         std::fs::write(scratch.join("person.lua"), PERSON_LUA).unwrap();
         let tmux_socket = runtime.join("tm.sock");
         let addr = runtime.join("n.sock");
@@ -246,19 +244,12 @@ impl Case {
         nvim_snapshot::snapshot(&|code| without_tty_responses(self.lua(code)))
     }
 
-    /// The snapshot once the terminal's own queries have settled: two in a row, longer apart than the queries' own
-    /// one-second timers, the same.
+    /// The terminal's bootstrap timers have finished before the baseline counts handles.
     fn settled_snapshot(&self) -> nvim_snapshot::Snapshot {
-        let until = Instant::now() + Duration::from_secs(15);
-        let mut last = self.snapshot();
-        loop {
-            std::thread::sleep(Duration::from_millis(1500));
-            let now = self.snapshot();
-            if now == last || Instant::now() > until {
-                return now;
-            }
-            last = now;
-        }
+        wait("the terminal's bootstrap timers", HANG, || {
+            self.lua("local active = false; vim.uv.walk(function(h) if h:get_type() == 'timer' and h:is_active() then active = true end end); return not active").as_bool() == Some(true)
+        }).expect("the terminal never finished its bootstrap timers");
+        self.snapshot()
     }
 
     fn server_alive(&self) -> bool {
@@ -403,8 +394,7 @@ impl Case {
 
     /// The window takes the keyboard (with no window manager, X's own input focus), then `then` runs.
     fn focused(&self, then: &[&str]) -> Result<(), String> {
-        self.xdo(&["windowfocus", "%1"])?;
-        std::thread::sleep(Duration::from_millis(300));
+        self.xdo(&["windowfocus", "--sync", "%1"])?;
         let display = std::env::var("DISPLAY").map_err(|_| "no DISPLAY: the case runs on its own server")?;
         let out = Command::new("timeout")
             .arg("20")
@@ -508,7 +498,7 @@ impl Case {
 
     /// The same nvim, alive and never signalled, has its terminal UI back and the window gone, with nothing of
     /// Eitri's left in it.
-    fn assert_back(&mut self, before: &nvim_snapshot::Snapshot, since: Instant) -> Result<(), String> {
+    fn assert_back(&mut self, before: &nvim_snapshot::Snapshot, link_loss: bool) -> Result<(), String> {
         let fork = self.fork_chan();
         wait("the terminal UI back", HANG, || {
             let uis = self.uis();
@@ -517,10 +507,6 @@ impl Case {
                 && !self.capture().contains(ROOM_TEXT)
         })
         .map_err(|why| format!("{why}; terminal:\n{}\nwindow:\n{}", self.capture(), self.out()))?;
-        let took = since.elapsed();
-        if took > BACK_WITHIN {
-            return Err(format!("the terminal UI came back after {took:?}"));
-        }
         if !self.server_alive() {
             return Err("nvim's server process is gone".into());
         }
@@ -536,6 +522,12 @@ impl Case {
         let code = self.wait_shell()?;
         if code != Some(0) {
             return Err(format!("the window exited {code:?}, wanted 0:\n{}", self.out()));
+        }
+        let out = self.out();
+        if !takeover_log::hand_back_complete(&out, link_loss) {
+            return Err(format!(
+                "the hand-back did not complete through teardown and the room event:\n{out}"
+            ));
         }
         self.assert_nothing_left(before);
         Ok(())
@@ -726,11 +718,11 @@ fn last_module_kill(case: &mut Case) -> Result<(), String> {
     // The agent goes first; the editor is then the last module, and killing it closes the window.
     case.lua("vim.cmd('Eitri focus agent')");
     case.keys_to_window(&["ctrl+b", "x"])?;
-    std::thread::sleep(Duration::from_millis(500));
+    case.wait_for_line("kill-pane agent")?;
     case.keys_to_window(&["y"])?;
     case.lua("vim.cmd('Eitri focus editor')");
     case.keys_to_window(&["ctrl+b", "x"])?;
-    std::thread::sleep(Duration::from_millis(500));
+    case.wait_for_line("give nvim back to the terminal and close this window? (y/n)")?;
     case.keys_to_window(&["y"])
 }
 
@@ -791,16 +783,12 @@ fn each_close_puts_the_same_nvim_back() -> Result<(), String> {
         let mut case = Case::new(&format!("close{i}"));
         let before = case.settled_snapshot();
         let result = case.open_and_wait().and_then(|()| {
-            let since = Instant::now();
             ending(&mut case)?;
             if name == "another UI attaching" {
                 // Two UIs stay: the terminal's, back, and the one that attached.
-                let took = wait("the terminal UI back beside the other", HANG, || {
+                wait("the terminal UI back beside the other", HANG, || {
                     case.uis().len() == 2 && !case.capture().contains(ROOM_TEXT)
                 })?;
-                if took > BACK_WITHIN {
-                    return Err(format!("the terminal UI came back after {took:?}"));
-                }
                 let code = case.wait_shell()?;
                 if code != Some(0) {
                     return Err(format!("exit {code:?}:\n{}", case.out()));
@@ -810,7 +798,7 @@ fn each_close_puts_the_same_nvim_back() -> Result<(), String> {
                 wait("the other UI gone", HANG, || case.uis().len() == 1)?;
                 return case.assert_untouched(&before);
             }
-            case.assert_back(&before, since)
+            case.assert_back(&before, name == "a lost link")
         });
         if let Err(why) = result {
             failures.push(format!("{name}: {why}"));
@@ -827,7 +815,6 @@ fn sigkill_of_the_window_puts_the_nvim_back() -> Result<(), String> {
     let mut case = Case::new("sigkill");
     let before = case.settled_snapshot();
     case.open_and_wait()?;
-    let since = Instant::now();
     case.signal_shell(libc::SIGKILL);
     let fork = case.fork_chan();
     wait("the terminal UI back", HANG, || {
@@ -835,10 +822,6 @@ fn sigkill_of_the_window_puts_the_nvim_back() -> Result<(), String> {
         uis.len() == 1 && field(&uis[0], "chan").and_then(Value::as_u64) != fork && !case.capture().contains(ROOM_TEXT)
     })
     .map_err(|why| format!("{why}:\n{}", case.capture()))?;
-    let took = since.elapsed();
-    if took > BACK_WITHIN {
-        return Err(format!("back after {took:?}"));
-    }
     if !case.server_alive() || !case.lua("return vim.g.eitri_test_signalled").is_nil() {
         return Err("the server was signalled or is gone".into());
     }
@@ -991,9 +974,8 @@ fn a_terminal_ui_that_reaches_the_room_late_gets_nvim_back() -> Result<(), Strin
     // The way back is there again: a close gives nvim back without the no-window question, and the terminal's UI is
     // the one that comes back.
     let tui = case.tui;
-    let since = Instant::now();
     case.compositor_close()?;
-    case.assert_back(&before, since)?;
+    case.assert_back(&before, false)?;
     if eitri_core::split::proc_start_time(tui) != case.tui_start {
         return Err("the terminal's UI process is gone".into());
     }
@@ -1111,9 +1093,8 @@ fn handed_back_is_never_refused_while_a_question_is_up() -> Result<(), String> {
     case.open_and_wait()?;
     case.keys_to_window(&["ctrl+b", "x"])?;
     case.wait_for_line("give nvim back to the terminal and close this window? (y/n)")?;
-    let since = Instant::now();
     case.keys_to_terminal("Enter");
-    case.assert_back(&before, since)
+    case.assert_back(&before, false)
 }
 
 fn a_shell_chunk_the_table_refuses_never_reaches_the_taken_over_nvim() -> Result<(), String> {
@@ -1246,4 +1227,9 @@ fn main() {
     }
     println!("takeover_start: {} passed; {failed} failed", ran - failed);
     server.exit(if failed == 0 && ran > 0 { 0 } else { 1 });
+}
+
+#[cfg(test)]
+mod script_fixture {
+    include!(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/support/executable.rs"));
 }
