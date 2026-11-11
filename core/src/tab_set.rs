@@ -541,9 +541,11 @@ pub struct SessionState {
     /// card showed: the CLI's own prompt for exactly such a call, which follows the gate's request
     /// for it, is answered `allow` without a second card, once, as the real CLI asks once. Written
     /// only when a card's Approve acknowledgement is read; emptied when the turn
-    /// ends (the CLI asks within the turn that made the call), on every `Resync` (one can swallow a
-    /// turn boundary), on a start-over and with the backend. Private for the reason `host_answered`
-    /// is.
+    /// ends (the CLI asks within the turn that made the call), on every `Resync` the backend reports
+    /// (one can swallow a turn boundary), on a start-over and with the backend; a snapshot the drain
+    /// asks for to show a released prompt keeps them. In-flight matches survive a resync and hold
+    /// matching follow-up prompts until their acknowledgement is read. Private for the reason
+    /// `host_answered` is.
     human_allowed: crate::agent_backend::HumanApprovals,
     /// Permission ids the user answered on a card here (any decision), including sends awaiting an
     /// acknowledgement, that the projection still lists as pending. A failed send removes its id;
@@ -674,6 +676,24 @@ pub const NAME_UNKNOWN_LINE: &str = "Eitri could not read all of your Codex conf
                                      may be in it; the editor tools are off in this tab (see the agents guide)";
 
 impl SessionState {
+    /// The pending requests no page shows: those answered on the user's behalf, and the CLI prompts held
+    /// for an approval in flight. A held one is either in `held` or matched by `holds`, and every
+    /// match is moved into `held` when its send settles or its turn ends, so whatever a snapshot hid
+    /// here is reconsidered by a drain. A request the user answered is never hidden as held.
+    fn hidden_permissions(&self, projection: &agent::AgentSessionProjection) -> BTreeSet<String> {
+        let held = self
+            .human_allowed
+            .held_ids()
+            .cloned()
+            .chain(projection.pending_permissions.iter().filter_map(|(id, p)| {
+                self.human_allowed
+                    .holds(p, &projection.active_turn_id)
+                    .then(|| id.clone())
+            }))
+            .filter(|id| !self.user_answered.contains(id));
+        self.host_answered.iter().cloned().chain(held).collect()
+    }
+
     /// Reports a turn the clock now names and has not been reported. The clock is stamped from the projection on every
     /// path (the early read and a resync's snapshot alike), so a turn whose `TurnStarted` a resync dropped is still
     /// found here.
@@ -700,7 +720,7 @@ impl SessionState {
         self.turn_clock = None;
         self.last_began_turn = None;
         self.host_answered.clear();
-        self.human_allowed.clear();
+        self.human_allowed = Default::default();
         self.note_ledger.clear();
         self.creates_file_unsent.clear();
         self.user_answered.clear();
@@ -801,9 +821,11 @@ impl Tab {
     /// What the panel's "Always allow" checks before saving a rule.
     pub fn card_is_waiting(&self, permission_id: &str) -> bool {
         !self.session.user_answered.contains(permission_id)
-            && self
-                .live()
-                .is_some_and(|backend| backend.projection().pending_permissions.contains_key(permission_id))
+            && self.live().is_some_and(|backend| {
+                let projection = backend.projection();
+                projection.pending_permissions.contains_key(permission_id)
+                    && !self.session.hidden_permissions(&projection).contains(permission_id)
+            })
     }
 
     /// When this tab's running turn started, if one is running (see `turn_clock`).
@@ -3201,6 +3223,9 @@ impl TabSet {
         };
         let offer = tab.session.rule_offers.remove(permission_id);
         tab.session.user_answered.insert(permission_id.to_string());
+        if let Some(call) = call.as_ref().filter(|_| approves) {
+            tab.session.human_allowed.sending(permission_id, turn_id.clone(), call);
+        }
         Ok(PermissionSend {
             permission_id: permission_id.into(),
             generation,
@@ -3221,6 +3246,14 @@ impl TabSet {
             benign: true,
         });
         if let Some(tab) = self.get_mut(id).filter(|tab| tab.backend_generation == send.generation) {
+            let projection = match &tab.backend {
+                TabBackend::Live(backend) => Some(backend.projection()),
+                _ => None,
+            };
+            tab.session
+                .human_allowed
+                .finished(&send.permission_id, projection.as_deref(), &tab.session.user_answered);
+            drop(projection);
             if reply.is_ok() {
                 if let Some((tool_use_id, tool_name, input)) = send.call.as_ref().filter(|_| {
                     tab.live()
@@ -3774,7 +3807,7 @@ impl TabSet {
         let mut answered_for_you = crate::agent_backend::AnsweredForYou::default();
         // Every fold through this revision is in this drain or an earlier one, whatever the drain then drops.
         let folded_before = backend.projection().last_revision;
-        let delivery = backend.take_revised_ui_delivery(
+        let delivery = backend.take_revised_ui_delivery_after_answers(
             tick.project_root,
             tick.rules,
             crate::agent_backend::GateMode {
@@ -3783,6 +3816,7 @@ impl TabSet {
             },
             &mut tab.session.host_answered,
             &mut tab.session.human_allowed,
+            &tab.session.user_answered,
             &mut answered_for_you,
         );
         #[cfg(test)]
@@ -3939,11 +3973,10 @@ impl TabSet {
                 // doc used to record for `resync` itself. Answered here, outside every guard of the
                 // projection: answering a permission must happen outside the lock.
                 if live.mode == SessionModeChoice::Bypass {
+                    let hidden = live.session.hidden_permissions(&live.backend.projection());
                     let sweep: Vec<String> = pending
                         .iter()
-                        .filter(|id| {
-                            !live.session.host_answered.contains(*id) && !live.session.user_answered.contains(*id)
-                        })
+                        .filter(|id| !hidden.contains(*id) && !live.session.user_answered.contains(*id))
                         .cloned()
                         .collect();
                     // The events (legacy's own resolutions) are not needed here: the snapshot is read
@@ -4081,7 +4114,10 @@ impl TabSet {
                     live.session.was_unseen_busy = false;
                     arm.turn_ended = true;
                     // The CLI asks within the turn that made the call.
-                    live.session.human_allowed.clear();
+                    live.session.human_allowed.forget_recorded();
+                    live.session
+                        .human_allowed
+                        .forget_in_flight(&live.backend.projection(), &live.session.user_answered);
                 }
                 // The session ended: its queue waits for `r`, not a flush.
                 AgentDomainEvent::SessionClosed { .. } | AgentDomainEvent::SessionUnavailable { .. } => {
@@ -4215,16 +4251,14 @@ impl TabSet {
             }
             live.unseen_stretch.counted_through = Some(projection.last_revision);
             live.session.was_unseen_busy = projection.cli_unseen_busy;
-            // Unconditionally: the dropped events may have held a turn's end and the next one's
-            // start, which `was_running` cannot see, and an approval must never outlive its turn.
-            // Costs at most a card.
-            live.session.human_allowed.clear();
+            // Recorded approvals are not forgotten here: the drain forgot them for a resync the backend
+            // reported (its dropped events may have held a turn's end), and kept them for a snapshot
+            // it asked for to show a released prompt, which drops no event the drain did not read.
             // The ledger stands in for the dropped events: a candidate whose call finished among them
             // becomes its note now, so the snapshot already carries it, and a gate candidate whose
             // call has a card still pending is dropped (`NoteLedger::resync`).
-            live.session
-                .note_ledger
-                .resync(&projection, &live.session.host_answered, live.notes);
+            let hidden = live.session.hidden_permissions(&projection);
+            live.session.note_ledger.resync(&projection, &hidden, live.notes);
             (turn_ended, projection.pending_permissions.keys().cloned().collect())
         };
         // The snapshot carries every note.
@@ -4245,12 +4279,9 @@ impl TabSet {
             turn_ended,
             ..ArmOutcome::default()
         };
-        live.attention.resync(
-            pending
-                .iter()
-                .filter(|id| !live.session.host_answered.contains(*id))
-                .cloned(),
-        );
+        let hidden = live.session.hidden_permissions(&live.backend.projection());
+        live.attention
+            .resync(pending.iter().filter(|id| !hidden.contains(*id)).cloned());
         if !place.in_a_page {
             live.session.stale = true;
             return arm;
@@ -4264,7 +4295,10 @@ impl TabSet {
         #[cfg(not(test))]
         let _ = tick;
         let (payload, revision) = {
-            let view = SnapshotView::of(live.backend, &live.session.host_answered);
+            let hidden;
+            let mut view = SnapshotView::of(live.backend, &live.session.host_answered);
+            hidden = live.session.hidden_permissions(&view.projection);
+            view.hidden_pending = Some(&hidden);
             // Observed from this snapshot's own view, under the guard it is serialized from -- not
             // the early read before the arm, which the arm's own further lock cycles (its read of the
             // projection and `approve_pending`'s bypass sweep) can leave stale: if a turn ends and the
@@ -4530,6 +4564,18 @@ impl TabSet {
     /// it. Empty for a tab it does not have, and for a background base-view tab: no page shows that
     /// one, and its state goes out when it is selected.
     pub fn state_payloads(&mut self, tab: TabId) -> Vec<String> {
+        self.payloads_of(tab, true)
+    }
+
+    /// [`TabSet::state_payloads`] without the composer's draft, for a page already showing `tab`
+    /// whose state changed under it outside a switch, `ready`, a reset or a scratch return. Between
+    /// those the page's box is its own and this copy trails it by the mirror's debounce: sent here,
+    /// the page would take it and lose whatever was typed since.
+    pub fn refresh_payloads(&mut self, tab: TabId) -> Vec<String> {
+        self.payloads_of(tab, false)
+    }
+
+    fn payloads_of(&mut self, tab: TabId, with_draft: bool) -> Vec<String> {
         if !self.is_shown(tab) {
             return Vec::new();
         }
@@ -4539,7 +4585,10 @@ impl TabSet {
         match &mut tab.backend {
             TabBackend::Live(backend) => {
                 let (payload, revision) = {
-                    let view = SnapshotView::of(backend, &tab.session.host_answered);
+                    let hidden;
+                    let mut view = SnapshotView::of(backend, &tab.session.host_answered);
+                    hidden = tab.session.hidden_permissions(&view.projection);
+                    view.hidden_pending = Some(&hidden);
                     settle_opening(
                         &mut tab.session.opening_prompt,
                         &mut tab.session.queue,
@@ -4589,7 +4638,9 @@ impl TabSet {
             tab.queue_line().as_deref(),
             tab.steers(),
         ));
-        payloads.push(crate::agent_bridge::serialize_draft_for_js(tab.id, &tab.session.draft));
+        if with_draft {
+            payloads.push(crate::agent_bridge::serialize_draft_for_js(tab.id, &tab.session.draft));
+        }
         if tab.live().is_some() {
             payloads.push(crate::agent_bridge::serialize_rule_offers_for_js(
                 tab.id,
@@ -6671,17 +6722,14 @@ impl NoteLedger {
     /// candidate whose call finished becomes its note in `kept`, so the snapshot sent next carries it.
     /// A gate candidate whose call still has a pending card nobody answered for the user is dropped:
     /// the card that would have dropped it was among the dropped events, and whatever answers that
-    /// card now is a human. A request this tab answered itself (`host_answered`) can still be listed
-    /// as pending until the provider's resolution folds, and is no card: it is left out, or a
-    /// `Resync` that merely came early would drop an answer recorded at the answer itself
+    /// card now is a human. `hidden` are the pending requests no page shows
+    /// (`SessionState::hidden_permissions`): one this tab answered itself can still be listed as
+    /// pending until the provider's resolution folds, and a CLI prompt held for an approval in
+    /// flight has not been drawn. Neither is a card: they are left out, or a `Resync` that merely
+    /// came early would drop an answer recorded at the answer itself
     /// (`a_resync_before_the_call_finishes_keeps_its_fast_path_answer` and `..._keeps_its_rule_answer`
     /// each fail without that filter).
-    fn resync(
-        &mut self,
-        projection: &agent::AgentSessionProjection,
-        host_answered: &BTreeSet<String>,
-        kept: &mut CallNotes,
-    ) {
+    fn resync(&mut self, projection: &agent::AgentSessionProjection, hidden: &BTreeSet<String>, kept: &mut CallNotes) {
         let finished: Vec<(String, NoteKind)> = self
             .candidates
             .keys()
@@ -6701,7 +6749,7 @@ impl NoteLedger {
         let still_pending: BTreeSet<&str> = projection
             .pending_permissions
             .values()
-            .filter(|p| !host_answered.contains(&p.permission_id))
+            .filter(|p| !hidden.contains(&p.permission_id))
             .filter_map(|p| p.tool_use_id.as_deref())
             .collect();
         self.candidates

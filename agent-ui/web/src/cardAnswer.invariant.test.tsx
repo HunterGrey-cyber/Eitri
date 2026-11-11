@@ -5,6 +5,7 @@
    These cases hold that from the outside, on the page, and a text check holds who may build a proof. */
 import { act, cleanup, fireEvent, render } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+vi.unmock("./afterPaint");
 import App from "./App";
 import { initialState } from "./reducer";
 import { TYPING_GUARD_MS } from "./typingGuard";
@@ -275,14 +276,24 @@ describe("(b) only a fresh, armed press on the root answers", () => {
 
   it("a 1 before card mode is painted answers nothing and says it is arming", () => {
     const { container, root } = setup();
-    fireEvent.keyDown(root, { key: "Enter", code: "Enter" });
-    fireEvent.keyUp(root, { key: "Enter", code: "Enter" });
+    let frame: FrameRequestCallback | undefined;
+    vi.stubGlobal("requestAnimationFrame", (run: FrameRequestCallback) => { frame = run; return 1; });
+    fireEvent.keyDown(root, { key: "n", code: "KeyN", altKey: true });
+    fireEvent.keyUp(root, { key: "n", code: "KeyN", altKey: true });
     expect(inCardMode(container)).toBe(true);
+    wait(CARD_ARM_MS + 1000);
     fireEvent.keyDown(root, { key: "1", code: "Digit1" });
     expect(band(container)).toBe(cardArmingFlash("1"));
     fireEvent.keyUp(root, { key: "1", code: "Digit1" });
     wait(CARD_ARM_MS + 1000);
     expect(answers()).toEqual([]);
+    act(() => frame!(performance.now()));
+    act(() => frame!(performance.now()));
+    wait(CARD_ARM_MS + 100);
+    fireEvent.keyDown(root, { key: "1", code: "Digit1" });
+    fireEvent.keyUp(root, { key: "1", code: "Digit1" });
+    wait(TYPING_GUARD_MS + 50);
+    expect(answers()).toHaveLength(1);
   });
 });
 

@@ -8,6 +8,7 @@ declare global {
 }
 
 export function webkitTransport(w: Window): Transport {
+  const prefix = Array.from(crypto.getRandomValues(new Uint32Array(4)), (word) => word.toString(16).padStart(8, "0")).join("");
   let counter = 0;
   return {
     name: "webkit",
@@ -23,7 +24,7 @@ export function webkitTransport(w: Window): Transport {
       w.__eitriDispatch = onMessage;
     },
     nextId(kind) {
-      return `${kind}-${++counter}`;
+      return `${kind}-${prefix}-${++counter}`;
     },
   };
 }

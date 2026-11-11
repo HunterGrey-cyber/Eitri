@@ -93,6 +93,12 @@ impl RecordingProvider {
         held.pop().unwrap().send(reply).unwrap();
     }
 
+    /// Replies to the held answer at `index` among those still held, oldest first.
+    pub fn reply_to_held_permission(&self, index: usize, reply: agent::InteractionReply) {
+        let sender = self.held_permission_replies.lock().unwrap().remove(index);
+        sender.send(reply).unwrap();
+    }
+
     pub fn held_permissions(&self) -> usize {
         self.held_permission_replies.lock().unwrap().len()
     }

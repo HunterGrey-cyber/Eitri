@@ -328,8 +328,8 @@ export function proofAnswers(
   return !remember || (proof.rule !== null && proof.rule === offeredRule);
 }
 
-// A pointer's proof: a click a real press made (`detail` > 0). Its own module, which imports nothing, so a card's
-// markup can make one without this module's imports.
+// A pointer's proof: a click with a positive press count (`detail` > 0). Its own module, which imports nothing, so a
+// card's markup can make one without this module's imports.
 export { pointerAnswerProof, type PointerAnswerProof } from "./answerProof";
 
 // What an answer must carry; `keyAnswerProof` and `pointerAnswerProof` are the only constructors.

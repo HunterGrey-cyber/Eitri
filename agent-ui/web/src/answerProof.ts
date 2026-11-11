@@ -8,9 +8,9 @@
 declare const pointerBrand: unique symbol;
 export type PointerAnswerProof = { readonly [pointerBrand]: true };
 
-/** The proof that a pointer answered: a click a real press made (`detail` counts the presses). A click that Enter
- *  or Space synthesised on a focused button has `detail` 0 and proves nothing; so does one a script dispatched
- *  without a press. */
+/** The proof that a pointer answered: a click with a positive press count (`detail`). Native activation by Enter
+ *  or Space on a focused button has `detail` 0 and is refused. This guards accidental native activation;
+ *  it does not authenticate events against script running in this page. */
 export function pointerAnswerProof(event: { detail: number }): PointerAnswerProof | null {
   if (!(event.detail > 0)) return null;
   // The brand is a type only: no value carries it at run time.

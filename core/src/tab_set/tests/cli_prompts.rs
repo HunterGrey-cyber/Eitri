@@ -3,6 +3,364 @@
 
 use super::*;
 
+#[test]
+fn a_followup_waits_for_the_async_approval_and_is_reconsidered_once() {
+    followup_before_reply(Ok(None));
+}
+
+#[test]
+fn a_followup_is_a_card_when_the_async_approval_fails() {
+    followup_before_reply(Err(agent::ProviderError::Timeout));
+    followup_before_reply(Err(agent::ProviderError::Transport("lost".into())));
+}
+
+fn followup_before_reply(reply: agent::InteractionReply) {
+    let succeeds = reply.is_ok();
+    let dir = workspace("early-followup");
+    let mut set = set();
+    let tab = set.active();
+    let (provider, backend) = live(&dir);
+    set.get_mut(tab).unwrap().set_backend(TabBackend::Live(backend));
+    provider.queue(started("t1"));
+    provider.queue(gate_write("hook", "call"));
+    until("the gate card", || {
+        set.pump(&dir, true);
+        set.get(tab).unwrap().attention.attention().pending == 1
+    });
+    provider.hold_permission_replies();
+    let send = set
+        .answer_card_async(tab, ViewId::BASE, "hook", agent::PermissionDecision::Allow)
+        .unwrap();
+    provider.queue(resolved("hook"));
+    let prompt = || {
+        cli_prompt(
+            "followup",
+            "call",
+            "Write",
+            serde_json::json!({ "file_path": ".git/probe2", "content": "o3" }),
+            None,
+        )
+    };
+    provider.queue(prompt());
+    until("the follow-up folded before the acknowledgement", || {
+        set.get(tab)
+            .unwrap()
+            .live()
+            .unwrap()
+            .projection()
+            .pending_permissions
+            .contains_key("followup")
+    });
+    let key = set.get(tab).unwrap().row_key().clone();
+    let observer = set.observe(&key).unwrap();
+    let frames = set.take_observer_frames(observer, usize::MAX);
+    assert!(matches!(&frames[0], ObserverFrame::Snapshot { json, .. } if !json.contains("followup")));
+    let out = set.pump(&dir, true);
+    assert!(!out.active_payload.as_deref().unwrap_or("").contains("followup"));
+    assert_eq!(set.get(tab).unwrap().attention.attention().pending, 0);
+    assert!(set.get(tab).unwrap().session.human_allowed.is_empty());
+    assert!(
+        !set.active_state_payloads()[0].contains("followup"),
+        "reloads hide the held prompt too"
+    );
+    // A resync must keep the in-flight approval and hide the follow-up.
+    for i in 0..300 {
+        provider.queue(AgentDomainEvent::ContentDelta {
+            turn_id: "t1".into(),
+            kind: agent::ContentKind::Text,
+            text: format!("chunk {i}"),
+        });
+    }
+    until("the overflow folded", || {
+        set.get(tab)
+            .unwrap()
+            .live()
+            .unwrap()
+            .projection()
+            .transcript
+            .last()
+            .is_some_and(|m| m.text.ends_with("chunk 299"))
+    });
+    let resync: serde_json::Value = serde_json::from_str(&set.pump(&dir, true).active_payload.unwrap()).unwrap();
+    assert_eq!(resync["kind"], "snapshot");
+    assert!(!resync.to_string().contains("followup"));
+    assert_eq!(set.get(tab).unwrap().attention.attention().pending, 0);
+    let frames = set.take_observer_frames(observer, usize::MAX);
+    assert!(matches!(&frames[0], ObserverFrame::Snapshot { json, .. } if !json.contains("followup")));
+    provider.reply_to_held_permissions(reply);
+    provider.resume_permission_replies();
+    assert_eq!(set.finish_card_answer(tab, &send).unwrap().is_ok(), succeeds);
+    until("the held follow-up settled", || {
+        set.pump(&dir, true);
+        if succeeds {
+            provider.resolutions().len() == 1
+        } else {
+            set.get(tab).unwrap().attention.attention().pending == 1
+        }
+    });
+    if succeeds {
+        assert_eq!(provider.resolutions(), vec![("followup".into(), true)]);
+        let revision = set.get(tab).unwrap().live().unwrap().projection().last_revision;
+        provider.queue(prompt());
+        until("the duplicate folded", || {
+            set.get(tab).unwrap().live().unwrap().projection().last_revision > revision
+        });
+        set.pump(&dir, true);
+        assert_eq!(provider.resolutions().len(), 1);
+        assert_eq!(set.get(tab).unwrap().attention.attention().pending, 0);
+    } else {
+        assert!(set.active_state_payloads()[0].contains("followup"));
+        assert!(set.get(tab).unwrap().card_is_waiting("followup"));
+    }
+    shut_down_all(&mut set);
+}
+
+fn probe_input() -> serde_json::Value {
+    serde_json::json!({ "file_path": ".git/probe2", "content": "o3" })
+}
+
+/// The ids of the cards a snapshot payload lists, sorted.
+fn cards_in(payload: &str) -> Vec<String> {
+    let snapshot: serde_json::Value = serde_json::from_str(payload).unwrap();
+    assert_eq!(snapshot["kind"], "snapshot", "{payload}");
+    let mut cards: Vec<String> = snapshot["state"]["pendingPermissions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|card| card["permissionId"].as_str().unwrap().to_string())
+        .collect();
+    cards.sort();
+    cards
+}
+
+fn pending(set: &TabSet, tab: TabId, permission: &str) -> bool {
+    set.get(tab)
+        .unwrap()
+        .live()
+        .unwrap()
+        .projection()
+        .pending_permissions
+        .contains_key(permission)
+}
+
+/// A CLI prompt that is itself the card being approved is not held by its own send: it stays listed
+/// (the page shows it as sending), and an acknowledgement read before its resolution folds leads to
+/// no second answer.
+#[test]
+fn an_approved_cli_prompt_card_is_answered_once_and_stays_shown_while_sending() {
+    let dir = workspace("cli-prompt-card-async");
+    let mut set = set();
+    let tab = set.active();
+    let (provider, backend) = live(&dir);
+    set.get_mut(tab).unwrap().set_backend(TabBackend::Live(backend));
+    provider.queue(started("t1"));
+    provider.queue(cli_prompt("prompt", "call", "Write", probe_input(), None));
+    until("the prompt's card", || {
+        set.pump(&dir, true);
+        set.get(tab).unwrap().attention.attention().pending == 1
+    });
+    provider.hold_permission_replies();
+    let send = set
+        .answer_card_async(tab, ViewId::BASE, "prompt", agent::PermissionDecision::Allow)
+        .unwrap();
+    assert_eq!(cards_in(&set.active_state_payloads()[0]), vec!["prompt"]);
+    set.pump(&dir, true);
+    assert_eq!(
+        cards_in(&set.active_state_payloads()[0]),
+        vec!["prompt"],
+        "its own send does not hide it"
+    );
+    provider.reply_to_held_permissions(Ok(None));
+    provider.resume_permission_replies();
+    assert!(set.finish_card_answer(tab, &send).unwrap().is_ok());
+    for _ in 0..3 {
+        set.pump(&dir, true);
+    }
+    assert!(pending(&set, tab, "prompt"), "its resolution has not folded yet");
+    assert_eq!(
+        provider.resolutions(),
+        Vec::new(),
+        "the answer is not sent a second time"
+    );
+    provider.queue(resolved("prompt"));
+    until("the resolution folded", || {
+        set.pump(&dir, true);
+        !pending(&set, tab, "prompt")
+    });
+    set.pump(&dir, true);
+    assert_eq!(provider.resolutions(), Vec::new());
+    assert!(cards_in(&set.active_state_payloads()[0]).is_empty());
+    assert_eq!(set.get(tab).unwrap().attention.attention().pending, 0);
+    shut_down_all(&mut set);
+}
+
+/// A follow-up a snapshot hid before any drain read it is released like a drained one: when the
+/// approval fails, the next pump shows it in a snapshot.
+#[test]
+fn a_followup_hidden_by_a_snapshot_before_any_drain_is_shown_when_the_approval_fails() {
+    let dir = workspace("snapshot-hidden-followup");
+    let mut set = set();
+    let tab = set.active();
+    let (provider, backend) = live(&dir);
+    set.get_mut(tab).unwrap().set_backend(TabBackend::Live(backend));
+    provider.queue(started("t1"));
+    provider.queue(gate_write("hook", "call"));
+    until("the gate card", || {
+        set.pump(&dir, true);
+        set.get(tab).unwrap().attention.attention().pending == 1
+    });
+    provider.hold_permission_replies();
+    let send = set
+        .answer_card_async(tab, ViewId::BASE, "hook", agent::PermissionDecision::Allow)
+        .unwrap();
+    provider.queue(cli_prompt("followup", "call", "Write", probe_input(), None));
+    until("the follow-up folded", || pending(&set, tab, "followup"));
+    // No pump in between: this snapshot hides the follow-up and covers its event.
+    assert_eq!(cards_in(&set.active_state_payloads()[0]), vec!["hook"]);
+    provider.reply_to_held_permissions(Err(agent::ProviderError::Timeout));
+    provider.resume_permission_replies();
+    assert!(set.finish_card_answer(tab, &send).unwrap().is_err());
+    let out = set.pump(&dir, true);
+    let payload = out.active_payload.expect("the released follow-up is sent");
+    assert_eq!(cards_in(&payload), vec!["followup", "hook"]);
+    assert_eq!(set.get(tab).unwrap().attention.attention().pending, 2);
+    assert!(set.get(tab).unwrap().card_is_waiting("followup"));
+    assert_eq!(provider.resolutions(), Vec::new());
+    shut_down_all(&mut set);
+}
+
+/// Two approvals in flight at once: releasing the first one's follow-up, in a batch with other
+/// events, keeps the second one's recorded approval, which then answers its own follow-up.
+#[test]
+fn releasing_one_followup_keeps_another_calls_recorded_approval() {
+    let dir = workspace("parallel-approvals");
+    let mut set = set();
+    let tab = set.active();
+    let (provider, backend) = live(&dir);
+    set.get_mut(tab).unwrap().set_backend(TabBackend::Live(backend));
+    provider.queue(started("t1"));
+    provider.queue(gate_write("gate-a", "call-a"));
+    provider.queue(gate_write("gate-b", "call-b"));
+    until("both gate cards", || {
+        set.pump(&dir, true);
+        set.get(tab).unwrap().attention.attention().pending == 2
+    });
+    provider.hold_permission_replies();
+    let send_a = set
+        .answer_card_async(tab, ViewId::BASE, "gate-a", agent::PermissionDecision::Allow)
+        .unwrap();
+    let send_b = set
+        .answer_card_async(tab, ViewId::BASE, "gate-b", agent::PermissionDecision::Allow)
+        .unwrap();
+    assert_eq!(provider.held_permissions(), 2);
+    provider.queue(resolved("gate-a"));
+    provider.queue(resolved("gate-b"));
+    provider.queue(cli_prompt("followup-a", "call-a", "Write", probe_input(), None));
+    until("the first follow-up folded", || pending(&set, tab, "followup-a"));
+    set.pump(&dir, true);
+    assert_eq!(set.get(tab).unwrap().attention.attention().pending, 0);
+    provider.reply_to_held_permission(1, Ok(None));
+    assert!(set.finish_card_answer(tab, &send_b).unwrap().is_ok());
+    provider.queue(AgentDomainEvent::ContentDelta {
+        turn_id: "t1".into(),
+        kind: agent::ContentKind::Text,
+        text: "in the same batch".into(),
+    });
+    until("the text folded", || {
+        set.get(tab)
+            .unwrap()
+            .live()
+            .unwrap()
+            .projection()
+            .transcript
+            .last()
+            .is_some_and(|m| m.text.ends_with("in the same batch"))
+    });
+    provider.reply_to_held_permission(0, Ok(None));
+    provider.resume_permission_replies();
+    assert!(set.finish_card_answer(tab, &send_a).unwrap().is_ok());
+    set.pump(&dir, true);
+    assert_eq!(provider.resolutions(), vec![("followup-a".to_string(), true)]);
+    provider.queue(cli_prompt("followup-b", "call-b", "Write", probe_input(), None));
+    until("the second follow-up settled", || {
+        set.pump(&dir, true);
+        provider.resolutions().len() == 2 || set.get(tab).unwrap().attention.attention().pending > 0
+    });
+    assert_eq!(
+        provider.resolutions().get(1),
+        Some(&("followup-b".to_string(), true)),
+        "the second call's approval answered its follow-up"
+    );
+    assert_eq!(set.get(tab).unwrap().attention.attention().pending, 0);
+    shut_down_all(&mut set);
+}
+
+/// A follow-up held for an approval in flight is no card, so a resync keeps the gate note of its call
+/// that a pending card would drop.
+#[test]
+fn a_resync_keeps_a_gate_note_whose_only_pending_request_is_held() {
+    let dir = workspace("held-keeps-note");
+    let mut set = set();
+    let tab = set.active();
+    let (provider, backend) = live(&dir);
+    set.get_mut(tab).unwrap().set_backend(TabBackend::Live(backend));
+    provider.queue(started("t1"));
+    provider.queue(gate_write("hook", "call"));
+    until("the gate card", || {
+        set.pump(&dir, true);
+        set.get(tab).unwrap().attention.attention().pending == 1
+    });
+    provider.hold_permission_replies();
+    let send = set
+        .answer_card_async(tab, ViewId::BASE, "hook", agent::PermissionDecision::Allow)
+        .unwrap();
+    provider.queue(resolved("hook"));
+    provider.queue(cli_prompt("followup", "call", "Write", probe_input(), None));
+    until("the follow-up folded", || {
+        pending(&set, tab, "followup") && !pending(&set, tab, "hook")
+    });
+    set.pump(&dir, true);
+    set.get_mut(tab).unwrap().session.note_ledger.record_report(NoteReport {
+        by_the_fast_path: vec![crate::agent_backend::FastPathAnsweredForYou {
+            tool_use_id: "call".into(),
+            tool_name: "Write".into(),
+            input: probe_input(),
+        }],
+        ..NoteReport::default()
+    });
+    for i in 0..300 {
+        provider.queue(AgentDomainEvent::ContentDelta {
+            turn_id: "t1".into(),
+            kind: agent::ContentKind::Text,
+            text: format!("chunk {i}"),
+        });
+    }
+    until("the overflow folded", || {
+        set.get(tab)
+            .unwrap()
+            .live()
+            .unwrap()
+            .projection()
+            .transcript
+            .last()
+            .is_some_and(|m| m.text.ends_with("chunk 299"))
+    });
+    let resync: serde_json::Value = serde_json::from_str(&set.pump(&dir, true).active_payload.unwrap()).unwrap();
+    assert_eq!(resync["kind"], "snapshot");
+    assert!(
+        set.get(tab)
+            .unwrap()
+            .session
+            .note_ledger
+            .has("call", NoteKind::AutoEdit),
+        "the held follow-up is no card"
+    );
+    provider.reply_to_held_permissions(Ok(None));
+    provider.resume_permission_replies();
+    assert!(set.finish_card_answer(tab, &send).unwrap().is_ok());
+    shut_down_all(&mut set);
+}
+
 /// The gate card, human approval through `answer_card`, and gate resolution can be followed by
 /// the CLI's prompt for the same call under a new permission id. That request is accepted and
 /// answered `allow` using the prior human approval, producing exactly one card for the call.

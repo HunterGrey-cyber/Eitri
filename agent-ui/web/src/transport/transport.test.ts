@@ -7,6 +7,7 @@ function fakeWindow(properties: Record<string, unknown> = {}): Window {
 }
 
 afterEach(() => {
+  vi.restoreAllMocks();
   vi.unstubAllGlobals();
   vi.resetModules();
 });
@@ -25,11 +26,11 @@ it("webkit_transport_posts_through_the_message_handler", () => {
   expect(dispatch.mock.calls).toEqual([[json]]);
 });
 
-it("webkit_ids_are_unchanged", () => {
+it("webkit_ids_keep_the_kind_and_increase_the_counter", () => {
   const transport = detectTransport(fakeWindow());
-  expect(transport.nextId("req")).toBe("req-1");
-  expect(transport.nextId("mirror")).toBe("mirror-2");
-  expect(transport.nextId("req")).toBe("req-3");
+  expect(transport.nextId("req")).toMatch(/^req-[a-f0-9]{32}-1$/);
+  expect(transport.nextId("mirror")).toMatch(/^mirror-[a-f0-9]{32}-2$/);
+  expect(transport.nextId("req")).toMatch(/^req-[a-f0-9]{32}-3$/);
 });
 
 it("android_transport_posts_through_eitri_host", async () => {
@@ -73,11 +74,26 @@ it("android_messages_reach_the_dispatch", async () => {
 it("android_ids_have_their_own_prefix", async () => {
   vi.stubGlobal("window", fakeWindow({ eitriHost: { postMessage: vi.fn() } }));
   const { nextRequestId, nextMirrorId } = await import("../bridge");
-  expect(nextRequestId()).toBe("a-req-1");
-  expect(nextMirrorId()).toBe("a-mirror-2");
-  expect(nextRequestId()).toBe("a-req-3");
+  expect(nextRequestId()).toMatch(/^a-req-[a-f0-9]{32}-1$/);
+  expect(nextMirrorId()).toMatch(/^a-mirror-[a-f0-9]{32}-2$/);
+  expect(nextRequestId()).toMatch(/^a-req-[a-f0-9]{32}-3$/);
   const desktop = detectTransport(fakeWindow());
-  expect(desktop.nextId("req")).toBe("req-1");
+  expect(desktop.nextId("req")).toMatch(/^req-[a-f0-9]{32}-1$/);
+});
+
+it.each(["webkit", "android"])("%s instances mint different request ids across loads", (kind) => {
+  const properties = kind === "android" ? { eitriHost: { postMessage: vi.fn() } } : {};
+  let load = 0;
+  const random = vi.spyOn(crypto, "getRandomValues").mockImplementation((array) => {
+    (array as Uint32Array).fill(++load);
+    return array;
+  });
+  const first = detectTransport(fakeWindow(properties));
+  const second = detectTransport(fakeWindow(properties));
+  const ids = [first.nextId("req"), second.nextId("req"), first.nextId("mirror"), second.nextId("mirror")];
+  expect(new Set(ids).size).toBe(4);
+  expect(random).toHaveBeenCalledTimes(2);
+  random.mockRestore();
 });
 
 it("is_mirror_request_knows_both_prefixes", async () => {

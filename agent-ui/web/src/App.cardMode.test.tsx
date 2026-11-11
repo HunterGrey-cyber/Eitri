@@ -9,6 +9,7 @@
  */
 import { afterEach, beforeAll, beforeEach, describe, expect, it, onTestFinished, vi } from "vitest";
 import { act, cleanup, fireEvent, render } from "@testing-library/react";
+vi.unmock("./afterPaint");
 import App from "./App";
 import { initialState } from "./reducer";
 import { EMPTY_PANEL_TABLE } from "./keymap";
@@ -504,17 +505,27 @@ describe("card mode answers only an armed, fresh press with nothing after it", (
 
   it("a digit queued in a stall (pressed before the paint, handled after it) answers nothing", () => {
     const { container } = started();
+    let frame: FrameRequestCallback = () => {};
+    vi.stubGlobal("requestAnimationFrame", (run: FrameRequestCallback) => { frame = run; return 1; });
     altN();
+    wait(CARD_ARM_MS + 1_000);
     const pressed = Date.now();
+    wait(100);
+    act(() => frame!(performance.now()));
+    act(() => frame!(performance.now()));
     arm();
     const event = new KeyboardEvent("keydown", { key: "1", bubbles: true, cancelable: true });
-    Object.defineProperty(event, "timeStamp", { value: pressed + 5 });
+    Object.defineProperty(event, "timeStamp", { value: pressed });
     act(() => {
       root(container).dispatchEvent(event);
     });
     afterHalf();
     expect(answers()).toEqual([]);
     expect(band(container)).toBe(cardArmingFlash("1"));
+    arm();
+    press("1");
+    afterHalf();
+    expect(answers()).toHaveLength(1);
   });
 
   it("a digit followed within the after-half by any key answers nothing", () => {

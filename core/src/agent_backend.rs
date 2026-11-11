@@ -1729,6 +1729,31 @@ impl AgentBackend {
         approvals: &mut HumanApprovals,
         answered_for_you: &mut AnsweredForYou,
     ) -> RevisedDelivery {
+        self.take_revised_ui_delivery_after_answers(
+            project_root,
+            rules,
+            mode,
+            host_answered,
+            approvals,
+            &BTreeSet::new(),
+            answered_for_you,
+        )
+    }
+
+    /// [`Self::take_revised_ui_delivery`] for a caller whose user answers cards: `user_answered` are
+    /// the ids answered there, sends in flight included. Such a request is never held for another
+    /// approval and never reconsidered here, so nothing answers it a second time.
+    #[allow(clippy::too_many_arguments)]
+    pub fn take_revised_ui_delivery_after_answers(
+        &mut self,
+        project_root: &Path,
+        rules: &agent::PrefixRules,
+        mode: impl Into<GateMode>,
+        host_answered: &mut BTreeSet<String>,
+        approvals: &mut HumanApprovals,
+        user_answered: &BTreeSet<String>,
+        answered_for_you: &mut AnsweredForYou,
+    ) -> RevisedDelivery {
         let GateMode {
             mode,
             followed_out_of_auto,
@@ -1744,30 +1769,100 @@ impl AgentBackend {
             }
             AgentBackend::Conversation { conversation, .. } => conversation.take_revised_ui_delivery(),
         };
-        match delivery {
-            RevisedDelivery::Events(events) => {
-                let kept = self.answer_what_needs_no_human(
-                    events,
-                    project_root,
-                    AnswerContext {
-                        rules,
-                        mode,
-                        followed_out_of_auto,
-                        host_answered,
-                        approvals,
-                        answered_for_you,
-                    },
-                );
-                if kept.is_empty() {
-                    RevisedDelivery::Nothing
-                } else {
-                    RevisedDelivery::Events(kept)
+        // A prompt can precede the acknowledgement of the approval that covers it. Keep it
+        // pending, and reconsider it from canonical state after that send settles. A backend's
+        // resync may have dropped a turn boundary, so recorded approvals end with it; this is the
+        // only place they end on a resync.
+        let resync = matches!(delivery, RevisedDelivery::Resync);
+        if resync {
+            approvals.forget_recorded();
+        }
+        let (retry, waiting) = if !approvals.in_flight.is_empty() || !approvals.held.is_empty() {
+            let projection = self.projection();
+            approvals.held.retain(|id| !user_answered.contains(id));
+            for (id, p) in &projection.pending_permissions {
+                if !user_answered.contains(id) && approvals.holds(p, &projection.active_turn_id) {
+                    approvals.held.insert(id.clone());
                 }
             }
-            // A `Resync` carries no events to filter: the UI is about to rebuild from the
-            // projection instead. See `answer_what_needs_no_human`'s own note on the window that
-            // leaves open, and `TabSet::pump`'s own Resync arm for how bypass sweeps it.
-            other => other,
+            let waiting = approvals.held.clone();
+            let mut retry = Vec::new();
+            for id in std::mem::take(&mut approvals.held) {
+                let Some(p) = projection.pending_permissions.get(&id) else {
+                    continue;
+                };
+                if approvals.holds(p, &projection.active_turn_id) {
+                    approvals.held.insert(id);
+                    continue;
+                }
+                retry.push((
+                    projection.last_revision,
+                    AgentDomainEvent::PermissionRequested {
+                        permission_id: id,
+                        tool_use_id: p.tool_use_id.clone(),
+                        tool_name: p.tool_name.clone(),
+                        input: p.input.clone(),
+                        provider_prompt: p.provider_prompt.clone(),
+                    },
+                ));
+            }
+            (retry, waiting)
+        } else {
+            (Vec::new(), BTreeSet::new())
+        };
+        let retried: BTreeSet<String> = retry
+            .iter()
+            .filter_map(|(_, event)| match event {
+                AgentDomainEvent::PermissionRequested { permission_id, .. } => Some(permission_id.clone()),
+                _ => None,
+            })
+            .collect();
+        let mut events = match delivery {
+            RevisedDelivery::Events(events) => events,
+            _ => Vec::new(),
+        };
+        events.retain(|(_, event)| {
+            !matches!(event, AgentDomainEvent::PermissionRequested { permission_id, .. }
+            if waiting.contains(permission_id))
+        });
+        let mut all = retry;
+        all.extend(events);
+        let kept = self.answer_what_needs_no_human(
+            all,
+            project_root,
+            AnswerContext {
+                rules,
+                mode,
+                followed_out_of_auto,
+                host_answered,
+                approvals,
+                answered_for_you,
+            },
+        );
+        // Releasing a held card needs a snapshot: its fold revision may already have
+        // been covered by a snapshot which deliberately hid it. One answered here needs none.
+        let released = kept.iter().any(|(_, event)| {
+            matches!(event, AgentDomainEvent::PermissionRequested { permission_id, .. }
+                if retried.contains(permission_id))
+        });
+        // Such a snapshot replaces this batch, and the tab set ends a turn's approvals from the
+        // events it delivers: a turn end in the batch ends them here. Without one they are kept, as
+        // they still answer their own calls' prompts.
+        if released
+            && !resync
+            && kept.iter().any(|(_, event)| {
+                matches!(event, AgentDomainEvent::TurnCompleted { turn_id, .. } if turn_id != agent::NO_OPEN_TURN_ID)
+            })
+        {
+            approvals.forget_recorded();
+            approvals.forget_in_flight(&self.projection(), user_answered);
+        }
+        if resync || released {
+            RevisedDelivery::Resync
+        } else if kept.is_empty() {
+            RevisedDelivery::Nothing
+        } else {
+            RevisedDelivery::Events(kept)
         }
     }
 
@@ -2633,14 +2728,103 @@ fn decide(request: GateRequest<'_>, judge: Judge<'_>) -> Option<PlannedAnswer> {
 ///
 /// The input is kept whole rather than as a digest: the comparison is then exact (`Value` equality,
 /// which ignores object key order) with no canonical form to get wrong and no collision to argue
-/// about. The set is small and short-lived -- emptied at every turn end, every `Resync`, `r` and with
-/// the backend (`TabSet`).
+/// about. Recorded approvals expire at turn end, on a resync the backend reports and with the backend;
+/// a snapshot the host sends to show a released prompt keeps them. In-flight sends survive resync so
+/// their matching prompts can wait for the acknowledgement without being approved. A prompt they
+/// hide is kept in `held` until a drain reconsiders it, also once its send settles or its turn ends.
 #[derive(Debug, Default, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct HumanApprovals {
     calls: std::collections::BTreeMap<String, (String, serde_json::Value)>,
+    #[serde(skip)]
+    in_flight: std::collections::BTreeMap<String, InFlightApproval>,
+    #[serde(skip)]
+    held: BTreeSet<String>,
 }
 
+/// An approval whose acknowledgement is pending, by its card's permission id: the turn it was sent
+/// in, and the call's tool-use id, tool and input.
+type InFlightApproval = (Option<String>, String, String, serde_json::Value);
+
 impl HumanApprovals {
+    pub(crate) fn sending(
+        &mut self,
+        permission: &str,
+        turn: Option<String>,
+        call: &(String, String, serde_json::Value),
+    ) {
+        self.in_flight.insert(
+            permission.into(),
+            (turn, call.0.clone(), call.1.clone(), call.2.clone()),
+        );
+    }
+
+    /// The send for `permission` settled. Every pending prompt it could be hiding is kept in `held`
+    /// first, so the next drain reconsiders it and, when it is a card, shows it with a snapshot: a
+    /// snapshot may have left it out before any drain saw it, and its event is then covered.
+    /// `answered` are the ids the user answered on a card: their answer stands and they are never held.
+    pub(crate) fn finished(
+        &mut self,
+        permission: &str,
+        projection: Option<&agent::AgentSessionProjection>,
+        answered: &BTreeSet<String>,
+    ) {
+        if let Some(sent) = self.in_flight.remove(permission) {
+            if let Some(projection) = projection {
+                self.keep_what_could_hide(&[(permission.to_string(), sent)], projection, answered);
+            }
+        }
+    }
+
+    /// Every in-flight send is forgotten (the turn ended); what any of them could be hiding is kept in
+    /// `held` as [`Self::finished`] keeps it.
+    pub(crate) fn forget_in_flight(&mut self, projection: &agent::AgentSessionProjection, answered: &BTreeSet<String>) {
+        let sent: Vec<_> = std::mem::take(&mut self.in_flight).into_iter().collect();
+        self.keep_what_could_hide(&sent, projection, answered);
+    }
+
+    /// The turn is not compared: a snapshot taken while the send's turn ran may have hidden the prompt
+    /// before that turn ended.
+    fn keep_what_could_hide(
+        &mut self,
+        sent: &[(String, InFlightApproval)],
+        projection: &agent::AgentSessionProjection,
+        answered: &BTreeSet<String>,
+    ) {
+        for (id, p) in &projection.pending_permissions {
+            if !answered.contains(id)
+                && Self::holdable(p)
+                && sent
+                    .iter()
+                    .any(|(perm, (_, call, tool, input))| perm != id && Self::same_call(p, call, tool, input))
+            {
+                self.held.insert(id.clone());
+            }
+        }
+    }
+
+    /// Whether the in-flight approval of another card covers `p`, a CLI prompt that can wait for it.
+    /// The card being answered never holds itself: its own send is no reason to hide it.
+    pub(crate) fn holds(&self, p: &agent::PermissionRequestRecord, turn: &Option<String>) -> bool {
+        Self::holdable(p)
+            && self.in_flight.iter().any(|(perm, (sent_turn, call, tool, input))| {
+                perm != &p.permission_id && sent_turn == turn && Self::same_call(p, call, tool, input)
+            })
+    }
+
+    fn holdable(p: &agent::PermissionRequestRecord) -> bool {
+        p.provider_prompt
+            .as_ref()
+            .is_some_and(|prompt| !prompt.needs_its_own_card())
+    }
+
+    fn same_call(p: &agent::PermissionRequestRecord, call: &str, tool: &str, input: &serde_json::Value) -> bool {
+        p.tool_use_id.as_deref() == Some(call) && p.tool_name == tool && &p.input == input
+    }
+
+    pub(crate) fn held_ids(&self) -> impl Iterator<Item = &String> {
+        self.held.iter()
+    }
+
     /// The user approved `tool_name` with `input` for the call `tool_use_id`. An empty id is no link
     /// to anything and is never recorded.
     pub fn record(&mut self, tool_use_id: &str, tool_name: &str, input: &serde_json::Value) {
@@ -2668,8 +2852,17 @@ impl HumanApprovals {
         self.calls.contains_key(tool_use_id)
     }
 
+    pub(crate) fn forget_recorded(&mut self) {
+        self.calls.clear();
+    }
+
+    /// Forgets approvals and in-flight matches, for tests only: production drops in-flight entries
+    /// through `finished` and `forget_in_flight`, which first keep in `held` every prompt an entry
+    /// could hide, so no hidden request is left pending without a drain to release it.
+    #[cfg(test)]
     pub fn clear(&mut self) {
         self.calls.clear();
+        self.in_flight.clear();
     }
 
     pub fn is_empty(&self) -> bool {

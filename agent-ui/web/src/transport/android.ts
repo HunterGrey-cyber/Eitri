@@ -12,6 +12,7 @@ declare global {
 }
 
 export function androidTransport(host: AndroidHost): Transport {
+  const prefix = Array.from(crypto.getRandomValues(new Uint32Array(4)), (word) => word.toString(16).padStart(8, "0")).join("");
   let counter = 0;
   return {
     name: "android",
@@ -24,7 +25,7 @@ export function androidTransport(host: AndroidHost): Transport {
       };
     },
     nextId(kind) {
-      return `a-${kind}-${++counter}`;
+      return `a-${kind}-${prefix}-${++counter}`;
     },
   };
 }

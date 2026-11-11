@@ -417,7 +417,10 @@ struct BuiltSnapshot {
 /// otherwise the turns it keeps are copied while the projection is held, and serialized from the copy after.
 fn observer_snapshot(tab: &Tab) -> Option<BuiltSnapshot> {
     let backend = tab.live()?;
-    let view = SnapshotView::of(backend, &tab.session.host_answered);
+    let hidden;
+    let mut view = SnapshotView::of(backend, &tab.session.host_answered);
+    hidden = tab.session.hidden_permissions(&view.projection);
+    view.hidden_pending = Some(&hidden);
     // The clock as the last tick left it, and only for the turn this very snapshot names: a clock from the turn
     // before would be taken as this one's start.
     let started_at = tab
@@ -545,7 +548,10 @@ fn observer_page(tab: &Tab, before_turn: u64, limit: usize, watermark: u64) -> P
     let Some(backend) = tab.live() else {
         return PageRead::None;
     };
-    let view = SnapshotView::of(backend, &tab.session.host_answered);
+    let hidden;
+    let mut view = SnapshotView::of(backend, &tab.session.host_answered);
+    hidden = tab.session.hidden_permissions(&view.projection);
+    view.hidden_pending = Some(&hidden);
     let mark = WorkMark {
         generation: tab.backend_generation,
         unseen: tab.unseen_stretch_at(view.projection.last_revision),

@@ -195,14 +195,22 @@ pub(super) struct PendingPermissionSend {
     view: ViewId,
     request_id: String,
     send: eitri_core::tab_set::PermissionSend,
+    orphaned: bool,
 }
 
 /// Completes pending permission replies on their original pages and restores refused cards.
 pub(super) fn poll_permission_sends(state: &mut AgentPanelState, out: &mut Outbox) {
+    let mut refresh = Vec::new();
     state.permission_sends.retain(|pending| {
         let Some(reply) = state.tabs.finish_card_answer(pending.tab, &pending.send) else {
             return true;
         };
+        if pending.orphaned {
+            if reply.is_err() {
+                refresh.push(pending.tab);
+            }
+            return false;
+        }
         if let Err(error) = &reply {
             eprintln!("[agent_panel] permission answer: {}", error.message);
             if let Some(tab) = state.tabs.get(pending.tab) {
@@ -221,6 +229,13 @@ pub(super) fn poll_permission_sends(state: &mut AgentPanelState, out: &mut Outbo
         );
         false
     });
+    for tab in refresh {
+        if let Some(view) = state.page_of(tab) {
+            for payload in state.tabs.refresh_payloads(tab) {
+                out.send(view, payload);
+            }
+        }
+    }
 }
 
 /// Applies one command's outcome to its tab and the frontend, uniformly.
@@ -237,6 +252,7 @@ pub(super) struct PendingQuestionSend {
     view: ViewId,
     request_id: String,
     send: eitri_core::agent_backend::QuestionSend,
+    orphaned: bool,
 }
 
 /// A `question_answer` or `question_decline` taken by the tab's session: refused at once, the page is
@@ -256,6 +272,7 @@ fn question_sent(
             view,
             request_id: request_id.to_string(),
             send,
+            orphaned: false,
         }),
         Err(error) => apply_command_outcome(state, screen, view, tab, request_id, Err(error), out),
     }
@@ -268,12 +285,19 @@ pub(super) fn poll_question_sends(state: &mut AgentPanelState, out: &mut Outbox)
     if state.question_sends.is_empty() {
         return;
     }
+    let mut refresh = Vec::new();
     let AgentPanelState {
         question_sends, tabs, ..
     } = state;
     question_sends.retain(|pending| match tabs.finish_question_send(pending.tab, &pending.send) {
         None => true,
         Some(reply) => {
+            if pending.orphaned {
+                if reply.is_err() {
+                    refresh.push(pending.tab);
+                }
+                return false;
+            }
             if let Err(error) = &reply {
                 eprintln!(
                     "[agent_panel] tab {}: answer not taken (session stays alive): {}",
@@ -288,6 +312,13 @@ pub(super) fn poll_question_sends(state: &mut AgentPanelState, out: &mut Outbox)
             false
         }
     });
+    for tab in refresh {
+        if let Some(view) = state.page_of(tab) {
+            for payload in state.tabs.refresh_payloads(tab) {
+                out.send(view, payload);
+            }
+        }
+    }
 }
 
 pub(super) fn apply_command_outcome(
@@ -595,6 +626,12 @@ pub(super) fn handle_inbound_message(
 
     match message {
         InboundMessage::Ready { .. } => {
+            for pending in &mut state.permission_sends {
+                pending.orphaned |= pending.view == view;
+            }
+            for pending in &mut state.question_sends {
+                pending.orphaned |= pending.view == view;
+            }
             // A held message of the document that was here answers a page that is gone.
             super::mentions::drop_view(state, view, &mut out);
             super::symbol_lookup::drop_view(state, view);
@@ -1019,6 +1056,7 @@ pub(super) fn handle_inbound_message(
                         view,
                         request_id: request_id.clone(),
                         send,
+                        orphaned: false,
                     });
                     poll_permission_sends(state, &mut out);
                 }
@@ -2119,6 +2157,161 @@ mod tests {
         });
         assert_eq!(result_for(&page.sent.borrow(), "same"), Some(Ok(())));
         handle.state.borrow_mut().scratch.take().unwrap().cleanup();
+    }
+
+    #[test]
+    fn reload_orphans_a_question_reply_but_still_restores_a_refused_answer() {
+        agent::state_dirs::redirect_state_to_a_test_root();
+        let dir = agent::state_dirs::test_repository_dir("reload-held-question");
+        let (handle, page, _) = handle_with_two_pages();
+        let (tab, provider) = live_tab(&handle, &dir);
+        provider.queue(agent::AgentDomainEvent::QuestionAsked {
+            interaction_id: "q1".into(),
+            tool_use_id: Some("call".into()),
+            questions: vec![agent::QuestionSpec {
+                question: "Which?".into(),
+                header: "Pick".into(),
+                multi_select: false,
+                options: ["One", "Two"]
+                    .map(|label| agent::QuestionOptionSpec {
+                        label: label.into(),
+                        description: String::new(),
+                        preview: None,
+                    })
+                    .to_vec(),
+            }],
+            unsupported_reason: None,
+        });
+        tick_handle_until(&handle, "the question", || {
+            handle
+                .state
+                .borrow()
+                .tabs
+                .get(tab)
+                .unwrap()
+                .live()
+                .unwrap()
+                .projection()
+                .questions
+                .iter()
+                .any(|q| q.interaction_id == "q1")
+        });
+        provider.hold_interaction_replies(true);
+        handle.page_message(
+            ViewId::BASE,
+            &serde_json::json!({
+                "type": "question_answer", "request_id": "old-question", "tab": tab.0,
+                "interaction_id": "q1", "answers": [{"question_index": 0, "option_indexes": [1]}]
+            })
+            .to_string(),
+        );
+        assert_eq!(provider.interactions().len(), 1);
+        // The old document's last mirror: the host's copy, which the new one gets on its `ready` and
+        // types on from.
+        handle.page_message(
+            ViewId::BASE,
+            &serde_json::json!({ "type": "draft", "request_id": "old-draft", "tab": tab.0, "text": "before" })
+                .to_string(),
+        );
+        handle.page_message(ViewId::BASE, READY);
+        provider.reply_to_held_interactions(|| Err(agent::ProviderError::Timeout));
+        let before = page.sent.borrow().len();
+        handle.tick();
+        assert_eq!(result_for(&page.sent.borrow(), "old-question"), None);
+        let fresh: Vec<serde_json::Value> = page.sent.borrow()[before..].iter().map(|p| json_of(p)).collect();
+        assert!(
+            fresh
+                .iter()
+                .any(|v| v["kind"] == "snapshot" && v["state"]["questions"][0]["state"]["kind"] == "waiting"),
+            "the new document is shown the question waiting again: {fresh:?}"
+        );
+        assert!(
+            !fresh.iter().any(|v| v["kind"] == "draft"),
+            "but not the host's draft, older than what the new document's box may hold: {fresh:?}"
+        );
+        let state = handle.state.borrow();
+        assert!(state.question_sends.is_empty());
+        assert_eq!(
+            state.tabs.get(tab).unwrap().live().unwrap().projection().questions[0].state,
+            agent::QuestionState::Waiting
+        );
+        drop(state);
+        shut_down_every_tab(&handle);
+    }
+
+    #[test]
+    fn reload_orphans_a_permission_reply_but_still_settles_the_host() {
+        agent::state_dirs::redirect_state_to_a_test_root();
+        let dir = agent::state_dirs::test_repository_dir("reload-held-permission");
+        for succeeds in [true, false] {
+            let (handle, page, _) = handle_with_two_pages();
+            let (tab, provider) = live_tab(&handle, &dir);
+            provider.queue(agent::AgentDomainEvent::PermissionRequested {
+                permission_id: "reload-card".into(),
+                tool_use_id: Some("call".into()),
+                tool_name: "Bash".into(),
+                input: serde_json::json!({"command": "git push origin main"}),
+                provider_prompt: None,
+            });
+            tick_handle_until(&handle, "the card", || {
+                handle
+                    .state
+                    .borrow()
+                    .tabs
+                    .get(tab)
+                    .unwrap()
+                    .card_is_waiting("reload-card")
+            });
+            provider.hold_permission_replies();
+            handle.page_message(
+                ViewId::BASE,
+                &serde_json::json!({
+                    "type": "permission_response", "request_id": "old-document", "tab": tab.0,
+                    "permission_id": "reload-card", "decision": "allow"
+                })
+                .to_string(),
+            );
+            handle.page_message(
+                ViewId::BASE,
+                &serde_json::json!({ "type": "draft", "request_id": "old-draft", "tab": tab.0, "text": "before" })
+                    .to_string(),
+            );
+            handle.page_message(ViewId::BASE, READY);
+            provider.reply_to_held_permissions(if succeeds {
+                Ok(None)
+            } else {
+                Err(agent::ProviderError::Timeout)
+            });
+            let before = page.sent.borrow().len();
+            handle.tick();
+            assert_eq!(result_for(&page.sent.borrow(), "old-document"), None);
+            if !succeeds {
+                let fresh: Vec<serde_json::Value> = page.sent.borrow()[before..].iter().map(|p| json_of(p)).collect();
+                assert!(
+                    fresh.iter().any(|v| v["kind"] == "snapshot"
+                        && v["state"]["pendingPermissions"]
+                            .as_array()
+                            .is_some_and(|cards| cards.iter().any(|card| card["permissionId"] == "reload-card"))),
+                    "the new document is shown the card again: {fresh:?}"
+                );
+                assert!(
+                    fresh.iter().any(|v| v["kind"] == "rule_offers"),
+                    "and its rule offer: {fresh:?}"
+                );
+                assert!(
+                    !fresh.iter().any(|v| v["kind"] == "draft"),
+                    "but not the host's draft, older than what the new document's box may hold: {fresh:?}"
+                );
+            }
+            let state = handle.state.borrow();
+            assert!(
+                state.permission_sends.is_empty(),
+                "the send and its guard were collected"
+            );
+            assert_eq!(state.tabs.get(tab).unwrap().card_is_waiting("reload-card"), !succeeds);
+            drop(state);
+            shut_down_every_tab(&handle);
+        }
     }
 
     #[test]
