@@ -117,19 +117,23 @@ export function pathsIn(item: TimelineItem): PathRef[] {
   }
 }
 
-/** `Ctrl+g` in BROWSE: the row's whole text, never the cut one, and a title for the buffer. */
-export function fenced(text: string): string {
+/** A closed Markdown code fence retaining its text and optional language verbatim. */
+export function fenced(text: string, lang = ""): string {
+  const marker = lang.includes("`") ? "~" : "`";
   // A loop, not a spread into `Math.max`: an output with a few hundred thousand backtick runs would overflow it.
   let longest = 0;
   let run = 0;
   for (let at = 0; at < text.length; at++) {
-    run = text.charCodeAt(at) === 96 ? run + 1 : 0;
+    run = text[at] === marker ? run + 1 : 0;
     if (run > longest) longest = run;
   }
-  const fence = "`".repeat(Math.max(3, longest + 1));
-  return `${fence}\n${text}\n${fence}`;
+  const fence = marker.repeat(Math.max(3, longest + 1));
+  // A label that begins with the fence character would read as more fence, so it is set apart by a space.
+  const label = lang.startsWith(marker) ? ` ${lang}` : lang;
+  return `${fence}${label}\n${text}\n${fence}`;
 }
 
+/** `Ctrl+g` in BROWSE: the row's whole text, never the cut one, and a title for the buffer. */
 export function viewText(item: TimelineItem): { title: string; text: string } {
   switch (item.kind) {
     case "prompt":

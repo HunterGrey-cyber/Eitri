@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { buildIndex, lastLineAtOrBefore, lastTopAtOrBefore, measure, type Measured } from "./lineindex";
 
 const el = () => document.createElement("div");
@@ -55,6 +55,35 @@ describe("measure", () => {
     node.getBoundingClientRect = () =>
       ({ top, height, bottom: top + height, left: 0, right: 100, width: 100, x: 0, y: top, toJSON: () => ({}) }) as DOMRect;
   }
+
+  it("indexes a separate raw-HTML summary inside closed details by its range, keeping hidden content out", () => {
+    const root = document.createElement("main");
+    root.innerHTML = '<details>' +
+      '<div class="code-line" data-line="2" data-line-end="3" data-eitri-html="start:1"></div>' +
+      '<summary>Visible title</summary><span data-eitri-html="end:1"></span>' +
+      '<div class="code-line" data-line="4" data-line-end="5" data-eitri-html="start:2"></div>' +
+      '<p>Hidden content</p><span data-eitri-html="end:2"></span>' +
+      '<p class="code-line" data-line="6" data-line-end="7">Also hidden</p></details>';
+    const [summaryMarker, hiddenMarker, hidden] = [...root.querySelectorAll(".code-line")];
+    place(summaryMarker, 0, 0);
+    place(hiddenMarker, 0, 0);
+    // A regular element still uses the closed-details check even if it reports a box.
+    place(hidden, 10, 20);
+    const createRange = document.createRange.bind(document);
+    const spy = vi.spyOn(document, "createRange").mockImplementation(() => {
+      const range = createRange();
+      range.getClientRects = () => (range.startOffset === 1
+        ? [{ top: 40, bottom: 64, height: 24 }] : []) as unknown as DOMRectList;
+      return range;
+    });
+    try {
+      const measured = measure(root, 100);
+      expect(measured.map((m) => m.visible)).toEqual([true, false, false]);
+      expect(buildIndex(measured)).toEqual([{ line: 2, end: 3, top: 140, height: 24, el: summaryMarker }]);
+    } finally {
+      spy.mockRestore();
+    }
+  });
   it("reads every tagged element's lines and document position, and marks containers and hidden ones", () => {
     const root = document.createElement("main");
     root.innerHTML = [

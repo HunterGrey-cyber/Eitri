@@ -58,7 +58,7 @@ export function yankObject(item: TimelineItem, scope: "i" | "a", object: YankObj
     case "`":
       if (ctx.codeBlocks.length === 0) return wrong("code block");
       return choose(ctx.codeBlocks.map(({ code, lang }, i) => ({ label: `code block ${i + 1}${lang ? ` (${lang})` : ""}`,
-        text: scope === "i" ? code : fenced(code).replace("\n", `${lang ?? ""}\n`) })));
+        text: scope === "i" ? code : fenced(code, lang ?? "") })));
     case "f": {
       const paths = pathsIn(item);
       const entries = paths.map((ref) => ({ label: `${ref.path}${ref.line === null ? "" : `:${ref.line}`}`,

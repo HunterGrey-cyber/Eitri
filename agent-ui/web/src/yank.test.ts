@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { marked } from "marked";
 import { toolInput, yankObject, yankRows, type YankObject } from "./yank";
 import type { TimelineItem } from "./timeline";
 
@@ -47,6 +48,29 @@ it("copies code verbatim or fenced with language and a fence longer than any int
 
 it("offers two code blocks", () => {
   expect(yank(reply, "i", "`", { codeBlocks: [{ code: "a", lang: "rust" }, { code: "b", lang: null }] })).toEqual({ pick: [{ label: "code block 1 (rust)", text: "a" }, { label: "code block 2", text: "b" }] });
+});
+
+it.each(["sh`", "$'", "$&", "$`"])("copies a literal code label %s in a valid fence", (lang) => {
+  const code = "# heading\n````\n~~~~~\nbody";
+  const result = yank(reply, "a", "`", { codeBlocks: [{ code, lang }] });
+  const marker = lang.includes("`") ? "~" : "`";
+  const fence = marker.repeat(marker === "~" ? 6 : 5);
+  expect(result).toEqual({ text: `${fence}${lang}\n${code}\n${fence}` });
+  if (!("text" in result)) throw new Error("expected one code block");
+  const tokens = marked.lexer(result.text);
+  expect(tokens).toHaveLength(1);
+  expect(tokens[0]).toMatchObject({ type: "code", lang, text: code });
+  expect(yank(reply, "i", "`", { codeBlocks: [{ code, lang }] })).toEqual({ text: code });
+});
+
+it.each(["~sh`", "`sh`", "~"])("keeps a label %s that begins with the fence character out of the fence", (lang) => {
+  const code = "body\n~~~~";
+  const result = yank(reply, "a", "`", { codeBlocks: [{ code, lang }] });
+  if (!("text" in result)) throw new Error("expected one code block");
+  const tokens = marked.lexer(`${result.text}\n\nafter`);
+  expect(tokens.filter((t) => t.type === "code")).toHaveLength(1);
+  expect(tokens[0]).toMatchObject({ type: "code", lang, text: code });
+  expect(tokens.some((t) => t.type === "paragraph" && t.text === "after")).toBe(true);
 });
 
 it("copies paths with optional line numbers, URLs, and offers distinct paths", () => {

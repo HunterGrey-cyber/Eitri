@@ -1,7 +1,7 @@
 import { marked } from "marked";
 import { outputText } from "./copyText";
 import { fenced, pathsIn } from "./paths";
-import { noticeText, wakeText, type TimelineItem } from "./timeline";
+import { noticeBody, noticeText, wakeText, type TimelineItem } from "./timeline";
 import { turnEndingText } from "./turnEnding";
 import { toolInput } from "./yank";
 import type { HistoryNotice, SubagentStream, ToolCallRecord } from "./types";
@@ -60,7 +60,11 @@ function tool(call: ToolCallRecord, options: ExportOptions): string {
   const item: TimelineItem = { kind: "tool", seq: call.seq, key: `t-${call.seq}`, call };
   const output = outputText(item);
   const block = fenced(provenance(`${call.name}: ${toolInput(call.name, call.input)}${output === null ? "" : `\n${output}`}`));
-  const paths = pathsIn(item).map(({ path, line }) => closeOpenBlocks(provenance(`${path}${line === null ? "" : `:${line}`}`)));
+  const paths = pathsIn(item).map(({ path, line }) => {
+    const text = provenance(`${path}${line === null ? "" : `:${line}`}`);
+    // Tool path fields have no length limit. Keep long ones as plain text so inline parsing cannot stall export.
+    return text.length > 4096 ? fenced(text) : closeOpenBlocks(text);
+  });
   const nested = call.children ? children(call.children, options) : "";
   return [block, ...paths, nested].filter(Boolean).join("\n\n");
 }
@@ -82,9 +86,11 @@ function renderItem(item: TimelineItem, options: ExportOptions): string {
     case "ending":
       return quote(provenance(turnEndingText(item.ending, item.ending.resetsAt ?? null)));
     case "notice":
-      return quote(provenance(noticeText(item.notice)));
-    case "wake":
-      return quote(provenance(wakeText(item)));
+    case "wake": {
+      const text = item.kind === "notice" ? noticeText(item.notice) : wakeText(item);
+      const body = item.kind === "notice" ? noticeBody(item.notice) : item.body;
+      return [text, ...(body && body !== text ? [body] : [])].map((part) => quote(provenance(part))).join("\n\n");
+    }
     case "thinking":
       return "";
   }

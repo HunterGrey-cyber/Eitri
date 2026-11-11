@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { marked } from "marked";
 import { exportConversation } from "./scratchExport";
 import type { TimelineItem } from "./timeline";
@@ -158,6 +158,38 @@ describe("exportConversation", () => {
       .toBe("```\nRead: src/a.rs\nok\n```\n\nsrc/a.rs");
   });
 
+  it("bounds lexer work for a tenfold increase in pathological tool-path whitespace", () => {
+    const lexer = marked.lexer;
+    const lengths: number[] = [];
+    const spy = vi.spyOn(marked, "lexer").mockImplementation((source, config) => {
+      lengths.push(source.length);
+      // Count unsafe inputs without running the quadratic inline rule in the failing version.
+      return source.length > 4096 ? [] as unknown as ReturnType<typeof lexer> : lexer(source, config);
+    });
+    try {
+      const work = (spaces: number) => {
+        lengths.length = 0;
+        const path = "[x](" + " ".repeat(spaces);
+        const text = exportConversation([prompt(0, "read"), tool(call(1, "Read", { file_path: path }))], options);
+        const cost = lengths.reduce((sum, length) => sum + length, 0);
+        return { text, path, cost, lengths: [...lengths] };
+      };
+      const small = work(5_000);
+      const large = work(50_000);
+      expect(small.cost).toBeGreaterThan(0);
+      expect(large.cost).toBeLessThanOrEqual(small.cost);
+      expect([...small.lengths, ...large.lengths].every((length) => length <= 4096)).toBe(true);
+      expect(large.text).toContain(`\n\n\`\`\`\n${large.path}\n\`\`\``);
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
+  it.each(["````open", "<!-- open", "<pre>open"])("keeps the next prompt outside a path's open block: %s", (path) => {
+    const text = exportConversation([tool(call(0, "Read", { file_path: path })), prompt(1, "next")], options);
+    expect(markedHeadings(text)).toEqual(["▍You · prompt 1/1"]);
+  });
+
   it("orders children after their call, merges their stream by sequence, and nests grandchildren", () => {
     const parent = call(0, "Agent", {});
     const nested = call(1, "Agent", {});
@@ -184,6 +216,29 @@ describe("exportConversation", () => {
       { kind: "thinking", seq: 3, key: "k", block: { seq: 3, turnId: "t", text: "private thought" }, open: false },
     ];
     expect(exportConversation(items, options)).toBe("> interrupted\n\n> notice\n\n> wake ×2");
+  });
+
+  it("exports compaction summaries and wake bodies as provenance-encoded quotations", () => {
+    const items: TimelineItem[] = [
+      { kind: "notice", seq: 0, key: "n", notice: { seq: 0, kind: "compaction", content: "summary ▍\nretained context",
+        scalars: {}, level: "info", taskId: null, toolUseId: null, taskStatus: null } },
+      { kind: "wake", seq: 1, key: "w", text: "peer ▍", body: "report ▍\nsecond line", scheduled: false, count: 1 },
+    ];
+    expect(exportConversation(items, options)).toBe(
+      "> ──── Conversation compacted ────\n\n> summary &#x258D;\n> retained context\n\n> peer &#x258D;\n\n> report &#x258D;\n> second line",
+    );
+  });
+
+  it("exports a long shell notice and a wake's repeated body only once", () => {
+    const content = Array.from({ length: 20 }, (_, i) => `output ${i} ▍`).join("\n");
+    const items: TimelineItem[] = [
+      { kind: "notice", seq: 0, key: "n", notice: { seq: 0, kind: "shell_output", content,
+        scalars: {}, level: "info", taskId: null, toolUseId: null, taskStatus: null } },
+      { kind: "wake", seq: 1, key: "w", text: "wake", body: "wake", scheduled: false, count: 1 },
+    ];
+    expect(exportConversation(items, options)).toBe(
+      content.replace(/▍/g, "&#x258D;").split("\n").map((line) => `> ${line}`).join("\n") + "\n\n> wake",
+    );
   });
 
   it("drops whole oldest turns, including their delivered prompts, while keeping original ordinals", () => {

@@ -99,9 +99,10 @@ export function measure(root: Element, scrollY: number): Measured[] {
       first = line + 1;
       end = line + 1 + code;
     }
+    // A raw-HTML range can show a summary while its preceding marker is hidden inside closed details.
     const m: Measured = {
       el, line: first, end, top, height,
-      visible: height > 0 && !inClosedDetails(el, root), hasTaggedVisibleDescendant: false,
+      visible: height > 0 && (htmlBoxes.has(el) || !inClosedDetails(el, root)), hasTaggedVisibleDescendant: false,
     };
     out.push(m);
     byEl.set(el, m);
