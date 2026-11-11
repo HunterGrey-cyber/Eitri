@@ -968,7 +968,8 @@ mod tests {
             }
         }
         /// Answers every collect pending until the budget's last one, which finds `last` (a server still out).
-        fn hold_to_the_end(&mut self, last: serde_json::Value) {
+        /// Returns the milliseconds after the request at which the reply came.
+        fn hold_to_the_end(&mut self, last: serde_json::Value) -> u64 {
             let mut ms = 0;
             while self.reply.is_none() {
                 ms += 50;
@@ -988,6 +989,7 @@ mod tests {
                     self.settle();
                 }
             }
+            ms
         }
         fn matches(&self) -> Vec<(String, u32, &'static str)> {
             match self.reply.as_ref().expect("a reply") {
@@ -1354,6 +1356,19 @@ mod tests {
     }
 
     #[test]
+    fn a_held_lookup_replies_within_the_budget_and_its_grace() {
+        let root = project("gd-held-clock", &[("src/lib.rs", "fn effective() {}\n")]);
+        let mut run = Run::new(&root, "effective", None);
+        run.settle();
+        run.rpc.answer(started(&["pyright"], &[]));
+        run.at(0);
+        let ms = run.hold_to_the_end(done("workspace_symbols", vec![], &["workspace_symbols"]));
+        // The loop steps the injected clock by 50 ms.
+        let latest = (BUDGET + GRACE).as_millis() as u64 + 50;
+        assert!(ms <= latest, "replied {ms} ms after the request, past {latest}");
+    }
+
+    #[test]
     fn a_server_reporting_work_that_answers_empty_to_the_end_is_indexing_not_no_symbol() {
         let root = project("gd-busy-empty", &[("a.ts", "x\n")]);
         let mut run = Run::new(&root, "Missing", None);
@@ -1586,9 +1601,13 @@ mod tests {
     /// ```
     ///
     /// Either variable may be left out to skip that server. It prints one line per lookup and asserts only what holds
-    /// whatever the machine's load: every reply within the budget and its grace, and the warm answers' places.
+    /// whatever the machine's load: the warm answers' places, and that no reply hangs (a generous multiple of the
+    /// budget; the budget and its grace themselves are held by the injected-clock tests above).
+    ///
+    /// The real-nvim gate (`tools/real-nvim-gate.sh`) leaves this and the next test out on purpose: they need the
+    /// variables, so they are run by name.
     #[test]
-    #[ignore = "needs nvim, gopls and/or rust-analyzer; spends no tokens and needs no display"]
+    #[ignore = "run by name with EITRI_GD_E2E_GOPLS and/or EITRI_GD_E2E_RUST_ANALYZER set (see the doc comment); drives a headless Neovim and the real servers; spends no tokens and needs no display"]
     fn gd_against_real_servers() {
         let gopls = std::env::var_os("EITRI_GD_E2E_GOPLS").map(PathBuf::from);
         let analyzer = std::env::var_os("EITRI_GD_E2E_RUST_ANALYZER").map(PathBuf::from);
@@ -1710,7 +1729,7 @@ mod tests {
     ///   cargo test -p eitri-panel -- --ignored gd_against_rust_analyzer_loading --nocapture
     /// ```
     #[test]
-    #[ignore = "needs nvim, rust-analyzer and a large Rust checkout; spends no tokens and needs no display"]
+    #[ignore = "run by name with EITRI_GD_E2E_RUST_ANALYZER and EITRI_GD_E2E_RUST_PROJECT set (see the doc comment); drives a headless Neovim and rust-analyzer on a large Rust checkout; spends no tokens and needs no display"]
     fn gd_against_rust_analyzer_loading() {
         let analyzer =
             PathBuf::from(std::env::var_os("EITRI_GD_E2E_RUST_ANALYZER").expect("EITRI_GD_E2E_RUST_ANALYZER"));
@@ -1743,12 +1762,44 @@ mod tests {
         editor.stop();
     }
 
+    /// A directory only this fixture uses, removed (recursively) when dropped, so a failing run leaves none behind.
+    struct OwnDir(PathBuf);
+
+    impl OwnDir {
+        /// Short, so the socket inside it binds under a long `TMPDIR`, and private to this user.
+        fn new() -> OwnDir {
+            let id = &uuid::Uuid::new_v4().simple().to_string()[..12];
+            let dir = agent::state_dirs::test_temp_dir().join(format!("gd{id}"));
+            agent::private_fs::create_private_dir_all(&dir, &dir).expect("a private directory for the editor socket");
+            OwnDir(dir)
+        }
+    }
+
+    impl Drop for OwnDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// The `nvim` child this fixture started; killed and reaped when dropped, whatever stage the fixture got to.
+    /// Declared after the directory it listens in, so the directory goes last.
+    struct NvimProcess {
+        child: std::process::Child,
+        _dir: OwnDir,
+    }
+
+    impl Drop for NvimProcess {
+        fn drop(&mut self) {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
+    }
+
     /// A headless `nvim --clean` on a socket, with one language server started on one file of a fixture.
     struct RealEditor {
-        child: std::process::Child,
         link: eitri_core::nvim_rpc::NvimLink,
         _events: mpsc::Receiver<eitri_core::nvim_rpc::LinkEvent>,
-        socket: PathBuf,
+        process: NvimProcess,
         sequencer: RefCell<Sequencer>,
         asks: RefCell<u64>,
         workers: Arc<AtomicUsize>,
@@ -1769,8 +1820,8 @@ mod tests {
         /// workspace load is what a lookup meets; a whole-workspace `cargo check` is load nobody needs here).
         fn start(root: &Path, file: &str, filetype: &str, name: &str, server: &Path, own_tree: bool) -> RealEditor {
             let home = agent::state_dirs::test_workspace_dir("gd-e2e-home");
-            let socket = std::env::temp_dir().join(format!("gd-{}-{}.sock", std::process::id(), name.len()));
-            let _ = std::fs::remove_file(&socket);
+            let dir = OwnDir::new();
+            let socket = agent::socket_path::in_dir(&dir.0, "nvim.sock").expect("a short socket path");
             let child = std::process::Command::new("nvim")
                 .args(["--headless", "--clean", "--listen"])
                 .arg(&socket)
@@ -1792,6 +1843,7 @@ mod tests {
                 .stderr(std::process::Stdio::null())
                 .spawn()
                 .expect("nvim on PATH");
+            let process = NvimProcess { child, _dir: dir };
             let deadline = Instant::now() + Duration::from_secs(10);
             while !socket.exists() {
                 assert!(Instant::now() < deadline, "nvim did not listen");
@@ -1800,10 +1852,9 @@ mod tests {
             let (link, events) =
                 eitri_core::nvim_rpc::NvimLink::connect(&socket, Duration::from_secs(5)).expect("connect to nvim");
             let editor = RealEditor {
-                child,
                 link,
                 _events: events,
-                socket,
+                process,
                 sequencer: RefCell::new(Sequencer::new("gd-e2e".into())),
                 asks: RefCell::new(0),
                 workers: Arc::default(),
@@ -1865,10 +1916,10 @@ mod tests {
                 };
                 if let Some(reply) = lookup.poll(&mut cx) {
                     let took = started.elapsed();
-                    assert!(
-                        took <= BUDGET + GRACE + Duration::from_millis(200),
-                        "{name} took {took:?}"
-                    );
+                    // Only a hang guard: a loaded machine may run well past the budget, and the budget itself is
+                    // held by the injected-clock tests.
+                    assert!(took <= BUDGET * 3, "{name} took {took:?}");
+                    eprintln!("gd-e2e {name}: replied after {} ms", took.as_millis());
                     return (took, reply);
                 }
                 drop((sequencer, asks));
@@ -1888,7 +1939,8 @@ mod tests {
             eprintln!("gd-e2e {server} {phase} {name}: {} ms -> {said}", got.0.as_millis());
         }
 
-        fn stop(mut self) {
+        /// Stops the servers and waits for them to be gone; the nvim and its directory go when `self` drops.
+        fn stop(self) {
             settled(self.link.exec_lua(E2E_STOP, vec![]).wait(Duration::from_secs(10)));
             let deadline = Instant::now() + Duration::from_secs(5);
             while settled(self.link.exec_lua(E2E_LEFT, vec![]).wait(Duration::from_secs(10))).as_u64() != Some(0)
@@ -1896,9 +1948,14 @@ mod tests {
             {
                 std::thread::sleep(Duration::from_millis(50));
             }
-            let _ = self.child.kill();
-            let _ = self.child.wait();
-            let _ = std::fs::remove_file(&self.socket);
+        }
+    }
+
+    impl Drop for RealEditor {
+        /// A failed run: ask the servers to stop (they are nvim's children, and killing nvim outright can leave
+        /// them behind), briefly, then `process` kills nvim and removes its directory.
+        fn drop(&mut self) {
+            let _ = self.link.exec_lua(E2E_STOP, vec![]).wait(Duration::from_secs(2));
         }
     }
 

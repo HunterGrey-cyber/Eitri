@@ -11,7 +11,7 @@ use eitri_core::companion::{
 use eitri_core::takeover::glue::{CommandsPart, TakeoverParts, TmuxSwap};
 use embed_nvim::EmbedNvim;
 use rmpv::Value;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 fn parts() -> TakeoverParts {
     let absent = std::env::temp_dir().join(format!("takeover-{}", &uuid::Uuid::new_v4().simple().to_string()[..16]));
@@ -1245,14 +1245,37 @@ struct UninstalledRoom {
     dir: Option<eitri_core::takeover::room::RoomDir>,
     pid: u32,
     start: Option<u64>,
-    scratch: PathBuf,
+    scratch: ScratchGuard,
+}
+
+/// Owns a scratch directory and removes it when dropped, including when the fixture's setup panics halfway.
+struct ScratchGuard(PathBuf);
+
+impl ScratchGuard {
+    fn new() -> Self {
+        let dir = std::env::temp_dir().join(format!("er-{}", &uuid::Uuid::new_v4().simple().to_string()[..12]));
+        agent::private_fs::create_private_dir_all(&dir, &dir).unwrap();
+        Self(dir)
+    }
+}
+
+impl std::ops::Deref for ScratchGuard {
+    type Target = Path;
+    fn deref(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl Drop for ScratchGuard {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
 }
 
 impl UninstalledRoom {
     fn start() -> Self {
-        let scratch = std::env::temp_dir().join(format!("er-{}", &uuid::Uuid::new_v4().simple().to_string()[..12]));
-        agent::private_fs::create_private_dir_all(&scratch, &scratch).unwrap();
-        let dir = eitri_core::takeover::room::RoomDir::create(&scratch).unwrap();
+        let scratch = ScratchGuard::new();
+        let dir = eitri_core::takeover::room::RoomDir::create(&scratch.0).unwrap();
         let binary = std::env::split_paths(&std::env::var_os("PATH").unwrap())
             .find_map(|dir| eitri_core::takeover::room::room_binary(dir.join("nvim").to_str()?))
             .expect("nvim must be on PATH");
@@ -1278,8 +1301,21 @@ impl Drop for UninstalledRoom {
         if let Some(dir) = self.dir.take() {
             let _ = dir.remove();
         }
-        let _ = std::fs::remove_dir_all(&self.scratch);
     }
+}
+
+#[test]
+fn a_scratch_guard_removes_its_directory_when_setup_panics() {
+    let kept = std::cell::RefCell::new(None);
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let scratch = ScratchGuard::new();
+        std::fs::write(scratch.0.join("left"), "x").unwrap();
+        *kept.borrow_mut() = Some(scratch.0.clone());
+        panic!("setup fails after the directory exists");
+    }));
+    assert!(outcome.is_err());
+    let dir = kept.into_inner().expect("the directory was made");
+    assert!(!dir.exists(), "{dir:?} was left behind");
 }
 
 #[test]
