@@ -72,6 +72,16 @@ struct Wanted {
     qualifier: Option<String>,
 }
 
+impl Wanted {
+    /// The qualifier when the name was cut at a `::` (a path: `Type::method`), else none: before a `.` stands a value
+    /// or a package, which says nothing about the container of a Rust definition.
+    fn path_qualifier(&self) -> Option<&str> {
+        let qualifier = self.qualifier.as_deref()?;
+        let head = self.name.strip_suffix(self.last.as_str())?;
+        head.ends_with("::").then_some(qualifier)
+    }
+}
+
 fn wanted(name: &str) -> Wanted {
     let cut = [name.rfind("::").map(|at| (at, 2)), name.rfind('.').map(|at| (at, 1))]
         .into_iter()
@@ -664,14 +674,15 @@ impl Lookup {
             return;
         }
         let (root, name) = (self.root.clone(), self.wanted.last.clone());
-        // A qualified name keeps only the definitions its qualifier contains: `Foo::wired` is not `Other::wired`.
-        // `Self`, `self`, `super` and `crate` name a place by where the reference stands, which the text search does
-        // not know, so they keep every definition of the name.
+        // A path name keeps only the definitions its qualifier contains: `Foo::wired` is not `Other::wired`. A `.`
+        // name (`state.tabs.get`) is a value's method: its qualifier names a field or a variable, not a container,
+        // so every definition of the last segment stays. `Self`, `self`, `super` and `crate` name a place by where
+        // the reference stands, which the text search does not know, so they keep every definition too.
         let within = self
             .wanted
-            .qualifier
-            .clone()
-            .filter(|qualifier| !["Self", "self", "super", "crate"].contains(&qualifier.as_str()));
+            .path_qualifier()
+            .filter(|qualifier| !["Self", "self", "super", "crate"].contains(qualifier))
+            .map(str::to_owned);
         self.text = counted_worker(cx.workers, move || {
             let limits = eitri_core::symbol_text::Limits::default();
             let found = eitri_core::symbol_text::search_within(&root, &name, within.as_deref(), limits);
@@ -743,9 +754,9 @@ impl Lookup {
     }
 
     /// A symbol search without an exact match inside the project: rust-analyzer's text matches when it answered with
-    /// other names (a qualified name waits for the end: its text matches are those whose enclosing `impl`, `trait` or
-    /// module bears the qualifier's name, a guess from the text that the server may still better), else the servers
-    /// are asked again while time is left.
+    /// other names (a qualified name waits for the end: for a `::` path its text matches are those whose enclosing
+    /// `impl`, `trait` or module bears the qualifier's name, for a `.` name every definition of the last segment, a
+    /// guess from the text that the server may still better), else the servers are asked again while time is left.
     fn no_exact(&mut self, cx: &mut Cx<'_>) -> Flow {
         self.take_text();
         if self.analyzer().is_some() && self.inexact && self.wanted.qualifier.is_none() {
@@ -1750,6 +1761,41 @@ mod tests {
             assert!(run.reply.is_none(), "{name}: a qualified name waits for the end");
             run.at(3500);
             assert_eq!(run.matches(), [("src/lib.rs".to_owned(), line, "text")], "{name}");
+        }
+    }
+
+    #[test]
+    fn a_value_method_name_keeps_every_text_match() {
+        let root = project(
+            "gd-value-method",
+            &[(
+                "src/lib.rs",
+                "impl A {\n    fn get() {}\n}\nimpl B {\n    fn get() {}\n}\n",
+            )],
+        );
+        for name in ["state.tabs.get", "self.tabs.get", "tabs.get"] {
+            let mut run = Run::new(&root, name, None);
+            run.settle();
+            run.rpc.answer(started(&["rust-analyzer"], &[]));
+            run.at(0);
+            run.text_settles();
+            run.at(100);
+            run.rpc.answer(done(
+                "workspace_symbols",
+                vec![item(&root.join("src/lib.rs"), 2, 7, Some("get"), Some("Other"))],
+                &[],
+            ));
+            run.at(100);
+            assert!(run.reply.is_none(), "{name}: a qualified name waits for the end");
+            run.at(3500);
+            assert_eq!(
+                run.matches(),
+                [
+                    ("src/lib.rs".to_owned(), 2, "text"),
+                    ("src/lib.rs".to_owned(), 5, "text")
+                ],
+                "{name}"
+            );
         }
     }
 

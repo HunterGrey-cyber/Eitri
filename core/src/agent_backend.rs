@@ -1773,7 +1773,17 @@ impl AgentBackend {
         // pending, and reconsider it from canonical state after that send settles. A backend's
         // resync may have dropped a turn boundary, so recorded approvals end with it; this is the
         // only place they end on a resync.
-        let resync = matches!(delivery, RevisedDelivery::Resync);
+        let backend_resync = match &delivery {
+            RevisedDelivery::Resync { revision } => Some(*revision),
+            _ => None,
+        };
+        // The newest revision this drain took off the queue, in fold order; what a resync for a released card
+        // replaces, and so the furthest it may claim to cover.
+        let drained_through = match &delivery {
+            RevisedDelivery::Events(events) => events.last().map(|(revision, _)| *revision),
+            _ => None,
+        };
+        let resync = backend_resync.is_some();
         if resync {
             approvals.forget_recorded();
         }
@@ -1857,8 +1867,15 @@ impl AgentBackend {
             approvals.forget_recorded();
             approvals.forget_in_flight(&self.projection(), user_answered);
         }
-        if resync || released {
-            RevisedDelivery::Resync
+        if let Some(revision) = backend_resync {
+            RevisedDelivery::Resync { revision }
+        } else if released {
+            // The snapshot stands in for exactly what this drain took. Folds after it are still queued and arrive
+            // as events; the tab set bounds evicted calls by this revision, so a call whose turn's events are still
+            // queued waits for them. A drain that took nothing claims nothing.
+            RevisedDelivery::Resync {
+                revision: drained_through.unwrap_or(0),
+            }
         } else if kept.is_empty() {
             RevisedDelivery::Nothing
         } else {
