@@ -32,15 +32,6 @@
 # All build inputs and scripts come from the clone. Refuse if its copy of this script differs,
 # so the source asset contains the scripts that controlled the build.
 set -euo pipefail
-if [ "${1:-}" != __container ]; then
-    mkdir -p "$HOME/.cache"
-    if command -v flock >/dev/null 2>&1; then
-        flock -s -w "${PERF_WAIT:-1800}" "$HOME/.cache/perf-window.lock" true ||
-            printf 'note: performance window still open after %ss; starting anyway\n' "${PERF_WAIT:-1800}" >&2
-    else
-        printf '%s\n' 'note: flock is missing; starting without performance-window admission' >&2
-    fi
-fi
 
 RS_GTK_FLOOR=4.14
 RS_GLIBC_FLOOR=2.39
@@ -889,6 +880,13 @@ host_main() {
 	trap 'cleanup_containers; exit 130' INT TERM
 	local started=$SECONDS names=() name
 	say "releasing Eitri $RS_VERSION from $RS_SOURCE at $RS_COMMIT (neovide $RS_FORK_COMMIT, Verdandi $RS_VERDANDI_REV) into $RS_REL"
+	mkdir -p "$HOME/.cache"
+	if command -v flock >/dev/null 2>&1; then
+		flock -s -w "${PERF_WAIT:-1800}" "$HOME/.cache/perf-window.lock" true ||
+			printf 'note: performance window still open after %ss; starting anyway\n' "${PERF_WAIT:-1800}" >&2
+	else
+		printf '%s\n' 'note: flock is missing; starting without performance-window admission' >&2
+	fi
 	build_image
 	phase_f
 	phase_b

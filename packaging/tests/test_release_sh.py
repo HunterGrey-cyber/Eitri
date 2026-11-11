@@ -1094,6 +1094,41 @@ def _bash(script, env, cwd):
                           capture_output=True, text=True, env=env, cwd=cwd, timeout=60)
 
 
+class PerformanceWindowAdmission(unittest.TestCase):
+    def setUp(self):
+        if shutil.which("flock") is None:
+            self.skipTest("flock is not installed")
+        self.scratch = _scratch_dir()
+        self.addCleanup(shutil.rmtree, self.scratch, ignore_errors=True)
+        cache = os.path.join(self.scratch, ".cache")
+        os.makedirs(cache)
+        self.holder = subprocess.Popen(
+            ["flock", "-x", os.path.join(cache, "perf-window.lock"), "sh", "-c",
+             'printf "locked\\n"; read -r release'],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        self.addCleanup(self.holder.communicate, "\n", timeout=60)
+        self.assertTrue(select.select([self.holder.stdout], [], [], 60)[0], "lock holder did not start")
+        self.assertEqual(self.holder.stdout.readline(), "locked\n")
+        # A contended admission reports a note immediately; no elapsed-time assertion is needed.
+        self.vars = dict(os.environ, HOME=self.scratch, PERF_WAIT="0")
+
+    def test_sourcing_helpers_does_not_enter_admission(self):
+        proc = subprocess.run(["bash", "-c", 'source "$1"; printf "sourced\\n"', "bash", _RELEASE_SH],
+                              env=self.vars, capture_output=True, text=True, timeout=60)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(proc.stdout, "sourced\n")
+        self.assertEqual(proc.stderr, "")
+        self.assertIsNone(self.holder.poll())
+
+    def test_help_does_not_enter_admission(self):
+        proc = subprocess.run(["bash", _RELEASE_SH, "--help"], env=self.vars,
+                              capture_output=True, text=True, timeout=60)
+        self.assertEqual(proc.returncode, 2, proc.stderr)
+        self.assertIn("packaging/release.sh <version>", proc.stderr)
+        self.assertNotIn("performance window", proc.stderr)
+        self.assertIsNone(self.holder.poll())
+
+
 class PhaseFCopyRebuilds(unittest.TestCase):
     """Phase F copies the clone into /build/src, and phase
     B builds there into the persistent $RS_ROOT/target. `cp -a` keeps the clone's own mtimes (its

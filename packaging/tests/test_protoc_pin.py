@@ -297,7 +297,8 @@ sidecar_build_core "$HOME/work" "$HOME/node.tgz" "$HOME/source.tgz"
     assert 'build:binary' not in (root / 'npm.log').read_text()
 
 
-@pytest.mark.parametrize('mismatch', ['', 'version', 'x64', 'arm64', 'malformed', 'missing'])
+@pytest.mark.parametrize('mismatch', ['', 'version', 'x64', 'arm64', 'malformed', 'missing',
+                                      'duplicate-x64', 'duplicate-version'])
 def test_release_checks_locked_version_and_downloads_against_pins(tmp_path, mismatch):
     (tmp_path / 'package-lock.json').write_text('{"packages":{"node_modules/grpc-tools":{"version":"1.13.1"}}}')
     for arch in ('x64', 'arm64'):
@@ -312,13 +313,21 @@ def test_release_checks_locked_version_and_downloads_against_pins(tmp_path, mism
         fields = fields.replace(digest, 'invalid')
     elif mismatch == 'missing':
         fields = ''
+    elif mismatch == 'duplicate-x64':
+        fields = f'GRPC_TOOLS_SHA256_linux_x64={"0" * 64}\n' + fields
+    elif mismatch == 'duplicate-version':
+        fields = 'GRPC_TOOLS_VERSION=1.13.0\n' + fields
     (tmp_path / 'pins.env').write_text(fields)
     proc = subprocess.run(['python3', str(PACKAGING / 'release_check.py'), 'check-protoc-pin',
                            str(tmp_path / 'package-lock.json'), str(tmp_path / 'pins.env'), str(tmp_path)],
                           capture_output=True, text=True, timeout=30)
     assert (proc.returncode == 0) == (not mismatch), proc.stderr
     if mismatch:
-        assert 'pins.env' in proc.stderr
+        if mismatch.startswith('duplicate-'):
+            key = 'GRPC_TOOLS_VERSION' if mismatch == 'duplicate-version' else 'GRPC_TOOLS_SHA256_linux_x64'
+            assert f'duplicate key {key!r}' in proc.stderr
+        else:
+            assert 'pins.env' in proc.stderr
 
 
 @pytest.mark.parametrize('version,fields,allowed', [

@@ -108,6 +108,8 @@ def parse_release_text(text: str) -> dict[str, str]:
         if "=" not in line:
             raise ReleaseCheckError(f"RELEASE line {lineno}: no '=' in {raw!r}")
         key, _, value = line.partition("=")
+        if key in fields:
+            raise ReleaseCheckError(f"RELEASE line {lineno}: duplicate key {key!r}")
         fields[key] = value
     return fields
 
