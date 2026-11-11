@@ -1285,12 +1285,46 @@ export default function App() {
     symbolRequests.current.clear();
     pathExpectations.current.clear();
   }, [tabs?.active]);
+  /** The page's interaction generation. Every `open_path` carries it and `panel_keys` mirrors it; the host gives
+   *  the editor the keys only while the two still agree, so a path the file system was slow to resolve never takes
+   *  them from whatever the person turned to meanwhile. Each `gd` moves it on, and so does the first step away
+   *  after an open: leaving BROWSE or its region, the pane losing focus, a card, typing into a field. */
+  const interaction = useRef(0);
+  /** An open went out at the current generation and nothing has moved it on since. */
+  const openAtInteraction = useRef(false);
+  /** What the mirror last said, for a move of the generation that is not a change of mode. */
+  const panelKeysModeRef = useRef<PanelKeysMode>("other");
+  function advanceInteraction() {
+    openAtInteraction.current = false;
+    postToRust({ type: "panel_keys", request_id: nextRequestId(), mode: panelKeysModeRef.current,
+      interaction: ++interaction.current });
+  }
+  function stepAway() {
+    if (openAtInteraction.current) advanceInteraction();
+  }
+  /** A new `gd` supersedes every earlier one on the tab: their replies are dropped with their timers, and an open
+   *  one of them still has out never takes the keys. */
+  function beginGd() {
+    advanceInteraction();
+    dropNameLookups();
+  }
+  /** Forgets the tab's name lookups still out, with their timers: their replies are ignored. A `gf` does this too,
+   *  so an older `gd`'s single match never opens over the path it opened. */
+  function dropNameLookups() {
+    const tab = activeTabRef.current;
+    for (const [id, pending] of symbolRequests.current) {
+      if (pending.tab !== tab) continue;
+      clearTimeout(pending.timer);
+      symbolRequests.current.delete(id);
+    }
+  }
 
   function openPath(ref: DefinitionPath) {
     const requestId = nextRequestId();
     trackRequest(requestId, { kind: "editor", tab: activeTabRef.current ?? 0 });
     if (ref.expect !== undefined) pathExpectations.current.set(requestId, ref.expect);
-    postToRust({ type: "open_path", request_id: requestId, path: ref.path,
+    openAtInteraction.current = true;
+    postToRust({ type: "open_path", request_id: requestId, path: ref.path, interaction: interaction.current,
       ...(ref.line === null ? {} : { line: ref.line }), ...(ref.expect === undefined ? {} : { expect: ref.expect }) });
   }
   function definitionPath(ref: PathRef, text: string): DefinitionPath {
@@ -1299,6 +1333,7 @@ export default function App() {
     return { ...ref, expect: expectedName(line, ref.path) };
   }
   function goDefinition(target: GdTarget, line: string) {
+    beginGd();
     if (target.kind === "none") { showFlash("gd: nothing under the caret"); return; }
     if (target.kind === "path" || target.kind === "pathline") {
       openPath(definitionPath({ path: target.path, line: target.kind === "pathline" ? target.line : null }, line));
@@ -3529,10 +3564,26 @@ export default function App() {
           : emptyMode === "input"
             ? "input"
             : "browse";
+  panelKeysModeRef.current = panelKeysMode;
   useEffect(() => {
-    postToRust({ type: "panel_keys", request_id: nextRequestId(), mode: panelKeysMode });
+    // Back in BROWSE (a pick's letter closing it) keeps the generation the letter's open just carried.
+    if (panelKeysMode !== "browse" && openAtInteraction.current) {
+      openAtInteraction.current = false;
+      ++interaction.current;
+    }
+    postToRust({ type: "panel_keys", request_id: nextRequestId(), mode: panelKeysMode, interaction: interaction.current });
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [panelKeysMode]);
+  useEffect(() => {
+    if (mode !== "browse" || !paneFocused || cardMode !== null) stepAway();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [mode, paneFocused, cardMode !== null]);
+  useEffect(() => {
+    const typed = () => stepAway();
+    document.addEventListener("input", typed, true);
+    return () => document.removeEventListener("input", typed, true);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
   /** "Stale mirror, both ways": every `nav_key` this page cannot apply comes back
    *  as one `nav_fallthrough`, so Rust runs the chord's ordinary `move_focus` instead of dropping the
    *  key. `keymapOpen`/`confirm` are checked here rather than left to `EmptyTab`:
@@ -7108,6 +7159,8 @@ export default function App() {
       }
       case "go-definition":
       case "open-path": {
+        if (action.kind === "go-definition") beginGd();
+        else dropNameLookups();
         // A tool's own path field, or a path found in prose -- never a guess at what
         // the model meant, only what `pathsIn` (`../paths.ts`) can actually read off the row.
         const item = timeline[cursor];

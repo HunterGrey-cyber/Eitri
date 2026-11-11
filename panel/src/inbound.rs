@@ -1488,7 +1488,9 @@ pub(super) fn handle_inbound_message(
         }
         // `gd` on a name: answered from the tick once the language servers have, never waited on here.
         InboundMessage::EditorSymbol { name, cited, .. } => {
-            if let Err(refusal) = super::symbol_lookup::start(state, view, request_id.clone(), &name, cited) {
+            if let Err(refusal) =
+                super::symbol_lookup::start(state, view, request_id.clone(), &name, cited, tab_of(target))
+            {
                 out.send(
                     view,
                     eitri_core::agent_bridge::serialize_editor_symbol_result_for_js(&request_id, &[], Some(&refusal)),
@@ -1496,7 +1498,13 @@ pub(super) fn handle_inbound_message(
             }
         }
         // `gf`: the window shows the editor and hands it the file; its answer is the page's.
-        InboundMessage::OpenPath { path, line, expect, .. } => {
+        InboundMessage::OpenPath {
+            path,
+            line,
+            expect,
+            interaction,
+            ..
+        } => {
             if let Err(why) = super::path_lookup::check_path_length(&path) {
                 refuse(&mut out, &why);
                 return out;
@@ -1513,12 +1521,13 @@ pub(super) fn handle_inbound_message(
             if eitri_core::agent_bridge::path_holds_control(&path) {
                 refuse(&mut out, &super::links::OpenPathRefusal::ControlChar.message(&path));
             } else if let Some(result) =
-                super::path_lookup::pick(state, &path, line, expect.clone(), view, &request_id, tab)
+                super::path_lookup::pick(state, &path, line, expect.clone(), view, &request_id, tab, interaction)
             {
                 if let Err(why) = result {
                     refuse(&mut out, &why);
                 }
-            } else if let Err(why) = super::path_lookup::start(state, path, line, expect, view, request_id.clone(), tab)
+            } else if let Err(why) =
+                super::path_lookup::start(state, path, line, expect, view, request_id.clone(), tab, interaction)
             {
                 refuse(&mut out, &why);
             }
@@ -1786,9 +1795,10 @@ pub(super) fn handle_inbound_message(
         // The nav-mode mirror: recorded so `main.rs`'s intercept can read it back through
         // `AgentPanelHandle::panel_keys`. Never refused -- an unrecognised `mode` is a parse
         // failure in `parse_inbound_message`, not something that reaches here.
-        InboundMessage::PanelKeys { mode, .. } => {
+        InboundMessage::PanelKeys { mode, interaction, .. } => {
             if let Some(record) = state.page(view) {
                 record.nav_mode.set(mode);
+                record.interaction.set(interaction);
             }
             ok(&mut out);
         }

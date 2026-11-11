@@ -44,6 +44,10 @@ const SYMBOL_MAX: usize = 256;
 /// The longest query window 1 hands a language server, as a tool's own argument is held to.
 const QUERY_MAX: usize = 1024;
 
+/// The most per-client queries an ask carries, and the longest client name among them.
+const QUERY_FOR_MAX: usize = 8;
+const CLIENT_NAME_MAX: usize = 64;
+
 /// The longest an ask's entry may stay in the editor: a language server's budget and the last collect's margin.
 const LSP_LIFE_MAX: Duration =
     crate::editor_tools::tools::lsp::LSP_BUDGET.saturating_add(crate::editor_tools::tools::lsp::COLLECT_MARGIN);
@@ -428,6 +432,7 @@ pub fn dispatch(id: u64, op: EditorOp, ctx: &dyn OpContext, rpc: &dyn EditorRpc)
             symbol,
             include,
             query,
+            query_for,
             budget_ms,
             load,
             stamp,
@@ -437,6 +442,15 @@ pub fn dispatch(id: u64, op: EditorOp, ctx: &dyn OpContext, rpc: &dyn EditorRpc)
             checked_id(&id)?;
             checked_text("symbol", symbol.as_deref(), SYMBOL_MAX)?;
             checked_text("query", query.as_deref(), QUERY_MAX)?;
+            if query_for.len() > QUERY_FOR_MAX {
+                return Err(OpRefused::Outside(format!(
+                    "an ask carries at most {QUERY_FOR_MAX} per-client queries"
+                )));
+            }
+            for (client, query) in &query_for {
+                checked_text("client", Some(client), CLIENT_NAME_MAX)?;
+                checked_text("query", Some(query), QUERY_MAX)?;
+            }
             if u128::from(budget_ms) > LSP_LIFE_MAX.as_millis() {
                 return Err(OpRefused::Outside(format!("{budget_ms} ms is past an ask's limit")));
             }
@@ -460,8 +474,7 @@ pub fn dispatch(id: u64, op: EditorOp, ctx: &dyn OpContext, rpc: &dyn EditorRpc)
                     symbol,
                     include: include.into_iter().map(Into::into).collect(),
                     query,
-                    // Only window 1's own callers word a query per server; none of them crosses the link.
-                    query_for: Vec::new(),
+                    query_for,
                     // The edits never cross the link, so the wire ask carries neither.
                     new_name: None,
                     action: None,
@@ -1378,6 +1391,7 @@ mod tests {
             symbol: Some("frob".into()),
             include: vec![WireUsagePart::Definitions, WireUsagePart::References],
             query: None,
+            query_for: Vec::new(),
             budget_ms: LSP_LIFE_MAX.as_millis() as u32,
             load,
             stamp,
@@ -1394,6 +1408,7 @@ mod tests {
             symbol: None,
             include: vec![],
             query: Some(query.into()),
+            query_for: Vec::new(),
             budget_ms: 1000,
             load: false,
             stamp: stamp(),
@@ -1694,6 +1709,43 @@ mod tests {
     }
 
     #[test]
+    fn per_client_queries_cross_the_link_as_bounded_data() {
+        let f = fixture("agent-client-queries");
+        let valid = vec![
+            ("gopls".to_owned(), "Type.Name".to_owned()),
+            ("rust-analyzer".into(), "Name#".into()),
+        ];
+        for (queries, allowed) in [
+            (valid, true),
+            (vec![("gopls".into(), "x".repeat(QUERY_MAX)); QUERY_FOR_MAX], true),
+            (vec![("gopls".into(), "Name".into()); QUERY_FOR_MAX + 1], false),
+            (vec![("x".repeat(CLIENT_NAME_MAX + 1), "Name".into())], false),
+            (vec![("gopls".into(), "x".repeat(QUERY_MAX + 1))], false),
+            (vec![("gopls\n".into(), "Name".into())], false),
+            (vec![("gopls".into(), "Name\n".into())], false),
+        ] {
+            let rpc = Recorder::default();
+            let mut op = lsp_search("Name", "gd-1");
+            if let EditorOp::AgentLspAsk { query_for, .. } = &mut op {
+                *query_for = queries.clone();
+            }
+            let result = dispatch(1, op, &f.ctx, &rpc);
+            assert_eq!(result.is_ok(), allowed, "{result:?}");
+            if allowed {
+                let expected = Value::Map(
+                    queries
+                        .into_iter()
+                        .map(|(client, query)| (client.into(), query.into()))
+                        .collect(),
+                );
+                assert_eq!(sent_field(&rpc.calls()[0].1, "query_for"), expected);
+                assert_eq!(sent_field(&rpc.calls()[0].1, "load"), Value::Boolean(false));
+            } else {
+                assert!(rpc.calls().is_empty());
+            }
+        }
+    }
+    #[test]
     fn each_kind_reaches_the_chunk_under_its_own_word() {
         let f = fixture("agent-lsp-kinds");
         for (kind, word) in [
@@ -1712,6 +1764,7 @@ mod tests {
                 symbol: None,
                 include: vec![],
                 query: None,
+                query_for: Vec::new(),
                 budget_ms: 1000,
                 load: false,
                 stamp: stamp(),
@@ -1786,6 +1839,7 @@ mod tests {
             symbol: Some("a".into()),
             include: vec![],
             query: None,
+            query_for: Vec::new(),
             budget_ms,
             load: false,
             stamp: stamp(),
@@ -1814,6 +1868,7 @@ mod tests {
             symbol: Some(symbol),
             include: vec![],
             query: None,
+            query_for: Vec::new(),
             budget_ms: 1000,
             load: false,
             stamp: stamp(),
@@ -1851,6 +1906,7 @@ mod tests {
                 symbol: None,
                 include: vec![],
                 query: None,
+                query_for: Vec::new(),
                 budget_ms: 1000,
                 load: true,
                 stamp: stamp(),
@@ -1898,6 +1954,98 @@ mod tests {
             .unwrap()
             .1
             .clone()
+    }
+
+    /// The panel's `gd` in window 2 builds its calls through `RemoteWay`: a cited `usages` ask, a workspace search
+    /// worded per server, and their collect, each under the gd stamp scope and ids, with the budgets it gives them.
+    #[test]
+    fn a_gd_ask_built_as_window_2_builds_it_passes_window_1s_checks() {
+        use crate::editor_tools::stamp::Sequencer;
+        use crate::editor_tools::way::RemoteWay;
+        use std::rc::Rc;
+        let f = fixture("agent-gd-remote");
+        let built = Rc::new(RefCell::new(Vec::new()));
+        let keep = built.clone();
+        let way = RemoteWay::new(
+            &f.ctx.root,
+            Box::new(move |op| {
+                keep.borrow_mut().push(op);
+                Pending::failed(RpcError::Unavailable("kept for the test".into()))
+            }),
+        );
+        let mut sequencer = Sequencer::new(format!("gd-{}-{:x}", std::process::id(), wall_ms()));
+        // The cited step lives 1.5 s and the symbol search 3.5 s, each with a second's margin.
+        let cited = AskArgs {
+            id: "gd-1".into(),
+            kind: LspKind::Usages,
+            root: f.ctx.root.clone(),
+            path: Some(f.ctx.root.join("src/a.rs")),
+            line: Some(1),
+            symbol: Some("a".into()),
+            include: vec![UsagePart::Definitions],
+            budget_ms: 2500,
+            load: false,
+            ..Default::default()
+        };
+        let search = AskArgs {
+            id: "gd-2".into(),
+            kind: LspKind::WorkspaceSymbols,
+            root: f.ctx.root.clone(),
+            query: Some("Name".into()),
+            query_for: vec![
+                ("gopls".into(), "pkg.Name".into()),
+                ("rust-analyzer".into(), "Name#".into()),
+                ("rust_analyzer".into(), "Name#".into()),
+            ],
+            budget_ms: 4500,
+            load: false,
+            ..Default::default()
+        };
+        let calls = [
+            EditorCall::LspAsk(cited),
+            EditorCall::LspAsk(search),
+            EditorCall::LspCollect {
+                id: "gd-2".into(),
+                last: true,
+            },
+        ];
+        for call in &calls {
+            let stamp = sequencer.stamp(Duration::from_millis(3500));
+            drop(way.call("s-held", call, &stamp));
+        }
+        let ops = built.borrow().clone();
+        assert_eq!(ops.len(), 3, "every call crossed as an op: {ops:?}");
+        assert!(matches!(&ops[0], EditorOp::AgentLspAsk { path: Some(path), .. } if path == "src/a.rs"));
+        let rpc = Recorder::default();
+        for op in ops {
+            let name = op.name();
+            assert!(
+                matches!(dispatch(1, op, &f.ctx, &rpc), Ok(Dispatch::Rpc(_))),
+                "window 1 refused {name}"
+            );
+        }
+        let sent = rpc.calls();
+        assert_eq!(
+            sent.iter().map(|(code, _)| *code).collect::<Vec<_>>(),
+            [lsp::LSP_ASK_LUA, lsp::LSP_ASK_LUA, lsp::LSP_COLLECT_LUA]
+        );
+        assert_eq!(
+            sent_field(&sent[0].1, "path"),
+            Value::Binary(f.ctx.root.join("src/a.rs").as_os_str().as_encoded_bytes().to_vec())
+        );
+        assert_eq!(sent_field(&sent[0].1, "id").as_str(), Some("gd-1"));
+        assert_eq!(sent_field(&sent[1].1, "query").as_str(), Some("Name"));
+        assert_eq!(
+            sent_field(&sent[1].1, "query_for"),
+            Value::Map(vec![
+                ("gopls".into(), "pkg.Name".into()),
+                ("rust-analyzer".into(), "Name#".into()),
+                ("rust_analyzer".into(), "Name#".into()),
+            ])
+        );
+        for (_, args) in &sent[..2] {
+            assert_eq!(sent_field(args, "load"), Value::Boolean(false));
+        }
     }
 
     #[test]

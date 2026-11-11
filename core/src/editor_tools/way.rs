@@ -184,6 +184,7 @@ impl RemoteWay {
                 symbol: args.symbol.clone(),
                 include: args.include.iter().map(|part| (*part).into()).collect(),
                 query: args.query.clone(),
+                query_for: args.query_for.clone(),
                 budget_ms: args.budget_ms,
                 load: args.load,
                 stamp,
@@ -543,6 +544,7 @@ mod tests {
                 symbol: Some("frob".to_owned()),
                 include: vec![WireUsagePart::References, WireUsagePart::Implementations],
                 query: None,
+                query_for: Vec::new(),
                 budget_ms: 15000,
                 load: true,
                 stamp: wire_stamp(),
@@ -557,6 +559,7 @@ mod tests {
             kind: LspKind::WorkspaceSymbols,
             root: "/p".into(),
             query: Some("frob".into()),
+            query_for: vec![("rust-analyzer".into(), "frob#".into())],
             budget_ms: 15000,
             ..Default::default()
         }));
@@ -571,6 +574,7 @@ mod tests {
                 symbol: None,
                 include: vec![],
                 query: Some("frob".to_owned()),
+                query_for: vec![("rust-analyzer".into(), "frob#".into())],
                 budget_ms: 15000,
                 load: false,
                 stamp: wire_stamp(),

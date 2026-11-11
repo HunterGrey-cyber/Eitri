@@ -159,6 +159,9 @@ pub enum EditorOp {
         symbol: Option<String>,
         include: Vec<WireUsagePart>,
         query: Option<String>,
+        /// A workspace search's query for a named client in place of `query`, as `AskArgs::query_for` holds them.
+        #[serde(default)]
+        query_for: Vec<(String, String)>,
         budget_ms: u32,
         load: bool,
         stamp: WireStamp,
@@ -624,6 +627,7 @@ mod tests {
                 symbol: Some("frob".into()),
                 include: vec![WireUsagePart::Definitions, WireUsagePart::Implementations],
                 query: None,
+                query_for: Vec::new(),
                 budget_ms: 15_000,
                 load: true,
                 stamp: stamp(),
@@ -637,6 +641,7 @@ mod tests {
                 symbol: None,
                 include: vec![],
                 query: Some("frob".into()),
+                query_for: Vec::new(),
                 budget_ms: 15_000,
                 load: false,
                 stamp: stamp(),

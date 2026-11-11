@@ -48,6 +48,12 @@ impl FakeEditor {
         answer.send(Err(crate::nvim_rpc::RpcError::Closed));
     }
 
+    /// Fails the chunk sent last of those still waiting with `error`.
+    pub fn fail_newest_with(&self, error: crate::nvim_rpc::RpcError) {
+        let answer = self.waiting.borrow_mut().pop_back().expect("a chunk is waiting");
+        answer.send(Err(error));
+    }
+
     /// How many chunks wait for their answer.
     pub fn unanswered(&self) -> usize {
         self.waiting.borrow().len()

@@ -24,6 +24,8 @@ struct Request {
     tab: TabId,
     wanted: String,
     started: Instant,
+    /// The page's interaction generation when it asked, if it sent one.
+    interaction: Option<u64>,
 }
 #[derive(Debug)]
 struct FoundPath {
@@ -195,6 +197,7 @@ pub(super) fn start(
     view: ViewId,
     request_id: String,
     tab: TabId,
+    interaction: Option<u64>,
 ) -> Result<(), String> {
     check_path_length(&path)?;
     let root = state.project_dir.clone();
@@ -207,6 +210,7 @@ pub(super) fn start(
         tab,
         wanted: path.clone(),
         started: Instant::now(),
+        interaction,
     };
     start_worker(state, request, move || {
         match super::links::open_path_exact(&root, &path) {
@@ -258,6 +262,7 @@ pub(super) fn pick(
     view: ViewId,
     request_id: &str,
     tab: TabId,
+    interaction: Option<u64>,
 ) -> Option<Result<(), String>> {
     state
         .path_lookup
@@ -276,6 +281,7 @@ pub(super) fn pick(
         tab,
         wanted: path.to_owned(),
         started: Instant::now(),
+        interaction,
     };
     Some(start_worker(state, request, move || {
         final_check(&offer.root, found, line, expect.as_deref())
@@ -329,6 +335,14 @@ fn active(state: &AgentPanelState, request: &Request) -> bool {
         }
 }
 
+/// Whether the page is still where it asked: its `panel_keys` mirror carries the generation the request did. A
+/// page that has moved on since (typed, left BROWSE, lost the keys) is not given an editor that takes them.
+fn still_wanted(state: &AgentPanelState, request: &Request) -> bool {
+    request
+        .interaction
+        .is_none_or(|asked| state.page(request.view).and_then(|page| page.interaction.get()) == Some(asked))
+}
+
 pub(super) fn poll(state: &mut AgentPanelState, out: &mut Outbox) {
     state
         .path_lookup
@@ -380,6 +394,12 @@ pub(super) fn poll(state: &mut AgentPanelState, out: &mut Outbox) {
                 }) {
                     out.send(view, serialize_command_result_for_js(&id, Err(&why)));
                 }
+            }
+            Ok(Answer::Ready(..)) if !still_wanted(state, &request) => {
+                out.send(
+                    request.view,
+                    serialize_command_result_for_js(&request.request_id, Ok(())),
+                );
             }
             Ok(Answer::Ready(path, note)) => {
                 if let Some(note) = note {
@@ -543,7 +563,7 @@ mod tests {
             let mut state = handle.state.borrow_mut();
             let tab = state.tabs.active();
             assert_eq!(
-                start(&mut state, path, None, None, ViewId::BASE, "long".into(), tab),
+                start(&mut state, path, None, None, ViewId::BASE, "long".into(), tab, None),
                 Err("path is longer than 4096 bytes".into())
             );
             assert!(!state.path_lookup.is_running());
@@ -837,6 +857,7 @@ mod tests {
                     tab: TabId(1),
                     wanted: "held".into(),
                     started: Instant::now(),
+                    interaction: None,
                 },
                 rx,
             ));
@@ -881,6 +902,7 @@ mod tests {
             tab: state.tabs.active(),
             wanted: "a.rs".into(),
             started: Instant::now(),
+            interaction: None,
         }
     }
     #[test]
@@ -976,7 +998,7 @@ mod tests {
                 at: Instant::now(),
             });
             assert_eq!(
-                pick(&mut state, "src/a.rs", None, None, ViewId::BASE, "pick", tab),
+                pick(&mut state, "src/a.rs", None, None, ViewId::BASE, "pick", tab, None),
                 Some(Err(FULL.into()))
             );
             assert!(state.path_lookup.running.is_empty());
@@ -990,6 +1012,81 @@ mod tests {
         start_worker(&mut state, req, || Err("free slot".into())).unwrap();
         drop(state);
         wait_for_workers(&live);
+    }
+    #[test]
+    fn path_lookup_a_new_interaction_cancels_a_held_open_even_back_in_browse() {
+        for changed in [false, true] {
+            let (handle, page) = settled_panel();
+            let opened = record_opens(&handle);
+            let mirror = |mode: &str, interaction: u64| {
+                handle.page_message(
+                    ViewId::BASE,
+                    &serde_json::json!({
+                        "type": "panel_keys", "request_id": "keys", "mode": mode, "interaction": interaction,
+                    })
+                    .to_string(),
+                );
+            };
+            mirror("browse", 1);
+            let (release, blocked) = mpsc::channel::<()>();
+            let live = handle.state.borrow().path_lookup.live_workers.clone();
+            {
+                let mut state = handle.state.borrow_mut();
+                let req = Request {
+                    interaction: Some(1),
+                    ..request(&state)
+                };
+                start_worker(&mut state, req, move || {
+                    blocked.recv().unwrap();
+                    Ok(Answer::Ready(PathBuf::from("/project/a.rs"), None))
+                })
+                .unwrap();
+            }
+            handle.tick();
+            assert!(opened.borrow().is_empty(), "the filesystem is held");
+            if changed {
+                mirror("input", 2);
+                mirror("browse", 3);
+            }
+            release.send(()).unwrap();
+            wait_for_workers(&live);
+            page.sent.borrow_mut().clear();
+            handle.tick();
+            assert_eq!(opened.borrow().len(), usize::from(!changed));
+            assert!(handle.state.borrow().path_lookup.running.is_empty());
+            assert_eq!(response(&page).unwrap()["ok"], true);
+        }
+    }
+    #[test]
+    fn path_lookup_open_path_carries_its_interaction_to_the_editor_check() {
+        for (asked, mirrored, opens) in [(4, 4, true), (4, 5, false)] {
+            let root = Project::new();
+            root.write("src/a.rs");
+            let (handle, page, _) = handle_with_recording_page();
+            handle.state.borrow_mut().project_dir = root.0.clone();
+            let opened = record_opens(&handle);
+            handle.page_message(
+                ViewId::BASE,
+                &serde_json::json!({
+                    "type": "panel_keys", "request_id": "keys", "mode": "browse", "interaction": mirrored,
+                })
+                .to_string(),
+            );
+            handle.page_message(
+                ViewId::BASE,
+                &serde_json::json!({
+                    "type": "open_path", "request_id": "find", "path": "src/a.rs", "interaction": asked,
+                })
+                .to_string(),
+            );
+            tick_handle_until(&handle, "the open's answer", || {
+                !opened.borrow().is_empty() || response(&page).is_some()
+            });
+            assert_eq!(!opened.borrow().is_empty(), opens, "asked {asked}, mirrored {mirrored}");
+            if !opens {
+                assert_eq!(response(&page).unwrap()["ok"], true);
+            }
+        }
     }
     #[test]
     fn path_lookup_panicking_worker_releases_its_live_count() {
@@ -1242,7 +1339,7 @@ mod tests {
         assert_eq!(state.path_lookup.offers.len(), MAX_OFFERS - 1);
         assert_eq!(state.path_lookup.offers[0].request_id, "3");
         let tab = state.tabs.active();
-        assert!(pick(&mut state, "src/a.rs", None, None, view(2), "pick", tab).is_none());
+        assert!(pick(&mut state, "src/a.rs", None, None, view(2), "pick", tab, None).is_none());
     }
     #[test]
     fn path_lookup_unchanged_pick_opens_and_consumes_its_offer() {

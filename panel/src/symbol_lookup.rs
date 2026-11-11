@@ -17,10 +17,11 @@
 
 use super::*;
 use eitri_core::agent_bridge::{EditorSymbolError, EditorSymbolMatch, SymbolCitation};
-use eitri_core::editor_rpc::EditorRpc;
 use eitri_core::editor_tools::stamp::{wall_ms, Sequencer};
+use eitri_core::editor_tools::step::EditorReach;
 use eitri_core::editor_tools::tools::lsp::{self, AskArgs, Asked, Collected, LspKind, RawItem, UsagePart};
-use eitri_core::nvim_rpc::Pending;
+use eitri_core::editor_tools::way::{EditorCall, EditorWay, LocalWay};
+use eitri_core::nvim_rpc::{Pending, RpcError};
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc};
@@ -49,6 +50,8 @@ const MAX_MATCHES: usize = 50;
 const MAX_WORKERS: usize = 12;
 /// The most of a cited file read to find its line.
 const CITED_FILE_MAX: u64 = 1_000_000;
+/// The most characters of a failed editor call's reason the reply carries.
+const REASON_MAX: usize = 160;
 const GOPLS: &str = "gopls";
 const RUST_ANALYZER: &str = "rust-analyzer";
 /// What nvim-lspconfig (and `vim.lsp.config`) names the rust-analyzer client; rustaceanvim names it `rust-analyzer`.
@@ -231,6 +234,28 @@ fn refused(message: String) -> EditorSymbolError {
     }
 }
 
+/// Why an editor call failed, as a reply may name it: the editor out of reach (its connection closed, no editor to
+/// ask, a call that could not be sent) or, over the link, window 1's answer, which is its refusal of the call. One
+/// line of at most [`REASON_MAX`] characters, since it goes in the band. An error nvim raised running this window's
+/// own chunk is none: it tells the person nothing they can act on, and the lookup comes to what it would have
+/// without the call.
+fn failure_reason(error: &RpcError, reach: EditorReach) -> Option<String> {
+    if matches!(error, RpcError::Nvim(_)) && reach == EditorReach::Own {
+        return None;
+    }
+    let text = error.to_string();
+    let line = text
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .unwrap_or("the editor call failed");
+    let mut reason: String = line.chars().take(REASON_MAX).collect();
+    if line.chars().nth(REASON_MAX).is_some() {
+        reason.push('…');
+    }
+    Some(reason)
+}
+
 type Reply = Result<Vec<EditorSymbolMatch>, EditorSymbolError>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -263,7 +288,7 @@ enum Stage {
 
 /// What a lookup needs from its window for one poll.
 struct Cx<'a> {
-    rpc: Option<&'a dyn EditorRpc>,
+    way: Option<&'a dyn EditorWay>,
     sequencer: &'a mut Sequencer,
     asks: &'a mut u64,
     workers: &'a Arc<AtomicUsize>,
@@ -302,6 +327,8 @@ enum Flow {
 struct Lookup {
     view: ViewId,
     request_id: String,
+    /// The asking tab's provider session, which names the lookup's calls to a linked editor.
+    session: String,
     wanted: Wanted,
     cited: Option<SymbolCitation>,
     root: PathBuf,
@@ -324,6 +351,9 @@ struct Lookup {
     inexact: bool,
     text: Option<mpsc::Receiver<Vec<EditorSymbolMatch>>>,
     text_found: Option<Vec<EditorSymbolMatch>>,
+    /// Why the lookup's last editor call failed, when it failed for a reason [`failure_reason`] names; none once
+    /// another call goes out. The reply when nothing else settles it.
+    failed: Option<String>,
 }
 
 impl Lookup {
@@ -338,6 +368,7 @@ impl Lookup {
         Lookup {
             view,
             request_id,
+            session: String::new(),
             wanted: wanted(name),
             cited,
             root,
@@ -353,6 +384,7 @@ impl Lookup {
             inexact: false,
             text: None,
             text_found: None,
+            failed: None,
         }
     }
 
@@ -401,7 +433,7 @@ impl Lookup {
         let now = cx.now;
         match stage {
             Stage::Start => {
-                if cx.rpc.is_none() {
+                if cx.way.is_none() {
                     return Flow::Reply(Err(refused(format!(
                         "gd: {}",
                         eitri_core::editor_tools::words::NO_EDITOR
@@ -428,7 +460,10 @@ impl Lookup {
             },
             Stage::Asking(phase, pending) => match pending.try_take() {
                 None => self.held_up(phase, Stage::Asking(phase, pending), cx),
-                Some(Err(_)) => self.phase_failed(phase, cx),
+                Some(Err(why)) => {
+                    self.failed_with(&why, cx);
+                    self.phase_failed(phase, cx)
+                }
                 Some(Ok(value)) => match lsp::parse_asked(&value) {
                     Ok(Asked::Started { clients, busy, .. }) => {
                         self.searched |= phase == Phase::Workspace;
@@ -455,18 +490,24 @@ impl Lookup {
                             Phase::Workspace => self.end(),
                         };
                         let last = now + LAST_LEAD >= ends;
-                        let Some(rpc) = cx.rpc else {
+                        let Some(way) = cx.way else {
                             return self.phase_failed(phase, cx);
                         };
-                        let stamp = self.stamp(cx);
-                        self.stage = Stage::Collecting(phase, lsp::collect(rpc, &stamp, &self.id, last));
+                        let call = EditorCall::LspCollect {
+                            id: self.id.clone(),
+                            last,
+                        };
+                        self.stage = Stage::Collecting(phase, self.call(way, &call, cx));
                         Flow::Wait
                     }
                 }
             }
             Stage::Collecting(phase, pending) => match pending.try_take() {
                 None => self.held_up(phase, Stage::Collecting(phase, pending), cx),
-                Some(Err(_)) => self.phase_failed(phase, cx),
+                Some(Err(why)) => {
+                    self.failed_with(&why, cx);
+                    self.phase_failed(phase, cx)
+                }
                 Some(Ok(value)) => match lsp::parse_collected(&value) {
                     Ok(Collected::Pending) => {
                         if phase == Phase::Workspace {
@@ -521,6 +562,18 @@ impl Lookup {
         }
     }
 
+    /// Sends `call` as the lookup's newest: an earlier call's failure no longer speaks for the lookup.
+    fn call(&mut self, way: &dyn EditorWay, call: &EditorCall, cx: &mut Cx<'_>) -> Pending {
+        self.failed = None;
+        let stamp = self.stamp(cx);
+        way.call(&self.session, call, &stamp)
+    }
+
+    fn failed_with(&mut self, error: &RpcError, cx: &Cx<'_>) {
+        let reach = cx.way.map_or(EditorReach::Own, |way| way.reach());
+        self.failed = failure_reason(error, reach);
+    }
+
     fn phase_failed(&mut self, phase: Phase, cx: &mut Cx<'_>) -> Flow {
         match phase {
             Phase::Cited => self.ask_workspace(cx),
@@ -537,12 +590,19 @@ impl Lookup {
     /// Gives up the ask out: its entry in the editor tools' table goes now, not at its deadline, so an abandoned ask
     /// does not push another tool's out of the table. Nothing waits on the call.
     fn release(&self, cx: &mut Cx<'_>) {
-        let Some(rpc) = cx.rpc else { return };
+        let Some(way) = cx.way else { return };
         if self.id.is_empty() {
             return;
         }
         let stamp = self.stamp(cx);
-        drop(lsp::collect(rpc, &stamp, &self.id, true));
+        drop(way.call(
+            &self.session,
+            &EditorCall::LspCollect {
+                id: self.id.clone(),
+                last: true,
+            },
+            &stamp,
+        ));
     }
 
     fn template(&mut self, cx: &mut Cx<'_>, kind: LspKind) -> AskArgs {
@@ -566,7 +626,7 @@ impl Lookup {
     }
 
     fn ask_cited(&mut self, file: PathBuf, cx: &mut Cx<'_>) -> Flow {
-        let Some(rpc) = cx.rpc else {
+        let Some(way) = cx.way else {
             return self.ask_workspace(cx);
         };
         let line = self.cited.as_ref().map(|cited| cited.line);
@@ -575,8 +635,7 @@ impl Lookup {
         args.line = line;
         args.symbol = Some(self.wanted.last.clone());
         args.include = vec![UsagePart::Definitions];
-        let stamp = self.stamp(cx);
-        self.stage = Stage::Asking(Phase::Cited, lsp::ask(rpc, &stamp, &args));
+        self.stage = Stage::Asking(Phase::Cited, self.call(way, &EditorCall::LspAsk(args), cx));
         Flow::Wait
     }
 
@@ -584,15 +643,14 @@ impl Lookup {
         if cx.now + LAST_LEAD >= self.end() {
             return self.finish(cx.now);
         }
-        let Some(rpc) = cx.rpc else {
+        let Some(way) = cx.way else {
             return self.finish(cx.now);
         };
         let (query, query_for) = queries(&self.wanted);
         let mut args = self.template(cx, LspKind::WorkspaceSymbols);
         args.query = Some(query);
         args.query_for = query_for;
-        let stamp = self.stamp(cx);
-        self.stage = Stage::Asking(Phase::Workspace, lsp::ask(rpc, &stamp, &args));
+        self.stage = Stage::Asking(Phase::Workspace, self.call(way, &EditorCall::LspAsk(args), cx));
         Flow::Wait
     }
 
@@ -716,7 +774,8 @@ impl Lookup {
     /// What the lookup comes to with no exact match from a server: rust-analyzer's text matches; rust-analyzer still
     /// holding its answer, `indexing`; an answer without the name, `no_symbol` (but while a server reports work and
     /// no answer held any item, `indexing`: servers answer empty while they index); a server still reporting work,
-    /// `indexing`; nothing at all, `timeout`.
+    /// `indexing`; the lookup's last editor call failed out of reach of the editor or was refused over the link, its
+    /// reason as `refused`; otherwise `timeout`.
     fn verdict(&self) -> Reply {
         if let Some(analyzer) = self.analyzer() {
             if let Some(found) = self.text_found.as_ref().filter(|found| !found.is_empty()) {
@@ -731,6 +790,9 @@ impl Lookup {
         }
         if let Some(busy) = self.busy_server() {
             return Err(error("indexing", Some(busy)));
+        }
+        if let Some(why) = &self.failed {
+            return Err(refused(format!("gd: {why}")));
         }
         Err(error("timeout", self.server()))
     }
@@ -759,12 +821,13 @@ pub(super) fn start(
     request_id: String,
     name: &str,
     cited: Option<SymbolCitation>,
+    tab: TabId,
 ) -> Result<(), EditorSymbolError> {
     let looked_up = wanted(name);
     if !eitri_core::agent_bridge::valid_symbol_name(name) || looked_up.last.is_empty() {
         return Err(refused(format!("gd: {name} is not a name gd can look up")));
     }
-    if state.editor_rpc.is_none() {
+    if state.editor_way.is_none() && state.editor_rpc.is_none() {
         return Err(refused(format!("gd: {}", eitri_core::editor_tools::words::NO_EDITOR)));
     }
     if state.symbol_lookup.workers.load(Ordering::SeqCst) >= MAX_WORKERS {
@@ -777,7 +840,12 @@ pub(super) fn start(
             "gd: {MAX_LOOKUPS} lookups are still out; try again in a moment"
         )));
     }
-    let lookup = Lookup::new(view, request_id, name, cited, state.project_dir.clone(), Instant::now());
+    let mut lookup = Lookup::new(view, request_id, name, cited, state.project_dir.clone(), Instant::now());
+    lookup.session = state
+        .tabs
+        .get(tab)
+        .and_then(|tab| tab.provider_session_id())
+        .unwrap_or_default();
     state.symbol_lookup.lookups.push(lookup);
     Ok(())
 }
@@ -787,7 +855,12 @@ pub(super) fn poll(state: &mut AgentPanelState, out: &mut Outbox) {
     if state.symbol_lookup.lookups.is_empty() {
         return;
     }
-    let rpc = state.editor_rpc.clone();
+    let way = state.editor_way.clone().or_else(|| {
+        state
+            .editor_rpc
+            .clone()
+            .map(|rpc| Rc::new(LocalWay(rpc)) as Rc<dyn EditorWay>)
+    });
     let SymbolLookup {
         lookups,
         sequencer,
@@ -795,7 +868,7 @@ pub(super) fn poll(state: &mut AgentPanelState, out: &mut Outbox) {
         workers,
     } = &mut state.symbol_lookup;
     let mut cx = Cx {
-        rpc: rpc.as_deref(),
+        way: way.as_deref(),
         sequencer: sequencer
             .get_or_insert_with(|| Sequencer::new(format!("gd-{}-{:x}", std::process::id(), wall_ms()))),
         asks,
@@ -831,6 +904,7 @@ pub(super) fn drop_view(state: &mut AgentPanelState, view: ViewId) {
 mod tests {
     use super::*;
     use crate::agent_panel::tests::*;
+    use eitri_core::editor_rpc::EditorRpc;
     use eitri_core::editor_tools::testing::FakeEditor;
     use serde_json::json;
     use std::cell::RefCell;
@@ -909,6 +983,18 @@ mod tests {
         reply: Option<Reply>,
         /// The window has no editor link any more.
         editor_gone: bool,
+        /// The editor is the other window's, reached over the link.
+        linked: bool,
+    }
+    /// The fake editor as the other window's: the calls are the same, only the reach differs.
+    struct OverLink(LocalWay);
+    impl EditorWay for OverLink {
+        fn call(&self, session: &str, call: &EditorCall, stamp: &eitri_core::editor_tools::stamp::Stamp) -> Pending {
+            self.0.call(session, call, stamp)
+        }
+        fn reach(&self) -> EditorReach {
+            EditorReach::Link
+        }
     }
     impl Run {
         fn new(root: &Path, name: &str, cited: Option<(&str, u32)>) -> Run {
@@ -927,12 +1013,15 @@ mod tests {
                 now: start,
                 reply: None,
                 editor_gone: false,
+                linked: false,
             }
         }
         fn poll(&mut self) {
-            let rpc = self.rpc.clone();
+            let local = LocalWay(self.rpc.clone());
+            let linked = OverLink(LocalWay(self.rpc.clone()));
+            let way: &dyn EditorWay = if self.linked { &linked } else { &local };
             let mut cx = Cx {
-                rpc: (!self.editor_gone).then_some(rpc.as_ref() as &dyn EditorRpc),
+                way: (!self.editor_gone).then_some(way),
                 sequencer: &mut self.sequencer,
                 asks: &mut self.asks,
                 workers: &self.workers,
@@ -1430,7 +1519,78 @@ mod tests {
         assert_eq!(run.rpc.last_kind(), "collect");
         run.rpc.fail_newest();
         run.at(100);
+        assert_eq!(run.error(), ("refused", None));
+        let Some(Err(error)) = &run.reply else {
+            panic!("an error")
+        };
+        assert_eq!(error.message.as_deref(), Some("gd: the connection to nvim closed"));
+    }
+
+    /// The symbol search's ask answered with gopls, then its collect failed with `error`.
+    fn collect_fails(label: &str, linked: bool, error: RpcError) -> Run {
+        let root = project(label, &[]);
+        let mut run = Run::new(&root, "Foo", None);
+        run.linked = linked;
+        run.settle();
+        run.rpc.answer(started(&["gopls"], &[]));
+        run.at(0);
+        run.at(100);
+        assert_eq!(run.rpc.last_kind(), "collect");
+        run.rpc.fail_newest_with(error);
+        run.at(100);
+        run
+    }
+
+    fn refusal(run: &Run) -> String {
+        assert_eq!(run.error(), ("refused", None));
+        let Some(Err(error)) = &run.reply else {
+            panic!("an error")
+        };
+        error.message.clone().expect("a refusal says why")
+    }
+
+    #[test]
+    fn a_lua_error_in_this_windows_editor_ends_as_a_timeout() {
+        let traceback = "E5108: Error executing lua: [string \"lsp\"]:12: attempt to index a nil value\n\
+                         stack traceback:\n\t[C]: in function 'error'";
+        let run = collect_fails("gd-lua-error", false, RpcError::Nvim(traceback.into()));
         assert_eq!(run.error(), ("timeout", Some("gopls".to_owned())));
+    }
+
+    #[test]
+    fn an_editor_out_of_reach_is_refused_on_one_bounded_line() {
+        let long = format!("{}\nsecond line", "w".repeat(REASON_MAX * 2));
+        let run = collect_fails("gd-unreachable", false, RpcError::Unavailable(long));
+        let message = refusal(&run);
+        assert!(!message.contains('\n'), "{message}");
+        assert!(message.starts_with("gd: no editor to ask: www"), "{message}");
+        assert_eq!(message.chars().count(), "gd: ".len() + REASON_MAX + 1, "{message}");
+        assert!(message.ends_with('…'));
+    }
+
+    #[test]
+    fn window_1s_refusal_over_the_link_is_named_on_its_first_line() {
+        let run = collect_fails(
+            "gd-link-refused",
+            true,
+            RpcError::Nvim("session s1 is not held by window 2\nmore".into()),
+        );
+        assert_eq!(refusal(&run), "gd: session s1 is not held by window 2");
+    }
+
+    #[test]
+    fn a_failed_cited_ask_does_not_speak_for_a_symbol_search_never_answered() {
+        let root = project("gd-cited-fails", &[("a.go", "func Foo() {}\n")]);
+        let mut run = Run::new(&root, "Foo", Some(("a.go", 1)));
+        run.settle();
+        assert_eq!(run.rpc.last_arg("kind").unwrap().as_str(), Some("usages"));
+        run.rpc.fail_newest();
+        run.at(0);
+        assert_eq!(run.rpc.last_arg("kind").unwrap().as_str(), Some("workspace_symbols"));
+        run.at(2999);
+        assert!(run.reply.is_none());
+        run.at(3000);
+        assert_eq!(run.error(), ("timeout", None));
     }
 
     #[test]
@@ -1907,8 +2067,9 @@ mod tests {
             loop {
                 let mut sequencer = self.sequencer.borrow_mut();
                 let mut asks = self.asks.borrow_mut();
+                let way = LocalWay(Rc::new(self.link.clone()));
                 let mut cx = Cx {
-                    rpc: Some(&self.link as &dyn EditorRpc),
+                    way: Some(&way),
                     sequencer: &mut sequencer,
                     asks: &mut asks,
                     workers: &self.workers,
@@ -1972,6 +2133,78 @@ mod tests {
             .collect()
     }
 
+    #[test]
+    fn a_linked_window_lookup_uses_the_editor_way_and_preserves_transport_errors() {
+        use eitri_core::editor_tools::way::RemoteWay;
+        use eitri_core::window_link::EditorOp;
+        for (cited, fail_collect) in [(false, None), (true, None), (false, Some(false)), (false, Some(true))] {
+            let root = project("gd-linked", &[("a.rs", "fn Name() {}")]);
+            let (handle, page, _) = handle_with_recording_page();
+            let sent = Rc::new(RefCell::new(Vec::new()));
+            let record = sent.clone();
+            let file = root.join("a.rs");
+            let way = RemoteWay::new(
+                &root,
+                Box::new(move |op| {
+                    let collecting = matches!(op, EditorOp::AgentLspCollect { .. });
+                    let value = if collecting {
+                        done(
+                            if cited { "definitions" } else { "workspace_symbols" },
+                            vec![item(&file, 7, 0, Some("Name"), None)],
+                            &[],
+                        )
+                    } else {
+                        started(&["gopls"], &[])
+                    };
+                    record.borrow_mut().push(serde_json::to_value(&op).unwrap());
+                    if fail_collect == Some(collecting) {
+                        return Pending::failed(eitri_core::nvim_rpc::RpcError::Unavailable(
+                            "linked editor disconnected".into(),
+                        ));
+                    }
+                    let editor = FakeEditor::default();
+                    let pending = editor.exec_lua(lsp::LSP_ASK_LUA, vec![]);
+                    editor.answer_oldest(&value);
+                    pending
+                }),
+            );
+            let tab = {
+                let mut state = handle.state.borrow_mut();
+                state.project_dir = root.clone();
+                state.editor_rpc = None;
+                state.editor_way = Some(Rc::new(way));
+                state.tabs.active()
+            };
+            let mut message: serde_json::Value = serde_json::from_str(&symbol_message("linked", tab, "Name")).unwrap();
+            if cited {
+                message["cited"] = json!({"path": "a.rs", "line": 1});
+            }
+            handle.page_message(ViewId::BASE, &message.to_string());
+            tick_handle_until(&handle, "linked symbol answer", || !symbol_replies(&page).is_empty());
+            let reply = &symbol_replies(&page)[0];
+            if fail_collect.is_some() {
+                assert_eq!(reply["error"]["kind"], "refused");
+                assert!(reply["error"]["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains("linked editor disconnected"));
+            } else {
+                assert_eq!(reply["matches"][0]["path"], "a.rs");
+                assert_eq!(reply["matches"][0]["line"], 7);
+                let ops = sent.borrow();
+                assert_eq!(ops.len(), 2);
+                assert_eq!(ops[0]["load"], false);
+                if cited {
+                    assert_eq!(ops[0]["path"], "a.rs");
+                    assert_eq!(ops[0]["include"], json!(["definitions"]));
+                    assert_eq!(ops[0]["symbol"], "Name");
+                } else {
+                    assert_eq!(ops[0]["query_for"][0], json!(["gopls", "Name"]));
+                }
+                assert_eq!(ops[1]["id"], ops[0]["id"]);
+            }
+        }
+    }
     #[test]
     fn the_reply_goes_to_the_asking_view_only() {
         let (handle, base, second) = handle_with_two_pages();

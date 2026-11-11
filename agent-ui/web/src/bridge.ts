@@ -99,8 +99,9 @@ export type OutboundMessage =
   | { type: "edit_draft"; request_id: string; tab: TabId; text: string }
   /** Append this typed text to the shared prompt history, e.g. `Ctrl+c`'s clear. */
   | { type: "history_push"; request_id: string; text: string }
-  /** `gf` on a path: open it in the scratch split, at `line` when given. */
-  | { type: "open_path"; request_id: string; path: string; line?: number; expect?: string }
+  /** `gf` on a path: open it in the scratch split, at `line` when given. `interaction` is the page's generation
+   *  when it asked: the host opens the editor only while the `panel_keys` mirror still carries it. */
+  | { type: "open_path"; request_id: string; path: string; line?: number; expect?: string; interaction?: number }
   /** `Ctrl+g` on a row: show this text read-only in the scratch split. */
   | { type: "view_in_editor"; request_id: string; title: string; text: string; tab?: boolean }
   /** A copy's text for the primary selection too (`primaryCopy.ts`). The shell's page handler takes this
@@ -158,8 +159,8 @@ export type OutboundMessage =
    *  because the capture controller (`install_module_nav`) that reads it back is itself installed
    *  once per window. `"other"` covers everything that is neither a live BROWSE nor a live INPUT:
    *  the empty tab's own menu/composer count as `"browse"`/`"input"` too (`core::agent_bridge::
-   *  PanelKeys`). */
-  | { type: "panel_keys"; request_id: string; mode: PanelKeysMode }
+   *  PanelKeys`). `interaction` is the page's interaction generation (`open_path`'s). */
+  | { type: "panel_keys"; request_id: string; mode: PanelKeysMode; interaction?: number }
   /** A stale mirror, either way: a `nav_key` this page could not apply -- the mirror was a
    *  keystroke stale, an overlay owns the keys, or the session it named has ended -- comes back
    *  here so Rust runs the chord's ordinary `move_focus` instead of silently dropping the key

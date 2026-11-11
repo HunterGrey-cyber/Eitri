@@ -144,6 +144,7 @@ describe("gd on the page", () => {
       paths: [{ path: "src/a.go", line: 10 }, { path: "test/a.go", line: 10 }] });
     press("s");
     expect(last("open_path")).toMatchObject({ path: "test/a.go", line: 10, expect: "serve_replay" });
+    expect(last("open_path")!.interaction).toBe(last("panel_keys")!.interaction);
   });
   it("explains how to look up a name when the BROWSE row has no paths", () => {
     const { gd, container } = setup("Name"); gd();
@@ -171,6 +172,38 @@ describe("gd on the page", () => {
     const { gd, press } = setup("Name\nmesh.go:142"); press("v"); gd();
     expect(last("editor_symbol")).toMatchObject({ name: "Name" });
     expect(last("editor_symbol")).not.toHaveProperty("cited");
+  });
+  it("a newer name gd discards the older reply and its timer", () => {
+    const { gd, press, container } = setup("Name"); press("v"); gd();
+    const older = last("editor_symbol")!.request_id;
+    press("v"); gd();
+    dispatch({ kind: "editor_symbol_result", requestId: older, matches: [match("old.rs", 1)] });
+    expect(last("open_path")).toBeUndefined();
+    answer([match("new.rs", 2)]);
+    expect(last("open_path")).toMatchObject({ path: "new.rs", line: 2 });
+    act(() => vi.advanceTimersByTime(4000));
+    expect(container.textContent).not.toContain("gd: no answer in 3 s");
+  });
+  it("a direct path gd also discards an older name lookup", () => {
+    const { gd, press } = setup("Name at a.rs:3"); press("v"); gd();
+    const older = last("editor_symbol")!.request_id;
+    gd();
+    const opened = posted.filter((p) => p.type === "open_path").length;
+    dispatch({ kind: "editor_symbol_result", requestId: older, matches: [match("old.rs", 1)] });
+    expect(posted.filter((p) => p.type === "open_path")).toHaveLength(opened);
+  });
+  it("gf drops a pending name gd without moving the interaction", () => {
+    const { gd, press, container } = setup("Name at a.rs:3"); press("v"); gd();
+    const older = last("editor_symbol")!.request_id;
+    const mirrors = posted.filter((p) => p.type === "panel_keys").length;
+    press("g"); press("f");
+    expect(last("open_path")).toMatchObject({ path: "a.rs", line: 3 });
+    expect(posted.filter((p) => p.type === "panel_keys")).toHaveLength(mirrors);
+    const opened = posted.filter((p) => p.type === "open_path").length;
+    dispatch({ kind: "editor_symbol_result", requestId: older, matches: [match("old.rs", 1)] });
+    expect(posted.filter((p) => p.type === "open_path")).toHaveLength(opened);
+    act(() => vi.advanceTimersByTime(4000));
+    expect(container.textContent).not.toContain("gd: no answer in 3 s");
   });
   it("opens one symbol match via gf", () => {
     const { gd, press } = setup("Name"); press("v"); gd();
@@ -252,6 +285,36 @@ describe("gd on the page", () => {
     act(() => vi.advanceTimersByTime(5000));
     expect(container.textContent).not.toContain("gd: no answer in 3 s");
     answer([match("a.rs", 1)]); expect(last("open_path")).toBeUndefined();
+  });
+  it.each(["gf", "gd"])("%s's open carries the interaction its mirror last said, and leaving BROWSE moves it on", (verb) => {
+    const { gd, press } = setup(verb === "gf" ? "a.rs:7" : "Name");
+    if (verb === "gd") { press("v"); gd(); answer([match("a.rs", 7)]); }
+    else { press("g"); press("f"); }
+    const carried = last("open_path")!.interaction as number;
+    expect(carried).toBe(last("panel_keys")!.interaction);
+    act(() => vi.advanceTimersByTime(1000));
+    press("i");
+    expect(last("panel_keys")).toMatchObject({ mode: "input" });
+    expect(last("panel_keys")!.interaction as number).toBeGreaterThan(carried);
+  });
+  it.each(["typing", "focus"])("after an open, %s moves the interaction on once", (how) => {
+    const { press, container } = setup("a.rs:7");
+    press("g"); press("f");
+    const carried = last("open_path")!.interaction as number;
+    const before = posted.filter((p) => p.type === "panel_keys").length;
+    const away = () => how === "typing"
+      ? fireEvent.input(container.querySelector(".agent-ui-conversation")!)
+      : dispatch({ kind: "pane_focus", focused: false });
+    away(); away();
+    const mirrors = posted.filter((p) => p.type === "panel_keys").slice(before);
+    expect(mirrors).toHaveLength(1);
+    expect(mirrors[0]!.interaction as number).toBeGreaterThan(carried);
+  });
+  it("typing with no open out moves nothing", () => {
+    const { container } = setup("a.rs:7");
+    const before = posted.filter((p) => p.type === "panel_keys").length;
+    fireEvent.input(container.querySelector(".agent-ui-conversation")!);
+    expect(posted.filter((p) => p.type === "panel_keys")).toHaveLength(before);
   });
   it("a late single match while typing in the box opens nothing and names the place", () => {
     const { gd, press, container } = setup("Name"); press("v"); gd();

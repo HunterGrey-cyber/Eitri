@@ -12,6 +12,10 @@ pub(super) struct PageState {
     /// `Other` on every `ready` (`PanelKeys::Other`'s own doc says why, `reset_nav_mode_for_ready`
     /// is where the reset happens) -- see `AgentPanelHandle::panel_keys`.
     pub(super) nav_mode: Cell<PanelKeys>,
+    /// The interaction generation the page's last `panel_keys` carried (`panel::path_lookup` opens the editor for
+    /// an `open_path` only while it is the one the request carried). Forgotten with the mode, so a new document's
+    /// own mirror decides.
+    pub(super) interaction: Cell<Option<u64>>,
     /// Whether this page's pane holds the window's keyboard focus, as the window's focus tracking last
     /// reported it. It is held here so that a freshly loaded document (first load or a
     /// `prefix r` reload) is told on `ready`. A document is otherwise told only when focus
@@ -44,6 +48,7 @@ impl Default for PageState {
         PageState {
             document_ready: false,
             nav_mode: Cell::new(PanelKeys::Other),
+            interaction: Cell::new(None),
             pane_focused: false,
             last_tabs_payload: None,
             tabs_delivered: 0,
@@ -273,6 +278,7 @@ impl OwedAnswers {
 pub(super) fn reset_nav_mode_for_ready(state: &AgentPanelState, view: ViewId) {
     if let Some(record) = state.page(view) {
         record.nav_mode.set(PanelKeys::Other);
+        record.interaction.set(None);
     }
 }
 
@@ -284,6 +290,7 @@ pub(super) fn reset_nav_mode_for_ready(state: &AgentPanelState, view: ViewId) {
 pub(super) fn forget_the_pages_nav_mode(state: &AgentPanelState, view: ViewId) {
     if let Some(record) = state.page(view) {
         record.nav_mode.set(PanelKeys::Other);
+        record.interaction.set(None);
     }
 }
 

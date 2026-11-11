@@ -9000,7 +9000,7 @@ describe("the session chooser", () => {
     // The chooser's own close is still local -- no round trip to Rust for IT --
     // and the mirror posts once, BROWSE: this landing keeps BROWSE throughout (unlike the old
     // INPUT-landing behaviour this test used to pin), so there is no second, mode-changing post.
-    expect(posted.slice(postsBefore)).toEqual([{ type: "panel_keys", request_id: expect.any(String), mode: "browse" }]);
+    expect(posted.slice(postsBefore)).toEqual([{ type: "panel_keys", request_id: expect.any(String), mode: "browse", interaction: expect.any(Number) }]);
     expect(container.querySelector(".chooser")).toBeNull();
     expect(container.querySelector("textarea")).toBeNull();
     expect(document.activeElement).toBe(container.querySelector(".empty-tab"));

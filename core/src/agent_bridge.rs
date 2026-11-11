@@ -388,6 +388,10 @@ pub enum InboundMessage {
         line: Option<u32>,
         #[serde(default)]
         expect: Option<String>,
+        /// The page's interaction generation when it asked; the editor is opened only while the page's
+        /// `panel_keys` mirror still carries the same one.
+        #[serde(default)]
+        interaction: Option<u64>,
     },
     /// A symbol name is data for the editor, never Lua or Vim source.
     EditorSymbol {
@@ -549,6 +553,9 @@ pub enum InboundMessage {
     PanelKeys {
         request_id: String,
         mode: PanelKeys,
+        /// The page's interaction generation, which `open_path` carries too.
+        #[serde(default)]
+        interaction: Option<u64>,
     },
     /// The mode mirror's stale-state recovery: a `nav_key` the page could not apply against its own
     /// current state. `shell` runs `move_focus(agent, direction)`, i.e. exactly what the chord would
