@@ -29,7 +29,7 @@
 //! A path found empty when the caller named bytes is the same refusal: writing would bring back a
 //! file someone removed.
 
-use std::ffi::CString;
+use std::ffi::{CString, OsStr};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::ffi::OsStrExt;
@@ -62,9 +62,27 @@ pub struct Target {
     parent: Option<OwnedFd>,
     leaf: CString,
     rel: PathBuf,
+    /// The inode whose creation time authorized deletion, retained across the final content check.
+    pub(super) delete_identity: Option<(u64, u64)>,
 }
 
 impl Target {
+    pub(super) fn identity(&self) -> io::Result<Option<(u64, u64)>> {
+        self.sibling_identity(OsStr::from_bytes(self.leaf.as_bytes()))
+    }
+
+    /// Look up another name through this same held parent, without following the leaf.
+    pub(super) fn sibling_identity(&self, leaf: &OsStr) -> io::Result<Option<(u64, u64)>> {
+        let Some(parent) = &self.parent else {
+            return Ok(None);
+        };
+        match stat_at(parent, &c_name(leaf.as_bytes())?) {
+            Ok(st) => Ok(Some(identity_of(&st))),
+            Err(e) if e.raw_os_error() == Some(libc::ENOENT) => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
     /// The path the target was asked for, relative to the project root.
     pub fn rel(&self) -> &Path {
         &self.rel
@@ -316,6 +334,7 @@ impl ProjectDir {
                         parent: None,
                         leaf,
                         rel: rel.to_path_buf(),
+                        delete_identity: None,
                     })
                 }
                 Err(e) => return Err(io_err(e)),
@@ -326,6 +345,7 @@ impl ProjectDir {
             parent: Some(dir),
             leaf,
             rel: rel.to_path_buf(),
+            delete_identity: None,
         })
     }
 
@@ -424,7 +444,8 @@ thread_local! {
 
 /// Birth time if the filesystem supplies it, otherwise modification time; no link is followed.
 /// The flag distinguishes proof of creation from a modification that could expose an old file.
-pub(super) fn file_origin_ns(target: &Target) -> io::Result<(u128, bool)> {
+/// The device/inode comes from that same stat, so this proof cannot authorize a different inode.
+pub(super) fn file_origin_ns(target: &Target) -> io::Result<(u128, bool, (u64, u64))> {
     let parent = target
         .parent
         .as_ref()
@@ -439,7 +460,7 @@ pub(super) fn file_origin_ns(target: &Target) -> io::Result<(u128, bool)> {
                 parent.as_raw_fd(),
                 target.leaf.as_ptr(),
                 libc::AT_SYMLINK_NOFOLLOW,
-                libc::STATX_BTIME,
+                libc::STATX_BTIME | libc::STATX_INO,
                 sx.as_mut_ptr(),
             )
         } == 0
@@ -447,15 +468,30 @@ pub(super) fn file_origin_ns(target: &Target) -> io::Result<(u128, bool)> {
             // SAFETY: statx succeeded and initialized sx.
             let sx = unsafe { sx.assume_init() };
             if sx.stx_mask & libc::STATX_BTIME != 0 {
-                return Ok((timestamp_ns(sx.stx_btime.tv_sec, sx.stx_btime.tv_nsec as i64), true));
+                if sx.stx_mask & libc::STATX_INO == 0 {
+                    return Err(io::Error::other("creation time has no inode identity"));
+                }
+                return Ok((
+                    timestamp_ns(sx.stx_btime.tv_sec, sx.stx_btime.tv_nsec as i64),
+                    true,
+                    (libc::makedev(sx.stx_dev_major, sx.stx_dev_minor) as u64, sx.stx_ino),
+                ));
             }
         }
     }
     #[cfg(target_os = "macos")]
     if st.st_birthtime > 0 {
-        return Ok((timestamp_ns(st.st_birthtime, st.st_birthtime_nsec), true));
+        return Ok((
+            timestamp_ns(st.st_birthtime, st.st_birthtime_nsec),
+            true,
+            identity_of(&st),
+        ));
     }
-    Ok((timestamp_ns(st.st_mtime, st.st_mtime_nsec), false))
+    Ok((timestamp_ns(st.st_mtime, st.st_mtime_nsec), false, identity_of(&st)))
+}
+
+fn identity_of(st: &libc::stat) -> (u64, u64) {
+    (st.st_dev as u64, st.st_ino as u64)
 }
 
 fn timestamp_ns(seconds: i64, nanos: i64) -> u128 {
@@ -594,7 +630,10 @@ pub fn replace(
         (Content::Absent, Some(_)) => {
             let st = st.expect("a kind comes from a stat");
             // An unlink cannot be taken back: the file must still be what the caller judged.
-            if !still_as_judged(parent, &target.leaf, &st, expected.as_deref(), judged_link).map_err(io_err)?
+            if target
+                .delete_identity
+                .is_some_and(|identity| identity_of(&st) != identity)
+                || !still_as_judged(parent, &target.leaf, &st, expected.as_deref(), judged_link).map_err(io_err)?
                 || !target.parent_is_reached().map_err(io_err)?
             {
                 return Err(WriteError::Changed);
@@ -1517,6 +1556,54 @@ mod tests {
         for wanted in [0o4755, 0o600, 0o1755] {
             assert!(can_preserve_mode(wanted, 0o644, 1000, 1002, 1000, false, false).is_ok());
         }
+    }
+
+    #[test]
+    fn deletion_refuses_an_identical_inode_replaced_after_authorization() {
+        use std::os::unix::fs::MetadataExt;
+
+        let scratch = ScratchDir::new("eitri-write", "delete-identity");
+        let project = scratch.join("project");
+        std::fs::create_dir(&project).unwrap();
+        let path = project.join("file");
+        let replacement = project.join("replacement");
+        for path in [&path, &replacement] {
+            std::fs::write(path, b"same bytes\n").unwrap();
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        let review = scratch.join("review");
+        let shadow = Shadow::open_with_excludes(&review, &project, None).unwrap();
+        let journal = Journal::open(&review).unwrap();
+        let root = ProjectDir::open(&project).unwrap();
+        let mut target = root.target(Path::new("file"), false).unwrap();
+        let (_, _, identity) = file_origin_ns(&target).unwrap();
+        assert_eq!(target.identity().unwrap(), Some(identity));
+        target.delete_identity = Some(identity);
+        let note = JournalNote {
+            session: "s1".into(),
+            path: PathBuf::from("file"),
+            pre: Some(shadow.store_blob(b"same bytes\n").unwrap()),
+            pre_mode: 0o600,
+            intended: None,
+        };
+        let replacement_identity = std::fs::metadata(&replacement).unwrap();
+        std::fs::rename(&replacement, &path).unwrap();
+        let result = replace(
+            &target,
+            &Content::Absent,
+            &note,
+            &journal,
+            &shadow,
+            &FsHooks::default(),
+            None,
+        );
+        assert!(matches!(result, Err(WriteError::Changed)), "{result:?}");
+        assert_eq!(std::fs::read(&path).unwrap(), b"same bytes\n");
+        let after = std::fs::metadata(&path).unwrap();
+        assert_eq!(
+            (after.dev(), after.ino()),
+            (replacement_identity.dev(), replacement_identity.ino())
+        );
     }
 
     #[test]

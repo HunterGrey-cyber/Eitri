@@ -744,6 +744,40 @@ fn excludes_changed_after_the_end_refuse_deletion_with_changed_ancestor_rules() 
 }
 
 #[test]
+fn deletion_refuses_an_old_identical_inode_swapped_in_at_the_final_check() {
+    let mut w = World::new("delete-identity");
+    if !has_birth_time(&w.project) {
+        return;
+    }
+    w.write("older.txt", b"same bytes\n", 0o600);
+    let older = w.file("older.txt");
+    let identity = meta(&older);
+    let n = w.turn(|w| w.write("new.txt", b"same bytes\n", 0o600));
+    let target = w.file("new.txt");
+    let swapped = target.clone();
+    let result = w
+        .review
+        .revert_job(
+            w.guard(),
+            wanted(),
+            SESSION,
+            n,
+            Scope::Turn,
+            "new.txt",
+            RevertTarget::File,
+            w.clear("new.txt"),
+        )
+        .on_final_check(Arc::new(move || {
+            std::fs::rename(&older, &swapped).unwrap();
+        }))
+        .run();
+    assert!(matches!(result, Err(Refusal::ChangedSinceEnd)), "{result:?}");
+    let after = meta(&target);
+    assert_eq!((after.dev(), after.ino()), (identity.dev(), identity.ino()));
+    assert_eq!(w.read("new.txt"), b"same bytes\n");
+}
+
+#[test]
 fn new_files_beside_ignored_files_are_deleted() {
     for (old, new, rule) in [
         ("logs/a.log", "logs/new.txt", "*.log\n"),

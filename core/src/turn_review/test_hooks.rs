@@ -21,6 +21,9 @@ thread_local! {
     /// In a recovery's restore, right after the bytes the file holds now are stored and before the
     /// revert anchor that keeps them is written.
     pub(crate) static AFTER_RECOVERY_STORE: Hook = const { RefCell::new(None) };
+    /// In a revert's deletion check, after the target was compared with the recorded ignored names
+    /// and before the identity that binds the delete is read.
+    pub(crate) static AFTER_IGNORED_ALIAS_CHECK: Hook = const { RefCell::new(None) };
 }
 
 /// Sets `hook` to run `then` the next time this thread reaches it.

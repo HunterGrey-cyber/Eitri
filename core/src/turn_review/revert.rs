@@ -806,9 +806,18 @@ impl RevertJob {
             }
             RevertTarget::File => plan_file(&rel, base, end, &current)?,
         };
-        if planned.kind == RevertKind::Delete {
-            refuse_uncertain_delete(&shadow, &resolved.from, &end_commit, &rel, &root, &target)?;
-        }
+        let delete_identity = if planned.kind == RevertKind::Delete {
+            Some(refuse_uncertain_delete(
+                &shadow,
+                &resolved.from,
+                &end_commit,
+                &rel,
+                &root,
+                &target,
+            )?)
+        } else {
+            None
+        };
         let pre = save_current(&shadow, &current)?;
         let post = save_content(&shadow, &planned.content)?;
         let at_ms = wall_clock_ms();
@@ -824,6 +833,7 @@ impl RevertJob {
             &root,
             &rel,
             &current,
+            delete_identity,
             !matches!(planned.content, Content::Absent),
             self.final_hook.as_ref(),
             || Refusal::ChangedSinceEnd,
@@ -911,6 +921,7 @@ impl UndoJob {
             &root,
             &rel,
             &current,
+            None,
             !matches!(content, Content::Absent),
             self.final_hook.as_ref(),
             || Refusal::ChangedSinceRevert,
@@ -1113,7 +1124,7 @@ fn restore_entry(
         mode: entry.mode,
     };
     let shown = rel.display().to_string();
-    let target = final_checks(guard, None, clear, &root, &rel, &current, true, hook, || {
+    let target = final_checks(guard, None, clear, &root, &rel, &current, None, true, hook, || {
         Refusal::Unavailable(format!(
             "{shown} changed while it was being restored; nothing was written"
         ))
@@ -1181,6 +1192,7 @@ fn final_checks(
     root: &ProjectDir,
     rel: &Path,
     expected: &Current,
+    delete_identity: Option<(u64, u64)>,
     writes_something: bool,
     hook: Option<&FinalHook>,
     changed: impl Fn() -> Refusal,
@@ -1192,7 +1204,13 @@ fn final_checks(
     still_wanted(wanted)?;
     still_clear(clear, Instant::now())?;
     let create_missing = *expected == Current::Absent && writes_something;
-    let target = root.target(rel, create_missing).map_err(write_refusal)?;
+    let mut target = root.target(rel, create_missing).map_err(write_refusal)?;
+    if let Some(identity) = delete_identity {
+        if target.identity().map_err(|e| read_failed(rel, e))? != Some(identity) {
+            return Err(changed());
+        }
+        target.delete_identity = Some(identity);
+    }
     let limit = match expected {
         Current::Regular { bytes, .. } => bytes.len() as u64,
         Current::Symlink { target } => target.len() as u64,
@@ -1299,7 +1317,7 @@ fn refuse_uncertain_delete(
     rel: &Path,
     root: &ProjectDir,
     target: &Target,
-) -> Result<(), Refusal> {
+) -> Result<(u64, u64), Refusal> {
     let uncertain = || {
         Refusal::Unavailable(
             "this file may have existed before the turn; its ignore rules or creation time do not prove it is new"
@@ -1310,9 +1328,38 @@ fn refuse_uncertain_delete(
         .recorded_ignored(base)
         .map_err(store_failed)?
         .ok_or_else(uncertain)?;
-    if ignored.contains(rel) {
+    let mut held_parent: Option<Target> = None;
+    // What the alias check found at `rel`: looked up once, so every comparison is with the same file,
+    // and later required to be the file whose identity binds the delete.
+    let mut checked_at_rel: Option<Option<(u64, u64)>> = None;
+    if ignored
+        .contains_with_stat(rel, |path| {
+            if path == rel {
+                if let Some(seen) = checked_at_rel {
+                    return Ok(seen);
+                }
+            }
+            if held_parent
+                .as_ref()
+                .is_none_or(|held| held.rel().parent() != path.parent())
+            {
+                held_parent = Some(root.target(path, false).map_err(std::io::Error::other)?);
+            }
+            let leaf = path
+                .file_name()
+                .ok_or_else(|| std::io::Error::other("path has no file name"))?;
+            let found = held_parent.as_ref().unwrap().sibling_identity(leaf)?;
+            if path == rel {
+                checked_at_rel = Some(found);
+            }
+            Ok(found)
+        })
+        .map_err(|e| read_failed(rel, e))?
+    {
         return Err(uncertain());
     }
+    #[cfg(test)]
+    super::test_hooks::run(&super::test_hooks::AFTER_IGNORED_ALIAS_CHECK);
     let (taken, before) = shadow
         .deletion_provenance(base)
         .map_err(store_failed)?
@@ -1339,17 +1386,21 @@ fn refuse_uncertain_delete(
     for dir in rel.ancestors().skip(1).filter(|dir| !dir.as_os_str().is_empty()) {
         if !ignored.contains_directory(dir) && !shadow.tree_contains(base, dir).map_err(store_failed)? {
             let ancestor = root.target(dir, false).map_err(write_refusal)?;
-            let (origin, birth) = super::write::file_origin_ns(&ancestor).map_err(|e| read_failed(dir, e))?;
+            let (origin, birth, _) = super::write::file_origin_ns(&ancestor).map_err(|e| read_failed(dir, e))?;
             if !birth || origin <= taken {
                 return Err(uncertain());
             }
         }
     }
-    let (origin, birth) = super::write::file_origin_ns(target).map_err(|e| read_failed(rel, e))?;
+    let (origin, birth, identity) = super::write::file_origin_ns(target).map_err(|e| read_failed(rel, e))?;
     if origin <= taken || (changed && !birth) {
         return Err(uncertain());
     }
-    Ok(())
+    // A file put at the name after the alias check was never compared with the ignored names.
+    if checked_at_rel.is_some_and(|seen| seen != Some(identity)) {
+        return Err(uncertain());
+    }
+    Ok(identity)
 }
 
 /// What a revert will write, and what it records about it.
@@ -1564,7 +1615,13 @@ fn splice_hunk(
                 matches.next().is_none().then_some(first)
             };
             unique(end)
-                .and_then(|_| unique(cur))
+                .zip(unique(cur))
+                .filter(|&(at_end, at_cur)| {
+                    // Uniqueness alone cannot distinguish a surviving region from a copy elsewhere.
+                    cur[..at_cur] == end[..at_end]
+                        || cur[at_cur + end_region.len()..] == end[at_end + end_region.len()..]
+                })
+                .map(|(_, at_cur)| at_cur)
                 .ok_or_else(|| Refusal::Unavailable("too large to locate the change; revert the whole file".into()))?
         } else {
             unchanged_region(end, cur, at, end_region.len()).ok_or(Refusal::ChangedSinceEnd)?
@@ -1976,6 +2033,96 @@ mod tests {
         }));
         assert!(matches!(revert.run(), Err(Refusal::ChangedSinceEnd)));
         assert_eq!(reads(), vec![(7, 7), (7, 8)]);
+    }
+
+    #[test]
+    fn over_budget_hunks_refuse_an_appended_copy_of_an_edited_region() {
+        let end: Vec<Vec<u8>> = (0..2100).map(|n| format!("line {n}\n").into_bytes()).collect();
+        let mut base = end.clone();
+        base[1003] = b"OLD\n".to_vec();
+        let mut cur = end.clone();
+        cur[1003] = b"USER EDIT\n".to_vec();
+        cur.extend_from_slice(&end[1000..1007]);
+        assert!(matches!(
+            splice_hunk(&base, &end, &cur, (1001, 7), (1001, 7)),
+            Err(Refusal::Unavailable(why)) if why.contains("too large to locate the change")
+        ));
+    }
+
+    #[test]
+    fn over_budget_hunks_refuse_a_surviving_near_twin_of_a_deleted_region() {
+        let mut base = lines(&["a\n", "b\n", "c\n", "OLD\n", "d\n", "e\n", "f\n"]);
+        base.extend((0..2100).map(|n| format!("middle {n}\n").into_bytes()));
+        base.extend(lines(&["a\n", "b\n", "c\n", "NEW\n", "d\n", "e\n", "g\n"]));
+        let mut end = base.clone();
+        end[3] = b"NEW\n".to_vec();
+        let mut cur = end[7..].to_vec();
+        *cur.last_mut().unwrap() = b"f\n".to_vec();
+        assert!(matches!(
+            splice_hunk(&base, &end, &cur, (1, 7), (1, 7)),
+            Err(Refusal::Unavailable(why)) if why.contains("too large to locate the change")
+        ));
+    }
+
+    #[test]
+    fn over_budget_hunks_keep_edits_on_either_side_of_the_region() {
+        let end: Vec<Vec<u8>> = (0..2100).map(|n| format!("line {n}\r\n").into_bytes()).collect();
+        let mut base = end.clone();
+        base[1003] = b"OLD\r\n".to_vec();
+        for edited in [10, 2000] {
+            let mut cur = end.clone();
+            cur[edited] = b"USER EDIT\r\n".to_vec();
+            let spliced = splice_hunk(&base, &end, &cur, (1001, 7), (1001, 7)).unwrap();
+            cur[1003] = base[1003].clone();
+            assert_eq!(spliced.bytes, cur.concat());
+            assert_eq!(spliced.at_line, 1001);
+        }
+    }
+
+    #[test]
+    fn a_file_put_at_the_name_after_the_ignored_alias_check_is_not_deleted() {
+        use super::super::shadow::{Limits, SnapshotKind, SnapshotLabel, SnapshotOutcome};
+        use super::super::test_hooks::{self, AFTER_IGNORED_ALIAS_CHECK};
+        let scratch = crate::test_scratch_dir::ScratchDir::new("review", "alias-swap");
+        let project = scratch.join("project");
+        std::fs::create_dir(&project).unwrap();
+        let project = project.canonicalize().unwrap();
+        let shadow = Shadow::open_with_excludes(&scratch.join("store"), &project, None).unwrap();
+        let snapshot = |kind| {
+            let label = SnapshotLabel {
+                turn: 1,
+                kind,
+                turn_id: "t1".into(),
+                tab: 1,
+                time_ms: wall_clock_ms(),
+            };
+            match shadow.snapshot("s1", &label, &Limits::default()) {
+                SnapshotOutcome::Taken(taken) => taken.commit,
+                SnapshotOutcome::Unavailable(why) => panic!("{why}"),
+            }
+        };
+        let (ignored, created) = (project.join("kept.log"), project.join("new.txt"));
+        std::fs::write(project.join(".gitignore"), b"*.log\n").unwrap();
+        std::fs::write(&ignored, b"old\n").unwrap();
+        let base = snapshot(SnapshotKind::Base);
+        // The ignored file is made again during the turn, so its inode is born after the base too.
+        std::fs::remove_file(&ignored).unwrap();
+        std::fs::write(&ignored, b"created\n").unwrap();
+        std::fs::write(&created, b"created\n").unwrap();
+        let end = snapshot(SnapshotKind::End);
+        let root = ProjectDir::open(&project).unwrap();
+        let rel = Path::new("new.txt");
+        let target = root.target(rel, false).unwrap();
+        if !super::super::write::file_origin_ns(&target).unwrap().1 {
+            return;
+        }
+        assert!(refuse_uncertain_delete(&shadow, &base, &end, rel, &root, &target).is_ok());
+        test_hooks::set(&AFTER_IGNORED_ALIAS_CHECK, move || {
+            std::fs::remove_file(&created).unwrap();
+            std::fs::hard_link(&ignored, &created).unwrap();
+        });
+        let result = refuse_uncertain_delete(&shadow, &base, &end, rel, &root, &target);
+        assert!(matches!(result, Err(Refusal::Unavailable(_))), "{result:?}");
     }
 
     #[test]

@@ -69,6 +69,32 @@ impl RecordedIgnored {
         })
     }
 
+    /// Ask the volume about aliases too: its case and normalization rules may exceed ASCII folding.
+    pub(super) fn contains_with_stat(
+        &self,
+        path: &Path,
+        mut stat: impl FnMut(&Path) -> std::io::Result<Option<(u64, u64)>>,
+    ) -> std::io::Result<bool> {
+        if self.contains(path) {
+            return Ok(true);
+        }
+        for entry in nul_separated(&self.0) {
+            let directory = entry.ends_with(b"/");
+            let entry = Path::new(OsStr::from_bytes(entry.strip_suffix(b"/").unwrap_or(entry)));
+            for candidate in path.ancestors().take_while(|p| !p.as_os_str().is_empty()) {
+                if (candidate == path || directory) && candidate.parent() == entry.parent() {
+                    if let Some(identity) = stat(candidate)? {
+                        if stat(entry)? == Some(identity) {
+                            return Ok(true);
+                        }
+                    }
+                    break;
+                }
+            }
+        }
+        Ok(false)
+    }
+
     /// A listed child proves its ancestors were directories, even without any tracked files.
     /// Positive evidence uses exact bytes: case folding must never authorize deletion.
     pub(super) fn contains_directory(&self, path: &Path) -> bool {
@@ -2112,6 +2138,57 @@ fn write_atomically(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn recorded_ignored_unicode_aliases_refuse_by_filesystem_identity() {
+        for (recorded, target, alias) in [
+            ("σ.txt\0", "Σ.txt", "σ.txt"),
+            ("é.txt\0", "É.txt", "é.txt"),
+            ("café.txt\0", "cafe\u{301}.txt", "café.txt"),
+            ("σ/\0", "Σ/new.txt", "σ"),
+            ("parent/é/\0", "parent/É/nested/new.txt", "parent/é"),
+        ] {
+            let ignored = RecordedIgnored(recorded.as_bytes().to_vec());
+            let target = Path::new(target);
+            let alias = Path::new(alias);
+            let equivalent = if recorded.ends_with("/\0") {
+                target.ancestors().find(|path| path.parent() == alias.parent()).unwrap()
+            } else {
+                target
+            };
+            assert!(!ignored.contains(target));
+            assert!(
+                ignored
+                    .contains_with_stat(target, |path| {
+                        Ok((path == alias || path == equivalent).then_some((1, 42)))
+                    })
+                    .unwrap(),
+                "{recorded:?}: {target:?}"
+            );
+            assert!(!ignored
+                .contains_with_stat(target, |path| {
+                    Ok(if path == alias { Some((1, 41)) } else { Some((1, 42)) })
+                })
+                .unwrap());
+            assert!(!ignored.contains_directory(equivalent));
+        }
+    }
+
+    #[test]
+    fn recorded_ignored_identity_checks_propagate_errors_and_do_not_match_missing_names() {
+        let ignored = RecordedIgnored("é.txt\0".as_bytes().to_vec());
+        let target = Path::new("É.txt");
+        assert!(!ignored.contains_with_stat(target, |_| Ok(None)).unwrap());
+        assert!(ignored
+            .contains_with_stat(target, |path| {
+                if path == target {
+                    Ok(Some((1, 42)))
+                } else {
+                    Err(std::io::Error::from_raw_os_error(libc::EACCES))
+                }
+            })
+            .is_err());
+    }
 
     #[test]
     fn recorded_ignored_paths_are_bounded_and_retained_with_the_snapshot() {
