@@ -633,6 +633,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(target_os = "macos", ignore = "macOS has no /dev/full to stand in for a full disk")]
     fn a_write_the_disk_refuses_is_dropped_and_counted() {
         let full = File::options().write(true).open("/dev/full").unwrap();
         let dir = scratch("full");

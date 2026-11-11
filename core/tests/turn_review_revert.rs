@@ -75,14 +75,19 @@ impl Drop for Scratch {
     }
 }
 
-/// This process's umask, from `/proc/self/status` (setting it to read it would race the other tests).
-fn umask() -> u32 {
+/// The mode a revert gives a file it puts back where none is, from git's mode `base`: under this process's umask,
+/// read from `/proc/self/status` (setting it to read it would race the other tests). macOS has no way to read the
+/// umask without setting it, so there the revert keeps the owner's bits alone, and so does this.
+fn restored_mode(base: u32) -> u32 {
+    if cfg!(not(target_os = "linux")) {
+        return base & 0o700;
+    }
     let status = std::fs::read_to_string("/proc/self/status").expect("/proc/self/status");
     let value = status
         .lines()
         .find_map(|line| line.strip_prefix("Umask:"))
         .expect("a Umask line");
-    u32::from_str_radix(value.trim(), 8).expect("an octal umask")
+    base & !u32::from_str_radix(value.trim(), 8).expect("an octal umask")
 }
 
 fn now() -> u64 {
@@ -1206,7 +1211,7 @@ fn whole_file_delete_restore_replace() {
     assert_eq!(w.read("bin/run.sh"), b"#!/bin/sh\necho base\n");
     assert_eq!(
         mode_of(&w.file("bin/run.sh")),
-        0o755 & !umask(),
+        restored_mode(0o755),
         "the base's mode, under the umask"
     );
     assert_eq!(restored.pre, Saved::Absent);
@@ -1958,7 +1963,7 @@ fn undo_of_a_regular_turned_symlink() {
     assert_eq!(w.read("thing"), b"regular\n");
     assert_eq!(
         mode_of(&w.file("thing")),
-        0o644 & !umask(),
+        restored_mode(0o644),
         "git's mode, under the umask"
     );
     w.undo(&applied).unwrap();

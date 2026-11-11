@@ -15,7 +15,7 @@ pub mod wire;
 
 pub use publish::{agents_dir, new_instance, Publisher};
 #[cfg(target_os = "linux")]
-pub use read::{scan_once, scan_windows, Reader, ReaderEvent};
+pub use read::{scan_once, scan_windows, Reader};
 pub use row::{Background, Change, Departed, GoneWhy, LabelFrom, Needs, ProcessFile, ProjectRef, Row, View, WindowRef};
 pub use state::{derive, Class, EndedHow, State, TabInputs};
 
@@ -30,6 +30,17 @@ pub const LABEL_MAX: usize = 40;
 pub const GESTURE_MS: u64 = 1_000;
 pub const NEW_MIN_INTERVAL_MS: u64 = 1_000;
 pub const ROUND_MAX_IDLE_MS: u64 = 600_000;
+
+/// What a reader of the agents directory hands its caller, on the reader's own thread. Nearly every event is a
+/// change, so the change is not boxed to spare the rare error its size. Defined here, not beside the Linux reader,
+/// because a page's feed takes these events on every platform.
+#[allow(clippy::large_enum_variant)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReaderEvent {
+    Change(Change),
+    /// The reader cannot go on (the directory went, the watch failed); nothing follows it.
+    Error(String),
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]

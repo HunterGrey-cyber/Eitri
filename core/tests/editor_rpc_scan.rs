@@ -2359,6 +2359,9 @@ fn literals_are_read_with_and_without_the_tests() {
     assert_eq!(literals(text, true), ["\"one\"", "\"two\""]);
 }
 
+// Linux only: the table leaves out the IDE server's chunks where that module is not built, while the scan
+// reads every source file; the Linux run covers the whole table.
+#[cfg(target_os = "linux")]
 #[test]
 fn every_exec_lua_code_argument_is_in_the_chunk_table() {
     let sources = source_scan::rust_sources(&["core/src", "shell/src"]);

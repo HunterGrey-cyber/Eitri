@@ -611,20 +611,57 @@ impl<'a> Deadline<'a> {
 impl Read for Deadline<'_> {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         let left = self.left()?;
-        self.stream.set_read_timeout(Some(left))?;
-        self.stream.read(buf)
+        match self.stream.set_read_timeout(Some(left)) {
+            Ok(()) => self.stream.read(buf),
+            // Nothing more can arrive, so what is left is read as one call that never waits.
+            Err(e) if shut_both_ways(&e) => recv_without_waiting(self.stream, buf),
+            Err(e) => Err(e),
+        }
     }
 }
 
 impl Write for Deadline<'_> {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         let left = self.left()?;
-        self.stream.set_write_timeout(Some(left))?;
-        self.stream.write(buf)
+        match self.stream.set_write_timeout(Some(left)) {
+            Ok(()) => self.stream.write(buf),
+            Err(e) if shut_both_ways(&e) => Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "the socket is shut in both directions",
+            )),
+            Err(e) => Err(e),
+        }
     }
 
     fn flush(&mut self) -> io::Result<()> {
         self.stream.flush()
+    }
+}
+
+/// Whether setting a timeout failed because both directions of the socket are shut. macOS refuses every socket
+/// option then, with `EINVAL`: the client has shut its writing side once its request is out, so a server that answers
+/// and closes before the client's next read leaves it in that state, and so does a peer that closed on a server.
+/// Neither direction can block any more: a read returns what is left and then the end, a write fails. Linux sets the
+/// timeout in that state too, so there this is never true and the plain read or write runs.
+fn shut_both_ways(e: &io::Error) -> bool {
+    cfg!(target_os = "macos") && e.kind() == io::ErrorKind::InvalidInput
+}
+
+/// One `recv` that never waits (`MSG_DONTWAIT`), for a socket [`shut_both_ways`] says nothing more can arrive on.
+fn recv_without_waiting(stream: &UnixStream, buf: &mut [u8]) -> io::Result<usize> {
+    // SAFETY: `buf` is writable for its whole length, and the descriptor is `stream`'s own, open for the call.
+    let n = unsafe {
+        libc::recv(
+            stream.as_raw_fd(),
+            buf.as_mut_ptr().cast(),
+            buf.len(),
+            libc::MSG_DONTWAIT,
+        )
+    };
+    if n < 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(n as usize)
     }
 }
 
@@ -788,6 +825,21 @@ mod tests {
         ));
     }
 
+    /// An answer the server wrote and closed on is read whole even once both directions are shut, which is when
+    /// macOS refuses the read timeout.
+    #[test]
+    fn an_answer_left_on_a_socket_shut_both_ways_is_read_whole() {
+        let (mut client, mut server) = UnixStream::pair().unwrap();
+        // The client's order: its request is out and its writing side shut before the answer comes.
+        client.shutdown(std::net::Shutdown::Write).unwrap();
+        write_answer(&mut server, &Answer::Text(b"left behind".to_vec())).unwrap();
+        drop(server);
+        let answer = read_answer(&mut Deadline::new(&mut client, PATIENT)).unwrap();
+        assert_eq!(answer, Answer::Text(b"left behind".to_vec()));
+        let mut rest = [0u8; 1];
+        assert_eq!(Deadline::new(&mut client, PATIENT).read(&mut rest).unwrap(), 0);
+    }
+
     #[test]
     fn a_reason_is_one_bounded_line() {
         let reason = bounded_reason(&format!("a\nb\x1b[31m{}", "é".repeat(600)));
@@ -810,6 +862,10 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(
+        target_os = "macos",
+        ignore = "the server admits a peer by its pid, which macOS does not give, so every request is refused there"
+    )]
     fn the_server_copies_and_pastes_through_the_host() {
         let dir = scratch("serve");
         let (socket, listener) = bound(&dir);
@@ -834,6 +890,10 @@ mod tests {
     /// The answer comes from the server's own limit (its words), not from the client giving up after
     /// a minute: that is the bound holding. A dropped reply is answered with its own words.
     #[test]
+    #[cfg_attr(
+        target_os = "macos",
+        ignore = "the server admits a peer by its pid, which macOS does not give, so every request is refused there"
+    )]
     fn a_host_that_never_answers_is_bounded_and_one_that_drops_the_reply_fails_at_once() {
         let dir = scratch("silent");
         let (socket, listener) = bound(&dir);
@@ -860,6 +920,10 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(
+        target_os = "macos",
+        ignore = "the server admits a peer by its pid, which macOS does not give, so every request is refused there"
+    )]
     fn a_copy_over_the_limit_is_refused_with_its_size() {
         let dir = scratch("big");
         let (socket, listener) = bound(&dir);
@@ -888,6 +952,10 @@ mod tests {
     /// A connection that never sends its request is dropped at the read limit, and the next request
     /// is served; an unbounded read would hold the server until the client gave up a minute later.
     #[test]
+    #[cfg_attr(
+        target_os = "macos",
+        ignore = "the server admits a peer by its pid, which macOS does not give, so every request is refused there"
+    )]
     fn a_request_that_never_arrives_does_not_hold_the_server() {
         let dir = scratch("stall");
         let (socket, listener) = bound(&dir);
@@ -903,6 +971,10 @@ mod tests {
     /// answer's deadline: the next request is answered, where an unbounded write would hold it until
     /// the client gave up.
     #[test]
+    #[cfg_attr(
+        target_os = "macos",
+        ignore = "the server admits a peer by its pid, which macOS does not give, so every request is refused there"
+    )]
     fn a_peer_that_never_reads_its_answer_holds_the_server_only_until_the_deadline() {
         let dir = scratch("drain");
         let (socket, listener) = bound(&dir);
@@ -924,6 +996,11 @@ mod tests {
     /// which a blocking `connect` would not. The outcome is the check; the watchdog only turns a hang
     /// into a failure.
     #[test]
+    #[cfg_attr(
+        target_os = "macos",
+        ignore = "macOS takes a backlog of 0 as its maximum and refuses a connect to a full queue at once \
+                  (ECONNREFUSED), so there is no full-queue wait to bound there"
+    )]
     fn a_full_queue_is_bounded_by_the_clients_wait() {
         let dir = scratch("queue");
         let (socket, listener) = bound(&dir);
@@ -1153,6 +1230,10 @@ mod tests {
     /// The real `/proc`, real processes: a child started with the switch socket and that child's own
     /// child descend from it; the same child started without it does not.
     #[test]
+    #[cfg_attr(
+        target_os = "macos",
+        ignore = "the descent walk reads parent links in /proc, which macOS does not have, so nothing descends there"
+    )]
     fn real_children_descend_only_through_the_one_holding_the_switch_socket() {
         let start = |with_var: bool| {
             let mut sh = std::process::Command::new("sh");

@@ -671,6 +671,10 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(
+        target_os = "macos",
+        ignore = "APFS refuses file names that are not UTF-8; this test needs one"
+    )]
     fn two_outside_names_that_read_alike_are_not_one_place() {
         let project = project("outside-alike");
         let named = project.beside.join(std::ffi::OsStr::from_bytes(b"secret\xff"));

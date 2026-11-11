@@ -44,15 +44,8 @@ use super::{
     MOVE_HOLD_MS, SCHEMA_V,
 };
 
-/// What a [`Reader`] hands its caller, on the reader's own thread. Nearly every event is a change, so the change
-/// is not boxed to spare the rare error its size.
-#[allow(clippy::large_enum_variant)]
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ReaderEvent {
-    Change(Change),
-    /// The reader cannot go on (the directory went, the watch failed); nothing follows it.
-    Error(String),
-}
+/// Still reachable here, where a reader's callers have always named it.
+pub use super::ReaderEvent;
 
 /// What one turn of the reader's loop did, for a test to follow without timing anything.
 #[doc(hidden)]

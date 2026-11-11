@@ -188,6 +188,8 @@ pub(super) fn chooser_records(
         .collect()
 }
 
+// Its one caller is the partner window's chooser, which only Linux has; the marking itself is tested everywhere.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub(super) fn mark_partner_records(records: &mut [ChooserRecord], window: Option<u8>, held: impl Fn(&str) -> bool) {
     for record in records {
         record.held_by_partner = window.is_some() && record.held_elsewhere && held(&record.provider_session_id);

@@ -259,6 +259,10 @@ fn a_missing_folder_reads_missing_and_a_file_reads_not_a_folder() {
     );
 }
 #[test]
+#[cfg_attr(
+    target_os = "macos",
+    ignore = "APFS refuses file names that are not UTF-8; this test needs one"
+)]
 fn a_non_utf8_name_keeps_its_raw_bytes() {
     let s = Scratch::new();
     let raw = OsString::from_vec(b"bad\xff\n\xe2\x80\xae".to_vec());

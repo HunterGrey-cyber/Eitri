@@ -1,6 +1,9 @@
 //! Environment wiring runs in a subprocess against the normal core library. Only the child with
 //! explicit scratch TMPDIR/runtime values bypasses state redirection; no real runtime directory is used.
+// The live mentions feed belongs to the IDE server, which is Linux-only.
+#[cfg(target_os = "linux")]
 use eitri_core::ide_server::mention::LiveMentions;
+#[cfg(target_os = "linux")]
 use eitri_core::ide_server::types::MentionPort;
 use eitri_core::plugin::follow_feed::FollowSocket;
 use eitri_core::scratch::ScratchDir;
@@ -13,6 +16,7 @@ fn feed_constructors_use_safe_bases() {
             "unsafe" => {
                 assert!(ScratchDir::new().is_none());
                 assert!(FollowSocket::bind().is_none());
+                #[cfg(target_os = "linux")]
                 assert!(LiveMentions::new().open().is_none());
                 assert_eq!(std::fs::read_dir(std::env::temp_dir()).unwrap().count(), 0);
             }

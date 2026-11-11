@@ -4,7 +4,6 @@
 //! half builds and tests on Linux without the page.
 
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 // The same build rule as `shell`'s (a sha256 fingerprint over the bundle's inputs, npm only when it
 // differs), read from the one file both build scripts include.

@@ -434,6 +434,11 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(
+        target_os = "macos",
+        ignore = "macOS refuses a connect to a full queue at once (ECONNREFUSED), so there a full backlog reads as \
+                  no listener; there is no Wayland socket to probe on the Mac"
+    )]
     fn the_probe_tells_a_listener_from_a_leftover_file_and_never_waits_on_a_full_backlog() {
         let dir = scratch("probe");
         let listener = live(&dir, "wayland-1");

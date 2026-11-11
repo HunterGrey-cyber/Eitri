@@ -200,7 +200,8 @@ fn it_runs_in_its_directory_with_nothing_on_stdin_and_the_clis_mark() {
 #[test]
 fn the_words_of_a_line_are_data_to_the_script_around_it() {
     let scratch = Scratch::new("quoting");
-    let done = line(&scratch, r#"echo "a'b" '"$1"' `echo c`; echo "$0" | wc -l"#);
+    // BSD `wc` pads its count with spaces; `tr` takes them off so the count reads the same everywhere.
+    let done = line(&scratch, r#"echo "a'b" '"$1"' `echo c`; echo "$0" | wc -l | tr -d ' '"#);
     assert_eq!(done.output, "a'b \"$1\" c\n1\n");
 }
 

@@ -29,6 +29,9 @@ const SLOT_FILE: &str = "write.lock";
 /// How many times a take is tried again because the name stopped naming the file it locked.
 const ATTEMPTS: usize = 8;
 
+/// How many times an `openat` with `O_CREAT` that macOS failed with ENOENT is made again (see `open_at`).
+const CREATE_RETRIES: u32 = 8;
+
 /// Why the slot was not taken.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SlotBusy {
@@ -210,6 +213,7 @@ impl WriteSlot {
     /// `openat` of the slot's name with `access` and the flags every open of it takes.
     fn open_at(&self, access: libc::c_int) -> io::Result<File> {
         let name = slot_name();
+        let mut lost_creates = 0;
         loop {
             // SAFETY: the directory descriptor is open for the call and `name` is NUL-terminated.
             let fd = unsafe {
@@ -225,8 +229,21 @@ impl WriteSlot {
                 return Ok(unsafe { File::from_raw_fd(fd) });
             }
             let err = io::Error::last_os_error();
-            if err.raw_os_error() != Some(libc::EINTR) {
-                return Err(err);
+            match err.raw_os_error() {
+                Some(libc::EINTR) => {}
+                // On macOS an `openat` with `O_CREAT` has been seen to fail with ENOENT though the directory is
+                // there, when two processes create the slot's file at the same moment; the cause is not known, and
+                // the same call made again opens the file. Asked again a few times, and only while the held
+                // directory is still linked: one that was removed answers ENOENT for good.
+                Some(libc::ENOENT)
+                    if cfg!(target_os = "macos")
+                        && access & libc::O_CREAT != 0
+                        && lost_creates < CREATE_RETRIES
+                        && fstat(&self.dir).is_ok_and(|st| st.st_nlink > 0) =>
+                {
+                    lost_creates += 1;
+                }
+                _ => return Err(err),
             }
         }
     }

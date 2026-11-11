@@ -124,7 +124,12 @@ mod publish {
     }
 
     /// Field 22 of `/proc/self/stat`, counted after the parenthesised command name, which may hold spaces.
+    /// Where there is no `/proc` (macOS) the writer has no start time to give and writes 0, which a reader takes as
+    /// "the lock decides".
     fn own_start_time() -> u64 {
+        if cfg!(not(target_os = "linux")) {
+            return 0;
+        }
         let stat = std::fs::read_to_string("/proc/self/stat").unwrap();
         let after = &stat[stat.rfind(')').unwrap() + 1..];
         after.split_whitespace().nth(19).unwrap().parse().unwrap()

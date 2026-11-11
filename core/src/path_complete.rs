@@ -385,6 +385,8 @@ mod tests {
         ] {
             std::fs::write(root.join(name), "").unwrap();
         }
+        // APFS refuses a name that is not UTF-8 (EILSEQ), so on macOS there is none to leave out.
+        #[cfg(not(target_os = "macos"))]
         std::fs::write(root.join(std::ffi::OsStr::from_bytes(b"bad\xff")), "").unwrap();
         let outside = TempDir::new();
         std::fs::write(outside.path().join("secret"), "").unwrap();

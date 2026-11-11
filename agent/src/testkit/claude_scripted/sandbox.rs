@@ -536,7 +536,10 @@ mod tests {
 
     impl FakeRoot {
         fn new() -> Self {
-            let dir = std::env::temp_dir().join(format!("agent-sandbox-check-{}", uuid::Uuid::new_v4()));
+            // Short, so a socket can still be bound directly in it under macOS's long `$TMPDIR` (a socket
+            // path has 104 bytes there, 108 on Linux).
+            let id = uuid::Uuid::new_v4().simple().to_string();
+            let dir = std::env::temp_dir().join(format!("agent-sbx-{}", &id[..12]));
             for sub in [
                 "mnt/eitri-runs/ch/abcd1234/c00/home",
                 "mnt/eitri-runs/ch/abcd1234/c00/project",
@@ -845,7 +848,11 @@ mod tests {
             let root = FakeRoot::new();
             let path = root.path(abs);
             fs::create_dir_all(path.parent().unwrap()).unwrap();
-            let _listener = UnixListener::bind(&path).unwrap();
+            // Bound at a short name and moved into place: the socket stays one, and the host path under the
+            // scratch root can be longer than a socket address allows.
+            let short = root.dir.join("s");
+            let _listener = UnixListener::bind(&short).unwrap();
+            fs::rename(&short, &path).unwrap();
             assert_refused(root.eval(), &format!("{abs} is a socket in reach"));
         }
     }

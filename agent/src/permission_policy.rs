@@ -3670,6 +3670,9 @@ mod tests {
         fn new() -> Self {
             let dir = std::env::temp_dir().join(format!("agent-policy-outside-{}", uuid::Uuid::new_v4()));
             std::fs::create_dir_all(&dir).unwrap();
+            // Canonical like the workspace's root, so a path into it leaves the root without passing a link
+            // (macOS's `$TMPDIR` is under `/var -> private/var`).
+            let dir = dir.canonicalize().unwrap();
             std::fs::write(dir.join("secret"), "private text\n").unwrap();
             Self { dir }
         }

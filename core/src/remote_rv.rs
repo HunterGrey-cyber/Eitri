@@ -714,7 +714,7 @@ where
     crate::panel_control::ensure_dir(control_dir)
         .map_err(|why| io::Error::new(io::ErrorKind::PermissionDenied, why))?;
     let dir = agent::private_fs::open_dir(control_dir)?;
-    let listener = UnixListener::bind(&path)?;
+    let listener = crate::panel_control::bind_unfollowed(&path)?;
     let meta = path.symlink_metadata()?;
     let bound = FileIdentity {
         dev: meta.dev(),
@@ -899,8 +899,21 @@ impl RvClient {
                 return Ok(None);
             }
             // A zero timeout is an error to set, and means "no timeout" to some platforms.
-            self.stream.set_read_timeout(Some(left.max(Duration::from_millis(1))))?;
-            match (&self.stream).read(&mut chunk) {
+            let read = match self.stream.set_read_timeout(Some(left.max(Duration::from_millis(1)))) {
+                Ok(()) => (&self.stream).read(&mut chunk),
+                // macOS refuses any socket option once both directions are shut (EINVAL), as after the server
+                // closed or `writer()` was shut down. The read then waits in `poll` and never blocks itself, so the
+                // deadline holds whatever state the socket is in.
+                Err(e) if cfg!(target_os = "macos") && e.kind() == io::ErrorKind::InvalidInput => {
+                    match read_when_ready(&self.stream, &mut chunk, left) {
+                        Ok(Some(n)) => Ok(n),
+                        Ok(None) => continue,
+                        Err(e) => Err(e),
+                    }
+                }
+                Err(e) => return Err(e),
+            };
+            match read {
                 Ok(0) => return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "the server closed")),
                 Ok(n) => self.buf.extend_from_slice(&chunk[..n]),
                 Err(e) if matches!(e.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut) => {}
@@ -911,9 +924,98 @@ impl RvClient {
     }
 }
 
+/// Waits up to `wait` for `stream` to be readable, then reads once without blocking: `None` when nothing came.
+fn read_when_ready(stream: &UnixStream, chunk: &mut [u8], wait: Duration) -> io::Result<Option<usize>> {
+    let mut fds = [libc::pollfd {
+        fd: stream.as_raw_fd(),
+        events: libc::POLLIN,
+        revents: 0,
+    }];
+    let ms = wait.as_millis().clamp(1, i32::MAX as u128) as libc::c_int;
+    // SAFETY: `fds` is one valid `pollfd` on a descriptor `stream` keeps open for the call.
+    let ready = unsafe { libc::poll(fds.as_mut_ptr(), 1, ms) };
+    if ready < 0 {
+        let e = io::Error::last_os_error();
+        return if e.kind() == io::ErrorKind::Interrupted {
+            Ok(None)
+        } else {
+            Err(e)
+        };
+    }
+    if ready == 0 {
+        return Ok(None);
+    }
+    // SAFETY: `chunk` is writable for its whole length; `MSG_DONTWAIT` keeps this one call from blocking.
+    let n = unsafe {
+        libc::recv(
+            stream.as_raw_fd(),
+            chunk.as_mut_ptr().cast(),
+            chunk.len(),
+            libc::MSG_DONTWAIT,
+        )
+    };
+    if n < 0 {
+        let e = io::Error::last_os_error();
+        return if matches!(e.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted) {
+            Ok(None)
+        } else {
+            Err(e)
+        };
+    }
+    Ok(Some(n as usize))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn read_when_ready_returns_within_its_wait_on_an_open_quiet_socket() {
+        let (a, _b) = UnixStream::pair().unwrap();
+        let mut chunk = [0u8; 16];
+        let started = Instant::now();
+        assert_eq!(
+            read_when_ready(&a, &mut chunk, Duration::from_millis(30)).unwrap(),
+            None
+        );
+        // Generous: only "it came back" matters, not how fast.
+        assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    #[test]
+    fn read_when_ready_reads_what_is_there_and_then_the_end() {
+        let (a, mut b) = UnixStream::pair().unwrap();
+        b.write_all(b"line\n").unwrap();
+        drop(b);
+        let mut chunk = [0u8; 16];
+        assert_eq!(
+            read_when_ready(&a, &mut chunk, Duration::from_secs(5)).unwrap(),
+            Some(5)
+        );
+        assert_eq!(&chunk[..5], b"line\n");
+        assert_eq!(
+            read_when_ready(&a, &mut chunk, Duration::from_secs(5)).unwrap(),
+            Some(0)
+        );
+    }
+
+    #[test]
+    fn recv_after_the_server_closed_reports_the_end() {
+        let (a, mut b) = UnixStream::pair().unwrap();
+        b.write_all(b"{\"v\":1}\n").unwrap();
+        drop(b);
+        let mut client = RvClient {
+            stream: a,
+            buf: Vec::new(),
+            scanned: 0,
+        };
+        assert_eq!(
+            client.recv(Duration::from_secs(5)).unwrap().as_deref(),
+            Some("{\"v\":1}")
+        );
+        let end = client.recv(Duration::from_secs(5)).unwrap_err();
+        assert_eq!(end.kind(), io::ErrorKind::UnexpectedEof);
+    }
     use std::sync::Arc;
 
     const INSTANCE: &str = "a3f09c1d2e4b5f60";
@@ -1019,6 +1121,22 @@ mod tests {
         let _listener = RvListener::bind(&scratch.0, INSTANCE, move |stream| tx.send(stream).is_ok()).unwrap();
         let _peer = RvClient::connect(&path).expect("this user's peer connects");
         assert!(rx.recv_timeout(Duration::from_secs(20)).is_ok(), "and is handed on");
+    }
+
+    #[test]
+    fn a_link_at_the_listener_socket_is_not_bound_through() {
+        let scratch = Scratch::new();
+        let path = rv_socket_path(&scratch.0, INSTANCE).unwrap();
+        let target = scratch.0.join("elsewhere");
+        std::os::unix::fs::symlink(&target, &path).unwrap();
+        let refused = RvListener::bind(&scratch.0, INSTANCE, |_| true)
+            .err()
+            .expect("a link at the name is refused");
+        assert_eq!(refused.kind(), io::ErrorKind::AddrInUse, "{refused}");
+        assert!(
+            std::fs::symlink_metadata(&target).is_err(),
+            "nothing is made where the link points"
+        );
     }
 
     #[test]

@@ -89,7 +89,9 @@ pub const CHUNKS: &[(&str, ChunkSide)] = &[
     (crate::plugin::editor::PLUGIN_ASSIST_LUA, ChunkSide::Registered),
     (crate::plugin::editor::PLUGIN_CWD_LUA, ChunkSide::Registered),
     (crate::plugin::editor::PLUGIN_FOLLOW_LUA, ChunkSide::Registered),
+    #[cfg(target_os = "linux")]
     (crate::ide_server::view::IDE_DIFF_OPEN, ChunkSide::Registered),
+    #[cfg(target_os = "linux")]
     (crate::ide_server::mention::IDE_MENTION_DEFINE, ChunkSide::Registered),
     (
         crate::editor_tools::tools::open_file::OPEN_FILE_LUA,
@@ -128,9 +130,13 @@ pub const CHUNKS: &[(&str, ChunkSide)] = &[
     (crate::review_editor::TAKE_EVENTS_LUA, ChunkSide::OneShot),
     (crate::editor_open::EDITOR_OPEN_LUA, ChunkSide::OneShot),
     (crate::plugin::editor::PLUGIN_OPEN_LUA, ChunkSide::OneShot),
+    #[cfg(target_os = "linux")]
     (crate::ide_server::view::IDE_DIFF_CLOSE, ChunkSide::OneShot),
+    #[cfg(target_os = "linux")]
     (crate::ide_server::view::IDE_TAKE_EVENTS, ChunkSide::OneShot),
+    #[cfg(target_os = "linux")]
     (crate::ide_server::mention::IDE_MENTION_REMOVE, ChunkSide::OneShot),
+    #[cfg(target_os = "linux")]
     (crate::ide_server::mention::IDE_MENTION_OUTSIDE, ChunkSide::OneShot),
     (crate::turn_review::revert::BUFFER_STATE_LUA, ChunkSide::OneShot),
     (crate::nvim_keys::rescan::KEYS_RESCAN_LUA, ChunkSide::OneShot),

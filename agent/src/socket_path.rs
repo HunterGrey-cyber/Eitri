@@ -453,7 +453,7 @@ mod tests {
             // Probes that the agent-hook binary exists; never bound.
             ("src/process.rs", "dir.join(\"probe.sock\")"),
             // Absolute paths of a host that the sandbox self-check's tests re-create inside a scratch
-            // root and bind there; the root is temp_dir plus a uuid, and the longest tail is 30 bytes.
+            // root: each is bound at a short name in that root and renamed to the long one.
             ("src/testkit/claude_scripted/sandbox.rs", "\"/run/docker.sock\""),
             (
                 "src/testkit/claude_scripted/sandbox.rs",

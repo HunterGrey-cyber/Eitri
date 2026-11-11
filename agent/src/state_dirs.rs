@@ -228,16 +228,81 @@ fn test_runtime_dir(root: &Path) -> std::io::Result<PathBuf> {
     Ok(dir)
 }
 
+/// The directory a test's scratch directories and its state root go under.
+///
+/// Test-only. `std::env::temp_dir()` everywhere but macOS. There `$TMPDIR` is a per-user
+/// `/var/folders/.../T/` of 49 bytes, under `/var -> private/var`, and a socket path may not pass 103
+/// bytes: with the state root, an instance directory (`nv-ec-<pid>-<32 hex>`) and a socket name below
+/// it, a test's socket did not fit, and the same tests failed or passed with the length of `TMPDIR`. So
+/// a macOS test uses `/private/tmp/eitri-test-<euid>` instead, which is short, canonical (`/tmp` is a
+/// link to it) and the same for every run. `/private/tmp` is shared by every account, so the
+/// directory is made 0700 and used only while it is this user's own real directory with no group or
+/// other bit; when it is not (another account made it first, or `/private/tmp` cannot be written), the
+/// test falls back to `temp_dir()` and its sockets may not fit, as before. It is kept, not removed,
+/// when a run ends: every test binary of this user shares it, and one that removed it while another
+/// was creating its root inside would have that root's parent made again with the umask's mode.
+#[doc(hidden)]
+pub fn test_temp_dir() -> PathBuf {
+    short_test_dir()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(std::env::temp_dir)
+}
+
+/// The macOS directory [`test_temp_dir`] prefers, judged once per process; `None` elsewhere, or
+/// where it cannot be used.
+fn short_test_dir() -> Option<&'static Path> {
+    static DIR: OnceLock<Option<PathBuf>> = OnceLock::new();
+    DIR.get_or_init(make_short_test_dir).as_deref()
+}
+
+#[cfg(not(target_os = "macos"))]
+fn make_short_test_dir() -> Option<PathBuf> {
+    None
+}
+
+#[cfg(target_os = "macos")]
+fn make_short_test_dir() -> Option<PathBuf> {
+    use std::os::unix::fs::DirBuilderExt;
+    let shared = Path::new("/private/tmp");
+    crate::private_fs::require_safe_parent(shared, "a test's scratch").ok()?;
+    let dir = shared.join(format!("eitri-test-{}", crate::private_fs::euid()));
+    match std::fs::DirBuilder::new()
+        .mode(crate::private_fs::PRIVATE_DIR_MODE)
+        .create(&dir)
+    {
+        // The umask may have taken bits off the mode given to `mkdir`.
+        Ok(()) => crate::private_fs::make_dir_private(&dir).ok()?,
+        // Made by an earlier run, or by another test binary of this user starting now: set to 0700
+        // if it is this user's real directory (`tighten_own_dir` leaves anything else alone).
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => crate::private_fs::tighten_own_dir(&dir),
+        Err(_) => return None,
+    }
+    if !crate::private_fs::is_private_dir(&dir) {
+        return None;
+    }
+    // On macOS a new entry takes its directory's group, and `/private/tmp`'s is `wheel`: what a test made below
+    // would be in a group of others (a check that trusts a group-writable directory only in the caller's own group
+    // then refuses it), where the per-user `$TMPDIR` gives the user's own group. So the directory takes this
+    // process's effective group, the group a new file gets on Linux. `lchown` never follows a link.
+    // SAFETY: `getegid` takes no arguments and cannot fail.
+    let egid = unsafe { libc::getegid() };
+    std::os::unix::fs::lchown(&dir, None, Some(egid)).ok()?;
+    use std::os::unix::fs::MetadataExt;
+    let meta = dir.symlink_metadata().ok()?;
+    (meta.gid() == egid && crate::private_fs::is_private_dir(&dir)).then_some(dir)
+}
+
 /// Points every directory above at a disposable root for the rest of this PROCESS, and returns it.
 ///
 /// Test-only (see this module's header for why it is not `#[cfg(test)]`). Idempotent: the first
 /// call wins and every later one returns the same root, so a test file can call it from each of its
 /// own helpers without coordinating.
 ///
-/// The root is `$TMPDIR/eitri-agent-test-state/<pid>`. libtest has no after-all-tests hook, so the
-/// root is removed by a C `atexit` handler ([`remove_test_root_at_exit`]), which runs when the test
-/// binary returns from `main` or calls `exit`, passing or failing; the parent goes with it when no
-/// other running binary has a root there. A run that is killed runs no handler, so its root is left;
+/// The root is `$TMPDIR/eitri-agent-test-state/<pid>`, and `/private/tmp/eitri-test-<euid>/<pid>` on
+/// macOS (see [`test_temp_dir`]). libtest has no after-all-tests hook, so the root is removed by a C
+/// `atexit` handler ([`remove_test_root_at_exit`]), which runs when the test binary returns from
+/// `main` or calls `exit`, passing or failing; `eitri-agent-test-state` goes with it when no other
+/// running binary has a root there. A run that is killed runs no handler, so its root is left;
 /// keyed on the pid, it is found by the next run's `prune_dead_roots` once that pid is gone (a root
 /// made inside another pid namespace may name a pid that is alive out here, and is only ever
 /// removed by its own handler).
@@ -245,7 +310,10 @@ fn test_runtime_dir(root: &Path) -> std::io::Result<PathBuf> {
 pub fn redirect_state_to_a_test_root() -> PathBuf {
     TEST_ROOT
         .get_or_init(|| {
-            let parent = std::env::temp_dir().join("eitri-agent-test-state");
+            let parent = match short_test_dir() {
+                Some(dir) => dir.to_path_buf(),
+                None => std::env::temp_dir().join("eitri-agent-test-state"),
+            };
             prune_dead_roots(&parent);
             let root = parent.join(std::process::id().to_string());
             // A pid can be reused, so a leftover root from a dead process with this same pid may
@@ -286,8 +354,9 @@ extern "C" fn remove_test_root_at_exit() {
         }
         std::thread::sleep(Duration::from_millis(5));
     }
-    // Only an empty parent goes: another test binary running now keeps its own root there.
-    if let Some(parent) = root.parent() {
+    // Only an empty parent goes: another test binary running now keeps its own root there. macOS's
+    // shared test directory stays (see `test_temp_dir`).
+    if let Some(parent) = root.parent().filter(|parent| Some(*parent) != short_test_dir()) {
         let _ = std::fs::remove_dir(parent);
     }
 }
@@ -355,18 +424,21 @@ mod tests {
 
     /// A test binary that redirected its state leaves nothing in the temp dir once it exits: a
     /// fresh copy of this binary under a private `TMPDIR` makes a workspace in its root and ends,
-    /// and neither the root nor `eitri-agent-test-state` is there afterwards.
+    /// and neither the root nor `eitri-agent-test-state` is there afterwards (on macOS, where the
+    /// root is under the shared test directory instead, the child's `<pid>` root is gone from it).
     #[test]
     fn a_test_binary_leaves_no_state_root_behind_when_it_exits() {
         const CHILD: &str = "EITRI_TEST_STATE_ROOT_CHILD";
         if std::env::var_os(CHILD).is_some() {
             let dir = test_workspace_dir("exit");
             std::fs::write(dir.join("record"), "kept until exit").unwrap();
-            assert!(dir.starts_with(std::env::temp_dir()), "{dir:?}");
+            // The workspace comes back canonical; macOS's `$TMPDIR` is under `/var -> private/var`.
+            let tmp = test_temp_dir().canonicalize().unwrap();
+            assert!(dir.starts_with(&tmp), "{dir:?} is not under {tmp:?}");
             return;
         }
         let tmp = crate::test_tmp::TmpDir::new("nv-state-exit", "child");
-        let out = std::process::Command::new(std::env::current_exe().unwrap())
+        let child = std::process::Command::new(std::env::current_exe().unwrap())
             .args([
                 "state_dirs::tests::a_test_binary_leaves_no_state_root_behind_when_it_exits",
                 "--exact",
@@ -374,8 +446,12 @@ mod tests {
             ])
             .env(CHILD, "1")
             .env("TMPDIR", &*tmp)
-            .output()
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
             .unwrap();
+        let pid = child.id();
+        let out = child.wait_with_output().unwrap();
         let stdout = String::from_utf8_lossy(&out.stdout);
         assert!(
             out.status.success() && stdout.contains("1 passed"),
@@ -388,6 +464,10 @@ mod tests {
             .map(|entry| entry.file_name())
             .collect();
         assert!(left.is_empty(), "left in the child's TMPDIR: {left:?}");
+        if let Some(shared) = short_test_dir() {
+            let root = shared.join(pid.to_string());
+            assert!(std::fs::symlink_metadata(&root).is_err(), "the child left {root:?}");
+        }
     }
 
     /// Both directories must land under the redirect, or a test run writes into the developer's
@@ -399,9 +479,30 @@ mod tests {
         assert!(history_dir().unwrap().starts_with(&root));
         assert!(leases_dir().unwrap().starts_with(&root));
         assert!(
-            root.starts_with(std::env::temp_dir()),
-            "the test root must live under TMPDIR: {root:?}"
+            root.starts_with(test_temp_dir()),
+            "the test root must live under the test directory: {root:?}"
         );
+    }
+
+    /// On macOS the test root is short enough for an nvim feed's instance directory and socket under
+    /// its runtime directory, the deepest socket a test binds there, whatever `TMPDIR` is; and the
+    /// shared directory above it is this user's alone, in the user's own group, and canonical.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_macos_test_root_leaves_room_for_an_instance_socket() {
+        redirect_state_to_a_test_root();
+        let shared = short_test_dir().expect("/private/tmp/eitri-test-<euid> must be usable here");
+        assert!(crate::private_fs::is_private_dir(shared), "{shared:?}");
+        // What a test makes there is in this user's own group, as under `$TMPDIR`, not `/private/tmp`'s `wheel`.
+        let made = test_workspace_dir("group");
+        use std::os::unix::fs::MetadataExt;
+        // SAFETY: `getegid` takes no arguments and cannot fail.
+        assert_eq!(made.metadata().unwrap().gid(), unsafe { libc::getegid() });
+        assert_eq!(shared.canonicalize().unwrap(), shared);
+        let instance = runtime_dir()
+            .unwrap()
+            .join(format!("nv-ec-{}-{}", u32::MAX, uuid::Uuid::new_v4().simple()));
+        crate::socket_path::in_dir(&instance, "e.sock").unwrap();
     }
 
     /// The redirect is one-way and single-valued: a second call cannot move an already-redirected

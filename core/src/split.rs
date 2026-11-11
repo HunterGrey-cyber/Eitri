@@ -164,14 +164,22 @@ pub fn wait_for_socket(sock: &Path, child: &mut Child, euid: u32, deadline: Dura
     }
 }
 
-/// Field 22 of `/proc/<pid>/stat`: when `pid` started, in clock ticks since boot. Together with the
-/// pid it names one process for good, which a pid alone does not once it is reused. `None` for a
-/// process that is gone, and off Linux.
+/// When `pid` started: field 22 of `/proc/<pid>/stat` on Linux, in clock ticks since boot, and on macOS
+/// `agent::process_probe::start_time`, in microseconds since the epoch. Together with the pid it names one
+/// process for good, which a pid alone does not once it is reused; the value is only ever compared with another
+/// reading on the same machine. `None` for a process that is gone, and on other platforms.
 pub fn proc_start_time(pid: u32) -> Option<u64> {
-    crate::proc_chain::proc_stat(pid)
-        .as_deref()
-        .and_then(panel_control::stat_parent_and_start)
-        .map(|(_, start)| start)
+    #[cfg(target_os = "macos")]
+    {
+        agent::process_probe::start_time(pid)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        crate::proc_chain::proc_stat(pid)
+            .as_deref()
+            .and_then(panel_control::stat_parent_and_start)
+            .map(|(_, start)| start)
+    }
 }
 
 #[cfg(test)]
@@ -367,12 +375,12 @@ mod tests {
         assert!(draws.len() > 1);
     }
 
-    // `proc_start_time` reads `/proc`, which only Linux has; elsewhere it answers `None` by design.
-    #[cfg(target_os = "linux")]
+    // Linux reads `/proc`, macOS asks `proc_pidinfo`; elsewhere it answers `None` by design.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     fn this_process_has_a_start_time_that_is_stable() {
         let pid = std::process::id();
-        let first = proc_start_time(pid).expect("the test process has a /proc entry");
+        let first = proc_start_time(pid).expect("the test process has a start time");
         assert_eq!(proc_start_time(pid), Some(first));
         assert_ne!(first, 0);
     }

@@ -42,7 +42,7 @@
 
 use crate::instance_dir::{nonblocking_connect_outcome, ConnectOutcome};
 use crate::panel_control::{
-    ensure_dir, euid, identity, peer_uid, read_line, remove_own_socket, reply_line, take_reclaim_lock,
+    bind_unfollowed, ensure_dir, euid, identity, peer_uid, read_line, remove_own_socket, reply_line, take_reclaim_lock,
     validate_nvim_addr, LineFail, MAX_LINE, REQUEST_DEADLINE,
 };
 use crate::project_root::OpenTarget;
@@ -525,9 +525,9 @@ fn reclaim(sock: &Path) -> Result<Option<UnixListener>, String> {
     try_bind(sock)
 }
 
-/// `bind`, with the name in use reported as `None`.
+/// `bind`, never through a link at the name, with the name in use reported as `None`.
 fn try_bind(sock: &Path) -> Result<Option<UnixListener>, String> {
-    match UnixListener::bind(sock) {
+    match bind_unfollowed(sock) {
         Ok(listener) => Ok(Some(listener)),
         Err(e) if e.kind() == io::ErrorKind::AddrInUse => Ok(None),
         Err(e) => Err(format!("could not bind {}: {e}", sock.display())),

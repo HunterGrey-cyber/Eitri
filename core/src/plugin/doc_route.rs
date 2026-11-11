@@ -383,7 +383,8 @@ mod tests {
         let proj = s.0.join("proj");
         fs::create_dir_all(proj.join("img")).unwrap();
         fs::write(proj.join("img/a.png"), "12345").unwrap();
-        fs::write(proj.join("img/A.PNG"), "1").unwrap();
+        // Not `A.PNG`: macOS's file system ignores case by default, and that name is `a.png`'s there.
+        fs::write(proj.join("img/B.PNG"), "1").unwrap();
         fs::write(proj.join("img/x.svg"), "<svg/>").unwrap();
         fs::write(proj.join("notes.md"), "# n").unwrap();
         fs::write(proj.join("x.avif"), "1").unwrap();
@@ -400,7 +401,7 @@ mod tests {
         let mut bytes = Vec::new();
         std::io::Read::read_to_end(&mut &a.file, &mut bytes).unwrap();
         assert_eq!(bytes, b"12345");
-        assert_eq!(doc_file(&proj, "img/A.PNG").unwrap().mime, "image/png");
+        assert_eq!(doc_file(&proj, "img/B.PNG").unwrap().mime, "image/png");
         assert_eq!(doc_file(&proj, "notes.md").unwrap_err(), SiteRefusal::UnknownType);
         assert_eq!(doc_file(&proj, "noext").unwrap_err(), SiteRefusal::UnknownType);
         assert_eq!(doc_file(&proj, "img/missing.png").unwrap_err(), SiteRefusal::NotFound);

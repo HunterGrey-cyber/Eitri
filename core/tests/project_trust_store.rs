@@ -1720,6 +1720,10 @@ fn a_file_below_a_linked_directory_has_a_line_and_no_text() {
 /// The record's keys are lossy, so `a\xff.md` and a file really named `a\u{fffd}.md` share one. The
 /// question must not draw one file's text under the other's change.
 #[test]
+#[cfg_attr(
+    target_os = "macos",
+    ignore = "APFS refuses file names that are not UTF-8; this test needs one"
+)]
 fn a_file_name_that_is_not_utf8_never_lends_its_key_to_a_diff() {
     let fx = Fixture::new("lossy");
     let root = fx.root("p");
@@ -1787,6 +1791,10 @@ fn the_texts_are_in_path_order() {
 
 /// A name that is not UTF-8, alone, reaches the question: `diff` holds its lossy key.
 #[test]
+#[cfg_attr(
+    target_os = "macos",
+    ignore = "APFS refuses file names that are not UTF-8; this test needs one"
+)]
 fn a_file_name_that_is_not_utf8_has_a_line() {
     let fx = Fixture::new("lossy-alone");
     let root = fx.root("p");

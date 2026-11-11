@@ -1010,8 +1010,15 @@ mod tests {
             ("eitri", TilingChoice::Eitri),
             ("compositor", TilingChoice::Compositor),
         ] {
-            let config = load_from(&format!("eitri.config.set(\"window.tiling\", \"{word}\")"), &[]).unwrap();
-            assert_eq!(config.tiling, choice, "{word}");
+            let loaded = load_from(&format!("eitri.config.set(\"window.tiling\", \"{word}\")"), &[]);
+            if cfg!(target_os = "macos") && choice == TilingChoice::Compositor {
+                assert!(
+                    loaded.err().unwrap_or_default().contains("not available on macOS"),
+                    "{word}"
+                );
+                continue;
+            }
+            assert_eq!(loaded.unwrap().tiling, choice, "{word}");
         }
         let err = load_from("eitri.config.set(\"window.tiling\", \"tiles\")", &[])
             .err()

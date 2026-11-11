@@ -968,6 +968,10 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(
+        target_os = "macos",
+        ignore = "APFS refuses file names that are not UTF-8; this test needs one"
+    )]
     fn two_outside_names_that_read_alike_are_not_one_place() {
         use std::os::unix::ffi::OsStrExt;
         let project = project("outside-alike");

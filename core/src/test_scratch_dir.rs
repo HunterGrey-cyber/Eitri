@@ -13,7 +13,8 @@ use std::os::unix::fs::DirBuilderExt;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-/// Owns a directory under the system temp dir and removes it (recursively) on drop.
+/// Owns a directory under the system temp dir (macOS: `agent::state_dirs::test_temp_dir()`) and removes it
+/// (recursively) on drop.
 ///
 /// The path it hands out is `state` inside that directory, not the directory itself: the state
 /// writers judge the owner of the directory above theirs (`<state home>/eitri` in a real run), and
@@ -24,16 +25,19 @@ pub(crate) struct ScratchDir {
 }
 
 impl ScratchDir {
-    /// Creates `<std::env::temp_dir()>/<prefix>-<label>-<12 hex>/state` and returns a guard that
-    /// removes the whole `<prefix>-<label>-<12 hex>` directory on drop.
+    /// Creates `<std::env::temp_dir()>/<prefix>-<label>-<12 hex>/state` (macOS:
+    /// `<agent::state_dirs::test_temp_dir()>/s<12 hex>/state`) and returns a guard that removes the whole
+    /// directory below the temp dir on drop.
     pub(crate) fn new(prefix: &str, label: &str) -> Self {
         // Sockets are bound inside, and a socket path may not pass 103 bytes, so the name is kept short: 12
         // random hex digits are unique enough for one run's scratch, and a long `TMPDIR` (a build host's
         // per-run one) still leaves room. macOS's `TMPDIR` is already ~49 bytes, so there the directory is
-        // named by the random id alone.
+        // named by the random id behind one letter, in the short test directory `agent` keeps for this. The
+        // letter matters: that directory also holds the per-process state roots, named by pid and pruned when
+        // their process is gone, and an id of digits alone would read as one of them.
         let id = &uuid::Uuid::new_v4().simple().to_string()[..12];
         #[cfg(target_os = "macos")]
-        let outer = std::env::temp_dir().join(id);
+        let outer = agent::state_dirs::test_temp_dir().join(format!("s{id}"));
         #[cfg(not(target_os = "macos"))]
         let outer = std::env::temp_dir().join(format!("{prefix}-{label}-{id}"));
         #[cfg(target_os = "macos")]
@@ -83,4 +87,16 @@ impl Drop for ScratchDir {
 /// Writes a private-state fixture with the production mode regardless of the test runner's umask.
 pub(crate) fn write_private(path: impl AsRef<Path>, bytes: impl AsRef<[u8]>) -> std::io::Result<()> {
     agent::private_fs::write_private(path.as_ref(), bytes.as_ref())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_scratch_directory_name_never_reads_as_a_pid() {
+        let scratch = ScratchDir::new("t", "name");
+        let name = scratch.outer.file_name().unwrap().to_str().unwrap().to_owned();
+        assert!(name.parse::<u32>().is_err(), "{name}");
+    }
 }

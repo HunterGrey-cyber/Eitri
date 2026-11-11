@@ -667,6 +667,23 @@ fn read_pid_record(pid_file: &Path) -> Option<PidRecord> {
     PidRecord::parse(&text)
 }
 
+/// `UnixListener::bind` at `sock`, never through a link at the name. Linux's `bind` refuses any name that exists, a
+/// link included (`EADDRINUSE`). macOS's follows a symbolic link at the name and makes the socket where the link
+/// points, so there a name that exists, whatever it is, is answered `AddrInUse` before `bind` is asked, and the
+/// caller's stale-socket check judges what is there (a link is never this user's socket). A link put at the name
+/// between that look and the bind would still be followed; the control directory is this user's own 0700 one, so
+/// only this user could put it there.
+pub(crate) fn bind_unfollowed(sock: &Path) -> io::Result<UnixListener> {
+    #[cfg(target_os = "macos")]
+    if sock.symlink_metadata().is_ok() {
+        return Err(io::Error::new(
+            io::ErrorKind::AddrInUse,
+            "something is at the socket's name",
+        ));
+    }
+    UnixListener::bind(sock)
+}
+
 /// `(device, inode)` of `path` itself, not of what a link there points at.
 pub(crate) fn identity(path: &Path) -> Option<(u64, u64)> {
     path.symlink_metadata().ok().map(|meta| (meta.dev(), meta.ino()))
@@ -825,7 +842,7 @@ pub fn claim_for(dir: &Path, control_key: &ControlKey<'_>, request: Option<&Requ
     let mut lock = None;
     let mut reclaimed = false;
     for _ in 0..MAX_CLAIM_ROUNDS {
-        match UnixListener::bind(&sock) {
+        match bind_unfollowed(&sock) {
             Ok(listener) => return serve(listener, sock, pid_file, page).map(Claim::Ours),
             Err(e) if e.kind() == io::ErrorKind::AddrInUse => {}
             Err(e) => return Err(format!("could not bind {}: {e}", sock.display())),
@@ -1314,6 +1331,10 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(
+        target_os = "macos",
+        ignore = "APFS refuses file names that are not UTF-8; this test needs one"
+    )]
     fn control_key_hashes_canonical_bytes() {
         use sha2::{Digest, Sha256};
         use std::os::unix::ffi::{OsStrExt, OsStringExt};
@@ -1445,6 +1466,21 @@ mod tests {
         std::fs::write(sock.with_extension("pid"), format!("{}\n", i32::MAX)).unwrap();
         let reclaimed = ours(claim_for(&dir, &key, None));
         reclaimed.cleanup();
+    }
+
+    /// A link at the control socket's name is never bound through: the claim is refused and nothing is made where
+    /// the link points (macOS's `bind` would follow it).
+    #[test]
+    fn a_link_at_the_control_socket_is_not_bound_through() {
+        let scratch = ScratchDir::new("eitri-pc", "link");
+        let dir = scratch.join("c");
+        ensure_dir(&dir).unwrap();
+        let sock = socket_path(&dir, &root()).unwrap();
+        let target = scratch.join("target");
+        symlink(&target, &sock).unwrap();
+        assert!(claim(&dir, &root(), None).is_err());
+        assert!(sock.symlink_metadata().unwrap().file_type().is_symlink());
+        assert!(target.symlink_metadata().is_err(), "the bind went through the link");
     }
 
     #[test]

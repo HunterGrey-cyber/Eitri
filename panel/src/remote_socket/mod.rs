@@ -388,7 +388,7 @@ impl Drop for RemoteSocket {
         // Connections accepted but not yet taken in by a pump.
         while let Ok(inbound) = self.inbound.try_recv() {
             if let Inbound::Opened { stream, .. } = inbound {
-                let _ = stream.shutdown(Shutdown::Both);
+                conn::shut_both_ways(&stream);
             }
         }
     }

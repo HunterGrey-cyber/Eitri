@@ -12,6 +12,7 @@
 //! | [`pid_is_alive`] | `kill(pid, 0)` | `kill(pid, 0)` |
 //! | [`resident_kib`] | `VmRSS` in `/proc/<pid>/status` (unchanged) | `proc_pidinfo(PROC_PIDTASKINFO).pti_resident_size` |
 //! | [`thread_count`] | entries of `/proc/<pid>/task` (unchanged) | `proc_pidinfo(PROC_PIDTASKINFO).pti_threadnum` |
+//! | [`start_time`] | none: callers read `/proc/<pid>/stat` | `proc_pidinfo(PROC_PIDTBSDINFO)` |
 //!
 //! `pid_is_alive` answers the same as the `/proc/<pid>` check it replaces on Linux: both say
 //! "alive" for a zombie and for another user's process. Elsewhere the two measurements return
@@ -99,6 +100,36 @@ pub fn thread_count(pid: u32) -> Option<usize> {
     }
 }
 
+/// When `pid` started, in microseconds since the epoch, from `proc_pidinfo(PROC_PIDTBSDINFO)`; `None` for a
+/// process that is gone or that this user may not inspect. Together with the pid it names one process for good, as a
+/// pid alone does not once it is reused: it is what Linux's start time in `/proc/<pid>/stat` is used for, and like that
+/// value it is only ever compared with another reading on the same machine. Never 0 for a process that exists.
+#[cfg(target_os = "macos")]
+pub fn start_time(pid: u32) -> Option<u64> {
+    let pid = libc::c_int::try_from(pid).ok().filter(|&p| p > 0)?;
+    let size = std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int;
+    // SAFETY: all-zero is a valid `proc_bsdinfo` (integers and byte arrays), and the buffer is exactly the size
+    // passed; `proc_pidinfo` writes at most that many bytes and returns how many it wrote.
+    let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
+    let written = unsafe {
+        libc::proc_pidinfo(
+            pid,
+            libc::PROC_PIDTBSDINFO,
+            0,
+            (&mut info as *mut libc::proc_bsdinfo).cast(),
+            size,
+        )
+    };
+    if written != size {
+        return None;
+    }
+    let micros = info
+        .pbi_start_tvsec
+        .checked_mul(1_000_000)?
+        .checked_add(info.pbi_start_tvusec)?;
+    (micros != 0).then_some(micros)
+}
+
 #[cfg(target_os = "macos")]
 fn task_info(pid: u32) -> Option<libc::proc_taskinfo> {
     let pid = libc::c_int::try_from(pid).ok().filter(|&p| p > 0)?;
@@ -121,6 +152,23 @@ fn task_info(pid: u32) -> Option<libc::proc_taskinfo> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A start time names one process: the same for every reading of a running one, another for a later process,
+    /// none for one that is gone.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_start_time_is_stable_for_a_process_and_gone_with_it() {
+        let own = start_time(std::process::id()).expect("this process has a start time");
+        assert_eq!(start_time(std::process::id()), Some(own));
+        let mut child = std::process::Command::new("sleep").arg("30").spawn().unwrap();
+        let started = start_time(child.id()).expect("a running child has a start time");
+        assert!(started >= own, "a child cannot start before its parent");
+        child.kill().unwrap();
+        child.wait().unwrap();
+        assert_eq!(start_time(child.id()), None);
+        assert_eq!(start_time(0), None);
+        assert_eq!(start_time(u32::MAX), None);
+    }
 
     #[test]
     fn this_process_is_alive() {

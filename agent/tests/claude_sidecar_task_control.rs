@@ -40,7 +40,9 @@ fn case(name: &str, run: impl FnOnce(&mut ClaudeSidecarProvider)) {
         run(&mut provider);
         return;
     }
-    let root = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!("tc-{}", uuid::Uuid::new_v4().simple()));
+    // Short: the sidecar's socket goes under it, and a socket path has at most 103 bytes.
+    let id = uuid::Uuid::new_v4().simple().to_string();
+    let root = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!("tc-{}", &id[..12]));
     agent::private_fs::create_private_dir_all(&root, &root).unwrap();
     let program = root.join("sidecar");
     let exe = std::env::current_exe().unwrap();

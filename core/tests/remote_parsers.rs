@@ -1,6 +1,8 @@
 #[path = "support/randomized.rs"]
 mod randomized;
 
+// The WebSocket decoder lives in the IDE server, which is Linux-only.
+#[cfg(target_os = "linux")]
 use eitri_core::ide_server::frames::{Decoder, Inbound};
 use eitri_core::remote_rv::{parse_rv_line, parse_rv_outbound};
 use eitri_core::remote_wire::parse_phone_frame;
@@ -62,6 +64,7 @@ fn remote_rv_outbound_randomized() {
     );
 }
 
+#[cfg(target_os = "linux")]
 fn masked(op: u8, payload: &[u8], key: [u8; 4], out: &mut Vec<u8>) {
     out.push(op);
     if payload.len() <= 125 {
@@ -74,6 +77,7 @@ fn masked(op: u8, payload: &[u8], key: [u8; 4], out: &mut Vec<u8>) {
     out.extend(payload.iter().enumerate().map(|(i, b)| b ^ key[i % 4]));
 }
 
+#[cfg(target_os = "linux")]
 #[test]
 fn remote_websocket_decoder_randomized() {
     let mut rng = randomized::Random(0x8ab1_4123_ace0_5eed);

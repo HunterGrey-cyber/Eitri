@@ -1025,6 +1025,8 @@ fn three_takeovers_in_a_row_leave_nothing() {
     }
 }
 
+// The editor's IDE server, whose chunks this drives, is Linux-only.
+#[cfg(target_os = "linux")]
 #[test]
 #[ignore = "needs nvim on PATH; uses stdio and no display"]
 fn leftover_with_every_module_in_use() {
@@ -1201,6 +1203,8 @@ fn registered_modules_reject_calls_after_their_takeover_ended() {
     }
 }
 
+// The editor's IDE server, whose chunks this drives, is Linux-only.
+#[cfg(target_os = "linux")]
 #[test]
 #[ignore = "needs nvim on PATH; uses stdio and no display"]
 fn mention_commands_are_registered_without_replacing_personal_commands() {

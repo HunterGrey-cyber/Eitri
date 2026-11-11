@@ -33,13 +33,15 @@ pub const SELECTION_FILE: &str = "selection.json";
 /// The shared round's file name in the agents directory.
 pub const ROUND_FILE: &str = "round.json";
 
-/// Which shared file a name in the agents directory is.
+/// Which shared file a name in the agents directory is. Only the Linux reader watches the directory by name.
+#[cfg(target_os = "linux")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SharedName {
     Selection,
     Round,
 }
 
+#[cfg(target_os = "linux")]
 impl SharedName {
     pub(crate) fn of(name: &OsStr) -> Option<SharedName> {
         if name == SELECTION_FILE {

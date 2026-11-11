@@ -125,7 +125,7 @@ impl Conn {
     }
 
     pub(super) fn close(&self) {
-        let _ = self.stream.shutdown(Shutdown::Both);
+        shut_both_ways(&self.stream);
     }
 }
 
@@ -171,7 +171,7 @@ pub(super) fn start_connection(stream: UnixStream, shared: &Arc<Shared>) -> bool
     // Sent after the owner's drop had taken what was queued: nobody will close it, so it is closed here; its reader
     // then ends at once.
     if shared.stopped.load(Ordering::SeqCst) {
-        let _ = stream.shutdown(Shutdown::Both);
+        shut_both_ways(&stream);
     }
     let reader_shared = Arc::clone(shared);
     let reader_stream = match stream.try_clone() {
@@ -186,7 +186,7 @@ pub(super) fn start_connection(stream: UnixStream, shared: &Arc<Shared>) -> bool
         .spawn(move || {
             let ended = read_loop(&reader_stream, conn, &reader_shared);
             // Both ways, whatever ended the reading, so a writer held in a write the peer never reads is let go.
-            let _ = reader_stream.shutdown(Shutdown::Both);
+            shut_both_ways(&reader_stream);
             let why = if gauge.stalled.load(Ordering::SeqCst) {
                 CloseWhy::WriteStall
             } else {
@@ -196,10 +196,25 @@ pub(super) fn start_connection(stream: UnixStream, shared: &Arc<Shared>) -> bool
         })
         .is_err()
     {
-        let _ = stream.shutdown(Shutdown::Both);
+        shut_both_ways(&stream);
         closed(shared, conn, CloseWhy::Peer);
     }
     true
+}
+
+/// Shuts both directions of `stream`, which frees a writer held in a write the peer never reads (its write fails).
+/// macOS refuses `SHUT_RDWR` with ENOTCONN once the peer has shut its own writing side, and then shuts nothing, so the
+/// writer stayed held; there the writing side is shut first, alone, which macOS always does, and then the reading side.
+pub(super) fn shut_both_ways(stream: &UnixStream) {
+    #[cfg(target_os = "macos")]
+    {
+        let _ = stream.shutdown(Shutdown::Write);
+        let _ = stream.shutdown(Shutdown::Read);
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = stream.shutdown(Shutdown::Both);
+    }
 }
 
 /// A connection ended: the tick forgets it and its observers, and the cap has room for one more.
@@ -224,7 +239,7 @@ fn write_loop(stream: &UnixStream, lines: &Receiver<Out>, gauge: &Gauge, wake: &
             if matches!(e.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut) {
                 gauge.stalled.store(true, Ordering::SeqCst);
             }
-            let _ = stream.shutdown(Shutdown::Both);
+            shut_both_ways(stream);
             return;
         }
         if gauge.bytes.load(Ordering::SeqCst) <= WRITER_BYTES / 2 && gauge.starved.swap(false, Ordering::SeqCst) {
@@ -273,7 +288,7 @@ fn read_loop(stream: &UnixStream, conn: u64, shared: &Shared) -> CloseWhy {
             let line: Vec<u8> = buf.drain(..=end).collect();
             let line = &line[..line.len() - 1];
             if line.len() > RV_MAX_LINE || !hand_on(line, conn, shared) {
-                let _ = stream.shutdown(Shutdown::Both);
+                shut_both_ways(stream);
                 return CloseWhy::Rule;
             }
             last_line = Instant::now();
@@ -281,7 +296,7 @@ fn read_loop(stream: &UnixStream, conn: u64, shared: &Shared) -> CloseWhy {
         }
         scanned = buf.len();
         if buf.len() > RV_MAX_LINE {
-            let _ = stream.shutdown(Shutdown::Both);
+            shut_both_ways(stream);
             return CloseWhy::Rule;
         }
         // A line begun must end within its own deadline; between lines, the idle deadline runs.
@@ -291,7 +306,7 @@ fn read_loop(stream: &UnixStream, conn: u64, shared: &Shared) -> CloseWhy {
         };
         let left = until.saturating_duration_since(Instant::now());
         if left.is_zero() {
-            let _ = stream.shutdown(Shutdown::Both);
+            shut_both_ways(stream);
             return why;
         }
         // A zero timeout is an error to set, and means "no timeout" to some platforms.
@@ -299,7 +314,7 @@ fn read_loop(stream: &UnixStream, conn: u64, shared: &Shared) -> CloseWhy {
             .set_read_timeout(Some(left.max(Duration::from_millis(1))))
             .is_err()
         {
-            let _ = stream.shutdown(Shutdown::Both);
+            shut_both_ways(stream);
             return CloseWhy::Peer;
         }
         match (&*stream).read(&mut chunk) {

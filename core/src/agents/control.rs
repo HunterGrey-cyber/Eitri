@@ -196,7 +196,7 @@ where
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "a socket path with no file name"))?;
     ensure_dir(control_dir).map_err(|why| io::Error::new(io::ErrorKind::PermissionDenied, why))?;
     let dir = agent::private_fs::open_dir(control_dir)?;
-    let listener = UnixListener::bind(&path)?;
+    let listener = crate::panel_control::bind_unfollowed(&path)?;
     let meta = path.symlink_metadata()?;
     let bound = FileIdentity {
         dev: meta.dev(),

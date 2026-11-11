@@ -29,6 +29,10 @@ fn toast(r: &Rig) -> String {
 }
 
 #[test]
+#[cfg_attr(
+    target_os = "macos",
+    ignore = "plugin pages are not available on the Mac: plugin.load is refused there"
+)]
 fn plugin_load_requests_a_worker_and_refuses_a_duplicate_pending_name() {
     let mut r = rig(fixture("row(editor, agent)"));
     let batch = r.run(load("demo"));
@@ -49,6 +53,16 @@ fn plugin_load_requests_a_worker_and_refuses_a_duplicate_pending_name() {
             name: "other".into()
         })]
     );
+}
+
+/// The Mac has no plugin pages: a load is refused with that reason and starts no worker.
+#[cfg(target_os = "macos")]
+#[test]
+fn plugin_load_is_refused_on_the_mac() {
+    let mut r = rig(fixture("row(editor, agent)"));
+    let before = r.said();
+    let batch = r.run(load("demo"));
+    r.assert_refused(&batch, &before, "plugin pages are not available on the Mac");
 }
 
 #[test]
@@ -128,6 +142,10 @@ fn plugin_loaded_declares_then_opens_by_its_rule_and_builds_without_taking_keys(
 }
 
 #[test]
+#[cfg_attr(
+    target_os = "macos",
+    ignore = "plugin pages are not available on the Mac: plugin.load is refused there"
+)]
 fn plugin_shown_while_is_deferred_until_a_show_and_keeps_its_own_rule() {
     let mut r = rig(fixture("row(editor, agent)"));
     r.run(load("demo"));
@@ -160,6 +178,10 @@ fn plugin_shown_while_is_deferred_until_a_show_and_keeps_its_own_rule() {
 }
 
 #[test]
+#[cfg_attr(
+    target_os = "macos",
+    ignore = "plugin pages are not available on the Mac: plugin.load is refused there"
+)]
 fn plugin_already_loaded_is_shown_without_a_second_load_or_build() {
     let mut r = rig(fixture("row(editor, agent)"));
     r.run(load("demo"));
@@ -187,6 +209,10 @@ fn plugin_session_only_pages_cannot_move_to_another_window() {
 }
 
 #[test]
+#[cfg_attr(
+    target_os = "macos",
+    ignore = "plugin pages are not available on the Mac: plugin.load is refused there"
+)]
 fn plugin_load_failed_toasts_the_reason_and_allows_retry() {
     let mut r = rig(fixture("row(editor, agent)"));
     r.run(load("demo"));

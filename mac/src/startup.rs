@@ -878,8 +878,15 @@ mod tests {
 
     #[test]
     fn a_closed_descriptor_is_replaced_by_dev_null() {
-        // A high number no other thread of the test process is likely to take.
-        let fd: RawFd = 777;
+        // A high number no other thread of the test process is likely to take, under the descriptor limit
+        // (macOS's default soft limit is 256).
+        let mut limit = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        // SAFETY: `limit` is a writable `rlimit`, which is all `getrlimit` writes.
+        assert_eq!(unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) }, 0);
+        let fd = limit.rlim_cur.min(778) as RawFd - 1;
         let null = File::open("/dev/null").unwrap();
         // SAFETY: `null` is open; `dup2` makes `fd` another descriptor for it.
         assert_ne!(unsafe { libc::dup2(null.as_raw_fd(), fd) }, -1);
