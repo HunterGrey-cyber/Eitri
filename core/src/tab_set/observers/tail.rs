@@ -186,8 +186,8 @@ pub(super) struct Tail {
 
 impl Tail {
     /// Whether the snapshot is the whole conversation, serialized as it stands.
-    pub(super) fn is_whole(&self) -> bool {
-        self.first_turn == 0 && self.cut.is_empty()
+    pub(super) fn is_whole(&self, turns: &Turns) -> bool {
+        turns.base == 0 && self.first_turn == 0 && self.cut.is_empty()
     }
 
     /// The cut entries as the frame names them.
@@ -304,7 +304,9 @@ pub(super) fn choose_page(
     limit: usize,
 ) -> Option<(usize, usize)> {
     let count = turns.starts.len();
-    let before = usize::try_from(before_turn).ok().filter(|b| (1..=count).contains(b))?;
+    let before = usize::try_from(before_turn.checked_sub(turns.base)?)
+        .ok()
+        .filter(|b| (1..=count).contains(b))?;
     let earliest = before.saturating_sub(MORE_PAGE_TURNS);
     let (lo, hi) = turns.seqs(earliest, before);
     let mut sizes = vec![0usize; before - earliest];

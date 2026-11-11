@@ -847,3 +847,195 @@ fn the_availability_question_names_the_reason_without_a_tab() {
     let tab = set.active();
     assert_eq!(set.review_session(tab).err().as_deref(), Some(TURN_REVIEW_OFF));
 }
+
+#[test]
+fn settled_attribution_survives_eviction_after_delivery() {
+    settled_attribution_survives_eviction(false);
+}
+
+#[test]
+fn settled_attribution_survives_eviction_after_resync() {
+    settled_attribution_survives_eviction(true);
+}
+
+fn settled_attribution_survives_eviction(resync: bool) {
+    use crate::turn_review::{Origin, Scope, Snap, TurnRef};
+    use std::os::unix::fs::DirBuilderExt;
+
+    agent::state_dirs::redirect_state_to_a_test_root();
+    let scratch = std::env::temp_dir().join(format!("review-eviction-{}", uuid::Uuid::new_v4().simple()));
+    std::fs::DirBuilder::new().mode(0o700).create(&scratch).unwrap();
+    let dir = scratch.join("project");
+    std::fs::create_dir(&dir).unwrap();
+    std::fs::write(dir.join("old.rs"), "before\n").unwrap();
+    let mut set = set();
+    set.install_turn_review(crate::turn_review::TurnReview::with_options(
+        Some(scratch.join("review")),
+        &dir,
+        crate::turn_review::ReviewOptions {
+            excludes: Some(None),
+            trim_every: Duration::MAX,
+            ..Default::default()
+        },
+    ))
+    .unwrap();
+    let tab = set.active();
+    let (provider, backend) = live(&dir);
+    set.get_mut(tab).unwrap().backend = TabBackend::Live(backend);
+    let fold = |set: &TabSet, events: Vec<AgentDomainEvent>| {
+        let TabBackend::Live(AgentBackend::Conversation { conversation, .. }) = &set.get(tab).unwrap().backend else {
+            panic!("a conversation");
+        };
+        for event in events {
+            conversation.fold_locally(event);
+        }
+    };
+    let wait = |set: &mut TabSet, end: bool| {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            set.pump(&dir, true);
+            if set
+                .turn_review()
+                .unwrap()
+                .turns("sess-evicted")
+                .first()
+                .is_some_and(|r| matches!(if end { &r.end } else { &r.base }, Snap::Taken { .. }))
+            {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "snapshot hang guard (end={end}): {:?}",
+                set.turn_review().unwrap().turns("sess-evicted")
+            );
+            std::thread::yield_now();
+        }
+    };
+    let edit = |id: &str, path: &str| AgentDomainEvent::ToolCallStarted {
+        turn_id: "t1".into(),
+        tool_use_id: id.into(),
+        name: "Write".into(),
+        input: serde_json::json!({ "file_path": dir.join(path) }),
+    };
+    let done = |id: &str| AgentDomainEvent::ToolCallCompleted {
+        turn_id: "t1".into(),
+        tool_use_id: id.into(),
+        content: serde_json::json!("ok"),
+        is_error: false,
+    };
+    provider.open_session("sess-evicted", &dir);
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while set.get(tab).unwrap().live().unwrap().provider_session_id().as_deref() != Some("sess-evicted") {
+        assert!(Instant::now() < deadline, "session-open hang guard");
+        std::thread::yield_now();
+    }
+    fold(
+        &set,
+        vec![
+            started("t1"),
+            AgentDomainEvent::UserPromptSubmitted { text: "first".into() },
+        ],
+    );
+    wait(&mut set, false);
+    std::fs::write(dir.join("old.rs"), "after\n").unwrap();
+    std::fs::write(dir.join("live.rs"), "after\n").unwrap();
+    fold(
+        &set,
+        vec![
+            edit("old", "old.rs"),
+            done("old"),
+            edit("dead", "dead.rs"),
+            AgentDomainEvent::UserPromptSubmitted { text: "steered".into() },
+            edit("live", "live.rs"),
+            done("live"),
+            edit("pending", "pending.rs"),
+        ],
+    );
+    // In the resync case the end is among dropped events, but the review already owns the start.
+    fold(&set, vec![completed("t1", agent::TurnOutcome::Completed)]);
+    if resync {
+        fold(
+            &set,
+            (0..300)
+                .map(|_| AgentDomainEvent::EffortReported { effort: None })
+                .collect(),
+        );
+    }
+    wait(&mut set, true);
+    let overview = |set: &TabSet, scope| {
+        set.review_overview_job(tab, TurnRef::Latest, scope)
+            .unwrap()
+            .run()
+            .unwrap()
+    };
+    assert_eq!(overview(&set, Scope::Turn).pending_no_result, 2);
+    let through_seq = set.get(tab).unwrap().live().unwrap().projection().user_prompts[1].seq;
+    fold(
+        &set,
+        vec![AgentDomainEvent::HistoryEvicted {
+            through_seq,
+            turns: 1,
+            lifted: vec![],
+        }],
+    );
+    set.pump(&dir, true);
+    // A live successful call can arrive after settle; the overview must combine it with the cached half.
+    std::fs::write(dir.join("later.rs"), "after\n").unwrap();
+    fold(&set, vec![edit("later", "later.rs"), done("later")]);
+    set.pump(&dir, true);
+    for scope in [Scope::Turn, Scope::Session] {
+        let result = overview(&set, scope);
+        for path in ["old.rs", "live.rs"] {
+            assert_eq!(
+                result.files.iter().find(|f| f.path == Path::new(path)).unwrap().origin,
+                Origin::Agent
+            );
+        }
+        assert_eq!(
+            result
+                .files
+                .iter()
+                .find(|f| f.path == Path::new("later.rs"))
+                .unwrap()
+                .origin,
+            Origin::AgentOnly
+        );
+        assert_eq!(result.pending_no_result, 1, "only the live unanswered call remains");
+    }
+    fold(
+        &set,
+        vec![AgentDomainEvent::UserPromptSubmitted { text: "next".into() }],
+    );
+    let through_seq = set.get(tab).unwrap().live().unwrap().projection().user_prompts[1].seq;
+    fold(
+        &set,
+        vec![AgentDomainEvent::HistoryEvicted {
+            through_seq,
+            turns: 2,
+            lifted: vec![],
+        }],
+    );
+    set.pump(&dir, true);
+    let result = overview(&set, Scope::Turn);
+    assert_eq!(result.pending_no_result, 0);
+    assert_eq!(
+        result
+            .files
+            .iter()
+            .find(|f| f.path == Path::new("old.rs"))
+            .unwrap()
+            .origin,
+        Origin::Agent
+    );
+    assert_eq!(
+        result
+            .files
+            .iter()
+            .find(|f| f.path == Path::new("live.rs"))
+            .unwrap()
+            .origin,
+        Origin::Agent
+    );
+    shut_down_all(&mut set);
+    let _ = std::fs::remove_dir_all(scratch);
+}

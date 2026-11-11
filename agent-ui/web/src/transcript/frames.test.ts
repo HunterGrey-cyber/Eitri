@@ -41,6 +41,22 @@ describe("phone frames", () => {
     expect(m.throughRevision).toBe(frames.filter((f) => f.kind === "events").at(-1)?.through);
   });
 
+  it("history_evicted_requests_a_snapshot_without_renumbering_or_pruning_locally", () => {
+    const before = { ...ready(), owedPage: true };
+    const after = applyFrame(before, { ...events(), frame: { events: [
+      { type: "history_evicted", through_seq: 15, turns: 3, lifted: [] },
+    ], revisions: [22] } });
+    expect(after.wantSnapshot).toBe(true);
+    expect(after.state).toBe(before.state);
+    expect(after.firstTurn).toBe(2);
+    expect(after.throughRevision).toBe(20);
+    expect(wantMore(after)).toBeNull();
+    const fresh = applyFrame(after, snapshot(3));
+    expect(fresh.firstTurn).toBe(3);
+    expect(fresh.wantSnapshot).toBe(false);
+    expect(fresh.owedPage).toBe(false);
+  });
+
   it("events_with_a_gap_ask_for_a_snapshot", () => {
     const before = ready();
     for (const frame of [events(21), events(20, 2), { ...events(), key: "other" }]) {

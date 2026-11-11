@@ -49,3 +49,11 @@ it("keeps a restored cursor when switching to another tab with an eviction bound
   rerender({ timeline: rows(100), tab: 2, boundary: 100 });
   expect(result.current).toBe(2);
 });
+
+it("keeps an expanded run after a thought separates it from an earlier run in expanded thinking", () => {
+  const call = (seq: number) => ({ seq, turnId: "turn", toolUseId: `call${seq}`, name: "Read", input: {}, result: { content: "ok", isError: false } });
+  const state = { ...initialState(), toolCalls: [call(20), call(21), call(23), call(24)],
+    thinking: [{ seq: 22, turnId: "turn", text: "thought" }] };
+  expect(pruneExpanded(state, { "r-1": true, "r-23": true }, "expanded"))
+    .toEqual({ "r-23": true });
+});

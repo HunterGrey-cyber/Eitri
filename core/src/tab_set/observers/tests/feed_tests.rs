@@ -219,10 +219,11 @@ fn huge_entry_is_cut_and_fetched_whole_in_chunks() {
 
 #[test]
 fn more_pages_back_without_gaps() {
-    let (_dir, mut set, tab, _provider) = tab_with("observers-more-pages", turns_of(350, 200));
+    // Keep two older pages without crossing the automatic settled-history eviction threshold.
+    let (_dir, mut set, tab, _provider) = tab_with("observers-more-pages", turns_of(210, 200));
     let id = set.observe(&key(&set, tab)).unwrap();
     let (first_turn, _, _, payload) = snapshot_of(&set.take_observer_frames(id, usize::MAX));
-    assert_eq!(first_turn, 250);
+    assert_eq!(first_turn, 110);
     let generation = generation(&set, tab);
     let mut held = prompts(&payload);
     let mut before = first_turn;
@@ -241,10 +242,10 @@ fn more_pages_back_without_gaps() {
         before = from;
         pages += 1;
     }
-    assert_eq!(pages, 3);
-    assert_eq!(held, numbered(0..350), "every turn once, in order");
-    assert_eq!(set.observer_more(id, generation, 0), Err(MoreRefusal::NoSuchTurn));
-    assert_eq!(set.observer_more(id, generation, 351), Err(MoreRefusal::NoSuchTurn));
+    assert_eq!(pages, 2);
+    assert_eq!(held, numbered(0..210), "every turn once, in order");
+    assert_eq!(set.observer_more(id, generation, 0), Err(MoreRefusal::NotLoaded));
+    assert_eq!(set.observer_more(id, generation, 211), Err(MoreRefusal::NoSuchTurn));
     assert!(set.observers_with_frames().is_empty());
     shut_down(&mut set);
 }
@@ -729,7 +730,7 @@ fn cut_largest_cuts_the_largest_entries_until_enough_is_saved() {
         let projection = set.get(tab).unwrap().live().unwrap().projection();
         let turns = Turns::of(&projection);
         let whole = tail::choose_tail(&projection, &turns, SNAPSHOT_CEILING_BYTES);
-        assert!(whole.is_whole());
+        assert!(whole.is_whole(&turns));
         let replies: Vec<u64> = projection.transcript.iter().map(|m| m.seq).collect();
         let cut_seqs = |tail: &tail::Tail| -> Vec<u64> {
             tail.cut_entries()
@@ -745,6 +746,99 @@ fn cut_largest_cuts_the_largest_entries_until_enough_is_saved() {
             tail::cut_largest(both, &projection, 1).is_none(),
             "nothing large is left to cut"
         );
+    }
+    shut_down(&mut set);
+}
+
+fn evict_before(set: &mut TabSet, tab: TabId, base: usize) {
+    let through_seq = set.get(tab).unwrap().live().unwrap().projection().user_prompts[base].seq;
+    let TabBackend::Live(AgentBackend::Conversation { conversation, .. }) = &mut set.get_mut(tab).unwrap().backend
+    else {
+        panic!("a conversation");
+    };
+    conversation.fold_locally(AgentDomainEvent::HistoryEvicted {
+        through_seq,
+        turns: base as u64,
+        lifted: Vec::new(),
+    });
+}
+
+#[test]
+fn eviction_keeps_snapshot_and_pages_absolute() {
+    let (dir, mut set, tab, _) = tab_with("observers-evicted-pages", turns_of(120, 20));
+    evict_before(&mut set, tab, 15);
+    set.pump(&dir, true);
+    let id = set.observe(&key(&set, tab)).unwrap();
+    let (first, _, _, snapshot) = snapshot_of(&set.take_observer_frames(id, usize::MAX));
+    assert_eq!(first, 20);
+    assert_eq!(prompts(&snapshot), numbered(20..120));
+    let generation = generation(&set, tab);
+    for before in [0, 14, 15] {
+        assert_eq!(set.observer_more(id, generation, before), Err(MoreRefusal::NotLoaded));
+    }
+    assert_eq!(set.observer_more(id, generation, 121), Err(MoreRefusal::NoSuchTurn));
+    set.observer_more(id, generation, first).unwrap();
+    let (from, through, _, page) = page_of(&set.take_observer_frames(id, usize::MAX));
+    assert_eq!((from, through), (15, 19));
+    assert_eq!(prompts(&page), numbered(15..20));
+    shut_down(&mut set);
+}
+
+#[test]
+fn an_evicted_tail_is_not_the_whole_conversation() {
+    let (dir, mut set, tab, _) = tab_with("observers-evicted-tail", turns_of(10, 20));
+    evict_before(&mut set, tab, 4);
+    set.pump(&dir, true);
+    {
+        let p = set.get(tab).unwrap().live().unwrap().projection();
+        let turns = Turns::of(&p);
+        let tail = tail::choose_tail(&p, &turns, SNAPSHOT_CEILING_BYTES);
+        assert!(!tail.is_whole(&turns));
+        // A page of the last live turn waits for its unseen changes; a page below the cut never waits.
+        assert!(page_waits(&p, &turns, 10, 0));
+        assert!(!page_waits(&p, &turns, 4, 0));
+    }
+    let id = set.observe(&key(&set, tab)).unwrap();
+    let (first, _, _, snapshot) = snapshot_of(&set.take_observer_frames(id, usize::MAX));
+    assert_eq!(first, 4);
+    assert_eq!(prompts(&snapshot), numbered(4..10));
+    shut_down(&mut set);
+}
+
+#[test]
+fn an_owed_page_overtaken_by_eviction_is_refused_and_released() {
+    let (_dir, mut set, tab, _) = tab_with("observers-evicted-owed", turns_of(10, 20));
+    let id = set.observe(&key(&set, tab)).unwrap();
+    set.take_observer_frames(id, usize::MAX);
+    let generation = generation(&set, tab);
+    set.observer_more(id, generation, 8).unwrap();
+    // Fold after admission and before the take, without a pump or another producer racing this cut.
+    evict_before(&mut set, tab, 8);
+    let frames = set.take_observer_frames(id, usize::MAX);
+    assert_eq!(frames.len(), 1, "the accepted request must get an answer: {frames:?}");
+    let line = json(&frame_line(&frames[0]));
+    assert_eq!(line["kind"], "refused");
+    assert_eq!(line["why"], "not loaded");
+    assert_eq!(line["key"], key(&set, tab).as_str());
+    assert!(set.take_observer_frames(id, usize::MAX).is_empty());
+    set.observer_more(id, generation, 9)
+        .expect("the old request no longer occupies the slot");
+    let (from, through, _, page) = page_of(&set.take_observer_frames(id, usize::MAX));
+    assert_eq!((from, through), (8, 8));
+    assert_eq!(prompts(&page), numbered(8..9));
+    shut_down(&mut set);
+}
+
+#[test]
+fn eviction_refuses_more_at_or_below_the_base() {
+    let (dir, mut set, tab, _) = tab_with("observers-evicted-refusal", turns_of(10, 20));
+    evict_before(&mut set, tab, 4);
+    set.pump(&dir, true);
+    let id = set.observe(&key(&set, tab)).unwrap();
+    set.take_observer_frames(id, usize::MAX);
+    let generation = generation(&set, tab);
+    for before in [0, 3, 4] {
+        assert_eq!(set.observer_more(id, generation, before), Err(MoreRefusal::NotLoaded));
     }
     shut_down(&mut set);
 }

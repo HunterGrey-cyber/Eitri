@@ -2066,35 +2066,48 @@ impl CallNotes {
         let boundary = evicted.through_seq;
         let remote_count = self.sent_from.len() + self.stopped_from.len();
         let mut calls = BTreeSet::new();
-        fn collect(calls: &mut BTreeSet<String>, records: &[agent::ToolCallRecord]) {
+        let mut owners = BTreeSet::new();
+        fn collect(calls: &mut BTreeSet<String>, owners: &mut BTreeSet<String>, records: &[agent::ToolCallRecord]) {
             for call in records {
                 calls.insert(call.tool_use_id.clone());
+                owners.insert(call.turn_id.clone());
+                owners.insert(call.tool_use_id.clone());
                 if let Some(children) = &call.children {
-                    collect(calls, &children.tool_calls);
+                    collect(calls, owners, &children.tool_calls);
                 }
             }
         }
-        collect(&mut calls, &projection.tool_calls);
+        collect(&mut calls, &mut owners, &projection.tool_calls);
+        calls.extend(
+            projection
+                .pending_permissions
+                .values()
+                .filter_map(|p| p.tool_use_id.clone()),
+        );
         self.turn_times
             .retain(|r| r.anchor_seq.is_some_and(|seq| seq >= boundary));
-        let turns: BTreeSet<_> = projection
-            .thinking
-            .iter()
-            .map(|r| r.turn_id.as_str())
-            .chain(self.turn_times.iter().map(|r| r.turn_id.as_str()))
-            .chain(projection.turn_starts.iter().map(|r| r.turn_id.as_str()))
-            .chain(projection.turn_endings.iter().map(|r| r.turn_id.as_str()))
-            .chain(projection.tool_calls.iter().map(|r| r.turn_id.as_str()))
-            .collect();
+        owners.extend(
+            projection
+                .thinking
+                .iter()
+                .map(|r| r.turn_id.as_str())
+                .chain(self.turn_times.iter().map(|r| r.turn_id.as_str()))
+                .chain(projection.turn_starts.iter().map(|r| r.turn_id.as_str()))
+                .chain(projection.turn_endings.iter().map(|r| r.turn_id.as_str()))
+                .chain(projection.active_turn_id.as_deref())
+                .chain(projection.background_tasks.rows.iter().map(|r| r.task.task_id.as_str()))
+                .map(str::to_owned),
+        );
         self.sent_from
             .retain(|seq, _| *seq >= boundary || evicted.lifted.contains(seq));
-        self.stopped_from.retain(|id, _| turns.contains(id.as_str()));
+        self.stopped_from.retain(|id, _| owners.contains(id));
         self.allowed_by_rule.retain(|id, _| calls.contains(id));
         self.prompt_notes.retain(|id, _| calls.contains(id));
         self.allowed_by_auto.retain(|id| calls.contains(id));
         self.auto_creates_file.retain(|id| calls.contains(id));
-        self.creates_file
-            .retain(|_, id| id.as_ref().is_some_and(|id| calls.contains(id)));
+        self.creates_file.retain(|permission, id| {
+            projection.pending_permissions.contains_key(permission) || id.as_ref().is_some_and(|id| calls.contains(id))
+        });
         self.remote_notes_dirty |= remote_count != self.sent_from.len() + self.stopped_from.len();
     }
 

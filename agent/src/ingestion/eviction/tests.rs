@@ -348,3 +348,102 @@ fn running_roster_lifts_its_launcher_even_after_a_launch_result() {
     assert_eq!(st.projection.evicted.as_ref().unwrap().lifted, vec![1]);
     assert_eq!(st.projection.tool_calls[0].tool_use_id, "launcher");
 }
+
+#[test]
+fn nested_running_roster_lifts_completed_ancestors_and_expires_after_completion() {
+    let scratch = Scratch::new();
+    let state = filled(12);
+    {
+        let mut st = state.lock().unwrap();
+        background(&mut st);
+        let root = &mut st.projection.tool_calls[0];
+        root.background = false;
+        root.result = Some(serde_json::from_value(json!({"content":"done", "is_error":false})).unwrap());
+        let nested = &mut root.children.as_mut().unwrap().tool_calls[0];
+        nested.result = root.result.clone();
+        nested.children = Some(
+            serde_json::from_value(json!({
+                "transcript":[],"thinking":[],"tool_calls":[{
+                    "seq":3,"turn_id":"grandchild","tool_use_id":"launcher","name":"Bash","input":{},
+                    "result":{"content":"launched","is_error":false}
+                }],"assistant_message_open":false,"thinking_open":false
+            }))
+            .unwrap(),
+        );
+        st.fold(serde_json::from_value(json!({"type":"background_tasks_changed","tasks":[{
+            "task_id":"task","kind":"shell","task_type":"shell","description":"work","ambient":false,"tool_use_id":"launcher"
+        }]})).unwrap());
+    }
+    assert!(flush(&state, &scratch.0));
+    {
+        let mut st = state.lock().unwrap();
+        assert_eq!(st.projection.evicted.as_ref().unwrap().lifted, vec![1]);
+        assert_eq!(
+            st.projection.tool_calls[0].children.as_ref().unwrap().tool_calls[0]
+                .children
+                .as_ref()
+                .unwrap()
+                .tool_calls[0]
+                .tool_use_id,
+            "launcher"
+        );
+        st.fold(
+            serde_json::from_value(json!({"type":"task_event","edge":"updated","task_id":"task",
+            "run_id":null,"task":null,"status":"completed","summary":"done"}))
+            .unwrap(),
+        );
+        turn(&mut st, 12);
+        turn(&mut st, 13);
+    }
+    assert!(flush(&state, &scratch.0));
+    let st = state.lock().unwrap();
+    assert!(st.projection.tool_calls.is_empty());
+    assert!(st.projection.evicted.as_ref().unwrap().lifted.is_empty());
+}
+
+#[test]
+fn synthetic_background_launcher_expires_when_its_roster_entry_completes() {
+    let scratch = Scratch::new();
+    let state = filled(0);
+    {
+        let mut st = state.lock().unwrap();
+        st.fold(AgentDomainEvent::SubagentFrame {
+            parent_tool_use_id: "unknown".into(),
+            frame: Box::new(AgentDomainEvent::ContentDelta {
+                turn_id: "child".into(),
+                kind: ContentKind::Text,
+                text: "work".into(),
+            }),
+        });
+        st.fold(serde_json::from_value(json!({"type":"background_tasks_changed","tasks":[{
+            "task_id":"task","kind":"local_agent","task_type":"agent","description":"work","ambient":false,"tool_use_id":"unknown"
+        }]})).unwrap());
+        for n in 0..12 {
+            turn(&mut st, n);
+        }
+    }
+    assert!(flush(&state, &scratch.0));
+    let id = {
+        let mut st = state.lock().unwrap();
+        assert_eq!(st.projection.evicted.as_ref().unwrap().lifted, vec![0]);
+        assert!(st.projection.tool_calls[0].background);
+        assert!(st.projection.tool_calls[0].result.is_none());
+        st.fold(
+            serde_json::from_value(json!({"type":"task_event","edge":"updated","task_id":"task",
+            "run_id":null,"task":null,"status":"completed","summary":"done"}))
+            .unwrap(),
+        );
+        turn(&mut st, 12);
+        turn(&mut st, 13);
+        st.archive_id.clone().unwrap()
+    };
+    assert!(flush(&state, &scratch.0));
+    let st = state.lock().unwrap();
+    assert!(st.projection.tool_calls.is_empty());
+    assert!(st.projection.evicted.as_ref().unwrap().lifted.is_empty());
+    assert!(page(&scratch.0, &id, 4)
+        .turns
+        .iter()
+        .flat_map(|t| &t.records)
+        .all(|r| !matches!(r, ArchivedRecord::ToolCall(c) if c.tool_use_id == "unknown")));
+}

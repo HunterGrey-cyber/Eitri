@@ -1624,3 +1624,92 @@ fn eviction_deliveries_and_overflow_resyncs_prune_notes_with_lifted_calls_kept()
         shut_down_all(&mut set);
     }
 }
+
+#[test]
+fn eviction_delivery_keeps_new_notes_before_their_call_starts() {
+    let dir = workspace("eviction-new-notes");
+    let mut set = set();
+    let tab = set.active();
+    let (provider, backend) = live(&dir);
+    set.get_mut(tab).unwrap().backend = TabBackend::Live(backend);
+    set.get_mut(tab).unwrap().mode = SessionModeChoice::Bypass;
+    set.get_mut(tab).unwrap().session.note_ledger.record(
+        "late-rule".into(),
+        NoteCandidate::Rule {
+            rule: "Bash(npm ci *)".into(),
+            call: CandidateCall {
+                tool_name: "Bash".into(),
+                input: serde_json::json!({"command":"npm ci"}),
+            },
+        },
+    );
+    set.get_mut(tab)
+        .unwrap()
+        .notes
+        .prompt_notes
+        .insert("gone".into(), "old".into());
+    let revision = set.get(tab).unwrap().live().unwrap().projection().last_revision;
+    provider.queue_all(vec![
+        AgentDomainEvent::HistoryEvicted {
+            through_seq: revision,
+            turns: 1,
+            lifted: vec![],
+        },
+        started("t1"),
+        AgentDomainEvent::PermissionRequested {
+            permission_id: "perm-new".into(),
+            tool_use_id: Some("late-write".into()),
+            tool_name: "Write".into(),
+            input: serde_json::json!({"file_path":"fresh.rs","content":"new"}),
+            provider_prompt: None,
+        },
+        call_done("late-rule", false),
+    ]);
+    // Wait for the whole queued batch before draining, so the cut and notes share one delivery.
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while set.get(tab).unwrap().live().unwrap().projection().last_revision < revision + 4 {
+        assert!(Instant::now() < deadline, "batch did not fold");
+        std::thread::yield_now();
+    }
+    let out = set.pump(&dir, true);
+    let notes = &set.get(tab).unwrap().notes;
+    assert!(notes.auto_creates_file.contains("late-write"));
+    assert_eq!(
+        notes.allowed_by_rule.get("late-rule").map(String::as_str),
+        Some("Bash(npm ci *)")
+    );
+    assert!(!notes.prompt_notes.contains_key("gone"));
+    let payloads: Vec<serde_json::Value> = out
+        .active_payload
+        .iter()
+        .map(|p| serde_json::from_str(p).unwrap())
+        .collect();
+    assert!(payloads
+        .iter()
+        .any(|p| p["autoCreatesFile"] == serde_json::json!(["late-write"])));
+    assert!(payloads
+        .iter()
+        .any(|p| p["ruleNotes"] == serde_json::json!([{"toolUseId":"late-rule","rule":"Bash(npm ci *)"}])));
+    provider.queue_all(vec![
+        call_started(
+            "late-write",
+            "Write",
+            serde_json::json!({"file_path":"fresh.rs","content":"new"}),
+        ),
+        call_started("late-rule", "Bash", serde_json::json!({"command":"npm ci"})),
+    ]);
+    while set.get(tab).unwrap().live().unwrap().projection().tool_calls.len() < 2 {
+        assert!(Instant::now() < deadline, "call starts did not fold");
+        std::thread::yield_now();
+    }
+    set.pump(&dir, true);
+    assert_eq!(
+        call_in_snapshot(&mut set, "late-write")["createsFile"],
+        serde_json::json!(true)
+    );
+    assert_eq!(
+        call_in_snapshot(&mut set, "late-rule")["allowedByRule"],
+        serde_json::json!("Bash(npm ci *)")
+    );
+    shut_down_all(&mut set);
+}

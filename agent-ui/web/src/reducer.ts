@@ -336,12 +336,33 @@ function foldEvent(state: AgentUiState, event: AgentDomainEvent, seq: Seq, onUnk
     case "history_evicted": {
       const lifted = new Set(event.lifted);
       const keep = (r: { seq: Seq }) => r.seq >= event.through_seq || lifted.has(r.seq);
-      return { ...state,
+      const next = { ...state,
         userPrompts: state.userPrompts.filter(keep), transcript: state.transcript.filter(keep),
         thinking: state.thinking.filter(keep), toolCalls: state.toolCalls.filter(keep),
         turnStarts: state.turnStarts.filter(keep), turnEndings: state.turnEndings.filter(keep),
         notices: state.notices.filter(keep), questions: state.questions.filter(keep),
         evicted: { throughSeq: event.through_seq, turns: event.turns },
+      };
+      const owners = new Set([
+        ...next.thinking.map((r) => r.turnId), ...next.turnStarts.map((r) => r.turnId),
+        ...next.turnEndings.map((r) => r.turnId), ...next.backgroundTasks.rows.map((r) => r.task_id),
+      ]);
+      if (next.activeTurnId !== null) owners.add(next.activeTurnId);
+      const collect = (calls: AgentUiState["toolCalls"]) => {
+        for (const call of calls) {
+          if (call.turnId !== undefined) owners.add(call.turnId);
+          owners.add(call.toolUseId);
+          if (call.children) collect(call.children.toolCalls);
+        }
+      };
+      collect(next.toolCalls);
+      return { ...next,
+        ...(state.sentFrom === undefined ? {} : { sentFrom: Object.fromEntries(
+          Object.entries(state.sentFrom).filter(([seq]) => keep({ seq: Number(seq) })),
+        ) }),
+        ...(state.stoppedFrom === undefined ? {} : { stoppedFrom: Object.fromEntries(
+          Object.entries(state.stoppedFrom).filter(([id]) => owners.has(id)),
+        ) }),
       };
     }
     case "turn_cause_updated": {

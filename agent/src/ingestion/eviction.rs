@@ -1,6 +1,7 @@
 use super::*;
 use crate::history::archive::{ArchiveId, ArchiveWriter, ArchivedRecord, ArchivedTurn};
-use crate::projection::{turns::Turns, QuestionState, TaskStatus};
+use crate::projection::{turns::Turns, QuestionState, TaskStatus, ToolCallRecord};
+use std::collections::BTreeMap;
 use std::path::Path;
 
 fn ready(state: &IngestState) -> bool {
@@ -13,6 +14,20 @@ fn ready(state: &IngestState) -> bool {
             .iter()
             .all(|q| matches!(q.state, QuestionState::Settled { .. }))
         && !state.reload_held
+}
+
+fn running_background(call: &ToolCallRecord, roster: &BTreeMap<&str, bool>) -> bool {
+    // A roster outcome is authoritative even when a synthetic launcher never receives a result.
+    roster
+        .get(call.tool_use_id.as_str())
+        .copied()
+        .unwrap_or(call.background && call.result.is_none())
+        || call.children.as_ref().is_some_and(|children| {
+            children
+                .tool_calls
+                .iter()
+                .any(|child| running_background(child, roster))
+        })
 }
 
 pub(super) fn flush_eviction(
@@ -63,17 +78,16 @@ fn flush_in(
         };
         let cut = count - budget;
         let through_seq = turns.starts[cut];
+        let mut roster = BTreeMap::new();
+        for row in &p.background_tasks.rows {
+            if let Some(id) = row.task.tool_use_id.as_deref() {
+                *roster.entry(id).or_insert(false) |= row.status == TaskStatus::Running;
+            }
+        }
         let lifted: Vec<_> = p
             .tool_calls
             .iter()
-            .filter(|call| {
-                call.seq < through_seq
-                    && ((call.result.is_none() && call.background)
-                        || p.background_tasks.rows.iter().any(|r| {
-                            r.status == TaskStatus::Running
-                                && r.task.tool_use_id.as_deref() == Some(call.tool_use_id.as_str())
-                        }))
-            })
+            .filter(|call| call.seq < through_seq && running_background(call, &roster))
             .map(|call| call.seq)
             .collect();
         let mut records: Vec<_> = (0..cut)

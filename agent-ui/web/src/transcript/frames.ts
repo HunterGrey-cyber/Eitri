@@ -134,6 +134,7 @@ export function applyFrame(m: TranscriptModel, frame: unknown): TranscriptModel 
       const envelope = f.frame;
       if (envelope.revisions !== undefined && (!Array.isArray(envelope.revisions) ||
         envelope.revisions.length !== f.frame.events.length || !envelope.revisions.every(uint))) return needsSnapshot(m);
+      if ((envelope.events as ObjectValue[]).some((event) => event.type === "history_evicted")) return needsSnapshot(m);
       let update = false;
       try {
         const state = applyEvents(m.state, envelope.events as AgentDomainEvent[], envelope.revisions as number[] | undefined,

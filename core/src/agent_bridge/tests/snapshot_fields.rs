@@ -1130,3 +1130,71 @@ fn eviction_prunes_call_notes_and_preserves_lifted_descendant_notes() {
     notes.prune_evicted_if_moved(&p);
     assert!(!notes.prompt_notes.contains_key("not-started-yet"));
 }
+
+#[test]
+fn eviction_badges_match_the_shared_page_fixture() {
+    let fixture: Value = serde_json::from_str(include_str!(
+        "../../../../agent-ui/web/src/fixtures/history-evicted.json"
+    ))
+    .unwrap();
+    let mut projection = AgentSessionProjection::default();
+    for event in fixture["events"].as_array().unwrap() {
+        projection.apply(&serde_json::from_value(event.clone()).unwrap());
+    }
+    let mut notes = CallNotes::default();
+    notes.sent_from = serde_json::from_value(fixture["notes"]["sentFrom"].clone()).unwrap();
+    notes.stopped_from = serde_json::from_value(fixture["notes"]["stoppedFrom"].clone()).unwrap();
+    notes.prune_evicted(&projection);
+    assert_eq!(json!(notes.sent_from), fixture["surviving_notes"]["sentFrom"]);
+    assert_eq!(json!(notes.stopped_from), fixture["surviving_notes"]["stoppedFrom"]);
+}
+
+#[test]
+fn eviction_keeps_notes_for_pending_permissions_before_the_call_starts() {
+    let mut projection = AgentSessionProjection::default();
+    for (permission_id, tool_use_id) in [("pending", Some("not-started")), ("unjoined", None)] {
+        projection.apply(&AgentDomainEvent::PermissionRequested {
+            permission_id: permission_id.into(),
+            tool_use_id: tool_use_id.map(str::to_owned),
+            tool_name: "Write".into(),
+            input: json!({}),
+            provider_prompt: None,
+        });
+    }
+    projection.apply(&AgentDomainEvent::HistoryEvicted {
+        through_seq: 40,
+        turns: 10,
+        lifted: vec![],
+    });
+    let mut notes = CallNotes::default();
+    for id in ["gone", "not-started"] {
+        notes.allowed_by_rule.insert(id.into(), "rule".into());
+        notes.prompt_notes.insert(id.into(), "prompt".into());
+        notes.allowed_by_auto.insert(id.into());
+        notes.auto_creates_file.insert(id.into());
+    }
+    notes.creates_file.insert("pending".into(), Some("not-started".into()));
+    notes.creates_file.insert("unjoined".into(), None);
+    notes.creates_file.insert("gone-perm".into(), None);
+    notes.prune_evicted(&projection);
+    assert_eq!(
+        notes.allowed_by_rule.keys().map(String::as_str).collect::<Vec<_>>(),
+        vec!["not-started"]
+    );
+    assert_eq!(
+        notes.prompt_notes.keys().map(String::as_str).collect::<Vec<_>>(),
+        vec!["not-started"]
+    );
+    assert_eq!(
+        notes.allowed_by_auto.iter().map(String::as_str).collect::<Vec<_>>(),
+        vec!["not-started"]
+    );
+    assert_eq!(
+        notes.auto_creates_file.iter().map(String::as_str).collect::<Vec<_>>(),
+        vec!["not-started"]
+    );
+    assert_eq!(
+        notes.creates_file.keys().map(String::as_str).collect::<Vec<_>>(),
+        vec!["pending", "unjoined"]
+    );
+}

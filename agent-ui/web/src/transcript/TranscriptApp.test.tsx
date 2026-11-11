@@ -173,12 +173,14 @@ describe("the transcript page", () => {
     expect(t.posted).toEqual([{ kind: "more", key, generation: 1, before_turn: 3 }]);
   });
 
-  it("a_refused_more_is_asked_again_after_a_fresh_snapshot", () => {
+  it.each(["the session changed", "not loaded"])("a_refused_more_is_remembered_until_a_fresh_snapshot: %s", (why) => {
     const t = setup(snapshot());
     const list = t.list();
     list.scrollTop = 0;
     fireEvent.scroll(list);
-    t.send({ v: 1, kind: "refused", key, why: "the session changed" });
+    const shown = t.container.textContent;
+    t.send({ v: 1, kind: "refused", key, why });
+    expect(t.container.textContent).toBe(shown);
     fireEvent.scroll(list);
     expect(t.posted.filter((p) => p.kind === "more")).toHaveLength(1);
     // The same session again, with the same turns: the refusal was about the moment, not the request.

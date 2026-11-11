@@ -1778,7 +1778,7 @@ export default function App() {
   );
   useEffect(() => {
     if (state.evicted === null) return;
-    setExpanded((held) => pruneExpanded(state, held));
+    setExpanded((held) => pruneExpanded(state, held, thinkingDisplay));
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [state.evicted]);
   /** For the dispatch handler (installed once), as `cursorRef`: the park names the cursor's row by key. */

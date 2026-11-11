@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 import { afterEach, beforeAll, expect, it, vi } from "vitest";
 import { cleanup, render } from "@testing-library/react";
-import { applyEvent, applySnapshot, initialState } from "./reducer";
+import { applyCallNotes, applyEvent, applySnapshot, initialState } from "./reducer";
 import type { AgentDomainEvent, AgentUiState } from "./types";
 import fixture from "./fixtures/history-evicted.json";
 import { MessageList } from "./components/MessageList";
@@ -12,7 +12,7 @@ beforeAll(() => { Element.prototype.scrollIntoView = vi.fn(); });
 
 it("folds the shared eviction fixture with the same surviving sequences and children as Rust", () => {
   const unknown = vi.fn();
-  let state = initialState();
+  let state = applyCallNotes(initialState(), fixture.notes);
   for (const event of fixture.events) state = applyEvent(state, event as AgentDomainEvent, unknown);
   const fields = {
     user_prompts: "userPrompts", transcript: "transcript", thinking: "thinking", tool_calls: "toolCalls",
@@ -21,6 +21,8 @@ it("folds the shared eviction fixture with the same surviving sequences and chil
   for (const [rust, ts] of Object.entries(fields)) {
     expect(state[ts].map((r) => r.seq)).toEqual(fixture.surviving[rust as keyof typeof fields]);
   }
+  expect(state.sentFrom).toEqual(fixture.surviving_notes.sentFrom);
+  expect(state.stoppedFrom).toEqual(fixture.surviving_notes.stoppedFrom);
   expect(state.evicted).toEqual({ throughSeq: fixture.evicted.through_seq, turns: fixture.evicted.turns });
   expect(state.toolCalls[0].background).toBe(true);
   expect(state.toolCalls[0].children?.toolCalls[0].toolUseId).toBe("nested");

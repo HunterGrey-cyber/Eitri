@@ -456,6 +456,7 @@ struct Rec {
     /// Position among this run's turns of the session, from 1; 0 while the session is not known.
     position: u32,
     record: TurnRecord,
+    named_paths: BTreeSet<PathBuf>,
     /// An event ended the turn.
     ended: bool,
     /// The pump the end was observed in, valid once `ended`.
@@ -561,6 +562,8 @@ pub struct HandedRecord {
     pub left_out_end: Vec<LeftOutEntry>,
     pub earlier_run: bool,
     pub ended: bool,
+    #[serde(default)]
+    pub named_paths: Vec<PathBytes>,
     pub marks_sent: MarksWire,
     pub started_ns: u64,
     pub ended_ns: Option<u64>,
@@ -571,6 +574,7 @@ impl HandedRecord {
         let Rec {
             position,
             record,
+            named_paths,
             ended,
             ended_pump: _,
             marks_sent,
@@ -600,6 +604,7 @@ impl HandedRecord {
             end: left_out_end,
         } = left_out;
         HandedRecord {
+            named_paths: named_paths.iter().cloned().map(PathBytes).collect(),
             position: *position,
             n: *n,
             turn_id: turn_id.clone(),
@@ -632,6 +637,7 @@ impl HandedRecord {
             n,
             turn_id,
             tab: _,
+            named_paths,
             session,
             started_ms,
             ended_ms,
@@ -652,6 +658,7 @@ impl HandedRecord {
             ended_ns,
         } = self;
         Rec {
+            named_paths: named_paths.into_iter().map(|p| p.0).collect(),
             position,
             record: TurnRecord {
                 n,
@@ -1963,6 +1970,38 @@ impl TurnReview {
         }
     }
 
+    /// The active record's identity, including an empty session while it is unbound.
+    pub(crate) fn active_attribution(&self, tab: u64) -> Option<(String, String)> {
+        let turn = self.active_turn_id(tab)?;
+        let session = match self.tabs.get(&tab)?.active.as_ref()? {
+            Active::Bound { session, .. } => session.clone(),
+            Active::Unbound(_) => String::new(),
+        };
+        Some((session, turn))
+    }
+
+    /// Keeps successful edit paths once a record ends, before its calls can leave the live projection.
+    pub(crate) fn set_ended_paths(&mut self, tab: u64, session: &str, turn: &str, paths: BTreeSet<PathBuf>) {
+        let records = if session.is_empty() {
+            self.tabs.get_mut(&tab).map(|t| &mut t.unbound)
+        } else {
+            self.sessions.get_mut(session).map(|s| &mut s.records)
+        };
+        if let Some(rec) = records.and_then(|rs| rs.iter_mut().find(|r| r.record.turn_id == turn && r.ended)) {
+            rec.named_paths.extend(paths);
+        }
+    }
+
+    pub(crate) fn stored_paths(&self, session: &str, turns: &[&str]) -> BTreeSet<PathBuf> {
+        self.sessions
+            .get(session)
+            .into_iter()
+            .flat_map(|s| &s.records)
+            .filter(|r| turns.contains(&r.record.turn_id.as_str()))
+            .flat_map(|r| r.named_paths.iter().cloned())
+            .collect()
+    }
+
     /// Exact turn hunks and their end snapshot's line count, built without I/O.
     pub fn live_settle_job(&self, session: &str, turn: u32, path: &str) -> LiveSettleJob {
         LiveSettleJob {
@@ -2233,6 +2272,7 @@ impl TurnReview {
             .any(|p| p.ended_ns.is_none_or(|end| end.saturating_add(reach) >= started_ns));
         let track = self.tabs.entry(tab).or_default();
         let mut rec = Rec {
+            named_paths: BTreeSet::new(),
             position: 0,
             record: TurnRecord {
                 n: 0,
@@ -3472,7 +3512,8 @@ mod tests {
     }
 
     fn finish_jobs(review: &mut TurnReview) {
-        let deadline = Instant::now() + Duration::from_secs(10);
+        // Opening the store, discovering refs and taking snapshots have separate budgets.
+        let deadline = Instant::now() + Duration::from_secs(60);
         while review.has_work_in_flight() {
             review.poll();
             assert!(Instant::now() < deadline, "snapshot replies arrive");
@@ -3585,17 +3626,22 @@ mod tests {
         let root = dir.join("project");
         std::fs::create_dir(&root).unwrap();
         std::fs::write(root.join("a"), "one\ntwo\nthree\n").unwrap();
-        let mut review = TurnReview::with_options(Some(dir.join("review")), &root, ReviewOptions::default());
+        let mut review = TurnReview::with_options(
+            Some(dir.join("review")),
+            &root,
+            ReviewOptions {
+                excludes: Some(None),
+                trim_every: Duration::MAX,
+                ..Default::default()
+            },
+        );
         review.observe(1, "s1", &AgentDomainEvent::TurnStarted { turn_id: "t1".into() }, 1);
-        let limit = Instant::now() + Duration::from_secs(10);
-        loop {
-            review.poll();
-            if review.turns("s1").first().is_some_and(|t| t.base.commit().is_some()) {
-                break;
-            }
-            assert!(Instant::now() < limit, "the base snapshot finishes");
-            std::thread::sleep(Duration::from_millis(5));
-        }
+        finish_jobs(&mut review);
+        let turns = review.turns("s1");
+        assert!(
+            turns.first().is_some_and(|t| t.base.commit().is_some()),
+            "the base snapshot was taken: {turns:?}"
+        );
         (dir, review)
     }
 
@@ -3869,6 +3915,7 @@ mod tests {
         record.skipped_large = vec![odd.clone()];
         record.left_out.base = LeftOut::from([(odd.clone(), Some(print)), (PathBuf::from("old"), None)]);
         let rec = Rec {
+            named_paths: BTreeSet::from([odd.clone(), PathBuf::from("edited.rs")]),
             position: 2,
             record: record.clone(),
             ended: true,
@@ -3883,6 +3930,11 @@ mod tests {
         let wire = serde_json::to_string(&HandedRecord::of(&rec)).unwrap();
         let back: HandedRecord = serde_json::from_str(&wire).unwrap();
         let moved = back.into_rec(record.tab, 3);
+        assert_eq!(moved.named_paths, rec.named_paths);
+        let mut legacy: serde_json::Value = serde_json::from_str(&wire).unwrap();
+        legacy.as_object_mut().unwrap().remove("named_paths");
+        let legacy: HandedRecord = serde_json::from_value(legacy).unwrap();
+        assert!(legacy.into_rec(record.tab, 3).named_paths.is_empty());
         assert_eq!(moved.record, record);
         assert_eq!(moved.marks_sent, rec.marks_sent);
         assert_eq!(

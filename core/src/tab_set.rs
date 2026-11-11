@@ -2062,7 +2062,7 @@ impl TabSet {
             .map(|r| vec![r.turn_id.as_str()])
             .unwrap_or_default(),
         };
-        let named = match self.get(tab).and_then(|t| t.live()) {
+        let mut named = match self.get(tab).and_then(|t| t.live()) {
             Some(backend) => {
                 // The projection's guard is dropped before anything else is read from the backend.
                 let projection = backend.projection();
@@ -2070,6 +2070,7 @@ impl TabSet {
             }
             None => crate::turn_review::NamedPaths::default(),
         };
+        named.paths.extend(review.stored_paths(&session, &turn_ids));
         review.hold_review(tab.0, &session);
         Ok(review.overview_job(&session, turn, scope, named))
     }
@@ -3798,6 +3799,12 @@ impl TabSet {
         );
         #[cfg(any(test, feature = "test-support"))]
         tab.gate_log.extend(answered_for_you.gate_answers);
+        if matches!(&delivery, RevisedDelivery::Events(events) if events.iter().any(|(_, e)| matches!(e, AgentDomainEvent::HistoryEvicted { .. })))
+        {
+            // Prune the previous delivery's notes before adding this delivery's answers. A permission
+            // can be answered before its call's start arrives, so those new notes have no row yet.
+            tab.notes.prune_evicted(&backend.projection());
+        }
         // What the fast path answered, what a saved rule answered and the CLI prompts answered
         // without a card, as recorded at the answer itself, wait in the ledger for their calls to
         // complete. Each `Write` answered without a card over no file is true already, and waits
@@ -4080,7 +4087,9 @@ impl TabSet {
             let session = live.backend.provider_session_id().unwrap_or_default();
             let now = wall_clock_ms();
             for event in &events {
+                let active = review.active_attribution(live.id.0);
                 review.observe(live.id.0, &session, event, now);
+                Self::store_review_paths(review, live.backend, live.id, active);
             }
         }
         let mut fresh_notes = CallNotes {
@@ -4110,14 +4119,6 @@ impl TabSet {
         };
         live.notes.remote_notes_dirty = false;
         live.session.note_ledger.fold(&events, live.notes, &mut fresh_notes);
-        if events
-            .iter()
-            .any(|e| matches!(e, AgentDomainEvent::HistoryEvicted { .. }))
-        {
-            let projection = live.backend.projection();
-            live.notes.prune_evicted(&projection);
-            fresh_notes.prune_evicted(&projection);
-        }
         // Every card in the batch is counted, those the snapshot drew included: they are pending all
         // the same, and this tab has not counted them yet.
         live.attention.observe(&events, place.on_screen);
@@ -4303,10 +4304,28 @@ impl TabSet {
             // command may have finished among the dropped events.
             let count = |running| AgentDomainEvent::BackgroundCalls { running };
             review.observe(tab.0, &session, &count(at_end), now);
+            let active = review.active_attribution(tab.0);
             review.observe_resync(tab.0, &session, running.as_deref(), now);
+            Self::store_review_paths(review, backend, tab, active);
             review.observe(tab.0, &session, &count(background), now);
         }
         still
+    }
+
+    fn store_review_paths(
+        review: &mut crate::turn_review::TurnReview,
+        backend: &AgentBackend,
+        tab: TabId,
+        active: Option<(String, String)>,
+    ) {
+        if active == review.active_attribution(tab.0) {
+            return;
+        }
+        if let Some((session, turn)) = active {
+            let projection = backend.projection();
+            let named = crate::turn_review::named_paths(&projection.tool_calls, &[&turn]);
+            review.set_ended_paths(tab.0, &session, &turn, named.paths);
+        }
     }
 
     /// The end of a tab's tick: hands its payload to the page that shows it, prints a trace nothing

@@ -5,17 +5,17 @@ import { isListScrollAnimating, settleListScroll } from "../jkScroll";
 import type { PanelMode } from "../keymap";
 import { conversationRows } from "../nav";
 import { buildTimeline, type TimelineItem } from "../timeline";
-import type { AgentUiState } from "../types";
+import type { AgentUiState, ThinkingDisplay } from "../types";
 import type { BuiltSelection } from "../visual";
 import { clampCursorToView, enterBoxAtNearEnd, revealRow } from "./rowScroll";
 import type { ArrivalPark, FrozenSnapshot } from "./rowScroll";
 
 /** Keep expansions of surviving rows, including runs and children currently folded out of view. */
-export function pruneExpanded(state: AgentUiState, expanded: Record<string, boolean>): Record<string, boolean> {
+export function pruneExpanded(state: AgentUiState, expanded: Record<string, boolean>, thinking: ThinkingDisplay = "collapsed"): Record<string, boolean> {
   const raw = buildTimeline(state);
   const keys = new Set([
-    ...buildDisplay(raw, { expanded: {}, detailed: false, turnRunning: state.activeTurnId !== null }),
-    ...buildDisplay(raw, { expanded, detailed: true, turnRunning: state.activeTurnId !== null }),
+    ...buildDisplay(raw, { expanded: {}, detailed: false, turnRunning: state.activeTurnId !== null, thinking }),
+    ...buildDisplay(raw, { expanded, detailed: true, turnRunning: state.activeTurnId !== null, thinking }),
   ].map((row) => row.key));
   return Object.fromEntries(Object.entries(expanded).filter(([key]) => keys.has(key)));
 }

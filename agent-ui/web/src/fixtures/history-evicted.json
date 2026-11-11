@@ -291,6 +291,19 @@
       "detail": {}
     },
     {
+      "type": "background_tasks_changed",
+      "tasks": [
+        {
+          "task_id": "roster-task",
+          "kind": "local_agent",
+          "task_type": "agent",
+          "description": "work",
+          "tool_use_id": "callt0",
+          "ambient": false
+        }
+      ]
+    },
+    {
       "type": "history_evicted",
       "through_seq": 21,
       "turns": 4,
@@ -332,5 +345,105 @@
     "lifted": [
       8
     ]
+  },
+  "notes": {
+    "sentFrom": {
+      "0": {
+        "deviceId": "phone",
+        "name": "Phone"
+      },
+      "8": {
+        "deviceId": "phone",
+        "name": "Phone"
+      },
+      "20": {
+        "deviceId": "phone",
+        "name": "Phone"
+      },
+      "21": {
+        "deviceId": "phone",
+        "name": "Phone"
+      },
+      "99": {
+        "deviceId": "phone",
+        "name": "Phone"
+      }
+    },
+    "stoppedFrom": {
+      "t0": {
+        "deviceId": "phone",
+        "name": "Phone"
+      },
+      "t2": {
+        "deviceId": "phone",
+        "name": "Phone"
+      },
+      "child": {
+        "deviceId": "phone",
+        "name": "Phone"
+      },
+      "nested": {
+        "deviceId": "phone",
+        "name": "Phone"
+      },
+      "callt2": {
+        "deviceId": "phone",
+        "name": "Phone"
+      },
+      "roster-task": {
+        "deviceId": "phone",
+        "name": "Phone"
+      },
+      "gone": {
+        "deviceId": "phone",
+        "name": "Phone"
+      },
+      "bg": {
+        "deviceId": "phone",
+        "name": "Phone"
+      }
+    }
+  },
+  "surviving_notes": {
+    "sentFrom": {
+      "8": {
+        "deviceId": "phone",
+        "name": "Phone"
+      },
+      "21": {
+        "deviceId": "phone",
+        "name": "Phone"
+      },
+      "99": {
+        "deviceId": "phone",
+        "name": "Phone"
+      }
+    },
+    "stoppedFrom": {
+      "t2": {
+        "deviceId": "phone",
+        "name": "Phone"
+      },
+      "child": {
+        "deviceId": "phone",
+        "name": "Phone"
+      },
+      "nested": {
+        "deviceId": "phone",
+        "name": "Phone"
+      },
+      "callt2": {
+        "deviceId": "phone",
+        "name": "Phone"
+      },
+      "roster-task": {
+        "deviceId": "phone",
+        "name": "Phone"
+      },
+      "bg": {
+        "deviceId": "phone",
+        "name": "Phone"
+      }
+    }
   }
 }

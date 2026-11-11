@@ -308,6 +308,7 @@ pub fn frame_line(frame: &ObserverFrame) -> String {
             json_string(key.as_str()),
             work_fields(mark),
         ),
+        ObserverFrame::MoreRefused { key, why } => refused_line(Some(key), why.why()),
         ObserverFrame::Ended { key, how } => RvOutbound::Ended {
             v: RV_PROTOCOL,
             key: key.as_str().to_owned(),
@@ -375,7 +376,9 @@ pub enum MoreRefusal {
     WorkChanged,
     /// A page is already owed to this observer; one at a time.
     Outstanding,
-    /// No such turn in the session: `before_turn` is 0 or past the last turn.
+    /// Earlier turns are no longer in the live projection.
+    NotLoaded,
+    /// No such turn in the session: `before_turn` is past the last turn.
     NoSuchTurn,
 }
 
@@ -383,6 +386,7 @@ impl MoreRefusal {
     /// The `why` of the `refused` line.
     pub fn why(self) -> &'static str {
         match self {
+            MoreRefusal::NotLoaded => "not loaded",
             MoreRefusal::WorkChanged => "the session changed",
             MoreRefusal::Outstanding => "a page is on its way",
             MoreRefusal::NoSuchTurn => "no such turn",

@@ -100,6 +100,8 @@ pub enum ObserverFrame {
         through_turn: u64,
         json: Arc<str>,
     },
+    /// A page accepted earlier is no longer available when it is built.
+    MoreRefused { key: RowKey, why: MoreRefusal },
     /// The tab's session failed or went away; the tab is still here, and a new session's snapshot may follow.
     Ended { key: RowKey, how: EndedHow },
     /// Whether, and why not, a phone may send to the tab now.
@@ -115,7 +117,10 @@ impl ObserverFrame {
             ObserverFrame::Snapshot { json, .. }
             | ObserverFrame::Events { json, .. }
             | ObserverFrame::Page { json, .. } => json.len(),
-            ObserverFrame::Ended { .. } | ObserverFrame::SendBlock { .. } | ObserverFrame::Gone { .. } => 0,
+            ObserverFrame::MoreRefused { .. }
+            | ObserverFrame::Ended { .. }
+            | ObserverFrame::SendBlock { .. }
+            | ObserverFrame::Gone { .. } => 0,
         }
     }
 }
@@ -432,7 +437,7 @@ fn observer_snapshot(tab: &Tab) -> Option<BuiltSnapshot> {
     let cards = &tab.session.editor_cards;
     let turns = Turns::of(&view.projection);
     let mut tail = tail::choose_tail(&view.projection, &turns, SNAPSHOT_CEILING_BYTES);
-    if tail.is_whole() {
+    if tail.is_whole(&turns) {
         let json = serialize_snapshot_with_notes_for_js(tab.id, &view, started_at, &tab.notes, cards);
         let over = json.len().saturating_sub(SNAPSHOT_CEILING_BYTES);
         // One turn over the ceiling has its largest entries cut, as a last turn alone over it does.
@@ -446,7 +451,7 @@ fn observer_snapshot(tab: &Tab) -> Option<BuiltSnapshot> {
             return Some(BuiltSnapshot {
                 through,
                 work,
-                first_turn: 0,
+                first_turn: turns.base,
                 cut: Vec::new(),
                 json,
                 turn_time,
@@ -498,7 +503,7 @@ fn observer_snapshot(tab: &Tab) -> Option<BuiltSnapshot> {
             return Some(BuiltSnapshot {
                 through,
                 work,
-                first_turn: tail.first_turn as u64,
+                first_turn: turns.absolute(tail.first_turn),
                 cut: tail.cut_entries(),
                 json,
                 turn_time,
@@ -525,10 +530,10 @@ enum PageRead {
 /// the start of would hold what the events still to come add to it, and the phone would apply those twice. A page of
 /// turns that ended before the watermark goes at once.
 fn page_waits(projection: &agent::AgentSessionProjection, turns: &Turns, before_turn: u64, watermark: u64) -> bool {
-    if projection.last_revision == watermark || before_turn == 0 || before_turn > turns.count() {
+    if projection.last_revision == watermark || before_turn <= turns.base || before_turn > turns.base + turns.count() {
         return false;
     }
-    let last = (before_turn - 1) as usize;
+    let last = (before_turn - turns.base - 1) as usize;
     // The turn after the page starts at `next`; that fold is revision `next + 1`.
     let (_, next) = tail::page_seqs(turns, last, last);
     next >= watermark
@@ -578,7 +583,7 @@ fn observer_page(tab: &Tab, before_turn: u64, limit: usize, watermark: u64) -> P
     let notes = tail::notes_between(&tab.notes, lo, hi);
     // No clock and no broker cards: a page is past turns, not the session as it stands.
     let json = serialize_snapshot_with_notes_for_js(tab.id, &view, None, &notes, &[]);
-    PageRead::Page(mark, from as u64, through as u64, json)
+    PageRead::Page(mark, turns.absolute(from), turns.absolute(through), json)
 }
 
 /// Why a phone may not send to `tab` now, if it may not: only a Claude tab holding a session takes a message, and
@@ -633,7 +638,8 @@ impl TabSet {
     /// one, a new session's, the conversation a `/clear` started): its turn numbers are those of the snapshot it has
     /// not had yet (`WorkChanged`); while a page is still owed
     /// (`Outstanding`: one at a time, so a peer asking again and again holds at most one page), and for a turn the
-    /// session does not have (`NoSuchTurn`).
+    /// session does not have (`NoSuchTurn`), or earlier turns no longer loaded
+    /// (`NotLoaded`: at or below the retained base).
     pub fn observer_more(&mut self, id: ObserverId, generation: u64, before_turn: u64) -> Result<(), MoreRefusal> {
         let observer = self
             .observers
@@ -654,8 +660,11 @@ impl TabSet {
         if observer.owed_page.is_some() {
             return Err(MoreRefusal::Outstanding);
         }
-        let count = Turns::of(&backend.projection()).count();
-        if before_turn == 0 || before_turn > count {
+        let turns = Turns::of(&backend.projection());
+        if before_turn <= turns.base {
+            return Err(MoreRefusal::NotLoaded);
+        }
+        if before_turn > turns.base + turns.count() {
             return Err(MoreRefusal::NoSuchTurn);
         }
         observer.owed_page = Some(before_turn);
@@ -837,8 +846,13 @@ impl TabSet {
                             json: Arc::from(json),
                         });
                     }
-                    // No session to page through: its `Ended` says so.
-                    PageRead::None => observer.owed_page = None,
+                    PageRead::None => {
+                        observer.owed_page = None;
+                        frames.push(ObserverFrame::MoreRefused {
+                            key: observer.key.clone(),
+                            why: MoreRefusal::NotLoaded,
+                        });
+                    }
                 }
             }
             if observer.ended_of != Some(tab.backend_generation) {
@@ -1027,7 +1041,8 @@ mod tests {
                         self.through = Some(through);
                     }
                     ObserverFrame::Gone { why, .. } => self.gone = Some(why),
-                    other @ (ObserverFrame::Page { .. }
+                    other @ (ObserverFrame::MoreRefused { .. }
+                    | ObserverFrame::Page { .. }
                     | ObserverFrame::Ended { .. }
                     | ObserverFrame::SendBlock { .. }) => self.others.push(other),
                 }
