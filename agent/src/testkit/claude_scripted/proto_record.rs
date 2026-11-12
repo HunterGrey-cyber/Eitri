@@ -44,6 +44,8 @@ struct State {
     error: Option<String>,
     /// The stream ended.
     ended: bool,
+    /// The recording was cut where its host stopped taking events: nothing the watch sees later is written.
+    cut: bool,
 }
 
 struct Shared {
@@ -56,6 +58,7 @@ pub struct ProtoRecorder {
     shared: Arc<Shared>,
     runtime: Option<tokio::runtime::Runtime>,
     bin: PathBuf,
+    txt: PathBuf,
 }
 
 impl ProtoRecorder {
@@ -107,6 +110,7 @@ impl ProtoRecorder {
             shared,
             runtime: Some(runtime),
             bin: bin_path,
+            txt: txt_path,
         })
     }
 
@@ -167,6 +171,23 @@ impl ProtoRecorder {
         Ok(())
     }
 
+    /// Ends the recording at `sequence`, the last event its host took: the session goes on emitting after the host
+    /// has stopped reading (the CLI can report itself ready again once its last turn is over), and a recording that
+    /// kept those events would replay to more than the host was handed. Events past `sequence` leave memory and both
+    /// files, and the watch writes nothing more. Fails when the recording has not reached `sequence`.
+    pub fn cut_at(&self, sequence: u64) -> Result<(), String> {
+        let mut state = self.shared.state.lock().unwrap();
+        if state.position.sequence < sequence {
+            return Err(format!(
+                "the recording is at sequence {} and cannot end at {sequence}",
+                state.position.sequence
+            ));
+        }
+        state.cut = true;
+        keep_through(&mut state, &self.bin, &self.txt, sequence)
+            .map_err(|e| format!("cannot cut the recording at sequence {sequence}: {e}"))
+    }
+
     /// Stops the watch and checks the recording: it must have started at sequence 1 and must not have failed.
     pub fn finish(mut self) -> Result<Vec<SessionEvent>, String> {
         let outcome = match self.failure() {
@@ -189,6 +210,31 @@ impl Drop for ProtoRecorder {
     }
 }
 
+/// Drops every event after `sequence` from `state` and truncates `bin` and `txt` to the events kept: each event is
+/// one length-delimited frame in `bin` and one line in `txt`, written in order.
+fn keep_through(state: &mut State, bin: &Path, txt: &Path, sequence: u64) -> io::Result<()> {
+    let kept = state.events.iter().take_while(|e| e.sequence <= sequence).count();
+    if kept == state.events.len() {
+        return Ok(());
+    }
+    state.events.truncate(kept);
+    let bytes: u64 = state
+        .events
+        .iter()
+        .map(|e| e.encode_length_delimited_to_vec().len() as u64)
+        .sum();
+    std::fs::OpenOptions::new().write(true).open(bin)?.set_len(bytes)?;
+    let text = std::fs::read_to_string(txt)?;
+    let lines: usize = text.split_inclusive('\n').take(kept).map(str::len).sum();
+    std::fs::OpenOptions::new().write(true).open(txt)?.set_len(lines as u64)?;
+    state.position = Position {
+        events: kept,
+        bytes,
+        sequence: state.events.last().map_or(0, |e| e.sequence),
+    };
+    Ok(())
+}
+
 fn first_sequence_message(sequence: u64) -> String {
     format!("the recording starts at sequence {sequence}, not 1: events before it were gone when the recorder attached")
 }
@@ -197,6 +243,9 @@ async fn pump(mut stream: tonic::Streaming<SessionEvent>, shared: Arc<Shared>, m
     loop {
         let next = stream.message().await;
         let mut state = shared.state.lock().unwrap();
+        if state.cut {
+            return;
+        }
         match next {
             Ok(Some(event)) => {
                 state.first_sequence.get_or_insert(event.sequence);
@@ -280,6 +329,53 @@ mod tests {
         assert!(!is_state_change(&notice(Some("status"))));
         assert!(!is_state_change(&notice(None)));
         assert!(!is_state_change(&SessionEvent::default()));
+    }
+
+    #[test]
+    fn a_cut_keeps_the_frames_and_lines_through_its_sequence() {
+        let dir = std::env::temp_dir().join(format!("proto-cut-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (bin, txt) = (dir.join("proto.bin"), dir.join("proto.txt"));
+        let events: Vec<SessionEvent> = (1..=4)
+            .map(|sequence| SessionEvent {
+                sequence,
+                session_id: format!("s\n{sequence}"),
+                ..SessionEvent::default()
+            })
+            .collect();
+        let frames = |events: &[SessionEvent]| -> Vec<u8> {
+            events.iter().flat_map(|e| e.encode_length_delimited_to_vec()).collect()
+        };
+        let lines = |events: &[SessionEvent]| -> String { events.iter().map(|e| format!("{e:?}\n")).collect() };
+        std::fs::write(&bin, frames(&events)).unwrap();
+        std::fs::write(&txt, lines(&events)).unwrap();
+        let mut state = State {
+            events: events.clone(),
+            position: Position {
+                events: 4,
+                bytes: frames(&events).len() as u64,
+                sequence: 4,
+            },
+            ..State::default()
+        };
+
+        keep_through(&mut state, &bin, &txt, 2).unwrap();
+
+        assert_eq!(std::fs::read(&bin).unwrap(), frames(&events[..2]));
+        assert_eq!(std::fs::read_to_string(&txt).unwrap(), lines(&events[..2]));
+        assert_eq!(state.events, events[..2]);
+        assert_eq!(
+            state.position,
+            Position {
+                events: 2,
+                bytes: frames(&events[..2]).len() as u64,
+                sequence: 2
+            }
+        );
+        // Cutting at the end the recording already has changes nothing.
+        keep_through(&mut state, &bin, &txt, 2).unwrap();
+        assert_eq!(std::fs::read(&bin).unwrap(), frames(&events[..2]));
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
