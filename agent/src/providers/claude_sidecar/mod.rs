@@ -3255,6 +3255,7 @@ mod tests {
                 },
                 folded_through: 0,
                 last_text: None,
+                last_text_open: None,
                 last_child_replies: Vec::new(),
                 cli_mode_noted: false,
                 steers_given_up: Vec::new(),
