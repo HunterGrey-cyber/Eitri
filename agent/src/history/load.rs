@@ -1285,9 +1285,10 @@ mod tests {
                 "{}: the notice disagrees with the projection it describes",
                 path.display()
             );
+            // A restored question keeps its tool row and adds its form: one slot, two rows.
             assert!(
-                notice.restored_items <= parsed.parsed_items,
-                "{}: folding cannot produce MORE rows than slots",
+                notice.restored_items <= parsed.parsed_items + projection.questions.len(),
+                "{}: folding cannot produce MORE rows than slots and restored questions",
                 path.display()
             );
             if notice.restored_items < parsed.parsed_items {

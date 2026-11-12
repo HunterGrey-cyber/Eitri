@@ -3149,7 +3149,9 @@ mod tests {
                     | AgentDomainEvent::TurnCompleted { .. }
                     | AgentDomainEvent::AssistantMessageBoundary { .. }
                     | AgentDomainEvent::UserMessageDelivered { .. }
-                    | AgentDomainEvent::SessionNotice { .. } => {}
+                    | AgentDomainEvent::SessionNotice { .. }
+                    | AgentDomainEvent::QuestionAsked { .. }
+                    | AgentDomainEvent::QuestionSettled { .. } => {}
                     other => panic!("{}: history produced {other:?}", path.display()),
                 }
             }

@@ -1952,6 +1952,51 @@ fn count_lines(path: &Path) -> usize {
     std::fs::read_to_string(path).map(|t| t.lines().count()).unwrap_or(0)
 }
 
+/// A command that writes two lines to `loop_file`, waits for `<loop_file>.release`, then writes a third. The
+/// absolute path is on its command line, which is how the test finds its processes: Codex may run the
+/// command in a PID namespace of its own, where `$$` names nothing on this side.
+fn held_loop_command(loop_file: &Path) -> String {
+    let file = loop_file.display();
+    let release = loop_file.with_extension("release");
+    let release = release.display();
+    format!("printf '1\\n2\\n' >> '{file}'; while [ ! -f '{release}' ]; do sleep 0.01; done; echo done >> '{file}'")
+}
+
+/// The live processes, other than this one, whose command line holds `needle`, with their state letter;
+/// a zombie or a process that went while it was read is not live.
+fn live_processes_naming(needle: &str) -> Vec<(i32, char)> {
+    let me = std::process::id() as i32;
+    let mut found = Vec::new();
+    let Ok(entries) = std::fs::read_dir("/proc") else {
+        return found;
+    };
+    for entry in entries.flatten() {
+        let Some(pid) = entry.file_name().to_str().and_then(|n| n.parse::<i32>().ok()) else {
+            continue;
+        };
+        if pid == me {
+            continue;
+        }
+        let Ok(cmdline) = std::fs::read(entry.path().join("cmdline")) else {
+            continue;
+        };
+        if !String::from_utf8_lossy(&cmdline).contains(needle) {
+            continue;
+        }
+        let Ok(stat) = std::fs::read_to_string(entry.path().join("stat")) else {
+            continue;
+        };
+        let state = stat
+            .rfind(')')
+            .and_then(|end| stat[end + 1..].trim_start().chars().next())
+            .unwrap_or('?');
+        if state != 'Z' && state != 'X' {
+            found.push((pid, state));
+        }
+    }
+    found
+}
+
 /// What an interrupted run left: the events, when the key was pressed and the turn and session ended, and
 /// how many lines the loop had written when the turn ended and a while later.
 struct InterruptRun {
@@ -2015,6 +2060,11 @@ fn interrupt_a_loop(
         events.extend(provider.pump());
         std::thread::yield_now();
     }
+    let needle = loop_file.display().to_string();
+    assert!(
+        !live_processes_naming(&needle).is_empty(),
+        "no process names {needle}: the check below would see nothing"
+    );
     provider.pause_time_for_tests();
     provider
         .interrupt_turn(InterruptTurnRequest {
@@ -2050,16 +2100,8 @@ fn interrupt_a_loop(
         std::thread::yield_now();
     }
     let lines_at_end = count_lines(loop_file);
-    let pid = pid_in(&loop_file.with_extension("pid")).expect("the command recorded its pid");
-    let state = std::process::Command::new("ps")
-        .args(["-o", "stat=", "-p", &pid.to_string()])
-        .output()
-        .expect("read the command's process state");
-    let state = String::from_utf8_lossy(&state.stdout);
-    assert!(
-        (!process_alive(pid) && state.trim().is_empty()) || state.trim().starts_with('Z'),
-        "the command outlived the turn's end: {state}"
-    );
+    let left = live_processes_naming(&needle);
+    assert!(left.is_empty(), "the command outlived the turn's end: {left:?}");
     let lines_later = count_lines(loop_file);
     let _ = provider.close_session(agent::CloseSessionRequest { session_id: thread });
     InterruptRun {
@@ -2089,15 +2131,15 @@ fn an_interrupt_stops_a_command_codex_keeps_running() {
     let codex = real_codex();
     // The held command has written two lines when interrupted.
     let s = Scratch::new("int-loop");
+    let project = s.dir("proj");
     let model = ScriptedModel::start(vec![Step::exec(
         "loop1",
-        "echo $$ > loop.pid; printf '1\n2\n' >> loop.txt; while [ ! -f loop.release ]; do sleep 0.01; done; echo done >> loop.txt",
+        &held_loop_command(&project.join("loop.txt")),
         false,
     )
     .when_body_has("PROMPT-LOOP")
     .unless_body_has("\"loop1\"")])
     .expect("model");
-    let project = s.dir("proj");
     write_project(&project, "");
     let run = interrupt_a_loop(
         &codex,
@@ -2121,15 +2163,15 @@ fn an_interrupt_stops_a_command_codex_keeps_running() {
 
     // A command that ends 1.5 s after the key: waited for, and the session is not stopped.
     let s = Scratch::new("int-short");
+    let project = s.dir("proj");
     let model = ScriptedModel::start(vec![Step::exec(
         "short1",
-        "echo $$ > loop.pid; printf '1\n2\n' >> loop.txt; while [ ! -f loop.release ]; do sleep 0.01; done; echo done >> loop.txt",
+        &held_loop_command(&project.join("loop.txt")),
         false,
     )
     .when_body_has("PROMPT-SHORT")
     .unless_body_has("\"short1\"")])
     .expect("model");
-    let project = s.dir("proj");
     write_project(&project, "");
     let run = interrupt_a_loop(
         &codex,
@@ -2159,6 +2201,8 @@ fn an_interrupt_stops_a_command_codex_keeps_running() {
 fn an_interrupt_stops_a_subagents_command() {
     let codex = real_codex();
     let s = Scratch::new("int-child-loop");
+    let project = s.dir("proj");
+    let child_loop = held_loop_command(&project.join("child-loop.txt"));
     let for_child = |step: Step| step.when_body_has(CHILD_TASK).unless_body_has(PARENT_PROMPT);
     let model = ScriptedModel::start(vec![
         spawn_step("sp1", "child", CHILD_TASK)
@@ -2167,15 +2211,9 @@ fn an_interrupt_stops_a_subagents_command() {
         Step::call("wa1", Some(COLLAB), "wait_agent", &json!({"timeout_ms": 60000}))
             .when_body_has("\"sp1\"")
             .unless_body_has("\"wa1\""),
-        for_child(Step::exec(
-            "cl1",
-            "echo $$ > child-loop.pid; printf '1\n2\n' >> child-loop.txt; while [ ! -f child-loop.release ]; do sleep 0.01; done; echo done >> child-loop.txt",
-            false,
-        ))
-        .unless_body_has("\"cl1\""),
+        for_child(Step::exec("cl1", &child_loop, false)).unless_body_has("\"cl1\""),
     ])
     .expect("model");
-    let project = s.dir("proj");
     write_project(&project, "");
     let run = interrupt_a_loop(
         &codex,
