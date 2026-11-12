@@ -91,10 +91,14 @@ pub enum EditorRequest {
         text: String,
     },
     /// A path click or `gf`; `path` is relative to the project root, or absolute, as the window's own `gf` takes it.
+    /// A `gd` answer adds `col`, one-based on `line`, and `unit`, what it counts in; the receiver judges the pair as
+    /// it judges a page's (`scratch::OpenColumn::checked`) and drops one it would not take.
     OpenPath {
         path: String,
         line: Option<u32>,
         col: Option<u32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        unit: Option<crate::editor_tools::text_edits::Encoding>,
     },
     /// Opening a reviewed file from the review list.
     ReviewOpen { path: String, line: Option<u32> },
@@ -823,6 +827,7 @@ mod tests {
                     path: "src/a.rs".into(),
                     line: Some(3),
                     col: None,
+                    unit: None,
                 },
                 token: Some("t".into()),
                 answer: Some(4),
@@ -945,6 +950,13 @@ mod tests {
                 path: "src/a.rs".into(),
                 line: Some(3),
                 col: Some(1),
+                unit: Some(crate::editor_tools::text_edits::Encoding::Utf16),
+            },
+            EditorRequest::OpenPath {
+                path: "src/a.rs".into(),
+                line: Some(3),
+                col: None,
+                unit: None,
             },
             EditorRequest::ReviewOpen {
                 path: "src/a.rs".into(),
@@ -974,6 +986,70 @@ mod tests {
             };
             assert_eq!(from_json(&to_json(&msg)).unwrap(), msg);
         }
+    }
+
+    /// An open with no column goes as it always went, with no `unit`; one with a column spells its unit as LSP does,
+    /// and a column or unit of a shape no build sends is a malformed message, as any other field of the wrong type is.
+    #[test]
+    fn an_open_path_column_travels_with_its_unit_and_a_malformed_one_is_refused() {
+        let plain = Msg::Editor {
+            request: EditorRequest::OpenPath {
+                path: "src/a.rs".into(),
+                line: Some(3),
+                col: None,
+                unit: None,
+            },
+            token: None,
+            answer: None,
+        };
+        let text = String::from_utf8(to_json(&plain)).unwrap();
+        assert!(!text.contains("\"unit\""), "{text}");
+        let at = Msg::Editor {
+            request: EditorRequest::OpenPath {
+                path: "src/a.rs".into(),
+                line: Some(3),
+                col: Some(9),
+                unit: Some(crate::editor_tools::text_edits::Encoding::Utf8),
+            },
+            token: None,
+            answer: None,
+        };
+        let text = String::from_utf8(to_json(&at)).unwrap();
+        assert!(
+            text.contains(r#""col":9"#) && text.contains(r#""unit":"utf-8""#),
+            "{text}"
+        );
+        for hostile in [
+            r#""col":-1,"unit":"utf-16""#,
+            r#""col":1.5,"unit":"utf-16""#,
+            r#""col":"1|q!","unit":"utf-16""#,
+            r#""col":4294967296,"unit":"utf-16""#,
+            r#""col":3,"unit":"utf-7""#,
+            r#""col":3,"unit":16"#,
+        ] {
+            let raw = format!(
+                r#"{{"v":1,"k":"editor","token":null,"request":{{"what":"open_path","path":"src/a.rs","line":3,{hostile}}}}}"#
+            );
+            assert!(
+                matches!(from_json(raw.as_bytes()), Err(LinkError::Malformed(_))),
+                "{hostile}"
+            );
+        }
+        let raw = r#"{"v":1,"k":"editor","token":null,"request":{"what":"open_path","path":"a.rs","line":3,"col":3}}"#;
+        assert!(
+            matches!(
+                from_json(raw.as_bytes()),
+                Ok(Msg::Editor {
+                    request: EditorRequest::OpenPath {
+                        col: Some(3),
+                        unit: None,
+                        ..
+                    },
+                    ..
+                })
+            ),
+            "a column without a unit reads, and the receiver drops it"
+        );
     }
 
     /// A view for the row-view split goes as it always went, with no `tab`, and one without it reads as the split.

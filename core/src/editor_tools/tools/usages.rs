@@ -1146,6 +1146,7 @@ mod tests {
             path: path.as_ref().to_string_lossy().into_owned(),
             line,
             character: 0,
+            encoding: crate::editor_tools::text_edits::Encoding::Utf16,
             text: None,
             text_from: None,
             read_from: None,

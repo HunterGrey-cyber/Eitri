@@ -3,12 +3,28 @@
 use crate::editor_lines::{expected_in_buffer, to_buffer_lines, FileFormat};
 use sha2::{Digest, Sha256};
 
-/// Units used by a server's zero-based character positions.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Units used by a server's zero-based character positions. On a wire they are spelled as LSP spells
+/// `positionEncoding`: `utf-8` (bytes), `utf-16` (code units), `utf-32` (code points).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum Encoding {
+    #[serde(rename = "utf-8")]
     Utf8,
+    #[serde(rename = "utf-16")]
     Utf16,
+    #[serde(rename = "utf-32")]
     Utf32,
+}
+
+impl Encoding {
+    /// The unit `name` spells, if it is one of the three.
+    pub fn from_name(name: &str) -> Option<Encoding> {
+        match name {
+            "utf-8" => Some(Encoding::Utf8),
+            "utf-16" => Some(Encoding::Utf16),
+            "utf-32" => Some(Encoding::Utf32),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

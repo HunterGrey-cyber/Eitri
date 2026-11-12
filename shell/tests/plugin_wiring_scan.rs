@@ -1574,18 +1574,22 @@ fn the_link_ended_hook_loads_again_every_page_that_comes_back() {
 }
 
 /// A path window 2 asks window 1 to open passes the panel's own rule, the same function a click in window 1's
-/// own chat goes through, so the two can never drift apart.
+/// own chat goes through, so the two can never drift apart; its column is judged by the rule a page's column is.
 #[test]
 fn window_2s_paths_follow_the_panels_own_rule() {
     let code = file_code("shell/src/linked_window/editor.rs");
     let open = arm(
         &code,
-        "EditorRequest::OpenPath{path,line,col:_}=>",
+        "EditorRequest::OpenPath{path,line,col,unit}=>",
         "EditorRequest::ReviewOpen",
     );
     assert!(
         open.contains("eitri_panel::agent_panel::open_path_target(&self.root,&path)"),
         "window 2's open request is checked by the panel's rule: {open}"
+    );
+    assert!(
+        open.contains("eitri_core::scratch::OpenColumn::checked(line,col,unit)"),
+        "window 2's column is judged as a page's is: {open}"
     );
     for own in ["fnopen_target", "fnopen_path_target"] {
         assert!(

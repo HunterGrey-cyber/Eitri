@@ -185,6 +185,121 @@ fn write_buffer_name(out: &std::path::Path) -> String {
     )
 }
 
+/// A probe that writes the cursor as `<line> <byte column>` (one-based line, zero-based byte) to `out`.
+fn write_cursor(out: &std::path::Path) -> String {
+    format!(
+        "lua local c = vim.api.nvim_win_get_cursor(0) local f = io.open('{}', 'w') f:write(c[1] .. ' ' .. c[2]) f:close()",
+        out.display()
+    )
+}
+
+fn read_cursor(probe: &std::path::Path) -> (u32, u32) {
+    let text = std::fs::read_to_string(probe).unwrap();
+    let (line, col) = text.trim().split_once(' ').unwrap();
+    (line.parse().unwrap(), col.parse().unwrap())
+}
+
+fn hex_of(request: &serde_json::Value) -> String {
+    request.to_string().bytes().map(|b| format!("{b:02x}")).collect()
+}
+
+/// A `gd` open's column counts in a language server's units. nvim turns it into the byte column of the character it
+/// names on the opened file's own line: past CJK, a surrogate pair and a combining mark, in each of the three units;
+/// one inside a character lands on its first byte, one past the end on the last character; without a column the
+/// cursor is at the line's start as before, and a line past the end moves nothing.
+#[test]
+#[ignore = "needs a real nvim on PATH; spends no tokens and needs no display"]
+fn an_open_column_lands_on_its_character_in_each_unit() {
+    use eitri_core::editor_tools::text_edits::Encoding::{self, Utf16, Utf32, Utf8};
+    use eitri_core::scratch::OpenColumn;
+    agent::state_dirs::redirect_state_to_a_test_root();
+    let dir = ScratchDir::new().expect("a scratch directory");
+    // Line 2, in bytes: two three-byte CJK characters 0..3 and 3..6, an emoji (two UTF-16 units) 6..10, e 10, a
+    // combining acute 11..13, a space 13, x 14. In code points x is the seventh, in UTF-16 units the eighth.
+    // Line 3 is empty.
+    let file = dir.path().join("wide.txt");
+    std::fs::write(&file, "first\n\u{4e2d}\u{6587}\u{1F600}e\u{301} x\n\nlast\n").unwrap();
+    let probe = dir.path().join("cursor");
+    let cursor = |line: u32, col: Option<(u32, Encoding)>| {
+        let col = col.map(|(col, unit)| OpenColumn { col, unit });
+        let request = eitri_core::scratch::open_request_at(&file, Some(line), col);
+        let _ = std::fs::remove_file(&probe);
+        nvim(&dir, &[call(request.hex()), write_cursor(&probe)]);
+        read_cursor(&probe)
+    };
+    for (col, unit, byte, why) in [
+        (7, Utf32, 14, "x is the seventh code point"),
+        (8, Utf16, 14, "the emoji is two UTF-16 units"),
+        (15, Utf8, 14, "x starts at the fifteenth byte"),
+        (
+            7,
+            Utf16,
+            13,
+            "the combining mark is a unit of its own; the space follows it",
+        ),
+        (3, Utf16, 6, "the emoji's first unit"),
+        (4, Utf16, 6, "inside the surrogate pair: the emoji's first byte"),
+        (8, Utf8, 6, "inside the emoji's bytes: its first byte"),
+        (2, Utf8, 0, "inside the first character: its first byte"),
+        (1000, Utf16, 14, "past the end: the last character"),
+        (1000, Utf8, 14, "past the end in bytes: the last character"),
+        (1000, Utf32, 14, "past the end in code points: the last character"),
+    ] {
+        assert_eq!(cursor(2, Some((col, unit))), (2, byte), "{col} {unit:?}: {why}");
+    }
+    assert_eq!(cursor(2, None), (2, 0), "no column: the line's start, as before");
+    assert_eq!(cursor(3, Some((5, Utf16))), (3, 0), "an empty line");
+    assert_eq!(
+        cursor(99, Some((3, Utf16))),
+        (1, 0),
+        "a line past the buffer moves nothing, so no column is placed"
+    );
+    dir.cleanup();
+}
+
+/// The column and its unit are data in the JSON request: a value of the wrong shape sent straight to the snippet
+/// raises no error, is never read as Ex or Lua, and leaves the cursor at the line's start.
+#[test]
+#[ignore = "needs a real nvim on PATH; spends no tokens and needs no display"]
+fn a_hostile_open_column_runs_nothing_and_places_nothing() {
+    use serde_json::json;
+    agent::state_dirs::redirect_state_to_a_test_root();
+    let dir = ScratchDir::new().expect("a scratch directory");
+    let file = dir.path().join("plain.txt");
+    std::fs::write(&file, "first\nsecond line\n").unwrap();
+    let probe = dir.path().join("cursor");
+    let pwned = dir.path().join("pwned");
+    let check = format!(
+        "lua if vim.g.eitri_pwned then io.open({},{}):close() end",
+        lua_bytes(&pwned.to_string_lossy()),
+        lua_bytes("w")
+    );
+    let shapes = [
+        (json!("1|let g:eitri_pwned=1"), json!("utf-16")),
+        (json!("3"), json!("utf-16")),
+        (json!(-1), json!("utf-16")),
+        (json!(0), json!("utf-8")),
+        (json!(1.5), json!("utf-16")),
+        (json!(1e12), json!("utf-32")),
+        (json!(null), json!("utf-16")),
+        (json!(3), json!("utf-7")),
+        (json!(3), json!("utf-16') vim.g.eitri_pwned = 1 --")),
+        (json!(3), json!(16)),
+        (json!(3), json!(null)),
+        (json!({"col": 3}), json!(["utf-16"])),
+    ];
+    for (col, unit) in shapes {
+        let request = json!({
+            "op": "open", "path": file.to_string_lossy(), "line": 2, "col": col, "unit": unit,
+        });
+        let _ = std::fs::remove_file(&probe);
+        nvim(&dir, &[call(&hex_of(&request)), write_cursor(&probe), check.clone()]);
+        assert_eq!(read_cursor(&probe), (2, 0), "{request}");
+        assert!(!pwned.exists(), "{request}: a column or unit ran as code");
+    }
+    dir.cleanup();
+}
+
 /// A file name is data. A newline in it must not end the command that opens it and start another:
 /// the line after it would run as Ex in the user's nvim. The payload has no space, quote, `|`,
 /// brace or bracket, so escaping the name for Ex does not defuse it; only never parsing it does.

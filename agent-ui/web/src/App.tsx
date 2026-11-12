@@ -1,6 +1,6 @@
 import { classify as classifyGd, expectedName, validName, wordAt } from "./gdTarget";
 import type { Cited, GdTarget } from "./gdTarget";
-import type { EditorSymbolResult } from "./bridge";
+import type { ColumnUnit, EditorSymbolResult } from "./bridge";
 import { editDiffOf, editPreviewsOf, hunksOf } from "./hunks";
 import { back, emptyJumplist, forward, landingIndex, recordJump } from "./jumplist";
 import type { JumpPos, Jumplist } from "./jumplist";
@@ -252,7 +252,8 @@ function sameOffer(a: CardOffer, b: CardOffer): boolean {
   );
 }
 
-type DefinitionPath = PathRef & { expect?: string; source?: "lsp" | "text"; col?: number };
+/** A path to open; a `gd` name lookup's answer also carries its definition's column and the units it counts in. */
+type DefinitionPath = PathRef & { expect?: string; source?: "lsp" | "text"; col?: number; unit?: ColumnUnit };
 
 export default function App() {
   /** Everything the envelope router decides (`./page_model`). `pageRef` is the latest model, written
@@ -1325,7 +1326,8 @@ export default function App() {
     if (ref.expect !== undefined) pathExpectations.current.set(requestId, ref.expect);
     openAtInteraction.current = true;
     postToRust({ type: "open_path", request_id: requestId, path: ref.path, interaction: interaction.current,
-      ...(ref.line === null ? {} : { line: ref.line }), ...(ref.expect === undefined ? {} : { expect: ref.expect }) });
+      ...(ref.line === null ? {} : { line: ref.line }), ...(ref.expect === undefined ? {} : { expect: ref.expect }),
+      ...(ref.line === null || ref.col === undefined || ref.unit === undefined ? {} : { col: ref.col, col_unit: ref.unit }) });
   }
   function definitionPath(ref: PathRef, text: string): DefinitionPath {
     if (ref.line === null) return ref;

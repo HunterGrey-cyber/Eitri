@@ -392,6 +392,13 @@ pub enum InboundMessage {
         /// `panel_keys` mirror still carries the same one.
         #[serde(default)]
         interaction: Option<u64>,
+        /// A `gd` answer's one-based column and `col_unit` the units it counts in. Kept as the page sent them and
+        /// judged by `scratch::OpenColumn::from_json`: a value of any other shape is dropped, so the open still goes
+        /// to its line as one without a column would, rather than failing the whole message.
+        #[serde(default)]
+        col: Option<Value>,
+        #[serde(default)]
+        col_unit: Option<Value>,
     },
     /// A symbol name is data for the editor, never Lua or Vim source.
     EditorSymbol {
@@ -1176,7 +1183,9 @@ pub struct SymbolCitation {
 pub struct EditorSymbolMatch {
     pub path: String,
     pub line: u32,
+    /// One-based, counted in `unit`: a language server's own position encoding, or code points for a text match.
     pub col: u32,
+    pub unit: crate::editor_tools::text_edits::Encoding,
     pub source: &'static str,
 }
 

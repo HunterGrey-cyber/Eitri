@@ -70,7 +70,13 @@ end
 local function whole(n)
   return type(n) == 'number' and n >= 0 and n <= 4294967294 and n == math.floor(n)
 end
-local function add_item(part, uri, range, name, kind, container)
+-- The units a client's positions count in, as it negotiated them; none or any other name is LSP's default.
+local position_units = { ['utf-8'] = true, ['utf-16'] = true, ['utf-32'] = true }
+local function units_of(client)
+  local encoding = client and client.offset_encoding
+  return position_units[encoding] and encoding or 'utf-16'
+end
+local function add_item(part, uri, range, name, kind, container, encoding)
   part.total = part.total + 1
   if #part.items >= 200 then return end
   local path = path_of(uri)
@@ -81,30 +87,30 @@ local function add_item(part, uri, range, name, kind, container)
   -- values would fail the whole answer, so such an item is dropped (it stays counted in `total`).
   local line, character = start.line or 0, start.character or 0
   if not whole(line) or not whole(character) then return end
-  local item = { path = path, line = line + 1, character = character }
+  local item = { path = path, line = line + 1, character = character, encoding = encoding or 'utf-16' }
   if type(name) == 'string' then item.name = cut(name, 1024) end
   if type(container) == 'string' then item.container = cut(container, 1024) end
   if type(kind) == 'number' then item.kind = vim.lsp.protocol.SymbolKind[kind] end
   part.items[#part.items + 1] = item
 end
-local function locations(part, result)
+local function locations(part, result, encoding)
   if type(result) ~= 'table' then return end
   if result.uri or result.targetUri then result = { result } end
   for _, loc in ipairs(result) do
     if type(loc) == 'table' then
-      add_item(part, loc.targetUri or loc.uri, loc.targetSelectionRange or loc.range)
+      add_item(part, loc.targetUri or loc.uri, loc.targetSelectionRange or loc.range, nil, nil, nil, encoding)
     end
   end
 end
-local function symbols(part, result, uri, container)
+local function symbols(part, result, uri, container, encoding)
   if type(result) ~= 'table' then return end
   for _, sym in ipairs(result) do
     if type(sym) == 'table' then
       if sym.location then
-        add_item(part, sym.location.uri, sym.location.range, sym.name, sym.kind, sym.containerName)
+        add_item(part, sym.location.uri, sym.location.range, sym.name, sym.kind, sym.containerName, encoding)
       else
-        add_item(part, uri, sym.selectionRange or sym.range, sym.name, sym.kind, container)
-        symbols(part, sym.children, uri, sym.name)
+        add_item(part, uri, sym.selectionRange or sym.range, sym.name, sym.kind, container, encoding)
+        symbols(part, sym.children, uri, sym.name, encoding)
       end
     end
   end

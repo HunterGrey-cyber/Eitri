@@ -177,6 +177,8 @@ pub struct RawItem {
     pub path: String,
     pub line: u32,
     pub character: u32,
+    /// The units `character` counts in: the answering client's position encoding.
+    pub encoding: Encoding,
     pub text: Option<String>,
     /// The actual buffer's name, kept as bytes for the caller's boundary check.
     pub text_from: Option<PathBuf>,
@@ -534,6 +536,12 @@ pub fn parse_collected(value: &Value) -> Result<Collected, String> {
                                 path: text(required(item, "path")?)?,
                                 line: number(item, "line")?,
                                 character: number(item, "character")?,
+                                // LSP's default when a client names none, or a unit outside the three.
+                                encoding: field(item, "encoding")
+                                    .and_then(Value::as_slice)
+                                    .and_then(|name| std::str::from_utf8(name).ok())
+                                    .and_then(Encoding::from_name)
+                                    .unwrap_or(Encoding::Utf16),
                                 text: optional_text(item, "text")?,
                                 text_from,
                                 read_from,
@@ -1832,6 +1840,7 @@ mod tests {
             path: root.join("a.py").to_string_lossy().into_owned(),
             line: 1,
             character: 0,
+            encoding: Encoding::Utf16,
             text: None,
             text_from: None,
             read_from: None,

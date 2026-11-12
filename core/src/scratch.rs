@@ -75,7 +75,58 @@ impl ScratchRequest {
 
 /// `gf`: `:edit <path>` and the line.
 pub fn open_request(path: &Path, line: Option<u32>) -> ScratchRequest {
-    ScratchRequest::of(serde_json::json!({ "op": "open", "path": path.to_string_lossy(), "line": line }))
+    open_request_at(path, line, None)
+}
+
+/// [`open_request`], and with `col` the cursor goes to that column of the line. Without one the request is exactly
+/// `open_request`'s: no `col` or `unit` key at all.
+pub fn open_request_at(path: &Path, line: Option<u32>, col: Option<OpenColumn>) -> ScratchRequest {
+    let mut request = serde_json::json!({ "op": "open", "path": path.to_string_lossy(), "line": line });
+    if let Some(col) = col {
+        request["col"] = col.col.into();
+        request["unit"] = serde_json::to_value(col.unit).unwrap_or_default();
+    }
+    ScratchRequest::of(request)
+}
+
+/// The largest column an open takes: far past any line a person reads, far below `u32::MAX`. A column past the
+/// line's end lands on its last character anyway, so a larger one could only be a mistake or an attack.
+pub const OPEN_COL_MAX: u32 = 1 << 24;
+
+/// Where on its line an open puts the cursor: a one-based column counted in `unit`, the units a language server
+/// counts in (`utf-8` bytes, `utf-16` code units, `utf-32` code points). nvim turns it into a byte column on the
+/// opened buffer's own line (`nvim_scratch.lua`), since only it knows the text that is there now.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OpenColumn {
+    pub col: u32,
+    pub unit: crate::editor_tools::text_edits::Encoding,
+}
+
+impl OpenColumn {
+    /// A column only with a line (one-based, so at least 1) and a unit, within `1..=OPEN_COL_MAX`; anything else is
+    /// none, and the open goes to the line's start as one without a column does.
+    pub fn checked(
+        line: Option<u32>,
+        col: Option<u32>,
+        unit: Option<crate::editor_tools::text_edits::Encoding>,
+    ) -> Option<OpenColumn> {
+        let (col, unit) = (col?, unit?);
+        (line? >= 1 && (1..=OPEN_COL_MAX).contains(&col)).then_some(OpenColumn { col, unit })
+    }
+
+    /// [`OpenColumn::checked`] on the page's untrusted JSON: the column only as a whole non-negative JSON number
+    /// (a negative, fractional, exponent-written or string one is none), the unit only as one of the three names.
+    pub fn from_json(
+        line: Option<u32>,
+        col: Option<&serde_json::Value>,
+        unit: Option<&serde_json::Value>,
+    ) -> Option<OpenColumn> {
+        let col = col?.as_u64().and_then(|col| u32::try_from(col).ok());
+        let unit = unit?
+            .as_str()
+            .and_then(crate::editor_tools::text_edits::Encoding::from_name);
+        OpenColumn::checked(line, col, unit)
+    }
 }
 
 /// The largest file a proposal is shown against. A source file an agent edits is far smaller; a larger one
@@ -625,6 +676,89 @@ mod tests {
         assert_eq!(value["op"], "open");
         assert_eq!(value["path"], hostile.to_string_lossy().as_ref());
         assert_eq!(value["line"], 42);
+    }
+
+    /// Without a column an open is exactly what it always was: these three keys and no other.
+    #[test]
+    fn an_open_without_a_column_is_the_plain_request() {
+        let path = Path::new("/project/src/a.rs");
+        assert_eq!(
+            decode(open_request(path, Some(42)).hex()),
+            serde_json::json!({"op": "open", "path": "/project/src/a.rs", "line": 42})
+        );
+        assert_eq!(
+            decode(open_request(path, None).hex()),
+            serde_json::json!({"op": "open", "path": "/project/src/a.rs", "line": null})
+        );
+        assert_eq!(open_request_at(path, Some(42), None), open_request(path, Some(42)));
+        let col = OpenColumn {
+            col: 9,
+            unit: crate::editor_tools::text_edits::Encoding::Utf16,
+        };
+        assert_eq!(
+            decode(open_request_at(path, Some(42), Some(col)).hex()),
+            serde_json::json!({"op": "open", "path": "/project/src/a.rs", "line": 42, "col": 9, "unit": "utf-16"})
+        );
+    }
+
+    /// The page's column is untrusted: only a whole number from one to the cap, with a line and one of the three
+    /// units, is taken; every other shape is none, and the open goes to the line's start.
+    #[test]
+    fn a_page_column_is_taken_only_as_a_bounded_whole_number_with_a_known_unit() {
+        use crate::editor_tools::text_edits::Encoding;
+        use serde_json::json;
+        let from = |line: Option<u32>, col: serde_json::Value, unit: serde_json::Value| {
+            OpenColumn::from_json(line, Some(&col), Some(&unit))
+        };
+        assert_eq!(
+            from(Some(3), json!(1), json!("utf-8")),
+            Some(OpenColumn {
+                col: 1,
+                unit: Encoding::Utf8
+            })
+        );
+        assert_eq!(
+            from(Some(3), json!(OPEN_COL_MAX), json!("utf-32")),
+            Some(OpenColumn {
+                col: OPEN_COL_MAX,
+                unit: Encoding::Utf32
+            })
+        );
+        for (col, unit, why) in [
+            (json!(-1), json!("utf-16"), "negative"),
+            (json!(0), json!("utf-16"), "zero: columns count from one"),
+            (json!(OPEN_COL_MAX + 1), json!("utf-16"), "past the cap"),
+            (json!(u64::from(u32::MAX) + 1), json!("utf-16"), "past a u32"),
+            (json!(1.5), json!("utf-16"), "fractional"),
+            (json!(2.0), json!("utf-16"), "written as a float"),
+            (json!(1e12), json!("utf-16"), "huge, in exponent form"),
+            (json!("3"), json!("utf-16"), "a string"),
+            (json!("1|q!"), json!("utf-16"), "a string with Ex in it"),
+            (json!(null), json!("utf-16"), "null"),
+            (json!([3]), json!("utf-16"), "an array"),
+            (json!(3), json!("utf-7"), "an unknown unit"),
+            (json!(3), json!("UTF-16"), "a unit spelled otherwise"),
+            (json!(3), json!(16), "a unit that is a number"),
+            (json!(3), json!(null), "a null unit"),
+        ] {
+            assert_eq!(from(Some(3), col, unit), None, "{why}");
+        }
+        assert_eq!(
+            OpenColumn::from_json(Some(3), Some(&json!(3)), None),
+            None,
+            "a column without a unit"
+        );
+        assert_eq!(
+            OpenColumn::from_json(Some(3), None, Some(&json!("utf-16"))),
+            None,
+            "a unit without a column"
+        );
+        assert_eq!(from(None, json!(3), json!("utf-16")), None, "a column without a line");
+        assert_eq!(
+            from(Some(0), json!(3), json!("utf-16")),
+            None,
+            "a column on line zero, which opens no line"
+        );
     }
 
     /// A focused `Ctrl+g` draft must not replace the user's file in editor context:

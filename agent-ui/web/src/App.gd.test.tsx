@@ -401,3 +401,74 @@ describe("a lookup answered while card mode holds the keys", () => {
     expect(posted.filter((p) => p.type === "open_path")).toHaveLength(1);
   });
 });
+
+describe("gd opens a name's definition at its column", () => {
+  const at = (path: string, line: number, col: number, unit?: string, source = "lsp") =>
+    ({ path, line, col, ...(unit === undefined ? {} : { unit }), source });
+  const columnKeys = (message: Record<string, unknown> | undefined) =>
+    Object.keys(message ?? {}).filter((key) => key === "col" || key === "col_unit");
+
+  it("a single answer opens at its column, with the unit it counts in", () => {
+    const { gd, press } = setup("Name"); press("v"); gd();
+    answer([at("src/a.ts", 1, 23, "utf-16")]);
+    expect(last("open_path")).toMatchObject({ path: "src/a.ts", line: 1, col: 23, col_unit: "utf-16" });
+  });
+  it("two definitions on one line are two picks, each opening at its own column", () => {
+    const { gd, press, container } = setup("Name"); press("v"); gd();
+    answer([at("src/a.ts", 1, 12, "utf-16"), at("src/a.ts", 1, 40, "utf-16")]);
+    expect(last("open_path")).toBeUndefined();
+    expect(container.querySelector(".path-pick")).not.toBeNull();
+    press("s");
+    expect(last("open_path")).toMatchObject({ path: "src/a.ts", line: 1, col: 40, col_unit: "utf-16" });
+  });
+  it("the nearest match in the cited file opens at its column; a text match counts code points", () => {
+    const { gd, press } = setup("Name at a.rs:10"); press("v"); gd();
+    answer([at("b.rs", 10, 3, "utf-8"), at("src/a.rs", 9, 23, "utf-32", "text")]);
+    expect(last("open_path")).toMatchObject({ path: "src/a.rs", line: 9, col: 23, col_unit: "utf-32" });
+  });
+  it("gd again after a late answer opens at the column", () => {
+    const { gd, press } = setup("Name"); press("v"); gd();
+    dispatch({ kind: "pane_focus", focused: false });
+    answer([at("src/a.ts", 4, 7, "utf-8")]);
+    expect(last("open_path")).toBeUndefined();
+    dispatch({ kind: "pane_focus", focused: true });
+    press("v"); gd();
+    answer([at("src/a.ts", 4, 7, "utf-8")]);
+    expect(last("open_path")).toMatchObject({ path: "src/a.ts", line: 4, col: 7, col_unit: "utf-8" });
+  });
+  it("a match with no unit opens its line only", () => {
+    const { gd, press } = setup("Name"); press("v"); gd();
+    answer([at("src/a.ts", 4, 7)]);
+    expect(last("open_path")).toMatchObject({ path: "src/a.ts", line: 4 });
+    expect(columnKeys(last("open_path"))).toEqual([]);
+  });
+  it("a match with a unit outside the three drops the whole answer", () => {
+    const { gd, press } = setup("Name"); press("v"); gd();
+    answer([at("src/a.ts", 4, 7, "utf-7")]);
+    expect(last("open_path")).toBeUndefined();
+  });
+  it("gf sends no column", () => {
+    const { press } = setup("a.rs:7"); press("g"); press("f");
+    expect(last("open_path")).toMatchObject({ path: "a.rs", line: 7 });
+    expect(columnKeys(last("open_path"))).toEqual([]);
+  });
+  it("a pick from gf's path choices sends no column", () => {
+    const { press } = setup("see a.go:3", true); press("g"); press("f");
+    const request = last("open_path")!;
+    dispatch({ kind: "path_choices", requestId: request.request_id, tab: 1,
+      paths: [{ path: "src/a.go", line: 3 }, { path: "test/a.go", line: 3 }] });
+    press("s");
+    expect(last("open_path")).toMatchObject({ path: "test/a.go", line: 3 });
+    expect(columnKeys(last("open_path"))).toEqual([]);
+  });
+  it("gd's cited path:line sends no column", () => {
+    const { gd, press } = setup("`mesh.go:142` has `Name`", true); press("v"); gd();
+    expect(last("open_path")).toMatchObject({ path: "mesh.go", line: 142 });
+    expect(columnKeys(last("open_path"))).toEqual([]);
+  });
+  it("gd's fallback to the cited line sends no column", () => {
+    const { gd, press } = setup("Name at mesh.go:142"); press("v"); gd(); answer([]);
+    expect(last("open_path")).toMatchObject({ path: "mesh.go", line: 142, expect: "Name" });
+    expect(columnKeys(last("open_path"))).toEqual([]);
+  });
+});

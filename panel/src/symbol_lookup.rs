@@ -19,7 +19,7 @@ use super::*;
 use eitri_core::agent_bridge::{EditorSymbolError, EditorSymbolMatch, SymbolCitation};
 use eitri_core::editor_tools::stamp::{wall_ms, Sequencer};
 use eitri_core::editor_tools::step::EditorReach;
-use eitri_core::editor_tools::tools::lsp::{self, AskArgs, Asked, Collected, LspKind, RawItem, UsagePart};
+use eitri_core::editor_tools::tools::lsp::{self, AskArgs, Asked, Collected, Encoding, LspKind, RawItem, UsagePart};
 use eitri_core::editor_tools::way::{EditorCall, EditorWay, LocalWay};
 use eitri_core::nvim_rpc::{Pending, RpcError};
 use std::collections::{HashMap, HashSet};
@@ -173,17 +173,23 @@ fn inside(canonical_root: &Path, path: &Path) -> Option<String> {
     (!relative.is_empty()).then(|| relative.to_owned())
 }
 
-/// The places among `items` (an absolute path, a one-based line, a one-based column) that lead to a regular file
-/// inside the project, each once. Dependencies, the standard library and anything else outside go: `gf` would refuse
-/// them. It walks paths, so it runs on a worker.
-fn place(root: &Path, items: Vec<(PathBuf, u32, u32)>, source: &'static str) -> Vec<EditorSymbolMatch> {
+/// An absolute path, a one-based line, a one-based column and the units the column counts in.
+type Spot = (PathBuf, u32, u32, Encoding);
+
+/// The places among `items` that lead to a regular file inside the project, each place once: two definitions on one
+/// line (two methods of a one-line file) stay two. A place is its path, line, column and the column's units: the
+/// same number counts different characters in different units, so places from servers that negotiated different
+/// encodings are never merged (one definition answered by two such servers can then be offered twice, a much rarer
+/// cost than losing a definition). Dependencies, the standard library and anything else outside go:
+/// `gf` would refuse them. It walks paths, so it runs on a worker.
+fn place(root: &Path, items: Vec<Spot>, source: &'static str) -> Vec<EditorSymbolMatch> {
     let Ok(canonical_root) = root.canonicalize() else {
         return Vec::new();
     };
     let mut judged: HashMap<PathBuf, Option<String>> = HashMap::new();
     let mut seen = HashSet::new();
     let mut places = Vec::new();
-    for (path, line, col) in items {
+    for (path, line, col, unit) in items {
         if !path.is_absolute() {
             continue;
         }
@@ -192,13 +198,14 @@ fn place(root: &Path, items: Vec<(PathBuf, u32, u32)>, source: &'static str) -> 
             .or_insert_with(|| inside(&canonical_root, &path))
             .clone();
         let Some(relative) = relative else { continue };
-        if !seen.insert((relative.clone(), line)) {
+        if !seen.insert((relative.clone(), line, col, unit)) {
             continue;
         }
         places.push(EditorSymbolMatch {
             path: relative,
             line,
             col,
+            unit,
             source,
         });
         if places.len() >= MAX_MATCHES {
@@ -208,10 +215,14 @@ fn place(root: &Path, items: Vec<(PathBuf, u32, u32)>, source: &'static str) -> 
     places
 }
 
-fn lsp_places(items: &[&RawItem]) -> Vec<(PathBuf, u32, u32)> {
+/// A server's zero-based `character` becomes the one-based column a match carries, still in the server's units.
+fn lsp_places(items: &[&RawItem]) -> Vec<Spot> {
     items
         .iter()
-        .map(|item| (PathBuf::from(&item.path), item.line, item.character.saturating_add(1)))
+        .map(|item| {
+            let col = item.character.saturating_add(1);
+            (PathBuf::from(&item.path), item.line, col, item.encoding)
+        })
         .collect()
 }
 
@@ -688,7 +699,14 @@ impl Lookup {
             let found = eitri_core::symbol_text::search_within(&root, &name, within.as_deref(), limits);
             let places = found
                 .into_iter()
-                .map(|found| (root.join(&found.path), found.line, found.col))
+                .map(|found| {
+                    (
+                        root.join(&found.path),
+                        found.line,
+                        found.col,
+                        eitri_core::symbol_text::COLUMN_UNIT,
+                    )
+                })
                 .collect();
             place(&root, places, "text")
         });
@@ -731,13 +749,7 @@ impl Lookup {
 
     /// Judges `places` on a worker. With the window's workers all out they are judged by none, which comes to what a
     /// worker that found nothing comes to.
-    fn place_on_worker(
-        &mut self,
-        phase: Phase,
-        root: PathBuf,
-        places: Vec<(PathBuf, u32, u32)>,
-        cx: &mut Cx<'_>,
-    ) -> Flow {
+    fn place_on_worker(&mut self, phase: Phase, root: PathBuf, places: Vec<Spot>, cx: &mut Cx<'_>) -> Flow {
         match counted_worker(cx.workers, move || place(&root, places, "lsp")) {
             Some(placed) => {
                 self.stage = Stage::Placing(phase, placed);
@@ -983,6 +995,7 @@ mod tests {
             path: "/p/a".into(),
             line: 1,
             character: 0,
+            encoding: Encoding::Utf16,
             text: None,
             text_from: None,
             read_from: None,
@@ -1104,6 +1117,13 @@ mod tests {
         fn matches(&self) -> Vec<(String, u32, &'static str)> {
             match self.reply.as_ref().expect("a reply") {
                 Ok(found) => found.iter().map(|m| (m.path.clone(), m.line, m.source)).collect(),
+                Err(error) => panic!("an error: {error:?}"),
+            }
+        }
+        /// Each match's line, column and the unit the column counts in.
+        fn columns(&self) -> Vec<(u32, u32, Encoding)> {
+            match self.reply.as_ref().expect("a reply") {
+                Ok(found) => found.iter().map(|m| (m.line, m.col, m.unit)).collect(),
                 Err(error) => panic!("an error: {error:?}"),
             }
         }
@@ -1383,6 +1403,125 @@ mod tests {
         run.text_settles();
         run.hold_to_the_end(done("workspace_symbols", vec![], &["workspace_symbols"]));
         assert_eq!(run.matches(), [("src/a.rs".to_owned(), 1, "text")]);
+    }
+
+    #[test]
+    fn two_definitions_on_one_line_stay_two_places_and_the_same_place_is_one() {
+        let root = project(
+            "gd-same-line",
+            &[("a.ts", "class A { foo() {} } class B { foo() {} }\n")],
+        );
+        let file = root.join("a.ts");
+        let placed = place(
+            &root,
+            vec![
+                (file.clone(), 1, 17, Encoding::Utf16),
+                (file.clone(), 1, 38, Encoding::Utf16),
+                (file.clone(), 1, 17, Encoding::Utf16),
+            ],
+            "lsp",
+        );
+        let spots: Vec<_> = placed
+            .iter()
+            .map(|m| (m.path.as_str(), m.line, m.col, m.unit))
+            .collect();
+        assert_eq!(
+            spots,
+            [("a.ts", 1, 17, Encoding::Utf16), ("a.ts", 1, 38, Encoding::Utf16)],
+            "distinct columns stay distinct; the exact same place is kept once"
+        );
+    }
+
+    #[test]
+    fn the_same_column_number_in_different_units_is_two_places() {
+        // Column 35 is the first `f` counted in bytes and the second counted in UTF-16 units: each CJK character is
+        // three bytes but one unit. Merging them would lose a definition.
+        let root = project(
+            "gd-units-apart",
+            &[(
+                "a.js",
+                "/*\u{4e2d}\u{4e2d}\u{4e2d}\u{4e2d}\u{4e2d}\u{4e2d}\u{4e2d}*/function f(){}function f(){}\n",
+            )],
+        );
+        let file = root.join("a.js");
+        let placed = place(
+            &root,
+            vec![
+                (file.clone(), 1, 35, Encoding::Utf8),
+                (file.clone(), 1, 35, Encoding::Utf16),
+            ],
+            "lsp",
+        );
+        assert_eq!(
+            placed.iter().map(|m| (m.col, m.unit)).collect::<Vec<_>>(),
+            [(35, Encoding::Utf8), (35, Encoding::Utf16)]
+        );
+    }
+
+    #[test]
+    fn a_server_column_is_one_based_in_its_own_encoding() {
+        let mut utf8 = raw("foo", None);
+        utf8.character = 9;
+        utf8.encoding = Encoding::Utf8;
+        let utf16 = raw("foo", None);
+        let spots = lsp_places(&[&utf8, &utf16]);
+        assert_eq!(
+            spots
+                .iter()
+                .map(|(_, line, col, unit)| (*line, *col, *unit))
+                .collect::<Vec<_>>(),
+            [(1, 10, Encoding::Utf8), (1, 1, Encoding::Utf16)]
+        );
+    }
+
+    #[test]
+    fn each_match_carries_the_unit_its_column_counts_in() {
+        // A server that named its encoding is taken at its word; one that named none, or one outside the three, is
+        // LSP's default.
+        let root = project(
+            "gd-units",
+            &[("a.go", "package a\n\nfunc Foo() {}\nfunc Foo2() {}\nfunc Foo3() {}\n")],
+        );
+        let mut run = Run::new(&root, "Foo", Some(("a.go", 3)));
+        run.settle();
+        run.rpc.answer(started(&["gopls"], &[]));
+        run.at(0);
+        run.at(100);
+        let mut named = item(&root.join("a.go"), 3, 5, None, None);
+        named["encoding"] = json!("utf-8");
+        let mut odd = item(&root.join("a.go"), 5, 5, None, None);
+        odd["encoding"] = json!("utf-7");
+        run.rpc.answer(done(
+            "definitions",
+            vec![named, item(&root.join("a.go"), 4, 5, None, None), odd],
+            &[],
+        ));
+        run.at(100);
+        run.settle();
+        assert_eq!(
+            run.columns(),
+            [(3, 6, Encoding::Utf8), (4, 6, Encoding::Utf16), (5, 6, Encoding::Utf16)]
+        );
+    }
+
+    #[test]
+    fn a_text_match_counts_code_points() {
+        // The emoji before the name is one code point (two UTF-16 units, four bytes).
+        let root = project(
+            "gd-ra-text-unit",
+            &[
+                ("src/lib.rs", "mod a;\n"),
+                ("src/a.rs", "/* \u{1F600} */ pub(crate) fn effective() {}\n"),
+            ],
+        );
+        let mut run = Run::new(&root, "effective", None);
+        run.settle();
+        run.rpc.answer(started(&["rust-analyzer"], &["rust-analyzer"]));
+        run.at(0);
+        run.text_settles();
+        run.hold_to_the_end(done("workspace_symbols", vec![], &["workspace_symbols"]));
+        assert_eq!(run.matches(), [("src/a.rs".to_owned(), 1, "text")]);
+        assert_eq!(run.columns(), [(1, 23, Encoding::Utf32)]);
     }
 
     #[test]

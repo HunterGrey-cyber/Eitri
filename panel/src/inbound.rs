@@ -1503,8 +1503,12 @@ pub(super) fn handle_inbound_message(
             line,
             expect,
             interaction,
+            col,
+            col_unit,
             ..
         } => {
+            // Only `gd`'s answers carry a column; one of any other shape is dropped and the line opens as `gf`'s.
+            let col = eitri_core::scratch::OpenColumn::from_json(line, col.as_ref(), col_unit.as_ref());
             if let Err(why) = super::path_lookup::check_path_length(&path) {
                 refuse(&mut out, &why);
                 return out;
@@ -1520,15 +1524,31 @@ pub(super) fn handle_inbound_message(
             };
             if eitri_core::agent_bridge::path_holds_control(&path) {
                 refuse(&mut out, &super::links::OpenPathRefusal::ControlChar.message(&path));
-            } else if let Some(result) =
-                super::path_lookup::pick(state, &path, line, expect.clone(), view, &request_id, tab, interaction)
-            {
+            } else if let Some(result) = super::path_lookup::pick(
+                state,
+                &path,
+                line,
+                col,
+                expect.clone(),
+                view,
+                &request_id,
+                tab,
+                interaction,
+            ) {
                 if let Err(why) = result {
                     refuse(&mut out, &why);
                 }
-            } else if let Err(why) =
-                super::path_lookup::start(state, path, line, expect, view, request_id.clone(), tab, interaction)
-            {
+            } else if let Err(why) = super::path_lookup::start(
+                state,
+                path,
+                line,
+                col,
+                expect,
+                view,
+                request_id.clone(),
+                tab,
+                interaction,
+            ) {
                 refuse(&mut out, &why);
             }
         }

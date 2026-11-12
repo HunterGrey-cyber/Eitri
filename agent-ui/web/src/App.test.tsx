@@ -16656,6 +16656,8 @@ describe("gf from CARET and selections", () => {
       input: { file_path: path }, result: { content: "file text", isError: false } }] });
     fireEvent.click(container.querySelector(".path-link")!);
     expect(lastOfType("open_path")).toMatchObject({ path });
+    expect(lastOfType("open_path"), "a clicked path carries no column").not.toHaveProperty("col");
+    expect(lastOfType("open_path")).not.toHaveProperty("col_unit");
   });
   it("V-LINE gf offers three letters and a letter opens its path in BROWSE", () => {
     const { container, press, gf, mode } = setup("compare a.rs, b.rs and c.rs, then a.rs again");

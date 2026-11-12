@@ -208,8 +208,8 @@ for _, job in ipairs(jobs) do
           current.cut = current.cut or clipped
         end
       elseif args.kind == 'document_symbols' or args.kind == 'workspace_symbols' then
-        symbols(part, result, vim.uri_from_bufnr(target.buf))
-      else locations(part, result) end
+        symbols(part, result, vim.uri_from_bufnr(target.buf), nil, units_of(target.client))
+      else locations(part, result, units_of(target.client)) end
     end)
   end
   if stored and has_edit(stored.action) then handler(nil, stored.action)

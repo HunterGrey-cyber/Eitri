@@ -100,8 +100,11 @@ export type OutboundMessage =
   /** Append this typed text to the shared prompt history, e.g. `Ctrl+c`'s clear. */
   | { type: "history_push"; request_id: string; text: string }
   /** `gf` on a path: open it in the scratch split, at `line` when given. `interaction` is the page's generation
-   *  when it asked: the host opens the editor only while the `panel_keys` mirror still carries it. */
-  | { type: "open_path"; request_id: string; path: string; line?: number; expect?: string; interaction?: number }
+   *  when it asked: the host opens the editor only while the `panel_keys` mirror still carries it. Only a `gd` name
+   *  lookup's answer sends `col` (one-based, on `line`) with `col_unit`, the units it counts in; every other open
+   *  sends neither key, and the host drops a pair it would not take and opens the line's start. */
+  | { type: "open_path"; request_id: string; path: string; line?: number; expect?: string; interaction?: number;
+      col?: number; col_unit?: ColumnUnit }
   /** `Ctrl+g` on a row: show this text read-only in the scratch split. */
   | { type: "view_in_editor"; request_id: string; title: string; text: string; tab?: boolean }
   /** A copy's text for the primary selection too (`primaryCopy.ts`). The shell's page handler takes this
@@ -283,9 +286,15 @@ export function postToRust(message: OutboundMessage): void {
   activeTransport().post(JSON.stringify(message));
 }
 
+/** What a column counts: bytes, UTF-16 code units or code points, as LSP spells a position encoding. */
+export type ColumnUnit = "utf-8" | "utf-16" | "utf-32";
+export const COLUMN_UNITS: readonly ColumnUnit[] = ["utf-8", "utf-16", "utf-32"];
+
 export type EditorSymbolResult = {
   kind: "editor_symbol_result"; requestId: string;
-  matches: { path: string; line: number; col: number; source: "lsp" | "text" }[];
+  /** `col` is one-based and counted in `unit`: the answering server's position encoding, code points for a text
+   *  match. */
+  matches: { path: string; line: number; col: number; unit?: ColumnUnit; source: "lsp" | "text" }[];
   error?: { kind: "no_client" | "no_symbol" | "indexing" | "timeout" | "refused"; server?: string; message?: string } | null;
 };
 
@@ -743,6 +752,7 @@ export function installDispatch(handler: InboundHandler): void {
         if (typeof value.requestId !== "string" || !Array.isArray(value.matches) ||
             !value.matches.every((m) => m !== null && typeof m === "object" && typeof m.path === "string" &&
               Number.isSafeInteger(m.line) && m.line > 0 && Number.isSafeInteger(m.col) && m.col >= 0 &&
+              (m.unit === undefined || COLUMN_UNITS.includes(m.unit)) &&
               (m.source === "lsp" || m.source === "text")) ||
             (value.error != null && (typeof value.error !== "object" ||
               !["no_client", "no_symbol", "indexing", "timeout", "refused"].includes(value.error.kind) ||

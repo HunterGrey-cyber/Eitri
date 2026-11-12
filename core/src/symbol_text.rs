@@ -49,9 +49,12 @@ pub struct Found {
     pub path: String,
     /// One-based.
     pub line: u32,
-    /// One-based, in characters, where the name starts.
+    /// One-based, in characters (Unicode scalar values, [`COLUMN_UNIT`]), where the name starts.
     pub col: u32,
 }
+
+/// The units [`Found::col`] counts in: code points, as `chars()` counts them.
+pub const COLUMN_UNIT: crate::editor_tools::text_edits::Encoding = crate::editor_tools::text_edits::Encoding::Utf32;
 
 /// The items whose definition line names what follows them.
 const KINDS: &[&str] = &[
@@ -534,6 +537,15 @@ mod tests {
         let (dir, listing) = project(&[("a.rs", "\u{3000}fn wanted() {}\n")]);
         let found = search_in(&dir, &listing, "wanted", Limits::default(), Instant::now());
         assert_eq!(found[0].col, 5, "an ideographic space is whitespace and one character");
+    }
+
+    #[test]
+    fn a_column_counts_code_points_which_is_its_unit() {
+        // An emoji is two UTF-16 code units and four bytes, but one code point: the column counts it once.
+        let (dir, listing) = project(&[("a.rs", "/* \u{1F600} */ fn wanted() {}\n")]);
+        let found = search_in(&dir, &listing, "wanted", Limits::default(), Instant::now());
+        assert_eq!(found[0].col, 12);
+        assert_eq!(COLUMN_UNIT, crate::editor_tools::text_edits::Encoding::Utf32);
     }
 
     #[test]

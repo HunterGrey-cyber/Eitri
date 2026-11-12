@@ -228,6 +228,43 @@ local function diff(req)
   end
 end
 
+-- The units a language server counts a column in: bytes, UTF-16 code units, code points.
+local units = { ['utf-8'] = true, ['utf-16'] = true, ['utf-32'] = true }
+local byteindex_takes_encoding = vim.fn.has('nvim-0.11') == 1
+
+-- The byte column on `text` of the one-based column `col` counted in `unit`. The column names the character holding
+-- its unit: one inside a character (the second half of a surrogate pair, a byte inside a multibyte character) lands
+-- on that character's first byte, and one past the line's end on its last character. vim.str_byteindex answers with
+-- the byte just past that character; before 0.11 it took (s, index, use_utf16) and raised an error past the end,
+-- since 0.11 it takes (s, encoding, index, strict_indexing) and, not strict, answers the line's length there.
+local function byte_column(text, col, unit)
+  if #text == 0 then return 0 end
+  local after = #text
+  if unit == 'utf-8' then
+    after = math.min(col, #text)
+  else
+    local found, at
+    if byteindex_takes_encoding then
+      found, at = pcall(vim.str_byteindex, text, unit, col, false)
+    else
+      found, at = pcall(vim.str_byteindex, text, col, unit == 'utf-16')
+    end
+    if found and type(at) == 'number' and at >= 1 then after = math.min(at, #text) end
+  end
+  -- `after` is the one-based index of the character's last byte; str_utf_start steps back to its first.
+  return after - 1 + vim.str_utf_start(text, after)
+end
+
+-- The column comes from the page by way of the host, which judged it already; it is judged again here, as data
+-- only: a whole number from 1 below 2^31 and a unit of the three, else the cursor stays at the line's start.
+local function place_column(line, col, unit)
+  if type(col) ~= 'number' or col < 1 or col >= 2 ^ 31 or col ~= math.floor(col) then return end
+  if type(unit) ~= 'string' or not units[unit] then return end
+  local text = vim.api.nvim_buf_get_lines(0, line - 1, line, false)[1]
+  if text == nil then return end
+  pcall(vim.api.nvim_win_set_cursor, 0, { line, byte_column(text, col, unit) })
+end
+
 function M.call(hex)
   if torn then return end
   local ok, req = pcall(vim.json.decode, unhex(hex))
@@ -237,7 +274,8 @@ function M.call(hex)
     if req.op == 'open' then
       run('edit', req.path)
       if type(req.line) == 'number' and req.line > 0 then
-        pcall(vim.api.nvim_win_set_cursor, 0, { req.line, 0 })
+        -- A line past the buffer's end moves nothing, and then no column is placed either.
+        if pcall(vim.api.nvim_win_set_cursor, 0, { req.line, 0 }) then place_column(req.line, req.col, req.unit) end
       end
     elseif req.op == 'view' then
       if req.tab then view_tab(req.path) else view(req.path) end

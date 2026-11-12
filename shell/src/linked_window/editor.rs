@@ -444,8 +444,12 @@ pub fn follow_batch(owner: &str, line: &str) -> Option<FollowBatch> {
 /// What a panel's request for nvim asks, read back from the request's own encoding.
 #[derive(Debug, Clone, PartialEq)]
 pub enum ScratchAsk {
-    /// `gf` or a path click: the file at `path` (absolute), at `line`.
-    Open { path: PathBuf, line: Option<u32> },
+    /// `gf` or a path click: the file at `path` (absolute), at `line`; a `gd` answer's also at `col` on it.
+    Open {
+        path: PathBuf,
+        line: Option<u32>,
+        col: Option<eitri_core::scratch::OpenColumn>,
+    },
     /// `Ctrl+g` in INPUT: the draft in `body`, its end reported in `done`.
     Edit { body: PathBuf, done: PathBuf },
     /// A read-only view of the text in `body`; with `tab`, in a tab page of its own rather than the row-view split.
@@ -470,13 +474,17 @@ pub fn read_request(request: &ScratchRequest) -> Result<ScratchAsk, String> {
         serde_json::from_slice(&bytes).map_err(|e| format!("a request for nvim that is not JSON: {e}"))?;
     let text = |key: &str| value.get(key).and_then(Value::as_str).map(PathBuf::from);
     match value.get("op").and_then(Value::as_str) {
-        Some("open") => Ok(ScratchAsk::Open {
-            path: text("path").ok_or("an open with no path")?,
-            line: value
+        Some("open") => {
+            let line = value
                 .get("line")
                 .and_then(Value::as_u64)
-                .and_then(|l| u32::try_from(l).ok()),
-        }),
+                .and_then(|l| u32::try_from(l).ok());
+            Ok(ScratchAsk::Open {
+                path: text("path").ok_or("an open with no path")?,
+                line,
+                col: eitri_core::scratch::OpenColumn::from_json(line, value.get("col"), value.get("unit")),
+            })
+        }
         Some("edit") => Ok(ScratchAsk::Edit {
             body: text("path").ok_or("an edit with no path")?,
             done: text("done").ok_or("an edit with no marker")?,
@@ -987,12 +995,14 @@ impl Window1Editor {
             .clone()
             .ok_or("this window has no editor to drive")?;
         match request {
-            EditorRequest::OpenPath { path, line, col: _ } => {
+            EditorRequest::OpenPath { path, line, col, unit } => {
                 // The rule a window's own panel uses, so a path from window 2 opens exactly when it would open from
-                // window 1's own chat.
+                // window 1's own chat; its column is judged as a page's is, and one that would not be taken is
+                // dropped.
                 let resolved = eitri_panel::agent_panel::open_path_target(&self.root, &path)?;
+                let col = eitri_core::scratch::OpenColumn::checked(line, col, unit);
                 drive(
-                    EditorAct::Request(&eitri_core::scratch::open_request(&resolved, line)),
+                    EditorAct::Request(&eitri_core::scratch::open_request_at(&resolved, line, col)),
                     token,
                 )
             }
@@ -1817,11 +1827,12 @@ impl Window2Editor {
             return Err(UNLINKED_NOTE.to_string());
         };
         let (request, waiting) = match read_request(request)? {
-            ScratchAsk::Open { path, line } => (
+            ScratchAsk::Open { path, line, col } => (
                 EditorRequest::OpenPath {
                     path: named_path(&self.root, &path),
                     line,
-                    col: None,
+                    col: col.map(|col| col.col),
+                    unit: col.map(|col| col.unit),
                 },
                 None,
             ),
@@ -3201,7 +3212,8 @@ mod tests {
             (
                 Some(ScratchAsk::Open {
                     path: w.root.join("src/a.rs"),
-                    line: Some(7)
+                    line: Some(7),
+                    col: None,
                 }),
                 Some("token-1".into())
             ),
@@ -3217,6 +3229,7 @@ mod tests {
                             path: path.into(),
                             line: None,
                             col: None,
+                            unit: None,
                         },
                         token: None,
                         answer: None,
@@ -3253,7 +3266,8 @@ mod tests {
             driven.borrow()[1].0,
             Some(ScratchAsk::Open {
                 path: w.root.join("src/a.rs"),
-                line: Some(1)
+                line: Some(1),
+                col: None,
             })
         );
 
@@ -3273,6 +3287,68 @@ mod tests {
 
         w.two.unlinked();
         assert_eq!(w.two.request(&click, &|| None), Err(UNLINKED_NOTE.to_string()));
+    }
+
+    #[test]
+    fn a_gd_column_from_window_2_reaches_window_1s_editor_and_one_it_would_not_take_is_dropped() {
+        use eitri_core::editor_tools::text_edits::Encoding;
+        use eitri_core::scratch::{OpenColumn, OPEN_COL_MAX};
+        let w = windows("columns");
+        let driven = recording_drive(&w);
+        let col = OpenColumn {
+            col: 5,
+            unit: Encoding::Utf16,
+        };
+        let open = eitri_core::scratch::open_request_at(&w.root.join("src/a.rs"), Some(7), Some(col));
+        w.two.request(&open, &|| None).unwrap();
+        assert!(w.settle(|| !driven.borrow().is_empty()));
+        assert_eq!(
+            driven.borrow()[0].0,
+            Some(ScratchAsk::Open {
+                path: w.root.join("src/a.rs"),
+                line: Some(7),
+                col: Some(col),
+            }),
+            "the column and its unit cross the link"
+        );
+
+        // Sent straight over the link, a column window 1 would not take from its own page is dropped and the line
+        // still opens: past the cap, zero (columns count from one), without a unit, without a line.
+        let shapes = [
+            (Some(7), Some(OPEN_COL_MAX + 1), Some(Encoding::Utf16)),
+            (Some(7), Some(0), Some(Encoding::Utf8)),
+            (Some(7), Some(5), None),
+            (None, Some(5), Some(Encoding::Utf32)),
+        ];
+        for (line, col, unit) in shapes {
+            w.two_link
+                .send(
+                    Msg::Editor {
+                        request: EditorRequest::OpenPath {
+                            path: "src/a.rs".into(),
+                            line,
+                            col,
+                            unit,
+                        },
+                        token: None,
+                        answer: None,
+                    },
+                    Vec::new(),
+                )
+                .unwrap();
+        }
+        assert!(w.settle(|| driven.borrow().len() == 1 + shapes.len()));
+        for (at, (line, _, _)) in shapes.into_iter().enumerate() {
+            assert_eq!(
+                driven.borrow()[1 + at].0,
+                Some(ScratchAsk::Open {
+                    path: w.root.join("src/a.rs"),
+                    line,
+                    col: None,
+                }),
+                "{at}"
+            );
+        }
     }
 
     /// Window 2's panel hears how a view went only once window 1 has written it and handed it to its editor: a

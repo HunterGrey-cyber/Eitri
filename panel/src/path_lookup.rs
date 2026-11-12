@@ -18,6 +18,8 @@ const MAX_OFFERS: usize = 64;
 
 struct Request {
     line: Option<u32>,
+    /// Where on `line` the cursor goes: only a `gd` answer's, already judged.
+    col: Option<eitri_core::scratch::OpenColumn>,
     expect: Option<String>,
     view: ViewId,
     request_id: String,
@@ -193,6 +195,7 @@ pub(super) fn start(
     state: &mut AgentPanelState,
     path: String,
     line: Option<u32>,
+    col: Option<eitri_core::scratch::OpenColumn>,
     expect: Option<String>,
     view: ViewId,
     request_id: String,
@@ -204,6 +207,7 @@ pub(super) fn start(
     let limits = state.path_lookup.limits;
     let request = Request {
         line,
+        col,
         expect: expect.clone(),
         view,
         request_id,
@@ -258,6 +262,7 @@ pub(super) fn pick(
     state: &mut AgentPanelState,
     path: &str,
     line: Option<u32>,
+    col: Option<eitri_core::scratch::OpenColumn>,
     expect: Option<String>,
     view: ViewId,
     request_id: &str,
@@ -275,6 +280,7 @@ pub(super) fn pick(
     let found = offer.paths.into_iter().find(|found| found.name == path).unwrap();
     let request = Request {
         line,
+        col,
         expect: expect.clone(),
         view,
         request_id: request_id.to_owned(),
@@ -410,7 +416,7 @@ pub(super) fn poll(state: &mut AgentPanelState, out: &mut Outbox) {
                     );
                 }
                 out.effect(Effect::AskEditor {
-                    request: eitri_core::scratch::open_request(&path, request.line),
+                    request: eitri_core::scratch::open_request_at(&path, request.line, request.col),
                     then: EditorThen::Answer {
                         view: request.view,
                         request_id: request.request_id,
@@ -563,7 +569,17 @@ mod tests {
             let mut state = handle.state.borrow_mut();
             let tab = state.tabs.active();
             assert_eq!(
-                start(&mut state, path, None, None, ViewId::BASE, "long".into(), tab, None),
+                start(
+                    &mut state,
+                    path,
+                    None,
+                    None,
+                    None,
+                    ViewId::BASE,
+                    "long".into(),
+                    tab,
+                    None
+                ),
                 Err("path is longer than 4096 bytes".into())
             );
             assert!(!state.path_lookup.is_running());
@@ -636,6 +652,58 @@ mod tests {
                 *opened.borrow(),
                 vec![eitri_core::scratch::open_request(&root.0.join(expected), Some(12))]
             );
+        }
+    }
+    /// `gd`'s column reaches the editor with its unit; a page message without one opens exactly as before, and a
+    /// column of any other shape is dropped so the line still opens, never refused and never passed on.
+    #[test]
+    fn path_lookup_carries_a_gd_column_and_drops_one_of_any_other_shape() {
+        use eitri_core::editor_tools::text_edits::Encoding;
+        use eitri_core::scratch::{open_request, open_request_at, OpenColumn, OPEN_COL_MAX};
+        use serde_json::json;
+        let root = Project::new();
+        root.write("src/a.rs");
+        let open = |fields: serde_json::Value| {
+            let (handle, page, _) = handle_with_recording_page();
+            handle.state.borrow_mut().project_dir = root.0.clone();
+            let opened = record_opens(&handle);
+            let mut message = json!({"type": "open_path", "request_id": "find", "path": "src/a.rs", "line": 12});
+            for (key, value) in fields.as_object().unwrap() {
+                message[key] = value.clone();
+            }
+            handle.page_message(ViewId::BASE, &message.to_string());
+            tick_handle_until(&handle, "the open", || response(&page).is_some());
+            assert_eq!(response(&page).unwrap()["ok"], true, "{message}");
+            let opened = opened.borrow().clone();
+            opened
+        };
+        let path = root.0.join("src/a.rs");
+        assert_eq!(open(json!({})), vec![open_request(&path, Some(12))]);
+        assert_eq!(
+            open(json!({"col": 23, "col_unit": "utf-16"})),
+            vec![open_request_at(
+                &path,
+                Some(12),
+                Some(OpenColumn {
+                    col: 23,
+                    unit: Encoding::Utf16
+                })
+            )]
+        );
+        for fields in [
+            json!({"col": -1, "col_unit": "utf-16"}),
+            json!({"col": OPEN_COL_MAX + 1, "col_unit": "utf-16"}),
+            json!({"col": 1.5, "col_unit": "utf-16"}),
+            json!({"col": 1e12, "col_unit": "utf-16"}),
+            json!({"col": "23", "col_unit": "utf-16"}),
+            json!({"col": null, "col_unit": "utf-16"}),
+            json!({"col": 23, "col_unit": "utf-7"}),
+            json!({"col": 23}),
+            json!({"col_unit": "utf-8"}),
+            json!({"col": 23, "col_unit": "utf-16", "line": null}),
+        ] {
+            let line = if fields.get("line").is_some() { None } else { Some(12) };
+            assert_eq!(open(fields.clone()), vec![open_request(&path, line)], "{fields}");
         }
     }
     #[test]
@@ -851,6 +919,7 @@ mod tests {
             handle.state.borrow_mut().path_lookup.running.push((
                 Request {
                     line: None,
+                    col: None,
                     expect: None,
                     view: ViewId::BASE,
                     request_id: "held".into(),
@@ -896,6 +965,7 @@ mod tests {
     fn request(state: &AgentPanelState) -> Request {
         Request {
             line: Some(12),
+            col: None,
             expect: None,
             view: ViewId::BASE,
             request_id: "find".into(),
@@ -998,7 +1068,17 @@ mod tests {
                 at: Instant::now(),
             });
             assert_eq!(
-                pick(&mut state, "src/a.rs", None, None, ViewId::BASE, "pick", tab, None),
+                pick(
+                    &mut state,
+                    "src/a.rs",
+                    None,
+                    None,
+                    None,
+                    ViewId::BASE,
+                    "pick",
+                    tab,
+                    None
+                ),
                 Some(Err(FULL.into()))
             );
             assert!(state.path_lookup.running.is_empty());
@@ -1339,7 +1419,7 @@ mod tests {
         assert_eq!(state.path_lookup.offers.len(), MAX_OFFERS - 1);
         assert_eq!(state.path_lookup.offers[0].request_id, "3");
         let tab = state.tabs.active();
-        assert!(pick(&mut state, "src/a.rs", None, None, view(2), "pick", tab, None).is_none());
+        assert!(pick(&mut state, "src/a.rs", None, None, None, view(2), "pick", tab, None).is_none());
     }
     #[test]
     fn path_lookup_unchanged_pick_opens_and_consumes_its_offer() {

@@ -598,6 +598,28 @@ fn a_position_is_in_each_clients_encoding() {
         );
     }
 }
+/// Each item names the units its `character` counts in: the answering client's negotiated encoding.
+#[test]
+#[ignore = "needs a real nvim on PATH; spends no tokens and needs no display"]
+fn an_item_names_its_clients_encoding() {
+    use eitri_core::editor_tools::text_edits::Encoding;
+    for (name, encoding) in [
+        ("utf-8", Encoding::Utf8),
+        ("utf-16", Encoding::Utf16),
+        ("utf-32", Encoding::Utf32),
+    ] {
+        let mut t = Test::new();
+        t.start("fake", name, t.buf.clone(), &t.root, None, 0);
+        t.definitions(t.location(&t.path), 0);
+        t.ask_definitions();
+        let parts = t.parts();
+        assert_eq!(
+            (parts[0].items[0].character, parts[0].items[0].encoding),
+            (2, encoding),
+            "{name}"
+        );
+    }
+}
 #[test]
 #[ignore = "needs a real nvim on PATH; spends no tokens and needs no display"]
 fn the_symbol_is_a_whole_word() {
