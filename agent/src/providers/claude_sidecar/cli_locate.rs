@@ -169,9 +169,16 @@ pub fn locate_claude(
 
 /// [`locate_claude`] over this process's environment and file system. Looks at the disk, so it belongs on a worker.
 pub fn locate_claude_here() -> ClaudeCli {
-    let path_var = std::env::var_os("PATH");
+    locate_claude_in(&|k| std::env::var_os(k))
+}
+
+/// [`locate_claude`] over the caller's environment and this process's file system. Looks at the disk,
+/// so it belongs on a worker. Every environment lookup, including interpreter checks, uses `env`.
+/// Relative command paths and PATH entries (including empty entries and `.`) use this process's cwd.
+pub fn locate_claude_in(env: &dyn Fn(&str) -> Option<OsString>) -> ClaudeCli {
+    let path_var = env("PATH");
     locate_claude(
-        &|name| std::env::var_os(name),
+        env,
         &runnable_file,
         &|p| inspect_for_window(p, path_var.as_deref()),
         &|p| read_user_file(p, NPMRC_CAP),
@@ -249,6 +256,49 @@ pub fn located_log_lines(located: &ClaudeCli) -> Vec<String> {
 mod tests {
     use super::*;
     use std::collections::{HashMap, HashSet};
+
+    #[test]
+    fn locate_claude_in_uses_only_the_supplied_environment() {
+        const CHILD: &str = "EITRI_LOCATE_CLAUDE_IN_TEST";
+        if let Some(root) = std::env::var_os(CHILD) {
+            let root = PathBuf::from(root);
+            let caller_path = root.join("caller");
+            let env = |key: &str| match key {
+                "PATH" => Some(caller_path.clone().into_os_string()),
+                "HOME" => Some(root.clone().into_os_string()),
+                _ => None,
+            };
+            assert!(matches!(locate_claude_here(), ClaudeCli::Missing { .. }));
+            assert_eq!(crate::locate_claude_in(&env), ClaudeCli::OnPath);
+            std::fs::rename(caller_path.join("claude"), root.join("process/claude")).unwrap();
+            assert_eq!(locate_claude_here(), ClaudeCli::OnPath);
+            assert!(matches!(crate::locate_claude_in(&env), ClaudeCli::Missing { .. }));
+            return;
+        }
+        let root = crate::test_tmp::TmpDir::new("nv-cli-locate", "env");
+        std::fs::create_dir(root.join("caller")).unwrap();
+        std::fs::create_dir(root.join("process")).unwrap();
+        script_fixture::write_executable_script(root.join("caller/claude"), b"#!/bin/sh\nexit 0\n", 0o700).unwrap();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "providers::claude_sidecar::cli_locate::tests::locate_claude_in_uses_only_the_supplied_environment",
+                "--nocapture",
+            ])
+            .env_clear()
+            .env(CHILD, root.as_ref())
+            .env("PATH", root.join("process"))
+            .env("HOME", root.as_ref())
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(output.status.success(), "{stdout}\n{stderr}");
+        assert!(
+            stdout.contains("1 passed"),
+            "the child must run the test: {stdout}\n{stderr}"
+        );
+    }
 
     fn env_of(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<OsString> + use<> {
         let owned: Vec<(String, String)> = pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();

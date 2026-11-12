@@ -31,7 +31,7 @@
 use super::contract::{SidecarVersion, BUNDLED_SIDECAR_VERSION};
 use crate::provider::ProviderInfo;
 use std::collections::{HashSet, VecDeque};
-use std::ffi::OsStr;
+use std::ffi::{OsStr, OsString};
 use std::fs::File;
 use std::io::Read;
 use std::os::fd::{AsRawFd, OwnedFd, RawFd};
@@ -410,6 +410,44 @@ pub(crate) struct HandedOutput {
 }
 
 impl SpawnedSidecar {
+    pub(crate) fn liveness(&self) -> super::transport::Liveness {
+        use super::transport::Liveness;
+        match &self.process {
+            SidecarProcess::Spawned(child) => match crate::jsonrpc_link::child_state(child.id()) {
+                crate::jsonrpc_link::ChildState::Running => Liveness::Alive,
+                crate::jsonrpc_link::ChildState::Exited => Liveness::Exited { code: None },
+                crate::jsonrpc_link::ChildState::Gone => Liveness::Unknown,
+            },
+            #[cfg(target_os = "linux")]
+            SidecarProcess::Adopted(pidfd) => {
+                if pidfd.exited() {
+                    Liveness::Exited { code: None }
+                } else {
+                    Liveness::Alive
+                }
+            }
+        }
+    }
+
+    pub(crate) fn stop(&mut self) -> std::io::Result<()> {
+        if !self.holds {
+            return Ok(());
+        }
+        drop(self.stdin_keepalive.take()); // closes the write end -> sidecar sees stdin EOF
+        let result = match &mut self.process {
+            SidecarProcess::Spawned(child) => stop_child(child, SIDECAR_EXIT_GRACE).map(|_| ()),
+            #[cfg(target_os = "linux")]
+            SidecarProcess::Adopted(pidfd) => {
+                end_adopted(pidfd, SIDECAR_EXIT_GRACE);
+                Ok(())
+            }
+        };
+        self.holds = false;
+        // The directory outlives windows, so a killed sidecar's file would otherwise pile up in it.
+        let _ = std::fs::remove_file(&self.socket_path);
+        result
+    }
+
     /// The sidecar's most recent stderr lines, oldest first. Not only a failure path: the sidecar
     /// emits a real CLI-compatibility diagnostic here on a successful-but-untested start, which a
     /// UI should be able to show without scraping this process's own stderr.
@@ -1460,9 +1498,11 @@ fn sidecar_command(
     program_args: &[PathBuf],
     socket_path: &Path,
     account: Option<&crate::account::ClaudeAccount>,
+    cli_found: Option<&Path>,
 ) -> Command {
-    let keep_test_seams = std::env::var_os(TEST_SEAMS_VAR).is_some_and(|v| v == "1");
-    let bash_max_timeout = std::env::var_os("BASH_MAX_TIMEOUT_MS");
+    let inherited = |key: &str| std::env::var_os(key);
+    let keep_test_seams = inherited(TEST_SEAMS_VAR).is_some_and(|v| v == "1");
+    let bash_max_timeout = inherited("BASH_MAX_TIMEOUT_MS");
     sidecar_command_for(
         program_path,
         program_args,
@@ -1470,6 +1510,7 @@ fn sidecar_command(
         account,
         keep_test_seams,
         bash_max_timeout.as_deref(),
+        cli_found,
     )
 }
 
@@ -1480,6 +1521,7 @@ fn sidecar_command_for(
     account: Option<&crate::account::ClaudeAccount>,
     keep_test_seams: bool,
     bash_max_timeout: Option<&OsStr>,
+    cli_found: Option<&Path>,
 ) -> Command {
     let mut command = Command::new(program_path);
     command
@@ -1494,35 +1536,20 @@ fn sidecar_command_for(
         // A group of its own: a `Ctrl+C` in, or the hangup of, the terminal that started this window
         // goes to this window's group and must not reach a sidecar another window may hold by then.
         // Its end is its stdin's EOF, which every holder's end brings about, a crash included.
-        .process_group(0)
-        // An Eitri tab reaches its own editor and never attaches to an IDE the CLI finds on the machine:
-        // the SDK's sessions do not look for one today, and a later CLI that does stops here.
-        .env("CLAUDE_CODE_AUTO_CONNECT_IDE", "false")
-        // The sidecar merges this variable's MCP servers into every session it serves. Eitri states
-        // which servers a session gets and states none today, so a value left in the user's shell
-        // must not turn into servers (and tools) in an Eitri session.
-        .env_remove(EXTRA_MCP_SERVERS_VAR)
-        // `none` makes the sidecar ignore end-of-file on its stdin, which is how it learns that the
-        // window holding the other end is gone, so a window killed with SIGKILL would leave it
-        // running; any other value than `stdin` or `none` fails every start. The window states
-        // nothing here, so the sidecar's own default (`stdin`) is what applies.
-        .env_remove(PARENT_WATCH_VAR);
-    // Verdandi's fault-injection and sizing knobs change how a session behaves (dropped watches, a
-    // one-event ring); a value left in a shell must not reach a window's sidecar. The real-sidecar
-    // tests that set them on purpose also set `TEST_SEAMS_VAR`.
-    if !keep_test_seams {
-        for var in TEST_SEAM_VARS {
-            command.env_remove(var);
-        }
-    }
-    if let Some(account) = account {
-        command.env("VERDANDI_CLAUDE_ACCOUNT", account.name());
-    }
-    // Raise the ceiling for explicitly timed commands while keeping the CLI's default timeout.
-    // A value supplied by the user takes precedence, including an empty or non-UTF-8 value.
-    command.env(
-        "BASH_MAX_TIMEOUT_MS",
-        bash_max_timeout.unwrap_or(OsStr::new("2147483647")),
+        .process_group(0);
+    let inherited = |key: &str| {
+        (key == "BASH_MAX_TIMEOUT_MS")
+            .then(|| bash_max_timeout.map(OsStr::to_os_string))
+            .flatten()
+    };
+    apply_env_policy(
+        &mut command,
+        sidecar_env_policy(
+            &inherited,
+            account.map(|account| account.name()),
+            keep_test_seams,
+            cli_found,
+        ),
     );
     command
 }
@@ -1552,12 +1579,206 @@ fn exit_summary(status: &ExitStatus, socket_path: &Path, claude_refused: bool) -
     summary
 }
 
-/// Gives the sidecar the `claude` the lookup found where an installer puts it, in the one variable the sidecar reads
-/// to pick the CLI. `None` (the person set the variable, `claude` is on the `PATH`, or nothing was found) leaves the
-/// environment as this process has it.
-fn hand_over_cli(command: &mut Command, found: Option<&Path>) {
-    if let Some(found) = found {
-        command.env(super::cli_locate::CLI_PATH_VAR, found);
+/// Explicit overrides for a sidecar's inherited environment. The caller adds the socket path.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SidecarEnv {
+    pub set: Vec<(OsString, OsString)>,
+    pub remove: Vec<OsString>,
+}
+
+/// The common environment rules for a local sidecar and a helper's sidecar. A helper adds its
+/// own parent-watch setting after applying these rules.
+pub fn sidecar_env_policy(
+    inherited: &dyn Fn(&str) -> Option<OsString>,
+    account_name: Option<&str>,
+    keep_test_seams: bool,
+    cli_found: Option<&Path>,
+) -> SidecarEnv {
+    // Tabs use their own editor. SDK sessions do not discover IDEs today; force this off so a
+    // future CLI cannot attach a tab to an IDE found on the machine.
+    let mut set = vec![("CLAUDE_CODE_AUTO_CONNECT_IDE".into(), "false".into())];
+    // The sidecar merges this process-level MCP list into every session. Session requests state
+    // their servers, so a shell's leftover list must not add servers and tools to a tab.
+    let mut remove = vec![EXTRA_MCP_SERVERS_VAR.into()];
+    // `none` disables stdin EOF shutdown and would leave a sidecar running after a SIGKILLed
+    // window. Any value other than `stdin` or `none` (after trimming, with blank meaning stdin)
+    // fails every start. Removing the override selects the sidecar's default, `stdin`.
+    remove.push(PARENT_WATCH_VAR.into());
+    // Fault-injection and sizing knobs can drop watches or shrink the replay ring. A shell's
+    // leftover test settings must not change a tab; tests opt in explicitly to retain them.
+    if !keep_test_seams {
+        remove.extend(TEST_SEAM_VARS.into_iter().map(OsString::from));
+    }
+    if let Some(account) = account_name {
+        set.push(("VERDANDI_CLAUDE_ACCOUNT".into(), account.into()));
+    }
+    // Raise the ceiling for explicitly timed Bash commands while keeping the CLI's default
+    // timeout. User-supplied values take precedence, including empty and non-UTF-8 values.
+    set.push((
+        "BASH_MAX_TIMEOUT_MS".into(),
+        inherited("BASH_MAX_TIMEOUT_MS").unwrap_or_else(|| "2147483647".into()),
+    ));
+    // Only a discovered install path overrides the inherited CLI choice. With no handoff, a
+    // person's named CLI, PATH lookup or missing CLI keeps its existing environment.
+    if let Some(cli) = cli_found {
+        set.push((super::cli_locate::CLI_PATH_VAR.into(), cli.as_os_str().to_owned()));
+    }
+    SidecarEnv { set, remove }
+}
+
+fn apply_env_policy(command: &mut Command, policy: SidecarEnv) {
+    // Apply the IDE guard, removals, account, timeout and CLI handoff in that order.
+    let mut set = policy.set.into_iter();
+    if let Some((key, value)) = set.next() {
+        command.env(key, value);
+    }
+    for key in policy.remove {
+        command.env_remove(key);
+    }
+    command.envs(set);
+}
+
+#[cfg(test)]
+mod environment_regression {
+    use super::*;
+    use std::collections::BTreeSet;
+    use std::ffi::OsString;
+    use std::os::unix::ffi::OsStringExt;
+
+    #[test]
+    fn local_spawn_environment_is_unchanged() {
+        check_environment_tables(false);
+    }
+
+    #[test]
+    fn sidecar_env_policy_matches_literal_tables() {
+        check_environment_tables(true);
+    }
+
+    fn check_environment_tables(policy_only: bool) {
+        // These are the command's explicit overrides; everything else stays inherited.
+        let cases: [(bool, bool, &[(&str, Option<&str>)]); 4] = [
+            (
+                false,
+                false,
+                &[
+                    ("VERDANDI_CLAUDE_SIDECAR_SOCKET", Some("/srv/project/socket")),
+                    ("CLAUDE_CODE_AUTO_CONNECT_IDE", Some("false")),
+                    ("VERDANDI_CLAUDE_EXTRA_MCP_SERVERS", None),
+                    ("VERDANDI_CLAUDE_SIDECAR_PARENT_WATCH", None),
+                    ("VERDANDI_CLAUDE_SIDECAR_RING_CAPACITY", None),
+                    ("VERDANDI_CLAUDE_SIDECAR_FAULT_DROP_WATCH_AFTER", None),
+                    ("VERDANDI_CLAUDE_SIDECAR_WRITE_QUEUE_STATS_MS", None),
+                ],
+            ),
+            (
+                true,
+                false,
+                &[
+                    ("VERDANDI_CLAUDE_SIDECAR_SOCKET", Some("/srv/project/socket")),
+                    ("CLAUDE_CODE_AUTO_CONNECT_IDE", Some("false")),
+                    ("VERDANDI_CLAUDE_EXTRA_MCP_SERVERS", None),
+                    ("VERDANDI_CLAUDE_SIDECAR_PARENT_WATCH", None),
+                    ("VERDANDI_CLAUDE_SIDECAR_RING_CAPACITY", None),
+                    ("VERDANDI_CLAUDE_SIDECAR_FAULT_DROP_WATCH_AFTER", None),
+                    ("VERDANDI_CLAUDE_SIDECAR_WRITE_QUEUE_STATS_MS", None),
+                    ("VERDANDI_CLAUDE_ACCOUNT", Some("example-account")),
+                ],
+            ),
+            (
+                false,
+                true,
+                &[
+                    ("VERDANDI_CLAUDE_SIDECAR_SOCKET", Some("/srv/project/socket")),
+                    ("CLAUDE_CODE_AUTO_CONNECT_IDE", Some("false")),
+                    ("VERDANDI_CLAUDE_EXTRA_MCP_SERVERS", None),
+                    ("VERDANDI_CLAUDE_SIDECAR_PARENT_WATCH", None),
+                ],
+            ),
+            (
+                true,
+                true,
+                &[
+                    ("VERDANDI_CLAUDE_SIDECAR_SOCKET", Some("/srv/project/socket")),
+                    ("CLAUDE_CODE_AUTO_CONNECT_IDE", Some("false")),
+                    ("VERDANDI_CLAUDE_EXTRA_MCP_SERVERS", None),
+                    ("VERDANDI_CLAUDE_SIDECAR_PARENT_WATCH", None),
+                    ("VERDANDI_CLAUDE_ACCOUNT", Some("example-account")),
+                ],
+            ),
+        ];
+        let timeouts = [
+            (None, OsString::from("2147483647")),
+            (Some(OsString::from("900000")), OsString::from("900000")),
+            (Some(OsString::new()), OsString::new()),
+            (Some(OsString::from_vec(vec![0xff])), OsString::from_vec(vec![0xff])),
+        ];
+        let clis = [
+            (None, None),
+            (Some(Path::new("/srv/project/claude")), Some("/srv/project/claude")),
+        ];
+        let account = crate::account::ClaudeAccount::resolve_from("example-account", |key| {
+            (key == "HOME").then(|| "/srv/project".to_string())
+        })
+        .unwrap();
+        let socket = crate::socket_path::in_dir(Path::new("/srv/project"), "socket").unwrap();
+        for (has_account, keep, entries) in cases {
+            for (timeout, expected_timeout) in &timeouts {
+                for (cli, expected_cli) in clis {
+                    let mut expected: BTreeSet<(OsString, Option<OsString>)> = entries
+                        .iter()
+                        .map(|(key, value)| ((*key).into(), value.map(OsString::from)))
+                        .collect();
+                    expected.insert(("BASH_MAX_TIMEOUT_MS".into(), Some(expected_timeout.clone())));
+                    if let Some(cli) = expected_cli {
+                        expected.insert(("VERDANDI_CLAUDE_CLI_PATH".into(), Some(cli.into())));
+                    }
+                    if policy_only {
+                        expected.remove(&(
+                            "VERDANDI_CLAUDE_SIDECAR_SOCKET".into(),
+                            Some("/srv/project/socket".into()),
+                        ));
+                        let expected_policy = SidecarEnv {
+                            set: expected
+                                .iter()
+                                .filter_map(|(key, value)| value.as_ref().map(|value| (key.clone(), value.clone())))
+                                .collect(),
+                            remove: expected
+                                .iter()
+                                .filter(|(_, value)| value.is_none())
+                                .map(|(key, _)| key.clone())
+                                .collect(),
+                        };
+                        let inherited = |key: &str| (key == "BASH_MAX_TIMEOUT_MS").then(|| timeout.clone()).flatten();
+                        let mut policy =
+                            sidecar_env_policy(&inherited, has_account.then_some("example-account"), keep, cli);
+                        policy.set.sort();
+                        policy.remove.sort();
+                        assert_eq!(
+                            policy, expected_policy,
+                            "account={has_account}, keep={keep}, timeout={timeout:?}, cli={cli:?}"
+                        );
+                        continue;
+                    }
+                    let actual = sidecar_command_for(
+                        Path::new("/srv/project/sidecar"),
+                        &[],
+                        &socket,
+                        has_account.then_some(&account),
+                        keep,
+                        timeout.as_deref(),
+                        cli,
+                    )
+                    .get_envs()
+                    .map(|(key, value)| (key.to_os_string(), value.map(OsStr::to_os_string)))
+                    .collect();
+                    assert_eq!(
+                        expected, actual,
+                        "account={has_account}, keep={keep}, timeout={timeout:?}, cli={cli:?}"
+                    );
+                }
+            }
+        }
     }
 }
 
@@ -1681,14 +1902,19 @@ fn spawn_resolved(
             account.config_dir().display()
         );
     }
-    let mut command = sidecar_command(program_path, program_args, &socket_path, account);
     // A window started from a launcher can lack the `PATH` entry its person's `claude` is on; the lookup then looks
     // where Claude Code's installers put it, and the sidecar is given what it found (`cli_locate`).
     let located = super::cli_locate::locate_claude_here();
     for line in super::cli_locate::located_log_lines(&located) {
         eprintln!("agent: {line}");
     }
-    hand_over_cli(&mut command, super::cli_locate::sidecar_cli_path(&located));
+    let mut command = sidecar_command(
+        program_path,
+        program_args,
+        &socket_path,
+        account,
+        super::cli_locate::sidecar_cli_path(&located),
+    );
     let claude_refused = super::cli_locate::claude_problem(&located) == Some(super::cli_locate::ClaudeProblem::Refused);
 
     let mut child = command.spawn()?;
@@ -1906,19 +2132,7 @@ impl Drop for SpawnedSidecar {
     /// Only by the sidecar's holder. A process that handed the sidecar on, or took it over and never
     /// committed, closes its copies of the descriptors as the fields drop, and ends nothing.
     fn drop(&mut self) {
-        if !self.holds {
-            return;
-        }
-        drop(self.stdin_keepalive.take()); // closes the write end -> sidecar sees stdin EOF
-        match &mut self.process {
-            SidecarProcess::Spawned(child) => {
-                let _ = stop_child(child, SIDECAR_EXIT_GRACE);
-            }
-            #[cfg(target_os = "linux")]
-            SidecarProcess::Adopted(pidfd) => end_adopted(pidfd, SIDECAR_EXIT_GRACE),
-        }
-        // The directory outlives windows, so a killed sidecar's file would otherwise pile up in it.
-        let _ = std::fs::remove_file(&self.socket_path);
+        let _ = self.stop();
     }
 }
 
@@ -2584,14 +2798,20 @@ mod tests {
                 .find(|(k, _)| *k == OsStr::new("VERDANDI_CLAUDE_CLI_PATH"))
                 .map(|(_, v)| v.map(|v| v.to_os_string()))
         };
-        let mut command = sidecar_command_for(program, &[], &socket, None, false, None);
-        hand_over_cli(&mut command, Some(Path::new("/home/u/.local/bin/claude")));
+        let command = sidecar_command_for(
+            program,
+            &[],
+            &socket,
+            None,
+            false,
+            None,
+            Some(Path::new("/home/u/.local/bin/claude")),
+        );
         assert_eq!(
             cli_path_of(&command),
             Some(Some(std::ffi::OsString::from("/home/u/.local/bin/claude")))
         );
-        let mut command = sidecar_command_for(program, &[], &socket, None, false, None);
-        hand_over_cli(&mut command, None);
+        let command = sidecar_command_for(program, &[], &socket, None, false, None, None);
         assert_eq!(cli_path_of(&command), None);
         // What the lookup hands over for each answer: only an install place.
         use super::super::cli_locate::{sidecar_cli_path, ClaudeCli};
@@ -2623,6 +2843,7 @@ mod tests {
             &[],
             &socket,
             Some(&account),
+            None,
         );
         let env: Vec<(String, Option<String>)> = command
             .get_envs()
@@ -2668,6 +2889,7 @@ mod tests {
                 None,
                 keep_test_seams,
                 None,
+                None,
             );
             let env: Vec<_> = command.get_envs().collect();
             assert!(env.contains(&(OsStr::new("CLAUDE_CODE_AUTO_CONNECT_IDE"), Some(OsStr::new("false")))));
@@ -2683,6 +2905,7 @@ mod tests {
                 Path::new("/never/bound"),
                 None,
                 keep_test_seams,
+                None,
                 None,
             );
             assert!(command
@@ -2700,6 +2923,7 @@ mod tests {
                 Path::new("/never/bound"),
                 None,
                 keep_test_seams,
+                None,
                 None,
             );
             let env: Vec<_> = command.get_envs().collect();
@@ -2720,6 +2944,7 @@ mod tests {
                 None,
                 false,
                 Some(value),
+                None,
             );
             let env: Vec<_> = command.get_envs().collect();
             assert!(env.contains(&(OsStr::new("BASH_MAX_TIMEOUT_MS"), Some(value))));
@@ -2741,6 +2966,7 @@ mod tests {
                 &[],
                 &socket,
                 account,
+                None,
             );
             let removed: Vec<_> = command
                 .get_envs()
@@ -2758,7 +2984,7 @@ mod tests {
         let socket = crate::socket_path::sidecar_socket(Path::new("/tmp"), "watch-test").unwrap();
         let program = Path::new("/usr/lib/eitri/verdandi-claude-sidecar");
         for keep in [false, true] {
-            let command = sidecar_command_for(program, &[], &socket, None, keep, None);
+            let command = sidecar_command_for(program, &[], &socket, None, keep, None, None);
             let removed: Vec<_> = command
                 .get_envs()
                 .filter(|(k, _)| k.to_string_lossy() == PARENT_WATCH_VAR)
@@ -2776,7 +3002,7 @@ mod tests {
         let socket = crate::socket_path::sidecar_socket(Path::new("/tmp"), "seam-test").unwrap();
         let program = Path::new("/usr/lib/eitri/verdandi-claude-sidecar");
         let removed = |keep: bool| -> Vec<String> {
-            sidecar_command_for(program, &[], &socket, None, keep, None)
+            sidecar_command_for(program, &[], &socket, None, keep, None, None)
                 .get_envs()
                 .filter(|(_, v)| v.is_none())
                 .map(|(k, _)| k.to_string_lossy().into_owned())
@@ -2813,6 +3039,7 @@ mod tests {
             &socket,
             None,
             false,
+            None,
             None,
         );
         let keys: Vec<String> = command
@@ -3994,6 +4221,7 @@ mod tests {
             Path::new("/never/bound"),
             None,
             false,
+            None,
             None,
         );
         let mut child = command.spawn().unwrap();

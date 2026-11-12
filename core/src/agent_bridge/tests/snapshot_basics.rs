@@ -30,6 +30,9 @@ fn serialize_snapshot_for_js_produces_camel_case_matching_the_ts_shape() {
     });
 
     let provider = agent::ProviderInfo {
+        host: None,
+        account_name: None,
+        account_config_dir: None,
         sidecar_version: "0.1.0".into(),
         claude_agent_sdk_version: "0.3.0".into(),
         actual_claude_code_version: "2.1.269".into(),

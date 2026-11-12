@@ -509,6 +509,12 @@ pub struct ProviderCapabilities {
 /// struct, with a real wire source behind it.
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ProviderInfo {
+    #[serde(default)]
+    pub host: Option<String>,
+    #[serde(default)]
+    pub account_name: Option<String>,
+    #[serde(default)]
+    pub account_config_dir: Option<std::path::PathBuf>,
     pub sidecar_version: String,
     pub claude_agent_sdk_version: String,
     /// The Claude Code CLI version the provider is actually running against.
@@ -661,7 +667,19 @@ impl std::fmt::Display for ProviderError {
 
 impl std::error::Error for ProviderError {}
 
+/// The connection to a remote provider, independently of the session's own state.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RemoteLinkState {
+    Live,
+    Disconnected { since_unix_ms: u64 },
+    Reconnecting { attempt: u32, next_in_ms: u64 },
+    CatchingUp { done: u64, total: u64 },
+}
+
 pub trait AgentProvider {
+    fn link_state(&self) -> Option<RemoteLinkState> {
+        None
+    }
     fn capabilities(&self) -> ProviderCapabilities;
     /// Descriptive facts for display and diagnostics -- never a substitute for `capabilities()`
     /// when deciding whether a command may be sent.

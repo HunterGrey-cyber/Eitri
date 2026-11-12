@@ -1,17 +1,19 @@
 //! A stand-in for Verdandi's Claude sidecar, for the tests of handing a sidecar from one process to
 //! another. It speaks the sidecar's gRPC service on the socket `VERDANDI_CLAUDE_SIDECAR_SOCKET` names,
 //! with what those tests rest on and nothing more:
-//! - every session keeps a ring of all its events, numbered from 1, and a watch replays the ring
+//! - every session keeps a ring of its events, numbered from 1, and a watch replays the ring
 //!   after the sequence it asks for, then follows live; any number of watchers per session;
+//!   a future cursor is always refused with `INVALID_CONFIGURATION`, even with an unbounded ring;
 //! - a permission is answered from any connection;
-//! - the process ends on its stdin's end of file, and through nothing else (unless a turn told it to
-//!   ignore that end, so a holder has to kill it).
+//! - the process ends on stdin's end of file unless parent watching is disabled or a turn told it
+//!   to ignore that end, so a holder has to kill it.
 //!
 //! A turn's text is a script of steps separated by `;`:
 //! - `text <message id> <words>`: a text delta of that message;
 //! - `sleep <ms>`;
 //! - `gate <directory>`: publish `ready`, wait for `release`, then remove the directory;
 //! - `ask <permission id>`: a permission request; the rest of the script runs once it is answered;
+//! - `ask-then-end <permission id>`: request permission and end the turn with the request unresolved;
 //! - `ask-unknown <permission id>`: the same, with a `PermissionOrigin` no client knows;
 //! - `unknown-event`: a session event whose only arm is a field no client knows;
 //! - `drop-watches`: every open watch stream of the session ends (the clients reconnect);
@@ -56,7 +58,17 @@
 //! - `EITRI_STANDIN_STALL_HANDSHAKE`: `Handshake` never answers, and nothing is printed to stderr;
 //! - `EITRI_STANDIN_REFUSE_BIND`: this text goes to stderr and the process exits 1 before it binds, as
 //!   a sidecar refusing a CLI does;
-//! - `EITRI_STANDIN_NEVER_BIND`: the process stays up, silent, and never binds.
+//! - `EITRI_STANDIN_NEVER_BIND`: the process stays up, silent, and never binds;
+//! - `VERDANDI_CLAUDE_SIDECAR_PARENT_WATCH`: trimmed; unset, blank or `stdin` watches stdin's EOF;
+//!   `none` never reads stdin; any other value refuses startup;
+//! - `EITRI_STANDIN_RECORD_CREATE=<absolute file>`: the same length-prefixed prost records as
+//!   `--record-create <file>` (the flag takes precedence when both are supplied);
+//! - `EITRI_STANDIN_RECORD_ENV=<absolute file>`: atomically publish a private snapshot of the whole
+//!   environment at startup, including these knobs, as NUL-separated `name=value` entries with their original bytes;
+//! - `EITRI_STANDIN_STDERR_FLOOD=<bytes>`: after binding, write this many bytes in 64 KiB chunks a few
+//!   milliseconds apart on a separate thread; write errors do not stop the process;
+//! - `EITRI_STANDIN_RING=<n>`: retain only the newest `n` events per session (unset is unbounded),
+//!   refusing evicted cursors with `EVENT_GAP`.
 
 use claude_runtime_protocol::v1::client_tool_content::Kind as ContentKind;
 use claude_runtime_protocol::v1::session_event::Event;
@@ -73,7 +85,7 @@ use claude_runtime_protocol::v1::{
 use prost::bytes::{Buf, BufMut};
 use prost::encoding::{DecodeContext, WireType};
 use prost::Message as _;
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::future::Future;
 use std::io::{Read, Write};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -172,7 +184,8 @@ impl Scripted {
 #[derive(Default)]
 struct Session {
     closed: bool,
-    ring: Vec<SessionEvent>,
+    ring: VecDeque<SessionEvent>,
+    latest_sequence: u64,
     watchers: Vec<Watcher>,
     /// The rest of a script, by the permission it waits on, with its turn.
     waiting: HashMap<String, (String, Vec<String>)>,
@@ -199,6 +212,7 @@ struct Shared {
     /// While true, `AnswerClientToolCall` replies wait.
     holding_answers: tokio::sync::watch::Sender<bool>,
     scripted: Scripted,
+    ring_capacity: Option<usize>,
 }
 
 static IGNORE_EOF: AtomicBool = AtomicBool::new(false);
@@ -225,12 +239,18 @@ impl Shared {
             .unwrap_or(0);
         let event = SessionEvent {
             session_id: session_id.to_string(),
-            sequence: session.ring.len() as u64 + 1,
+            sequence: session.latest_sequence + 1,
             occurred_at,
             turn_id: turn_id.map(str::to_string),
             event,
         };
-        session.ring.push(event.clone());
+        session.latest_sequence = event.sequence;
+        session.ring.push_back(event.clone());
+        if let Some(capacity) = self.ring_capacity {
+            while session.ring.len() > capacity {
+                session.ring.pop_front();
+            }
+        }
         session
             .watchers
             .retain(|watcher| watcher.send(Ok(self.on_the_wire(event.clone()))).is_ok());
@@ -394,10 +414,13 @@ fn run(shared: Arc<Shared>, session_id: String, mut turn_id: String, mut steps: 
                     let ms = words.next().and_then(|ms| ms.parse().ok()).unwrap_or(0);
                     tokio::time::sleep(Duration::from_millis(ms)).await;
                 }
-                Some(step @ ("ask" | "ask-unknown")) => {
+                Some(step @ ("ask" | "ask-unknown" | "ask-then-end")) => {
                     let permission_id = words.next().unwrap_or("p").to_string();
                     if let Some(session) = shared.sessions.lock().unwrap().get_mut(&session_id) {
-                        let rest = std::mem::take(&mut steps);
+                        let mut rest = std::mem::take(&mut steps);
+                        if step == "ask-then-end" {
+                            rest.clear();
+                        }
                         session.waiting.insert(permission_id.clone(), (turn_id.clone(), rest));
                     }
                     shared.emit(
@@ -412,7 +435,11 @@ fn run(shared: Arc<Shared>, session_id: String, mut turn_id: String, mut steps: 
                             ..Default::default()
                         }),
                     );
-                    return;
+                    if step == "ask-then-end" {
+                        steps.push("end".to_string());
+                    } else {
+                        return;
+                    }
                 }
                 Some("client-call") => {
                     let call_id = words.next().unwrap_or("c").to_string();
@@ -803,7 +830,7 @@ impl Service<http::Request<Body>> for StandIn {
                             .get(&request.session_id)
                             .ok_or_else(|| refusal(tonic::Code::NotFound, ErrorCode::SessionNotFound, ""))?;
                         Ok(GetClientToolCallStateResponse {
-                            through_sequence: session.ring.len() as u64,
+                            through_sequence: session.latest_sequence,
                             open: session.open_calls.clone(),
                         })
                     })
@@ -839,6 +866,22 @@ impl Service<http::Request<Body>> for StandIn {
                             let Some(session) = sessions.get_mut(&request.session_id) else {
                                 return Err(Status::not_found("no such session"));
                             };
+                            if request.after_sequence.is_some() {
+                                if after > session.latest_sequence {
+                                    return Err(refusal(
+                                        tonic::Code::InvalidArgument,
+                                        ErrorCode::InvalidConfiguration,
+                                        "replay_cursor_in_future",
+                                    ));
+                                }
+                                let oldest = session
+                                    .ring
+                                    .front()
+                                    .map_or(session.latest_sequence.saturating_add(1), |event| event.sequence);
+                                if after < oldest.saturating_sub(1) {
+                                    return Err(refusal(tonic::Code::OutOfRange, ErrorCode::EventGap, ""));
+                                }
+                            }
                             for event in session.ring.iter().filter(|event| event.sequence > after) {
                                 let _ = tx.send(Ok(shared.on_the_wire(event.clone())));
                             }
@@ -860,14 +903,46 @@ impl Service<http::Request<Body>> for StandIn {
 }
 
 fn main() {
+    let parent_watch = std::env::var_os("VERDANDI_CLAUDE_SIDECAR_PARENT_WATCH").unwrap_or_default();
+    let parent_watch = parent_watch.to_string_lossy();
+    // JavaScript's trim includes the byte-order mark and excludes the Unicode next-line character.
+    let value = parent_watch.trim_matches(|c: char| (c.is_whitespace() && c != '\u{0085}') || c == '\u{feff}');
+    let watch_stdin = match value {
+        "" | "stdin" => true,
+        "none" => false,
+        _ => {
+            eprintln!(
+                "VERDANDI_CLAUDE_SIDECAR_PARENT_WATCH: expected \"stdin\" or \"none\", got {}",
+                serde_json::to_string(parent_watch.as_ref()).unwrap()
+            );
+            std::process::exit(1);
+        }
+    };
+    if let Some(path) = std::env::var_os("EITRI_STANDIN_RECORD_ENV") {
+        let path = std::path::PathBuf::from(path);
+        assert!(path.is_absolute(), "record file must be absolute");
+        let mut bytes = Vec::new();
+        for (name, value) in std::env::vars_os() {
+            bytes.extend_from_slice(name.as_encoded_bytes());
+            bytes.push(b'=');
+            bytes.extend_from_slice(value.as_encoded_bytes());
+            bytes.push(0);
+        }
+        let directory = agent::private_fs::open_dir(path.parent().unwrap()).unwrap();
+        agent::private_fs::publish_private_file(&directory, path.file_name().unwrap(), &bytes).unwrap();
+    }
     let mut shared = Shared {
         scripted: Scripted::from_environment(),
+        ring_capacity: std::env::var("EITRI_STANDIN_RING")
+            .ok()
+            .map(|n| n.parse().expect("a ring capacity")),
         ..Shared::default()
     };
     if let Some(words) = std::env::var_os("EITRI_STANDIN_REFUSE_BIND") {
         std::io::stderr().write_all(words.as_encoded_bytes()).unwrap();
         std::process::exit(1);
     }
+    let mut record_create = std::env::var_os("EITRI_STANDIN_RECORD_CREATE");
     let mut args = std::env::args_os().skip(1);
     while let Some(arg) = args.next() {
         match arg.to_str() {
@@ -889,31 +964,35 @@ fn main() {
                 *shared.record_sends.get_mut().unwrap() = Some(agent::private_fs::open_private(&path).unwrap());
             }
             Some("--record-create") => {
-                let path = std::path::PathBuf::from(args.next().expect("record file"));
-                assert!(path.is_absolute(), "record file must be absolute");
-                *shared.record_create.get_mut().unwrap() = Some(agent::private_fs::open_private(&path).unwrap());
+                record_create = Some(args.next().expect("record file"));
             }
             _ => panic!("unknown stand-in argument: {arg:?}"),
         }
     }
+    if let Some(path) = record_create {
+        let path = std::path::PathBuf::from(path);
+        assert!(path.is_absolute(), "record file must be absolute");
+        *shared.record_create.get_mut().unwrap() = Some(agent::private_fs::open_private(&path).unwrap());
+    }
     let socket = std::env::var_os("VERDANDI_CLAUDE_SIDECAR_SOCKET").expect("the socket to serve on");
-    // Ends on stdin's end of file, as the real sidecar does.
-    std::thread::spawn(|| {
-        let mut stdin = std::io::stdin();
-        let mut buf = [0u8; 256];
-        loop {
-            match stdin.read(&mut buf) {
-                Ok(0) | Err(_) => break,
-                Ok(_) => {}
+    if watch_stdin {
+        std::thread::spawn(|| {
+            let mut stdin = std::io::stdin();
+            let mut buf = [0u8; 256];
+            loop {
+                match stdin.read(&mut buf) {
+                    Ok(0) | Err(_) => break,
+                    Ok(_) => {}
+                }
             }
-        }
-        loop {
-            if !IGNORE_EOF.load(Ordering::SeqCst) {
-                std::process::exit(0);
+            loop {
+                if !IGNORE_EOF.load(Ordering::SeqCst) {
+                    std::process::exit(0);
+                }
+                std::thread::sleep(Duration::from_millis(50));
             }
-            std::thread::sleep(Duration::from_millis(50));
-        }
-    });
+        });
+    }
     if std::env::var_os("EITRI_STANDIN_NEVER_BIND").is_some() {
         loop {
             std::thread::park();
@@ -932,6 +1011,19 @@ fn main() {
         // A line in progress on each stream, finished only at the end of the process's life.
         print!("stand-in stdout line in progress");
         let _ = std::io::stdout().flush();
+        if let Ok(bytes) = std::env::var("EITRI_STANDIN_STDERR_FLOOD") {
+            let mut remaining: usize = bytes.parse().expect("a byte count");
+            std::thread::spawn(move || {
+                let chunk = [b'x'; 64 * 1024];
+                let mut stderr = std::io::stderr();
+                while remaining > 0 {
+                    let count = remaining.min(chunk.len());
+                    let _ = stderr.write_all(&chunk[..count]);
+                    remaining -= count;
+                    std::thread::sleep(Duration::from_millis(3));
+                }
+            });
+        }
         tonic::transport::Server::builder()
             .add_service(StandIn {
                 shared: Arc::new(shared),

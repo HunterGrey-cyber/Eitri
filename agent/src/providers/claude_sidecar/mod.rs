@@ -16,6 +16,7 @@ mod steer;
 mod system_prompt;
 mod translate;
 pub(crate) mod translate_322;
+mod transport;
 mod watch;
 
 /// Real, billed A/B runs proving that protocol 3's two narrowing fields do what they say at
@@ -24,8 +25,8 @@ mod watch;
 mod runtime_policy_verification;
 
 pub use cli_locate::{
-    claude_cli_missing_here, claude_problem_here, failure_names_missing_cli, locate_claude_here, ClaudeCli,
-    ClaudeProblem, CLAUDE_INSTALL_URL, CLAUDE_LOOKED_IN, CLAUDE_REFUSED_NOTE, CLI_MISSING_FAILURE_MARKER,
+    claude_cli_missing_here, claude_problem_here, failure_names_missing_cli, locate_claude_here, locate_claude_in,
+    ClaudeCli, ClaudeProblem, CLAUDE_INSTALL_URL, CLAUDE_LOOKED_IN, CLAUDE_REFUSED_NOTE, CLI_MISSING_FAILURE_MARKER,
 };
 pub use contract::{
     missing_required, SidecarVersion, BUNDLED_SIDECAR_VERSION, REFUSED_CLAUDE_NOTE, REQUIRED_CAPABILITIES,
@@ -36,8 +37,8 @@ pub use moving::{ClaudeProviderHandoff, MoveRefusedWhy};
 #[cfg(target_os = "linux")]
 pub use spawn::SidecarFds;
 pub use spawn::{
-    sidecar_availability, sidecar_missing_message, sidecar_origin, user_sidecar_path, SidecarAvailability,
-    BUNDLED_SIDECAR_REVISION, NO_SIDECAR_HINT, SIDECAR_EXIT_GRACE,
+    sidecar_availability, sidecar_env_policy, sidecar_missing_message, sidecar_origin, user_sidecar_path,
+    SidecarAvailability, SidecarEnv, BUNDLED_SIDECAR_REVISION, NO_SIDECAR_HINT, SIDECAR_EXIT_GRACE,
 };
 
 use crate::provider::{
@@ -60,15 +61,13 @@ use claude_runtime_protocol::v1::{
     SettingSource, SettingSourceSelection, SteerTurnRequest as ProtoSteerTurnRequest, StreamingMode,
     SystemPromptPreset, ToolPolicy, WatchSessionEventsRequest,
 };
-use hyper_util::rt::TokioIo;
 use spawn::{SpawnedSidecar, UpdateChoice, UpdateTrouble};
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use system_prompt::EITRI_APPEND;
-use tokio::net::UnixStream;
-use tonic::transport::{Channel, Endpoint, Uri};
-use tower::service_fn;
+use transport::{local::LocalChild, CallMetadata, RuntimeClient, SidecarTransport};
+pub use transport::{HelperHandoff, Liveness, TransportKind};
 
 pub const UNARY_RPC_TIMEOUT: Duration = Duration::from_secs(10);
 /// `SetModel` on an id the CLI does not list waits for the API request the CLI checks it with.
@@ -242,6 +241,9 @@ fn info_from_handshake(
     startup_diagnostics: Vec<String>,
 ) -> ProviderInfo {
     ProviderInfo {
+        host: None,
+        account_name: None,
+        account_config_dir: None,
         sidecar_version: response.sidecar_version.clone(),
         claude_agent_sdk_version: response.claude_agent_sdk_version.clone(),
         actual_claude_code_version: response.actual_claude_code_version.clone(),
@@ -376,16 +378,16 @@ pub fn probe(path: &std::path::Path) -> Result<ProbeReport, String> {
     })
 }
 
-// `RuntimeServiceClient<Channel>` is already cheaply `Clone` (tonic's generated clients wrap a
+// `RuntimeClient` is already cheaply `Clone` (tonic's generated clients wrap a
 // `Channel`, designed for exactly this "clone one per concurrent call" pattern -- cloning shares
 // the same underlying HTTP/2 connection). No `Mutex` is needed to clone it from `&self`; a `Mutex`
 // here would be protecting nothing (`.clone()` never needs exclusive access).
 pub struct ClaudeSidecarProvider {
     /// Behind a lock because a move hands it on (or takes it up) while the provider is shared with
     /// its conversation's ingest thread.
-    sidecar: Mutex<SpawnedSidecar>,
+    transport: Mutex<Box<dyn SidecarTransport>>,
     runtime: RuntimeThread,
-    client: RuntimeServiceClient<Channel>,
+    client: RuntimeClient,
     events: Arc<EventQueue>,
     backpressure: Arc<BackpressureCounters>,
     /// Captured once at `connect()` from the real `HandshakeResponse`, which this provider used to
@@ -516,7 +518,7 @@ impl WatchState {
 
 /// What a handshake tells a provider about its sidecar.
 struct Handshaken {
-    client: RuntimeServiceClient<Channel>,
+    client: RuntimeClient,
     capabilities: ProviderCapabilities,
     info: ProviderInfo,
     splits_messages: bool,
@@ -531,39 +533,12 @@ struct Handshaken {
 /// sidecar commands named in the startup notes exist next to it.
 fn handshake_with(
     runtime: &RuntimeThread,
-    sidecar: &SpawnedSidecar,
+    transport: &dyn SidecarTransport,
     expected_pid: Option<u32>,
     exe_dir: Option<&std::path::Path>,
 ) -> std::io::Result<Handshaken> {
-    let socket_path = sidecar.socket_path.clone();
-    let client = runtime
-        .block_on(
-            async move {
-                let channel = Endpoint::try_from("http://[::]:50051")?
-                    .connect_with_connector(service_fn(move |_: Uri| {
-                        let socket_path = socket_path.clone();
-                        async move {
-                            let stream = UnixStream::connect(socket_path).await?;
-                            let peer = stream.peer_cred()?;
-                            crate::socket_path::require_own_peer(peer.uid())?;
-                            if let Some(expected) = expected_pid {
-                                if peer.pid().map(|pid| pid as u32) != Some(expected) {
-                                    return Err(std::io::Error::new(
-                                        std::io::ErrorKind::PermissionDenied,
-                                        "the sidecar socket is served by another process than the one handed over",
-                                    ));
-                                }
-                            }
-                            Ok::<_, std::io::Error>(TokioIo::new(stream))
-                        }
-                    }))
-                    .await?;
-                Ok::<_, tonic::transport::Error>(RuntimeServiceClient::new(channel))
-            },
-            UNARY_RPC_TIMEOUT,
-        )
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::TimedOut, e.to_string()))?
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::ConnectionRefused, e.to_string()))?;
+    let channel = transport.channel(runtime, expected_pid)?;
+    let client = RuntimeServiceClient::with_interceptor(channel, CallMetadata::new(transport.call_metadata())?);
     let handshake = runtime
         .block_on(
             {
@@ -636,18 +611,18 @@ fn handshake_with(
     // Warnings only. The checkout DESCRIPTION is always present and travels separately as
     // `build_description`; mixing it in here made `startup_diagnostics` never empty, which lit
     // a permanent warning indicator in the UI for every healthy session.
-    let mut diagnostics = sidecar.build_warnings.clone();
+    let mut diagnostics = transport.build_warnings();
     if !claude_code_prompt {
         diagnostics.push(format!(
             "Claude Code's system prompt unavailable: this sidecar does not offer system_prompt_preset, so Claude runs with the Agent SDK's minimal prompt. Build the sidecar for Verdandi {BUNDLED_SIDECAR_REVISION}."
         ));
     }
-    let stderr = sidecar.stderr_tail();
+    let stderr = transport.stderr_tail();
     diagnostics.extend(startup_diagnostics_from_stderr(&stderr));
     if untested_note_applies(&stderr, exe_dir) {
         diagnostics.push(UNTESTED_CLAUDE_NOTE.to_string());
     }
-    let info = info_from_handshake(&handshake, Some(sidecar.build_description.clone()), diagnostics);
+    let info = info_from_handshake(&handshake, Some(transport.build_description()), diagnostics);
     for diagnostic in &info.startup_diagnostics {
         eprintln!("agent: ClaudeSidecarProvider: {diagnostic}");
     }
@@ -715,8 +690,10 @@ impl ClaudeSidecarProvider {
             version: version.to_string(),
             reason: spawn::quotable(reason),
         };
-        let sidecar = spawn::spawn_program(instance_id, path)
-            .map_err(|error| did_not_start(spawn::start_failure_reason(&error)))?;
+        let sidecar = LocalChild::new(
+            spawn::spawn_program(instance_id, path)
+                .map_err(|error| did_not_start(spawn::start_failure_reason(&error)))?,
+        );
         let runtime = RuntimeThread::spawn();
         let mut handshaken =
             handshake_with(&runtime, &sidecar, None, spawn::running_exe_dir().as_deref()).map_err(|error| {
@@ -797,6 +774,7 @@ impl ClaudeSidecarProvider {
     }
 
     fn around_in(sidecar: SpawnedSidecar, exe_dir: Option<&std::path::Path>) -> std::io::Result<Self> {
+        let sidecar = LocalChild::new(sidecar);
         let runtime = RuntimeThread::spawn();
         let handshaken = handshake_with(&runtime, &sidecar, None, exe_dir).map_err(|error| {
             let stderr = sidecar.stderr_tail();
@@ -812,7 +790,7 @@ impl ClaudeSidecarProvider {
         Ok(Self::holding(sidecar, runtime, handshaken))
     }
 
-    fn holding(sidecar: SpawnedSidecar, runtime: RuntimeThread, handshaken: Handshaken) -> Self {
+    fn holding(sidecar: LocalChild, runtime: RuntimeThread, handshaken: Handshaken) -> Self {
         let Handshaken {
             client,
             capabilities,
@@ -823,7 +801,7 @@ impl ClaudeSidecarProvider {
             max_message_bytes,
         } = handshaken;
         Self {
-            sidecar: Mutex::new(sidecar),
+            transport: Mutex::new(Box::new(sidecar)),
             runtime,
             client,
             events: Arc::new(EventQueue::default()),
@@ -914,7 +892,7 @@ impl ClaudeSidecarProvider {
     /// The sidecar process's recent stderr, for diagnosing a provider that connected but is
     /// misbehaving. `info().startup_diagnostics` is the curated subset worth showing a user.
     pub fn sidecar_stderr_tail(&self) -> Vec<String> {
-        lock(&self.sidecar).stderr_tail()
+        lock(&self.transport).stderr_tail()
     }
 
     /// The unix socket the sidecar serves on, for a test that opens a watch of its own beside the provider's.
@@ -922,7 +900,7 @@ impl ClaudeSidecarProvider {
     #[cfg(feature = "test-support")]
     #[doc(hidden)]
     pub fn sidecar_socket_path(&self) -> std::path::PathBuf {
-        lock(&self.sidecar).socket_path.clone()
+        lock(&self.transport).socket_path()
     }
 
     /// What this provider's watch was told about its sessions, which decides how their wire events translate:
@@ -943,7 +921,7 @@ impl ClaudeSidecarProvider {
     /// developer machine are themselves processes named `claude`, so a name-matched search sweeps up
     /// the session running the test. Capture this pid, check this pid.
     pub fn sidecar_pid(&self) -> u32 {
-        lock(&self.sidecar).pid()
+        lock(&self.transport).pid()
     }
 
     fn map_status(&self, status: tonic::Status) -> ProviderError {
@@ -1208,10 +1186,7 @@ where
 /// The sidecar's list of questions still waiting, after a re-opened watch. The replay itself carries
 /// every ask and settlement the break hid, so a failed read loses nothing; it is logged and the watch
 /// goes on.
-async fn read_interaction_state(
-    client: &RuntimeServiceClient<Channel>,
-    session_id: &str,
-) -> Option<crate::InteractionState> {
+async fn read_interaction_state(client: &RuntimeClient, session_id: &str) -> Option<crate::InteractionState> {
     let request = claude_runtime_protocol::v1::GetInteractionStateRequest {
         session_id: session_id.to_string(),
     };
@@ -1303,6 +1278,14 @@ fn map_status(status: tonic::Status) -> ProviderError {
         },
         None => ProviderError::Transport(status.message().to_string()),
     }
+}
+
+/// Runs the live watch's refusal parser and reports whether it ends the session instead of retrying.
+#[cfg(feature = "test-support")]
+pub fn classify_watch_open_for_test(status: tonic::Status) -> (ProviderError, bool) {
+    let error = map_status(status);
+    let fatal = matches!(watch::classify_open_failure(&error), watch::OpenFailure::Fatal(_));
+    (error, fatal)
 }
 
 /// The sidecar's own error, when the status carries one (see `map_status` for where it travels).
@@ -2846,7 +2829,7 @@ impl Drop for Answering {
 }
 
 async fn send_steers(
-    client: RuntimeServiceClient<Channel>,
+    client: RuntimeClient,
     events: Arc<EventQueue>,
     first: (String, ProtoSteerTurnRequest),
     _steering: Steering,
@@ -3219,6 +3202,158 @@ pub fn replay_frames(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "linux")]
+    struct ChildGuard(std::process::Child);
+
+    #[cfg(target_os = "linux")]
+    impl Drop for ChildGuard {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    #[test]
+    fn provider_info_has_no_host_for_a_local_tab() {
+        let info = info_from_handshake(&real_handshake_today(), Some("local sidecar".into()), Vec::new());
+        assert_eq!(info.host, None);
+        assert_eq!(info.account_name, None);
+        assert_eq!(info.account_config_dir, None);
+        let mut old = serde_json::to_value(&info).unwrap();
+        for key in ["host", "account_name", "account_config_dir"] {
+            old.as_object_mut().unwrap().remove(key);
+        }
+        assert_eq!(serde_json::from_value::<ProviderInfo>(old).unwrap(), info);
+
+        use tonic::service::Interceptor;
+        let mut metadata = CallMetadata::new(vec![("eitri-sidecar", "example-sidecar".into())]).unwrap();
+        let request = metadata.call(tonic::Request::new(())).unwrap();
+        assert_eq!(request.metadata().get("eitri-sidecar").unwrap(), "example-sidecar");
+    }
+
+    #[cfg(target_os = "linux")]
+    fn local_handoff(socket_path: std::path::PathBuf, pid: u32) -> (ClaudeProviderHandoff, SidecarFds) {
+        let descriptor = || std::fs::File::open("/dev/null").unwrap().into();
+        (
+            ClaudeProviderHandoff {
+                transport: TransportKind::Local,
+                provider_session_id: "example-session".into(),
+                socket_path,
+                child: crate::child::ChildRecord {
+                    pid,
+                    start: crate::child::start_time(pid).unwrap(),
+                    kind: crate::child::ChildKind::Sidecar,
+                },
+                folded_through: 0,
+                last_text: None,
+                last_child_replies: Vec::new(),
+                cli_mode_noted: false,
+                steers_given_up: Vec::new(),
+                stdout_partial: Vec::new(),
+                stderr_partial: Vec::new(),
+                stderr_tail: Vec::new(),
+                build_description: "local sidecar".into(),
+                build_warnings: Vec::new(),
+            },
+            SidecarFds {
+                stdin: descriptor(),
+                stdout: descriptor(),
+                stderr: descriptor(),
+            },
+        )
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn local_link_state_is_none() {
+        let child = ChildGuard(
+            std::process::Command::new("/bin/cat")
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::null())
+                .spawn()
+                .unwrap(),
+        );
+        let socket = crate::socket_path::in_dir(std::path::Path::new("/srv/project"), "socket").unwrap();
+        let (handoff, fds) = local_handoff(socket, child.0.id());
+        let local = LocalChild::adopt(&handoff, fds).unwrap();
+        assert!(local.call_metadata().is_empty());
+        assert_eq!(local.replay_floor(), None);
+        assert_eq!(local.liveness(), Liveness::Alive);
+        let runtime = RuntimeThread::spawn();
+        let channel = {
+            let _entered = runtime.handle().enter();
+            tonic::transport::Endpoint::from_static("http://[::]:50051").connect_lazy()
+        };
+        let response = real_handshake_today();
+        let handshaken = Handshaken {
+            client: RuntimeServiceClient::with_interceptor(channel, CallMetadata::new(local.call_metadata()).unwrap()),
+            capabilities: capabilities_from_handshake(&response),
+            info: info_from_handshake(&response, Some(local.build_description()), Vec::new()),
+            splits_messages: false,
+            provider_prompts: false,
+            claude_code_prompt: false,
+            max_message_bytes: 0,
+        };
+        let provider = ClaudeSidecarProvider::holding(local, runtime, handshaken);
+        assert_eq!(provider.link_state(), None);
+        assert_eq!(provider.info().host, None);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn local_transport_keeps_peer_and_pid_checks() {
+        use std::io::Read;
+        use std::process::{Command, Stdio};
+        let child = ChildGuard(
+            Command::new("/bin/cat")
+                .stdin(Stdio::piped())
+                .stdout(Stdio::null())
+                .spawn()
+                .unwrap(),
+        );
+        let directory = crate::test_tmp::TmpDir::new("nv", "sc");
+        let socket = crate::socket_path::in_dir(&directory, "s").unwrap();
+        let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        let (handoff, fds) = local_handoff(socket, child.0.id());
+        let mut old = serde_json::to_value(&handoff).unwrap();
+        old.as_object_mut().unwrap().remove("transport");
+        assert_eq!(serde_json::from_value::<ClaudeProviderHandoff>(old).unwrap(), handoff);
+
+        // The process record is valid, but this socket belongs to this test, not that child.
+        let error = match ClaudeSidecarProvider::adopt(handoff.clone(), fds) {
+            Ok(_) => panic!("accepted a socket served by a different process"),
+            Err(error) => error,
+        };
+        assert_eq!(error.kind(), std::io::ErrorKind::ConnectionRefused);
+        let (mut stream, _) = listener.accept().unwrap();
+        stream.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
+        assert_eq!(
+            stream.read(&mut [0; 1]).unwrap(),
+            0,
+            "sent bytes before checking the peer"
+        );
+        // SAFETY: geteuid has no preconditions and cannot fail.
+        let uid = unsafe { libc::geteuid() };
+        assert!(crate::socket_path::require_own_peer(uid).is_ok());
+        assert_eq!(
+            crate::socket_path::require_own_peer(uid ^ 1).unwrap_err().kind(),
+            std::io::ErrorKind::PermissionDenied
+        );
+
+        let (mut helper, fds) = local_handoff(handoff.socket_path, child.0.id());
+        helper.transport = TransportKind::Helper(HelperHandoff {
+            host: "example-host".into(),
+            host_key_sha256: "example-key".into(),
+            sidecar_id: "example-sidecar".into(),
+        });
+        let error = match ClaudeSidecarProvider::adopt(helper, fds) {
+            Ok(_) => panic!("accepted an unsupported helper handoff"),
+            Err(error) => error,
+        };
+        assert_eq!(error.kind(), std::io::ErrorKind::Unsupported);
+        assert_eq!(error.to_string(), "a helper handoff is not supported yet");
+    }
 
     #[test]
     fn permission_timeout_aborts_the_call_before_reporting_failure() {

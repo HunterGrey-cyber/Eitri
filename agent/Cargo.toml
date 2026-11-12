@@ -115,3 +115,7 @@ required-features = ["legacy-backend"]
 [[test]]
 name = "wire_translation"
 required-features = ["legacy-backend"]
+
+[[test]]
+name = "standin_seams"
+required-features = ["test-support"]

@@ -20,7 +20,8 @@
 //! 4. the giving side's [`ClaudeSidecarProvider::forget_for_move`] cancels its watch and closes its
 //!    copies, and ends nothing.
 
-use super::spawn::{HandedOutput, SidecarFds, SpawnedSidecar};
+use super::spawn::{HandedOutput, SidecarFds};
+use super::transport::{self, TransportHandoff, TransportKind};
 use super::{
     handshake_with, lock, requested_cli_mode, ClaudeSidecarProvider, EventQueue, Handshaken, ParkedWatch, WatchMark,
     WatchState,
@@ -40,6 +41,8 @@ const LIVE_MOVE: bool = true;
 /// conversation folded.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ClaudeProviderHandoff {
+    #[serde(default)]
+    pub transport: TransportKind,
     /// The sidecar's id of the session the watch follows (the conversation's `session_id`).
     pub provider_session_id: String,
     pub socket_path: PathBuf,
@@ -128,7 +131,7 @@ impl ClaudeSidecarProvider {
     /// the taking side needs it.
     pub fn freeze_for_move(&self) -> Result<(ClaudeProviderHandoff, SidecarFds), MoveRefusedWhy> {
         let ClaudeSidecarProvider {
-            sidecar,
+            transport,
             // Rebuilt: the taking side runs its own runtime and connection.
             runtime: _,
             client: _,
@@ -164,26 +167,30 @@ impl ClaudeSidecarProvider {
             }
         };
         let (mark, steers_given_up) = events.freeze()?;
-        let mut sidecar = lock(sidecar);
-        let taken = sidecar.park_output().and_then(|()| {
-            let fds = sidecar.duplicate_fds()?;
-            let pid = sidecar.pid();
-            let start = crate::child::start_time(pid)?;
-            Ok((fds, pid, start))
+        let mut transport = lock(transport);
+        let taken = transport.freeze_for_move().and_then(|handoff| match handoff {
+            TransportHandoff::Local { fds, socket_path, pid } => {
+                let start = crate::child::start_time(pid).map_err(MoveRefusedWhy::SidecarEnding)?;
+                Ok((fds, socket_path, pid, start))
+            }
+            TransportHandoff::Helper(_) => Err(MoveRefusedWhy::SidecarEnding(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "a helper handoff is not supported yet",
+            ))),
         });
-        let (fds, pid, start) = match taken {
+        let (fds, socket_path, pid, start) = match taken {
             Ok(taken) => taken,
             Err(why) => {
-                let _ = sidecar.restart_output();
+                let _ = transport.restart_output();
                 events.thaw();
-                return Err(MoveRefusedWhy::SidecarEnding(why));
+                return Err(why);
             }
         };
         let HandedOutput {
             stdout_partial,
             stderr_partial,
             stderr_tail,
-        } = sidecar.handed_output();
+        } = transport.handed_output();
         let WatchMark {
             sequence,
             last_text,
@@ -191,8 +198,9 @@ impl ClaudeSidecarProvider {
             cli_mode_noted,
         } = mark;
         let handoff = ClaudeProviderHandoff {
+            transport: TransportKind::Local,
             provider_session_id: session_id,
-            socket_path: sidecar.socket_path.clone(),
+            socket_path,
             child: ChildRecord {
                 pid,
                 start,
@@ -206,8 +214,8 @@ impl ClaudeSidecarProvider {
             stdout_partial,
             stderr_partial,
             stderr_tail,
-            build_description: sidecar.build_description.clone(),
-            build_warnings: sidecar.build_warnings.clone(),
+            build_description: transport.build_description(),
+            build_warnings: transport.build_warnings(),
         };
         Ok((handoff, fds))
     }
@@ -215,7 +223,7 @@ impl ClaudeSidecarProvider {
     /// After a freeze whose move did not happen: the drains read on from where they stopped, and the
     /// events the watch queued meanwhile are handed over at the next pump.
     pub fn unfreeze(&self) -> std::io::Result<()> {
-        let restarted = lock(&self.sidecar).restart_output();
+        let restarted = lock(&self.transport).restart_output();
         self.events.thaw();
         restarted
     }
@@ -227,33 +235,23 @@ impl ClaudeSidecarProvider {
     ///
     /// The session lease is not the provider's: it crosses with the conversation, which holds it.
     pub fn adopt(handoff: ClaudeProviderHandoff, fds: SidecarFds) -> std::io::Result<Self> {
+        let transport = transport::adopt(&handoff, fds)?;
         let ClaudeProviderHandoff {
+            transport: _,
             provider_session_id: session_id,
-            socket_path,
+            socket_path: _,
             child,
             folded_through,
             last_text,
             last_child_replies,
             cli_mode_noted,
             steers_given_up,
-            stdout_partial,
-            stderr_partial,
-            stderr_tail,
-            build_description,
-            build_warnings,
+            stdout_partial: _,
+            stderr_partial: _,
+            stderr_tail: _,
+            build_description: _,
+            build_warnings: _,
         } = handoff;
-        let sidecar = SpawnedSidecar::adopted(
-            socket_path,
-            &child,
-            fds,
-            HandedOutput {
-                stdout_partial,
-                stderr_partial,
-                stderr_tail,
-            },
-            build_description,
-            build_warnings,
-        )?;
         let runtime = RuntimeThread::spawn();
         let Handshaken {
             client,
@@ -265,7 +263,7 @@ impl ClaudeSidecarProvider {
             max_message_bytes,
         } = handshake_with(
             &runtime,
-            &sidecar,
+            transport.as_ref(),
             Some(child.pid),
             super::spawn::running_exe_dir().as_deref(),
         )?;
@@ -276,7 +274,7 @@ impl ClaudeSidecarProvider {
             cli_mode_noted,
         };
         Ok(ClaudeSidecarProvider {
-            sidecar: Mutex::new(sidecar),
+            transport: Mutex::new(transport),
             runtime,
             client,
             events: Arc::new(EventQueue::taking_over(mark.clone(), steers_given_up)),
@@ -304,7 +302,7 @@ impl ClaudeSidecarProvider {
         let Some(ParkedWatch { session_id, mark }) = lock(&self.parked).take() else {
             return Ok(());
         };
-        let held = lock(&self.sidecar).start_holding();
+        let held = lock(&self.transport).start_holding();
         let state = WatchState::resumed(&mark, self.splits_messages, requested_cli_mode(&self.capabilities));
         self.watch_from(session_id, state);
         held
@@ -320,6 +318,6 @@ impl ClaudeSidecarProvider {
             watch.task.abort();
         }
         self.events.close_for_good();
-        lock(&self.sidecar).let_go();
+        lock(&self.transport).let_go();
     }
 }
