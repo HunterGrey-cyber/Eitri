@@ -813,7 +813,15 @@ mod tests {
         let writer = agent::private_fs::PrivateLock::open(&lock_path(&path)).unwrap();
         assert!(!writer.try_lock().unwrap(), "writers still need an exclusive lock");
         drop(held);
-        assert!(writer.try_lock().unwrap(), "a stamp holds no lock");
+        // A sibling test's fork can keep the shared lock alive until exec closes its inherited descriptor.
+        let give_up = Instant::now() + Duration::from_secs(60);
+        while !writer.try_lock().unwrap() {
+            assert!(Instant::now() < give_up, "a stamp holds no lock");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        // Unlock the probe's open file description so a fork's copy cannot extend its exclusive hold.
+        // SAFETY: writer owns the descriptor and keeps it open for the call; flock takes no pointers.
+        assert_eq!(unsafe { libc::flock(writer.as_file().as_raw_fd(), libc::LOCK_UN) }, 0);
     }
 
     #[test]
