@@ -2116,6 +2116,19 @@ mod tests {
     }
 
     /// Pumps both ends and steps the windows until `done` holds, for at most five seconds.
+    /// Runs both ends twenty turns, each reading through everything the other has sent and waiting until `idle`
+    /// (the view workers), for checking that nothing arrives: a sample of turns, not a quiet stretch of time.
+    fn pump_a_while(one: &LinkDriver, two: &LinkDriver, steps: &Steps, idle: impl Fn() -> bool) {
+        for _ in 0..20 {
+            one.read_through_for_test(two);
+            two.read_through_for_test(one);
+            one.pump();
+            two.pump();
+            steps.run();
+            assert!(settle(one, two, steps, &idle), "view workers did not become idle");
+        }
+    }
+
     fn settle(one: &LinkDriver, two: &LinkDriver, steps: &Steps, done: impl Fn() -> bool) -> bool {
         let deadline = Instant::now() + Duration::from_secs(5);
         while Instant::now() < deadline {
@@ -3750,7 +3763,9 @@ mod tests {
 
         nvim_writes(&old_ask, "edited for the old chat");
         assert!(settle(&one_link, &two_link, &w.steps, || w.one.drafts.borrow().len() == 1));
-        pump_a_while(&one_link, &two_link, &w.steps);
+        pump_a_while(&one_link, &two_link, &w.steps, || {
+            w.one.views.borrow().is_empty() && again.views.borrow().is_empty()
+        });
         assert_eq!(
             edit.poll(),
             None,
@@ -3770,7 +3785,9 @@ mod tests {
                 Vec::new(),
             )
             .unwrap();
-        pump_a_while(&one_link, &two_link, &w.steps);
+        pump_a_while(&one_link, &two_link, &w.steps, || {
+            w.one.views.borrow().is_empty() && again.views.borrow().is_empty()
+        });
         assert_eq!(edit.poll(), None, "a draft is found by its session");
 
         nvim_writes(&new_ask, "edited for the new chat");

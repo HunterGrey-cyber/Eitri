@@ -1714,7 +1714,10 @@ mod tests {
         assert!(liveness_lock(&sock).unwrap().is_none());
         drop(alive);
         liveness_comes_free(&sock);
-        assert!(liveness_lock(&sock).unwrap().is_some(), "the next claimant can take the lock");
+        assert!(
+            liveness_lock(&sock).unwrap().is_some(),
+            "the next claimant can take the lock"
+        );
     }
 
     #[test]
@@ -1878,9 +1881,11 @@ mod tests {
         assert!(looked.get(), "the close never reached the stop");
         wait_until("the thread ends", || watch.finished.load(Ordering::SeqCst));
         server.close();
+        liveness_comes_free(&sock);
 
         // A newer window took the path meanwhile.
         let server = fixture.server();
+        assert_eq!(server.socket(), sock, "the closed server left the root name free");
         std::fs::remove_file(&sock).unwrap();
         let _newer = UnixListener::bind(&sock).unwrap();
         server.close();

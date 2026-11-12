@@ -1870,8 +1870,8 @@ mod tests {
     /// the warm answers' places. Elapsed durations are printed for diagnosis; waits use hang guards (the budget and its
     /// grace themselves are held by the injected-clock tests above).
     ///
-    /// The real-nvim gate (`tools/real-nvim-gate.sh`) leaves this and the next test out on purpose: they need the
-    /// variables, so they are run by name.
+    /// The real-nvim gate leaves this and the next test out on purpose: they need the variables, so they are run by
+    /// name.
     #[test]
     #[ignore = "run by name with EITRI_GD_E2E_GOPLS and/or EITRI_GD_E2E_RUST_ANALYZER set (see the doc comment); drives a headless Neovim and the real servers; spends no tokens and needs no display"]
     fn gd_against_real_servers() {
@@ -2068,7 +2068,7 @@ mod tests {
     struct RealEditor {
         link: eitri_core::nvim_rpc::NvimLink,
         _events: mpsc::Receiver<eitri_core::nvim_rpc::LinkEvent>,
-        process: NvimProcess,
+        _process: NvimProcess,
         sequencer: RefCell<Sequencer>,
         asks: RefCell<u64>,
         workers: Arc<AtomicUsize>,
@@ -2123,7 +2123,7 @@ mod tests {
             let editor = RealEditor {
                 link,
                 _events: events,
-                process,
+                _process: process,
                 sequencer: RefCell::new(Sequencer::new("gd-e2e".into())),
                 asks: RefCell::new(0),
                 workers: Arc::default(),
@@ -2220,7 +2220,7 @@ mod tests {
 
     impl Drop for RealEditor {
         /// A failed run: ask the servers to stop (they are nvim's children, and killing nvim outright can leave
-        /// them behind), briefly, then `process` kills nvim and removes its directory.
+        /// them behind), briefly, then `_process` kills nvim and removes its directory.
         fn drop(&mut self) {
             let _ = self.link.exec_lua(E2E_STOP, vec![]).wait(Duration::from_secs(2));
         }
