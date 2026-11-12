@@ -11,7 +11,7 @@ set -eu
 
 NODE_VERSION=v22.23.2
 # From https://nodejs.org/dist/v22.23.2/SHASUMS256.txt (node-v22.23.2-darwin-arm64.tar.xz). Verdandi's
-# own table has no darwin entry, so this value is the script's, not Verdandi's pin.
+# pin (apps/claude-sidecar/node-pin.json) has no darwin entry, so this value is the script's, not Verdandi's.
 NODE_DARWIN_ARM64_SHA256=5eff7a9011895aae3f29d06f167b84a62b028a591370c7cafb59103559fd26e1
 PROTOCOL_MAJOR=3
 
@@ -225,18 +225,25 @@ if [ -n "$CHECKOUT" ]; then
 	mv -- "$UNPACK/node-$NODE_VERSION-darwin-arm64" "$NODE_TREE"
 	rm -rf -- "$UNPACK"
 
+	# The checksum above is for this Node only: a pin that names another version needs a new one here.
+	PIN=$SC/node-pin.json
+	[ -f "$PIN" ] || die "$PIN is missing: the build script's Node pin moved"
+	pinned=$(node -e 'process.stdout.write(String(JSON.parse(require("fs").readFileSync(process.argv[1], "utf8")).version))' "$PIN") ||
+		die "cannot read the version from $PIN"
+	[ "$pinned" = "$NODE_VERSION" ] || die "$PIN pins Node $pinned, but this script's darwin-arm64 checksum is for $NODE_VERSION"
+
 	# A patched copy of the build script, next to the original (it resolves paths from its own place).
 	ORIG=$SC/scripts/buildBinary.mjs
 	COPY=$SC/scripts/buildBinary.darwin.mjs
 	[ -f "$ORIG" ] || die "$ORIG is missing"
 	SHA=$NODE_DARWIN_ARM64_SHA256 perl -pe '
-		s/^(  .linux-arm64.: .*)$/$1\n  \x27darwin-arm64\x27: \x27$ENV{SHA}\x27,/;
+		s/^(const \{ version: NODE_VERSION, tarballSha256: NODE_TARBALL_SHA256 \} = loadNodePin\(workspaceRoot\);)$/$1\nNODE_TARBALL_SHA256[\x27darwin-arm64\x27] = \x27$ENV{SHA}\x27;/;
 		s/^run\(process\.execPath, \[.--experimental-sea-config., seaConfigPath\]\);/run(join(cacheDir, `node-\${NODE_VERSION}-\${platform}`, \x27bin\x27, \x27node\x27), [\x27--experimental-sea-config\x27, seaConfigPath]);/;
 		s/^  run\(.strip., \[outPath\]\);/  run(\x27codesign\x27, [\x27--remove-signature\x27, outPath]);/;
 		s/^(run\(.npx., \[.postject., outPath, .NODE_SEA_BLOB., blobPath, .--sentinel-fuse., SEA_FUSE)\]\);/$1, \x27--macho-segment-name\x27, \x27NODE_SEA\x27]);\nrun(\x27codesign\x27, [\x27--sign\x27, \x27-\x27, outPath]);/;
 	' "$ORIG" >"$COPY"
 	# Every edit must have landed: a build script that moved leaves a half-patched copy.
-	grep -q "'darwin-arm64': '$NODE_DARWIN_ARM64_SHA256'" "$COPY" || die "the build script's checksum table moved: cannot add darwin-arm64"
+	grep -q "^NODE_TARBALL_SHA256\['darwin-arm64'\] = '$NODE_DARWIN_ARM64_SHA256';\$" "$COPY" || die "the build script's Node pin moved: cannot add darwin-arm64"
 	grep -q "node-\${NODE_VERSION}-\${platform}\`, 'bin', 'node'), \['--experimental-sea-config'" "$COPY" || die "the build script's SEA blob step moved"
 	grep -q "run('codesign', \['--remove-signature', outPath\]);" "$COPY" || die "the build script's strip step moved"
 	grep -q -- "--macho-segment-name" "$COPY" || die "the build script's inject step moved"
