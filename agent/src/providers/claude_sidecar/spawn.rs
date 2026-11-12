@@ -657,6 +657,9 @@ impl SpawnedSidecar {
 ///   (`ProviderCapabilities::direct_settings`, all three or none); `SessionReady.effort`; the
 ///   `CliModeReported` event (`SessionEvent` arm 60), judged as `SessionReady.permission_mode` is;
 ///   a range of `GetTaskOutput` behind `task_output_range`.
+/// - 3.25: `TextDelta.starts_block`, behind `text_block_start`: true on the first delta of a text
+///   content block. Read: `translate::MessageSplit::separate_block`, which keeps two text blocks of
+///   one reply apart as paragraphs; an older sidecar never sets it and its blocks are joined.
 pub const BUNDLED_SIDECAR_REVISION: &str = "842d54e";
 
 /// Where `EITRI_VERDANDI_CHECKOUT` came from, and what it points at. Carried onto `ProviderInfo`
@@ -2225,7 +2228,7 @@ mod tests {
         };
         let packaged = packaged_description(Path::new("/lib/eitri/verdandi-claude-sidecar"));
         let origin = |version, update, description| sidecar_origin(&info(version, update, description));
-        assert_eq!(origin("0.3.3", Some("0.3.3"), Some(&packaged)), "update");
+        assert_eq!(origin("0.4.3", Some("0.4.3"), Some(&packaged)), "update");
         assert_eq!(origin(BUNDLED_SIDECAR_VERSION, None, Some(&packaged)), "bundled");
         assert_eq!(origin(BUNDLED_SIDECAR_VERSION, None, None), "bundled");
         let checkout = "Verdandi checkout: /src/verdandi @ 0123456 (via EITRI_VERDANDI_CHECKOUT)";
@@ -3667,12 +3670,12 @@ mod tests {
     #[test]
     fn a_complete_update_newer_than_bundled_is_used() {
         let fixture = UpdateFixture::new();
-        let binary = fixture.build("0.3.2");
-        fixture.select("version=0.3.2\n");
+        let binary = fixture.build("0.4.2");
+        fixture.select("version=0.4.2\n");
         assert_eq!(
             fixture.choice(),
             UpdateChoice::Use {
-                version: "0.3.2".into(),
+                version: "0.4.2".into(),
                 path: binary,
             }
         );
@@ -3681,34 +3684,34 @@ mod tests {
     #[test]
     fn the_line_needs_no_final_newline() {
         let fixture = UpdateFixture::new();
-        fixture.build("0.3.2");
-        fixture.select("version=0.3.2");
+        fixture.build("0.4.2");
+        fixture.select("version=0.4.2");
         assert!(matches!(fixture.choice(), UpdateChoice::Use { .. }));
     }
 
     #[test]
     fn a_release_candidate_can_be_selected() {
         let fixture = UpdateFixture::new();
-        fixture.build("0.3.2-rc.1");
-        fixture.select("version=0.3.2-rc.1\n");
+        fixture.build("0.4.2-rc.1");
+        fixture.select("version=0.4.2-rc.1\n");
         assert!(matches!(fixture.choice(), UpdateChoice::Use { .. }));
     }
 
     #[test]
     fn a_selected_file_holding_anything_else_is_unusable() {
         let fixture = UpdateFixture::new();
-        fixture.build("0.3.2");
+        fixture.build("0.4.2");
         let cases: [&[u8]; 11] = [
             b"",
             b"\n",
             b"junk\n",
-            b"0.3.2\n",
+            b"0.4.2\n",
             b"version=\n",
             b"version=0.3\n",
-            b"Version=0.3.2\n",
-            b" version=0.3.2\n",
-            b"version=0.3.2 \n",
-            b"version=0.3.2\r\n",
+            b"Version=0.4.2\n",
+            b" version=0.4.2\n",
+            b"version=0.4.2 \n",
+            b"version=0.4.2\r\n",
             b"version=\xff\xfe\n",
         ];
         for contents in cases {
@@ -3734,11 +3737,11 @@ mod tests {
     #[test]
     fn a_second_line_is_unusable() {
         let fixture = UpdateFixture::new();
-        fixture.build("0.3.2");
-        fixture.build("0.3.3");
-        fixture.select("version=0.3.2\nversion=0.3.3\n");
+        fixture.build("0.4.2");
+        fixture.build("0.4.3");
+        fixture.select("version=0.4.2\nversion=0.4.3\n");
         fixture.unusable();
-        fixture.select("version=0.3.2\n\n");
+        fixture.select("version=0.4.2\n\n");
         fixture.unusable();
     }
 
@@ -3746,8 +3749,8 @@ mod tests {
     #[test]
     fn a_huge_selected_file_is_unusable_and_stays_out_of_the_message() {
         let fixture = UpdateFixture::new();
-        fixture.build("0.3.2");
-        let mut contents = b"version=0.3.2\n".to_vec();
+        fixture.build("0.4.2");
+        let mut contents = b"version=0.4.2\n".to_vec();
         contents.resize(1024 * 1024, b'x');
         fixture.select(&contents);
         assert_eq!(fixture.unusable(), "the selected file does not name a version");
@@ -3757,8 +3760,8 @@ mod tests {
     fn a_group_writable_selected_file_is_tightened_and_used() {
         use std::os::unix::fs::PermissionsExt;
         let fixture = UpdateFixture::new();
-        fixture.select("version=0.3.2\n");
-        fixture.build("0.3.2");
+        fixture.select("version=0.4.2\n");
+        fixture.build("0.4.2");
         let path = fixture.sidecar_dir().join("selected");
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o664)).unwrap();
         assert!(matches!(fixture.choice(), UpdateChoice::Use { .. }));
@@ -3769,7 +3772,7 @@ mod tests {
     fn an_other_writable_selected_file_reports_its_permissions() {
         use std::os::unix::fs::PermissionsExt;
         let fixture = UpdateFixture::new();
-        fixture.select("version=0.3.2\n");
+        fixture.select("version=0.4.2\n");
         let path = fixture.sidecar_dir().join("selected");
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o602)).unwrap();
         assert_eq!(
@@ -3807,7 +3810,7 @@ mod tests {
     fn a_selected_file_nobody_may_read_is_unusable() {
         use std::os::unix::fs::PermissionsExt;
         let fixture = UpdateFixture::new();
-        fixture.select("version=0.3.2\n");
+        fixture.select("version=0.4.2\n");
         let path = fixture.sidecar_dir().join("selected");
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
         // A process that may read it anyway (root in a container) has nothing to test here.
@@ -3844,21 +3847,21 @@ mod tests {
     #[test]
     fn an_update_without_build_is_unusable() {
         let fixture = UpdateFixture::new();
-        fixture.build("0.3.2");
-        std::fs::remove_file(fixture.sidecar_dir().join("updates/0.3.2/BUILD")).unwrap();
-        fixture.select("version=0.3.2\n");
+        fixture.build("0.4.2");
+        std::fs::remove_file(fixture.sidecar_dir().join("updates/0.4.2/BUILD")).unwrap();
+        fixture.select("version=0.4.2\n");
         let what = fixture.unusable();
-        assert!(what.contains("0.3.2") && what.contains("BUILD"), "{what}");
+        assert!(what.contains("0.4.2") && what.contains("BUILD"), "{what}");
     }
 
     #[test]
     fn an_update_without_its_binary_is_unusable() {
         let fixture = UpdateFixture::new();
-        std::fs::remove_file(fixture.build("0.3.2")).unwrap();
-        fixture.select("version=0.3.2\n");
+        std::fs::remove_file(fixture.build("0.4.2")).unwrap();
+        fixture.select("version=0.4.2\n");
         let what = fixture.unusable();
         assert!(
-            what.contains("0.3.2") && what.contains(PACKAGED_SIDECAR_BINARY),
+            what.contains("0.4.2") && what.contains(PACKAGED_SIDECAR_BINARY),
             "{what}"
         );
     }
@@ -3866,15 +3869,15 @@ mod tests {
     #[test]
     fn a_selected_version_with_no_directory_is_unusable() {
         let fixture = UpdateFixture::new();
-        fixture.select("version=0.3.2\n");
+        fixture.select("version=0.4.2\n");
         fixture.unusable();
     }
 
     #[test]
     fn a_named_binary_or_checkout_means_no_update() {
         let fixture = UpdateFixture::new();
-        fixture.build("0.3.2");
-        fixture.select("version=0.3.2\n");
+        fixture.build("0.4.2");
+        fixture.select("version=0.4.2\n");
         for (binary, checkout) in [(Some("/some/sidecar"), None), (None, Some("/some/checkout"))] {
             assert_eq!(
                 update_choice(
@@ -3894,8 +3897,8 @@ mod tests {
     #[test]
     fn an_empty_override_does_not_stop_an_update() {
         let fixture = UpdateFixture::new();
-        fixture.build("0.3.2");
-        fixture.select("version=0.3.2\n");
+        fixture.build("0.4.2");
+        fixture.select("version=0.4.2\n");
         assert!(matches!(
             update_choice(
                 Some("  "),
@@ -3914,8 +3917,8 @@ mod tests {
     #[test]
     fn no_setup_program_beside_the_binary_means_no_update() {
         let fixture = UpdateFixture::new();
-        fixture.build("0.3.2");
-        fixture.select("version=0.3.2\n");
+        fixture.build("0.4.2");
+        fixture.select("version=0.4.2\n");
         std::fs::remove_file(fixture.exe_dir.join("eitri-setup")).unwrap();
         assert_eq!(fixture.choice(), UpdateChoice::NoUpdate);
         assert_eq!(
@@ -3927,11 +3930,11 @@ mod tests {
     #[test]
     fn a_version_that_failed_in_this_process_is_not_tried_again() {
         let fixture = UpdateFixture::new();
-        fixture.build("0.3.2");
-        fixture.select("version=0.3.2\n");
-        let failed = HashSet::from(["0.3.2".to_string()]);
-        assert_eq!(fixture.choice_failed(&failed), UpdateChoice::FailedHere("0.3.2".into()));
-        let other = HashSet::from(["0.3.1".to_string()]);
+        fixture.build("0.4.2");
+        fixture.select("version=0.4.2\n");
+        let failed = HashSet::from(["0.4.2".to_string()]);
+        assert_eq!(fixture.choice_failed(&failed), UpdateChoice::FailedHere("0.4.2".into()));
+        let other = HashSet::from(["0.4.1".to_string()]);
         assert!(matches!(fixture.choice_failed(&other), UpdateChoice::Use { .. }));
     }
 
@@ -3945,10 +3948,10 @@ mod tests {
         let by_xdg = fixture.root.join("xdg");
         for root in [&by_home, &by_xdg] {
             let sidecar = root.join("eitri/sidecar");
-            std::fs::create_dir_all(sidecar.join("updates/0.3.2")).unwrap();
-            std::fs::write(sidecar.join("updates/0.3.2/BUILD"), b"built\n").unwrap();
-            std::fs::write(sidecar.join("updates/0.3.2").join(PACKAGED_SIDECAR_BINARY), b"x").unwrap();
-            crate::test_tmp::write_private(sidecar.join("selected"), b"version=0.3.2\n").unwrap();
+            std::fs::create_dir_all(sidecar.join("updates/0.4.2")).unwrap();
+            std::fs::write(sidecar.join("updates/0.4.2/BUILD"), b"built\n").unwrap();
+            std::fs::write(sidecar.join("updates/0.4.2").join(PACKAGED_SIDECAR_BINARY), b"x").unwrap();
+            crate::test_tmp::write_private(sidecar.join("selected"), b"version=0.4.2\n").unwrap();
         }
         let path_with = |xdg: Option<&OsStr>| match update_choice(
             None,
@@ -3961,7 +3964,7 @@ mod tests {
             UpdateChoice::Use { path, .. } => path,
             other => panic!("expected an update under {xdg:?}, got {other:?}"),
         };
-        let binary_under = |root: &Path| root.join("eitri/sidecar/updates/0.3.2").join(PACKAGED_SIDECAR_BINARY);
+        let binary_under = |root: &Path| root.join("eitri/sidecar/updates/0.4.2").join(PACKAGED_SIDECAR_BINARY);
         assert_eq!(path_with(Some(by_xdg.as_os_str())), binary_under(&by_xdg));
         assert_eq!(path_with(None), binary_under(&by_home));
         assert_eq!(path_with(Some(OsStr::new("relative/data"))), binary_under(&by_home));
@@ -3995,8 +3998,8 @@ mod tests {
     #[test]
     fn an_update_counts_as_available_with_nothing_else_built() {
         let fixture = UpdateFixture::new();
-        fixture.build("0.3.2");
-        fixture.select("version=0.3.2\n");
+        fixture.build("0.4.2");
+        fixture.select("version=0.4.2\n");
         let availability = |failed: &HashSet<String>| {
             sidecar_availability_in(
                 None,
@@ -4009,7 +4012,7 @@ mod tests {
             )
         };
         assert_eq!(availability(&HashSet::new()), SidecarAvailability::Runnable);
-        let failed = HashSet::from(["0.3.2".to_string()]);
+        let failed = HashSet::from(["0.4.2".to_string()]);
         assert_eq!(availability(&failed), SidecarAvailability::Missing);
     }
 
@@ -4035,8 +4038,8 @@ mod tests {
     #[test]
     fn a_named_binary_outranks_an_update_in_availability() {
         let fixture = UpdateFixture::new();
-        fixture.build("0.3.2");
-        fixture.select("version=0.3.2\n");
+        fixture.build("0.4.2");
+        fixture.select("version=0.4.2\n");
         assert_eq!(
             sidecar_availability_in(
                 Some("/no/such/sidecar"),
@@ -4077,8 +4080,8 @@ mod tests {
     #[test]
     fn an_update_newer_than_a_missing_bundled_is_still_chosen() {
         let fixture = UpdateFixture::new();
-        fixture.build("0.3.2");
-        fixture.select("version=0.3.2\n");
+        fixture.build("0.4.2");
+        fixture.select("version=0.4.2\n");
         assert!(matches!(fixture.choice(), UpdateChoice::Use { .. }));
     }
 
@@ -4145,32 +4148,32 @@ mod tests {
         let line = |trouble: UpdateTrouble| trouble.fallback_line();
         assert_eq!(
             line(UpdateTrouble::DidNotStart {
-                version: "0.3.2".into(),
+                version: "0.4.2".into(),
                 reason: "no answer in 15 s".into(),
             }),
-            format!("Sidecar update 0.3.2 did not start (no answer in 15 s), {tail}")
+            format!("Sidecar update 0.4.2 did not start (no answer in 15 s), {tail}")
         );
         assert_eq!(
             line(UpdateTrouble::Refused {
-                version: "0.3.2".into(),
+                version: "0.4.2".into(),
                 words: "client protocol_major 3 is incompatible with this sidecar's 4".into(),
             }),
-            format!("Sidecar update 0.3.2 refused this Eitri (client protocol_major 3 is incompatible with this sidecar's 4), {tail}")
+            format!("Sidecar update 0.4.2 refused this Eitri (client protocol_major 3 is incompatible with this sidecar's 4), {tail}")
         );
         assert_eq!(
             line(UpdateTrouble::Lacks {
-                version: "0.3.2".into(),
+                version: "0.4.2".into(),
                 lacks: "lacks cli_auto_mode".into(),
             }),
-            format!("Sidecar update 0.3.2 lacks cli_auto_mode, {tail}")
+            format!("Sidecar update 0.4.2 lacks cli_auto_mode, {tail}")
         );
         assert_eq!(
-            line(UpdateTrouble::Unusable("0.3.2 is incomplete (no BUILD)".into())),
-            format!("Sidecar update: 0.3.2 is incomplete (no BUILD), {tail}")
+            line(UpdateTrouble::Unusable("0.4.2 is incomplete (no BUILD)".into())),
+            format!("Sidecar update: 0.4.2 is incomplete (no BUILD), {tail}")
         );
         assert_eq!(
-            line(UpdateTrouble::FailedHere("0.3.2".into())),
-            format!("Sidecar update 0.3.2 did not start earlier in this window, {tail}")
+            line(UpdateTrouble::FailedHere("0.4.2".into())),
+            format!("Sidecar update 0.4.2 did not start earlier in this window, {tail}")
         );
     }
 
@@ -4178,29 +4181,29 @@ mod tests {
     fn every_also_failed_line_opens_with_the_prefix_the_band_knows() {
         for trouble in [
             UpdateTrouble::DidNotStart {
-                version: "0.3.2".into(),
+                version: "0.4.2".into(),
                 reason: "no answer in 15 s".into(),
             },
             UpdateTrouble::Refused {
-                version: "0.3.2".into(),
+                version: "0.4.2".into(),
                 words: "no".into(),
             },
             UpdateTrouble::Lacks {
-                version: "0.3.2".into(),
+                version: "0.4.2".into(),
                 lacks: "lacks cli_auto_mode".into(),
             },
             UpdateTrouble::Unusable("selected holds no version".into()),
-            UpdateTrouble::FailedHere("0.3.2".into()),
+            UpdateTrouble::FailedHere("0.4.2".into()),
         ] {
             assert!(trouble.also_failed_line().starts_with("Sidecar update"));
         }
         assert_eq!(
             UpdateTrouble::DidNotStart {
-                version: "0.3.2".into(),
+                version: "0.4.2".into(),
                 reason: "no answer in 15 s".into(),
             }
             .also_failed_line(),
-            "Sidecar update 0.3.2 also did not start: no answer in 15 s"
+            "Sidecar update 0.4.2 also did not start: no answer in 15 s"
         );
     }
 

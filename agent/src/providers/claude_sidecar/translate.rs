@@ -6,6 +6,7 @@
 
 use super::translate_322;
 use crate::process::{classify_cli_mode, classify_reported_cli_mode, CliModeReport, RequestedCliMode};
+use crate::projection::TEXT_BLOCK_SEPARATOR;
 use crate::{
     AgentDomainEvent, ContentKind, InitServer, PermissionOutcome, ResumeStatus, TokenUsage, TurnEndDetail, TurnOutcome,
     UsageInfo,
@@ -570,6 +571,10 @@ fn translate_close_reason(reason: SessionCloseReason) -> String {
 pub(crate) struct MessageSplit {
     enabled: bool,
     last_text: Option<String>,
+    /// Whether the main reply with id `last_text` is still open for another text block: set by its text,
+    /// cleared by a main-thread tool call and by a turn start. A subagent's reply is open while it has an
+    /// entry in `children` (its own tool call removes it).
+    main_open: bool,
     /// Per subagent (its call id, then the message id of the reply its stream has open), the one
     /// that sent a delta longest ago first.
     children: Vec<(String, String)>,
@@ -582,15 +587,21 @@ const CHILD_REPLIES_KEPT: usize = 256;
 
 impl MessageSplit {
     pub(crate) fn new(enabled: bool) -> Self {
-        Self::resuming(enabled, None, Vec::new())
+        Self::resuming(enabled, None, false, Vec::new())
     }
 
     /// A split that goes on from another process's: `last_text` is the message id that split had
     /// translated last, and `children` the same for each subagent's open reply, so the first delta of
     /// a different message still opens a new one.
-    pub(crate) fn resuming(enabled: bool, last_text: Option<String>, children: Vec<(String, String)>) -> Self {
+    pub(crate) fn resuming(
+        enabled: bool,
+        last_text: Option<String>,
+        main_open: bool,
+        children: Vec<(String, String)>,
+    ) -> Self {
         Self {
             enabled,
+            main_open: main_open && last_text.is_some(),
             last_text,
             children,
         }
@@ -599,6 +610,11 @@ impl MessageSplit {
     /// The message id of each subagent's open reply, the longest silent first (see [`Self::resuming`]).
     pub(crate) fn child_replies(&self) -> &[(String, String)] {
         &self.children
+    }
+
+    /// Whether the main reply `last_text` names is still open for another text block.
+    pub(crate) fn main_open(&self) -> bool {
+        self.main_open
     }
 
     /// The message id of the last text delta translated, if any since the turn started.
@@ -613,11 +629,13 @@ impl MessageSplit {
         match event.event.as_ref()? {
             ProtoEvent::TurnStarted(_) => {
                 self.last_text = None;
+                self.main_open = false;
                 None
             }
             ProtoEvent::ToolCallStarted(started) => {
-                if let Some(parent) = &started.parent_tool_use_id {
-                    self.children.retain(|(call, _)| call != parent);
+                match &started.parent_tool_use_id {
+                    Some(parent) => self.children.retain(|(call, _)| call != parent),
+                    None => self.main_open = false,
                 }
                 None
             }
@@ -649,9 +667,39 @@ impl MessageSplit {
                     }
                 });
                 self.last_text = Some(id.clone());
+                self.main_open = true;
                 boundary
             }
             _ => None,
+        }
+    }
+
+    /// Puts [`TEXT_BLOCK_SEPARATOR`] in front of a `TextDelta` that starts a text block
+    /// (`starts_block`, capability `text_block_start`) of the reply its stream has open: the same
+    /// message id as that stream's last text, and no tool call since. The CLI draws each content block
+    /// as its own row, so the blocks of one reply are paragraphs; glued, a table opening the second block
+    /// is not a table. The history loader and the legacy backend apply the same rule to the blocks they
+    /// see. A sidecar without the capability never sets `starts_block`, so its deltas are joined as they
+    /// always were.
+    ///
+    /// Reads the state as it was before this event, so it is called before [`Self::before`] for the
+    /// same event (which records it), and before the event is translated.
+    pub(crate) fn separate_block(&self, event: &mut ProtoSessionEvent) {
+        if !self.enabled {
+            return;
+        }
+        let Some(ProtoEvent::TextDelta(delta)) = event.event.as_mut() else {
+            return;
+        };
+        let (true, Some(id)) = (delta.starts_block, delta.message_id.as_ref()) else {
+            return;
+        };
+        let open = match &delta.parent_tool_use_id {
+            Some(parent) => self.children.iter().any(|(call, last)| call == parent && last == id),
+            None => self.main_open && self.last_text.as_ref() == Some(id),
+        };
+        if open {
+            delta.text.insert_str(0, TEXT_BLOCK_SEPARATOR);
         }
     }
 }
@@ -2135,6 +2183,148 @@ mod tests {
         Some(AgentDomainEvent::AssistantMessageBoundary { turn_id: turn.into() })
     }
 
+    /// A delta as a sidecar with `text_block_start` sends it, run through the split as the watch does:
+    /// `separate_block`, then `before`. Returns the text that goes on to translation.
+    fn through(split: &mut MessageSplit, parent: Option<&str>, id: &str, text: &str, starts_block: bool) -> String {
+        let mut event = wrap(ProtoEvent::TextDelta(TextDelta {
+            turn_id: "t1".into(),
+            text: text.into(),
+            message_id: Some(id.into()),
+            parent_tool_use_id: parent.map(Into::into),
+            starts_block,
+        }));
+        split.separate_block(&mut event);
+        split.before(&event);
+        match event.event {
+            Some(ProtoEvent::TextDelta(delta)) => delta.text,
+            other => panic!("{other:?}"),
+        }
+    }
+
+    fn tool_call(split: &mut MessageSplit, parent: Option<&str>) {
+        let event = wrap(ProtoEvent::ToolCallStarted(ToolCallStarted {
+            turn_id: "t1".into(),
+            tool_use_id: "toolu_1".into(),
+            name: "Bash".into(),
+            parent_tool_use_id: parent.map(Into::into),
+            ..Default::default()
+        }));
+        split.separate_block(&mut event.clone());
+        split.before(&event);
+    }
+
+    #[test]
+    fn a_second_text_block_of_the_open_reply_is_a_new_paragraph() {
+        let mut split = MessageSplit::new(true);
+        assert_eq!(
+            through(&mut split, None, "msg_a", "Intro", true),
+            "Intro",
+            "the first block"
+        );
+        assert_eq!(
+            through(&mut split, None, "msg_a", " line", false),
+            " line",
+            "more of the same block"
+        );
+        assert_eq!(
+            through(&mut split, None, "msg_a", "| a |", true),
+            "\n\n| a |",
+            "the next block of the same reply"
+        );
+        assert_eq!(through(&mut split, None, "msg_a", "\n|---|", false), "\n|---|");
+        let thinking = wrap(ProtoEvent::ThinkingDelta(ThinkingDelta {
+            turn_id: "t1".into(),
+            text: "hm".into(),
+            message_id: Some("msg_a".into()),
+            ..Default::default()
+        }));
+        split.before(&thinking);
+        assert_eq!(
+            through(&mut split, None, "msg_a", "After", true),
+            "\n\nAfter",
+            "a thinking block between does not close the reply"
+        );
+        assert_eq!(
+            through(&mut split, None, "msg_b", "Next", true),
+            "Next",
+            "another message is a new reply, split by its boundary instead"
+        );
+    }
+
+    #[test]
+    fn a_tool_call_or_a_turn_start_closes_the_reply_for_the_next_block() {
+        let mut split = MessageSplit::new(true);
+        through(&mut split, None, "msg_a", "Checking", true);
+        tool_call(&mut split, None);
+        assert_eq!(through(&mut split, None, "msg_a", "Done", true), "Done");
+        split.before(&wrap(ProtoEvent::TurnStarted(TurnStarted {
+            turn_id: "t2".into(),
+            ..Default::default()
+        })));
+        assert_eq!(through(&mut split, None, "msg_a", "Again", true), "Again");
+    }
+
+    #[test]
+    fn without_starts_block_or_the_capability_blocks_join_as_before() {
+        let mut split = MessageSplit::new(true);
+        through(&mut split, None, "msg_a", "Intro", false);
+        assert_eq!(
+            through(&mut split, None, "msg_a", "| a |", false),
+            "| a |",
+            "an older sidecar"
+        );
+        let mut off = MessageSplit::new(false);
+        through(&mut off, None, "msg_a", "Intro", true);
+        assert_eq!(
+            through(&mut off, None, "msg_a", "| a |", true),
+            "| a |",
+            "no message ids, no split"
+        );
+    }
+
+    #[test]
+    fn a_subagents_blocks_are_separated_in_its_own_reply_only() {
+        let mut split = MessageSplit::new(true);
+        through(&mut split, None, "main", "Main", true);
+        assert_eq!(
+            through(&mut split, Some("p1"), "c1", "Sub", true),
+            "Sub",
+            "its first block"
+        );
+        assert_eq!(through(&mut split, Some("p1"), "c1", "| a |", true), "\n\n| a |");
+        assert_eq!(
+            through(&mut split, Some("p2"), "c1", "Other", true),
+            "Other",
+            "another subagent's first block, whatever its message id"
+        );
+        assert_eq!(
+            through(&mut split, None, "main", "| m |", true),
+            "\n\n| m |",
+            "the main reply is still open"
+        );
+        tool_call(&mut split, Some("p1"));
+        assert_eq!(
+            through(&mut split, Some("p1"), "c1", "Done", true),
+            "Done",
+            "its tool call closed its reply"
+        );
+    }
+
+    #[test]
+    fn a_split_that_goes_on_after_a_move_keeps_the_handed_over_reply_open_or_closed() {
+        let mut split = MessageSplit::resuming(true, Some("msg_a".into()), true, vec![("p1".into(), "c1".into())]);
+        assert_eq!(through(&mut split, None, "msg_a", "| a |", true), "\n\n| a |");
+        assert_eq!(through(&mut split, Some("p1"), "c1", "| b |", true), "\n\n| b |");
+        let mut fresh = MessageSplit::resuming(true, None, true, Vec::new());
+        assert_eq!(through(&mut fresh, None, "msg_a", "First", true), "First");
+        let mut closed = MessageSplit::resuming(true, Some("msg_a".into()), false, Vec::new());
+        assert_eq!(
+            through(&mut closed, None, "msg_a", "Done", true),
+            "Done",
+            "a reply a tool call closed before the move stays closed"
+        );
+    }
+
     #[test]
     fn a_new_message_id_closes_the_message_before_it() {
         let mut split = MessageSplit::new(true);
@@ -2335,7 +2525,7 @@ mod tests {
     fn the_subagent_replies_a_watch_hands_over_are_the_ones_the_next_watch_splits_on() {
         let mut split = MessageSplit::new(true);
         split.before(&child_text("p1", "c1", "First reply."));
-        let mut resumed = MessageSplit::resuming(true, None, split.child_replies().to_vec());
+        let mut resumed = MessageSplit::resuming(true, None, false, split.child_replies().to_vec());
         assert_eq!(
             resumed.before(&child_text("p1", "c2", "Second reply.")),
             child_boundary("p1")

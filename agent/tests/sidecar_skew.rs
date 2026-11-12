@@ -99,7 +99,7 @@ fn handshake_fixtures() -> PathBuf {
 
 /// What a sidecar of this build's own pin advertises, with one name taken out.
 fn current_without(absent: &str) -> String {
-    let (names, _) = frozen(&handshake_fixtures().join("3.24.json"));
+    let (names, _) = frozen(&handshake_fixtures().join("3.25.json"));
     let kept: Vec<String> = names.into_iter().filter(|name| name != absent).collect();
     kept.join(" ")
 }
@@ -273,6 +273,30 @@ fn a_higher_minor_with_unknown_capability_arm_and_field_completes_a_turn_and_los
     assert_eq!(text_of(&seen), "beforeafteranswered");
 }
 
+/// Through the provider's own watch: a second text block of one message is a new paragraph of the same
+/// reply, a delta that continues a block is joined as it always was, and a block of another message
+/// opens a new reply instead.
+#[test]
+fn a_second_text_block_of_one_message_arrives_as_a_new_paragraph() {
+    let dir = Scratch::new();
+    let program = launcher(&dir.0, "blocks", &[("EITRI_STANDIN_CAPABILITIES", current().as_str())]);
+    let provider = ClaudeSidecarProvider::connect_to_program(&instance(), &program).unwrap();
+    let session = open_session(&provider);
+    send(
+        &provider,
+        &session,
+        "block m1 Intro ; text m1 line ; block m1 | a | ; block m2 Next ; end",
+    );
+    let mut seen = Vec::new();
+    pump_until(&provider, &mut seen, "the turn's end", completed);
+    assert_eq!(text_of(&seen), "Introline\n\n| a |Next");
+    let boundaries = seen
+        .iter()
+        .filter(|event| matches!(event, AgentDomainEvent::AssistantMessageBoundary { .. }))
+        .count();
+    assert_eq!(boundaries, 1, "only the change of message closes a reply: {seen:#?}");
+}
+
 /// Each capability's flag, for those a flag reads.
 fn flag_of(capability: &str, flags: &ProviderCapabilities) -> Option<bool> {
     Some(match capability {
@@ -297,7 +321,7 @@ fn flag_of(capability: &str, flags: &ProviderCapabilities) -> Option<bool> {
 #[test]
 fn each_optional_capability_removed_leaves_a_running_tab_and_reads_as_absent() {
     let dir = Scratch::new();
-    let (names, _) = frozen(&handshake_fixtures().join("3.24.json"));
+    let (names, _) = frozen(&handshake_fixtures().join("3.25.json"));
     // `steer_turn` is conditional on a real sidecar, and is one more name to take out here.
     let mut optional: Vec<String> = names
         .into_iter()

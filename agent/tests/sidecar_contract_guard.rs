@@ -24,13 +24,25 @@ fn the_pinned_protocol_exposes_the_preset() {
     assert!(preset.append.is_none());
 }
 
-/// The pinned revision speaks protocol 3.24, whose capabilities Eitri reads by name: a protocol bump
+/// The pinned revision speaks protocol 3.25, whose capabilities Eitri reads by name: a protocol bump
 /// the client does not know fails here.
 #[test]
-fn the_pinned_protocol_is_3_24_and_names_its_capabilities() {
+fn the_pinned_protocol_is_3_25_and_names_its_capabilities() {
     use claude_runtime_protocol as wire;
     assert_eq!(wire::PROTOCOL_MAJOR, 3);
-    assert_eq!(wire::PROTOCOL_MINOR, 24);
+    assert_eq!(wire::PROTOCOL_MINOR, 25);
+    assert_eq!(wire::CAP_TEXT_BLOCK_START, "text_block_start");
+    let new_in_25: Vec<&str> = wire::CAPABILITY_SINCE_MINOR
+        .iter()
+        .filter(|(_, minor)| *minor == 25)
+        .map(|(name, _)| *name)
+        .collect();
+    assert_eq!(new_in_25, ["text_block_start"], "the capabilities of minor 25");
+    let block = wire::v1::TextDelta {
+        starts_block: true,
+        ..Default::default()
+    };
+    assert!(block.starts_block);
     assert_eq!(wire::CAP_CLIENT_TOOLS, "client_tools");
     assert_eq!(wire::CAP_SET_MODEL, "set_model");
     assert_eq!(wire::CAP_LIST_MODELS, "list_models");

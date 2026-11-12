@@ -407,6 +407,23 @@ fn run(shared: Arc<Shared>, session_id: String, mut turn_id: String, mut steps: 
                         }),
                     );
                 }
+                // `block <message id> <text>`: the first delta of a text block (`starts_block`), as a
+                // sidecar with `text_block_start` sends it; `text` is a delta that continues one.
+                Some("block") => {
+                    let message_id = words.next().unwrap_or("m").to_string();
+                    let text = words.collect::<Vec<_>>().join(" ");
+                    shared.emit(
+                        &session_id,
+                        Some(&turn_id),
+                        Event::TextDelta(TextDelta {
+                            turn_id: turn_id.clone(),
+                            text,
+                            message_id: Some(message_id),
+                            starts_block: true,
+                            ..Default::default()
+                        }),
+                    );
+                }
                 Some("gate") => {
                     wait_for_gate(words.next().expect("gate directory")).await;
                 }

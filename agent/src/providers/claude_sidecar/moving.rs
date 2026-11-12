@@ -56,6 +56,11 @@ pub struct ClaudeProviderHandoff {
     /// without it the first delta of a subagent's next message would join the reply row on screen.
     #[serde(default)]
     pub last_child_replies: Vec<(String, String)>,
+    /// Whether the main reply `last_text` names is still open for another text block (no main-thread
+    /// tool call since its text), so a block that starts after the move is a paragraph of it only if it
+    /// was before. Absent from a peer that predates it: taken as open while `last_text` is set.
+    #[serde(default)]
+    pub last_text_open: Option<bool>,
     /// Whether the session's CLI-mode line was printed up to `folded_through`.
     pub cli_mode_noted: bool,
     /// Messages reported dropped whose delivery may still come, with their typed text, oldest first.
@@ -194,6 +199,7 @@ impl ClaudeSidecarProvider {
         let WatchMark {
             sequence,
             last_text,
+            last_text_open,
             child_replies,
             cli_mode_noted,
         } = mark;
@@ -208,6 +214,7 @@ impl ClaudeSidecarProvider {
             },
             folded_through: sequence,
             last_text,
+            last_text_open: Some(last_text_open),
             last_child_replies: child_replies,
             cli_mode_noted,
             steers_given_up,
@@ -243,6 +250,7 @@ impl ClaudeSidecarProvider {
             child,
             folded_through,
             last_text,
+            last_text_open,
             last_child_replies,
             cli_mode_noted,
             steers_given_up,
@@ -269,6 +277,7 @@ impl ClaudeSidecarProvider {
         )?;
         let mark = WatchMark {
             sequence: folded_through,
+            last_text_open: last_text_open.unwrap_or(last_text.is_some()),
             last_text,
             child_replies: last_child_replies,
             cli_mode_noted,

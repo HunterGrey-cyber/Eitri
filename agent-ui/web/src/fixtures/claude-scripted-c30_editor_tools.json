@@ -1,12 +1,12 @@
 {
   "domain_events": [
     {
-      "occurred_at": 1793757422799,
+      "occurred_at": 1794467462141,
       "tasks": [],
       "type": "background_tasks_changed"
     },
     {
-      "turn_id": "4bbb6eb7-42e9-4e14-b067-d6f9e6b793e1",
+      "turn_id": "44f4e404-5aec-4787-9192-95274bf5895b",
       "type": "turn_started"
     },
     {
@@ -213,8 +213,8 @@
     {
       "cwd": "$RUN/project",
       "model": "claude-opus-5-5",
-      "provider_session_id": "e545a37a-15bd-493c-b5fe-4c0bb11bbf75",
-      "session_id": "5dc5c424-24a8-4ac4-87da-82a7c111f7a9",
+      "provider_session_id": "2091821c-7ad9-4b38-81bd-cce3fd0d81d2",
+      "session_id": "c263ae73-9147-47d0-9efb-c5062aa68d0e",
       "type": "session_opened"
     },
     {
@@ -248,7 +248,7 @@
     {
       "kind": "text",
       "text": "C30-OPEN-DONE",
-      "turn_id": "4bbb6eb7-42e9-4e14-b067-d6f9e6b793e1",
+      "turn_id": "44f4e404-5aec-4787-9192-95274bf5895b",
       "type": "content_delta"
     },
     {
@@ -261,7 +261,7 @@
       "outcome": "completed",
       "result_text": "C30-OPEN-DONE",
       "stop_reason": "end_turn",
-      "turn_id": "4bbb6eb7-42e9-4e14-b067-d6f9e6b793e1",
+      "turn_id": "44f4e404-5aec-4787-9192-95274bf5895b",
       "type": "turn_completed",
       "usage": {
         "model": "claude-opus-5-5",
@@ -276,7 +276,7 @@
       }
     },
     {
-      "turn_id": "8a97f168-00e8-484b-a9a6-e4f3223434cd",
+      "turn_id": "975ed248-20b9-4728-ba7e-aa8d6ac3f318",
       "type": "turn_started"
     },
     {
@@ -284,29 +284,33 @@
         "line": 1,
         "path": "a.txt"
       },
-      "permission_id": "484f7643-a1bd-4bfe-aa1b-9d8d75b64062",
+      "permission_id": "f765fc04-8e06-4a8a-9674-867a96ae9ba0",
       "tool_name": "mcp__eitri__open_file",
       "tool_use_id": "toolu_open",
       "type": "permission_requested"
     },
     {
       "outcome": "allowed",
-      "permission_id": "484f7643-a1bd-4bfe-aa1b-9d8d75b64062",
+      "permission_id": "f765fc04-8e06-4a8a-9674-867a96ae9ba0",
       "type": "permission_resolved"
     },
     {
       "arguments_json": "<cli-text chars=25 sha256=667e69f0fb3c06f9>",
-      "call_id": "<cli-text chars=36 sha256=d3b9458707098f36>",
+      "call_id": "<cli-text chars=36 sha256=5942f533c37870d9>",
       "sequence": 12,
       "tool": "open_file",
       "tool_use_id": "toolu_open",
       "type": "client_tool_call"
     },
     {
+      "call_id": "<cli-text chars=36 sha256=5942f533c37870d9>",
+      "type": "client_tool_call_settled"
+    },
+    {
       "cwd": "$RUN/project",
       "model": "claude-opus-5-5",
-      "provider_session_id": "e545a37a-15bd-493c-b5fe-4c0bb11bbf75",
-      "session_id": "5dc5c424-24a8-4ac4-87da-82a7c111f7a9",
+      "provider_session_id": "2091821c-7ad9-4b38-81bd-cce3fd0d81d2",
+      "session_id": "c263ae73-9147-47d0-9efb-c5062aa68d0e",
       "type": "session_opened"
     },
     {
@@ -328,17 +332,13 @@
       "type": "session_servers"
     },
     {
-      "call_id": "<cli-text chars=36 sha256=d3b9458707098f36>",
-      "type": "client_tool_call_settled"
-    },
-    {
       "input": {
         "line": 1,
         "path": "a.txt"
       },
       "name": "mcp__eitri__open_file",
       "tool_use_id": "toolu_open",
-      "turn_id": "8a97f168-00e8-484b-a9a6-e4f3223434cd",
+      "turn_id": "975ed248-20b9-4728-ba7e-aa8d6ac3f318",
       "type": "tool_call_started"
     },
     {
@@ -350,13 +350,13 @@
       ],
       "is_error": false,
       "tool_use_id": "toolu_open",
-      "turn_id": "8a97f168-00e8-484b-a9a6-e4f3223434cd",
+      "turn_id": "975ed248-20b9-4728-ba7e-aa8d6ac3f318",
       "type": "tool_call_completed"
     },
     {
       "kind": "text",
       "text": "C30-DONE",
-      "turn_id": "8a97f168-00e8-484b-a9a6-e4f3223434cd",
+      "turn_id": "975ed248-20b9-4728-ba7e-aa8d6ac3f318",
       "type": "content_delta"
     },
     {
@@ -369,7 +369,7 @@
       "outcome": "completed",
       "result_text": "C30-DONE",
       "stop_reason": "end_turn",
-      "turn_id": "8a97f168-00e8-484b-a9a6-e4f3223434cd",
+      "turn_id": "975ed248-20b9-4728-ba7e-aa8d6ac3f318",
       "type": "turn_completed",
       "usage": {
         "model": "claude-opus-5-5",
@@ -387,12 +387,12 @@
   "events": {
     "events": [
       {
-        "occurred_at": 1793757422799,
+        "occurred_at": 1794467462141,
         "tasks": [],
         "type": "background_tasks_changed"
       },
       {
-        "turn_id": "4bbb6eb7-42e9-4e14-b067-d6f9e6b793e1",
+        "turn_id": "44f4e404-5aec-4787-9192-95274bf5895b",
         "type": "turn_started"
       },
       {
@@ -599,8 +599,8 @@
       {
         "cwd": "$RUN/project",
         "model": "claude-opus-5-5",
-        "provider_session_id": "e545a37a-15bd-493c-b5fe-4c0bb11bbf75",
-        "session_id": "5dc5c424-24a8-4ac4-87da-82a7c111f7a9",
+        "provider_session_id": "2091821c-7ad9-4b38-81bd-cce3fd0d81d2",
+        "session_id": "c263ae73-9147-47d0-9efb-c5062aa68d0e",
         "type": "session_opened"
       },
       {
@@ -634,7 +634,7 @@
       {
         "kind": "text",
         "text": "C30-OPEN-DONE",
-        "turn_id": "4bbb6eb7-42e9-4e14-b067-d6f9e6b793e1",
+        "turn_id": "44f4e404-5aec-4787-9192-95274bf5895b",
         "type": "content_delta"
       },
       {
@@ -647,7 +647,7 @@
         "outcome": "completed",
         "result_text": "C30-OPEN-DONE",
         "stop_reason": "end_turn",
-        "turn_id": "4bbb6eb7-42e9-4e14-b067-d6f9e6b793e1",
+        "turn_id": "44f4e404-5aec-4787-9192-95274bf5895b",
         "type": "turn_completed",
         "usage": {
           "model": "claude-opus-5-5",
@@ -662,7 +662,7 @@
         }
       },
       {
-        "turn_id": "8a97f168-00e8-484b-a9a6-e4f3223434cd",
+        "turn_id": "975ed248-20b9-4728-ba7e-aa8d6ac3f318",
         "type": "turn_started"
       },
       {
@@ -670,29 +670,33 @@
           "line": 1,
           "path": "a.txt"
         },
-        "permission_id": "484f7643-a1bd-4bfe-aa1b-9d8d75b64062",
+        "permission_id": "f765fc04-8e06-4a8a-9674-867a96ae9ba0",
         "tool_name": "mcp__eitri__open_file",
         "tool_use_id": "toolu_open",
         "type": "permission_requested"
       },
       {
         "outcome": "allowed",
-        "permission_id": "484f7643-a1bd-4bfe-aa1b-9d8d75b64062",
+        "permission_id": "f765fc04-8e06-4a8a-9674-867a96ae9ba0",
         "type": "permission_resolved"
       },
       {
         "arguments_json": "<cli-text chars=25 sha256=667e69f0fb3c06f9>",
-        "call_id": "<cli-text chars=36 sha256=d3b9458707098f36>",
+        "call_id": "<cli-text chars=36 sha256=5942f533c37870d9>",
         "sequence": 12,
         "tool": "open_file",
         "tool_use_id": "toolu_open",
         "type": "client_tool_call"
       },
       {
+        "call_id": "<cli-text chars=36 sha256=5942f533c37870d9>",
+        "type": "client_tool_call_settled"
+      },
+      {
         "cwd": "$RUN/project",
         "model": "claude-opus-5-5",
-        "provider_session_id": "e545a37a-15bd-493c-b5fe-4c0bb11bbf75",
-        "session_id": "5dc5c424-24a8-4ac4-87da-82a7c111f7a9",
+        "provider_session_id": "2091821c-7ad9-4b38-81bd-cce3fd0d81d2",
+        "session_id": "c263ae73-9147-47d0-9efb-c5062aa68d0e",
         "type": "session_opened"
       },
       {
@@ -714,17 +718,13 @@
         "type": "session_servers"
       },
       {
-        "call_id": "<cli-text chars=36 sha256=d3b9458707098f36>",
-        "type": "client_tool_call_settled"
-      },
-      {
         "input": {
           "line": 1,
           "path": "a.txt"
         },
         "name": "mcp__eitri__open_file",
         "tool_use_id": "toolu_open",
-        "turn_id": "8a97f168-00e8-484b-a9a6-e4f3223434cd",
+        "turn_id": "975ed248-20b9-4728-ba7e-aa8d6ac3f318",
         "type": "tool_call_started"
       },
       {
@@ -736,13 +736,13 @@
         ],
         "is_error": false,
         "tool_use_id": "toolu_open",
-        "turn_id": "8a97f168-00e8-484b-a9a6-e4f3223434cd",
+        "turn_id": "975ed248-20b9-4728-ba7e-aa8d6ac3f318",
         "type": "tool_call_completed"
       },
       {
         "kind": "text",
         "text": "C30-DONE",
-        "turn_id": "8a97f168-00e8-484b-a9a6-e4f3223434cd",
+        "turn_id": "975ed248-20b9-4728-ba7e-aa8d6ac3f318",
         "type": "content_delta"
       },
       {
@@ -755,7 +755,7 @@
         "outcome": "completed",
         "result_text": "C30-DONE",
         "stop_reason": "end_turn",
-        "turn_id": "8a97f168-00e8-484b-a9a6-e4f3223434cd",
+        "turn_id": "975ed248-20b9-4728-ba7e-aa8d6ac3f318",
         "type": "turn_completed",
         "usage": {
           "model": "claude-opus-5-5",
@@ -1034,7 +1034,7 @@
           },
           "seq": 19,
           "toolUseId": "toolu_open",
-          "turnId": "8a97f168-00e8-484b-a9a6-e4f3223434cd"
+          "turnId": "975ed248-20b9-4728-ba7e-aa8d6ac3f318"
         }
       ],
       "transcript": [

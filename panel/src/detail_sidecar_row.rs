@@ -1,5 +1,5 @@
 //! The detail popover's revision row says which sidecar a tab runs and where it came from: `sidecar 0.3.3
-//! (update)` for a tab on a selected update, `sidecar 0.3.0 (bundled)` for the one Eitri ships, and a checkout's or
+//! (update)` for a tab on a selected update, `sidecar 0.4.0 (bundled)` for the one Eitri ships, and a checkout's or
 //! a named binary's own description for those.
 
 #[cfg(test)]

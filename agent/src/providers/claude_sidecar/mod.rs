@@ -462,6 +462,8 @@ struct WatchMark {
     /// The message id of the last text delta translated, which decides whether the next delta opens
     /// a new assistant message.
     last_text: Option<String>,
+    /// Whether that main reply is still open for another text block (`MessageSplit::main_open`).
+    last_text_open: bool,
     /// The same for each subagent's open reply, by the call that started it, the longest silent first.
     child_replies: Vec<(String, String)>,
     /// Whether the session's CLI-mode line was printed.
@@ -486,6 +488,7 @@ impl WatchState {
             split: translate::MessageSplit::resuming(
                 splits_messages,
                 mark.last_text.clone(),
+                mark.last_text_open,
                 mark.child_replies.clone(),
             ),
             cli_mode_note: translate::CliModeNote::resuming(requested, mark.cli_mode_noted),
@@ -510,6 +513,7 @@ impl WatchState {
         WatchMark {
             sequence: tracker.after_sequence(),
             last_text: split.last_text().map(str::to_string),
+            last_text_open: split.main_open(),
             child_replies: split.child_replies().to_vec(),
             cli_mode_noted: cli_mode_note.noted(),
         }
@@ -1064,13 +1068,14 @@ impl ClaudeSidecarProvider {
                 let mut closed_by_session = false;
                 let end_detail = loop {
                     match stream.message().await {
-                        Ok(Some(event)) => {
+                        Ok(Some(mut event)) => {
                             let sequence = event.sequence;
                             record_delivery_lag(&backpressure, event.occurred_at);
                             match state.tracker.observe(sequence) {
                                 watch::SequenceVerdict::Deliver => {
                                     delivered_since_open = true;
                                     let mut translated = Vec::new();
+                                    state.split.separate_block(&mut event);
                                     if let Some(boundary) = state.split.before(&event) {
                                         translated.push(boundary);
                                     }
@@ -3172,10 +3177,13 @@ pub fn replay_frames(
             watch::SequenceVerdict::Invalid => return Err("an event with the reserved sequence 0".into()),
         }
         let mut translated = Vec::new();
-        if let Some(boundary) = split.before(event) {
+        let mut event = event.clone();
+        split.separate_block(&mut event);
+        if let Some(boundary) = split.before(&event) {
             translated.push(boundary);
         }
-        translated.extend(translate::translate(event.clone(), settings.requested_cli_mode));
+        let occurred_at = event.occurred_at;
+        translated.extend(translate::translate(event, settings.requested_cli_mode));
         for domain_event in translated {
             if let AgentDomainEvent::TurnStarted { turn_id: started } = &domain_event {
                 turn_id = started.clone();
@@ -3183,7 +3191,7 @@ pub fn replay_frames(
             let passed = gate.pass(domain_event);
             out.extend(passed.ready);
             if let Some(generation) = passed.hold_started {
-                hold = Some((generation, event.occurred_at));
+                hold = Some((generation, occurred_at));
             }
         }
         if !gate.holding() {
@@ -3911,8 +3919,8 @@ mod tests {
             protocol_major: 3,
             // The handshake reports `capabilities.json`'s minor (it was the literal 0 until
             // 2026-09-30): 23 at the pinned revision.
-            protocol_minor: 23,
-            sidecar_version: "0.3.0".into(),
+            protocol_minor: 25,
+            sidecar_version: "0.4.0".into(),
             claude_agent_sdk_version: "0.3.0".into(),
             sdk_declared_claude_code_version: "2.1.269".into(),
             actual_claude_code_version: "2.1.269".into(),
@@ -4008,6 +4016,7 @@ mod tests {
                 "session_effort_report",
                 "cli_mode_reports",
                 "task_output_range",
+                "text_block_start",
                 // Which executable sources this build can actually serve, advertised as capability
                 // strings rather than a new wire field. `executable_host_cli` is always present;
                 // a checkout build adds one more, `executable_sdk_bundled`, which a PACKAGED build
@@ -5237,16 +5246,16 @@ mod tests {
         );
         assert_eq!(info.actual_claude_code_version, "2.1.269");
         assert_eq!(info.protocol_major, 3);
-        assert_eq!(info.sidecar_version, "0.3.0");
+        assert_eq!(info.sidecar_version, "0.4.0");
         // Raw, not filtered down to the ones this client recognizes -- an unrecognized future
         // capability must stay visible in diagnostics rather than vanish.
         assert!(info.advertised_permission_modes.contains(&"verdandi_rules".to_string()));
-        // Fifty-nine: the PACKAGED shape at the pinned revision (twenty-four up to
+        // Sixty: the PACKAGED shape at the pinned revision (twenty-four up to
         // `provider_permission_prompts`, five from protocol 3.13, three from 3.14, seven from 3.15-3.19, two from 3.20, one from 3.21, ten from
-        // 3.22, one from 3.23 and six from 3.24), which a shipped install meets. A checkout build advertises one more,
+        // 3.22, one from 3.23, six from 3.24 and one from 3.25), which a shipped install meets. A checkout build advertises one more,
         // executable_sdk_bundled, and a sidecar with egress restrictions enabled advertises
         // egress_restricted besides. See real_handshake_today().
-        assert_eq!(info.advertised_capabilities.len(), 59);
+        assert_eq!(info.advertised_capabilities.len(), 60);
         assert_eq!(info.startup_diagnostics, vec!["diag".to_string()]);
         assert_eq!(info.build_description.as_deref(), Some("checkout @ abc1234"));
     }
@@ -5405,6 +5414,7 @@ mod tests {
         WatchMark {
             sequence,
             last_text: Some(last_text.to_string()),
+            last_text_open: true,
             child_replies: Default::default(),
             cli_mode_noted: false,
         }
