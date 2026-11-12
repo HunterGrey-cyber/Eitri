@@ -32,7 +32,7 @@ use serde_json::Value;
 use super::composed_block::strip_composed_block;
 use crate::projection::{
     AgentDomainEvent, ContentKind, NoticeLevel, QuestionOptionSpec, QuestionOutcome, QuestionSpec, SessionNoticeKind,
-    ShownAnswer, TurnCause, TurnCauseKind, TurnOrigin, TurnOutcome,
+    ShownAnswer, TurnCause, TurnCauseKind, TurnOrigin, TurnOutcome, TEXT_BLOCK_SEPARATOR,
 };
 
 /// The most conversational items a restored history may carry.
@@ -223,6 +223,9 @@ pub(crate) fn read_history_from(
     let mut segment: Option<Rc<Segment>> = None;
     let mut segment_count = 0usize;
     let mut last_text_message: Option<Option<String>> = None;
+    // Whether the event before this one was assistant text, so the reply is still open: a tool call, a
+    // prompt or anything else that is not text closes it.
+    let mut text_run_open = false;
 
     while let Some(line) = read_bounded_line(reader)? {
         let raw = match line {
@@ -301,22 +304,34 @@ pub(crate) fn read_history_from(
                 _ => {}
             }
             let mut prefix = Vec::new();
-            if matches!(
-                event,
+            if let AgentDomainEvent::ContentDelta {
+                kind: ContentKind::Text,
+                text,
+                ..
+            } = &mut *event
+            {
+                match last_text_message.as_ref() {
+                    Some(id) if id != &parsed.assistant_message_id => {
+                        prefix.push(AgentDomainEvent::AssistantMessageBoundary {
+                            turn_id: segment.turn_id.clone(),
+                        });
+                    }
+                    // The CLI writes each content block of one message as its own line under the same
+                    // id, and draws each as its own row: a text block straight after another one is the
+                    // next paragraph of the same reply, not more of the same sentence.
+                    Some(Some(_)) if text_run_open => *text = format!("{TEXT_BLOCK_SEPARATOR}{text}"),
+                    _ => {}
+                }
+                last_text_message = Some(parsed.assistant_message_id.clone());
+                text_run_open = true;
+            } else if !matches!(
+                &*event,
                 AgentDomainEvent::ContentDelta {
-                    kind: ContentKind::Text,
+                    kind: ContentKind::Thinking,
                     ..
                 }
             ) {
-                if last_text_message
-                    .as_ref()
-                    .is_some_and(|id| id != &parsed.assistant_message_id)
-                {
-                    prefix.push(AgentDomainEvent::AssistantMessageBoundary {
-                        turn_id: segment.turn_id.clone(),
-                    });
-                }
-                last_text_message = Some(parsed.assistant_message_id.clone());
+                text_run_open = false;
             }
             match outcome {
                 Outcome::Item {
@@ -1915,9 +1930,53 @@ mod tests {
                 .iter()
                 .map(|m| m.text.as_str())
                 .collect::<Vec<_>>(),
-            ["First reply", "Second reply"]
+            ["First \n\nreply", "Second reply"]
         );
         assert_eq!(turn_ids(&history), ["turn-1"]);
+    }
+
+    /// Claude Code writes each content block of one API message as its own line with the message's id,
+    /// and its TUI draws every block as its own row. Two text blocks with nothing between them are
+    /// therefore two paragraphs of one reply, not one run of characters.
+    #[test]
+    fn adjacent_text_blocks_of_one_message_are_separate_paragraphs() {
+        let history = fold(
+            r#"{"type":"user","uuid":"turn-1","promptSource":"typed","message":{"role":"user","content":"Explain"}}
+{"type":"assistant","uuid":"a1","message":{"role":"assistant","id":"m1","content":[{"type":"text","text":"Intro line"}]}}
+{"type":"assistant","uuid":"a2","message":{"role":"assistant","id":"m1","content":[{"type":"text","text":"| a | b |\n|---|---|\n| 1 | 2 |"}]}}
+"#,
+        );
+        let projection = projected(&history);
+        assert_eq!(
+            projection
+                .transcript
+                .iter()
+                .map(|m| m.text.as_str())
+                .collect::<Vec<_>>(),
+            ["Intro line\n\n| a | b |\n|---|---|\n| 1 | 2 |"]
+        );
+    }
+
+    /// A tool call closes the reply, so the text after it starts a new message: no separator is
+    /// prepended to it, whether or not the CLI reused the message id.
+    #[test]
+    fn a_text_block_after_a_tool_call_of_the_same_message_gets_no_separator() {
+        let history = fold(
+            r#"{"type":"user","uuid":"turn-1","promptSource":"typed","message":{"role":"user","content":"Explain"}}
+{"type":"assistant","uuid":"a1","message":{"role":"assistant","id":"m1","content":[{"type":"text","text":"Checking"}]}}
+{"type":"assistant","uuid":"a2","message":{"role":"assistant","id":"m1","content":[{"type":"tool_use","id":"c","name":"Bash","input":{"command":"true"}}]}}
+{"type":"user","uuid":"r1","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"c","content":"ok"}]}}
+{"type":"assistant","uuid":"a3","message":{"role":"assistant","id":"m1","content":[{"type":"text","text":"Done"}]}}
+"#,
+        );
+        assert_eq!(
+            projected(&history)
+                .transcript
+                .iter()
+                .map(|m| m.text.as_str())
+                .collect::<Vec<_>>(),
+            ["Checking", "Done"]
+        );
     }
 
     #[test]

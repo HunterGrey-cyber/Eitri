@@ -32,6 +32,13 @@ mod subagents;
 pub use subagents::SubagentStream;
 pub(crate) use subagents::{restore_children, subagent_frame_exceeds_limits};
 
+/// What the translators put in front of a text block that follows another text block of the same
+/// assistant message, with nothing between them. Claude Code draws each content block as its own row
+/// (its transcript has one line per block), so the blocks of one reply are paragraphs; a projection
+/// message holds the whole reply, and this keeps the blocks apart inside it. Only a source that sees
+/// the blocks separately can apply it: a stream of text chunks must never get one.
+pub(crate) const TEXT_BLOCK_SEPARATOR: &str = "\n\n";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ContentKind {

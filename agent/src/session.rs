@@ -15,7 +15,9 @@
 
 use crate::event::{AgentEvent, PermissionSource};
 use crate::process::AgentProcess;
-use crate::projection::{AgentDomainEvent, AgentSessionProjection, ContentKind, PermissionOutcome, TurnOutcome};
+use crate::projection::{
+    AgentDomainEvent, AgentSessionProjection, ContentKind, PermissionOutcome, TurnOutcome, TEXT_BLOCK_SEPARATOR,
+};
 use crate::provider::PermissionDecision;
 use crate::setting_sources::ProjectTrust;
 use std::collections::HashMap;
@@ -314,8 +316,9 @@ impl AgentSession {
 /// - `interrupt_requested`: read and cleared when deciding a `TurnFinished`'s outcome.
 /// - `pending_permission_sources`: written, so `respond_permission` can later route an answer back
 ///   over the channel its request arrived on.
-/// - `last_text_message_id`: the `message.id` of the last text block, read and written, so a text
-///   block of a different message starts a new transcript entry.
+/// - `last_text_message_id`: the `message.id` of the last text block while its reply is open (a tool
+///   call clears it), read and written, so a text block of a different message starts a new transcript
+///   entry and one of the same message starts a new paragraph.
 ///
 /// Global Constraint: an `AgentEvent` with no domain-event mapping (`ControlResponse`,
 /// `ProcessStderr`, `RateLimit`, `Unknown`) always returns an empty `Vec` -- never a fabricated
@@ -345,13 +348,19 @@ pub(crate) fn translate_wire_event(
                 return vec![];
             };
             let mut out = Vec::with_capacity(2);
+            let mut text = text;
             // A text block of a different message than the last one: that message is over, even
             // with no tool call between (which would have closed it anyway).
             if let Some(id) = message_id {
-                if last_text_message_id.as_ref().is_some_and(|last| *last != id) {
-                    out.push(AgentDomainEvent::AssistantMessageBoundary {
+                match last_text_message_id.as_ref() {
+                    Some(last) if *last != id => out.push(AgentDomainEvent::AssistantMessageBoundary {
                         turn_id: turn_id.clone(),
-                    });
+                    }),
+                    // The same message, and no tool call since (one clears the id): the CLI sends each
+                    // content block as its own line and draws it as its own row, so this block is the
+                    // next paragraph of the open reply.
+                    Some(_) => text.insert_str(0, TEXT_BLOCK_SEPARATOR),
+                    None => {}
                 }
                 *last_text_message_id = Some(id);
             }
@@ -376,6 +385,8 @@ pub(crate) fn translate_wire_event(
             let Some(turn_id) = active_turn_id.map(|t| t.to_string()) else {
                 return vec![];
             };
+            // A tool call ends the reply, so a text block after it opens a new one whatever its id.
+            *last_text_message_id = None;
             vec![AgentDomainEvent::ToolCallStarted {
                 turn_id,
                 tool_use_id: id,
@@ -625,11 +636,29 @@ mod tests {
         assert_eq!(texts, vec!["After the table.", "TURN-1-DONE"]);
     }
 
+    /// The blocks of one message stay ONE transcript entry (a different id is what splits), but the CLI
+    /// draws each block as its own row, so the entry holds them as separate paragraphs: glued, a table
+    /// starting the second block would not be a table.
     #[test]
-    fn two_text_blocks_of_one_message_still_merge() {
-        let projection = fold_lines(&[assistant_text("msg_1", "one "), assistant_text("msg_1", "message")]);
+    fn two_text_blocks_of_one_message_are_one_entry_in_two_paragraphs() {
+        let projection = fold_lines(&[
+            assistant_text("msg_1", "one"),
+            assistant_text("msg_1", "| a |\n|---|\n| 1 |"),
+        ]);
         let texts: Vec<&str> = projection.transcript.iter().map(|m| m.text.as_str()).collect();
-        assert_eq!(texts, vec!["one message"]);
+        assert_eq!(texts, vec!["one\n\n| a |\n|---|\n| 1 |"]);
+    }
+
+    #[test]
+    fn a_text_block_after_a_tool_call_of_the_same_message_has_no_leading_separator() {
+        let projection = fold_lines(&[
+            assistant_text("msg_1", "checking"),
+            json!({"type": "assistant", "message": {"id": "msg_1", "role": "assistant",
+                "content": [{"type": "tool_use", "id": "toolu_1", "name": "Bash", "input": {"command": "true"}}]}}),
+            assistant_text("msg_1", "done"),
+        ]);
+        let texts: Vec<&str> = projection.transcript.iter().map(|m| m.text.as_str()).collect();
+        assert_eq!(texts, vec!["checking", "done"]);
     }
 
     /// **The test across the seam.** Everything else in this module tests
