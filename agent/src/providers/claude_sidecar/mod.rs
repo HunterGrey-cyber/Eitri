@@ -1617,8 +1617,13 @@ fn build_create_request_loading(
         resume_provider_session_id,
         fork,
         // Absence preserves the CLI's own question handling until both ends support the host path.
-        client_interactions: (questions.capable && questions.client_implements)
-            .then_some(claude_runtime_protocol::v1::ClientInteractions { questions: true }),
+        client_interactions: (questions.capable && questions.client_implements).then_some(
+            claude_runtime_protocol::v1::ClientInteractions {
+                questions: true,
+                // Plan approval is not offered: a plan session needs host support this tree does not have.
+                plan_mode: false,
+            },
+        ),
         // Keep model, effort and output format at their defaults. A replacement would discard
         // Claude Code's instructions; the preset keeps them and adds only static panel context.
         // Without the capability both fields stay absent, retaining the SDK's minimal prompt.
@@ -1838,6 +1843,8 @@ impl AgentProvider for ClaudeSidecarProvider {
             text,
             client_message_id: client_message_id.clone(),
             typed_by_person: stamp.typed_by_person && self.capabilities.human_origin,
+            // Turns carry text only; image content is not sent.
+            content: Vec::new(),
         };
         let result = self.run_unary(async move { client.send_turn(proto_request).await });
         if result.is_err() {
@@ -3921,7 +3928,7 @@ mod tests {
             // The handshake reports `capabilities.json`'s minor (it was the literal 0 until
             // 2026-09-30): 23 at the pinned revision.
             protocol_minor: 25,
-            sidecar_version: "0.4.0".into(),
+            sidecar_version: "0.5.0".into(),
             claude_agent_sdk_version: "0.3.0".into(),
             sdk_declared_claude_code_version: "2.1.269".into(),
             actual_claude_code_version: "2.1.269".into(),
@@ -5247,7 +5254,7 @@ mod tests {
         );
         assert_eq!(info.actual_claude_code_version, "2.1.269");
         assert_eq!(info.protocol_major, 3);
-        assert_eq!(info.sidecar_version, "0.4.0");
+        assert_eq!(info.sidecar_version, "0.5.0");
         // Raw, not filtered down to the ones this client recognizes -- an unrecognized future
         // capability must stay visible in diagnostics rather than vanish.
         assert!(info.advertised_permission_modes.contains(&"verdandi_rules".to_string()));

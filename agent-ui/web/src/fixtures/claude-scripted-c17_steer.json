@@ -1,12 +1,12 @@
 {
   "domain_events": [
     {
-      "occurred_at": 1794467418962,
+      "occurred_at": 1794501200269,
       "tasks": [],
       "type": "background_tasks_changed"
     },
     {
-      "turn_id": "eb039682-3ee8-4551-baa9-3a96e60099f3",
+      "turn_id": "d6cb021b-9a9e-4fc1-836a-a04228b713e9",
       "type": "turn_started"
     },
     {
@@ -213,8 +213,8 @@
     {
       "cwd": "$RUN/project",
       "model": "claude-opus-5-5",
-      "provider_session_id": "9f8aff39-2bb8-4705-a870-f4fb9eb4c4ea",
-      "session_id": "a2b279b2-2c11-455a-bcc6-a00671148b1e",
+      "provider_session_id": "8fa35f1c-22a2-4d39-a4d8-c4026cf5b76f",
+      "session_id": "240fa788-eaa3-4d61-8446-81e3ba258fef",
       "type": "session_opened"
     },
     {
@@ -242,19 +242,19 @@
     {
       "kind": "text",
       "text": "C17-HELD some ",
-      "turn_id": "eb039682-3ee8-4551-baa9-3a96e60099f3",
+      "turn_id": "d6cb021b-9a9e-4fc1-836a-a04228b713e9",
       "type": "content_delta"
     },
     {
       "kind": "text",
       "text": "words before ",
-      "turn_id": "eb039682-3ee8-4551-baa9-3a96e60099f3",
+      "turn_id": "d6cb021b-9a9e-4fc1-836a-a04228b713e9",
       "type": "content_delta"
     },
     {
       "kind": "text",
       "text": "the steer",
-      "turn_id": "eb039682-3ee8-4551-baa9-3a96e60099f3",
+      "turn_id": "d6cb021b-9a9e-4fc1-836a-a04228b713e9",
       "type": "content_delta"
     },
     {
@@ -267,7 +267,7 @@
       "outcome": "completed",
       "result_text": "C17-HELD some words before the steer",
       "stop_reason": "end_turn",
-      "turn_id": "eb039682-3ee8-4551-baa9-3a96e60099f3",
+      "turn_id": "d6cb021b-9a9e-4fc1-836a-a04228b713e9",
       "type": "turn_completed",
       "usage": {
         "model": "claude-opus-5-5",
@@ -282,26 +282,26 @@
       }
     },
     {
-      "turn_id": "f1d22a2c-06f3-467c-8760-58dde44a5c76",
+      "turn_id": "ec7d1c2f-5ea3-45df-b1ab-7b1be3471a93",
       "type": "turn_started"
     },
     {
       "cause": null,
       "origin": "follow_up",
-      "turn_id": "f1d22a2c-06f3-467c-8760-58dde44a5c76",
+      "turn_id": "ec7d1c2f-5ea3-45df-b1ab-7b1be3471a93",
       "type": "turn_attributed"
     },
     {
       "client_message_id": "msg-2",
       "text": "C17 ultracode: tidy the notes",
-      "turn_id": "f1d22a2c-06f3-467c-8760-58dde44a5c76",
+      "turn_id": "ec7d1c2f-5ea3-45df-b1ab-7b1be3471a93",
       "type": "user_message_delivered"
     },
     {
       "cwd": "$RUN/project",
       "model": "claude-opus-5-5",
-      "provider_session_id": "9f8aff39-2bb8-4705-a870-f4fb9eb4c4ea",
-      "session_id": "a2b279b2-2c11-455a-bcc6-a00671148b1e",
+      "provider_session_id": "8fa35f1c-22a2-4d39-a4d8-c4026cf5b76f",
+      "session_id": "240fa788-eaa3-4d61-8446-81e3ba258fef",
       "type": "session_opened"
     },
     {
@@ -319,7 +319,7 @@
     {
       "kind": "text",
       "text": "C17-SEEN",
-      "turn_id": "f1d22a2c-06f3-467c-8760-58dde44a5c76",
+      "turn_id": "ec7d1c2f-5ea3-45df-b1ab-7b1be3471a93",
       "type": "content_delta"
     },
     {
@@ -333,7 +333,7 @@
       "outcome": "completed",
       "result_text": "C17-SEEN",
       "stop_reason": "end_turn",
-      "turn_id": "f1d22a2c-06f3-467c-8760-58dde44a5c76",
+      "turn_id": "ec7d1c2f-5ea3-45df-b1ab-7b1be3471a93",
       "type": "turn_completed",
       "usage": {
         "model": "claude-opus-5-5",
@@ -351,12 +351,12 @@
   "events": {
     "events": [
       {
-        "occurred_at": 1794467418962,
+        "occurred_at": 1794501200269,
         "tasks": [],
         "type": "background_tasks_changed"
       },
       {
-        "turn_id": "eb039682-3ee8-4551-baa9-3a96e60099f3",
+        "turn_id": "d6cb021b-9a9e-4fc1-836a-a04228b713e9",
         "type": "turn_started"
       },
       {
@@ -563,8 +563,8 @@
       {
         "cwd": "$RUN/project",
         "model": "claude-opus-5-5",
-        "provider_session_id": "9f8aff39-2bb8-4705-a870-f4fb9eb4c4ea",
-        "session_id": "a2b279b2-2c11-455a-bcc6-a00671148b1e",
+        "provider_session_id": "8fa35f1c-22a2-4d39-a4d8-c4026cf5b76f",
+        "session_id": "240fa788-eaa3-4d61-8446-81e3ba258fef",
         "type": "session_opened"
       },
       {
@@ -592,19 +592,19 @@
       {
         "kind": "text",
         "text": "C17-HELD some ",
-        "turn_id": "eb039682-3ee8-4551-baa9-3a96e60099f3",
+        "turn_id": "d6cb021b-9a9e-4fc1-836a-a04228b713e9",
         "type": "content_delta"
       },
       {
         "kind": "text",
         "text": "words before ",
-        "turn_id": "eb039682-3ee8-4551-baa9-3a96e60099f3",
+        "turn_id": "d6cb021b-9a9e-4fc1-836a-a04228b713e9",
         "type": "content_delta"
       },
       {
         "kind": "text",
         "text": "the steer",
-        "turn_id": "eb039682-3ee8-4551-baa9-3a96e60099f3",
+        "turn_id": "d6cb021b-9a9e-4fc1-836a-a04228b713e9",
         "type": "content_delta"
       },
       {
@@ -617,7 +617,7 @@
         "outcome": "completed",
         "result_text": "C17-HELD some words before the steer",
         "stop_reason": "end_turn",
-        "turn_id": "eb039682-3ee8-4551-baa9-3a96e60099f3",
+        "turn_id": "d6cb021b-9a9e-4fc1-836a-a04228b713e9",
         "type": "turn_completed",
         "usage": {
           "model": "claude-opus-5-5",
@@ -632,26 +632,26 @@
         }
       },
       {
-        "turn_id": "f1d22a2c-06f3-467c-8760-58dde44a5c76",
+        "turn_id": "ec7d1c2f-5ea3-45df-b1ab-7b1be3471a93",
         "type": "turn_started"
       },
       {
         "cause": null,
         "origin": "follow_up",
-        "turn_id": "f1d22a2c-06f3-467c-8760-58dde44a5c76",
+        "turn_id": "ec7d1c2f-5ea3-45df-b1ab-7b1be3471a93",
         "type": "turn_attributed"
       },
       {
         "client_message_id": "msg-2",
         "text": "C17 ultracode: tidy the notes",
-        "turn_id": "f1d22a2c-06f3-467c-8760-58dde44a5c76",
+        "turn_id": "ec7d1c2f-5ea3-45df-b1ab-7b1be3471a93",
         "type": "user_message_delivered"
       },
       {
         "cwd": "$RUN/project",
         "model": "claude-opus-5-5",
-        "provider_session_id": "9f8aff39-2bb8-4705-a870-f4fb9eb4c4ea",
-        "session_id": "a2b279b2-2c11-455a-bcc6-a00671148b1e",
+        "provider_session_id": "8fa35f1c-22a2-4d39-a4d8-c4026cf5b76f",
+        "session_id": "240fa788-eaa3-4d61-8446-81e3ba258fef",
         "type": "session_opened"
       },
       {
@@ -669,7 +669,7 @@
       {
         "kind": "text",
         "text": "C17-SEEN",
-        "turn_id": "f1d22a2c-06f3-467c-8760-58dde44a5c76",
+        "turn_id": "ec7d1c2f-5ea3-45df-b1ab-7b1be3471a93",
         "type": "content_delta"
       },
       {
@@ -683,7 +683,7 @@
         "outcome": "completed",
         "result_text": "C17-SEEN",
         "stop_reason": "end_turn",
-        "turn_id": "f1d22a2c-06f3-467c-8760-58dde44a5c76",
+        "turn_id": "ec7d1c2f-5ea3-45df-b1ab-7b1be3471a93",
         "type": "turn_completed",
         "usage": {
           "model": "claude-opus-5-5",
@@ -961,7 +961,7 @@
           "cause": null,
           "origin": "follow_up",
           "seq": 13,
-          "turnId": "f1d22a2c-06f3-467c-8760-58dde44a5c76"
+          "turnId": "ec7d1c2f-5ea3-45df-b1ab-7b1be3471a93"
         }
       ],
       "usage": {

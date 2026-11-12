@@ -99,7 +99,7 @@ fn handshake_fixtures() -> PathBuf {
 
 /// What a sidecar of this build's own pin advertises, with one name taken out.
 fn current_without(absent: &str) -> String {
-    let (names, _) = frozen(&handshake_fixtures().join("3.25.json"));
+    let (names, _) = frozen(&handshake_fixtures().join("3.26.json"));
     let kept: Vec<String> = names.into_iter().filter(|name| name != absent).collect();
     kept.join(" ")
 }
@@ -321,7 +321,7 @@ fn flag_of(capability: &str, flags: &ProviderCapabilities) -> Option<bool> {
 #[test]
 fn each_optional_capability_removed_leaves_a_running_tab_and_reads_as_absent() {
     let dir = Scratch::new();
-    let (names, _) = frozen(&handshake_fixtures().join("3.25.json"));
+    let (names, _) = frozen(&handshake_fixtures().join("3.26.json"));
     // `steer_turn` is conditional on a real sidecar, and is one more name to take out here.
     let mut optional: Vec<String> = names
         .into_iter()

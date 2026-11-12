@@ -1,12 +1,12 @@
 {
   "domain_events": [
     {
-      "occurred_at": 1794467417521,
+      "occurred_at": 1794501198737,
       "tasks": [],
       "type": "background_tasks_changed"
     },
     {
-      "turn_id": "3125856d-4aba-46a7-9e37-ff85c34e99e1",
+      "turn_id": "5146ef61-87c4-40dc-b314-28be335dbf04",
       "type": "turn_started"
     },
     {
@@ -213,8 +213,8 @@
     {
       "cwd": "$RUN/project",
       "model": "claude-opus-5-5",
-      "provider_session_id": "cfc19ed9-6b80-4799-add2-82d1c7a08409",
-      "session_id": "d7ab4c46-377d-4172-9e39-80bdc61c971b",
+      "provider_session_id": "666df08f-24dc-4dde-bc6a-bed7729f11c7",
+      "session_id": "0589c25d-4787-41eb-899f-1eef5f01d559",
       "type": "session_opened"
     },
     {
@@ -242,7 +242,7 @@
     {
       "kind": "text",
       "text": "C17-SEEN",
-      "turn_id": "3125856d-4aba-46a7-9e37-ff85c34e99e1",
+      "turn_id": "5146ef61-87c4-40dc-b314-28be335dbf04",
       "type": "content_delta"
     },
     {
@@ -255,7 +255,7 @@
       "outcome": "completed",
       "result_text": "C17-SEEN",
       "stop_reason": "end_turn",
-      "turn_id": "3125856d-4aba-46a7-9e37-ff85c34e99e1",
+      "turn_id": "5146ef61-87c4-40dc-b314-28be335dbf04",
       "type": "turn_completed",
       "usage": {
         "model": "claude-opus-5-5",
@@ -273,12 +273,12 @@
   "events": {
     "events": [
       {
-        "occurred_at": 1794467417521,
+        "occurred_at": 1794501198737,
         "tasks": [],
         "type": "background_tasks_changed"
       },
       {
-        "turn_id": "3125856d-4aba-46a7-9e37-ff85c34e99e1",
+        "turn_id": "5146ef61-87c4-40dc-b314-28be335dbf04",
         "type": "turn_started"
       },
       {
@@ -485,8 +485,8 @@
       {
         "cwd": "$RUN/project",
         "model": "claude-opus-5-5",
-        "provider_session_id": "cfc19ed9-6b80-4799-add2-82d1c7a08409",
-        "session_id": "d7ab4c46-377d-4172-9e39-80bdc61c971b",
+        "provider_session_id": "666df08f-24dc-4dde-bc6a-bed7729f11c7",
+        "session_id": "0589c25d-4787-41eb-899f-1eef5f01d559",
         "type": "session_opened"
       },
       {
@@ -514,7 +514,7 @@
       {
         "kind": "text",
         "text": "C17-SEEN",
-        "turn_id": "3125856d-4aba-46a7-9e37-ff85c34e99e1",
+        "turn_id": "5146ef61-87c4-40dc-b314-28be335dbf04",
         "type": "content_delta"
       },
       {
@@ -527,7 +527,7 @@
         "outcome": "completed",
         "result_text": "C17-SEEN",
         "stop_reason": "end_turn",
-        "turn_id": "3125856d-4aba-46a7-9e37-ff85c34e99e1",
+        "turn_id": "5146ef61-87c4-40dc-b314-28be335dbf04",
         "type": "turn_completed",
         "usage": {
           "model": "claude-opus-5-5",

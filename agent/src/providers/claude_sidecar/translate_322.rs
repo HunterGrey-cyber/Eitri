@@ -376,11 +376,14 @@ pub(super) fn requested(value: wire::InteractionRequested) -> Domain {
             unsupported = Some("Question payload exceeds supported bounds or is malformed".into());
             Vec::new()
         }
-        (Ok(wire::InteractionKind::Question), None) => {
+        // A plan payload on a question is no question payload at all.
+        (Ok(wire::InteractionKind::Question), None | Some(wire::interaction_requested::Payload::Plan(_))) => {
             unsupported.get_or_insert_with(|| "Question payload is missing".into());
             Vec::new()
         }
-        (Ok(wire::InteractionKind::Unspecified), _) | (Err(_), _) => {
+        // A plan approval is never offered by this tree (no `plan_mode` opt-in), so one is refused like any kind
+        // it does not know.
+        (Ok(wire::InteractionKind::Unspecified | wire::InteractionKind::PlanApproval), _) | (Err(_), _) => {
             unsupported = Some("Unsupported interaction kind".into());
             Vec::new()
         }
@@ -431,7 +434,10 @@ fn question_outcome(value: i32) -> Option<QuestionOutcome> {
         wire::InteractionOutcome::SessionClosed => QuestionOutcome::SessionClosed,
         wire::InteractionOutcome::ProviderFailed => QuestionOutcome::ProviderFailed,
         wire::InteractionOutcome::HostRefused => QuestionOutcome::HostRefused,
-        wire::InteractionOutcome::Unspecified => return absent("InteractionOutcome"),
+        // Plan outcomes belong to plan approvals, which this tree never takes; on a question they are unreadable.
+        wire::InteractionOutcome::Unspecified
+        | wire::InteractionOutcome::Approved
+        | wire::InteractionOutcome::KeptPlanning => return absent("InteractionOutcome"),
     })
 }
 pub(super) fn resolved(value: wire::InteractionResolved) -> Option<Domain> {
@@ -1224,6 +1230,7 @@ mod tests {
                 outcome,
                 answers: Vec::new(),
                 reason: None,
+                ..Default::default()
             });
             assert!(
                 matches!(
@@ -1265,6 +1272,7 @@ mod tests {
                     notes: Some("note".into()),
                 }],
                 reason: Some("reason".into()),
+                ..Default::default()
             }));
             assert!(
                 matches!(event, Domain::QuestionSettled { outcome,answers,reason,.. } if outcome == expected && answers[0].answer == "A" && reason.as_deref() == Some("reason"))
@@ -1363,6 +1371,28 @@ mod tests {
                 matches!(requested(value),Domain::QuestionAsked { unsupported_reason:Some(_),questions,.. } if questions.is_empty()),
                 "{mode}"
             );
+        }
+    }
+    #[test]
+    fn a_plan_approval_and_plan_outcomes_are_not_read_as_questions() {
+        let mut value = question();
+        value.kind = wire::InteractionKind::PlanApproval as i32;
+        assert!(matches!(
+            requested(value),
+            Domain::QuestionAsked { unsupported_reason: Some(reason), questions, .. }
+                if questions.is_empty() && reason == "Unsupported interaction kind"
+        ));
+        let mut value = question();
+        value.payload = Some(wire::interaction_requested::Payload::Plan(wire::PlanProposal::default()));
+        assert!(matches!(
+            requested(value),
+            Domain::QuestionAsked { unsupported_reason: Some(_), questions, .. } if questions.is_empty()
+        ));
+        for outcome in [
+            wire::InteractionOutcome::Approved,
+            wire::InteractionOutcome::KeptPlanning,
+        ] {
+            assert_eq!(question_outcome(outcome as i32), None);
         }
     }
     #[test]
@@ -1661,6 +1691,7 @@ mod tests {
                         notes: None,
                     }],
                     reason: None,
+                    ..Default::default()
                 };
                 match field {
                     "answer" => value.answers[0].answer = text.clone(),
@@ -1746,6 +1777,7 @@ mod tests {
                     },
                 ],
                 reason: None,
+                ..Default::default()
             };
             let Domain::QuestionSettled { outcome, answers, .. } = resolved(value).unwrap() else {
                 panic!("settled")

@@ -82,9 +82,9 @@ fn project_dir() -> PathBuf {
 /// `update` the version of the selected update the tab ran on.
 fn info(untested: bool, update: Option<&str>) -> ProviderInfo {
     let mut info = ProviderInfo {
-        sidecar_version: update.unwrap_or("0.4.0").to_string(),
+        sidecar_version: update.unwrap_or("0.5.0").to_string(),
         protocol_major: 3,
-        protocol_minor: 25,
+        protocol_minor: 26,
         ..ProviderInfo::default()
     };
     if untested {

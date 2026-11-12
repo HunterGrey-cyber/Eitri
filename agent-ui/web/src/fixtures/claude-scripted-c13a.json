@@ -1,12 +1,12 @@
 {
   "domain_events": [
     {
-      "occurred_at": 1794467380963,
+      "occurred_at": 1794501137968,
       "tasks": [],
       "type": "background_tasks_changed"
     },
     {
-      "turn_id": "d1da6a5b-ebe6-4186-ba54-a057947b2782",
+      "turn_id": "b62a220d-4f88-4d6a-a33a-6d59a1238f1d",
       "type": "turn_started"
     },
     {
@@ -213,8 +213,8 @@
     {
       "cwd": "$RUN/project",
       "model": "claude-opus-5-5",
-      "provider_session_id": "15ad1d79-ee50-4314-95bc-8eae38ec91b8",
-      "session_id": "8e14b04f-b1df-4d61-86f6-47ddd6fdc27d",
+      "provider_session_id": "aacf25a5-bb4c-41b7-b254-c2eeeb4f22d5",
+      "session_id": "6c8325ac-7aea-421b-93f7-1251fad4692e",
       "type": "session_opened"
     },
     {
@@ -248,7 +248,7 @@
         "error_kind": "<cli-text chars=10 sha256=23b17b289036cd30>",
         "error_status": 529,
         "max_retries": 2,
-        "retry_delay_ms": 553
+        "retry_delay_ms": 542
       },
       "task_id": null,
       "task_status": null,
@@ -264,7 +264,7 @@
         "error_kind": "<cli-text chars=10 sha256=23b17b289036cd30>",
         "error_status": 529,
         "max_retries": 2,
-        "retry_delay_ms": 1004
+        "retry_delay_ms": 1006
       },
       "task_id": null,
       "task_status": null,
@@ -274,7 +274,7 @@
     {
       "kind": "text",
       "text": "C13A-OK",
-      "turn_id": "d1da6a5b-ebe6-4186-ba54-a057947b2782",
+      "turn_id": "b62a220d-4f88-4d6a-a33a-6d59a1238f1d",
       "type": "content_delta"
     },
     {
@@ -287,7 +287,7 @@
       "outcome": "completed",
       "result_text": "C13A-OK",
       "stop_reason": "end_turn",
-      "turn_id": "d1da6a5b-ebe6-4186-ba54-a057947b2782",
+      "turn_id": "b62a220d-4f88-4d6a-a33a-6d59a1238f1d",
       "type": "turn_completed",
       "usage": {
         "model": "claude-opus-5-5",
@@ -305,12 +305,12 @@
   "events": {
     "events": [
       {
-        "occurred_at": 1794467380963,
+        "occurred_at": 1794501137968,
         "tasks": [],
         "type": "background_tasks_changed"
       },
       {
-        "turn_id": "d1da6a5b-ebe6-4186-ba54-a057947b2782",
+        "turn_id": "b62a220d-4f88-4d6a-a33a-6d59a1238f1d",
         "type": "turn_started"
       },
       {
@@ -517,8 +517,8 @@
       {
         "cwd": "$RUN/project",
         "model": "claude-opus-5-5",
-        "provider_session_id": "15ad1d79-ee50-4314-95bc-8eae38ec91b8",
-        "session_id": "8e14b04f-b1df-4d61-86f6-47ddd6fdc27d",
+        "provider_session_id": "aacf25a5-bb4c-41b7-b254-c2eeeb4f22d5",
+        "session_id": "6c8325ac-7aea-421b-93f7-1251fad4692e",
         "type": "session_opened"
       },
       {
@@ -552,7 +552,7 @@
           "error_kind": "<cli-text chars=10 sha256=23b17b289036cd30>",
           "error_status": 529,
           "max_retries": 2,
-          "retry_delay_ms": 553
+          "retry_delay_ms": 542
         },
         "task_id": null,
         "task_status": null,
@@ -568,7 +568,7 @@
           "error_kind": "<cli-text chars=10 sha256=23b17b289036cd30>",
           "error_status": 529,
           "max_retries": 2,
-          "retry_delay_ms": 1004
+          "retry_delay_ms": 1006
         },
         "task_id": null,
         "task_status": null,
@@ -578,7 +578,7 @@
       {
         "kind": "text",
         "text": "C13A-OK",
-        "turn_id": "d1da6a5b-ebe6-4186-ba54-a057947b2782",
+        "turn_id": "b62a220d-4f88-4d6a-a33a-6d59a1238f1d",
         "type": "content_delta"
       },
       {
@@ -591,7 +591,7 @@
         "outcome": "completed",
         "result_text": "C13A-OK",
         "stop_reason": "end_turn",
-        "turn_id": "d1da6a5b-ebe6-4186-ba54-a057947b2782",
+        "turn_id": "b62a220d-4f88-4d6a-a33a-6d59a1238f1d",
         "type": "turn_completed",
         "usage": {
           "model": "claude-opus-5-5",

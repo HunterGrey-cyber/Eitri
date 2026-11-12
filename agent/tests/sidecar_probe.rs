@@ -62,7 +62,7 @@ fn launcher(dir: &Path, name: &str, vars: &[(&str, &str)]) -> PathBuf {
 
 /// What a sidecar of this build's own pin advertises, with one name taken out (none, for `""`).
 fn advertised_without(absent: &str) -> String {
-    let file = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/handshake/3.25.json");
+    let file = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/handshake/3.26.json");
     let json: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(file).unwrap()).unwrap();
     let kept: Vec<String> = json["capabilities"]
         .as_array()

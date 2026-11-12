@@ -1,12 +1,12 @@
 {
   "domain_events": [
     {
-      "occurred_at": 1794467385309,
+      "occurred_at": 1794501142264,
       "tasks": [],
       "type": "background_tasks_changed"
     },
     {
-      "turn_id": "fee7dd54-d097-4c4a-94c1-1cc93c7ee858",
+      "turn_id": "b74c46e4-151f-4f2f-a4f1-1a8637d3f8b7",
       "type": "turn_started"
     },
     {
@@ -213,8 +213,8 @@
     {
       "cwd": "$RUN/project",
       "model": "claude-opus-5-5",
-      "provider_session_id": "dab85499-d0f9-4659-9da1-7c61b2f0d10b",
-      "session_id": "af9b5aee-5134-4d75-a095-aaefd2adec7d",
+      "provider_session_id": "3ad823d1-2ff1-49c2-9aa9-fe1aeba3bb35",
+      "session_id": "36770659-3eb8-4f39-9806-6cffa244a1f3",
       "type": "session_opened"
     },
     {
@@ -249,19 +249,19 @@
       "outcome": "completed",
       "result_text": "<cli-text chars=102 sha256=70e182b345f02503>",
       "stop_reason": null,
-      "turn_id": "fee7dd54-d097-4c4a-94c1-1cc93c7ee858",
+      "turn_id": "b74c46e4-151f-4f2f-a4f1-1a8637d3f8b7",
       "type": "turn_completed",
       "usage": null
     },
     {
-      "turn_id": "05c6077f-5599-4136-a6f4-a2db7382810d",
+      "turn_id": "890958e5-c17a-411b-92d6-0eb4c94531e9",
       "type": "turn_started"
     },
     {
       "cwd": "$RUN/project",
       "model": "claude-opus-5-5",
-      "provider_session_id": "dab85499-d0f9-4659-9da1-7c61b2f0d10b",
-      "session_id": "af9b5aee-5134-4d75-a095-aaefd2adec7d",
+      "provider_session_id": "3ad823d1-2ff1-49c2-9aa9-fe1aeba3bb35",
+      "session_id": "36770659-3eb8-4f39-9806-6cffa244a1f3",
       "type": "session_opened"
     },
     {
@@ -289,7 +289,7 @@
     {
       "kind": "text",
       "text": "C14-REPLY",
-      "turn_id": "05c6077f-5599-4136-a6f4-a2db7382810d",
+      "turn_id": "890958e5-c17a-411b-92d6-0eb4c94531e9",
       "type": "content_delta"
     },
     {
@@ -302,7 +302,7 @@
       "outcome": "completed",
       "result_text": "C14-REPLY",
       "stop_reason": "end_turn",
-      "turn_id": "05c6077f-5599-4136-a6f4-a2db7382810d",
+      "turn_id": "890958e5-c17a-411b-92d6-0eb4c94531e9",
       "type": "turn_completed",
       "usage": {
         "model": "claude-opus-5-5",
@@ -317,14 +317,14 @@
       }
     },
     {
-      "turn_id": "9e7a10e2-ee58-4888-b6fa-767221a9d92e",
+      "turn_id": "9f8814b1-5aad-4c16-a9a9-350b35d5b13e",
       "type": "turn_started"
     },
     {
       "cwd": "$RUN/project",
       "model": "claude-opus-5-5",
-      "provider_session_id": "dab85499-d0f9-4659-9da1-7c61b2f0d10b",
-      "session_id": "af9b5aee-5134-4d75-a095-aaefd2adec7d",
+      "provider_session_id": "3ad823d1-2ff1-49c2-9aa9-fe1aeba3bb35",
+      "session_id": "36770659-3eb8-4f39-9806-6cffa244a1f3",
       "type": "session_opened"
     },
     {
@@ -342,7 +342,7 @@
     {
       "kind": "text",
       "text": "<cli-text chars=353 sha256=8e515f14f7ccdbed>",
-      "turn_id": "9e7a10e2-ee58-4888-b6fa-767221a9d92e",
+      "turn_id": "9f8814b1-5aad-4c16-a9a9-350b35d5b13e",
       "type": "content_delta"
     },
     {
@@ -355,7 +355,7 @@
       "outcome": "completed",
       "result_text": "<cli-text chars=353 sha256=8e515f14f7ccdbed>",
       "stop_reason": null,
-      "turn_id": "9e7a10e2-ee58-4888-b6fa-767221a9d92e",
+      "turn_id": "9f8814b1-5aad-4c16-a9a9-350b35d5b13e",
       "type": "turn_completed",
       "usage": {
         "model": "claude-opus-5-5",
@@ -373,12 +373,12 @@
   "events": {
     "events": [
       {
-        "occurred_at": 1794467385309,
+        "occurred_at": 1794501142264,
         "tasks": [],
         "type": "background_tasks_changed"
       },
       {
-        "turn_id": "fee7dd54-d097-4c4a-94c1-1cc93c7ee858",
+        "turn_id": "b74c46e4-151f-4f2f-a4f1-1a8637d3f8b7",
         "type": "turn_started"
       },
       {
@@ -585,8 +585,8 @@
       {
         "cwd": "$RUN/project",
         "model": "claude-opus-5-5",
-        "provider_session_id": "dab85499-d0f9-4659-9da1-7c61b2f0d10b",
-        "session_id": "af9b5aee-5134-4d75-a095-aaefd2adec7d",
+        "provider_session_id": "3ad823d1-2ff1-49c2-9aa9-fe1aeba3bb35",
+        "session_id": "36770659-3eb8-4f39-9806-6cffa244a1f3",
         "type": "session_opened"
       },
       {
@@ -621,19 +621,19 @@
         "outcome": "completed",
         "result_text": "<cli-text chars=102 sha256=70e182b345f02503>",
         "stop_reason": null,
-        "turn_id": "fee7dd54-d097-4c4a-94c1-1cc93c7ee858",
+        "turn_id": "b74c46e4-151f-4f2f-a4f1-1a8637d3f8b7",
         "type": "turn_completed",
         "usage": null
       },
       {
-        "turn_id": "05c6077f-5599-4136-a6f4-a2db7382810d",
+        "turn_id": "890958e5-c17a-411b-92d6-0eb4c94531e9",
         "type": "turn_started"
       },
       {
         "cwd": "$RUN/project",
         "model": "claude-opus-5-5",
-        "provider_session_id": "dab85499-d0f9-4659-9da1-7c61b2f0d10b",
-        "session_id": "af9b5aee-5134-4d75-a095-aaefd2adec7d",
+        "provider_session_id": "3ad823d1-2ff1-49c2-9aa9-fe1aeba3bb35",
+        "session_id": "36770659-3eb8-4f39-9806-6cffa244a1f3",
         "type": "session_opened"
       },
       {
@@ -661,7 +661,7 @@
       {
         "kind": "text",
         "text": "C14-REPLY",
-        "turn_id": "05c6077f-5599-4136-a6f4-a2db7382810d",
+        "turn_id": "890958e5-c17a-411b-92d6-0eb4c94531e9",
         "type": "content_delta"
       },
       {
@@ -674,7 +674,7 @@
         "outcome": "completed",
         "result_text": "C14-REPLY",
         "stop_reason": "end_turn",
-        "turn_id": "05c6077f-5599-4136-a6f4-a2db7382810d",
+        "turn_id": "890958e5-c17a-411b-92d6-0eb4c94531e9",
         "type": "turn_completed",
         "usage": {
           "model": "claude-opus-5-5",
@@ -689,14 +689,14 @@
         }
       },
       {
-        "turn_id": "9e7a10e2-ee58-4888-b6fa-767221a9d92e",
+        "turn_id": "9f8814b1-5aad-4c16-a9a9-350b35d5b13e",
         "type": "turn_started"
       },
       {
         "cwd": "$RUN/project",
         "model": "claude-opus-5-5",
-        "provider_session_id": "dab85499-d0f9-4659-9da1-7c61b2f0d10b",
-        "session_id": "af9b5aee-5134-4d75-a095-aaefd2adec7d",
+        "provider_session_id": "3ad823d1-2ff1-49c2-9aa9-fe1aeba3bb35",
+        "session_id": "36770659-3eb8-4f39-9806-6cffa244a1f3",
         "type": "session_opened"
       },
       {
@@ -714,7 +714,7 @@
       {
         "kind": "text",
         "text": "<cli-text chars=353 sha256=8e515f14f7ccdbed>",
-        "turn_id": "9e7a10e2-ee58-4888-b6fa-767221a9d92e",
+        "turn_id": "9f8814b1-5aad-4c16-a9a9-350b35d5b13e",
         "type": "content_delta"
       },
       {
@@ -727,7 +727,7 @@
         "outcome": "completed",
         "result_text": "<cli-text chars=353 sha256=8e515f14f7ccdbed>",
         "stop_reason": null,
-        "turn_id": "9e7a10e2-ee58-4888-b6fa-767221a9d92e",
+        "turn_id": "9f8814b1-5aad-4c16-a9a9-350b35d5b13e",
         "type": "turn_completed",
         "usage": {
           "model": "claude-opus-5-5",

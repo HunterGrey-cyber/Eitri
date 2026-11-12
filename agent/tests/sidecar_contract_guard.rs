@@ -27,10 +27,20 @@ fn the_pinned_protocol_exposes_the_preset() {
 /// The pinned revision speaks protocol 3.25, whose capabilities Eitri reads by name: a protocol bump
 /// the client does not know fails here.
 #[test]
-fn the_pinned_protocol_is_3_25_and_names_its_capabilities() {
+fn the_pinned_protocol_is_3_26_and_names_its_capabilities() {
     use claude_runtime_protocol as wire;
     assert_eq!(wire::PROTOCOL_MAJOR, 3);
-    assert_eq!(wire::PROTOCOL_MINOR, 25);
+    assert_eq!(wire::PROTOCOL_MINOR, 26);
+    let new_in_26: Vec<&str> = wire::CAPABILITY_SINCE_MINOR
+        .iter()
+        .filter(|(_, minor)| *minor == 26)
+        .map(|(name, _)| *name)
+        .collect();
+    assert_eq!(
+        new_in_26,
+        ["plan_mode_v1", "turn_content_v1"],
+        "the capabilities of minor 26"
+    );
     assert_eq!(wire::CAP_TEXT_BLOCK_START, "text_block_start");
     let new_in_25: Vec<&str> = wire::CAPABILITY_SINCE_MINOR
         .iter()
