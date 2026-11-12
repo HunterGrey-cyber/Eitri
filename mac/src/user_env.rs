@@ -186,6 +186,8 @@ mod tests {
     const LAUNCHSERVICES_PATH: &str = "/usr/bin:/bin:/usr/sbin:/sbin";
 
     fn executable(path: &Path, text: &str) {
+        // The writer is a child process: a fork while another test holds a log lock would hold that lock too.
+        let _spawning = crate::spawn_gate::spawning();
         script_fixture::write_executable_script(path, text, 0o755).unwrap();
     }
 
