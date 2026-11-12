@@ -1,12 +1,12 @@
 {
   "domain_events": [
     {
-      "occurred_at": 1794467387604,
+      "occurred_at": 1794497482103,
       "tasks": [],
       "type": "background_tasks_changed"
     },
     {
-      "turn_id": "41c5cfd9-3818-4826-9a59-99c619d9c69a",
+      "turn_id": "9f4724fc-b6ec-4c5e-91c5-6ef7c44ba7e8",
       "type": "turn_started"
     },
     {
@@ -211,20 +211,10 @@
       "type": "commands_available"
     },
     {
-      "input": {
-        "max_results": 5,
-        "query": "<cli-text chars=37 sha256=7734778e71856845>"
-      },
-      "permission_id": "82509aa7-6502-4dfd-a392-03ef6669e9ec",
-      "tool_name": "ToolSearch",
-      "tool_use_id": "toolu_preload_m1",
-      "type": "permission_requested"
-    },
-    {
       "cwd": "$RUN/project",
       "model": "claude-opus-5-5",
-      "provider_session_id": "a1e10899-14ef-4a0c-acd9-9abf86a17f43",
-      "session_id": "90494ebe-f471-4521-b91f-ba7b7e399546",
+      "provider_session_id": "4879d1f4-62ad-4285-b135-3cf464309e9c",
+      "session_id": "0bf3ec6b-e630-40c8-8ab1-5bff56cbb64c",
       "type": "session_opened"
     },
     {
@@ -240,20 +230,19 @@
       "type": "session_servers"
     },
     {
-      "outcome": "allowed",
-      "permission_id": "82509aa7-6502-4dfd-a392-03ef6669e9ec",
-      "type": "permission_resolved"
+      "input": {
+        "max_results": 5,
+        "query": "<cli-text chars=37 sha256=7734778e71856845>"
+      },
+      "permission_id": "cc656c53-8f8e-41d1-945d-60b533b7528e",
+      "tool_name": "ToolSearch",
+      "tool_use_id": "toolu_preload_m1",
+      "type": "permission_requested"
     },
     {
-      "input": {
-        "cron": "<cli-text chars=12 sha256=5546cdbbef4c6a01>",
-        "prompt": "C15B-FIRE",
-        "recurring": false
-      },
-      "permission_id": "67c88f34-f68a-4394-9aa8-703f6735e625",
-      "tool_name": "CronCreate",
-      "tool_use_id": "toolu_cron1",
-      "type": "permission_requested"
+      "outcome": "allowed",
+      "permission_id": "cc656c53-8f8e-41d1-945d-60b533b7528e",
+      "type": "permission_resolved"
     },
     {
       "content": "<cli-text chars=445 sha256=16b94d4abf4831e2>",
@@ -266,8 +255,19 @@
       "type": "session_notice"
     },
     {
+      "input": {
+        "cron": "<cli-text chars=13 sha256=c8d9bf8e03010b50>",
+        "prompt": "C15B-FIRE",
+        "recurring": false
+      },
+      "permission_id": "a7f147a3-e530-4bd3-a254-27bc3be0150f",
+      "tool_name": "CronCreate",
+      "tool_use_id": "toolu_cron1",
+      "type": "permission_requested"
+    },
+    {
       "outcome": "allowed",
-      "permission_id": "67c88f34-f68a-4394-9aa8-703f6735e625",
+      "permission_id": "a7f147a3-e530-4bd3-a254-27bc3be0150f",
       "type": "permission_resolved"
     },
     {
@@ -276,26 +276,14 @@
         "prompt": "C15B-NEVER",
         "recurring": false
       },
-      "permission_id": "aa795b88-5bc7-4960-b899-b3b52a0459f3",
+      "permission_id": "769ed424-5d22-4047-bd90-8a3cfa21149e",
       "tool_name": "CronCreate",
       "tool_use_id": "toolu_cron2",
       "type": "permission_requested"
     },
     {
       "outcome": "allowed",
-      "permission_id": "aa795b88-5bc7-4960-b899-b3b52a0459f3",
-      "type": "permission_resolved"
-    },
-    {
-      "input": {},
-      "permission_id": "d6531173-13d1-40ae-a59e-6287cc032fda",
-      "tool_name": "CronList",
-      "tool_use_id": "toolu_list1",
-      "type": "permission_requested"
-    },
-    {
-      "outcome": "allowed",
-      "permission_id": "d6531173-13d1-40ae-a59e-6287cc032fda",
+      "permission_id": "769ed424-5d22-4047-bd90-8a3cfa21149e",
       "type": "permission_resolved"
     },
     {
@@ -305,34 +293,29 @@
       },
       "name": "ToolSearch",
       "tool_use_id": "toolu_preload_m1",
-      "turn_id": "41c5cfd9-3818-4826-9a59-99c619d9c69a",
+      "turn_id": "9f4724fc-b6ec-4c5e-91c5-6ef7c44ba7e8",
       "type": "tool_call_started"
     },
     {
+      "input": {},
+      "permission_id": "ef11e2a5-3c4e-4a96-bf6f-e56b1365fee4",
+      "tool_name": "CronList",
+      "tool_use_id": "toolu_list1",
+      "type": "permission_requested"
+    },
+    {
+      "outcome": "allowed",
+      "permission_id": "ef11e2a5-3c4e-4a96-bf6f-e56b1365fee4",
+      "type": "permission_resolved"
+    },
+    {
       "input": {
-        "id": "a75ac00d"
+        "id": "050c6a6f"
       },
-      "permission_id": "569e8e71-a411-4a25-a2b4-ed9893e53156",
+      "permission_id": "421692d1-172f-4e62-9602-2351d247b53f",
       "tool_name": "CronDelete",
       "tool_use_id": "toolu_del1",
       "type": "permission_requested"
-    },
-    {
-      "outcome": "allowed",
-      "permission_id": "569e8e71-a411-4a25-a2b4-ed9893e53156",
-      "type": "permission_resolved"
-    },
-    {
-      "input": {},
-      "permission_id": "82ebc6a0-6459-44b0-ad15-8a9229b8dac7",
-      "tool_name": "CronList",
-      "tool_use_id": "toolu_list2",
-      "type": "permission_requested"
-    },
-    {
-      "outcome": "allowed",
-      "permission_id": "82ebc6a0-6459-44b0-ad15-8a9229b8dac7",
-      "type": "permission_resolved"
     },
     {
       "content": [
@@ -351,25 +334,42 @@
       ],
       "is_error": false,
       "tool_use_id": "toolu_preload_m1",
-      "turn_id": "41c5cfd9-3818-4826-9a59-99c619d9c69a",
+      "turn_id": "9f4724fc-b6ec-4c5e-91c5-6ef7c44ba7e8",
       "type": "tool_call_completed"
     },
     {
+      "outcome": "allowed",
+      "permission_id": "421692d1-172f-4e62-9602-2351d247b53f",
+      "type": "permission_resolved"
+    },
+    {
+      "input": {},
+      "permission_id": "2b79ef80-de55-4443-83f8-74201ffbd232",
+      "tool_name": "CronList",
+      "tool_use_id": "toolu_list2",
+      "type": "permission_requested"
+    },
+    {
+      "outcome": "allowed",
+      "permission_id": "2b79ef80-de55-4443-83f8-74201ffbd232",
+      "type": "permission_resolved"
+    },
+    {
       "input": {
-        "cron": "<cli-text chars=12 sha256=5546cdbbef4c6a01>",
+        "cron": "<cli-text chars=13 sha256=c8d9bf8e03010b50>",
         "prompt": "C15B-FIRE",
         "recurring": false
       },
       "name": "CronCreate",
       "tool_use_id": "toolu_cron1",
-      "turn_id": "41c5cfd9-3818-4826-9a59-99c619d9c69a",
+      "turn_id": "9f4724fc-b6ec-4c5e-91c5-6ef7c44ba7e8",
       "type": "tool_call_started"
     },
     {
-      "content": "<cli-text chars=169 sha256=cfe9ae943e69a20a>",
+      "content": "<cli-text chars=170 sha256=64188fe229719c6a>",
       "is_error": false,
       "tool_use_id": "toolu_cron1",
-      "turn_id": "41c5cfd9-3818-4826-9a59-99c619d9c69a",
+      "turn_id": "9f4724fc-b6ec-4c5e-91c5-6ef7c44ba7e8",
       "type": "tool_call_completed"
     },
     {
@@ -380,64 +380,64 @@
       },
       "name": "CronCreate",
       "tool_use_id": "toolu_cron2",
-      "turn_id": "41c5cfd9-3818-4826-9a59-99c619d9c69a",
+      "turn_id": "9f4724fc-b6ec-4c5e-91c5-6ef7c44ba7e8",
       "type": "tool_call_started"
     },
     {
-      "content": "<cli-text chars=167 sha256=e2fada8557f5d2f8>",
+      "content": "<cli-text chars=166 sha256=1b70499d4e18add1>",
       "is_error": false,
       "tool_use_id": "toolu_cron2",
-      "turn_id": "41c5cfd9-3818-4826-9a59-99c619d9c69a",
+      "turn_id": "9f4724fc-b6ec-4c5e-91c5-6ef7c44ba7e8",
       "type": "tool_call_completed"
     },
     {
       "input": {},
       "name": "CronList",
       "tool_use_id": "toolu_list1",
-      "turn_id": "41c5cfd9-3818-4826-9a59-99c619d9c69a",
+      "turn_id": "9f4724fc-b6ec-4c5e-91c5-6ef7c44ba7e8",
       "type": "tool_call_started"
     },
     {
-      "content": "<cli-text chars=168 sha256=a188c49d950313b3>",
+      "content": "<cli-text chars=168 sha256=fd5b40482254575a>",
       "is_error": false,
       "tool_use_id": "toolu_list1",
-      "turn_id": "41c5cfd9-3818-4826-9a59-99c619d9c69a",
+      "turn_id": "9f4724fc-b6ec-4c5e-91c5-6ef7c44ba7e8",
       "type": "tool_call_completed"
     },
     {
       "input": {
-        "id": "a75ac00d"
+        "id": "050c6a6f"
       },
       "name": "CronDelete",
       "tool_use_id": "toolu_del1",
-      "turn_id": "41c5cfd9-3818-4826-9a59-99c619d9c69a",
+      "turn_id": "9f4724fc-b6ec-4c5e-91c5-6ef7c44ba7e8",
       "type": "tool_call_started"
     },
     {
-      "content": "<cli-text chars=23 sha256=570a6bd6b5b4af19>",
+      "content": "<cli-text chars=23 sha256=22ee515c66ae2f7b>",
       "is_error": false,
       "tool_use_id": "toolu_del1",
-      "turn_id": "41c5cfd9-3818-4826-9a59-99c619d9c69a",
+      "turn_id": "9f4724fc-b6ec-4c5e-91c5-6ef7c44ba7e8",
       "type": "tool_call_completed"
     },
     {
       "input": {},
       "name": "CronList",
       "tool_use_id": "toolu_list2",
-      "turn_id": "41c5cfd9-3818-4826-9a59-99c619d9c69a",
+      "turn_id": "9f4724fc-b6ec-4c5e-91c5-6ef7c44ba7e8",
       "type": "tool_call_started"
     },
     {
-      "content": "<cli-text chars=84 sha256=645683201f53f631>",
+      "content": "<cli-text chars=85 sha256=0037c72500f74898>",
       "is_error": false,
       "tool_use_id": "toolu_list2",
-      "turn_id": "41c5cfd9-3818-4826-9a59-99c619d9c69a",
+      "turn_id": "9f4724fc-b6ec-4c5e-91c5-6ef7c44ba7e8",
       "type": "tool_call_completed"
     },
     {
       "kind": "text",
       "text": "CRONS-SET",
-      "turn_id": "41c5cfd9-3818-4826-9a59-99c619d9c69a",
+      "turn_id": "9f4724fc-b6ec-4c5e-91c5-6ef7c44ba7e8",
       "type": "content_delta"
     },
     {
@@ -450,7 +450,7 @@
       "outcome": "completed",
       "result_text": "CRONS-SET",
       "stop_reason": "end_turn",
-      "turn_id": "41c5cfd9-3818-4826-9a59-99c619d9c69a",
+      "turn_id": "9f4724fc-b6ec-4c5e-91c5-6ef7c44ba7e8",
       "type": "turn_completed",
       "usage": {
         "model": "claude-opus-5-5",
@@ -465,12 +465,12 @@
       }
     },
     {
-      "turn_id": "150be956-6fbd-4c8e-8c5f-5713a3aa22ac",
+      "turn_id": "d499cf51-2531-4d6c-bdbc-e7498a49b44e",
       "type": "turn_started"
     },
     {
       "cause": {
-        "cron_id": "<cli-text chars=8 sha256=47ad3fc4e2645f39>",
+        "cron_id": "<cli-text chars=8 sha256=409edf692f4ecdde>",
         "description": null,
         "kind": "scheduled",
         "peer_name": null,
@@ -485,14 +485,14 @@
         "wakeup_source": "<cli-text chars=15 sha256=c747dfdaf21028f2>"
       },
       "origin": "cli",
-      "turn_id": "150be956-6fbd-4c8e-8c5f-5713a3aa22ac",
+      "turn_id": "d499cf51-2531-4d6c-bdbc-e7498a49b44e",
       "type": "turn_attributed"
     },
     {
       "cwd": "$RUN/project",
       "model": "claude-opus-5-5",
-      "provider_session_id": "a1e10899-14ef-4a0c-acd9-9abf86a17f43",
-      "session_id": "90494ebe-f471-4521-b91f-ba7b7e399546",
+      "provider_session_id": "4879d1f4-62ad-4285-b135-3cf464309e9c",
+      "session_id": "0bf3ec6b-e630-40c8-8ab1-5bff56cbb64c",
       "type": "session_opened"
     },
     {
@@ -510,7 +510,7 @@
     {
       "kind": "text",
       "text": "CRON-FIRED",
-      "turn_id": "150be956-6fbd-4c8e-8c5f-5713a3aa22ac",
+      "turn_id": "d499cf51-2531-4d6c-bdbc-e7498a49b44e",
       "type": "content_delta"
     },
     {
@@ -523,7 +523,7 @@
       "outcome": "completed",
       "result_text": "CRON-FIRED",
       "stop_reason": "end_turn",
-      "turn_id": "150be956-6fbd-4c8e-8c5f-5713a3aa22ac",
+      "turn_id": "d499cf51-2531-4d6c-bdbc-e7498a49b44e",
       "type": "turn_completed",
       "usage": {
         "model": "claude-opus-5-5",
@@ -541,12 +541,12 @@
   "events": {
     "events": [
       {
-        "occurred_at": 1794467387604,
+        "occurred_at": 1794497482103,
         "tasks": [],
         "type": "background_tasks_changed"
       },
       {
-        "turn_id": "41c5cfd9-3818-4826-9a59-99c619d9c69a",
+        "turn_id": "9f4724fc-b6ec-4c5e-91c5-6ef7c44ba7e8",
         "type": "turn_started"
       },
       {
@@ -751,20 +751,10 @@
         "type": "commands_available"
       },
       {
-        "input": {
-          "max_results": 5,
-          "query": "<cli-text chars=37 sha256=7734778e71856845>"
-        },
-        "permission_id": "82509aa7-6502-4dfd-a392-03ef6669e9ec",
-        "tool_name": "ToolSearch",
-        "tool_use_id": "toolu_preload_m1",
-        "type": "permission_requested"
-      },
-      {
         "cwd": "$RUN/project",
         "model": "claude-opus-5-5",
-        "provider_session_id": "a1e10899-14ef-4a0c-acd9-9abf86a17f43",
-        "session_id": "90494ebe-f471-4521-b91f-ba7b7e399546",
+        "provider_session_id": "4879d1f4-62ad-4285-b135-3cf464309e9c",
+        "session_id": "0bf3ec6b-e630-40c8-8ab1-5bff56cbb64c",
         "type": "session_opened"
       },
       {
@@ -780,20 +770,19 @@
         "type": "session_servers"
       },
       {
-        "outcome": "allowed",
-        "permission_id": "82509aa7-6502-4dfd-a392-03ef6669e9ec",
-        "type": "permission_resolved"
+        "input": {
+          "max_results": 5,
+          "query": "<cli-text chars=37 sha256=7734778e71856845>"
+        },
+        "permission_id": "cc656c53-8f8e-41d1-945d-60b533b7528e",
+        "tool_name": "ToolSearch",
+        "tool_use_id": "toolu_preload_m1",
+        "type": "permission_requested"
       },
       {
-        "input": {
-          "cron": "<cli-text chars=12 sha256=5546cdbbef4c6a01>",
-          "prompt": "C15B-FIRE",
-          "recurring": false
-        },
-        "permission_id": "67c88f34-f68a-4394-9aa8-703f6735e625",
-        "tool_name": "CronCreate",
-        "tool_use_id": "toolu_cron1",
-        "type": "permission_requested"
+        "outcome": "allowed",
+        "permission_id": "cc656c53-8f8e-41d1-945d-60b533b7528e",
+        "type": "permission_resolved"
       },
       {
         "content": "<cli-text chars=445 sha256=16b94d4abf4831e2>",
@@ -806,8 +795,19 @@
         "type": "session_notice"
       },
       {
+        "input": {
+          "cron": "<cli-text chars=13 sha256=c8d9bf8e03010b50>",
+          "prompt": "C15B-FIRE",
+          "recurring": false
+        },
+        "permission_id": "a7f147a3-e530-4bd3-a254-27bc3be0150f",
+        "tool_name": "CronCreate",
+        "tool_use_id": "toolu_cron1",
+        "type": "permission_requested"
+      },
+      {
         "outcome": "allowed",
-        "permission_id": "67c88f34-f68a-4394-9aa8-703f6735e625",
+        "permission_id": "a7f147a3-e530-4bd3-a254-27bc3be0150f",
         "type": "permission_resolved"
       },
       {
@@ -816,26 +816,14 @@
           "prompt": "C15B-NEVER",
           "recurring": false
         },
-        "permission_id": "aa795b88-5bc7-4960-b899-b3b52a0459f3",
+        "permission_id": "769ed424-5d22-4047-bd90-8a3cfa21149e",
         "tool_name": "CronCreate",
         "tool_use_id": "toolu_cron2",
         "type": "permission_requested"
       },
       {
         "outcome": "allowed",
-        "permission_id": "aa795b88-5bc7-4960-b899-b3b52a0459f3",
-        "type": "permission_resolved"
-      },
-      {
-        "input": {},
-        "permission_id": "d6531173-13d1-40ae-a59e-6287cc032fda",
-        "tool_name": "CronList",
-        "tool_use_id": "toolu_list1",
-        "type": "permission_requested"
-      },
-      {
-        "outcome": "allowed",
-        "permission_id": "d6531173-13d1-40ae-a59e-6287cc032fda",
+        "permission_id": "769ed424-5d22-4047-bd90-8a3cfa21149e",
         "type": "permission_resolved"
       },
       {
@@ -845,34 +833,29 @@
         },
         "name": "ToolSearch",
         "tool_use_id": "toolu_preload_m1",
-        "turn_id": "41c5cfd9-3818-4826-9a59-99c619d9c69a",
+        "turn_id": "9f4724fc-b6ec-4c5e-91c5-6ef7c44ba7e8",
         "type": "tool_call_started"
       },
       {
+        "input": {},
+        "permission_id": "ef11e2a5-3c4e-4a96-bf6f-e56b1365fee4",
+        "tool_name": "CronList",
+        "tool_use_id": "toolu_list1",
+        "type": "permission_requested"
+      },
+      {
+        "outcome": "allowed",
+        "permission_id": "ef11e2a5-3c4e-4a96-bf6f-e56b1365fee4",
+        "type": "permission_resolved"
+      },
+      {
         "input": {
-          "id": "a75ac00d"
+          "id": "050c6a6f"
         },
-        "permission_id": "569e8e71-a411-4a25-a2b4-ed9893e53156",
+        "permission_id": "421692d1-172f-4e62-9602-2351d247b53f",
         "tool_name": "CronDelete",
         "tool_use_id": "toolu_del1",
         "type": "permission_requested"
-      },
-      {
-        "outcome": "allowed",
-        "permission_id": "569e8e71-a411-4a25-a2b4-ed9893e53156",
-        "type": "permission_resolved"
-      },
-      {
-        "input": {},
-        "permission_id": "82ebc6a0-6459-44b0-ad15-8a9229b8dac7",
-        "tool_name": "CronList",
-        "tool_use_id": "toolu_list2",
-        "type": "permission_requested"
-      },
-      {
-        "outcome": "allowed",
-        "permission_id": "82ebc6a0-6459-44b0-ad15-8a9229b8dac7",
-        "type": "permission_resolved"
       },
       {
         "content": [
@@ -891,25 +874,42 @@
         ],
         "is_error": false,
         "tool_use_id": "toolu_preload_m1",
-        "turn_id": "41c5cfd9-3818-4826-9a59-99c619d9c69a",
+        "turn_id": "9f4724fc-b6ec-4c5e-91c5-6ef7c44ba7e8",
         "type": "tool_call_completed"
       },
       {
+        "outcome": "allowed",
+        "permission_id": "421692d1-172f-4e62-9602-2351d247b53f",
+        "type": "permission_resolved"
+      },
+      {
+        "input": {},
+        "permission_id": "2b79ef80-de55-4443-83f8-74201ffbd232",
+        "tool_name": "CronList",
+        "tool_use_id": "toolu_list2",
+        "type": "permission_requested"
+      },
+      {
+        "outcome": "allowed",
+        "permission_id": "2b79ef80-de55-4443-83f8-74201ffbd232",
+        "type": "permission_resolved"
+      },
+      {
         "input": {
-          "cron": "<cli-text chars=12 sha256=5546cdbbef4c6a01>",
+          "cron": "<cli-text chars=13 sha256=c8d9bf8e03010b50>",
           "prompt": "C15B-FIRE",
           "recurring": false
         },
         "name": "CronCreate",
         "tool_use_id": "toolu_cron1",
-        "turn_id": "41c5cfd9-3818-4826-9a59-99c619d9c69a",
+        "turn_id": "9f4724fc-b6ec-4c5e-91c5-6ef7c44ba7e8",
         "type": "tool_call_started"
       },
       {
-        "content": "<cli-text chars=169 sha256=cfe9ae943e69a20a>",
+        "content": "<cli-text chars=170 sha256=64188fe229719c6a>",
         "is_error": false,
         "tool_use_id": "toolu_cron1",
-        "turn_id": "41c5cfd9-3818-4826-9a59-99c619d9c69a",
+        "turn_id": "9f4724fc-b6ec-4c5e-91c5-6ef7c44ba7e8",
         "type": "tool_call_completed"
       },
       {
@@ -920,64 +920,64 @@
         },
         "name": "CronCreate",
         "tool_use_id": "toolu_cron2",
-        "turn_id": "41c5cfd9-3818-4826-9a59-99c619d9c69a",
+        "turn_id": "9f4724fc-b6ec-4c5e-91c5-6ef7c44ba7e8",
         "type": "tool_call_started"
       },
       {
-        "content": "<cli-text chars=167 sha256=e2fada8557f5d2f8>",
+        "content": "<cli-text chars=166 sha256=1b70499d4e18add1>",
         "is_error": false,
         "tool_use_id": "toolu_cron2",
-        "turn_id": "41c5cfd9-3818-4826-9a59-99c619d9c69a",
+        "turn_id": "9f4724fc-b6ec-4c5e-91c5-6ef7c44ba7e8",
         "type": "tool_call_completed"
       },
       {
         "input": {},
         "name": "CronList",
         "tool_use_id": "toolu_list1",
-        "turn_id": "41c5cfd9-3818-4826-9a59-99c619d9c69a",
+        "turn_id": "9f4724fc-b6ec-4c5e-91c5-6ef7c44ba7e8",
         "type": "tool_call_started"
       },
       {
-        "content": "<cli-text chars=168 sha256=a188c49d950313b3>",
+        "content": "<cli-text chars=168 sha256=fd5b40482254575a>",
         "is_error": false,
         "tool_use_id": "toolu_list1",
-        "turn_id": "41c5cfd9-3818-4826-9a59-99c619d9c69a",
+        "turn_id": "9f4724fc-b6ec-4c5e-91c5-6ef7c44ba7e8",
         "type": "tool_call_completed"
       },
       {
         "input": {
-          "id": "a75ac00d"
+          "id": "050c6a6f"
         },
         "name": "CronDelete",
         "tool_use_id": "toolu_del1",
-        "turn_id": "41c5cfd9-3818-4826-9a59-99c619d9c69a",
+        "turn_id": "9f4724fc-b6ec-4c5e-91c5-6ef7c44ba7e8",
         "type": "tool_call_started"
       },
       {
-        "content": "<cli-text chars=23 sha256=570a6bd6b5b4af19>",
+        "content": "<cli-text chars=23 sha256=22ee515c66ae2f7b>",
         "is_error": false,
         "tool_use_id": "toolu_del1",
-        "turn_id": "41c5cfd9-3818-4826-9a59-99c619d9c69a",
+        "turn_id": "9f4724fc-b6ec-4c5e-91c5-6ef7c44ba7e8",
         "type": "tool_call_completed"
       },
       {
         "input": {},
         "name": "CronList",
         "tool_use_id": "toolu_list2",
-        "turn_id": "41c5cfd9-3818-4826-9a59-99c619d9c69a",
+        "turn_id": "9f4724fc-b6ec-4c5e-91c5-6ef7c44ba7e8",
         "type": "tool_call_started"
       },
       {
-        "content": "<cli-text chars=84 sha256=645683201f53f631>",
+        "content": "<cli-text chars=85 sha256=0037c72500f74898>",
         "is_error": false,
         "tool_use_id": "toolu_list2",
-        "turn_id": "41c5cfd9-3818-4826-9a59-99c619d9c69a",
+        "turn_id": "9f4724fc-b6ec-4c5e-91c5-6ef7c44ba7e8",
         "type": "tool_call_completed"
       },
       {
         "kind": "text",
         "text": "CRONS-SET",
-        "turn_id": "41c5cfd9-3818-4826-9a59-99c619d9c69a",
+        "turn_id": "9f4724fc-b6ec-4c5e-91c5-6ef7c44ba7e8",
         "type": "content_delta"
       },
       {
@@ -990,7 +990,7 @@
         "outcome": "completed",
         "result_text": "CRONS-SET",
         "stop_reason": "end_turn",
-        "turn_id": "41c5cfd9-3818-4826-9a59-99c619d9c69a",
+        "turn_id": "9f4724fc-b6ec-4c5e-91c5-6ef7c44ba7e8",
         "type": "turn_completed",
         "usage": {
           "model": "claude-opus-5-5",
@@ -1005,12 +1005,12 @@
         }
       },
       {
-        "turn_id": "150be956-6fbd-4c8e-8c5f-5713a3aa22ac",
+        "turn_id": "d499cf51-2531-4d6c-bdbc-e7498a49b44e",
         "type": "turn_started"
       },
       {
         "cause": {
-          "cron_id": "<cli-text chars=8 sha256=47ad3fc4e2645f39>",
+          "cron_id": "<cli-text chars=8 sha256=409edf692f4ecdde>",
           "description": null,
           "kind": "scheduled",
           "peer_name": null,
@@ -1025,14 +1025,14 @@
           "wakeup_source": "<cli-text chars=15 sha256=c747dfdaf21028f2>"
         },
         "origin": "cli",
-        "turn_id": "150be956-6fbd-4c8e-8c5f-5713a3aa22ac",
+        "turn_id": "d499cf51-2531-4d6c-bdbc-e7498a49b44e",
         "type": "turn_attributed"
       },
       {
         "cwd": "$RUN/project",
         "model": "claude-opus-5-5",
-        "provider_session_id": "a1e10899-14ef-4a0c-acd9-9abf86a17f43",
-        "session_id": "90494ebe-f471-4521-b91f-ba7b7e399546",
+        "provider_session_id": "4879d1f4-62ad-4285-b135-3cf464309e9c",
+        "session_id": "0bf3ec6b-e630-40c8-8ab1-5bff56cbb64c",
         "type": "session_opened"
       },
       {
@@ -1050,7 +1050,7 @@
       {
         "kind": "text",
         "text": "CRON-FIRED",
-        "turn_id": "150be956-6fbd-4c8e-8c5f-5713a3aa22ac",
+        "turn_id": "d499cf51-2531-4d6c-bdbc-e7498a49b44e",
         "type": "content_delta"
       },
       {
@@ -1063,7 +1063,7 @@
         "outcome": "completed",
         "result_text": "CRON-FIRED",
         "stop_reason": "end_turn",
-        "turn_id": "150be956-6fbd-4c8e-8c5f-5713a3aa22ac",
+        "turn_id": "d499cf51-2531-4d6c-bdbc-e7498a49b44e",
         "type": "turn_completed",
         "usage": {
           "model": "claude-opus-5-5",
@@ -1309,7 +1309,7 @@
           "kind": "informational",
           "level": "warning",
           "scalars": {},
-          "seq": 10,
+          "seq": 9,
           "taskId": null,
           "taskStatus": null,
           "toolUseId": null
@@ -1348,24 +1348,24 @@
             ],
             "isError": false
           },
-          "seq": 16,
+          "seq": 14,
           "toolUseId": "toolu_preload_m1",
-          "turnId": "41c5cfd9-3818-4826-9a59-99c619d9c69a"
+          "turnId": "9f4724fc-b6ec-4c5e-91c5-6ef7c44ba7e8"
         },
         {
           "input": {
-            "cron": "<cli-text chars=12 sha256=5546cdbbef4c6a01>",
+            "cron": "<cli-text chars=13 sha256=c8d9bf8e03010b50>",
             "prompt": "C15B-FIRE",
             "recurring": false
           },
           "name": "CronCreate",
           "result": {
-            "content": "<cli-text chars=169 sha256=cfe9ae943e69a20a>",
+            "content": "<cli-text chars=170 sha256=64188fe229719c6a>",
             "isError": false
           },
           "seq": 22,
           "toolUseId": "toolu_cron1",
-          "turnId": "41c5cfd9-3818-4826-9a59-99c619d9c69a"
+          "turnId": "9f4724fc-b6ec-4c5e-91c5-6ef7c44ba7e8"
         },
         {
           "input": {
@@ -1375,47 +1375,47 @@
           },
           "name": "CronCreate",
           "result": {
-            "content": "<cli-text chars=167 sha256=e2fada8557f5d2f8>",
+            "content": "<cli-text chars=166 sha256=1b70499d4e18add1>",
             "isError": false
           },
           "seq": 24,
           "toolUseId": "toolu_cron2",
-          "turnId": "41c5cfd9-3818-4826-9a59-99c619d9c69a"
+          "turnId": "9f4724fc-b6ec-4c5e-91c5-6ef7c44ba7e8"
         },
         {
           "input": {},
           "name": "CronList",
           "result": {
-            "content": "<cli-text chars=168 sha256=a188c49d950313b3>",
+            "content": "<cli-text chars=168 sha256=fd5b40482254575a>",
             "isError": false
           },
           "seq": 26,
           "toolUseId": "toolu_list1",
-          "turnId": "41c5cfd9-3818-4826-9a59-99c619d9c69a"
+          "turnId": "9f4724fc-b6ec-4c5e-91c5-6ef7c44ba7e8"
         },
         {
           "input": {
-            "id": "a75ac00d"
+            "id": "050c6a6f"
           },
           "name": "CronDelete",
           "result": {
-            "content": "<cli-text chars=23 sha256=570a6bd6b5b4af19>",
+            "content": "<cli-text chars=23 sha256=22ee515c66ae2f7b>",
             "isError": false
           },
           "seq": 28,
           "toolUseId": "toolu_del1",
-          "turnId": "41c5cfd9-3818-4826-9a59-99c619d9c69a"
+          "turnId": "9f4724fc-b6ec-4c5e-91c5-6ef7c44ba7e8"
         },
         {
           "input": {},
           "name": "CronList",
           "result": {
-            "content": "<cli-text chars=84 sha256=645683201f53f631>",
+            "content": "<cli-text chars=85 sha256=0037c72500f74898>",
             "isError": false
           },
           "seq": 30,
           "toolUseId": "toolu_list2",
-          "turnId": "41c5cfd9-3818-4826-9a59-99c619d9c69a"
+          "turnId": "9f4724fc-b6ec-4c5e-91c5-6ef7c44ba7e8"
         }
       ],
       "transcript": [
@@ -1432,7 +1432,7 @@
       "turnStarts": [
         {
           "cause": {
-            "cronId": "<cli-text chars=8 sha256=47ad3fc4e2645f39>",
+            "cronId": "<cli-text chars=8 sha256=409edf692f4ecdde>",
             "description": null,
             "kind": "scheduled",
             "peerName": null,
@@ -1448,7 +1448,7 @@
           },
           "origin": "cli",
           "seq": 35,
-          "turnId": "150be956-6fbd-4c8e-8c5f-5713a3aa22ac"
+          "turnId": "d499cf51-2531-4d6c-bdbc-e7498a49b44e"
         }
       ],
       "usage": {

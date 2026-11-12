@@ -226,7 +226,10 @@ fn keep_through(state: &mut State, bin: &Path, txt: &Path, sequence: u64) -> io:
     std::fs::OpenOptions::new().write(true).open(bin)?.set_len(bytes)?;
     let text = std::fs::read_to_string(txt)?;
     let lines: usize = text.split_inclusive('\n').take(kept).map(str::len).sum();
-    std::fs::OpenOptions::new().write(true).open(txt)?.set_len(lines as u64)?;
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(txt)?
+        .set_len(lines as u64)?;
     state.position = Position {
         events: kept,
         bytes,
