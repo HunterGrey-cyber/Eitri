@@ -1545,9 +1545,9 @@ fn sidecar_command_for(
             .then(|| bash_max_timeout.map(OsStr::to_os_string))
             .flatten()
     };
-    apply_env_policy(
+    apply_sidecar_env(
         &mut command,
-        sidecar_env_policy(
+        &sidecar_env_policy(
             &inherited,
             account.map(|account| account.name()),
             keep_test_seams,
@@ -1629,16 +1629,17 @@ pub fn sidecar_env_policy(
     SidecarEnv { set, remove }
 }
 
-fn apply_env_policy(command: &mut Command, policy: SidecarEnv) {
+/// Apply shared sidecar overrides in the same order for local and detached children.
+pub fn apply_sidecar_env(command: &mut Command, policy: &SidecarEnv) {
     // Apply the IDE guard, removals, account, timeout and CLI handoff in that order.
-    let mut set = policy.set.into_iter();
+    let mut set = policy.set.iter();
     if let Some((key, value)) = set.next() {
         command.env(key, value);
     }
-    for key in policy.remove {
+    for key in &policy.remove {
         command.env_remove(key);
     }
-    command.envs(set);
+    command.envs(set.map(|(key, value)| (key, value)));
 }
 
 #[cfg(test)]

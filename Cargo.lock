@@ -1014,8 +1014,27 @@ name = "eitri-server"
 version = "0.3.0"
 dependencies = [
  "agent",
+ "bytes",
+ "claude-runtime-protocol",
  "eitri-core",
  "eitri-server-proto",
+ "futures-util",
+ "http",
+ "http-body",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
+ "libc",
+ "prost",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tokio",
+ "tokio-stream",
+ "tonic",
+ "tonic-prost",
+ "tower",
+ "tower-service",
 ]
 
 [[package]]

@@ -12,9 +12,18 @@ service Helper {
   rpc TrustScan(TrustScanRequest) returns (TrustScanResponse);
 }
 message HelloRequest { uint32 protocol_major = 1; uint32 protocol_minor = 2; string client_version = 3; }
+enum LoginEnvState {
+  LOGIN_ENV_STATE_CAPTURING = 0;
+  LOGIN_ENV_STATE_CAPTURED = 1;
+  LOGIN_ENV_STATE_FALLBACK_MINIMAL = 2;
+  // Account lookup failed; the next start retries it.
+  LOGIN_ENV_STATE_UNAVAILABLE = 3;
+}
 message HelloResponse {
   uint32 protocol_major = 1; uint32 protocol_minor = 2; repeated string capabilities = 3;
   string helper_version = 4; string helper_build = 5; string sidecar_revision = 6;
+  repeated string warnings = 7;
+  LoginEnvState login_env = 8;
 }
 message StartSidecarRequest {
   string root = 1; string account = 2; map<string, string> env = 3; string command_id = 4;
@@ -28,9 +37,11 @@ message ListSidecarsRequest {}
 message SessionInfo { string session_id = 1; uint64 journal_head = 2; bool closed = 3; uint64 pending = 4; }
 message SidecarInfo {
   string sidecar_id = 1; string root = 2; string account = 3; uint32 pid = 4; uint64 started_unix_ms = 5;
-  bool alive = 6; repeated SessionInfo sessions = 7; string helper_version = 8;
+  bool alive = 6; repeated SessionInfo sessions = 7; string helper_version = 8; bool handshake = 9;
 }
-message ListSidecarsResponse { repeated SidecarInfo sidecars = 1; }
+message ListSidecarsResponse {
+  repeated SidecarInfo sidecars = 1; repeated string warnings = 2; LoginEnvState login_env = 3;
+}
 message PendingRequest { string sidecar_id = 1; string session_id = 2; }
 // SessionEvent bytes are retained as received.
 message PendingPermission { uint64 sequence = 1; bytes event = 2; }
