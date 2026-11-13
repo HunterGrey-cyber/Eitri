@@ -189,6 +189,30 @@ fn allow_every_request(provider: &ClaudeSidecarProvider, session_id: &str, event
     }
 }
 
+/// The one CLI child of this provider's sidecar, including its OS identity so a restart with
+/// the same conversation id cannot masquerade as one long-lived process.
+#[cfg(target_os = "linux")]
+fn cli_child_identity(sidecar_pid: u32) -> (u32, u64) {
+    let mut children = Vec::new();
+    for task in std::fs::read_dir(format!("/proc/{sidecar_pid}/task")).unwrap() {
+        let path = task.unwrap().path().join("children");
+        match std::fs::read_to_string(&path) {
+            Ok(text) => children.extend(text.split_whitespace().map(|pid| pid.parse::<u32>().unwrap())),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => panic!("cannot read {path:?}: {error}"),
+        }
+    }
+    children.sort_unstable();
+    children.dedup();
+    assert_eq!(children.len(), 1, "one session must have one CLI child: {children:?}");
+    let pid = children[0];
+    assert!(agent::process_probe::pid_is_alive(pid));
+    (
+        pid,
+        agent::child::start_time(pid).expect("the live CLI child's start time"),
+    )
+}
+
 /// T2.1 -- the sidecar analog of the legacy backend's own multi-turn conformance test.
 ///
 /// The assertion is a CONTENT ORACLE, not an event count. Two `TurnCompleted` events prove only
@@ -199,6 +223,8 @@ fn allow_every_request(provider: &ClaudeSidecarProvider, session_id: &str, event
 #[ignore]
 fn real_second_turn_on_the_same_session_recalls_the_first_turns_content() {
     let provider = connect();
+    let pid = provider.sidecar_pid();
+    assert!(agent::process_probe::pid_is_alive(pid));
     let session_id = create_gated_session(&provider);
 
     let first = run_turn(
@@ -212,7 +238,21 @@ fn real_second_turn_on_the_same_session_recalls_the_first_turns_content() {
         vec![TurnOutcome::Completed],
         "first turn: {first:?}"
     );
+    assert!(text_of(&first).to_lowercase().contains("ok"), "first reply: {first:?}");
+    let mut projection = agent::AgentSessionProjection::default();
+    for event in &first {
+        projection.apply(event);
+    }
+    assert!(projection.active_turn_id.is_none());
+    assert_eq!(
+        provider.sidecar_pid(),
+        pid,
+        "the sidecar restarted after the first turn"
+    );
+    assert!(agent::process_probe::pid_is_alive(pid));
 
+    #[cfg(target_os = "linux")]
+    let cli_child = cli_child_identity(pid);
     let second = run_turn(
         &provider,
         &session_id,
@@ -224,6 +264,15 @@ fn real_second_turn_on_the_same_session_recalls_the_first_turns_content() {
         vec![TurnOutcome::Completed],
         "second turn: {second:?}"
     );
+    for event in &second {
+        projection.apply(event);
+    }
+    assert!(projection.active_turn_id.is_none());
+    assert_eq!(projection.status, agent::ProjectionStatus::Running);
+    assert_eq!(provider.sidecar_pid(), pid, "both turns must use one sidecar process");
+    assert!(agent::process_probe::pid_is_alive(pid));
+    #[cfg(target_os = "linux")]
+    assert_eq!(cli_child_identity(pid), cli_child, "the CLI restarted between turns");
 
     let recalled = text_of(&second);
     assert!(
@@ -475,6 +524,62 @@ fn dropping_the_provider_leaves_no_orphaned_sidecar() {
         !agent::process_probe::pid_is_alive(sidecar_pid),
         "sidecar pid {sidecar_pid} outlived its provider -- this is a leak to report, not to clean up by hand"
     );
+}
+
+/// Dropping after an interrupted live turn must end both processes owned by the provider.
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore]
+fn real_drop_after_interrupt_leaves_no_sidecar_or_cli_child() {
+    let provider = connect();
+    let sidecar_pid = provider.sidecar_pid();
+    let sidecar = (
+        sidecar_pid,
+        agent::child::start_time(sidecar_pid).expect("the live sidecar's start time"),
+    );
+    let session_id = create_gated_session(&provider);
+    provider
+        .send_turn(SendTurnRequest {
+            session_id: session_id.clone(),
+            text: "Count slowly from 1 to 10000, writing each number on its own line. Do not use tools or stop early."
+                .into(),
+        })
+        .unwrap();
+    let started = drain_until(&provider, 60, |events| {
+        events
+            .iter()
+            .any(|event| matches!(event, AgentDomainEvent::ContentDelta { .. }))
+    });
+    assert!(
+        started
+            .iter()
+            .any(|event| matches!(event, AgentDomainEvent::ContentDelta { .. })),
+        "the turn never produced content to interrupt: {started:?}"
+    );
+    assert!(
+        !started
+            .iter()
+            .any(|event| matches!(event, AgentDomainEvent::TurnCompleted { .. })),
+        "the turn finished before it could be interrupted: {started:?}"
+    );
+    let cli_child = cli_child_identity(sidecar_pid);
+    provider.interrupt_turn(InterruptTurnRequest { session_id }).unwrap();
+    assert_eq!(cli_child_identity(sidecar_pid), cli_child);
+
+    let deadline = Instant::now() + Duration::from_secs(60);
+    drop(provider);
+    let still_present = |(pid, start)| {
+        agent::process_probe::pid_is_alive(pid) && !agent::child::start_time(pid).is_ok_and(|current| current != start)
+    };
+    while still_present(sidecar) || still_present(cli_child) {
+        assert!(
+            Instant::now() < deadline,
+            "processes survived provider drop (zombies count): sidecar {sidecar:?} present={}, CLI {cli_child:?} present={}",
+            still_present(sidecar),
+            still_present(cli_child)
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
 }
 
 /// Free (no model turn, no billing): a connected provider reports real, wire-sourced capabilities

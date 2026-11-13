@@ -3,9 +3,6 @@ import type { CallNotes } from "../reducer";
 import type { AgentDomainEvent, AgentUiSnapshot, AgentUiState } from "../types";
 
 export const TRANSCRIPT_PROTOCOL = 1;
-export type HostHello = {
-  kind: "host"; protocol: number; deskProtocol: number; app: string; device: string; location: string;
-};
 export type ThemeTokens = { vars: Record<string, string>; scheme: string };
 export type CutEntry = { entry_id: string; bytes: number };
 export type TranscriptModel = {

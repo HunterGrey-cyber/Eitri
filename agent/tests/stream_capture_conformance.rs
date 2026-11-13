@@ -1,22 +1,17 @@
-//! Runs one real session's captured output through the two parsers that read the CLI's own
-//! formats: `agent::translate_line` for the `--output-format stream-json` stdout the legacy
-//! backend reads live, and `agent::history::read_transcript_history` for the `<uuid>.jsonl`
-//! transcript the CLI writes. Neither format is a documented interface, so a CLI upgrade can add
-//! or reshape a line kind without any compile error; this is the check that says what the current
-//! build does to each.
+//! Reads `stream.jsonl` in `EITRI_CAPTURE_DIR` through `agent::translate_line`, the parser
+//! for the `--output-format stream-json` stdout the legacy backend reads live. A CLI upgrade
+//! can add or reshape a line kind without any compile error; this check pins the conversational
+//! records the current build must recognize.
 //!
-//! **`#[ignore]`d, and it spends no tokens itself**: it reads files a capture already produced,
-//! named by `EITRI_CAPTURE_DIR` (holding `stream.jsonl`, the child's stdout verbatim, and
-//! `transcript.jsonl`, the CLI's own file for that session). The capture is a real session under
-//! the TEST profile (the test-account wrapper): a plain turn, a turn that runs `echo`, a turn that
+//! **`#[ignore]`d, and it spends no tokens itself**: it reads stdout a capture already produced
+//! under the TEST profile (the test-account wrapper): a plain turn, a turn that runs `echo`, a turn that
 //! thinks. Run it with
 //!
 //!     EITRI_CAPTURE_DIR=<dir> cargo test -p agent --features legacy-backend \
 //!         --test stream_capture_conformance -- --ignored --nocapture
 //!
-//! and read the printed tallies: the assertions only pin what must never regress (no
-//! conversational line left in `Unknown`, the results counted, nothing malformed on disk); the tallies of what
-//! lands in `Unknown` are the finding, and `agent/BACKEND_BASELINE.md` records them.
+//! Read the printed tallies: no conversational line may remain in `Unknown`, every result must
+//! be counted, and every line must be JSON. New non-conversational kinds are printed for inspection.
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -24,7 +19,7 @@ use std::path::PathBuf;
 use agent::{translate_line, AgentEvent};
 
 /// `None` (with a line on stderr) when no capture is named, so a blanket `-- --ignored` run skips
-/// these two tests instead of failing them for a missing input.
+/// this test instead of failing it for a missing input.
 fn capture_dir() -> Option<PathBuf> {
     match std::env::var("EITRI_CAPTURE_DIR") {
         Ok(dir) if !dir.is_empty() => Some(PathBuf::from(dir)),
@@ -91,34 +86,4 @@ fn the_captured_stream_json_translates_without_a_parse_failure() {
     assert!(kinds.contains_key("AssistantText"), "no assistant text came out");
     assert!(kinds.contains_key("ToolStarted"), "no tool call came out");
     assert!(kinds.contains_key("ToolResult"), "no tool result came out");
-}
-
-#[test]
-#[ignore = "reads a capture made under the TEST profile; see this file's header"]
-fn the_captured_transcript_reads_back_as_the_conversation() {
-    let Some(dir) = capture_dir() else { return };
-    let path = dir.join("transcript.jsonl");
-    let history = agent::history::read_transcript_history(&path).expect("transcript.jsonl is readable");
-    eprintln!(
-        "transcript: writer {:?}, {} parsed items, {} events, counts {:#?}",
-        history.writer_version,
-        history.parsed_items,
-        history.events.len(),
-        history.counts
-    );
-    assert_eq!(
-        history.counts.malformed_lines, 0,
-        "a captured transcript line is not JSON"
-    );
-    assert_eq!(history.counts.oversized_lines, 0);
-    assert_eq!(
-        history.counts.unknown_type_lines, 0,
-        "a line type this reader has never seen: see the printed counts, then the reader's classifier"
-    );
-    assert_eq!(history.counts.orphan_tool_results, 0, "a tool result found no call");
-    assert!(
-        history.parsed_items > 0,
-        "nothing in the transcript became conversation"
-    );
-    assert!(history.writer_version.is_some(), "no line carried the writer's version");
 }

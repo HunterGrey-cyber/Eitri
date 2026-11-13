@@ -693,7 +693,6 @@ impl PairWriter {
     }
 
     /// Window `window` is on `monitor` now: written at once when that is news.
-    #[cfg_attr(not(test), allow(dead_code))] // Each window's monitor reports come here once they are made.
     ///
     /// Monitor memory is the pair's: while no window 2 is open, the report is kept for the pair's next write and
     /// nothing is written, so a window that never had a window 2 leaves no file naming its monitor.

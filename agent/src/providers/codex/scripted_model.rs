@@ -21,7 +21,7 @@ use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread::JoinHandle;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 /// The longest request head and the largest request body accepted.
 const MAX_HEAD: usize = 64 * 1024;
@@ -35,7 +35,6 @@ pub struct Step {
     events: Vec<Value>,
     needs: Vec<String>,
     lacks: Vec<String>,
-    hang: Option<Duration>,
     #[cfg(feature = "test-support")]
     hold_until_drop: bool,
 }
@@ -48,7 +47,6 @@ impl Step {
             events,
             needs: Vec::new(),
             lacks: Vec::new(),
-            hang: None,
             #[cfg(feature = "test-support")]
             hold_until_drop: false,
         }
@@ -103,12 +101,6 @@ impl Step {
     /// The step applies only to a request whose body text does not contain `text`.
     pub fn unless_body_has(mut self, text: &str) -> Step {
         self.lacks.push(text.to_string());
-        self
-    }
-
-    /// After the events, the stream is held open this long (or until the model is dropped): a turn in progress.
-    pub fn then_hang(mut self, how_long: Duration) -> Step {
-        self.hang = Some(how_long);
         self
     }
 
@@ -347,9 +339,9 @@ fn serve(stream: TcpStream, inner: &Mutex<Inner>, stop: &AtomicBool) -> io::Resu
     };
     #[cfg(feature = "test-support")]
     let hold_until_drop = step.as_ref().is_some_and(|step| step.hold_until_drop);
-    let (events, hang) = match step {
-        Some(step) => (step.events, step.hang),
-        None => (Step::say("done").events, None),
+    let events = match step {
+        Some(step) => step.events,
+        None => Step::say("done").events,
     };
 
     writer.write_all(
@@ -364,18 +356,13 @@ fn serve(stream: TcpStream, inner: &Mutex<Inner>, stop: &AtomicBool) -> io::Resu
         }
         return writer.shutdown(Shutdown::Both);
     }
-    if let Some(how_long) = hang {
-        let end = Instant::now() + how_long;
-        while Instant::now() < end && !stop.load(Ordering::SeqCst) {
-            std::thread::sleep(Duration::from_millis(100));
-        }
-    }
     writer.shutdown(Shutdown::Both)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Instant;
 
     /// The tests take turns, so that the port one of them frees is not handed to another that is starting.
     static ONE_AT_A_TIME: Mutex<()> = Mutex::new(());

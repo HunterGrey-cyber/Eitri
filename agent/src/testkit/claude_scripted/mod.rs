@@ -68,6 +68,7 @@ pub struct Reply {
     pub stop_reason: String,
     pub usage: Value,
     pub chunks: usize,
+    pub pace_ms: u64,
     pub cut: Option<Point>,
     pub hold: Option<Hold>,
     pub error: Option<HttpError>,
@@ -84,6 +85,7 @@ impl Reply {
             usage: json!({"input_tokens":1000,"cache_creation_input_tokens":0,
                 "cache_read_input_tokens":0,"output_tokens":10}),
             chunks: 3,
+            pace_ms: 0,
             cut: None,
             hold: None,
             error: None,
@@ -528,6 +530,9 @@ fn invalid(message: &str) -> io::Error {
 }
 
 fn validate(reply: &Reply) -> io::Result<()> {
+    if reply.pace_ms > 60_000 {
+        return Err(invalid("pace_ms must be between 0 and 60000"));
+    }
     for block in &reply.content {
         let valid = match block["type"].as_str() {
             Some("text") => block["text"].is_string(),
@@ -996,7 +1001,7 @@ fn serve(mut stream: TcpStream, index: usize, shared: Arc<Shared>) {
         }
         http::stream_headers(&mut stream, index, &reply.ok_headers)?;
         for frame in sse::frames(&reply, index, model) {
-            stream.write_all(frame.wire().as_bytes())?;
+            frame.write_to(&mut stream, std::thread::sleep)?;
             record
                 .response_events
                 .push(json!({"event":frame.event,"data":frame.data}));

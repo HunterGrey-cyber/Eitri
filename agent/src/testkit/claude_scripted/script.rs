@@ -166,6 +166,9 @@ pub struct Step {
     pub cut: Option<Point>,
     #[serde(default)]
     pub chunks: Option<usize>,
+    /// Milliseconds between streamed content deltas; zero preserves immediate emission.
+    #[serde(default)]
+    pub pace_ms: u64,
     #[serde(default)]
     pub error: Option<HttpError>,
     /// Rate-limit headers on the answer that succeeds (after any `error` answers).
@@ -434,15 +437,6 @@ impl Scenario {
             }
         }
         Ok(())
-    }
-
-    /// The environment the CLI gets from this scenario and variant.
-    pub fn effective_env(&self, variant: Option<&str>) -> BTreeMap<String, String> {
-        let mut env = self.env.clone();
-        if let Some(v) = variant.and_then(|v| self.variants.get(v)) {
-            env.extend(v.env.clone());
-        }
-        env
     }
 
     /// The tab's mode in this scenario and variant: the variant's own when it states one.
@@ -789,6 +783,7 @@ fn build_reply(step: &Step, ex: &Expander) -> Result<Reply, String> {
     if let Some(chunks) = step.chunks {
         reply.chunks = chunks;
     }
+    reply.pace_ms = step.pace_ms;
     reply.cut = step.cut.clone();
     reply.hold = step.hold.clone();
     reply.error = step.error.clone();
@@ -1052,6 +1047,20 @@ fn require_tool(view: &View, name: &str, preloaded: &[String]) -> Result<(), Str
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pacing_is_optional_bounded_and_reaches_the_reply() {
+        for value in [json!(0), json!(120), json!(60_000)] {
+            let file = ScriptFile::parse(&json!({"model":[{"id":"paced","pace_ms":value}]}).to_string()).unwrap();
+            let reply = build_reply(&file.model[0], &Expander::new(None, &BTreeMap::new(), 0)).unwrap();
+            assert_eq!(reply.pace_ms, value.as_u64().unwrap());
+        }
+        let file = ScriptFile::parse(r#"{"model":[{"id":"old"}]}"#).unwrap();
+        assert_eq!(file.model[0].pace_ms, 0);
+        for value in [json!(-1), json!(1.5), json!("120"), json!(60_001)] {
+            assert!(ScriptFile::parse(&json!({"model":[{"id":"bad","pace_ms":value}]}).to_string()).is_err());
+        }
+    }
 
     fn parse(v: Value) -> Result<Scenario, String> {
         Scenario::parse(&v.to_string())

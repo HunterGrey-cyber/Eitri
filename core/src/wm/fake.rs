@@ -189,9 +189,6 @@ impl FakeHost {
     pub fn set_tab_can_step(&self, delta: i32, answer: bool) {
         self.reads.borrow_mut().tab_steps.insert(delta, answer);
     }
-    pub fn set_tab_has_last(&self, answer: bool) {
-        self.reads.borrow_mut().tab_last = answer;
-    }
     pub fn set_tab_place(&self, n: u16, place: Option<crate::tab_set::TabPlace>) {
         let mut reads = self.reads.borrow_mut();
         if let Some(place) = place {
@@ -288,9 +285,6 @@ impl FakeHost {
     pub fn set_running_chats(&self, chats: Vec<(ModuleId, Option<TabId>)>) {
         self.reads.borrow_mut().running_chats = chats;
     }
-    pub fn set_terminal_job_modules(&self, modules: Vec<ModuleId>) {
-        self.reads.borrow_mut().terminal_job_modules = modules;
-    }
     pub fn set_pages_with_tasks(&self, modules: Vec<ModuleId>) {
         self.reads.borrow_mut().pages_with_tasks = modules;
     }
@@ -321,9 +315,6 @@ impl FakeHost {
         if claims {
             reads.chat_claims.push((view, direction));
         }
-    }
-    pub fn set_module_min(&self, module: ModuleId, min: Size) {
-        self.reads.borrow_mut().module_min.insert(module, min);
     }
     /// What chat view `view` holds for the user from now on, as its panel would report it.
     pub fn set_attention(&self, view: ViewId, attention: crate::attention::Attention) {
@@ -906,10 +897,6 @@ impl FakePeerPort {
     /// Plain sends fail with `why` from now on (`None`: they go through again).
     pub fn refuse_sends(&self, why: Option<&str>) {
         *self.refuse.borrow_mut() = why.map(str::to_owned);
-    }
-    /// Confirmed sends fail with `why` from now on.
-    pub fn refuse_confirmed_sends(&self, why: Option<&str>) {
-        *self.refuse_confirmed.borrow_mut() = why.map(str::to_owned);
     }
     /// Answers the `n`th confirmed send (from 0), as the link thread does once the packet is on the socket or
     /// will never be.

@@ -393,11 +393,6 @@ impl AllowanceSet {
         Self::from_texts(scenario, &ids, own.as_deref(), all.as_deref())
     }
 
-    /// The allowances of `scenario` from the tree's allowance directory.
-    pub fn for_scenario(scenario: &str) -> Result<Self, AllowanceError> {
-        Self::load(&allowances_dir(), scenario)
-    }
-
     /// The allowances of one run of `scenario`: a variant or a numbered run that differs from the scenario's
     /// base run has a file of its own, `<scenario>_<run>.json`, whose entries name `<scenario>_<run>`; a run
     /// without one is held to the scenario's file. A file's allowances must all match in the run it is read for,

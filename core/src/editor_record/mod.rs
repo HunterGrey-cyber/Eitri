@@ -26,9 +26,6 @@ pub use writer::{RecordWriter, WriterAnswer};
 
 /// The largest record read or written, in bytes of JSON.
 pub const RECORD_MAX: usize = 256 * 1024;
-/// Above this size a capture drops listed buffers, then whole tabs, so what it hands over stays below
-/// [`RECORD_MAX`] with room to spare.
-pub const CAPTURE_TRIM_AT: usize = 224 * 1024;
 
 /// The record's format version; a record of another version is read as nothing.
 pub const VERSION: u64 = 1;

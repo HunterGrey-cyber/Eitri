@@ -76,7 +76,6 @@ pub(crate) trait GnomeCalls {
     /// manager then places the window. An implementation with no extension behind it has nothing
     /// to ask, so that is what it answers by default.
     // The full window restores its monitor through this; the companion never calls it.
-    #[allow(dead_code)]
     fn move_own_to_monitor(&self, connector: &str, done: Done) {
         let _ = connector;
         done(None);

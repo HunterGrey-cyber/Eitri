@@ -853,7 +853,6 @@ impl Pair {
     }
 
     /// The module windows window 1 has started and whose links last.
-    #[cfg_attr(not(test), allow(dead_code))] // The window verbs name windows through the controller.
     pub fn module_names(&self) -> Vec<WindowName> {
         self.modules.borrow().names()
     }

@@ -17,7 +17,6 @@ use std::{
     io::{self, Write},
     path::{Path, PathBuf},
     sync::{Arc, Condvar, Mutex},
-    time::{Duration, Instant},
 };
 use tokio::net::UnixStream;
 use tonic::transport::{Endpoint, Uri};
@@ -139,36 +138,6 @@ impl ProtoRecorder {
             .error
             .clone()
             .or_else(|| state.first_sequence.filter(|s| *s != 1).map(first_sequence_message))
-    }
-
-    /// How many of the CLI's session state changes the recording holds: the sidecar passes each
-    /// `system`/`session_state_changed` line on as a provider notice of that subtype.
-    pub fn state_changes(&self) -> usize {
-        let state = self.shared.state.lock().unwrap();
-        state.events.iter().filter(|e| is_state_change(e)).count()
-    }
-
-    /// Waits until the recording holds the event with `sequence` (or a later one), up to `limit`.
-    pub fn wait_through(&self, sequence: u64, limit: Duration) -> Result<(), String> {
-        let end = Instant::now() + limit;
-        let mut state = self.shared.state.lock().unwrap();
-        while state.position.sequence < sequence {
-            if let Some(why) = &state.error {
-                return Err(why.clone());
-            }
-            if state.ended {
-                return Err(format!("the stream ended at sequence {}", state.position.sequence));
-            }
-            let left = end.saturating_duration_since(Instant::now());
-            if left.is_zero() {
-                return Err(format!(
-                    "the recording stopped at sequence {} while waiting for {sequence}",
-                    state.position.sequence
-                ));
-            }
-            state = self.shared.changed.wait_timeout(state, left).unwrap().0;
-        }
-        Ok(())
     }
 
     /// Ends the recording at `sequence`, the last event its host took: the session goes on emitting after the host

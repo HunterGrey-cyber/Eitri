@@ -1,7 +1,7 @@
 //! `TerminalFrame` + view state -> [`PaintList`]. Every terminal decision is
 //! made here so that none of them reaches a backend.
 
-use terminal_frame::frame::{CellFlags, FrameCell, FrameColor, FrameCursorShape, TerminalFrame};
+use terminal_frame::frame::{CellFlags, FrameCell, FrameCursorShape, TerminalFrame};
 
 use crate::color::{resolve, to_rgb, Palette, BACKGROUND, CURSOR};
 use crate::paint::{CursorShape, CursorText, GlyphStyle, PaintList, PaintOp, RgbColor, UnderlineKind};
@@ -397,10 +397,4 @@ pub fn palette_for(frame: &TerminalFrame) -> Palette {
     let mut p = Palette::xterm_default();
     p.apply_overrides(&frame.color_overrides);
     p
-}
-
-/// Resolve a frame colour against a palette. Exposed because `RenderInput`
-/// builders sometimes need it; backends never do.
-pub fn resolve_frame_color(color: FrameColor, palette: &Palette) -> RgbColor {
-    to_rgb(color, palette)
 }

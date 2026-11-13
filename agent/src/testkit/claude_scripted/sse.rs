@@ -1,5 +1,6 @@
 //! Deterministic Messages API frames, shared by streamed and whole-message replies.
 use serde_json::{json, Value};
+use std::{io, io::Write, time::Duration};
 
 use super::{Point, Reply};
 
@@ -8,9 +9,17 @@ pub struct Frame {
     pub event: &'static str,
     pub data: Value,
     pub after: Option<Point>,
+    pub delay: Duration,
 }
 
 impl Frame {
+    pub fn write_to(&self, writer: &mut impl Write, wait: impl FnOnce(Duration)) -> io::Result<()> {
+        if !self.delay.is_zero() {
+            wait(self.delay);
+        }
+        writer.write_all(self.wire().as_bytes())
+    }
+
     pub fn wire(&self) -> String {
         format!("event: {}\ndata: {}\n\n", self.event, self.data)
     }
@@ -51,7 +60,22 @@ fn text_chunks(text: &str, count: usize) -> Vec<String> {
 
 pub fn frames(reply: &Reply, index: usize, model: &str) -> Vec<Frame> {
     let mut result = Vec::new();
-    let mut push = |event, data, after| result.push(Frame { event, data, after });
+    let mut seen_delta = false;
+    let mut push = |event, data, after| {
+        let mut delay = Duration::ZERO;
+        if event == "content_block_delta" {
+            if seen_delta {
+                delay = Duration::from_millis(reply.pace_ms);
+            }
+            seen_delta = true;
+        }
+        result.push(Frame {
+            event,
+            data,
+            after,
+            delay,
+        });
+    };
     let mut start = message(reply, index, model);
     start["content"] = json!([]);
     start["stop_reason"] = Value::Null;
@@ -219,6 +243,57 @@ event: content_block_stop
 data: {"index":0,"type":"content_block_stop"}
 
 "##;
+
+    #[test]
+    fn pacing_waits_before_each_subsequent_delta_across_blocks_without_changing_bytes() {
+        use std::cell::Cell;
+        struct Trace<'a> {
+            clock: &'a Cell<u64>,
+            writes: Vec<(u64, String)>,
+        }
+        impl Write for Trace<'_> {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                self.writes
+                    .push((self.clock.get(), String::from_utf8(bytes.to_vec()).unwrap()));
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        let mut reply = Reply::text("one two\n");
+        reply.content.push(json!({"type":"text","text":"three four\n"}));
+        reply.chunks = 2;
+        let unpaced = wire(&reply);
+        for frame in frames(&reply, 1, "scripted-model") {
+            frame
+                .write_to(&mut Vec::new(), |_| panic!("default must not wait"))
+                .unwrap();
+        }
+        reply.pace_ms = 120;
+        let clock = Cell::new(0);
+        let mut trace = Trace {
+            clock: &clock,
+            writes: Vec::new(),
+        };
+        for frame in frames(&reply, 1, "scripted-model") {
+            frame
+                .write_to(&mut trace, |delay| clock.set(clock.get() + delay.as_millis() as u64))
+                .unwrap();
+        }
+        assert_eq!(
+            trace.writes.iter().map(|(_, bytes)| bytes.as_str()).collect::<String>(),
+            unpaced
+        );
+        let times: Vec<_> = trace
+            .writes
+            .iter()
+            .filter(|(_, bytes)| bytes.starts_with("event: content_block_delta\n"))
+            .map(|(time, _)| *time)
+            .collect();
+        assert_eq!(times, [0, 120, 240, 360]);
+        assert_eq!(clock.get(), 360);
+    }
 
     #[test]
     fn text_reply_golden_frames() {

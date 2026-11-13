@@ -674,8 +674,6 @@ pub struct ThreadStartResponse {
     sandbox: Option<Value>,
 }
 
-pub type ThreadResumeResponse = ThreadStartResponse;
-
 /// The effective policy a start or resume answer reports, as raw JSON: an absent field stays `None` so the
 /// comparison with what was sent can fail closed on it, and a value of a shape this build does not know is
 /// still compared exactly.

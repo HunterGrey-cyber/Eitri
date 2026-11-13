@@ -64,6 +64,7 @@ fn real_pretooluse_permission_allow_end_to_end() {
     // not the client.
     let mut answered: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut saw_a_permission = false;
+    let mut gated_tool_ids = std::collections::HashSet::new();
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
     let mut all_events: Vec<AgentDomainEvent> = Vec::new();
     let mut completed = false;
@@ -82,6 +83,7 @@ fn real_pretooluse_permission_allow_end_to_end() {
                         tool_use_id.is_some(),
                         "the sidecar sent a PermissionRequested with an unset (proto3 empty-string) tool_use_id"
                     );
+                    gated_tool_ids.insert(tool_use_id.clone().unwrap());
                     saw_a_permission = true;
                     if answered.insert(permission_id.clone()) {
                         provider
@@ -120,9 +122,112 @@ fn real_pretooluse_permission_allow_end_to_end() {
         .collect();
     assert!(full_text.to_lowercase().contains("hello"), "got: {full_text}");
 
+    let mut projection = agent::AgentSessionProjection::default();
+    for event in &all_events {
+        projection.apply(event);
+    }
+    assert!(
+        projection.pending_permissions.is_empty(),
+        "an answered request stayed pending"
+    );
+    for tool_id in gated_tool_ids {
+        assert!(
+            projection.tool_calls.iter().any(|call| call.tool_use_id == tool_id),
+            "the gated tool_use_id {tool_id} names no tool call in this conversation"
+        );
+    }
+
     provider
         .close_session(agent::CloseSessionRequest { session_id })
         .unwrap();
+}
+
+#[test]
+#[ignore]
+fn real_pretooluse_permission_deny_end_to_end() {
+    const REASON: &str = "test policy: marker writes are forbidden";
+    let dir = agent::state_dirs::test_workspace_dir("sidecar-real-deny");
+    let target = dir.join("denied-marker.txt");
+    assert!(!target.exists());
+    let provider = ClaudeSidecarProvider::connect(&uuid::Uuid::new_v4().to_string()).unwrap();
+    let session_id = provider
+        .create_session(CreateSessionRequest {
+            cwd: dir.to_string_lossy().into_owned(),
+            streaming: agent::StreamingPreference::Partial,
+            project: agent::setting_sources::ProjectTrust::Untrusted,
+            client_tools: None,
+        })
+        .unwrap();
+    provider
+        .send_turn(agent::SendTurnRequest {
+            session_id: session_id.clone(),
+            text: format!(
+                "Use a tool to create {} containing 'marker'. If permission is denied, stop and report the denial.",
+                target.display()
+            ),
+        })
+        .unwrap();
+
+    let mut answered = std::collections::HashSet::new();
+    let mut events = Vec::new();
+    let mut completed = false;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+    while std::time::Instant::now() < deadline && !completed {
+        for event in provider.pump() {
+            match &event {
+                AgentDomainEvent::PermissionRequested { permission_id, .. } => {
+                    if answered.insert(permission_id.clone()) {
+                        provider
+                            .resolve_permission(agent::ResolvePermissionRequest {
+                                session_id: session_id.clone(),
+                                permission_id: permission_id.clone(),
+                                decision: PermissionDecision::Deny {
+                                    reason: Some(REASON.into()),
+                                },
+                            })
+                            .unwrap();
+                    }
+                }
+                AgentDomainEvent::TurnCompleted { .. } => completed = true,
+                _ => {}
+            }
+            events.push(event);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    assert!(
+        !answered.is_empty(),
+        "no real permission request was denied: {events:?}"
+    );
+    assert!(completed, "the denied turn never completed: {events:?}");
+    let results: Vec<_> = events
+        .iter()
+        .filter_map(|event| match event {
+            AgentDomainEvent::ToolCallCompleted { content, is_error, .. } => Some((content, *is_error)),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        !results.is_empty(),
+        "no denied tool result reached the host: {events:?}"
+    );
+    assert!(
+        results.iter().all(|(_, is_error)| *is_error),
+        "a tool succeeded despite denying every request: {results:?}"
+    );
+    assert!(
+        results
+            .iter()
+            .any(|(content, is_error)| *is_error && content.to_string().contains(REASON)),
+        "no error result carried the deny reason verbatim: {results:?}"
+    );
+    // Completion follows all tool results, so the marker must still be absent after the turn.
+    assert!(!target.exists(), "a denied tool created the marker");
+    provider
+        .close_session(agent::CloseSessionRequest { session_id })
+        .unwrap();
+    drop(provider);
+    std::fs::remove_dir_all(dir).unwrap();
 }
 
 #[test]
@@ -157,6 +262,13 @@ fn real_interrupt_mid_permission_fail_closes_the_pending_request() {
             .any(|e| matches!(e, AgentDomainEvent::PermissionRequested { .. })),
         "expected a real pending permission before interrupting"
     );
+    let pending_ids: std::collections::HashSet<_> = events
+        .iter()
+        .filter_map(|event| match event {
+            AgentDomainEvent::PermissionRequested { permission_id, .. } => Some(permission_id.clone()),
+            _ => None,
+        })
+        .collect();
 
     provider
         .interrupt_turn(agent::InterruptTurnRequest {
@@ -168,6 +280,9 @@ fn real_interrupt_mid_permission_fail_closes_the_pending_request() {
         events
             .iter()
             .any(|e| matches!(e, AgentDomainEvent::PermissionResolved { .. }))
+            && events
+                .iter()
+                .any(|e| matches!(e, AgentDomainEvent::TurnCompleted { .. }))
     });
     let resolved_outcome = events.iter().find_map(|e| match e {
         AgentDomainEvent::PermissionResolved { outcome, .. } => Some(*outcome),
@@ -190,6 +305,64 @@ fn real_interrupt_mid_permission_fail_closes_the_pending_request() {
         ),
         "expected the pending permission to resolve fail-closed via CancelledByInterrupt or Expired, got: {events:?}"
     );
+    for pending_id in pending_ids {
+        assert!(
+            events.iter().any(|event| matches!(
+                event,
+                AgentDomainEvent::PermissionResolved { permission_id, outcome }
+                    if *permission_id == pending_id
+                        && matches!(outcome, PermissionOutcome::CancelledByInterrupt | PermissionOutcome::Expired)
+            )),
+            "the interrupted request {pending_id} did not fail closed: {events:?}"
+        );
+    }
+    assert!(
+        events.iter().any(|event| matches!(
+            event,
+            AgentDomainEvent::TurnCompleted {
+                outcome: agent::TurnOutcome::Interrupted,
+                ..
+            }
+        )),
+        "the interrupted turn did not finish as Interrupted: {events:?}"
+    );
+    assert!(
+        !events.iter().any(|event| matches!(
+            event,
+            AgentDomainEvent::SessionClosed { .. } | AgentDomainEvent::SessionUnavailable { .. }
+        )),
+        "interrupt ended the session: {events:?}"
+    );
+
+    provider
+        .send_turn(agent::SendTurnRequest {
+            session_id: session_id.clone(),
+            text: "reply with exactly the word: pong".into(),
+        })
+        .unwrap();
+    let follow_up = drain_until(&provider, 60, |events| {
+        events
+            .iter()
+            .any(|event| matches!(event, AgentDomainEvent::TurnCompleted { .. }))
+    });
+    assert!(
+        follow_up.iter().any(|event| matches!(
+            event,
+            AgentDomainEvent::TurnCompleted {
+                outcome: agent::TurnOutcome::Completed,
+                ..
+            }
+        )),
+        "the same session did not complete a follow-up turn: {follow_up:?}"
+    );
+    let text: String = follow_up
+        .iter()
+        .filter_map(|event| match event {
+            AgentDomainEvent::ContentDelta { text, .. } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert!(text.to_lowercase().contains("pong"), "got: {text}");
 
     provider
         .close_session(agent::CloseSessionRequest { session_id })
@@ -332,12 +505,14 @@ fn real_edit_under_the_auto_gate_on_the_sidecar_path() {
             "a reviewable Edit request must carry {field}: {input}"
         );
     }
+    assert_eq!(input["file_path"].as_str().unwrap(), target.display().to_string());
 
     let after = std::fs::read_to_string(&target).unwrap();
     assert!(
         after.contains("BRAVO"),
         "the approved edit did not land; the file holds: {after:?}"
     );
+    assert!(!after.contains("bravo"), "the old text survived: {after:?}");
 
     provider
         .close_session(agent::CloseSessionRequest { session_id })

@@ -13,6 +13,8 @@
 //! - `sleep <ms>`;
 //! - `gate <directory>`: publish `ready`, wait for `release`, then remove the directory;
 //! - `ask <permission id>`: a permission request; the rest of the script runs once it is answered;
+//! - `ask-write <permission id> <JSON path>`: a gated file write, performed only on Allow;
+//!   emits the matching tool call and result, including a denial reason on Deny;
 //! - `ask-then-end <permission id>`: request permission and end the turn with the request unresolved;
 //! - `ask-unknown <permission id>`: the same, with a `PermissionOrigin` no client knows;
 //! - `unknown-event`: a session event whose only arm is a field no client knows;
@@ -79,8 +81,9 @@ use claude_runtime_protocol::v1::{
     HandshakeResponse, InterruptTurnRequest, InterruptTurnResponse, OpenClientToolCall, PermissionOutcome,
     PermissionRequested, PermissionResolved, ResolvePermissionRequest, ResolvePermissionResponse, SendTurnRequest,
     SendTurnResponse, SessionCloseReason, SessionClosed, SessionEvent, SessionReady, SteerTurnRequest,
-    SteerTurnResponse, TextDelta, TurnCause, TurnCauseKind, TurnCauseUpdated, TurnCompleted, TurnOrigin, TurnOutcome,
-    TurnStarted, UserMessageDelivered, UserMessageDropReason, UserMessageDropped, WatchSessionEventsRequest,
+    SteerTurnResponse, TextDelta, ToolCallCompleted, ToolCallStarted, TurnCause, TurnCauseKind, TurnCauseUpdated,
+    TurnCompleted, TurnOrigin, TurnOutcome, TurnStarted, UserMessageDelivered, UserMessageDropReason,
+    UserMessageDropped, WatchSessionEventsRequest,
 };
 use prost::bytes::{Buf, BufMut};
 use prost::encoding::{DecodeContext, WireType};
@@ -188,13 +191,19 @@ struct Session {
     latest_sequence: u64,
     watchers: Vec<Watcher>,
     /// The rest of a script, by the permission it waits on, with its turn.
-    waiting: HashMap<String, (String, Vec<String>)>,
+    waiting: HashMap<String, PendingPermission>,
     /// The client id of the latest `SendTurn`'s message, if it named one.
     last_client_id: Option<String>,
     /// The client tool calls waiting for an answer, oldest first.
     open_calls: Vec<OpenClientToolCall>,
     /// The client tool calls answered, each of them spent.
     answered_calls: HashSet<String>,
+}
+
+struct PendingPermission {
+    turn_id: String,
+    steps: Vec<String>,
+    write_path: Option<std::path::PathBuf>,
 }
 
 #[derive(Default)]
@@ -431,14 +440,44 @@ fn run(shared: Arc<Shared>, session_id: String, mut turn_id: String, mut steps: 
                     let ms = words.next().and_then(|ms| ms.parse().ok()).unwrap_or(0);
                     tokio::time::sleep(Duration::from_millis(ms)).await;
                 }
-                Some(step @ ("ask" | "ask-unknown" | "ask-then-end")) => {
+                Some(kind @ ("ask" | "ask-unknown" | "ask-then-end" | "ask-write")) => {
                     let permission_id = words.next().unwrap_or("p").to_string();
+                    let write_path = (kind == "ask-write").then(|| {
+                        let path: String = serde_json::from_str(step.splitn(3, ' ').nth(2).expect("JSON path"))
+                            .expect("a quoted path");
+                        std::path::PathBuf::from(path)
+                    });
+                    let input_json = match &write_path {
+                        Some(path) => serde_json::json!({"file_path": path, "content": "allowed\n"}).to_string(),
+                        None => r#"{"command":"true"}"#.to_string(),
+                    };
+                    let tool_name = if write_path.is_some() { "Write" } else { "Bash" };
+                    if write_path.is_some() {
+                        shared.emit(
+                            &session_id,
+                            Some(&turn_id),
+                            Event::ToolCallStarted(ToolCallStarted {
+                                turn_id: turn_id.clone(),
+                                tool_use_id: format!("tool-{permission_id}"),
+                                name: tool_name.to_string(),
+                                input_json: input_json.clone(),
+                                ..Default::default()
+                            }),
+                        );
+                    }
                     if let Some(session) = shared.sessions.lock().unwrap().get_mut(&session_id) {
                         let mut rest = std::mem::take(&mut steps);
-                        if step == "ask-then-end" {
+                        if kind == "ask-then-end" {
                             rest.clear();
                         }
-                        session.waiting.insert(permission_id.clone(), (turn_id.clone(), rest));
+                        session.waiting.insert(
+                            permission_id.clone(),
+                            PendingPermission {
+                                turn_id: turn_id.clone(),
+                                steps: rest,
+                                write_path,
+                            },
+                        );
                     }
                     shared.emit(
                         &session_id,
@@ -446,13 +485,13 @@ fn run(shared: Arc<Shared>, session_id: String, mut turn_id: String, mut steps: 
                         Event::PermissionRequested(PermissionRequested {
                             permission_id: permission_id.clone(),
                             tool_use_id: format!("tool-{permission_id}"),
-                            tool_name: "Bash".to_string(),
-                            input_json: r#"{"command":"true"}"#.to_string(),
-                            origin: if step == "ask-unknown" { UNKNOWN_ORIGIN } else { 0 },
+                            tool_name: tool_name.to_string(),
+                            input_json,
+                            origin: if kind == "ask-unknown" { UNKNOWN_ORIGIN } else { 0 },
                             ..Default::default()
                         }),
                     );
-                    if step == "ask-then-end" {
+                    if kind == "ask-then-end" {
                         steps.push("end".to_string());
                     } else {
                         return;
@@ -783,7 +822,12 @@ impl Service<http::Request<Body>> for StandIn {
                             .unwrap()
                             .get_mut(&request.session_id)
                             .and_then(|session| session.waiting.remove(&request.permission_id));
-                        let Some((turn_id, steps)) = rest else {
+                        let Some(PendingPermission {
+                            turn_id,
+                            steps,
+                            write_path,
+                        }) = rest
+                        else {
                             return Err(Status::not_found("no such permission"));
                         };
                         let outcome = if request.allow {
@@ -795,10 +839,31 @@ impl Service<http::Request<Body>> for StandIn {
                             &request.session_id,
                             Some(&turn_id),
                             Event::PermissionResolved(PermissionResolved {
-                                permission_id: request.permission_id,
+                                permission_id: request.permission_id.clone(),
                                 outcome: outcome as i32,
                             }),
                         );
+                        if let Some(path) = write_path {
+                            if request.allow {
+                                agent::private_fs::write_private(&path, b"allowed\n").unwrap();
+                            }
+                            shared.emit(
+                                &request.session_id,
+                                Some(&turn_id),
+                                Event::ToolCallCompleted(ToolCallCompleted {
+                                    turn_id: turn_id.clone(),
+                                    tool_use_id: format!("tool-{}", request.permission_id),
+                                    content_json: serde_json::json!(if request.allow {
+                                        "written".to_string()
+                                    } else {
+                                        request.reason
+                                    })
+                                    .to_string(),
+                                    is_error: !request.allow,
+                                    ..Default::default()
+                                }),
+                            );
+                        }
                         run(Arc::clone(&shared), request.session_id, turn_id, steps);
                         Ok(ResolvePermissionResponse {})
                     })
@@ -853,7 +918,42 @@ impl Service<http::Request<Body>> for StandIn {
                     })
                     .await
                 }
-                "InterruptTurn" => unary(req, |_: InterruptTurnRequest| async { Ok(InterruptTurnResponse {}) }).await,
+                "InterruptTurn" => {
+                    unary(req, move |request: InterruptTurnRequest| async move {
+                        let waiting = shared
+                            .sessions
+                            .lock()
+                            .unwrap()
+                            .get_mut(&request.session_id)
+                            .map(|session| std::mem::take(&mut session.waiting))
+                            .ok_or_else(|| refusal(tonic::Code::NotFound, ErrorCode::SessionNotFound, ""))?;
+                        let mut turns = HashSet::new();
+                        for (permission_id, pending) in waiting {
+                            shared.emit(
+                                &request.session_id,
+                                Some(&pending.turn_id),
+                                Event::PermissionResolved(PermissionResolved {
+                                    permission_id,
+                                    outcome: PermissionOutcome::CancelledByInterrupt as i32,
+                                }),
+                            );
+                            turns.insert(pending.turn_id);
+                        }
+                        for turn_id in turns {
+                            shared.emit(
+                                &request.session_id,
+                                Some(&turn_id),
+                                Event::TurnCompleted(TurnCompleted {
+                                    turn_id: turn_id.clone(),
+                                    outcome: TurnOutcome::Interrupted as i32,
+                                    ..Default::default()
+                                }),
+                            );
+                        }
+                        Ok(InterruptTurnResponse {})
+                    })
+                    .await
+                }
                 "CloseSession" => {
                     unary(req, move |request: CloseSessionRequest| async move {
                         shared.emit(

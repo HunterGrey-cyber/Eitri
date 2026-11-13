@@ -105,10 +105,9 @@ export function tabStateWord(info: TabInfo | null): string {
 }
 
 /** Claude Code's own `/resume` picker wording for a record's `updatedAt`: "just now",
- *  minutes, hours within today, "yesterday", else a bare month/day. A stamp `formatWhen`
- *  (`SessionRow.tsx`) can't parse passes through unchanged, the same defensive fallback that
- *  function has for a hand-edited or corrupted record (`agent::persistence`; nothing produces one,
- *  nothing tests it -- kept for the same reason). */
+ *  minutes, hours within today, "yesterday", else a bare month/day. A stamp that is not a
+ *  positive number passes through unchanged: persistence tolerates a hand-edited or corrupted
+ *  record (`agent::persistence`), and the literal stamp beats "Invalid Date". */
 export function relativeWhen(nowMs: number, stamp: string): string {
   const millis = Number(stamp);
   if (!Number.isFinite(millis) || millis <= 0) return stamp;

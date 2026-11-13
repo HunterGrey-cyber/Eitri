@@ -526,10 +526,6 @@ export function resetFind(): void {
   restoreFocus = null;
 }
 
-export function findPromptOpen(): boolean {
-  return !!prompt && !prompt.hidden;
-}
-
 function run(text: string): void {
   const wanted = text || query;
   if (!wanted) {

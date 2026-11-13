@@ -497,7 +497,6 @@ const MODEL_ROWS: usize = 64;
 const EFFORT_ROWS: usize = 16;
 
 /// A background task's output as `GetTaskOutput` answered it.
-#[allow(dead_code)] // read by the provider's task-output request, which no caller makes yet
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct TaskOutputTail {
     /// The tail, decoded lossily: it can begin in the middle of an encoded character.

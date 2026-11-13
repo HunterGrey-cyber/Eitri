@@ -13,7 +13,6 @@ pub const COMPACTION_PROMPTS: [&str; 2] = [
 /// The small-model request that labels a group of tool calls. Whether a session driven through the SDK sends it is
 /// not yet confirmed, so the row is listed but unconfirmed.
 pub const TOOL_USE_SUMMARY_PROMPT: &str = "Write a short summary label describing what these tool calls accomplished";
-pub const TOOL_USE_SUMMARY_CONFIRMED: bool = false;
 
 /// The attribution header line of a subagent's requests.
 pub const SUBAGENT_MARK: &str = "cc_is_subagent=true";

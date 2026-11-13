@@ -151,7 +151,6 @@ impl ModuleWindows {
         Some(name.clone())
     }
 
-    #[cfg_attr(not(test), allow(dead_code))] // The window verbs name windows through the controller.
     pub fn names(&self) -> Vec<WindowName> {
         self.windows.keys().cloned().collect()
     }

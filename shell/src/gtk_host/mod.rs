@@ -931,7 +931,6 @@ impl GtkHost {
     }
 
     /// What carries out the ops of a page window beside nvim, in that window only.
-    #[allow(dead_code)] // Set by the shell binary's page window; the tests that include this file set none.
     pub(crate) fn set_beside(&self, port: Rc<dyn BesidePort>) {
         *self.beside.borrow_mut() = Some(port);
     }
