@@ -27,7 +27,7 @@ use std::{
         Arc, Mutex,
     },
     thread::{self, JoinHandle},
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
@@ -1001,7 +1001,17 @@ fn serve(mut stream: TcpStream, index: usize, shared: Arc<Shared>) {
         }
         http::stream_headers(&mut stream, index, &reply.ok_headers)?;
         for frame in sse::frames(&reply, index, model) {
-            frame.write_to(&mut stream, std::thread::sleep)?;
+            frame.write_to(&mut stream, |delay| {
+                // Sliced so a shutdown never waits out a long pace.
+                let end = Instant::now() + delay;
+                while !shared.stop.load(Ordering::Acquire) {
+                    let left = end.saturating_duration_since(Instant::now());
+                    if left.is_zero() {
+                        break;
+                    }
+                    std::thread::sleep(left.min(Duration::from_millis(20)));
+                }
+            })?;
             record
                 .response_events
                 .push(json!({"event":frame.event,"data":frame.data}));

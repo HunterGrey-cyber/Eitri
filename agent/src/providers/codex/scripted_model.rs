@@ -314,6 +314,7 @@ fn sse(events: &[Value], response_id: &str) -> Vec<u8> {
     out.into_bytes()
 }
 
+#[cfg_attr(not(feature = "test-support"), allow(unused_variables))]
 fn serve(stream: TcpStream, inner: &Mutex<Inner>, stop: &AtomicBool) -> io::Result<()> {
     stream.set_read_timeout(Some(READ_TIMEOUT))?;
     let mut writer = stream.try_clone()?;
