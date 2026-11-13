@@ -158,10 +158,7 @@ fn open(thread: &str, rest: Vec<Value>) -> (Arc<CodexProvider>, String) {
 
 fn send(provider: &CodexProvider, thread: &str, text: &str) -> Result<String, ProviderError> {
     provider.send_turn_with(
-        SendTurnRequest {
-            session_id: thread.to_string(),
-            text: text.to_string(),
-        },
+        SendTurnRequest::text(thread.to_string(), text.to_string()),
         TurnPolicy {
             reviewer: Reviewer::User,
             sandbox: agent::Sandbox::Project,
@@ -575,10 +572,7 @@ fn a_codex_home_inside_the_project_refuses_the_start_before_anything_runs() {
 fn the_plain_claude_shaped_calls_refuse() {
     let (provider, thread) = open("th-plain", vec![]);
     let refused = |e: Result<String, ProviderError>| matches!(e, Err(ProviderError::UnsupportedCapability("external")));
-    assert!(refused(provider.send_turn(SendTurnRequest {
-        session_id: thread,
-        text: "x".into()
-    })));
+    assert!(refused(provider.send_turn(SendTurnRequest::text(thread, "x"))));
     assert_eq!(provider.name(), "codex");
 }
 
@@ -809,10 +803,7 @@ fn a_read_only_session_says_so_at_its_start_and_every_turn() {
     );
     let turn = provider
         .send_turn_with(
-            SendTurnRequest {
-                session_id: "th-ro".to_string(),
-                text: "hello".to_string(),
-            },
+            SendTurnRequest::text("th-ro".to_string(), "hello".to_string()),
             request.policy,
         )
         .expect("the turn starts");

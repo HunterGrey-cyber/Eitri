@@ -1,0 +1,3900 @@
+{
+  "cases": [
+    {
+      "name": "outcome-Approved",
+      "requested": "default",
+      "steps": [
+        {
+          "action": {
+            "event": {
+              "turn_id": "turn",
+              "type": "turn_started"
+            }
+          },
+          "isPlanning": false,
+          "planGateApplies": false,
+          "snapshot": {
+            "activeTurnId": "turn",
+            "planning": {
+              "phase": "executing"
+            }
+          },
+          "throughRevision": 1,
+          "waitingId": null
+        },
+        {
+          "action": {
+            "event": {
+              "input": {},
+              "name": "EnterPlanMode",
+              "tool_use_id": "tool-enter",
+              "turn_id": "turn",
+              "type": "tool_call_started"
+            }
+          },
+          "isPlanning": true,
+          "planGateApplies": false,
+          "snapshot": {
+            "activeTurnId": "turn",
+            "planning": {
+              "phase": "entering"
+            }
+          },
+          "throughRevision": 2,
+          "waitingId": null
+        },
+        {
+          "action": {
+            "event": {
+              "source": "CliModeReported",
+              "type": "cli_plan_mode"
+            }
+          },
+          "isPlanning": true,
+          "planGateApplies": true,
+          "snapshot": {
+            "activeTurnId": "turn",
+            "planning": {
+              "phase": "planning"
+            }
+          },
+          "throughRevision": 3,
+          "waitingId": null
+        },
+        {
+          "action": {
+            "event": {
+              "allowed_prompts": [
+                {
+                  "prompt": "run the tests",
+                  "tool": "Bash"
+                },
+                {
+                  "prompt": "remote‮​",
+                  "tool": "Bash"
+                }
+              ],
+              "interaction_id": "p",
+              "plan": "# Plan\n\n1. Read `src/a.rs`\n2. Change it​\n\n<script>alert(1)</script>",
+              "plan_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+              "tool_use_id": "tool-p",
+              "type": "plan_proposed",
+              "unsupported_reason": null
+            }
+          },
+          "isPlanning": true,
+          "planGateApplies": true,
+          "snapshot": {
+            "activeTurnId": "turn",
+            "planning": {
+              "phase": "planning"
+            },
+            "plans": [
+              {
+                "allowedPrompts": [
+                  {
+                    "prompt": "run the tests",
+                    "tool": "Bash"
+                  },
+                  {
+                    "prompt": "remote‮​",
+                    "tool": "Bash"
+                  }
+                ],
+                "interactionId": "p",
+                "plan": "# Plan\n\n1. Read `src/a.rs`\n2. Change it​\n\n<script>alert(1)</script>",
+                "planSha256": "0000000000000000000000000000000000000000000000000000000000000000",
+                "seq": 3,
+                "state": {
+                  "kind": "waiting"
+                },
+                "toolUseId": "tool-p",
+                "turnId": "turn",
+                "unsupportedReason": null
+              }
+            ]
+          },
+          "throughRevision": 4,
+          "waitingId": "p"
+        },
+        {
+          "action": {
+            "changed": true,
+            "interactionId": "p",
+            "send": "answering"
+          },
+          "isPlanning": true,
+          "planGateApplies": true,
+          "snapshot": {
+            "activeTurnId": "turn",
+            "planning": {
+              "phase": "planning"
+            },
+            "plans": [
+              {
+                "allowedPrompts": [
+                  {
+                    "prompt": "run the tests",
+                    "tool": "Bash"
+                  },
+                  {
+                    "prompt": "remote‮​",
+                    "tool": "Bash"
+                  }
+                ],
+                "interactionId": "p",
+                "plan": "# Plan\n\n1. Read `src/a.rs`\n2. Change it​\n\n<script>alert(1)</script>",
+                "planSha256": "0000000000000000000000000000000000000000000000000000000000000000",
+                "seq": 3,
+                "state": {
+                  "kind": "answering"
+                },
+                "toolUseId": "tool-p",
+                "turnId": "turn",
+                "unsupportedReason": null
+              }
+            ]
+          },
+          "throughRevision": 4,
+          "waitingId": "p"
+        },
+        {
+          "action": {
+            "event": {
+              "feedback": null,
+              "interaction_id": "p",
+              "mode_after": "auto",
+              "outcome": "approved",
+              "reason": "ended: Approved",
+              "type": "plan_settled"
+            }
+          },
+          "isPlanning": true,
+          "planGateApplies": true,
+          "snapshot": {
+            "activeTurnId": "turn",
+            "planning": {
+              "phase": "leaving"
+            },
+            "plans": [
+              {
+                "allowedPrompts": [
+                  {
+                    "prompt": "run the tests",
+                    "tool": "Bash"
+                  },
+                  {
+                    "prompt": "remote‮​",
+                    "tool": "Bash"
+                  }
+                ],
+                "interactionId": "p",
+                "plan": "# Plan\n\n1. Read `src/a.rs`\n2. Change it​\n\n<script>alert(1)</script>",
+                "planSha256": "0000000000000000000000000000000000000000000000000000000000000000",
+                "seq": 3,
+                "state": {
+                  "feedback": null,
+                  "kind": "settled",
+                  "modeAfter": "auto",
+                  "outcome": "approved",
+                  "reason": "ended: Approved"
+                },
+                "toolUseId": "tool-p",
+                "turnId": "turn",
+                "unsupportedReason": null
+              }
+            ]
+          },
+          "throughRevision": 5,
+          "waitingId": null
+        },
+        {
+          "action": {
+            "event": {
+              "feedback": null,
+              "interaction_id": "p",
+              "mode_after": "auto",
+              "outcome": "approved",
+              "reason": "ended: Approved",
+              "type": "plan_settled"
+            }
+          },
+          "isPlanning": true,
+          "planGateApplies": true,
+          "snapshot": {
+            "activeTurnId": "turn",
+            "planning": {
+              "phase": "leaving"
+            },
+            "plans": [
+              {
+                "allowedPrompts": [
+                  {
+                    "prompt": "run the tests",
+                    "tool": "Bash"
+                  },
+                  {
+                    "prompt": "remote‮​",
+                    "tool": "Bash"
+                  }
+                ],
+                "interactionId": "p",
+                "plan": "# Plan\n\n1. Read `src/a.rs`\n2. Change it​\n\n<script>alert(1)</script>",
+                "planSha256": "0000000000000000000000000000000000000000000000000000000000000000",
+                "seq": 3,
+                "state": {
+                  "feedback": null,
+                  "kind": "settled",
+                  "modeAfter": "auto",
+                  "outcome": "approved",
+                  "reason": "ended: Approved"
+                },
+                "toolUseId": "tool-p",
+                "turnId": "turn",
+                "unsupportedReason": null
+              }
+            ]
+          },
+          "throughRevision": 6,
+          "waitingId": null
+        },
+        {
+          "action": {
+            "changed": false,
+            "interactionId": "p",
+            "send": "failed"
+          },
+          "isPlanning": true,
+          "planGateApplies": true,
+          "snapshot": {
+            "activeTurnId": "turn",
+            "planning": {
+              "phase": "leaving"
+            },
+            "plans": [
+              {
+                "allowedPrompts": [
+                  {
+                    "prompt": "run the tests",
+                    "tool": "Bash"
+                  },
+                  {
+                    "prompt": "remote‮​",
+                    "tool": "Bash"
+                  }
+                ],
+                "interactionId": "p",
+                "plan": "# Plan\n\n1. Read `src/a.rs`\n2. Change it​\n\n<script>alert(1)</script>",
+                "planSha256": "0000000000000000000000000000000000000000000000000000000000000000",
+                "seq": 3,
+                "state": {
+                  "feedback": null,
+                  "kind": "settled",
+                  "modeAfter": "auto",
+                  "outcome": "approved",
+                  "reason": "ended: Approved"
+                },
+                "toolUseId": "tool-p",
+                "turnId": "turn",
+                "unsupportedReason": null
+              }
+            ]
+          },
+          "throughRevision": 6,
+          "waitingId": null
+        },
+        {
+          "action": {
+            "changed": false,
+            "interactionId": "p",
+            "send": "answering"
+          },
+          "isPlanning": true,
+          "planGateApplies": true,
+          "snapshot": {
+            "activeTurnId": "turn",
+            "planning": {
+              "phase": "leaving"
+            },
+            "plans": [
+              {
+                "allowedPrompts": [
+                  {
+                    "prompt": "run the tests",
+                    "tool": "Bash"
+                  },
+                  {
+                    "prompt": "remote‮​",
+                    "tool": "Bash"
+                  }
+                ],
+                "interactionId": "p",
+                "plan": "# Plan\n\n1. Read `src/a.rs`\n2. Change it​\n\n<script>alert(1)</script>",
+                "planSha256": "0000000000000000000000000000000000000000000000000000000000000000",
+                "seq": 3,
+                "state": {
+                  "feedback": null,
+                  "kind": "settled",
+                  "modeAfter": "auto",
+                  "outcome": "approved",
+                  "reason": "ended: Approved"
+                },
+                "toolUseId": "tool-p",
+                "turnId": "turn",
+                "unsupportedReason": null
+              }
+            ]
+          },
+          "throughRevision": 6,
+          "waitingId": null
+        }
+      ]
+    },
+    {
+      "name": "outcome-KeptPlanning",
+      "requested": "default",
+      "steps": [
+        {
+          "action": {
+            "event": {
+              "turn_id": "turn",
+              "type": "turn_started"
+            }
+          },
+          "isPlanning": false,
+          "planGateApplies": false,
+          "snapshot": {
+            "activeTurnId": "turn",
+            "planning": {
+              "phase": "executing"
+            }
+          },
+          "throughRevision": 1,
+          "waitingId": null
+        },
+        {
+          "action": {
+            "event": {
+              "input": {},
+              "name": "EnterPlanMode",
+              "tool_use_id": "tool-enter",
+              "turn_id": "turn",
+              "type": "tool_call_started"
+            }
+          },
+          "isPlanning": true,
+          "planGateApplies": false,
+          "snapshot": {
+            "activeTurnId": "turn",
+            "planning": {
+              "phase": "entering"
+            }
+          },
+          "throughRevision": 2,
+          "waitingId": null
+        },
+        {
+          "action": {
+            "event": {
+              "source": "CliModeReported",
+              "type": "cli_plan_mode"
+            }
+          },
+          "isPlanning": true,
+          "planGateApplies": true,
+          "snapshot": {
+            "activeTurnId": "turn",
+            "planning": {
+              "phase": "planning"
+            }
+          },
+          "throughRevision": 3,
+          "waitingId": null
+        },
+        {
+          "action": {
+            "event": {
+              "allowed_prompts": [
+                {
+                  "prompt": "run the tests",
+                  "tool": "Bash"
+                },
+                {
+                  "prompt": "remote‮​",
+                  "tool": "Bash"
+                }
+              ],
+              "interaction_id": "p",
+              "plan": "# Plan\n\n1. Read `src/a.rs`\n2. Change it​\n\n<script>alert(1)</script>",
+              "plan_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+              "tool_use_id": "tool-p",
+              "type": "plan_proposed",
+              "unsupported_reason": null
+            }
+          },
+          "isPlanning": true,
+          "planGateApplies": true,
+          "snapshot": {
+            "activeTurnId": "turn",
+            "planning": {
+              "phase": "planning"
+            },
+            "plans": [
+              {
+                "allowedPrompts": [
+                  {
+                    "prompt": "run the tests",
+                    "tool": "Bash"
+                  },
+                  {
+                    "prompt": "remote‮​",
+                    "tool": "Bash"
+                  }
+                ],
+                "interactionId": "p",
+                "plan": "# Plan\n\n1. Read `src/a.rs`\n2. Change it​\n\n<script>alert(1)</script>",
+                "planSha256": "0000000000000000000000000000000000000000000000000000000000000000",
+                "seq": 3,
+                "state": {
+                  "kind": "waiting"
+                },
+                "toolUseId": "tool-p",
+                "turnId": "turn",
+                "unsupportedReason": null
+              }
+            ]
+          },
+          "throughRevision": 4,
+          "waitingId": "p"
+        },
+        {
+          "action": {
+            "changed": true,
+            "interactionId": "p",
+            "send": "answering"
+          },
+          "isPlanning": true,
+          "planGateApplies": true,
+          "snapshot": {
+            "activeTurnId": "turn",
+            "planning": {
+              "phase": "planning"
+            },
+            "plans": [
+              {
+                "allowedPrompts": [
+                  {
+                    "prompt": "run the tests",
+                    "tool": "Bash"
+                  },
+                  {
+                    "prompt": "remote‮​",
+                    "tool": "Bash"
+                  }
+                ],
+                "interactionId": "p",
+                "plan": "# Plan\n\n1. Read `src/a.rs`\n2. Change it​\n\n<script>alert(1)</script>",
+                "planSha256": "0000000000000000000000000000000000000000000000000000000000000000",
+                "seq": 3,
+                "state": {
+                  "kind": "answering"
+                },
+                "toolUseId": "tool-p",
+                "turnId": "turn",
+                "unsupportedReason": null
+              }
+            ]
+          },
+          "throughRevision": 4,
+          "waitingId": "p"
+        },
+        {
+          "action": {
+            "event": {
+              "feedback": "Keep \"this\" shorter​",
+              "interaction_id": "p",
+              "mode_after": null,
+              "outcome": "kept_planning",
+              "reason": "ended: KeptPlanning",
+              "type": "plan_settled"
+            }
+          },
+          "isPlanning": true,
+          "planGateApplies": true,
+          "snapshot": {
+            "activeTurnId": "turn",
+            "planning": {
+              "phase": "planning"
+            },
+            "plans": [
+              {
+                "allowedPrompts": [
+                  {
+                    "prompt": "run the tests",
+                    "tool": "Bash"
+                  },
+                  {
+                    "prompt": "remote‮​",
+                    "tool": "Bash"
+                  }
+                ],
+                "interactionId": "p",
+                "plan": "# Plan\n\n1. Read `src/a.rs`\n2. Change it​\n\n<script>alert(1)</script>",
+                "planSha256": "0000000000000000000000000000000000000000000000000000000000000000",
+                "seq": 3,
+                "state": {
+                  "feedback": "Keep \"this\" shorter​",
+                  "kind": "settled",
+                  "modeAfter": null,
+                  "outcome": "kept_planning",
+                  "reason": "ended: KeptPlanning"
+                },
+                "toolUseId": "tool-p",
+                "turnId": "turn",
+                "unsupportedReason": null
+              }
+            ]
+          },
+          "throughRevision": 5,
+          "waitingId": null
+        },
+        {
+          "action": {
+            "event": {
+              "feedback": null,
+              "interaction_id": "p",
+              "mode_after": "auto",
+              "outcome": "approved",
+              "reason": "ended: Approved",
+              "type": "plan_settled"
+            }
+          },
+          "isPlanning": true,
+          "planGateApplies": true,
+          "snapshot": {
+            "activeTurnId": "turn",
+            "planning": {
+              "phase": "planning"
+            },
+            "plans": [
+              {
+                "allowedPrompts": [
+                  {
+                    "prompt": "run the tests",
+                    "tool": "Bash"
+                  },
+                  {
+                    "prompt": "remote‮​",
+                    "tool": "Bash"
+                  }
+                ],
+                "interactionId": "p",
+                "plan": "# Plan\n\n1. Read `src/a.rs`\n2. Change it​\n\n<script>alert(1)</script>",
+                "planSha256": "0000000000000000000000000000000000000000000000000000000000000000",
+                "seq": 3,
+                "state": {
+                  "feedback": "Keep \"this\" shorter​",
+                  "kind": "settled",
+                  "modeAfter": null,
+                  "outcome": "kept_planning",
+                  "reason": "ended: KeptPlanning"
+                },
+                "toolUseId": "tool-p",
+                "turnId": "turn",
+                "unsupportedReason": null
+              }
+            ]
+          },
+          "throughRevision": 6,
+          "waitingId": null
+        },
+        {
+          "action": {
+            "changed": false,
+            "interactionId": "p",
+            "send": "failed"
+          },
+          "isPlanning": true,
+          "planGateApplies": true,
+          "snapshot": {
+            "activeTurnId": "turn",
+            "planning": {
+              "phase": "planning"
+            },
+            "plans": [
+              {
+                "allowedPrompts": [
+                  {
+                    "prompt": "run the tests",
+                    "tool": "Bash"
+                  },
+                  {
+                    "prompt": "remote‮​",
+                    "tool": "Bash"
+                  }
+                ],
+                "interactionId": "p",
+                "plan": "# Plan\n\n1. Read `src/a.rs`\n2. Change it​\n\n<script>alert(1)</script>",
+                "planSha256": "0000000000000000000000000000000000000000000000000000000000000000",
+                "seq": 3,
+                "state": {
+                  "feedback": "Keep \"this\" shorter​",
+                  "kind": "settled",
+                  "modeAfter": null,
+                  "outcome": "kept_planning",
+                  "reason": "ended: KeptPlanning"
+                },
+                "toolUseId": "tool-p",
+                "turnId": "turn",
+                "unsupportedReason": null
+              }
+            ]
+          },
+          "throughRevision": 6,
+          "waitingId": null
+        },
+        {
+          "action": {
+            "changed": false,
+            "interactionId": "p",
+            "send": "answering"
+          },
+          "isPlanning": true,
+          "planGateApplies": true,
+          "snapshot": {
+            "activeTurnId": "turn",
+            "planning": {
+              "phase": "planning"
+            },
+            "plans": [
+              {
+                "allowedPrompts": [
+                  {
+                    "prompt": "run the tests",
+                    "tool": "Bash"
+                  },
+                  {
+                    "prompt": "remote‮​",
+                    "tool": "Bash"
+                  }
+                ],
+                "interactionId": "p",
+                "plan": "# Plan\n\n1. Read `src/a.rs`\n2. Change it​\n\n<script>alert(1)</script>",
+                "planSha256": "0000000000000000000000000000000000000000000000000000000000000000",
+                "seq": 3,
+                "state": {
+                  "feedback": "Keep \"this\" shorter​",
+                  "kind": "settled",
+                  "modeAfter": null,
+                  "outcome": "kept_planning",
+                  "reason": "ended: KeptPlanning"
+                },
+                "toolUseId": "tool-p",
+                "turnId": "turn",
+                "unsupportedReason": null
+              }
+            ]
+          },
+          "throughRevision": 6,
+          "waitingId": null
+        }
+      ]
+    },
+    {
+      "name": "outcome-Interrupted",
+      "requested": "default",
+      "steps": [
+        {
+          "action": {
+            "event": {
+              "turn_id": "turn",
+              "type": "turn_started"
+            }
+          },
+          "isPlanning": false,
+          "planGateApplies": false,
+          "snapshot": {
+            "activeTurnId": "turn",
+            "planning": {
+              "phase": "executing"
+            }
+          },
+          "throughRevision": 1,
+          "waitingId": null
+        },
+        {
+          "action": {
+            "event": {
+              "input": {},
+              "name": "EnterPlanMode",
+              "tool_use_id": "tool-enter",
+              "turn_id": "turn",
+              "type": "tool_call_started"
+            }
+          },
+          "isPlanning": true,
+          "planGateApplies": false,
+          "snapshot": {
+            "activeTurnId": "turn",
+            "planning": {
+              "phase": "entering"
+            }
+          },
+          "throughRevision": 2,
+          "waitingId": null
+        },
+        {
+          "action": {
+            "event": {
+              "source": "CliModeReported",
+              "type": "cli_plan_mode"
+            }
+          },
+          "isPlanning": true,
+          "planGateApplies": true,
+          "snapshot": {
+            "activeTurnId": "turn",
+            "planning": {
+              "phase": "planning"
+            }
+          },
+          "throughRevision": 3,
+          "waitingId": null
+        },
+        {
+          "action": {
+            "event": {
+              "allowed_prompts": [
+                {
+                  "prompt": "run the tests",
+                  "tool": "Bash"
+                },
+                {
+                  "prompt": "remote‮​",
+                  "tool": "Bash"
+                }
+              ],
+              "interaction_id": "p",
+              "plan": "# Plan\n\n1. Read `src/a.rs`\n2. Change it​\n\n<script>alert(1)</script>",
+              "plan_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+              "tool_use_id": "tool-p",
+              "type": "plan_proposed",
+              "unsupported_reason": null
+            }
+          },
+          "isPlanning": true,
+          "planGateApplies": true,
+          "snapshot": {
+            "activeTurnId": "turn",
+            "planning": {
+              "phase": "planning"
+            },
+            "plans": [
+              {
+                "allowedPrompts": [
+                  {
+                    "prompt": "run the tests",
+                    "tool": "Bash"
+                  },
+                  {
+                    "prompt": "remote‮​",
+                    "tool": "Bash"
+                  }
+                ],
+                "interactionId": "p",
+                "plan": "# Plan\n\n1. Read `src/a.rs`\n2. Change it​\n\n<script>alert(1)</script>",
+                "planSha256": "0000000000000000000000000000000000000000000000000000000000000000",
+                "seq": 3,
+                "state": {
+                  "kind": "waiting"
+                },
+                "toolUseId": "tool-p",
+                "turnId": "turn",
+                "unsupportedReason": null
+              }
+            ]
+          },
+          "throughRevision": 4,
+          "waitingId": "p"
+        },
+        {
+          "action": {
+            "changed": true,
+            "interactionId": "p",
+            "send": "answering"
+          },
+          "isPlanning": true,
+          "planGateApplies": true,
+          "snapshot": {
+            "activeTurnId": "turn",
+            "planning": {
+              "phase": "planning"
+            },
+            "plans": [
+              {
+                "allowedPrompts": [
+                  {
+                    "prompt": "run the tests",
+                    "tool": "Bash"
+                  },
+                  {
+                    "prompt": "remote‮​",
+                    "tool": "Bash"
+                  }
+                ],
+                "interactionId": "p",
+                "plan": "# Plan\n\n1. Read `src/a.rs`\n2. Change it​\n\n<script>alert(1)</script>",
+                "planSha256": "0000000000000000000000000000000000000000000000000000000000000000",
+                "seq": 3,
+                "state": {
+                  "kind": "answering"
+                },
+                "toolUseId": "tool-p",
+                "turnId": "turn",
+                "unsupportedReason": null
+              }
+            ]
+          },
+          "throughRevision": 4,
+          "waitingId": "p"
+        },
+        {
+          "action": {
+            "event": {
+              "feedback": null,
+              "interaction_id": "p",
+              "mode_after": null,
+              "outcome": "interrupted",
+              "reason": "ended: Interrupted",
+              "type": "plan_settled"
+            }
+          },
+          "isPlanning": true,
+          "planGateApplies": true,
+          "snapshot": {
+            "activeTurnId": "turn",
+            "planning": {
+              "phase": "planning"
+            },
+            "plans": [
+              {
+                "allowedPrompts": [
+                  {
+                    "prompt": "run the tests",
+                    "tool": "Bash"
+                  },
+                  {
+                    "prompt": "remote‮​",
+                    "tool": "Bash"
+                  }
+                ],
+                "interactionId": "p",
+                "plan": "# Plan\n\n1. Read `src/a.rs`\n2. Change it​\n\n<script>alert(1)</script>",
+                "planSha256": "0000000000000000000000000000000000000000000000000000000000000000",
+                "seq": 3,
+                "state": {
+                  "feedback": null,
+                  "kind": "settled",
+                  "modeAfter": null,
+                  "outcome": "interrupted",
+                  "reason": "ended: Interrupted"
+                },
+                "toolUseId": "tool-p",
+                "turnId": "turn",
+                "unsupportedReason": null
+              }
+            ]
+          },
+          "throughRevision": 5,
+          "waitingId": null
+        },
+        {
+          "action": {
+            "event": {
+              "feedback": null,
+              "interaction_id": "p",
+              "mode_after": "auto",
+              "outcome": "approved",
+              "reason": "ended: Approved",
+              "type": "plan_settled"
+            }
+          },
+          "isPlanning": true,
+          "planGateApplies": true,
+          "snapshot": {
+            "activeTurnId": "turn",
+            "planning": {
+              "phase": "planning"
+            },
+            "plans": [
+              {
+                "allowedPrompts": [
+                  {
+                    "prompt": "run the tests",
+                    "tool": "Bash"
+                  },
+                  {
+                    "prompt": "remote‮​",
+                    "tool": "Bash"
+                  }
+                ],
+                "interactionId": "p",
+                "plan": "# Plan\n\n1. Read `src/a.rs`\n2. Change it​\n\n<script>alert(1)</script>",
+                "planSha256": "0000000000000000000000000000000000000000000000000000000000000000",
+                "seq": 3,
+                "state": {
+                  "feedback": null,
+                  "kind": "settled",
+                  "modeAfter": null,
+                  "outcome": "interrupted",
+                  "reason": "ended: Interrupted"
+                },
+                "toolUseId": "tool-p",
+                "turnId": "turn",
+                "unsupportedReason": null
+              }
+            ]
+          },
+          "throughRevision": 6,
+          "waitingId": null
+        },
+        {
+          "action": {
+            "changed": false,
+            "interactionId": "p",
+            "send": "failed"
+          },
+          "isPlanning": true,
+          "planGateApplies": true,
+          "snapshot": {
+            "activeTurnId": "turn",
+            "planning": {
+              "phase": "planning"
+            },
+            "plans": [
+              {
+                "allowedPrompts": [
+                  {
+                    "prompt": "run the tests",
+                    "tool": "Bash"
+                  },
+                  {
+                    "prompt": "remote‮​",
+                    "tool": "Bash"
+                  }
+                ],
+                "interactionId": "p",
+                "plan": "# Plan\n\n1. Read `src/a.rs`\n2. Change it​\n\n<script>alert(1)</script>",
+                "planSha256": "0000000000000000000000000000000000000000000000000000000000000000",
+                "seq": 3,
+                "state": {
+                  "feedback": null,
+                  "kind": "settled",
+                  "modeAfter": null,
+                  "outcome": "interrupted",
+                  "reason": "ended: Interrupted"
+                },
+                "toolUseId": "tool-p",
+                "turnId": "turn",
+                "unsupportedReason": null
+              }
+            ]
+          },
+          "throughRevision": 6,
+          "waitingId": null
+        },
+        {
+          "action": {
+            "changed": false,
+            "interactionId": "p",
+            "send": "answering"
+          },
+          "isPlanning": true,
+          "planGateApplies": true,
+          "snapshot": {
+            "activeTurnId": "turn",
+            "planning": {
+              "phase": "planning"
+            },
+            "plans": [
+              {
+                "allowedPrompts": [
+                  {
+                    "prompt": "run the tests",
+                    "tool": "Bash"
+                  },
+                  {
+                    "prompt": "remote‮​",
+                    "tool": "Bash"
+                  }
+                ],
+                "interactionId": "p",
+                "plan": "# Plan\n\n1. Read `src/a.rs`\n2. Change it​\n\n<script>alert(1)</script>",
+                "planSha256": "0000000000000000000000000000000000000000000000000000000000000000",
+                "seq": 3,
+                "state": {
+                  "feedback": null,
+                  "kind": "settled",
+                  "modeAfter": null,
+                  "outcome": "interrupted",
+                  "reason": "ended: Interrupted"
+                },
+                "toolUseId": "tool-p",
+                "turnId": "turn",
+                "unsupportedReason": null
+              }
+            ]
+          },
+          "throughRevision": 6,
+          "waitingId": null
+        }
+      ]
+    },
+    {
+      "name": "outcome-Expired",
+      "requested": "default",
+      "steps": [
+        {
+          "action": {
+            "event": {
+              "turn_id": "turn",
+              "type": "turn_started"
+            }
+          },
+          "isPlanning": false,
+          "planGateApplies": false,
+          "snapshot": {
+            "activeTurnId": "turn",
+            "planning": {
+              "phase": "executing"
+            }
+          },
+          "throughRevision": 1,
+          "waitingId": null
+        },
+        {
+          "action": {
+            "event": {
+              "input": {},
+              "name": "EnterPlanMode",
+              "tool_use_id": "tool-enter",
+              "turn_id": "turn",
+              "type": "tool_call_started"
+            }
+          },
+          "isPlanning": true,
+          "planGateApplies": false,
+          "snapshot": {
+            "activeTurnId": "turn",
+            "planning": {
+              "phase": "entering"
+            }
+          },
+          "throughRevision": 2,
+          "waitingId": null
+        },
+        {
+          "action": {
+            "event": {
+              "source": "CliModeReported",
+              "type": "cli_plan_mode"
+            }
+          },
+          "isPlanning": true,
+          "planGateApplies": true,
+          "snapshot": {
+            "activeTurnId": "turn",
+            "planning": {
+              "phase": "planning"
+            }
+          },
+          "throughRevision": 3,
+          "waitingId": null
+        },
+        {
+          "action": {
+            "event": {
+              "allowed_prompts": [
+                {
+                  "prompt": "run the tests",
+                  "tool": "Bash"
+                },
+                {
+                  "prompt": "remote‮​",
+                  "tool": "Bash"
+                }
+              ],
+              "interaction_id": "p",
+              "plan": "# Plan\n\n1. Read `src/a.rs`\n2. Change it​\n\n<script>alert(1)</script>",
+              "plan_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+              "tool_use_id": "tool-p",
+              "type": "plan_proposed",
+              "unsupported_reason": null
+            }
+          },
+          "isPlanning": true,
+          "planGateApplies": true,
+          "snapshot": {
+            "activeTurnId": "turn",
+            "planning": {
+              "phase": "planning"
+            },
+            "plans": [
+              {
+                "allowedPrompts": [
+                  {
+                    "prompt": "run the tests",
+                    "tool": "Bash"
+                  },
+                  {
+                    "prompt": "remote‮​",
+                    "tool": "Bash"
+                  }
+                ],
+                "interactionId": "p",
+                "plan": "# Plan\n\n1. Read `src/a.rs`\n2. Change it​\n\n<script>alert(1)</script>",
+                "planSha256": "0000000000000000000000000000000000000000000000000000000000000000",
+                "seq": 3,
+                "state": {
+                  "kind": "waiting"
+                },
+                "toolUseId": "tool-p",
+                "turnId": "turn",
+                "unsupportedReason": null
+              }
+            ]
+          },
+          "throughRevision": 4,
+          "waitingId": "p"
+        },
+        {
+          "action": {
+            "changed": true,
+            "interactionId": "p",
+            "send": "answering"
+          },
+          "isPlanning": true,
+          "planGateApplies": true,
+          "snapshot": {
+            "activeTurnId": "turn",
+            "planning": {
+              "phase": "planning"
+            },
+            "plans": [
+              {
+                "allowedPrompts": [
+                  {
+                    "prompt": "run the tests",
+                    "tool": "Bash"
+                  },
+                  {
+                    "prompt": "remote‮​",
+                    "tool": "Bash"
+                  }
+                ],
+                "interactionId": "p",
+                "plan": "# Plan\n\n1. Read `src/a.rs`\n2. Change it​\n\n<script>alert(1)</script>",
+                "planSha256": "0000000000000000000000000000000000000000000000000000000000000000",
+                "seq": 3,
+                "state": {
+                  "kind": "answering"
+                },
+                "toolUseId": "tool-p",
+                "turnId": "turn",
+                "unsupportedReason": null
+              }
+            ]
+          },
+          "throughRevision": 4,
+          "waitingId": "p"
+        },
+        {
+          "action": {
+            "event": {
+              "feedback": null,
+              "interaction_id": "p",
+              "mode_after": null,
+              "outcome": "expired",
+              "reason": "ended: Expired",
+              "type": "plan_settled"
+            }
+          },
+          "isPlanning": true,
+          "planGateApplies": true,
+          "snapshot": {
+            "activeTurnId": "turn",
+            "planning": {
+              "phase": "planning"
+            },
+            "plans": [
+              {
+                "allowedPrompts": [
+                  {
+                    "prompt": "run the tests",
+                    "tool": "Bash"
+                  },
+                  {
+                    "prompt": "remote‮​",
+                    "tool": "Bash"
+                  }
+                ],
+                "interactionId": "p",
+                "plan": "# Plan\n\n1. Read `src/a.rs`\n2. Change it​\n\n<script>alert(1)</script>",
+                "planSha256": "0000000000000000000000000000000000000000000000000000000000000000",
+                "seq": 3,
+                "state": {
+                  "feedback": null,
+                  "kind": "settled",
+                  "modeAfter": null,
+                  "outcome": "expired",
+                  "reason": "ended: Expired"
+                },
+                "toolUseId": "tool-p",
+                "turnId": "turn",
+                "unsupportedReason": null
+              }
+            ]
+          },
+          "throughRevision": 5,
+          "waitingId": null
+        },
+        {
+          "action": {
+            "event": {
+              "feedback": null,
+              "interaction_id": "p",
+              "mode_after": "auto",
+              "outcome": "approved",
+              "reason": "ended: Approved",
+              "type": "plan_settled"
+            }
+          },
+          "isPlanning": true,
+          "planGateApplies": true,
+          "snapshot": {
+            "activeTurnId": "turn",
+            "planning": {
+              "phase": "planning"
+            },
+            "plans": [
+              {
+                "allowedPrompts": [
+                  {
+                    "prompt": "run the tests",
+                    "tool": "Bash"
+                  },
+                  {
+                    "prompt": "remote‮​",
+                    "tool": "Bash"
+                  }
+                ],
+                "interactionId": "p",
+                "plan": "# Plan\n\n1. Read `src/a.rs`\n2. Change it​\n\n<script>alert(1)</script>",
+                "planSha256": "0000000000000000000000000000000000000000000000000000000000000000",
+                "seq": 3,
+                "state": {
+                  "feedback": null,
+                  "kind": "settled",
+                  "modeAfter": null,
+                  "outcome": "expired",
+                  "reason": "ended: Expired"
+                },
+                "toolUseId": "tool-p",
+                "turnId": "turn",
+                "unsupportedReason": null
+              }
+            ]
+          },
+          "throughRevision": 6,
+          "waitingId": null
+        },
+        {
+          "action": {
+            "changed": false,
+            "interactionId": "p",
+            "send": "failed"
+          },
+          "isPlanning": true,
+          "planGateApplies": true,
+          "snapshot": {
+            "activeTurnId": "turn",
+            "planning": {
+              "phase": "planning"
+            },
+            "plans": [
+              {
+                "allowedPrompts": [
+                  {
+                    "prompt": "run the tests",
+                    "tool": "Bash"
+                  },
+                  {
+                    "prompt": "remote‮​",
+                    "tool": "Bash"
+                  }
+                ],
+                "interactionId": "p",
+                "plan": "# Plan\n\n1. Read `src/a.rs`\n2. Change it​\n\n<script>alert(1)</script>",
+                "planSha256": "0000000000000000000000000000000000000000000000000000000000000000",
+                "seq": 3,
+                "state": {
+                  "feedback": null,
+                  "kind": "settled",
+                  "modeAfter": null,
+                  "outcome": "expired",
+                  "reason": "ended: Expired"
+                },
+                "toolUseId": "tool-p",
+                "turnId": "turn",
+                "unsupportedReason": null
+              }
+            ]
+          },
+          "throughRevision": 6,
+          "waitingId": null
+        },
+        {
+          "action": {
+            "changed": false,
+            "interactionId": "p",
+            "send": "answering"
+          },
+          "isPlanning": true,
+          "planGateApplies": true,
+          "snapshot": {
+            "activeTurnId": "turn",
+            "planning": {
+              "phase": "planning"
+            },
+            "plans": [
+              {
+                "allowedPrompts": [
+                  {
+                    "prompt": "run the tests",
+                    "tool": "Bash"
+                  },
+                  {
+                    "prompt": "remote‮​",
+                    "tool": "Bash"
+                  }
+                ],
+                "interactionId": "p",
+                "plan": "# Plan\n\n1. Read `src/a.rs`\n2. Change it​\n\n<script>alert(1)</script>",
+                "planSha256": "0000000000000000000000000000000000000000000000000000000000000000",
+                "seq": 3,
+                "state": {
+                  "feedback": null,
+                  "kind": "settled",
+                  "modeAfter": null,
+                  "outcome": "expired",
+                  "reason": "ended: Expired"
+                },
+                "toolUseId": "tool-p",
+                "turnId": "turn",
+                "unsupportedReason": null
+              }
+            ]
+          },
+          "throughRevision": 6,
+          "waitingId": null
+        }
+      ]
+    },
+    {
+      "name": "outcome-SessionClosed",
+      "requested": "default",
+      "steps": [
+        {
+          "action": {
+            "event": {
+              "turn_id": "turn",
+              "type": "turn_started"
+            }
+          },
+          "isPlanning": false,
+          "planGateApplies": false,
+          "snapshot": {
+            "activeTurnId": "turn",
+            "planning": {
+              "phase": "executing"
+            }
+          },
+          "throughRevision": 1,
+          "waitingId": null
+        },
+        {
+          "action": {
+            "event": {
+              "input": {},
+              "name": "EnterPlanMode",
+              "tool_use_id": "tool-enter",
+              "turn_id": "turn",
+              "type": "tool_call_started"
+            }
+          },
+          "isPlanning": true,
+          "planGateApplies": false,
+          "snapshot": {
+            "activeTurnId": "turn",
+            "planning": {
+              "phase": "entering"
+            }
+          },
+          "throughRevision": 2,
+          "waitingId": null
+        },
+        {
+          "action": {
+            "event": {
+              "source": "CliModeReported",
+              "type": "cli_plan_mode"
+            }
+          },
+          "isPlanning": true,
+          "planGateApplies": true,
+          "snapshot": {
+            "activeTurnId": "turn",
+            "planning": {
+              "phase": "planning"
+            }
+          },
+          "throughRevision": 3,
+          "waitingId": null
+        },
+        {
+          "action": {
+            "event": {
+              "allowed_prompts": [
+                {
+                  "prompt": "run the tests",
+                  "tool": "Bash"
+                },
+                {
+                  "prompt": "remote‮​",
+                  "tool": "Bash"
+                }
+              ],
+              "interaction_id": "p",
+              "plan": "# Plan\n\n1. Read `src/a.rs`\n2. Change it​\n\n<script>alert(1)</script>",
+              "plan_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+              "tool_use_id": "tool-p",
+              "type": "plan_proposed",
+              "unsupported_reason": null
+            }
+          },
+          "isPlanning": true,
+          "planGateApplies": true,
+          "snapshot": {
+            "activeTurnId": "turn",
+            "planning": {
+              "phase": "planning"
+            },
+            "plans": [
+              {
+                "allowedPrompts": [
+                  {
+                    "prompt": "run the tests",
+                    "tool": "Bash"
+                  },
+                  {
+                    "prompt": "remote‮​",
+                    "tool": "Bash"
+                  }
+                ],
+                "interactionId": "p",
+                "plan": "# Plan\n\n1. Read `src/a.rs`\n2. Change it​\n\n<script>alert(1)</script>",
+                "planSha256": "0000000000000000000000000000000000000000000000000000000000000000",
+                "seq": 3,
+                "state": {
+                  "kind": "waiting"
+                },
+                "toolUseId": "tool-p",
+                "turnId": "turn",
+                "unsupportedReason": null
+              }
+            ]
+          },
+          "throughRevision": 4,
+          "waitingId": "p"
+        },
+        {
+          "action": {
+            "changed": true,
+            "interactionId": "p",
+            "send": "answering"
+          },
+          "isPlanning": true,
+          "planGateApplies": true,
+          "snapshot": {
+            "activeTurnId": "turn",
+            "planning": {
+              "phase": "planning"
+            },
+            "plans": [
+              {
+                "allowedPrompts": [
+                  {
+                    "prompt": "run the tests",
+                    "tool": "Bash"
+                  },
+                  {
+                    "prompt": "remote‮​",
+                    "tool": "Bash"
+                  }
+                ],
+                "interactionId": "p",
+                "plan": "# Plan\n\n1. Read `src/a.rs`\n2. Change it​\n\n<script>alert(1)</script>",
+                "planSha256": "0000000000000000000000000000000000000000000000000000000000000000",
+                "seq": 3,
+                "state": {
+                  "kind": "answering"
+                },
+                "toolUseId": "tool-p",
+                "turnId": "turn",
+                "unsupportedReason": null
+              }
+            ]
+          },
+          "throughRevision": 4,
+          "waitingId": "p"
+        },
+        {
+          "action": {
+            "event": {
+              "feedback": null,
+              "interaction_id": "p",
+              "mode_after": null,
+              "outcome": "session_closed",
+              "reason": "ended: SessionClosed",
+              "type": "plan_settled"
+            }
+          },
+          "isPlanning": true,
+          "planGateApplies": true,
+          "snapshot": {
+            "activeTurnId": "turn",
+            "planning": {
+              "phase": "planning"
+            },
+            "plans": [
+              {
+                "allowedPrompts": [
+                  {
+                    "prompt": "run the tests",
+                    "tool": "Bash"
+                  },
+                  {
+                    "prompt": "remote‮​",
+                    "tool": "Bash"
+                  }
+                ],
+                "interactionId": "p",
+                "plan": "# Plan\n\n1. Read `src/a.rs`\n2. Change it​\n\n<script>alert(1)</script>",
+                "planSha256": "0000000000000000000000000000000000000000000000000000000000000000",
+                "seq": 3,
+                "state": {
+                  "feedback": null,
+                  "kind": "settled",
+                  "modeAfter": null,
+                  "outcome": "session_closed",
+                  "reason": "ended: SessionClosed"
+                },
+                "toolUseId": "tool-p",
+                "turnId": "turn",
+                "unsupportedReason": null
+              }
+            ]
+          },
+          "throughRevision": 5,
+          "waitingId": null
+        },
+        {
+          "action": {
+            "event": {
+              "feedback": null,
+              "interaction_id": "p",
+              "mode_after": "auto",
+              "outcome": "approved",
+              "reason": "ended: Approved",
+              "type": "plan_settled"
+            }
+          },
+          "isPlanning": true,
+          "planGateApplies": true,
+          "snapshot": {
+            "activeTurnId": "turn",
+            "planning": {
+              "phase": "planning"
+            },
+            "plans": [
+              {
+                "allowedPrompts": [
+                  {
+                    "prompt": "run the tests",
+                    "tool": "Bash"
+                  },
+                  {
+                    "prompt": "remote‮​",
+                    "tool": "Bash"
+                  }
+                ],
+                "interactionId": "p",
+                "plan": "# Plan\n\n1. Read `src/a.rs`\n2. Change it​\n\n<script>alert(1)</script>",
+                "planSha256": "0000000000000000000000000000000000000000000000000000000000000000",
+                "seq": 3,
+                "state": {
+                  "feedback": null,
+                  "kind": "settled",
+                  "modeAfter": null,
+                  "outcome": "session_closed",
+                  "reason": "ended: SessionClosed"
+                },
+                "toolUseId": "tool-p",
+                "turnId": "turn",
+                "unsupportedReason": null
+              }
+            ]
+          },
+          "throughRevision": 6,
+          "waitingId": null
+        },
+        {
+          "action": {
+            "changed": false,
+            "interactionId": "p",
+            "send": "failed"
+          },
+          "isPlanning": true,
+          "planGateApplies": true,
+          "snapshot": {
+            "activeTurnId": "turn",
+            "planning": {
+              "phase": "planning"
+            },
+            "plans": [
+              {
+                "allowedPrompts": [
+                  {
+                    "prompt": "run the tests",
+                    "tool": "Bash"
+                  },
+                  {
+                    "prompt": "remote‮​",
+                    "tool": "Bash"
+                  }
+                ],
+                "interactionId": "p",
+                "plan": "# Plan\n\n1. Read `src/a.rs`\n2. Change it​\n\n<script>alert(1)</script>",
+                "planSha256": "0000000000000000000000000000000000000000000000000000000000000000",
+                "seq": 3,
+                "state": {
+                  "feedback": null,
+                  "kind": "settled",
+                  "modeAfter": null,
+                  "outcome": "session_closed",
+                  "reason": "ended: SessionClosed"
+                },
+                "toolUseId": "tool-p",
+                "turnId": "turn",
+                "unsupportedReason": null
+              }
+            ]
+          },
+          "throughRevision": 6,
+          "waitingId": null
+        },
+        {
+          "action": {
+            "changed": false,
+            "interactionId": "p",
+            "send": "answering"
+          },
+          "isPlanning": true,
+          "planGateApplies": true,
+          "snapshot": {
+            "activeTurnId": "turn",
+            "planning": {
+              "phase": "planning"
+            },
+            "plans": [
+              {
+                "allowedPrompts": [
+                  {
+                    "prompt": "run the tests",
+                    "tool": "Bash"
+                  },
+                  {
+                    "prompt": "remote‮​",
+                    "tool": "Bash"
+                  }
+                ],
+                "interactionId": "p",
+                "plan": "# Plan\n\n1. Read `src/a.rs`\n2. Change it​\n\n<script>alert(1)</script>",
+                "planSha256": "0000000000000000000000000000000000000000000000000000000000000000",
+                "seq": 3,
+                "state": {
+                  "feedback": null,
+                  "kind": "settled",
+                  "modeAfter": null,
+                  "outcome": "session_closed",
+                  "reason": "ended: SessionClosed"
+                },
+                "toolUseId": "tool-p",
+                "turnId": "turn",
+                "unsupportedReason": null
+              }
+            ]
+          },
+          "throughRevision": 6,
+          "waitingId": null
+        }
+      ]
+    },
+    {
+      "name": "outcome-ProviderFailed",
+      "requested": "default",
+      "steps": [
+        {
+          "action": {
+            "event": {
+              "turn_id": "turn",
+              "type": "turn_started"
+            }
+          },
+          "isPlanning": false,
+          "planGateApplies": false,
+          "snapshot": {
+            "activeTurnId": "turn",
+            "planning": {
+              "phase": "executing"
+            }
+          },
+          "throughRevision": 1,
+          "waitingId": null
+        },
+        {
+          "action": {
+            "event": {
+              "input": {},
+              "name": "EnterPlanMode",
+              "tool_use_id": "tool-enter",
+              "turn_id": "turn",
+              "type": "tool_call_started"
+            }
+          },
+          "isPlanning": true,
+          "planGateApplies": false,
+          "snapshot": {
+            "activeTurnId": "turn",
+            "planning": {
+              "phase": "entering"
+            }
+          },
+          "throughRevision": 2,
+          "waitingId": null
+        },
+        {
+          "action": {
+            "event": {
+              "source": "CliModeReported",
+              "type": "cli_plan_mode"
+            }
+          },
+          "isPlanning": true,
+          "planGateApplies": true,
+          "snapshot": {
+            "activeTurnId": "turn",
+            "planning": {
+              "phase": "planning"
+            }
+          },
+          "throughRevision": 3,
+          "waitingId": null
+        },
+        {
+          "action": {
+            "event": {
+              "allowed_prompts": [
+                {
+                  "prompt": "run the tests",
+                  "tool": "Bash"
+                },
+                {
+                  "prompt": "remote‮​",
+                  "tool": "Bash"
+                }
+              ],
+              "interaction_id": "p",
+              "plan": "# Plan\n\n1. Read `src/a.rs`\n2. Change it​\n\n<script>alert(1)</script>",
+              "plan_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+              "tool_use_id": "tool-p",
+              "type": "plan_proposed",
+              "unsupported_reason": null
+            }
+          },
+          "isPlanning": true,
+          "planGateApplies": true,
+          "snapshot": {
+            "activeTurnId": "turn",
+            "planning": {
+              "phase": "planning"
+            },
+            "plans": [
+              {
+                "allowedPrompts": [
+                  {
+                    "prompt": "run the tests",
+                    "tool": "Bash"
+                  },
+                  {
+                    "prompt": "remote‮​",
+                    "tool": "Bash"
+                  }
+                ],
+                "interactionId": "p",
+                "plan": "# Plan\n\n1. Read `src/a.rs`\n2. Change it​\n\n<script>alert(1)</script>",
+                "planSha256": "0000000000000000000000000000000000000000000000000000000000000000",
+                "seq": 3,
+                "state": {
+                  "kind": "waiting"
+                },
+                "toolUseId": "tool-p",
+                "turnId": "turn",
+                "unsupportedReason": null
+              }
+            ]
+          },
+          "throughRevision": 4,
+          "waitingId": "p"
+        },
+        {
+          "action": {
+            "changed": true,
+            "interactionId": "p",
+            "send": "answering"
+          },
+          "isPlanning": true,
+          "planGateApplies": true,
+          "snapshot": {
+            "activeTurnId": "turn",
+            "planning": {
+              "phase": "planning"
+            },
+            "plans": [
+              {
+                "allowedPrompts": [
+                  {
+                    "prompt": "run the tests",
+                    "tool": "Bash"
+                  },
+                  {
+                    "prompt": "remote‮​",
+                    "tool": "Bash"
+                  }
+                ],
+                "interactionId": "p",
+                "plan": "# Plan\n\n1. Read `src/a.rs`\n2. Change it​\n\n<script>alert(1)</script>",
+                "planSha256": "0000000000000000000000000000000000000000000000000000000000000000",
+                "seq": 3,
+                "state": {
+                  "kind": "answering"
+                },
+                "toolUseId": "tool-p",
+                "turnId": "turn",
+                "unsupportedReason": null
+              }
+            ]
+          },
+          "throughRevision": 4,
+          "waitingId": "p"
+        },
+        {
+          "action": {
+            "event": {
+              "feedback": null,
+              "interaction_id": "p",
+              "mode_after": null,
+              "outcome": "provider_failed",
+              "reason": "ended: ProviderFailed",
+              "type": "plan_settled"
+            }
+          },
+          "isPlanning": true,
+          "planGateApplies": true,
+          "snapshot": {
+            "activeTurnId": "turn",
+            "planning": {
+              "phase": "planning"
+            },
+            "plans": [
+              {
+                "allowedPrompts": [
+                  {
+                    "prompt": "run the tests",
+                    "tool": "Bash"
+                  },
+                  {
+                    "prompt": "remote‮​",
+                    "tool": "Bash"
+                  }
+                ],
+                "interactionId": "p",
+                "plan": "# Plan\n\n1. Read `src/a.rs`\n2. Change it​\n\n<script>alert(1)</script>",
+                "planSha256": "0000000000000000000000000000000000000000000000000000000000000000",
+                "seq": 3,
+                "state": {
+                  "feedback": null,
+                  "kind": "settled",
+                  "modeAfter": null,
+                  "outcome": "provider_failed",
+                  "reason": "ended: ProviderFailed"
+                },
+                "toolUseId": "tool-p",
+                "turnId": "turn",
+                "unsupportedReason": null
+              }
+            ]
+          },
+          "throughRevision": 5,
+          "waitingId": null
+        },
+        {
+          "action": {
+            "event": {
+              "feedback": null,
+              "interaction_id": "p",
+              "mode_after": "auto",
+              "outcome": "approved",
+              "reason": "ended: Approved",
+              "type": "plan_settled"
+            }
+          },
+          "isPlanning": true,
+          "planGateApplies": true,
+          "snapshot": {
+            "activeTurnId": "turn",
+            "planning": {
+              "phase": "planning"
+            },
+            "plans": [
+              {
+                "allowedPrompts": [
+                  {
+                    "prompt": "run the tests",
+                    "tool": "Bash"
+                  },
+                  {
+                    "prompt": "remote‮​",
+                    "tool": "Bash"
+                  }
+                ],
+                "interactionId": "p",
+                "plan": "# Plan\n\n1. Read `src/a.rs`\n2. Change it​\n\n<script>alert(1)</script>",
+                "planSha256": "0000000000000000000000000000000000000000000000000000000000000000",
+                "seq": 3,
+                "state": {
+                  "feedback": null,
+                  "kind": "settled",
+                  "modeAfter": null,
+                  "outcome": "provider_failed",
+                  "reason": "ended: ProviderFailed"
+                },
+                "toolUseId": "tool-p",
+                "turnId": "turn",
+                "unsupportedReason": null
+              }
+            ]
+          },
+          "throughRevision": 6,
+          "waitingId": null
+        },
+        {
+          "action": {
+            "changed": false,
+            "interactionId": "p",
+            "send": "failed"
+          },
+          "isPlanning": true,
+          "planGateApplies": true,
+          "snapshot": {
+            "activeTurnId": "turn",
+            "planning": {
+              "phase": "planning"
+            },
+            "plans": [
+              {
+                "allowedPrompts": [
+                  {
+                    "prompt": "run the tests",
+                    "tool": "Bash"
+                  },
+                  {
+                    "prompt": "remote‮​",
+                    "tool": "Bash"
+                  }
+                ],
+                "interactionId": "p",
+                "plan": "# Plan\n\n1. Read `src/a.rs`\n2. Change it​\n\n<script>alert(1)</script>",
+                "planSha256": "0000000000000000000000000000000000000000000000000000000000000000",
+                "seq": 3,
+                "state": {
+                  "feedback": null,
+                  "kind": "settled",
+                  "modeAfter": null,
+                  "outcome": "provider_failed",
+                  "reason": "ended: ProviderFailed"
+                },
+                "toolUseId": "tool-p",
+                "turnId": "turn",
+                "unsupportedReason": null
+              }
+            ]
+          },
+          "throughRevision": 6,
+          "waitingId": null
+        },
+        {
+          "action": {
+            "changed": false,
+            "interactionId": "p",
+            "send": "answering"
+          },
+          "isPlanning": true,
+          "planGateApplies": true,
+          "snapshot": {
+            "activeTurnId": "turn",
+            "planning": {
+              "phase": "planning"
+            },
+            "plans": [
+              {
+                "allowedPrompts": [
+                  {
+                    "prompt": "run the tests",
+                    "tool": "Bash"
+                  },
+                  {
+                    "prompt": "remote‮​",
+                    "tool": "Bash"
+                  }
+                ],
+                "interactionId": "p",
+                "plan": "# Plan\n\n1. Read `src/a.rs`\n2. Change it​\n\n<script>alert(1)</script>",
+                "planSha256": "0000000000000000000000000000000000000000000000000000000000000000",
+                "seq": 3,
+                "state": {
+                  "feedback": null,
+                  "kind": "settled",
+                  "modeAfter": null,
+                  "outcome": "provider_failed",
+                  "reason": "ended: ProviderFailed"
+                },
+                "toolUseId": "tool-p",
+                "turnId": "turn",
+                "unsupportedReason": null
+              }
+            ]
+          },
+          "throughRevision": 6,
+          "waitingId": null
+        }
+      ]
+    },
+    {
+      "name": "outcome-HostRefused",
+      "requested": "default",
+      "steps": [
+        {
+          "action": {
+            "event": {
+              "turn_id": "turn",
+              "type": "turn_started"
+            }
+          },
+          "isPlanning": false,
+          "planGateApplies": false,
+          "snapshot": {
+            "activeTurnId": "turn",
+            "planning": {
+              "phase": "executing"
+            }
+          },
+          "throughRevision": 1,
+          "waitingId": null
+        },
+        {
+          "action": {
+            "event": {
+              "input": {},
+              "name": "EnterPlanMode",
+              "tool_use_id": "tool-enter",
+              "turn_id": "turn",
+              "type": "tool_call_started"
+            }
+          },
+          "isPlanning": true,
+          "planGateApplies": false,
+          "snapshot": {
+            "activeTurnId": "turn",
+            "planning": {
+              "phase": "entering"
+            }
+          },
+          "throughRevision": 2,
+          "waitingId": null
+        },
+        {
+          "action": {
+            "event": {
+              "source": "CliModeReported",
+              "type": "cli_plan_mode"
+            }
+          },
+          "isPlanning": true,
+          "planGateApplies": true,
+          "snapshot": {
+            "activeTurnId": "turn",
+            "planning": {
+              "phase": "planning"
+            }
+          },
+          "throughRevision": 3,
+          "waitingId": null
+        },
+        {
+          "action": {
+            "event": {
+              "allowed_prompts": [
+                {
+                  "prompt": "run the tests",
+                  "tool": "Bash"
+                },
+                {
+                  "prompt": "remote‮​",
+                  "tool": "Bash"
+                }
+              ],
+              "interaction_id": "p",
+              "plan": "# Plan\n\n1. Read `src/a.rs`\n2. Change it​\n\n<script>alert(1)</script>",
+              "plan_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+              "tool_use_id": "tool-p",
+              "type": "plan_proposed",
+              "unsupported_reason": null
+            }
+          },
+          "isPlanning": true,
+          "planGateApplies": true,
+          "snapshot": {
+            "activeTurnId": "turn",
+            "planning": {
+              "phase": "planning"
+            },
+            "plans": [
+              {
+                "allowedPrompts": [
+                  {
+                    "prompt": "run the tests",
+                    "tool": "Bash"
+                  },
+                  {
+                    "prompt": "remote‮​",
+                    "tool": "Bash"
+                  }
+                ],
+                "interactionId": "p",
+                "plan": "# Plan\n\n1. Read `src/a.rs`\n2. Change it​\n\n<script>alert(1)</script>",
+                "planSha256": "0000000000000000000000000000000000000000000000000000000000000000",
+                "seq": 3,
+                "state": {
+                  "kind": "waiting"
+                },
+                "toolUseId": "tool-p",
+                "turnId": "turn",
+                "unsupportedReason": null
+              }
+            ]
+          },
+          "throughRevision": 4,
+          "waitingId": "p"
+        },
+        {
+          "action": {
+            "changed": true,
+            "interactionId": "p",
+            "send": "answering"
+          },
+          "isPlanning": true,
+          "planGateApplies": true,
+          "snapshot": {
+            "activeTurnId": "turn",
+            "planning": {
+              "phase": "planning"
+            },
+            "plans": [
+              {
+                "allowedPrompts": [
+                  {
+                    "prompt": "run the tests",
+                    "tool": "Bash"
+                  },
+                  {
+                    "prompt": "remote‮​",
+                    "tool": "Bash"
+                  }
+                ],
+                "interactionId": "p",
+                "plan": "# Plan\n\n1. Read `src/a.rs`\n2. Change it​\n\n<script>alert(1)</script>",
+                "planSha256": "0000000000000000000000000000000000000000000000000000000000000000",
+                "seq": 3,
+                "state": {
+                  "kind": "answering"
+                },
+                "toolUseId": "tool-p",
+                "turnId": "turn",
+                "unsupportedReason": null
+              }
+            ]
+          },
+          "throughRevision": 4,
+          "waitingId": "p"
+        },
+        {
+          "action": {
+            "event": {
+              "feedback": null,
+              "interaction_id": "p",
+              "mode_after": null,
+              "outcome": "host_refused",
+              "reason": "ended: HostRefused",
+              "type": "plan_settled"
+            }
+          },
+          "isPlanning": true,
+          "planGateApplies": true,
+          "snapshot": {
+            "activeTurnId": "turn",
+            "planning": {
+              "phase": "planning"
+            },
+            "plans": [
+              {
+                "allowedPrompts": [
+                  {
+                    "prompt": "run the tests",
+                    "tool": "Bash"
+                  },
+                  {
+                    "prompt": "remote‮​",
+                    "tool": "Bash"
+                  }
+                ],
+                "interactionId": "p",
+                "plan": "# Plan\n\n1. Read `src/a.rs`\n2. Change it​\n\n<script>alert(1)</script>",
+                "planSha256": "0000000000000000000000000000000000000000000000000000000000000000",
+                "seq": 3,
+                "state": {
+                  "feedback": null,
+                  "kind": "settled",
+                  "modeAfter": null,
+                  "outcome": "host_refused",
+                  "reason": "ended: HostRefused"
+                },
+                "toolUseId": "tool-p",
+                "turnId": "turn",
+                "unsupportedReason": null
+              }
+            ]
+          },
+          "throughRevision": 5,
+          "waitingId": null
+        },
+        {
+          "action": {
+            "event": {
+              "feedback": null,
+              "interaction_id": "p",
+              "mode_after": "auto",
+              "outcome": "approved",
+              "reason": "ended: Approved",
+              "type": "plan_settled"
+            }
+          },
+          "isPlanning": true,
+          "planGateApplies": true,
+          "snapshot": {
+            "activeTurnId": "turn",
+            "planning": {
+              "phase": "planning"
+            },
+            "plans": [
+              {
+                "allowedPrompts": [
+                  {
+                    "prompt": "run the tests",
+                    "tool": "Bash"
+                  },
+                  {
+                    "prompt": "remote‮​",
+                    "tool": "Bash"
+                  }
+                ],
+                "interactionId": "p",
+                "plan": "# Plan\n\n1. Read `src/a.rs`\n2. Change it​\n\n<script>alert(1)</script>",
+                "planSha256": "0000000000000000000000000000000000000000000000000000000000000000",
+                "seq": 3,
+                "state": {
+                  "feedback": null,
+                  "kind": "settled",
+                  "modeAfter": null,
+                  "outcome": "host_refused",
+                  "reason": "ended: HostRefused"
+                },
+                "toolUseId": "tool-p",
+                "turnId": "turn",
+                "unsupportedReason": null
+              }
+            ]
+          },
+          "throughRevision": 6,
+          "waitingId": null
+        },
+        {
+          "action": {
+            "changed": false,
+            "interactionId": "p",
+            "send": "failed"
+          },
+          "isPlanning": true,
+          "planGateApplies": true,
+          "snapshot": {
+            "activeTurnId": "turn",
+            "planning": {
+              "phase": "planning"
+            },
+            "plans": [
+              {
+                "allowedPrompts": [
+                  {
+                    "prompt": "run the tests",
+                    "tool": "Bash"
+                  },
+                  {
+                    "prompt": "remote‮​",
+                    "tool": "Bash"
+                  }
+                ],
+                "interactionId": "p",
+                "plan": "# Plan\n\n1. Read `src/a.rs`\n2. Change it​\n\n<script>alert(1)</script>",
+                "planSha256": "0000000000000000000000000000000000000000000000000000000000000000",
+                "seq": 3,
+                "state": {
+                  "feedback": null,
+                  "kind": "settled",
+                  "modeAfter": null,
+                  "outcome": "host_refused",
+                  "reason": "ended: HostRefused"
+                },
+                "toolUseId": "tool-p",
+                "turnId": "turn",
+                "unsupportedReason": null
+              }
+            ]
+          },
+          "throughRevision": 6,
+          "waitingId": null
+        },
+        {
+          "action": {
+            "changed": false,
+            "interactionId": "p",
+            "send": "answering"
+          },
+          "isPlanning": true,
+          "planGateApplies": true,
+          "snapshot": {
+            "activeTurnId": "turn",
+            "planning": {
+              "phase": "planning"
+            },
+            "plans": [
+              {
+                "allowedPrompts": [
+                  {
+                    "prompt": "run the tests",
+                    "tool": "Bash"
+                  },
+                  {
+                    "prompt": "remote‮​",
+                    "tool": "Bash"
+                  }
+                ],
+                "interactionId": "p",
+                "plan": "# Plan\n\n1. Read `src/a.rs`\n2. Change it​\n\n<script>alert(1)</script>",
+                "planSha256": "0000000000000000000000000000000000000000000000000000000000000000",
+                "seq": 3,
+                "state": {
+                  "feedback": null,
+                  "kind": "settled",
+                  "modeAfter": null,
+                  "outcome": "host_refused",
+                  "reason": "ended: HostRefused"
+                },
+                "toolUseId": "tool-p",
+                "turnId": "turn",
+                "unsupportedReason": null
+              }
+            ]
+          },
+          "throughRevision": 6,
+          "waitingId": null
+        }
+      ]
+    },
+    {
+      "name": "model-entry-approval-and-return-to-default",
+      "requested": "default",
+      "steps": [
+        {
+          "action": {
+            "event": {
+              "reported": "default",
+              "type": "cli_permission_mode"
+            }
+          },
+          "isPlanning": false,
+          "planGateApplies": false,
+          "snapshot": {
+            "activeTurnId": null,
+            "planning": {
+              "phase": "executing"
+            }
+          },
+          "throughRevision": 1,
+          "waitingId": null
+        },
+        {
+          "action": {
+            "event": {
+              "input": {},
+              "name": "EnterPlanMode",
+              "tool_use_id": "tool-enter",
+              "turn_id": "turn",
+              "type": "tool_call_started"
+            }
+          },
+          "isPlanning": true,
+          "planGateApplies": false,
+          "snapshot": {
+            "activeTurnId": null,
+            "planning": {
+              "phase": "entering"
+            }
+          },
+          "throughRevision": 2,
+          "waitingId": null
+        },
+        {
+          "action": {
+            "event": {
+              "source": "CliModeReported",
+              "type": "cli_plan_mode"
+            }
+          },
+          "isPlanning": true,
+          "planGateApplies": true,
+          "snapshot": {
+            "activeTurnId": null,
+            "planning": {
+              "phase": "planning"
+            }
+          },
+          "throughRevision": 3,
+          "waitingId": null
+        },
+        {
+          "action": {
+            "event": {
+              "allowed_prompts": [
+                {
+                  "prompt": "run the tests",
+                  "tool": "Bash"
+                },
+                {
+                  "prompt": "remote‮​",
+                  "tool": "Bash"
+                }
+              ],
+              "interaction_id": "p",
+              "plan": "# Plan\n\n1. Read `src/a.rs`\n2. Change it​\n\n<script>alert(1)</script>",
+              "plan_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+              "tool_use_id": "tool-p",
+              "type": "plan_proposed",
+              "unsupported_reason": null
+            }
+          },
+          "isPlanning": true,
+          "planGateApplies": true,
+          "snapshot": {
+            "activeTurnId": null,
+            "planning": {
+              "phase": "planning"
+            },
+            "plans": [
+              {
+                "allowedPrompts": [
+                  {
+                    "prompt": "run the tests",
+                    "tool": "Bash"
+                  },
+                  {
+                    "prompt": "remote‮​",
+                    "tool": "Bash"
+                  }
+                ],
+                "interactionId": "p",
+                "plan": "# Plan\n\n1. Read `src/a.rs`\n2. Change it​\n\n<script>alert(1)</script>",
+                "planSha256": "0000000000000000000000000000000000000000000000000000000000000000",
+                "seq": 3,
+                "state": {
+                  "kind": "waiting"
+                },
+                "toolUseId": "tool-p",
+                "turnId": null,
+                "unsupportedReason": null
+              }
+            ]
+          },
+          "throughRevision": 4,
+          "waitingId": "p"
+        },
+        {
+          "action": {
+            "changed": true,
+            "interactionId": "p",
+            "send": "answering"
+          },
+          "isPlanning": true,
+          "planGateApplies": true,
+          "snapshot": {
+            "activeTurnId": null,
+            "planning": {
+              "phase": "planning"
+            },
+            "plans": [
+              {
+                "allowedPrompts": [
+                  {
+                    "prompt": "run the tests",
+                    "tool": "Bash"
+                  },
+                  {
+                    "prompt": "remote‮​",
+                    "tool": "Bash"
+                  }
+                ],
+                "interactionId": "p",
+                "plan": "# Plan\n\n1. Read `src/a.rs`\n2. Change it​\n\n<script>alert(1)</script>",
+                "planSha256": "0000000000000000000000000000000000000000000000000000000000000000",
+                "seq": 3,
+                "state": {
+                  "kind": "answering"
+                },
+                "toolUseId": "tool-p",
+                "turnId": null,
+                "unsupportedReason": null
+              }
+            ]
+          },
+          "throughRevision": 4,
+          "waitingId": "p"
+        },
+        {
+          "action": {
+            "event": {
+              "at_ms": 1800000000000,
+              "cause": {
+                "kind": "tool",
+                "tool_use_id": "tool-p"
+              },
+              "enter": false,
+              "type": "plan_transition_started"
+            }
+          },
+          "isPlanning": true,
+          "planGateApplies": true,
+          "snapshot": {
+            "activeTurnId": null,
+            "planning": {
+              "phase": "leaving"
+            },
+            "plans": [
+              {
+                "allowedPrompts": [
+                  {
+                    "prompt": "run the tests",
+                    "tool": "Bash"
+                  },
+                  {
+                    "prompt": "remote‮​",
+                    "tool": "Bash"
+                  }
+                ],
+                "interactionId": "p",
+                "plan": "# Plan\n\n1. Read `src/a.rs`\n2. Change it​\n\n<script>alert(1)</script>",
+                "planSha256": "0000000000000000000000000000000000000000000000000000000000000000",
+                "seq": 3,
+                "state": {
+                  "kind": "answering"
+                },
+                "toolUseId": "tool-p",
+                "turnId": null,
+                "unsupportedReason": null
+              }
+            ]
+          },
+          "throughRevision": 5,
+          "waitingId": "p"
+        },
+        {
+          "action": {
+            "event": {
+              "feedback": null,
+              "interaction_id": "p",
+              "mode_after": "auto",
+              "outcome": "approved",
+              "reason": "ended: Approved",
+              "type": "plan_settled"
+            }
+          },
+          "isPlanning": true,
+          "planGateApplies": true,
+          "snapshot": {
+            "activeTurnId": null,
+            "planning": {
+              "phase": "leaving"
+            },
+            "plans": [
+              {
+                "allowedPrompts": [
+                  {
+                    "prompt": "run the tests",
+                    "tool": "Bash"
+                  },
+                  {
+                    "prompt": "remote‮​",
+                    "tool": "Bash"
+                  }
+                ],
+                "interactionId": "p",
+                "plan": "# Plan\n\n1. Read `src/a.rs`\n2. Change it​\n\n<script>alert(1)</script>",
+                "planSha256": "0000000000000000000000000000000000000000000000000000000000000000",
+                "seq": 3,
+                "state": {
+                  "feedback": null,
+                  "kind": "settled",
+                  "modeAfter": "auto",
+                  "outcome": "approved",
+                  "reason": "ended: Approved"
+                },
+                "toolUseId": "tool-p",
+                "turnId": null,
+                "unsupportedReason": null
+              }
+            ]
+          },
+          "throughRevision": 6,
+          "waitingId": null
+        },
+        {
+          "action": {
+            "event": {
+              "reported": "default",
+              "type": "cli_permission_mode"
+            }
+          },
+          "isPlanning": false,
+          "planGateApplies": false,
+          "snapshot": {
+            "activeTurnId": null,
+            "planning": {
+              "phase": "executing"
+            },
+            "plans": [
+              {
+                "allowedPrompts": [
+                  {
+                    "prompt": "run the tests",
+                    "tool": "Bash"
+                  },
+                  {
+                    "prompt": "remote‮​",
+                    "tool": "Bash"
+                  }
+                ],
+                "interactionId": "p",
+                "plan": "# Plan\n\n1. Read `src/a.rs`\n2. Change it​\n\n<script>alert(1)</script>",
+                "planSha256": "0000000000000000000000000000000000000000000000000000000000000000",
+                "seq": 3,
+                "state": {
+                  "feedback": null,
+                  "kind": "settled",
+                  "modeAfter": "auto",
+                  "outcome": "approved",
+                  "reason": "ended: Approved"
+                },
+                "toolUseId": "tool-p",
+                "turnId": null,
+                "unsupportedReason": null
+              }
+            ]
+          },
+          "throughRevision": 7,
+          "waitingId": null
+        }
+      ]
+    },
+    {
+      "name": "host-entry-and-leave-on-auto-through-default",
+      "requested": "auto",
+      "steps": [
+        {
+          "action": {
+            "event": {
+              "reported": "auto",
+              "type": "cli_permission_mode"
+            }
+          },
+          "isPlanning": false,
+          "planGateApplies": false,
+          "snapshot": {
+            "activeTurnId": null,
+            "planning": {
+              "phase": "executing"
+            }
+          },
+          "throughRevision": 1,
+          "waitingId": null
+        },
+        {
+          "action": {
+            "event": {
+              "at_ms": 1800000000000,
+              "cause": {
+                "kind": "host"
+              },
+              "enter": true,
+              "type": "plan_transition_started"
+            }
+          },
+          "isPlanning": true,
+          "planGateApplies": false,
+          "snapshot": {
+            "activeTurnId": null,
+            "planning": {
+              "phase": "entering"
+            }
+          },
+          "throughRevision": 2,
+          "waitingId": null
+        },
+        {
+          "action": {
+            "event": {
+              "source": "CliModeReported",
+              "type": "cli_plan_mode"
+            }
+          },
+          "isPlanning": true,
+          "planGateApplies": true,
+          "snapshot": {
+            "activeTurnId": null,
+            "planning": {
+              "phase": "planning"
+            }
+          },
+          "throughRevision": 3,
+          "waitingId": null
+        },
+        {
+          "action": {
+            "event": {
+              "at_ms": 1800000000000,
+              "cause": {
+                "kind": "host"
+              },
+              "enter": false,
+              "type": "plan_transition_started"
+            }
+          },
+          "isPlanning": true,
+          "planGateApplies": true,
+          "snapshot": {
+            "activeTurnId": null,
+            "planning": {
+              "phase": "leaving"
+            }
+          },
+          "throughRevision": 4,
+          "waitingId": null
+        },
+        {
+          "action": {
+            "event": {
+              "reported": "default",
+              "type": "cli_permission_mode"
+            }
+          },
+          "isPlanning": true,
+          "planGateApplies": false,
+          "snapshot": {
+            "activeTurnId": null,
+            "planning": {
+              "phase": "leaving"
+            }
+          },
+          "throughRevision": 5,
+          "waitingId": null
+        },
+        {
+          "action": {
+            "event": {
+              "reported": "auto",
+              "type": "cli_permission_mode"
+            }
+          },
+          "isPlanning": false,
+          "planGateApplies": false,
+          "snapshot": {
+            "activeTurnId": null,
+            "planning": {
+              "phase": "executing"
+            }
+          },
+          "throughRevision": 6,
+          "waitingId": null
+        }
+      ]
+    },
+    {
+      "name": "refused-plan-waits-for-settlement",
+      "requested": "default",
+      "steps": [
+        {
+          "action": {
+            "event": {
+              "input": {},
+              "name": "EnterPlanMode",
+              "tool_use_id": "tool-enter",
+              "turn_id": "turn",
+              "type": "tool_call_started"
+            }
+          },
+          "isPlanning": true,
+          "planGateApplies": false,
+          "snapshot": {
+            "activeTurnId": null,
+            "planning": {
+              "phase": "entering"
+            }
+          },
+          "throughRevision": 1,
+          "waitingId": null
+        },
+        {
+          "action": {
+            "event": {
+              "source": "CliModeReported",
+              "type": "cli_plan_mode"
+            }
+          },
+          "isPlanning": true,
+          "planGateApplies": true,
+          "snapshot": {
+            "activeTurnId": null,
+            "planning": {
+              "phase": "planning"
+            }
+          },
+          "throughRevision": 2,
+          "waitingId": null
+        },
+        {
+          "action": {
+            "event": {
+              "allowed_prompts": [],
+              "interaction_id": "refused",
+              "plan": "",
+              "plan_sha256": "",
+              "tool_use_id": "tool-refused",
+              "type": "plan_proposed",
+              "unsupported_reason": "The plan is longer than 256 KiB, so it was not shown"
+            }
+          },
+          "isPlanning": true,
+          "planGateApplies": true,
+          "snapshot": {
+            "activeTurnId": null,
+            "planning": {
+              "phase": "planning"
+            },
+            "plans": [
+              {
+                "allowedPrompts": [],
+                "interactionId": "refused",
+                "plan": "",
+                "planSha256": "",
+                "seq": 2,
+                "state": {
+                  "kind": "waiting"
+                },
+                "toolUseId": "tool-refused",
+                "turnId": null,
+                "unsupportedReason": "The plan is longer than 256 KiB, so it was not shown"
+              }
+            ]
+          },
+          "throughRevision": 3,
+          "waitingId": "refused"
+        },
+        {
+          "action": {
+            "event": {
+              "feedback": null,
+              "interaction_id": "refused",
+              "mode_after": null,
+              "outcome": "host_refused",
+              "reason": "ended: HostRefused",
+              "type": "plan_settled"
+            }
+          },
+          "isPlanning": true,
+          "planGateApplies": true,
+          "snapshot": {
+            "activeTurnId": null,
+            "planning": {
+              "phase": "planning"
+            },
+            "plans": [
+              {
+                "allowedPrompts": [],
+                "interactionId": "refused",
+                "plan": "",
+                "planSha256": "",
+                "seq": 2,
+                "state": {
+                  "feedback": null,
+                  "kind": "settled",
+                  "modeAfter": null,
+                  "outcome": "host_refused",
+                  "reason": "ended: HostRefused"
+                },
+                "toolUseId": "tool-refused",
+                "turnId": null,
+                "unsupportedReason": "The plan is longer than 256 KiB, so it was not shown"
+              }
+            ]
+          },
+          "throughRevision": 4,
+          "waitingId": null
+        }
+      ]
+    },
+    {
+      "name": "SessionClosed { reason: \"closed\" }",
+      "requested": "default",
+      "steps": [
+        {
+          "action": {
+            "event": {
+              "input": {},
+              "name": "EnterPlanMode",
+              "tool_use_id": "tool-enter",
+              "turn_id": "turn",
+              "type": "tool_call_started"
+            }
+          },
+          "isPlanning": true,
+          "planGateApplies": false,
+          "snapshot": {
+            "activeTurnId": null,
+            "planning": {
+              "phase": "entering"
+            }
+          },
+          "throughRevision": 1,
+          "waitingId": null
+        },
+        {
+          "action": {
+            "event": {
+              "source": "CliModeReported",
+              "type": "cli_plan_mode"
+            }
+          },
+          "isPlanning": true,
+          "planGateApplies": true,
+          "snapshot": {
+            "activeTurnId": null,
+            "planning": {
+              "phase": "planning"
+            }
+          },
+          "throughRevision": 2,
+          "waitingId": null
+        },
+        {
+          "action": {
+            "event": {
+              "allowed_prompts": [
+                {
+                  "prompt": "run the tests",
+                  "tool": "Bash"
+                },
+                {
+                  "prompt": "remote‮​",
+                  "tool": "Bash"
+                }
+              ],
+              "interaction_id": "settled",
+              "plan": "# Plan\n\n1. Read `src/a.rs`\n2. Change it​\n\n<script>alert(1)</script>",
+              "plan_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+              "tool_use_id": "tool-settled",
+              "type": "plan_proposed",
+              "unsupported_reason": null
+            }
+          },
+          "isPlanning": true,
+          "planGateApplies": true,
+          "snapshot": {
+            "activeTurnId": null,
+            "planning": {
+              "phase": "planning"
+            },
+            "plans": [
+              {
+                "allowedPrompts": [
+                  {
+                    "prompt": "run the tests",
+                    "tool": "Bash"
+                  },
+                  {
+                    "prompt": "remote‮​",
+                    "tool": "Bash"
+                  }
+                ],
+                "interactionId": "settled",
+                "plan": "# Plan\n\n1. Read `src/a.rs`\n2. Change it​\n\n<script>alert(1)</script>",
+                "planSha256": "0000000000000000000000000000000000000000000000000000000000000000",
+                "seq": 2,
+                "state": {
+                  "kind": "waiting"
+                },
+                "toolUseId": "tool-settled",
+                "turnId": null,
+                "unsupportedReason": null
+              }
+            ]
+          },
+          "throughRevision": 3,
+          "waitingId": "settled"
+        },
+        {
+          "action": {
+            "event": {
+              "feedback": "Keep \"this\" shorter​",
+              "interaction_id": "settled",
+              "mode_after": null,
+              "outcome": "kept_planning",
+              "reason": "ended: KeptPlanning",
+              "type": "plan_settled"
+            }
+          },
+          "isPlanning": true,
+          "planGateApplies": true,
+          "snapshot": {
+            "activeTurnId": null,
+            "planning": {
+              "phase": "planning"
+            },
+            "plans": [
+              {
+                "allowedPrompts": [
+                  {
+                    "prompt": "run the tests",
+                    "tool": "Bash"
+                  },
+                  {
+                    "prompt": "remote‮​",
+                    "tool": "Bash"
+                  }
+                ],
+                "interactionId": "settled",
+                "plan": "# Plan\n\n1. Read `src/a.rs`\n2. Change it​\n\n<script>alert(1)</script>",
+                "planSha256": "0000000000000000000000000000000000000000000000000000000000000000",
+                "seq": 2,
+                "state": {
+                  "feedback": "Keep \"this\" shorter​",
+                  "kind": "settled",
+                  "modeAfter": null,
+                  "outcome": "kept_planning",
+                  "reason": "ended: KeptPlanning"
+                },
+                "toolUseId": "tool-settled",
+                "turnId": null,
+                "unsupportedReason": null
+              }
+            ]
+          },
+          "throughRevision": 4,
+          "waitingId": null
+        },
+        {
+          "action": {
+            "event": {
+              "allowed_prompts": [
+                {
+                  "prompt": "run the tests",
+                  "tool": "Bash"
+                },
+                {
+                  "prompt": "remote‮​",
+                  "tool": "Bash"
+                }
+              ],
+              "interaction_id": "answering",
+              "plan": "# Plan\n\n1. Read `src/a.rs`\n2. Change it​\n\n<script>alert(1)</script>",
+              "plan_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+              "tool_use_id": "tool-answering",
+              "type": "plan_proposed",
+              "unsupported_reason": null
+            }
+          },
+          "isPlanning": true,
+          "planGateApplies": true,
+          "snapshot": {
+            "activeTurnId": null,
+            "planning": {
+              "phase": "planning"
+            },
+            "plans": [
+              {
+                "allowedPrompts": [
+                  {
+                    "prompt": "run the tests",
+                    "tool": "Bash"
+                  },
+                  {
+                    "prompt": "remote‮​",
+                    "tool": "Bash"
+                  }
+                ],
+                "interactionId": "settled",
+                "plan": "# Plan\n\n1. Read `src/a.rs`\n2. Change it​\n\n<script>alert(1)</script>",
+                "planSha256": "0000000000000000000000000000000000000000000000000000000000000000",
+                "seq": 2,
+                "state": {
+                  "feedback": "Keep \"this\" shorter​",
+                  "kind": "settled",
+                  "modeAfter": null,
+                  "outcome": "kept_planning",
+                  "reason": "ended: KeptPlanning"
+                },
+                "toolUseId": "tool-settled",
+                "turnId": null,
+                "unsupportedReason": null
+              },
+              {
+                "allowedPrompts": [
+                  {
+                    "prompt": "run the tests",
+                    "tool": "Bash"
+                  },
+                  {
+                    "prompt": "remote‮​",
+                    "tool": "Bash"
+                  }
+                ],
+                "interactionId": "answering",
+                "plan": "# Plan\n\n1. Read `src/a.rs`\n2. Change it​\n\n<script>alert(1)</script>",
+                "planSha256": "0000000000000000000000000000000000000000000000000000000000000000",
+                "seq": 4,
+                "state": {
+                  "kind": "waiting"
+                },
+                "toolUseId": "tool-answering",
+                "turnId": null,
+                "unsupportedReason": null
+              }
+            ]
+          },
+          "throughRevision": 5,
+          "waitingId": "answering"
+        },
+        {
+          "action": {
+            "changed": true,
+            "interactionId": "answering",
+            "send": "answering"
+          },
+          "isPlanning": true,
+          "planGateApplies": true,
+          "snapshot": {
+            "activeTurnId": null,
+            "planning": {
+              "phase": "planning"
+            },
+            "plans": [
+              {
+                "allowedPrompts": [
+                  {
+                    "prompt": "run the tests",
+                    "tool": "Bash"
+                  },
+                  {
+                    "prompt": "remote‮​",
+                    "tool": "Bash"
+                  }
+                ],
+                "interactionId": "settled",
+                "plan": "# Plan\n\n1. Read `src/a.rs`\n2. Change it​\n\n<script>alert(1)</script>",
+                "planSha256": "0000000000000000000000000000000000000000000000000000000000000000",
+                "seq": 2,
+                "state": {
+                  "feedback": "Keep \"this\" shorter​",
+                  "kind": "settled",
+                  "modeAfter": null,
+                  "outcome": "kept_planning",
+                  "reason": "ended: KeptPlanning"
+                },
+                "toolUseId": "tool-settled",
+                "turnId": null,
+                "unsupportedReason": null
+              },
+              {
+                "allowedPrompts": [
+                  {
+                    "prompt": "run the tests",
+                    "tool": "Bash"
+                  },
+                  {
+                    "prompt": "remote‮​",
+                    "tool": "Bash"
+                  }
+                ],
+                "interactionId": "answering",
+                "plan": "# Plan\n\n1. Read `src/a.rs`\n2. Change it​\n\n<script>alert(1)</script>",
+                "planSha256": "0000000000000000000000000000000000000000000000000000000000000000",
+                "seq": 4,
+                "state": {
+                  "kind": "answering"
+                },
+                "toolUseId": "tool-answering",
+                "turnId": null,
+                "unsupportedReason": null
+              }
+            ]
+          },
+          "throughRevision": 5,
+          "waitingId": "answering"
+        },
+        {
+          "action": {
+            "event": {
+              "reason": "closed",
+              "type": "session_closed"
+            }
+          },
+          "isPlanning": false,
+          "planGateApplies": false,
+          "snapshot": {
+            "activeTurnId": null,
+            "planning": {
+              "phase": "executing"
+            },
+            "plans": [
+              {
+                "allowedPrompts": [
+                  {
+                    "prompt": "run the tests",
+                    "tool": "Bash"
+                  },
+                  {
+                    "prompt": "remote‮​",
+                    "tool": "Bash"
+                  }
+                ],
+                "interactionId": "settled",
+                "plan": "# Plan\n\n1. Read `src/a.rs`\n2. Change it​\n\n<script>alert(1)</script>",
+                "planSha256": "0000000000000000000000000000000000000000000000000000000000000000",
+                "seq": 2,
+                "state": {
+                  "feedback": "Keep \"this\" shorter​",
+                  "kind": "settled",
+                  "modeAfter": null,
+                  "outcome": "kept_planning",
+                  "reason": "ended: KeptPlanning"
+                },
+                "toolUseId": "tool-settled",
+                "turnId": null,
+                "unsupportedReason": null
+              },
+              {
+                "allowedPrompts": [
+                  {
+                    "prompt": "run the tests",
+                    "tool": "Bash"
+                  },
+                  {
+                    "prompt": "remote‮​",
+                    "tool": "Bash"
+                  }
+                ],
+                "interactionId": "answering",
+                "plan": "# Plan\n\n1. Read `src/a.rs`\n2. Change it​\n\n<script>alert(1)</script>",
+                "planSha256": "0000000000000000000000000000000000000000000000000000000000000000",
+                "seq": 4,
+                "state": {
+                  "feedback": null,
+                  "kind": "settled",
+                  "modeAfter": null,
+                  "outcome": "session_closed",
+                  "reason": null
+                },
+                "toolUseId": "tool-answering",
+                "turnId": null,
+                "unsupportedReason": null
+              }
+            ]
+          },
+          "throughRevision": 6,
+          "waitingId": null
+        },
+        {
+          "action": {
+            "event": {
+              "feedback": null,
+              "interaction_id": "answering",
+              "mode_after": "auto",
+              "outcome": "approved",
+              "reason": "ended: Approved",
+              "type": "plan_settled"
+            }
+          },
+          "isPlanning": false,
+          "planGateApplies": false,
+          "snapshot": {
+            "activeTurnId": null,
+            "planning": {
+              "phase": "executing"
+            },
+            "plans": [
+              {
+                "allowedPrompts": [
+                  {
+                    "prompt": "run the tests",
+                    "tool": "Bash"
+                  },
+                  {
+                    "prompt": "remote‮​",
+                    "tool": "Bash"
+                  }
+                ],
+                "interactionId": "settled",
+                "plan": "# Plan\n\n1. Read `src/a.rs`\n2. Change it​\n\n<script>alert(1)</script>",
+                "planSha256": "0000000000000000000000000000000000000000000000000000000000000000",
+                "seq": 2,
+                "state": {
+                  "feedback": "Keep \"this\" shorter​",
+                  "kind": "settled",
+                  "modeAfter": null,
+                  "outcome": "kept_planning",
+                  "reason": "ended: KeptPlanning"
+                },
+                "toolUseId": "tool-settled",
+                "turnId": null,
+                "unsupportedReason": null
+              },
+              {
+                "allowedPrompts": [
+                  {
+                    "prompt": "run the tests",
+                    "tool": "Bash"
+                  },
+                  {
+                    "prompt": "remote‮​",
+                    "tool": "Bash"
+                  }
+                ],
+                "interactionId": "answering",
+                "plan": "# Plan\n\n1. Read `src/a.rs`\n2. Change it​\n\n<script>alert(1)</script>",
+                "planSha256": "0000000000000000000000000000000000000000000000000000000000000000",
+                "seq": 4,
+                "state": {
+                  "feedback": null,
+                  "kind": "settled",
+                  "modeAfter": null,
+                  "outcome": "session_closed",
+                  "reason": null
+                },
+                "toolUseId": "tool-answering",
+                "turnId": null,
+                "unsupportedReason": null
+              }
+            ]
+          },
+          "throughRevision": 7,
+          "waitingId": null
+        }
+      ]
+    },
+    {
+      "name": "SessionUnavailable { reason: \"lost\" }",
+      "requested": "default",
+      "steps": [
+        {
+          "action": {
+            "event": {
+              "input": {},
+              "name": "EnterPlanMode",
+              "tool_use_id": "tool-enter",
+              "turn_id": "turn",
+              "type": "tool_call_started"
+            }
+          },
+          "isPlanning": true,
+          "planGateApplies": false,
+          "snapshot": {
+            "activeTurnId": null,
+            "planning": {
+              "phase": "entering"
+            }
+          },
+          "throughRevision": 1,
+          "waitingId": null
+        },
+        {
+          "action": {
+            "event": {
+              "source": "CliModeReported",
+              "type": "cli_plan_mode"
+            }
+          },
+          "isPlanning": true,
+          "planGateApplies": true,
+          "snapshot": {
+            "activeTurnId": null,
+            "planning": {
+              "phase": "planning"
+            }
+          },
+          "throughRevision": 2,
+          "waitingId": null
+        },
+        {
+          "action": {
+            "event": {
+              "allowed_prompts": [
+                {
+                  "prompt": "run the tests",
+                  "tool": "Bash"
+                },
+                {
+                  "prompt": "remote‮​",
+                  "tool": "Bash"
+                }
+              ],
+              "interaction_id": "settled",
+              "plan": "# Plan\n\n1. Read `src/a.rs`\n2. Change it​\n\n<script>alert(1)</script>",
+              "plan_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+              "tool_use_id": "tool-settled",
+              "type": "plan_proposed",
+              "unsupported_reason": null
+            }
+          },
+          "isPlanning": true,
+          "planGateApplies": true,
+          "snapshot": {
+            "activeTurnId": null,
+            "planning": {
+              "phase": "planning"
+            },
+            "plans": [
+              {
+                "allowedPrompts": [
+                  {
+                    "prompt": "run the tests",
+                    "tool": "Bash"
+                  },
+                  {
+                    "prompt": "remote‮​",
+                    "tool": "Bash"
+                  }
+                ],
+                "interactionId": "settled",
+                "plan": "# Plan\n\n1. Read `src/a.rs`\n2. Change it​\n\n<script>alert(1)</script>",
+                "planSha256": "0000000000000000000000000000000000000000000000000000000000000000",
+                "seq": 2,
+                "state": {
+                  "kind": "waiting"
+                },
+                "toolUseId": "tool-settled",
+                "turnId": null,
+                "unsupportedReason": null
+              }
+            ]
+          },
+          "throughRevision": 3,
+          "waitingId": "settled"
+        },
+        {
+          "action": {
+            "event": {
+              "feedback": "Keep \"this\" shorter​",
+              "interaction_id": "settled",
+              "mode_after": null,
+              "outcome": "kept_planning",
+              "reason": "ended: KeptPlanning",
+              "type": "plan_settled"
+            }
+          },
+          "isPlanning": true,
+          "planGateApplies": true,
+          "snapshot": {
+            "activeTurnId": null,
+            "planning": {
+              "phase": "planning"
+            },
+            "plans": [
+              {
+                "allowedPrompts": [
+                  {
+                    "prompt": "run the tests",
+                    "tool": "Bash"
+                  },
+                  {
+                    "prompt": "remote‮​",
+                    "tool": "Bash"
+                  }
+                ],
+                "interactionId": "settled",
+                "plan": "# Plan\n\n1. Read `src/a.rs`\n2. Change it​\n\n<script>alert(1)</script>",
+                "planSha256": "0000000000000000000000000000000000000000000000000000000000000000",
+                "seq": 2,
+                "state": {
+                  "feedback": "Keep \"this\" shorter​",
+                  "kind": "settled",
+                  "modeAfter": null,
+                  "outcome": "kept_planning",
+                  "reason": "ended: KeptPlanning"
+                },
+                "toolUseId": "tool-settled",
+                "turnId": null,
+                "unsupportedReason": null
+              }
+            ]
+          },
+          "throughRevision": 4,
+          "waitingId": null
+        },
+        {
+          "action": {
+            "event": {
+              "allowed_prompts": [
+                {
+                  "prompt": "run the tests",
+                  "tool": "Bash"
+                },
+                {
+                  "prompt": "remote‮​",
+                  "tool": "Bash"
+                }
+              ],
+              "interaction_id": "answering",
+              "plan": "# Plan\n\n1. Read `src/a.rs`\n2. Change it​\n\n<script>alert(1)</script>",
+              "plan_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+              "tool_use_id": "tool-answering",
+              "type": "plan_proposed",
+              "unsupported_reason": null
+            }
+          },
+          "isPlanning": true,
+          "planGateApplies": true,
+          "snapshot": {
+            "activeTurnId": null,
+            "planning": {
+              "phase": "planning"
+            },
+            "plans": [
+              {
+                "allowedPrompts": [
+                  {
+                    "prompt": "run the tests",
+                    "tool": "Bash"
+                  },
+                  {
+                    "prompt": "remote‮​",
+                    "tool": "Bash"
+                  }
+                ],
+                "interactionId": "settled",
+                "plan": "# Plan\n\n1. Read `src/a.rs`\n2. Change it​\n\n<script>alert(1)</script>",
+                "planSha256": "0000000000000000000000000000000000000000000000000000000000000000",
+                "seq": 2,
+                "state": {
+                  "feedback": "Keep \"this\" shorter​",
+                  "kind": "settled",
+                  "modeAfter": null,
+                  "outcome": "kept_planning",
+                  "reason": "ended: KeptPlanning"
+                },
+                "toolUseId": "tool-settled",
+                "turnId": null,
+                "unsupportedReason": null
+              },
+              {
+                "allowedPrompts": [
+                  {
+                    "prompt": "run the tests",
+                    "tool": "Bash"
+                  },
+                  {
+                    "prompt": "remote‮​",
+                    "tool": "Bash"
+                  }
+                ],
+                "interactionId": "answering",
+                "plan": "# Plan\n\n1. Read `src/a.rs`\n2. Change it​\n\n<script>alert(1)</script>",
+                "planSha256": "0000000000000000000000000000000000000000000000000000000000000000",
+                "seq": 4,
+                "state": {
+                  "kind": "waiting"
+                },
+                "toolUseId": "tool-answering",
+                "turnId": null,
+                "unsupportedReason": null
+              }
+            ]
+          },
+          "throughRevision": 5,
+          "waitingId": "answering"
+        },
+        {
+          "action": {
+            "changed": true,
+            "interactionId": "answering",
+            "send": "answering"
+          },
+          "isPlanning": true,
+          "planGateApplies": true,
+          "snapshot": {
+            "activeTurnId": null,
+            "planning": {
+              "phase": "planning"
+            },
+            "plans": [
+              {
+                "allowedPrompts": [
+                  {
+                    "prompt": "run the tests",
+                    "tool": "Bash"
+                  },
+                  {
+                    "prompt": "remote‮​",
+                    "tool": "Bash"
+                  }
+                ],
+                "interactionId": "settled",
+                "plan": "# Plan\n\n1. Read `src/a.rs`\n2. Change it​\n\n<script>alert(1)</script>",
+                "planSha256": "0000000000000000000000000000000000000000000000000000000000000000",
+                "seq": 2,
+                "state": {
+                  "feedback": "Keep \"this\" shorter​",
+                  "kind": "settled",
+                  "modeAfter": null,
+                  "outcome": "kept_planning",
+                  "reason": "ended: KeptPlanning"
+                },
+                "toolUseId": "tool-settled",
+                "turnId": null,
+                "unsupportedReason": null
+              },
+              {
+                "allowedPrompts": [
+                  {
+                    "prompt": "run the tests",
+                    "tool": "Bash"
+                  },
+                  {
+                    "prompt": "remote‮​",
+                    "tool": "Bash"
+                  }
+                ],
+                "interactionId": "answering",
+                "plan": "# Plan\n\n1. Read `src/a.rs`\n2. Change it​\n\n<script>alert(1)</script>",
+                "planSha256": "0000000000000000000000000000000000000000000000000000000000000000",
+                "seq": 4,
+                "state": {
+                  "kind": "answering"
+                },
+                "toolUseId": "tool-answering",
+                "turnId": null,
+                "unsupportedReason": null
+              }
+            ]
+          },
+          "throughRevision": 5,
+          "waitingId": "answering"
+        },
+        {
+          "action": {
+            "event": {
+              "reason": "lost",
+              "type": "session_unavailable"
+            }
+          },
+          "isPlanning": false,
+          "planGateApplies": false,
+          "snapshot": {
+            "activeTurnId": null,
+            "planning": {
+              "phase": "executing"
+            },
+            "plans": [
+              {
+                "allowedPrompts": [
+                  {
+                    "prompt": "run the tests",
+                    "tool": "Bash"
+                  },
+                  {
+                    "prompt": "remote‮​",
+                    "tool": "Bash"
+                  }
+                ],
+                "interactionId": "settled",
+                "plan": "# Plan\n\n1. Read `src/a.rs`\n2. Change it​\n\n<script>alert(1)</script>",
+                "planSha256": "0000000000000000000000000000000000000000000000000000000000000000",
+                "seq": 2,
+                "state": {
+                  "feedback": "Keep \"this\" shorter​",
+                  "kind": "settled",
+                  "modeAfter": null,
+                  "outcome": "kept_planning",
+                  "reason": "ended: KeptPlanning"
+                },
+                "toolUseId": "tool-settled",
+                "turnId": null,
+                "unsupportedReason": null
+              },
+              {
+                "allowedPrompts": [
+                  {
+                    "prompt": "run the tests",
+                    "tool": "Bash"
+                  },
+                  {
+                    "prompt": "remote‮​",
+                    "tool": "Bash"
+                  }
+                ],
+                "interactionId": "answering",
+                "plan": "# Plan\n\n1. Read `src/a.rs`\n2. Change it​\n\n<script>alert(1)</script>",
+                "planSha256": "0000000000000000000000000000000000000000000000000000000000000000",
+                "seq": 4,
+                "state": {
+                  "feedback": null,
+                  "kind": "settled",
+                  "modeAfter": null,
+                  "outcome": "session_closed",
+                  "reason": null
+                },
+                "toolUseId": "tool-answering",
+                "turnId": null,
+                "unsupportedReason": null
+              }
+            ]
+          },
+          "throughRevision": 6,
+          "waitingId": null
+        },
+        {
+          "action": {
+            "event": {
+              "feedback": null,
+              "interaction_id": "answering",
+              "mode_after": "auto",
+              "outcome": "approved",
+              "reason": "ended: Approved",
+              "type": "plan_settled"
+            }
+          },
+          "isPlanning": false,
+          "planGateApplies": false,
+          "snapshot": {
+            "activeTurnId": null,
+            "planning": {
+              "phase": "executing"
+            },
+            "plans": [
+              {
+                "allowedPrompts": [
+                  {
+                    "prompt": "run the tests",
+                    "tool": "Bash"
+                  },
+                  {
+                    "prompt": "remote‮​",
+                    "tool": "Bash"
+                  }
+                ],
+                "interactionId": "settled",
+                "plan": "# Plan\n\n1. Read `src/a.rs`\n2. Change it​\n\n<script>alert(1)</script>",
+                "planSha256": "0000000000000000000000000000000000000000000000000000000000000000",
+                "seq": 2,
+                "state": {
+                  "feedback": "Keep \"this\" shorter​",
+                  "kind": "settled",
+                  "modeAfter": null,
+                  "outcome": "kept_planning",
+                  "reason": "ended: KeptPlanning"
+                },
+                "toolUseId": "tool-settled",
+                "turnId": null,
+                "unsupportedReason": null
+              },
+              {
+                "allowedPrompts": [
+                  {
+                    "prompt": "run the tests",
+                    "tool": "Bash"
+                  },
+                  {
+                    "prompt": "remote‮​",
+                    "tool": "Bash"
+                  }
+                ],
+                "interactionId": "answering",
+                "plan": "# Plan\n\n1. Read `src/a.rs`\n2. Change it​\n\n<script>alert(1)</script>",
+                "planSha256": "0000000000000000000000000000000000000000000000000000000000000000",
+                "seq": 4,
+                "state": {
+                  "feedback": null,
+                  "kind": "settled",
+                  "modeAfter": null,
+                  "outcome": "session_closed",
+                  "reason": null
+                },
+                "toolUseId": "tool-answering",
+                "turnId": null,
+                "unsupportedReason": null
+              }
+            ]
+          },
+          "throughRevision": 7,
+          "waitingId": null
+        }
+      ]
+    }
+  ],
+  "writtenBy": "agent/src/testkit/plans_fixture.rs::plans_fixture"
+}

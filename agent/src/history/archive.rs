@@ -12,6 +12,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 pub const SEGMENT_BYTES: u64 = 16 << 20;
 pub const MAX_SEGMENTS: usize = 4;
 pub const PAGE_MAX_CHARS: usize = super::HISTORY_MAX_CHARS;
+/// Private archive records contain metadata only, so base64 transcript sizing does not apply.
+pub(crate) const ARCHIVE_MAX_LINE_BYTES: usize = 4 * 1024 * 1024;
 const CUT_KEEP_BYTES: usize = 4 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -74,6 +76,7 @@ pub enum ArchivedRecord {
     TurnEnding(TurnEndingRecord),
     Notice(NoticeRecord),
     Question(QuestionRecord),
+    Plan(PlanRecord),
 }
 
 #[derive(Serialize, Deserialize)]
@@ -172,7 +175,7 @@ impl ArchiveWriter {
         let path = id.path(&dir, k);
         let file = append_private(&path)?;
         let cancel = AtomicBool::new(false);
-        let mut reader = PrivateLines::open(&path, super::HISTORY_MAX_LINE_BYTES, &cancel)?.into_file();
+        let mut reader = PrivateLines::open(&path, ARCHIVE_MAX_LINE_BYTES, &cancel)?.into_file();
         let mut end = file.metadata()?.len();
         let mut buf = [0; 8192];
         // Scan backwards in fixed blocks, retaining only bytes through the last complete line.
@@ -385,7 +388,7 @@ fn encode(turn: u64, record: &ArchivedRecord) -> io::Result<Vec<u8>> {
         record: record.clone(),
     };
     let bytes = serde_json::to_vec(&line)?;
-    if bytes.len() <= super::HISTORY_MAX_LINE_BYTES {
+    if bytes.len() <= ARCHIVE_MAX_LINE_BYTES {
         return Ok(bytes);
     }
     let mut value = serde_json::to_value(line)?;
@@ -394,7 +397,7 @@ fn encode(turn: u64, record: &ArchivedRecord) -> io::Result<Vec<u8>> {
     loop {
         cut(&mut value["record"], cap);
         let bytes = serde_json::to_vec(&value)?;
-        if bytes.len() <= super::HISTORY_MAX_LINE_BYTES {
+        if bytes.len() <= ARCHIVE_MAX_LINE_BYTES {
             return Ok(bytes);
         }
         if cap == 1 {
@@ -447,6 +450,18 @@ fn minimal_record(record: &ArchivedRecord) -> ArchivedRecord {
             r.unsupported_reason = None;
             if let QuestionState::Settled { answers, reason, .. } = &mut r.state {
                 answers.clear();
+                *reason = None;
+            }
+        }
+        ArchivedRecord::Plan(r) => {
+            r.tool_use_id = None;
+            r.turn_id = None;
+            r.plan.clear();
+            r.plan_sha256.clear();
+            r.allowed_prompts.clear();
+            r.unsupported_reason = None;
+            if let PlanState::Settled { feedback, reason, .. } = &mut r.state {
+                *feedback = None;
                 *reason = None;
             }
         }
@@ -561,7 +576,7 @@ fn scan_records(
         if cancel.load(Ordering::Acquire) {
             break;
         }
-        let lines = PrivateLines::open(path, super::HISTORY_MAX_LINE_BYTES, cancel)?;
+        let lines = PrivateLines::open(path, ARCHIVE_MAX_LINE_BYTES, cancel)?;
         #[cfg(test)]
         SEGMENT_OPENS.with(|counts| *counts.borrow_mut().entry(path.clone()).or_default() += 1);
         for bytes in lines {
@@ -595,6 +610,7 @@ fn scan_records(
                 ArchivedRecord::TurnEnding(r) => (r.seq, "turn_ending"),
                 ArchivedRecord::Notice(r) => (r.seq, "notice"),
                 ArchivedRecord::Question(r) => (r.seq, "question"),
+                ArchivedRecord::Plan(r) => (r.seq, "plan"),
             };
             visit(line.turn, key, line.record, line.cut);
         }
@@ -617,6 +633,7 @@ fn record_chars(record: &ArchivedRecord) -> usize {
             .sum(),
         ArchivedRecord::Notice(r) => store::notice_chars(r),
         ArchivedRecord::Question(r) => store::question_chars(r),
+        ArchivedRecord::Plan(r) => store::plan_chars(r),
     }
 }
 

@@ -249,6 +249,7 @@ pub(crate) fn build_agent_panel(
         return (crate::webkit_sandbox::notice_widget(notice), handle);
     }
     let handle = AgentPanelHandle::new(init, true, Rc::new(GtkPanelHost));
+    install_attachments(&handle);
     let (webview, _page) = build_chat_page(&handle, ViewId::BASE, related);
 
     // Started once, at construction, rather than when a session starts: it is also what collects a
@@ -284,10 +285,23 @@ pub(crate) fn make_panel_handle(
     AgentPanelHandle::new(init, false, Rc::new(GtkPanelHost))
 }
 
+/// The window's attachment desk, for a panel with pages: composer images are staged, decoded in a child of this
+/// executable (`eitri attachment-decoder`, dispatched first in `main`) and read back on the desk's own thread,
+/// which also sweeps the staging that processes now gone left behind. Nothing of it runs on this thread.
+fn install_attachments(handle: &AgentPanelHandle) {
+    #[cfg(target_os = "linux")]
+    handle.install_attachments(eitri_core::attachments::start_desk(
+        None,
+        eitri_core::attachments::DecoderCommand::this_executable(),
+        handle.waker(),
+    ));
+}
+
 /// The base view's page and the pump that drives every page after it. The page exists only because the window
 /// controller said so (`HostOp::BuildBasePage`), so this has one caller.
 pub(crate) fn build_base_page(handle: &AgentPanelHandle) -> (WebView, Rc<PanelPage>) {
     handle.open_pages();
+    install_attachments(handle);
     let built = build_chat_page(handle, ViewId::BASE, None);
     // One timer serves every page; `build_agent_panel`'s start of it says why it starts here.
     start_pump_timer(handle.clone());
@@ -299,6 +313,57 @@ pub(crate) fn build_base_page(handle: &AgentPanelHandle) -> (WebView, Rc<PanelPa
 pub(crate) fn start_review_pump(handle: &AgentPanelHandle) {
     handle.drive_review_without_pages();
     start_pump_timer(handle.clone());
+}
+
+/// Files dropped on a chat page go to the host, never to the page: WebKitGTK hands a page only a dropped file's link
+/// and an HTML anchor spelling its full path, and none of its bytes. This target runs in the capture phase, ahead of
+/// WebKit's own, and takes only a file list, so a dragged text still reaches the page as before. It only names the
+/// files: reading, staging and decoding run on the window's attachment desk.
+fn accept_file_drops(webview: &WebView, handle: &AgentPanelHandle, view: ViewId) {
+    let target = gtk4::DropTarget::new(gtk4::gdk::FileList::static_type(), gtk4::gdk::DragAction::COPY);
+    target.set_propagation_phase(gtk4::PropagationPhase::Capture);
+    let handle = handle.clone();
+    target.connect_drop(move |_, value, _, _| {
+        let Ok(list) = value.get::<gtk4::gdk::FileList>() else {
+            return false;
+        };
+        // A file that is not native (a remote location, a link dragged from a browser) has no path this process can
+        // read; asking for one could wait on the session's file daemon, so it is not asked.
+        let files = list.files().into_iter().map(|file| {
+            let path = file.is_native().then(|| file.path()).flatten();
+            (path, file.basename())
+        });
+        take_drop(&handle, view, files)
+    });
+    webview.add_controller(target);
+}
+
+/// What a drop on `view`'s page hands the panel: the files this computer has (a path), each named by its base name.
+/// A drop with none (links alone) is declined, and nothing is said or read.
+fn take_drop(
+    handle: &AgentPanelHandle,
+    view: ViewId,
+    files: impl IntoIterator<Item = (Option<PathBuf>, Option<PathBuf>)>,
+) -> bool {
+    let files: Vec<_> = files
+        .into_iter()
+        .filter(|(path, _)| path.is_some())
+        .map(|(path, basename)| dropped_file(path, basename))
+        .collect();
+    if files.is_empty() {
+        return false;
+    }
+    handle.drop_files(view, files);
+    true
+}
+
+/// One dropped file as the panel takes it: its path when it has one, and its base name as the chip's text.
+fn dropped_file(path: Option<PathBuf>, basename: Option<PathBuf>) -> eitri_core::tab_set::DroppedFile {
+    let name = basename
+        .or_else(|| path.as_deref().and_then(Path::file_name).map(PathBuf::from))
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    eitri_core::tab_set::DroppedFile { path, name }
 }
 
 /// The one way a chat page is built: its own `UserContentManager`, the CSP floor, the ephemeral
@@ -350,6 +415,7 @@ pub(crate) fn build_chat_page(
     webview.set_vexpand(true);
     let page = Rc::new(PanelPage::new(Rc::new(WebKitPage(webview.clone()))));
     handle.attach_page(view, page.clone());
+    accept_file_drops(&webview, handle, view);
 
     // Security: never let this WebView itself navigate away from its one embedded document.
     // Even sanitized markdown can legitimately contain an external link (a click), and a script
@@ -1263,6 +1329,83 @@ for (const first of [new Error('first'), undefined, null, false, 0]) {
             chain.contains(".default_content_security_policy(panel_content_security_policy())"),
             "the WebView builder chain never applies the panel's CSP: {chain}"
         );
+    }
+
+    /// A dropped file keeps its path and is named by its base name; one with no path (not on this computer) is still
+    /// named, and the panel makes it a failed chip.
+    #[test]
+    fn a_dropped_file_is_named_by_its_base_name() {
+        assert_eq!(
+            dropped_file(
+                Some(PathBuf::from("/home/u/Pictures/shot.png")),
+                Some(PathBuf::from("shot.png"))
+            ),
+            eitri_core::tab_set::DroppedFile {
+                path: Some(PathBuf::from("/home/u/Pictures/shot.png")),
+                name: "shot.png".into(),
+            }
+        );
+        assert_eq!(
+            dropped_file(Some(PathBuf::from("/tmp/a.webp")), None).name,
+            "a.webp",
+            "the path's own name when the file gives none"
+        );
+        assert_eq!(
+            dropped_file(None, Some(PathBuf::from("far.png"))),
+            eitri_core::tab_set::DroppedFile {
+                path: None,
+                name: "far.png".into(),
+            }
+        );
+    }
+
+    /// A drop hands the panel the files this computer has, as requests to the window's desk; a drop of links alone
+    /// (nothing native) is declined with nothing read, so it leaves no failed chip holding Send.
+    #[test]
+    fn a_drop_hands_the_panel_only_the_files_this_computer_has() {
+        let handle = AgentPanelHandle::for_host_test(Rc::new(CountingPage::default()));
+        let (desk, end) = eitri_core::tab_set::AttachmentDesk::channels();
+        handle.install_attachments(desk);
+        assert!(
+            !take_drop(&handle, ViewId::BASE, [(None, Some(PathBuf::from("example.com")))]),
+            "links alone are declined"
+        );
+        assert!(end.requests.try_recv().is_err());
+        assert!(take_drop(
+            &handle,
+            ViewId::BASE,
+            [
+                (Some(PathBuf::from("/p/one.png")), Some(PathBuf::from("one.png"))),
+                (None, Some(PathBuf::from("link"))),
+            ],
+        ));
+        let Ok(eitri_core::tab_set::DeskRequest::ImportFile { path, .. }) =
+            end.requests.recv_timeout(Duration::from_secs(10))
+        else {
+            panic!("the file goes to the desk")
+        };
+        assert_eq!(path, PathBuf::from("/p/one.png"));
+        assert!(end.requests.try_recv().is_err(), "the link is not");
+    }
+
+    /// Every chat page takes file drops through the host's own target, ahead of WebKit's: the page never sees a path.
+    #[test]
+    fn every_chat_page_takes_file_drops_in_the_capture_phase() {
+        let source = include_str!("agent_panel.rs");
+        let code = eitri_core::rust_mask::code_only(source);
+        let fn_at = code.find(concat!("fn build_chat_page", "(")).expect("build_chat_page");
+        let body = eitri_core::source_scan::braced(&code, fn_at + code[fn_at..].find('{').unwrap());
+        assert!(
+            body.contains(concat!("accept_file_drops", "(&webview, handle, view)")),
+            "{body}"
+        );
+        let target_at = code
+            .find(concat!("fn accept_file_drops", "("))
+            .expect("accept_file_drops");
+        let target = eitri_core::source_scan::braced(&code, target_at + code[target_at..].find('{').unwrap());
+        assert!(target.contains("gdk::FileList::static_type()"));
+        assert!(target.contains("PropagationPhase::Capture"));
+        assert!(target.contains("is_native()"), "no path is asked of a remote file");
     }
 
     /// The panel's WebView uses an ephemeral `NetworkSession` with a closed loopback proxy,

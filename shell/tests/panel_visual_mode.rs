@@ -696,6 +696,8 @@ fn on_ready_batch(projection: &AgentSessionProjection) -> Vec<String> {
     // live, matching the fixed id every fixture builds its snapshot for.
     let tabs = vec![TabView {
         question_draft: Default::default(),
+        plan_feedback_draft: Default::default(),
+        plan_on_start: false,
         id: eitri_core::tabs::TabId(1),
         number: 1,
         label: "1".into(),

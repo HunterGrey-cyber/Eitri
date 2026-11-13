@@ -708,6 +708,25 @@ describe("every chord COMPOSER_CHORDS names does what INPUT_KEYS says", () => {
       fireEvent.keyDown(textarea, { key: "p", ctrlKey: true });
       expect(container.querySelector(".slash-menu-row.current")!.textContent).toContain("/compact");
     },
+    "Ctrl+v / drop": () => {
+      const onFiles = vi.fn();
+      const file = new File([new Uint8Array(4)], "shot.png", { type: "image/png" });
+      const images = { items: [], pending: 0, imageInput: true, why: null, onFiles, onRemove: vi.fn() };
+      const { textarea, container } = renderComposer({ images });
+      fireEvent.paste(textarea, { clipboardData: { types: ["Files"], items: [{ kind: "file", type: "image/png", getAsFile: () => file }] } });
+      expect(fireEvent.drop(container.querySelector(".composer")!, { dataTransfer: { types: ["Files"], files: [file] } })).toBe(false);
+      expect(onFiles.mock.calls).toEqual([[[file]]]);
+    },
+    "← / Backspace": () => {
+      const onRemove = vi.fn();
+      const chip = (id: string) => ({ attachmentId: id, name: `${id}.png`, state: "ready" as const });
+      const images = { items: [chip("a"), chip("b")], pending: 0, imageInput: true, why: null, onFiles: vi.fn(), onRemove };
+      const { textarea, container } = renderComposer({ images });
+      fireEvent.keyDown(textarea, { key: "ArrowLeft" });
+      expect(document.activeElement).toBe(container.querySelectorAll(".attachment-chip")[1]);
+      fireEvent.keyDown(textarea, { key: "Backspace" });
+      expect(onRemove).toHaveBeenCalledWith("b");
+    },
     Tab: () => {
       const { textarea } = renderComposer({ slashCommands: [{ name: "compact", description: "" }] });
       typed(textarea, "/co");
@@ -1165,4 +1184,47 @@ describe("Ctrl+x Enter: send after the turn", () => {
     expect(onQueue).not.toHaveBeenCalled();
     expect(flashOf(container)).toBeNull();
   });
+});
+
+it.each(["/plan", "/rewind", "/help", "/status", "/tasks", "/memory", "/resume"])(
+  "%s runs locally with images and keeps them in the draft", (command) => {
+    const onSlashAction = vi.fn();
+    const items = [{ attachmentId: "x".repeat(32), name: "shot.png", state: "importing" as const }];
+    const { textarea, container, onSend } = renderComposer({ claudeSlashCommands: true, onSlashAction,
+      images: { items, pending: 1, imageInput: true, why: null, onFiles: vi.fn(), onRemove: vi.fn() },
+    });
+    fireEvent.change(textarea, { target: { value: command } });
+    fireEvent.keyDown(textarea, { key: "Enter" });
+    expect(onSlashAction).toHaveBeenCalledTimes(1);
+    expect(onSend).not.toHaveBeenCalled();
+    expect(container.querySelector(".attachment-chip")).toBeTruthy();
+    expect(textarea.value).toBe(command === "/rewind" ? command : "");
+  },
+);
+
+it("Ctrl+Enter explains that it sends nothing when the draft contains images", () => {
+  const onSendNow = vi.fn();
+  const { textarea, container } = renderComposer({ running: true, onSendNow, images: {
+    items: [{ attachmentId: "x".repeat(32), name: "shot.png", state: "ready" }], pending: 0,
+    imageInput: true, why: null, onFiles: vi.fn(), onRemove: vi.fn(),
+  } });
+  fireEvent.change(textarea, { target: { value: "look" } });
+  fireEvent.keyDown(textarea, { key: "Enter", ctrlKey: true });
+  expect(onSendNow).not.toHaveBeenCalled();
+  expect(textarea.value).toBe("look");
+  expect(container.querySelector(".composer-slash-flash")?.textContent)
+    .toBe("Ctrl+Enter cannot send images: Enter queues the message with them");
+});
+
+it.each(["/tmp/screenshot.png", "/unknown-command"])("refuses images beside %s using the leading-slash wording", (text) => {
+  const items = [{ attachmentId: "a", name: "a.png", state: "ready" as const }];
+  const { textarea, container, onSend } = renderComposer({ images: {
+    items, pending: 0, imageInput: true, why: null, onFiles: vi.fn(), onRemove: vi.fn(),
+  } });
+  fireEvent.change(textarea, { target: { value: text } });
+  fireEvent.keyDown(textarea, { key: "Enter" });
+  expect(onSend).not.toHaveBeenCalled();
+  expect(textarea.value).toBe(text);
+  expect(container.querySelector(".composer-slash-flash")?.textContent)
+    .toBe("a message starting with / takes no images: remove the images first");
 });

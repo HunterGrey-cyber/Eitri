@@ -53,6 +53,7 @@ impl Fixture {
             typed: text.into(),
             typed_by_person: origin == PromptOrigin::Typed,
             shell_line: false,
+            attachments: Vec::new(),
         };
         let sent = if first {
             self.set.send_first_turn(self.tab, "first", turn)
@@ -540,7 +541,7 @@ fn a_restored_message_the_person_resends_is_typed() {
         .push(Queued::held("saved", "old context".into(), 1));
     let text = f.set.take_back_queue(f.tab);
     assert_eq!(text, ["saved"]);
-    f.prompt(&text.join("\n\n"), PromptOrigin::Typed, false);
+    f.prompt(&text[0].text, PromptOrigin::Typed, false);
     assert!(f.provider.turn_stamps()[0].typed_by_person);
 }
 
@@ -702,15 +703,18 @@ fn every_send_caller_names_its_origin() {
     }
     let mut expected: Vec<(&str, String)> = [
         ("core/src/agent_backend.rs", "send_turn(wire_text)"),
-        ("core/src/agent_backend.rs", "send_turn(wire_text,as_typed,origin)"),
         (
             "core/src/agent_backend.rs",
-            "send_turn_as(wire_text,as_typed,origin,&client_message_id)",
+            "send_turn(wire_text,as_typed,origin,images)",
+        ),
+        (
+            "core/src/agent_backend.rs",
+            "send_turn_as(wire_text,as_typed,origin,&client_message_id,images)",
         ),
         ("core/src/agent_backend.rs", "send_turn_with(wire_text,policy)"),
         (
             "core/src/agent_backend.rs",
-            "send_turn(&turn.wire,&turn.typed,turn.origin)",
+            "send_turn(&turn.wire,&turn.typed,turn.origin,Vec::new())",
         ),
         (
             "core/src/agent_backend.rs",
@@ -727,11 +731,11 @@ fn every_send_caller_names_its_origin() {
         ),
         (
             "core/src/tab_set.rs",
-            "send_turn_in(&wire,&typed,mode,root.as_deref(),origin)",
+            "send_turn_in(&wire,&typed,mode,root.as_deref(),origin,images)",
         ),
         (
             "core/src/tab_set.rs",
-            "send_turn_in(&turn.wire,&turn.typed,mode,root.as_deref(),turn.origin())",
+            "send_turn_in(&turn.wire,&turn.typed,mode,root.as_deref(),turn.origin(),images)",
         ),
         (
             "core/src/tab_set.rs",

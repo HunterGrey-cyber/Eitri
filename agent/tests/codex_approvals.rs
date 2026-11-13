@@ -121,13 +121,7 @@ fn running_under(
     let id = provider.start(start).expect("the session starts");
     assert_eq!(id, thread);
     provider
-        .send_turn_with(
-            SendTurnRequest {
-                session_id: thread.to_string(),
-                text: "go".into(),
-            },
-            policy(turn_reviewer),
-        )
+        .send_turn_with(SendTurnRequest::text(thread.to_string(), "go"), policy(turn_reviewer))
         .expect("the turn starts");
     provider
 }
@@ -669,13 +663,7 @@ fn codex_reviewing_in_a_turn_started_with_reviewer_user_trips() {
         )),
         "a verdict from a reviewer that should not have acted is not shown as one: {events:#?}"
     );
-    let next = provider.send_turn_with(
-        SendTurnRequest {
-            session_id: "th-r".into(),
-            text: "again".into(),
-        },
-        policy(Reviewer::User),
-    );
+    let next = provider.send_turn_with(SendTurnRequest::text("th-r", "again"), policy(Reviewer::User));
     assert!(next.is_err(), "a tripped session starts no turn: {next:?}");
 }
 
@@ -749,13 +737,7 @@ fn a_review_belonging_to_an_earlier_auto_turn_does_not_trip() {
     let first = until_turn_completed(&provider);
     assert!(mismatches(&first).is_empty(), "{first:#?}");
     let turn = provider
-        .send_turn_with(
-            SendTurnRequest {
-                session_id: "th-r".into(),
-                text: "now in manual".into(),
-            },
-            policy(Reviewer::User),
-        )
+        .send_turn_with(SendTurnRequest::text("th-r", "now in manual"), policy(Reviewer::User))
         .expect("the Manual turn starts");
     assert_eq!(turn, "tu-m");
     let second = until_turn_completed(&provider);
@@ -2159,5 +2141,35 @@ fn an_over_cap_request_is_refused_with_a_note_on_its_row() {
     assert!(
         !format!("{events:?}").contains("f-1"),
         "a request from outside the family was shown"
+    );
+}
+
+/// A Codex turn is text: a turn with images is refused before anything else is looked at (here, before the
+/// running turn would refuse it as busy), with nothing sent.
+#[test]
+fn a_turn_with_images_is_refused_with_nothing_sent() {
+    let provider = running("thread-img", "turn-img", Reviewer::Agent, Vec::new());
+    let image = agent::TurnImage {
+        meta: agent::AttachmentMeta {
+            media_type: "image/png".into(),
+            bytes: 8,
+            width: 1,
+            height: 1,
+            sha256: String::new(),
+        },
+        data: Arc::from(vec![0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a]),
+    };
+    let refused = provider
+        .send_turn_with(
+            SendTurnRequest {
+                images: vec![image],
+                ..SendTurnRequest::text("thread-img".to_string(), "look".to_string())
+            },
+            policy(Reviewer::Agent),
+        )
+        .expect_err("Codex turns carry text here");
+    assert!(
+        matches!(refused, ProviderError::UnsupportedCapability("turn_content_v1")),
+        "{refused}"
     );
 }

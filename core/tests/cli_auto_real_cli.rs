@@ -150,7 +150,7 @@ fn drive_turn(set: &mut TabSet, dir: &Path, tab: TabId, prompt: &str, label: &st
         .unwrap()
         .live_mut()
         .unwrap()
-        .send_turn(prompt, prompt, agent::PromptOrigin::Composed)
+        .send_turn(prompt, prompt, agent::PromptOrigin::Composed, Vec::new())
         .map_err(|e| e.message)
         .unwrap();
     let mut seen = Vec::new();

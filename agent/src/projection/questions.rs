@@ -121,6 +121,9 @@ impl QuestionRecord {
                 so_far,
             } if !so_far.is_empty() => Err("a cancel carries no answers; only a request to chat does".to_string()),
             InteractionResolution::Decline { so_far, .. } => check_answers(&self.questions, so_far),
+            InteractionResolution::PlanApprove { .. } | InteractionResolution::PlanKeep { .. } => {
+                Err("a question is answered or declined, never approved as a plan".to_string())
+            }
         }
     }
 }

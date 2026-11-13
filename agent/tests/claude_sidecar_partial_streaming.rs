@@ -89,10 +89,7 @@ fn open(provider: &ClaudeSidecarProvider, streaming: StreamingPreference) -> Str
 fn run_timed_turn(provider: &ClaudeSidecarProvider, session_id: &str, prompt: &str, deadline_secs: u64) -> Timeline {
     let submitted = Instant::now();
     provider
-        .send_turn(SendTurnRequest {
-            session_id: session_id.to_string(),
-            text: prompt.to_string(),
-        })
+        .send_turn(SendTurnRequest::text(session_id.to_string(), prompt.to_string()))
         .expect("send_turn should be accepted");
 
     let mut timeline = Timeline {
@@ -298,10 +295,7 @@ fn interrupting_a_partial_stream_terminates_cleanly_and_leaves_a_coherent_prefix
 
     let submitted = Instant::now();
     provider
-        .send_turn(SendTurnRequest {
-            session_id: session_id.clone(),
-            text: LONG_PROMPT.to_string(),
-        })
+        .send_turn(SendTurnRequest::text(session_id.clone(), LONG_PROMPT.to_string()))
         .unwrap();
 
     // Interrupt only once real content has arrived -- otherwise this tests an interrupt of nothing,

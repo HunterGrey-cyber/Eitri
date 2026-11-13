@@ -52,6 +52,7 @@ enum Kind {
     Ending,
     Start,
     Question,
+    Plan,
 }
 
 impl Kind {
@@ -65,6 +66,7 @@ impl Kind {
             Kind::Ending => "turnEndings",
             Kind::Start => "turnStarts",
             Kind::Question => "questions",
+            Kind::Plan => "plans",
         }
     }
 
@@ -172,6 +174,9 @@ fn entries(projection: &AgentSessionProjection, lo: u64, hi: u64) -> Vec<Entry> 
     }
     for q in &projection.questions {
         add(Kind::Question, q.seq, &|| serialized_bytes(q) + 40);
+    }
+    for p in &projection.plans {
+        add(Kind::Plan, p.seq, &|| serialized_bytes(p) + 40);
     }
     out
 }
@@ -384,6 +389,8 @@ fn copy_between(projection: &AgentSessionProjection, lo: u64, hi: u64, keep_card
         notification,
         background_tasks,
         questions,
+        plans,
+        planning,
         last_turn_end_seq,
         usage,
         assistant_message_open,
@@ -443,6 +450,8 @@ fn copy_between(projection: &AgentSessionProjection, lo: u64, hi: u64, keep_card
         notification: notification.clone(),
         background_tasks: background_tasks.clone(),
         questions: kept(questions, |e| e.seq, lo, hi),
+        plans: kept(plans, |e| e.seq, lo, hi),
+        planning: planning.clone(),
         last_turn_end_seq: *last_turn_end_seq,
         usage: usage.clone(),
         assistant_message_open: *assistant_message_open,
@@ -517,7 +526,7 @@ pub(super) fn tail_copy(projection: &AgentSessionProjection, tail: &Tail) -> Age
                     }
                 }
             }
-            Kind::Ending | Kind::Start | Kind::Question => {}
+            Kind::Ending | Kind::Start | Kind::Question | Kind::Plan => {}
         }
     }
     copy

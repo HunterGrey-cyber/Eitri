@@ -731,7 +731,7 @@ fn is_hidden_char(c: char) -> bool {
 /// The part of [`is_hidden_char`] that is neither a control nor a space: a format character or one that
 /// renders blank. Public so another check of text a user reads (one that allows ordinary spaces) uses the
 /// same table rather than a copy that drifts. Rust's standard library has no format-character test, hence
-/// the table (Unicode general category `Cf`).
+/// the table of format and default-ignorable ranges.
 pub fn is_invisible_char(c: char) -> bool {
     const FORMAT: &[(u32, u32)] = &[
         (0xAD, 0xAD),
@@ -744,17 +744,15 @@ pub fn is_invisible_char(c: char) -> bool {
         (0x180E, 0x180E),
         (0x200B, 0x200F),
         (0x202A, 0x202E),
-        (0x2060, 0x2064),
-        (0x2066, 0x206F),
+        (0x2060, 0x206F),
         (0xFEFF, 0xFEFF),
-        (0xFFF9, 0xFFFB),
+        (0xFFF0, 0xFFFB),
         (0x110BD, 0x110BD),
         (0x110CD, 0x110CD),
         (0x13430, 0x1343F),
         (0x1BCA0, 0x1BCA3),
         (0x1D173, 0x1D17A),
-        (0xE0001, 0xE0001),
-        (0xE0020, 0xE007F),
+        (0xE0000, 0xE0FFF),
     ];
     // Blank-rendering characters outside the classes above: the combining grapheme joiner, the Hangul and
     // Braille fillers, the Khmer inherent vowels, the Mongolian and ordinary variation selectors.
@@ -767,7 +765,6 @@ pub fn is_invisible_char(c: char) -> bool {
         (0x3164, 0x3164),
         (0xFE00, 0xFE0F),
         (0xFFA0, 0xFFA0),
-        (0xE0100, 0xE01EF),
     ];
     let code = c as u32;
     let within = |table: &[(u32, u32)]| table.iter().any(|&(from, to)| (from..=to).contains(&code));
@@ -1078,6 +1075,19 @@ mod tests {
         '\u{FE0F}',
         '\u{00A0}',
     ];
+
+    #[test]
+    fn unassigned_default_ignorables_are_invisible_and_refused_in_names() {
+        for code in [
+            0x2065, 0xfff0, 0xfff8, 0xe0000, 0xe0002, 0xe001f, 0xe0080, 0xe00ff, 0xe01f0, 0xe0fff,
+        ] {
+            let c = char::from_u32(code).unwrap();
+            assert!(is_invisible_char(c), "U+{code:X}");
+            assert!(is_hidden_char(c));
+            let list = json!([{"name": format!("a{c}b")}]);
+            assert!(parse_commands(list.as_array().unwrap()).is_empty());
+        }
+    }
 
     #[test]
     fn a_name_with_an_invisible_or_direction_character_is_dropped() {

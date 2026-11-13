@@ -1,5 +1,5 @@
 [English](permissions.md) | 简体中文
-<!-- translated-from: permissions.md sha256=53dcf4c88362dbb06cc15dde06e31a7997afcae5f6cc4e88a55e3879e978f86b -->
+<!-- translated-from: permissions.md sha256=f0313dfa77afac8259f8cdf8623b00af474a9c7703d549f4a08edbb65393e842 -->
 
 # 权限与信任
 
@@ -13,7 +13,7 @@ agent 的[编辑器工具](editor-tools.zh-CN.md)（`mcp__eitri__open_file` 等�
 
 ## 谁来决定一次工具调用
 
-Claude Code 想运行的每一次工具调用，在运行之前都会先发给 Eitri，每种模式下都是如此。接下来发生什么，取决于标签页的模式以及 Claude Code 是怎样在运行的。一个标签页处在三种模式之一，`Shift+Tab`（或 `<leader>m`）按 Claude Code 的顺序轮换它们：manual、auto、bypass，然后再回到 manual。新标签页以 auto 开始，除非你设置了 `agent.default_mode`（[一次启动怎样开始](configuration.zh-CN.md#how-a-launch-starts)）。
+Claude Code 想运行的每一次工具调用，在运行之前都会先发给 Eitri，每种模式下都是如此。接下来发生什么，取决于标签页的模式以及 Claude Code 是怎样在运行的。一个标签页处在三种模式之一，`Shift+Tab`（或 `<leader>m`）按 Claude Code 的顺序轮换它们：manual、auto、bypass，然后再回到 manual。新标签页以 auto 开始，除非你设置了 `agent.default_mode`（[一次启动怎样开始](configuration.zh-CN.md#how-a-launch-starts)）。Claude Code 做计划时，[plan 模式](#plan-mode)会改变下面的一部分回答。
 
 <a id="manual"></a>
 ### Manual
@@ -51,7 +51,7 @@ Claude Code 可能回退到它普通的默认模式，而且某些已安装的�
 
 在 bypass 下，Eitri 自己批准每一次调用，不出卡片。这也包括 Claude Code 自己提出的问题（[下一节](#when-claude-code-itself-asks)），连你自己的 `permissions.ask` 规则强制发出的问题也在内：在 bypass 标签页里，ask 规则什么也拦不住。唯一的例外是 [`nvim_exec`](editor-tools.zh-CN.md#nvim-exec)，一个你打开之前一直关着的编辑器工具：它的每次调用都是一张卡片，在 bypass 下也一样。因为这意味着很大的信任，`Shift+Tab` 进入 bypass 时会先问。这个问题是一个 `y/n`，会说明还有什么会变：如果标签页里有卡片在等，它写的是 “Switch to bypass and approve the N waiting cards?”，每一张在等的卡片都算在内，但 agent 的[编辑器工具](editor-tools.zh-CN.md#cards)的卡片除外，进入 bypass 从不回答它。只有单独按下、并且在问题出现片刻之后按的 `y` 才算数，而且只有此刻仍在等待的卡片会被批准。只能从 auto 进入 bypass。离开 bypass 不需要确认，并且会落到 manual。
 
-Claude 问你的选择题，bypass 永远不会回答（[Claude 问你的问题](#claudes-questions-to-you)）。
+Claude 问你的选择题，bypass 永远不会回答（[Claude 问你的问题](#claudes-questions-to-you)）；它也从不对计划作出决定，并且在 Claude Code 做计划时不会自己批准任何东西（[plan 模式](#plan-mode)）。
 
 要不经提问就以 bypass 开始，只能事先说好，办法是在你的 `init.lua` 里写 `agent.default_mode = "bypass"`；见[一次启动怎样开始](configuration.zh-CN.md#how-a-launch-starts)。
 
@@ -127,6 +127,21 @@ Claude Code 的 `Workflow` 工具的卡片写着 `Run a dynamic workflow?`。它
 - 问题、选项和预览都以纯文本显示，隐藏字符和改变文字方向的字符会显示成可见的转义。预览里的 Markdown 不会显示图片、运行脚本或出现可点的控件。
 - 有提问在等时关闭标签页，会先问，并说明关闭会取消这个提问。
 
+<a id="plan-mode"></a>
+## plan 模式
+
+怎样进入 plan 模式、怎样对计划作出决定，见[Codex 与其他 agent](agents.zh-CN.md#plan-mode)。Claude Code 做计划时，Eitri 的回答有这些不同：
+
+- **任何模式下（包括 bypass）都不会自动批准文件编辑或命令。** Claude Code 自己写它的计划文件。其他每一次 `Write`、`Edit` 或 `NotebookEdit` 调用，以及每一条 `Bash` 命令，都是只有你能回答的卡片：保存的规则、bypass、对等待中卡片的批量处理都不会回答它，而且 plan 模式结束之后它仍然是卡片，不管标签页那时处在什么模式。在[不算边界的文件夹](#a-folder-that-is-no-boundary)里，写计划文件也是一张卡片，批准之后，Claude Code 可能还会就同一次调用自己再问一次，成为第二张卡片。
+- **Claude Code 自己的提问在它做计划时总是卡片**（[Claude Code 自己提问时](#when-claude-code-itself-asks)），bypass 下也一样。
+- **其他工具按 plan 模式开始时的那个模式来判断。** 在 Manual 和 Auto 下就是平常的回答。从 Bypass 开始时，bypass 不批准任何东西：Claude Code 运行它的 auto 模式时，调用交给 Claude Code 的分类器，否则就是卡片。在做计划期间，Eitri 自己的[编辑器工具](editor-tools.zh-CN.md)把 Bypass 标签页当作 Auto 标签页来回答。
+- **标签页的模式保持不动。** `Shift+Tab` 和 `<leader>m` 不改变任何东西，不能进入 bypass，也没有任何东西会批量批准等待中的卡片。批准之后，plan 模式结束过程中到达的请求，会在标签页换到新模式之后按新模式判断一次。
+- **计划不是权限卡片。** 只有你在计划框里的选择能对它作出决定；卡片按键、`Ctrl+y`、bypass 和保存的规则都不会。
+
+Eitri 根据 Claude Code 报告的先后顺序，分辨一次调用是在 plan 模式里发出的，还是在它之外发出的。对文件编辑、命令和 Claude Code 自己的提问，以及 Bypass 标签页里的每一次调用，它要等看到 Claude Code 开始这次调用之后才回答。这段等待通常约 0.2 秒，在所有记录里都不到一秒。Eitri 始终看不到开始的调用，比如[动态工作流](#a-dynamic-workflows-card)里某个 agent 的调用，会等 2 秒，然后按两种情况各判断一次：当作 Claude Code 在做计划，和当作它不在做计划；两种回答不同时，就是卡片。这适用于每一个提供 plan 模式的 Claude 标签页，没有人在做计划时也一样。所以在 Bypass 标签页里，工作流里各个 agent 的每一次调用都是卡片；在 Manual 或 Auto 标签页里，它们的文件编辑、命令和 Claude Code 自己的提问，凡是本来会由保存的规则或 Claude Code 的 auto 模式处理的，也都是卡片。
+
+plan 模式拦不住的东西，见[已知限制](#known-limits)。
+
 <a id="trusting-a-project"></a>
 ## 信任一个项目
 
@@ -197,3 +212,5 @@ eitri.config.set("agent.user_settings", false)    -- true (the default) or false
 - **Bypass 也会回答你自己的 ask 规则。** 在 bypass 标签页里，`permissions.ask` 规则（你的，或者被信任的项目的）什么也拦不住：它引出的问题，Eitri 会像对待其他问题一样替你回答。
 - **另一个 Claude Code 会话发来的消息不会显示。** 回合进行中另一个会话给这个会话发消息时，Claude Code 会把它送进这个回合，Claude 也会读到，但标签页里没有对应的一行，实时不显示，恢复之后也不显示。
 - **理由不是出处的证明。** 在 Auto 或 Manual 标签页里，带理由的问题会凭你对同一次调用的批准被回答，而 Eitri 分不清 Claude Code 自己的检查和一个带着理由来询问的 hook。
+- **plan 模式是监督，不是沙箱。** Claude Code 做计划时，它让文件编辑和命令都停在卡片上，但你的 hook（以及被信任项目的 hook）照样运行，MCP server 保持加载，其他任何工具（包括 MCP server 的工具）在上面的规则允许的地方照样可以运行。哪些调用算作在 plan 模式里发出，取决于 Claude Code 报告它们的先后顺序：晚了 2 秒以上才显示的调用，会按两种情况各判断一次，回答不同时就是卡片。
+- **在提供 plan 模式的标签页里，Eitri 看不到开始的调用会等 2 秒，并可能变成卡片。** 最常见的是动态工作流里各个 agent 的调用：在 Bypass 标签页里，它们的每一次调用都是卡片。

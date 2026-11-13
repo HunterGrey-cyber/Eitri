@@ -7,7 +7,11 @@ export function rowSearchText(item: TimelineItem): string {
   switch (item.kind) {
     case "prompt":
     case "message":
+    case "planmark":
       return item.text;
+    case "plan":
+      // The whole plan, so `/` finds a step while the row is folded.
+      return [item.plan.plan, item.text].join("\n");
     case "tool":
       return [
         item.call.name,

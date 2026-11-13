@@ -4,7 +4,7 @@ import type { AgentDomainEvent, AgentUiSnapshot, AgentUiState } from "../types";
  * conversation before it and keeps what the process still holds, as Rust's `projection::reset` does:
  * the session's identity and status, the running turn (the `/clear` turn ends after the reset), cards
  * still waiting with the calls they ask about (a broker's card stays too, but not its call: the projection
- * holds no broker card to keep it for), questions still waiting, the count of commands left running, the
+ * holds no broker card to keep it for), questions and plans still waiting, plan mode as the host reads it, the count of commands left running, the
  * account's limits, the command list, the live band fields and the held bookkeeping. */
 
 /** The conversation's fields, as a reset leaves them. */
@@ -28,6 +28,8 @@ const EMPTIED = {
   // Which phone sent or stopped what: notes on the old conversation's rows and turns.
   sentFrom: {},
   stoppedFrom: {},
+  // Rows of the old conversation, as the plan-mode moves the page saw are.
+  planMarks: [],
 } satisfies Partial<AgentUiState>;
 
 /** The fields the process still holds, which a reset leaves as they are. */
@@ -35,11 +37,11 @@ const KEPT = [
   "backend", "conversationId", "sessionId", "model", "cwd", "status", "activeTurnId", "pendingPermissions", "editorCards",
   "capabilities", "provider", "accountLimits", "backgroundCalls", "backgroundTasks", "availableCommands", "apiRetry",
   "compacting", "rateLimitWarning", "fallbackModel", "effort", "notification", "cliUnseenBusy", "cliUnseenEpisode", "nextSeq", "turnThinking",
-  "denialsBeforeTheirCall", "changedInputsBeforeTheirCall", "runningTurnCli",
+  "denialsBeforeTheirCall", "changedInputsBeforeTheirCall", "runningTurnCli", "planning",
 ] as const satisfies readonly (keyof AgentUiState)[];
 
 /** Kept in part (`fold` below says which part). */
-type Filtered = "providerSessionId" | "toolCalls" | "questions";
+type Filtered = "providerSessionId" | "toolCalls" | "questions" | "plans";
 
 // A field added to the state does not compile here until it is placed in one of the three lists.
 type Unplaced = Exclude<keyof AgentUiState, keyof typeof EMPTIED | (typeof KEPT)[number] | Filtered>;
@@ -57,6 +59,7 @@ export function fold(state: AgentUiState, event: AgentDomainEvent): AgentUiState
     // A waiting card's call stays with it: its answer and its result still land on that row.
     toolCalls: state.toolCalls.filter((call) => waitingCalls.has(call.toolUseId)),
     questions: state.questions.filter((set) => set.state.kind !== "settled"),
+    plans: state.plans.filter((plan) => plan.state.kind !== "settled"),
   };
 }
 

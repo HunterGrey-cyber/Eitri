@@ -23,10 +23,15 @@ fn count_hook(name: &'static str) {
 }
 
 mod notices;
+pub mod planning;
 mod questions;
 mod reset;
 mod roster;
 pub mod turns;
+pub use planning::{
+    CallPlanMark, PlanAllowedPrompt, PlanCause, PlanExecutionMode, PlanOutcome, PlanPhase, PlanRecord, PlanState,
+    PlanningState, PLAN_FEEDBACK_MAX_BYTES, PLAN_TRANSITION_GUARD_MS,
+};
 pub use roster::{BackgroundTaskRecord, TaskRoster};
 mod subagents;
 pub use subagents::SubagentStream;
@@ -440,8 +445,10 @@ pub enum AgentDomainEvent {
     /// What the CLI said its permission mode is, on a session that asked for the CLI's own `auto`
     /// under the gate (`ProviderCapabilities::cli_auto_mode`), each time it says it and it is a mode
     /// that session accepts: `auto`, or `default` when the CLI could not run auto. Anything else
-    /// becomes `UngatedCliMode` instead. Never produced by a session that asked for `default`, so
-    /// every such session's events are what they were before this existed.
+    /// becomes `UngatedCliMode` instead. On a session that offered plan mode, also `default` on one
+    /// created in `default`: the report that ends a move out of plan mode. Never produced by any other
+    /// session that asked for `default`, so every such session's events are what they were before this
+    /// existed.
     ///
     /// Read by the host's answer path (`eitri_core::agent_backend`), which defers a request to the
     /// CLI's classifier only while the latest report is `auto`: a CLI that fell back to `default`
@@ -608,6 +615,50 @@ pub enum AgentDomainEvent {
         answers: Vec<ShownAnswer>,
         reason: Option<String>,
     },
+    /// Claude proposed a plan (`ExitPlanMode`, on a session that offered plan mode). A plan record waits
+    /// until its `PlanSettled`; `unsupported_reason` says why one could not be carried, and `plan` is then
+    /// empty. Never cut: a plan is carried whole or not at all.
+    PlanProposed {
+        interaction_id: String,
+        tool_use_id: Option<String>,
+        plan: String,
+        plan_sha256: String,
+        #[serde(default)]
+        allowed_prompts: Vec<PlanAllowedPrompt>,
+        unsupported_reason: Option<String>,
+    },
+    /// A plan ended: approved, kept planning, or ended by something else. The only thing that settles a
+    /// plan record. `mode_after` is the mode an approval named, `feedback` what a person sent with "keep
+    /// planning" (possibly empty).
+    PlanSettled {
+        interaction_id: String,
+        outcome: PlanOutcome,
+        mode_after: Option<PlanExecutionMode>,
+        feedback: Option<String>,
+        reason: Option<String>,
+    },
+    /// The CLI says it runs plan mode, on a session that offered it: from `SessionReady` or
+    /// `CliModeReported` (`source`). Whether that is the move expected or a contradiction is the
+    /// projection's to judge (`projection::planning`); it never changes `cli_mode_reported`.
+    CliPlanMode {
+        source: String,
+    },
+    /// This side started a move into (`enter`) or out of plan mode: its own switch, or an approval it
+    /// sent. **This side's event, never the provider's**, folded where the request is sent, so the
+    /// projection expects the CLI's report of the move before the CLI can make it. `at_ms` is when, in
+    /// milliseconds since the epoch.
+    PlanTransitionStarted {
+        enter: bool,
+        cause: PlanCause,
+        at_ms: u64,
+    },
+    /// A move this side started (`PlanTransitionStarted` with the same `enter` and `cause`) that the
+    /// agent refused before making it. **This side's event, never the provider's**: the session goes back
+    /// to where it stood before the move, if it is still waiting for that move.
+    PlanTransitionUndone {
+        enter: bool,
+        cause: PlanCause,
+    },
     /// Claude Code is producing output this panel cannot show: the provider saw an assistant message
     /// while no turn of the panel's was open (a turn the CLI started by itself, or a background agent
     /// writing). Sets [`AgentSessionProjection::cli_unseen_busy`] until the next `TurnCompleted` or the
@@ -619,6 +670,13 @@ pub enum AgentDomainEvent {
     /// it is folded again. Without it the message would be drawn twice. Changes nothing when no such
     /// prompt is held.
     UserPromptWithdrawn,
+    /// The images the newest prompt the user sent (not one put into a running turn) went with, as what
+    /// they were, never their bytes. Folded by the host right after that prompt's `UserPromptSubmitted`,
+    /// only for a turn that carries images, so a prompt of text alone folds exactly as before. Changes
+    /// nothing when no such prompt is held.
+    UserPromptAttachments {
+        attachments: Vec<crate::provider::AttachmentMeta>,
+    },
     /// A conversation's settled records, carried from the window that held it into this one, with
     /// their own sequence numbers and the revision they were taken at. **Made only by the move**
     /// ([`AgentSessionProjection::adopt`]), never by a provider: it is how an adopted projection is
@@ -1201,6 +1259,11 @@ pub struct UserPromptRecord {
     /// record written before it existed reads the same.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub delivered: bool,
+    /// The images sent with this prompt, in the order they went: what each was (type, size, digest), never
+    /// its bytes. Set by [`AgentDomainEvent::UserPromptAttachments`]. Left out of the serialized form when
+    /// empty, so a prompt of text alone, and every record written before images existed, read the same.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub attachments: Vec<crate::provider::AttachmentMeta>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -1818,6 +1881,14 @@ pub struct AgentSessionProjection {
     /// Every question set Claude asked, where it was asked, waiting or settled. Not in
     /// `pending_permissions`, and nothing that answers a card reads it.
     pub questions: Vec<QuestionRecord>,
+    /// Every plan Claude proposed, where it was proposed, waiting or settled. Not in
+    /// `pending_permissions` or `questions`, and nothing that answers a card or a question reads it.
+    #[serde(default)]
+    pub plans: Vec<PlanRecord>,
+    /// Whether the session offered plan mode and where it stands between executing and planning
+    /// (`projection::planning`).
+    #[serde(default)]
+    pub planning: PlanningState,
     /// The `seq` at which the latest `TurnCompleted` was folded, whatever its outcome, or `None` before
     /// the first. `turn_endings` records only the turns that did not complete; a host that lost the
     /// events to a resync reads here whether a turn it started has since ended. Not serialized: no view
@@ -2141,6 +2212,7 @@ impl AgentSessionProjection {
             || self.thinking.iter().any(|item| item.seq > seq)
             || self.notices.iter().any(|item| item.seq > seq)
             || self.questions.iter().any(|item| item.seq > seq)
+            || self.plans.iter().any(|item| item.seq > seq)
             || self.turn_endings.iter().any(|item| item.seq > seq)
             || self.turn_starts.iter().any(|item| item.seq > seq)
             || self.pending_permissions.values().any(|item| item.seq > seq)
@@ -2371,10 +2443,21 @@ impl AgentSessionProjection {
         notices::snapshot_json(self, state);
         subagents::snapshot_json(self, state);
         questions::snapshot_json(self, state);
+        planning::snapshot_json(self, state);
         reset::snapshot_json(self, state);
     }
 
     pub fn apply(&mut self, event: &AgentDomainEvent) {
+        self.apply_with_clock(event, &planning::wall_clock_ms);
+    }
+
+    /// [`Self::apply`], dating a plan-mode move the event starts at `now_ms` (milliseconds since the epoch)
+    /// rather than at the clock's reading. Every other effect is `apply`'s.
+    pub fn apply_at(&mut self, event: &AgentDomainEvent, now_ms: u64) {
+        self.apply_with_clock(event, &|| now_ms);
+    }
+
+    fn apply_with_clock(&mut self, event: &AgentDomainEvent, now: &dyn Fn() -> u64) {
         match event {
             AgentDomainEvent::TurnCompleted { .. } => {
                 roster::on_turn_completed(self, event);
@@ -2386,6 +2469,7 @@ impl AgentSessionProjection {
             AgentDomainEvent::SessionClosed { .. } | AgentDomainEvent::SessionUnavailable { .. } => {
                 roster::on_session_end(self, event);
                 questions::on_session_end(self, event);
+                planning::on_session_end(self);
                 self.open_client_calls.clear();
             }
             // A resume replaces the CLI process; `SessionOpened` repeats on every turn of one process and
@@ -2396,6 +2480,7 @@ impl AgentSessionProjection {
             }
             _ => {}
         }
+        planning::fold(self, event, now);
         self.apply_inner(event);
     }
 
@@ -2416,6 +2501,7 @@ impl AgentSessionProjection {
                 self.turn_endings.retain(|r| keep(r.seq));
                 self.notices.retain(|r| keep(r.seq));
                 self.questions.retain(|r| keep(r.seq));
+                self.plans.retain(|r| keep(r.seq));
                 self.call_index = CallIndex::default();
                 self.evicted = Some(Evicted {
                     through_seq: *through_seq,
@@ -2521,6 +2607,7 @@ impl AgentSessionProjection {
                     seq,
                     text: text.clone(),
                     delivered: false,
+                    attachments: Vec::new(),
                 });
                 // A prompt sent while a turn runs does not start that turn.
                 if self.active_turn_id.is_none() {
@@ -2542,6 +2629,7 @@ impl AgentSessionProjection {
                     seq,
                     text: text.clone(),
                     delivered: true,
+                    attachments: Vec::new(),
                 });
                 // The agent read it between two of its own steps, so whatever it said before is over,
                 // and so is the thought: the next one sits below this prompt, not in the block above it.
@@ -2834,11 +2922,15 @@ impl AgentSessionProjection {
             // The latest report wins: the CLI re-reports its mode at every turn's start.
             AgentDomainEvent::CliPermissionMode { reported } => {
                 // Whatever said so: the CLI's status frame, or the next `SessionReady` on a sidecar that
-                // reports no move. A session that was running auto is not running it now.
-                if reported == "auto" {
-                    self.cli_left_auto = false;
-                } else if self.cli_mode_reported.as_deref() == Some("auto") {
-                    self.cli_left_auto = true;
+                // reports no move. A session that was running auto is not running it now. On a session
+                // that offered plan mode, a `default` may be a step out of plan mode instead, which only
+                // the plan phase tells apart (`planning::fold`, already run).
+                if !self.planning.offered {
+                    if reported == "auto" {
+                        self.cli_left_auto = false;
+                    } else if self.cli_mode_reported.as_deref() == Some("auto") {
+                        self.cli_left_auto = true;
+                    }
                 }
                 self.cli_mode_reported = Some(reported.clone());
             }
@@ -2923,6 +3015,12 @@ impl AgentSessionProjection {
             AgentDomainEvent::QuestionAsked { .. } | AgentDomainEvent::QuestionSettled { .. } => {
                 questions::fold(self, event);
             }
+            // Folded by `planning::fold` before this match: plans and the plan phase are its alone.
+            AgentDomainEvent::PlanProposed { .. }
+            | AgentDomainEvent::PlanSettled { .. }
+            | AgentDomainEvent::CliPlanMode { .. }
+            | AgentDomainEvent::PlanTransitionStarted { .. }
+            | AgentDomainEvent::PlanTransitionUndone { .. } => {}
             AgentDomainEvent::CliWorkUnseen => self.cli_unseen_busy = true,
             // The prompt goes, and with it what it said about the next turn: that turn is not its.
             AgentDomainEvent::UserPromptWithdrawn => {
@@ -2932,6 +3030,12 @@ impl AgentSessionProjection {
                     if self.opening_prompt == Some(removed.seq) {
                         self.opening_prompt = None;
                     }
+                }
+            }
+            // The images belong to the prompt they were sent with, the newest one not put into a turn.
+            AgentDomainEvent::UserPromptAttachments { attachments } => {
+                if let Some(prompt) = self.user_prompts.iter_mut().rev().find(|prompt| !prompt.delivered) {
+                    prompt.attachments = attachments.clone();
                 }
             }
             // Puts the records in place with their own `seq`s and leaves the revision where the
@@ -2982,6 +3086,7 @@ pub fn thinking_open_after(open: bool, event: &AgentDomainEvent) -> bool {
         | AgentDomainEvent::SessionUnavailable { .. }
         | AgentDomainEvent::SessionClosed { .. }
         | AgentDomainEvent::QuestionAsked { .. }
+        | AgentDomainEvent::PlanProposed { .. }
         | AgentDomainEvent::ConversationReset { .. }
         // A row of its own when it names the running turn.
         | AgentDomainEvent::CliCycleStarted { .. } => false,
@@ -3005,10 +3110,17 @@ pub fn thinking_open_after(open: bool, event: &AgentDomainEvent) -> bool {
         // Says who started a turn its `TurnStarted` already began; a settlement adds no row.
         | AgentDomainEvent::TurnAttributed { .. }
         | AgentDomainEvent::QuestionSettled { .. }
+        | AgentDomainEvent::PlanSettled { .. }
+        // A report of the CLI's mode, and a move this side started: no row between two thoughts.
+        | AgentDomainEvent::CliPlanMode { .. }
+        | AgentDomainEvent::PlanTransitionStarted { .. }
+        | AgentDomainEvent::PlanTransitionUndone { .. }
         // A note about work out of sight, and a prompt taken back: neither is a row between two
         // thoughts.
         | AgentDomainEvent::CliWorkUnseen
         | AgentDomainEvent::UserPromptWithdrawn
+        // What a prompt's images were: part of the prompt's row, no row of its own.
+        | AgentDomainEvent::UserPromptAttachments { .. }
         // A seed sets records, never whether a block is open.
         | AgentDomainEvent::HistoryEvicted { .. }
         | AgentDomainEvent::MoveSeeded(_)
@@ -4471,6 +4583,7 @@ mod unseen_turns {
                     "notices::snapshot_json",
                     "subagents::snapshot_json",
                     "questions::snapshot_json",
+                    "planning::snapshot_json",
                     "reset::snapshot_json"
                 ]
             )

@@ -30,10 +30,13 @@ use std::rc::Rc;
 use serde_json::Value;
 
 use super::composed_block::strip_composed_block;
+use crate::projection::planning::{PLAN_ALLOWED_PROMPTS_MAX, PLAN_ALLOWED_PROMPT_UNITS_MAX, PLAN_MAX_BYTES};
 use crate::projection::{
-    AgentDomainEvent, ContentKind, NoticeLevel, QuestionOptionSpec, QuestionOutcome, QuestionSpec, SessionNoticeKind,
-    ShownAnswer, TurnCause, TurnCauseKind, TurnOrigin, TurnOutcome, TEXT_BLOCK_SEPARATOR,
+    AgentDomainEvent, ContentKind, NoticeLevel, PlanAllowedPrompt, PlanOutcome, QuestionOptionSpec, QuestionOutcome,
+    QuestionSpec, SessionNoticeKind, ShownAnswer, TurnCause, TurnCauseKind, TurnOrigin, TurnOutcome,
+    TEXT_BLOCK_SEPARATOR,
 };
+use crate::provider::AttachmentMeta;
 
 /// The most conversational items a restored history may carry.
 ///
@@ -65,13 +68,15 @@ pub const HISTORY_MAX_CHARS: usize = 1_000_000;
 /// records, which is the wrong end.
 pub const HISTORY_SCAN_MAX_BYTES: u64 = 32 * 1024 * 1024;
 
-/// A single line longer than this is skipped without ever being held in memory.
+/// A user line longer than this is skipped without ever being held in memory.
 ///
-/// The longest real line in the whole 117,826-line corpus is 967,870 bytes, 23% of this. **It has
-/// never triggered, and that is not a reason to delete it**: line length is the one quantity a
-/// streaming parser cannot know in advance, so this is the only hard guarantee that one line cannot
-/// exhaust memory. Its value is entirely in inputs nobody has seen.
-pub const HISTORY_MAX_LINE_BYTES: usize = 4 * 1024 * 1024;
+/// Eight images totalling 3,670,016 bytes need at most ceil((3,670,016 + 2*8)/3)*4 base64 bytes.
+/// Independently, the full 4 MiB text budget needs up to 6 * 4 MiB in JSON (one control byte is \u0001).
+/// Adding 64 KiB of JSON overhead gives 30,124,736 bytes, rounded up to 29 MiB.
+pub const HISTORY_MAX_LINE_BYTES: usize = 29 * 1024 * 1024;
+
+/// Other line kinds cannot carry prompt images and keep a smaller parsing budget.
+pub const HISTORY_OTHER_MAX_LINE_BYTES: usize = 4 * 1024 * 1024;
 
 /// `promptSource` values that mean a person put these words there.
 ///
@@ -141,7 +146,7 @@ pub struct HistoryCounts {
     /// half-written final line. Measured 0 in 117,826 real lines; a partial line can only appear in
     /// a file that is being written, which `is_transcript_stable` exists to avoid reading.
     pub malformed_lines: u64,
-    /// Lines longer than [`HISTORY_MAX_LINE_BYTES`], discarded without being buffered.
+    /// Lines longer than their kind's byte limit, discarded without being buffered whole.
     pub oversized_lines: u64,
     /// Skipped `attachment` lines; a displayable queued human prompt is restored instead.
     pub attachment_lines: u64,
@@ -178,8 +183,8 @@ pub struct HistoryCounts {
     /// API error: the `No response requested.` line it writes after an interrupt. They are no reply of
     /// the model's, and the CLI's own readers leave them out.
     pub synthetic_lines: u64,
-    /// Content blocks dropped inside an otherwise usable line: `thinking`, `image`, an unknown
-    /// block type, a `tool_use` with no usable id.
+    /// Content blocks dropped inside an otherwise usable line: `thinking`, an `image` of an assistant line
+    /// or beside a tool result or without inline base64, an unknown block type, a `tool_use` with no usable id.
     pub dropped_blocks: u64,
     /// `tool_result` blocks naming a call that is not in the loaded window -- either genuinely
     /// unmatched, or matched to a call that truncation removed. Measured 0 unmatched in the whole
@@ -335,6 +340,14 @@ pub(crate) fn read_history_from(
             }
             match outcome {
                 Outcome::Item {
+                    chars: _,
+                    tool_use_id: None,
+                    event: event @ AgentDomainEvent::UserPromptAttachments { .. },
+                } if !slots.is_empty() => {
+                    // The images of the prompt just before: the same slot, so eviction keeps them together.
+                    slots.back_mut().expect("a prompt slot comes first").events.push(event);
+                }
+                Outcome::Item {
                     chars,
                     tool_use_id,
                     event,
@@ -372,13 +385,14 @@ pub(crate) fn read_history_from(
                         Some(index) => {
                             if let Some((asked, settled)) =
                                 restored_question(&slots[index], &event, structured.as_ref())
+                                    .or_else(|| restored_plan(&slots[index], &event, structured.as_ref()))
                             {
                                 chars += [&asked, &settled]
                                     .into_iter()
                                     .map(|event| serde_json::to_string(event).map_or(0, |text| text.chars().count()))
                                     .sum::<usize>();
-                                // Keep the question at the call's arrival position, with its result
-                                // where it was read. Only a known outcome creates a historical form.
+                                // Keep the question (or plan) at the call's arrival position, with its
+                                // result where it was read. Only a known outcome creates a historical form.
                                 slots[index].events.push(asked);
                                 slots.back_mut().expect("the call is retained").events.push(settled);
                             }
@@ -387,11 +401,18 @@ pub(crate) fn read_history_from(
                             slots[index].chars += chars;
                             total_chars += chars;
                             // ...but the event itself stays where the file put it.
-                            slots
+                            let entered = entered_plan_mode(&slots[index], &event);
+                            let back = slots
                                 .back_mut()
-                                .expect("a matching call means at least one slot exists")
-                                .events
-                                .push(event);
+                                .expect("a matching call means at least one slot exists");
+                            back.events.push(event);
+                            // The row a live tab draws when the CLI moves into plan mode, after the call's result.
+                            if let Some(notice) = entered {
+                                let cost = serde_json::to_string(&notice).map_or(0, |text| text.chars().count());
+                                back.events.push(notice);
+                                total_chars += cost;
+                                back.chars += cost;
+                            }
                         }
                         None => counts.orphan_tool_results += 1,
                     }
@@ -752,6 +773,7 @@ fn classify_user_line(value: &Value) -> ParsedLine {
     let mut dropped_blocks = 0u32;
     let mut saw_tool_result = false;
     let mut prompt_text = String::new();
+    let mut images: Vec<AttachmentMeta> = Vec::new();
 
     match content {
         Some(Value::String(text)) => prompt_text.push_str(text),
@@ -776,8 +798,11 @@ fn classify_user_line(value: &Value) -> ParsedLine {
                         Some(text) => prompt_text.push_str(text),
                         None => dropped_blocks += 1,
                     },
-                    // `image` has never appeared on a `user`/`assistant` line here; the panel has
-                    // no image renderer either way.
+                    // An image the person sent with the words: what it is is kept, never its bytes.
+                    Some("image") => match image_meta(block) {
+                        Some(meta) => images.push(meta),
+                        None => dropped_blocks += 1,
+                    },
                     _ => dropped_blocks += 1,
                 }
             }
@@ -793,24 +818,27 @@ fn classify_user_line(value: &Value) -> ParsedLine {
     if !prompt_text.is_empty() && saw_tool_result {
         dropped_blocks += 1;
     }
-    if !prompt_text.is_empty() && !saw_tool_result {
+    if saw_tool_result {
+        dropped_blocks += images.len() as u32;
+    }
+    // A line of images alone is a prompt too: an image-only message has no words, and its record is that.
+    let image_only = prompt_text.is_empty() && !images.is_empty();
+    if image_only && !saw_tool_result {
+        if user_line_is_the_users_own_words(value) {
+            push_prompt(&mut outcomes, String::new(), std::mem::take(&mut images));
+        } else {
+            skip = Some(SkipReason::RejectedUser);
+        }
+    } else if !prompt_text.is_empty() && !saw_tool_result {
         if let Some(text) = typed_command(value, &prompt_text) {
             command_prompt = true;
-            outcomes.push(Outcome::Item {
-                chars: text.chars().count(),
-                tool_use_id: None,
-                event: AgentDomainEvent::UserPromptSubmitted { text },
-            });
+            push_prompt(&mut outcomes, text, Vec::new());
         } else if user_line_is_the_users_own_words(value) {
             let text = strip_composed_block(&prompt_text).to_owned();
-            if text.is_empty() {
+            if text.is_empty() && images.is_empty() {
                 skip = Some(SkipReason::EmptyPrompt);
             } else {
-                outcomes.push(Outcome::Item {
-                    chars: text.chars().count(),
-                    tool_use_id: None,
-                    event: AgentDomainEvent::UserPromptSubmitted { text },
-                });
+                push_prompt(&mut outcomes, text, std::mem::take(&mut images));
             }
         } else {
             skip = Some(SkipReason::RejectedUser);
@@ -827,6 +855,210 @@ fn classify_user_line(value: &Value) -> ParsedLine {
         command_prompt,
         ..ParsedLine::default()
     }
+}
+
+/// A prompt's outcome, and after it, when the person sent images, the outcome that says what they were. The
+/// second joins the first's slot, so the two are kept or evicted together.
+fn push_prompt(outcomes: &mut Vec<Outcome>, text: String, attachments: Vec<AttachmentMeta>) {
+    outcomes.push(Outcome::Item {
+        chars: text.chars().count(),
+        tool_use_id: None,
+        event: AgentDomainEvent::UserPromptSubmitted { text },
+    });
+    if !attachments.is_empty() {
+        outcomes.push(Outcome::Item {
+            chars: 0,
+            tool_use_id: None,
+            event: AgentDomainEvent::UserPromptAttachments { attachments },
+        });
+    }
+}
+
+/// The longest base64 text of one image block whose digest and size are read: 8 MiB. A longer block keeps its
+/// type and length and no digest, so a line cannot make the reader hash an unbounded amount.
+pub(crate) const IMAGE_BASE64_MAX_BYTES: usize = 8 * 1024 * 1024;
+
+/// What an `image` block holds, from the block alone: its media type, the length and SHA-256 of the bytes its
+/// base64 stands for, and the width and height from the image's own header (no decoding of pixels). `None` for a
+/// block that is not inline base64 or names no media type. The text is never kept.
+fn image_meta(block: &Value) -> Option<AttachmentMeta> {
+    use base64::Engine as _;
+    use sha2::{Digest, Sha256};
+    let source = block.get("source")?;
+    if source.get("type").and_then(Value::as_str) != Some("base64") {
+        return None;
+    }
+    let media_type = source
+        .get("media_type")
+        .and_then(Value::as_str)
+        .filter(|m| !m.is_empty())?;
+    let data = source.get("data").and_then(Value::as_str)?;
+    let media_type = media_type.to_owned();
+    if data.len() > IMAGE_BASE64_MAX_BYTES {
+        let padding = data.bytes().rev().take(2).filter(|b| *b == b'=').count();
+        return Some(AttachmentMeta {
+            media_type,
+            bytes: (data.len() / 4 * 3).saturating_sub(padding) as u64,
+            width: 0,
+            height: 0,
+            sha256: String::new(),
+        });
+    }
+    let bytes = base64::engine::general_purpose::STANDARD.decode(data.as_bytes()).ok()?;
+    let (width, height) = image_size(&bytes).unwrap_or((0, 0));
+    let digest = Sha256::digest(&bytes);
+    Some(AttachmentMeta {
+        media_type,
+        bytes: bytes.len() as u64,
+        width,
+        height,
+        sha256: digest.iter().map(|byte| format!("{byte:02x}")).collect(),
+    })
+}
+
+/// Width and height of a PNG, GIF, WebP or JPEG from its header, without decoding any pixel.
+pub(crate) fn image_size(bytes: &[u8]) -> Option<(u32, u32)> {
+    let be32 = |at: usize| {
+        bytes
+            .get(at..at + 4)
+            .map(|b| u32::from_be_bytes([b[0], b[1], b[2], b[3]]))
+    };
+    let le16 = |at: usize| {
+        bytes
+            .get(at..at + 2)
+            .map(|b| u32::from(u16::from_le_bytes([b[0], b[1]])))
+    };
+    let le24 = |at: usize| bytes.get(at..at + 3).map(|b| u32::from_le_bytes([b[0], b[1], b[2], 0]));
+    if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+        // The IHDR chunk is first: length, "IHDR", width, height.
+        let size = (bytes.get(12..16)? == b"IHDR").then_some((be32(16)?, be32(20)?))?;
+        return Some(oriented_size(size, png_orientation(bytes)));
+    }
+    if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
+        return Some((le16(6)?, le16(8)?));
+    }
+    if bytes.len() >= 30 && &bytes[..4] == b"RIFF" && &bytes[8..12] == b"WEBP" {
+        return match bytes.get(12..16)? {
+            b"VP8 " => Some((le16(26)? & 0x3fff, le16(28)? & 0x3fff)),
+            b"VP8L" if *bytes.get(20)? == 0x2f => {
+                let bits = u32::from_le_bytes([bytes[21], bytes[22], bytes[23], bytes[24]]);
+                Some(((bits & 0x3fff) + 1, ((bits >> 14) & 0x3fff) + 1))
+            }
+            b"VP8X" => Some((le24(24)? + 1, le24(27)? + 1)),
+            _ => None,
+        };
+    }
+    if bytes.starts_with(b"\xff\xd8") {
+        let mut rest = bytes.get(2..)?;
+        let mut size = None;
+        let mut orientation = None;
+        // A segment is skipped as a slice; neither a length nor an EXIF offset allocates memory.
+        // A malformed later segment ends the scan without losing the size and orientation already found.
+        let _: Option<()> = (|| {
+            for _ in 0..4096 {
+                if *rest.first()? != 0xff {
+                    return None;
+                }
+                rest = rest.get(1..)?;
+                while rest.first() == Some(&0xff) {
+                    rest = rest.get(1..)?;
+                }
+                let marker = *rest.first()?;
+                rest = rest.get(1..)?;
+                if marker == 0xda || marker == 0xd9 {
+                    break;
+                }
+                if marker == 0x01 || (0xd0..=0xd8).contains(&marker) {
+                    continue;
+                }
+                let length = usize::from(u16::from_be_bytes(rest.get(..2)?.try_into().ok()?));
+                let segment = rest.get(2..length)?;
+                if matches!(marker, 0xc0..=0xc3 | 0xc5..=0xc7 | 0xc9..=0xcb | 0xcd..=0xcf) {
+                    let height = u16::from_be_bytes(segment.get(1..3)?.try_into().ok()?);
+                    let width = u16::from_be_bytes(segment.get(3..5)?.try_into().ok()?);
+                    size = Some((u32::from(width), u32::from(height)));
+                }
+                if marker == 0xe1 && orientation.is_none() && segment.starts_with(b"Exif\0\0") {
+                    orientation = tiff_orientation(segment.get(6..)?);
+                }
+                rest = rest.get(length..)?;
+                if rest.is_empty() {
+                    break;
+                }
+            }
+            Some(())
+        })();
+        return size.map(|size| oriented_size(size, orientation));
+    }
+    None
+}
+
+fn oriented_size((width, height): (u32, u32), orientation: Option<u16>) -> (u32, u32) {
+    if matches!(orientation, Some(5..=8)) {
+        (height, width)
+    } else {
+        (width, height)
+    }
+}
+
+fn png_orientation(bytes: &[u8]) -> Option<u16> {
+    let mut rest = bytes.get(8..)?;
+    for _ in 0..4096 {
+        let length = usize::try_from(u32::from_be_bytes(rest.get(..4)?.try_into().ok()?)).ok()?;
+        let end = 8usize.checked_add(length)?;
+        let chunk = rest.get(8..end)?;
+        if rest.get(4..8)? == b"eXIf" {
+            return tiff_orientation(chunk);
+        }
+        if rest.get(4..8)? == b"IEND" {
+            return None;
+        }
+        rest = rest.get(end.checked_add(4)?..)?;
+    }
+    None
+}
+
+fn tiff_orientation(bytes: &[u8]) -> Option<u16> {
+    let little = match bytes.get(..2)? {
+        b"II" => true,
+        b"MM" => false,
+        _ => return None,
+    };
+    let u16_at = |at: usize| {
+        let value = bytes.get(at..at.checked_add(2)?)?.try_into().ok()?;
+        Some(if little {
+            u16::from_le_bytes(value)
+        } else {
+            u16::from_be_bytes(value)
+        })
+    };
+    let u32_at = |at: usize| {
+        let value = bytes.get(at..at.checked_add(4)?)?.try_into().ok()?;
+        Some(if little {
+            u32::from_le_bytes(value)
+        } else {
+            u32::from_be_bytes(value)
+        })
+    };
+    if u16_at(2)? != 42 {
+        return None;
+    }
+    let ifd = usize::try_from(u32_at(4)?).ok()?;
+    let count = usize::from(u16_at(ifd)?);
+    let mut at = ifd.checked_add(2)?;
+    for _ in 0..count.min(4096) {
+        let entry = bytes.get(at..at.checked_add(12)?)?;
+        if u16_at(at)? == 0x0112 && u16_at(at.checked_add(2)?)? == 3 && u32_at(at.checked_add(4)?)? == 1 {
+            let orientation = if little {
+                u16::from_le_bytes([entry[8], entry[9]])
+            } else {
+                u16::from_be_bytes([entry[8], entry[9]])
+            };
+            return (1..=8).contains(&orientation).then_some(orientation);
+        }
+        at = at.checked_add(12)?;
+    }
+    None
 }
 
 /// A command the person typed, as the CLI's own resume shows it: a slash command's echo
@@ -1208,6 +1440,197 @@ fn question_text(value: &Value, key: &str, max: usize) -> Option<String> {
     question_fits(text, max).then(|| text.to_owned())
 }
 
+/// How Claude Code 2.1.311 words what the model reads when the person keeps planning: the rejection of any
+/// tool call, then (with feedback) the words that introduce the person's own. The sidecar sends the terminal's
+/// own text, so a plan kept in Eitri and one kept in the terminal read the same here.
+const PLAN_REJECT_OPENING: &str =
+    "The user doesn't want to proceed with this tool use. The tool use was rejected (eg. if it was a file edit, the new_string was NOT written to the file). ";
+const PLAN_REJECT_PLAIN: &str = "STOP what you are doing and wait for the user to tell you how to proceed.";
+const PLAN_REJECT_FEEDBACK: &str = "To tell you how to proceed, the user said:\n";
+/// What the CLI's own structured result says of a call its turn's abort reached while it waited.
+const PLAN_USER_REJECTED: &str = "User rejected tool use";
+/// How Claude Code 2.1.311 words an approved plan's result.
+const PLAN_APPROVED_OPENING: &str = "User has approved your plan.";
+/// What the sidecar tells the model when a plan could not be shown, and when the plan or the turn ended
+/// some other way than a person's decision.
+const PLAN_REFUSED_OPENING: &str = "This client could not show the plan: ";
+const PLAN_REFUSED_CLOSING: &str = ". Shorten the plan and call ExitPlanMode again.";
+const PLAN_WITHDRAWN: &str = "The host denied this plan because the CLI withdrew it.";
+const HOST_INTERRUPTED: &str = "The host denied this tool call because the turn was interrupted.";
+const HOST_SESSION_CLOSED: &str =
+    "The host denied this tool call because the session closed before permission was answered.";
+const HOST_PROVIDER_FAILED: &str =
+    "The host denied this tool call because the provider failed before permission was answered.";
+
+/// The plan an `ExitPlanMode` call proposed and how its result says it ended, as the pair of events a live
+/// tab folds. A restored plan has no live interaction id: its tool id gives it a stable local identity.
+///
+/// Only what the result's structure shows is restored: an approval (the CLI's structured result carries the
+/// plan; Eitri's own approval is a plain allow, so no edit is ever made) and every way the host's own words
+/// say a plan ended. **`mode_after` is never in the transcript and stays `None`**: the CLI does not write the
+/// mode a person approved into, and what a restored tab runs in is the tab's own business. A plan the CLI
+/// still waited on when the file ends has no result and no row, and nothing here re-arms one. A result that
+/// is none of these, a plan that is empty, over [`PLAN_MAX_BYTES`] or with prompts out of bounds, or one the
+/// person edited before approving (the approved text is not the one proposed), keeps the ordinary tool row.
+fn restored_plan(
+    call: &Slot,
+    result: &AgentDomainEvent,
+    structured: Option<&Value>,
+) -> Option<(AgentDomainEvent, AgentDomainEvent)> {
+    if call
+        .events
+        .iter()
+        .any(|event| matches!(event, AgentDomainEvent::PlanProposed { .. }))
+    {
+        return None;
+    }
+    let (id, input) = call.events.iter().find_map(|event| match event {
+        AgentDomainEvent::ToolCallStarted {
+            tool_use_id,
+            name,
+            input,
+            ..
+        } if name == "ExitPlanMode" => Some((tool_use_id, input)),
+        _ => None,
+    })?;
+    if !question_fits(id, 128) {
+        return None;
+    }
+    let AgentDomainEvent::ToolCallCompleted { content, is_error, .. } = result else {
+        return None;
+    };
+    let text = text_blocks(content).unwrap_or_default();
+    let text = text.trim_start();
+    let whole = text.trim_end();
+    let rejected_by_person = structured.and_then(Value::as_str) == Some(PLAN_USER_REJECTED);
+    let mut feedback = None;
+    let mut reason = None;
+    let outcome = if !*is_error {
+        let proposed = input.get("plan").and_then(Value::as_str);
+        let carried = structured.and_then(|v| v.get("plan")).and_then(Value::as_str);
+        let edited = structured.and_then(|v| v.get("planWasEdited")).and_then(Value::as_bool) == Some(true);
+        if edited
+            || (carried.is_none() && !text.starts_with(PLAN_APPROVED_OPENING))
+            || carried.zip(proposed).is_some_and(|(a, b)| a != b)
+        {
+            return None;
+        }
+        PlanOutcome::Approved
+    } else if let Some(rest) = text.strip_prefix(PLAN_REFUSED_OPENING) {
+        let why = rest
+            .trim_end()
+            .strip_suffix(PLAN_REFUSED_CLOSING)
+            .unwrap_or(rest.trim_end());
+        reason = Some(bounded_reason(why));
+        PlanOutcome::HostRefused
+    } else if rejected_by_person || text.starts_with("[Request interrupted by user") || whole == HOST_INTERRUPTED {
+        PlanOutcome::Interrupted
+    } else if let Some(said) = text
+        .strip_prefix(PLAN_REJECT_OPENING)
+        .and_then(|rest| rest.strip_prefix(PLAN_REJECT_FEEDBACK))
+    {
+        feedback = Some(said.to_owned());
+        PlanOutcome::KeptPlanning
+    } else if text
+        .strip_prefix(PLAN_REJECT_OPENING)
+        .is_some_and(|rest| rest.starts_with(PLAN_REJECT_PLAIN))
+    {
+        feedback = Some(String::new());
+        PlanOutcome::KeptPlanning
+    } else if whole == PLAN_WITHDRAWN {
+        PlanOutcome::Expired
+    } else if whole == HOST_SESSION_CLOSED || text.starts_with(QUESTION_STREAM_CLOSED) {
+        PlanOutcome::SessionClosed
+    } else if whole == HOST_PROVIDER_FAILED {
+        PlanOutcome::ProviderFailed
+    } else {
+        return None;
+    };
+    let (plan, plan_sha256, allowed_prompts, unsupported_reason) = if outcome == PlanOutcome::HostRefused {
+        // The words the model was refused with are all the CLI wrote of a plan the client could not carry:
+        // a live tab holds no text for it either.
+        (String::new(), String::new(), Vec::new(), reason.clone())
+    } else {
+        let plan = input.get("plan")?.as_str()?;
+        if plan.is_empty() || plan.len() > PLAN_MAX_BYTES {
+            return None;
+        }
+        (
+            plan.to_owned(),
+            plan_sha256_hex(plan),
+            plan_allowed_prompts(input)?,
+            None,
+        )
+    };
+    Some((
+        AgentDomainEvent::PlanProposed {
+            interaction_id: id.clone(),
+            tool_use_id: Some(id.clone()),
+            plan,
+            plan_sha256,
+            allowed_prompts,
+            unsupported_reason,
+        },
+        AgentDomainEvent::PlanSettled {
+            interaction_id: id.clone(),
+            outcome,
+            mode_after: None,
+            feedback,
+            reason,
+        },
+    ))
+}
+
+/// A plan's digest as the sidecar computes it: SHA-256 of the UTF-8 text, lower-case hex.
+fn plan_sha256_hex(plan: &str) -> String {
+    use sha2::{Digest, Sha256};
+    Sha256::digest(plan.as_bytes())
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+/// What the plan says it will need (`allowedPrompts`), within the bounds a live plan is held to; `None` when
+/// the list is malformed or out of them. Absent is none.
+fn plan_allowed_prompts(input: &Value) -> Option<Vec<PlanAllowedPrompt>> {
+    let Some(raw) = input.get("allowedPrompts") else {
+        return Some(Vec::new());
+    };
+    let raw = raw.as_array()?;
+    if raw.len() > PLAN_ALLOWED_PROMPTS_MAX {
+        return None;
+    }
+    raw.iter()
+        .map(|entry| {
+            Some(PlanAllowedPrompt {
+                tool: question_text(entry, "tool", PLAN_ALLOWED_PROMPT_UNITS_MAX)?,
+                prompt: question_text(entry, "prompt", PLAN_ALLOWED_PROMPT_UNITS_MAX)?,
+            })
+        })
+        .collect()
+}
+
+/// The row a live tab draws when the CLI moves into plan mode, for the model's own `EnterPlanMode` call that
+/// succeeded. The call keeps its ordinary tool row. A move a person made from the host has no call, so no
+/// transcript line says it happened and nothing is restored for it.
+fn entered_plan_mode(call: &Slot, result: &AgentDomainEvent) -> Option<AgentDomainEvent> {
+    let AgentDomainEvent::ToolCallCompleted { is_error: false, .. } = result else {
+        return None;
+    };
+    call.events
+        .iter()
+        .any(|event| matches!(event, AgentDomainEvent::ToolCallStarted { name, .. } if name == "EnterPlanMode"))
+        .then(|| AgentDomainEvent::SessionNotice {
+            kind: SessionNoticeKind::Informational,
+            level: NoticeLevel::Notice,
+            content: Some("entered plan mode".to_owned()),
+            scalars: Default::default(),
+            task_id: None,
+            tool_use_id: None,
+            task_status: None,
+        })
+}
+
 /// Whether the CLI wrote this assistant line under its own model name rather than the model's.
 ///
 /// The CLI's readers that pick out what the model said (its reply text, its turn summaries, its
@@ -1313,6 +1736,39 @@ enum Line {
     TooLong,
 }
 
+/// Looks only at top-level fields, without allocating the values skipped before `type`.
+/// A type absent from the bounded prefix cannot grant the larger image-prompt allowance.
+fn prefix_is_user_line(prefix: &[u8]) -> bool {
+    use serde::de::{IgnoredAny, MapAccess, Visitor};
+    use serde::Deserializer as _;
+
+    struct Kind<'a>(&'a mut bool);
+    impl<'de> Visitor<'de> for Kind<'_> {
+        type Value = ();
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+            formatter.write_str("a transcript object with a type field")
+        }
+
+        fn visit_map<M: MapAccess<'de>>(self, mut map: M) -> Result<(), M::Error> {
+            while let Some(key) = map.next_key::<String>()? {
+                if key == "type" {
+                    *self.0 = map.next_value::<String>()? == "user";
+                    return Ok(());
+                }
+                map.next_value::<IgnoredAny>()?;
+            }
+            Ok(())
+        }
+    }
+
+    let mut user = false;
+    // Stopping at `type` leaves the rest of the object unread, so serde's trailing-map check may fail.
+    // Only the parsed type matters here; the complete line is validated before it can become history.
+    let _ = serde_json::Deserializer::from_slice(prefix).deserialize_map(Kind(&mut user));
+    user
+}
+
 /// One line, without ever holding more than [`HISTORY_MAX_LINE_BYTES`] of it.
 ///
 /// `BufRead::read_line`/`read_until` would allocate the whole line first and discover its length
@@ -1321,6 +1777,7 @@ enum Line {
 fn read_bounded_line(reader: &mut impl BufRead) -> std::io::Result<Option<Line>> {
     let mut buf: Vec<u8> = Vec::new();
     let mut over_long = false;
+    let mut cap = HISTORY_OTHER_MAX_LINE_BYTES;
     loop {
         let (finished, consumed) = {
             let available = match reader.fill_buf() {
@@ -1334,26 +1791,28 @@ fn read_bounded_line(reader: &mut impl BufRead) -> std::io::Result<Option<Line>>
                 }
                 return Ok(Some(if over_long { Line::TooLong } else { Line::Complete(buf) }));
             }
-            match available.iter().position(|byte| *byte == b'\n') {
-                Some(index) => {
-                    if !over_long {
-                        buf.extend_from_slice(&available[..index]);
-                    }
-                    (true, index + 1)
+            let newline = available.iter().position(|byte| *byte == b'\n');
+            let bytes = newline.unwrap_or(available.len());
+            if !over_long && bytes > 0 && buf.len() == cap {
+                if cap == HISTORY_OTHER_MAX_LINE_BYTES && prefix_is_user_line(&buf) {
+                    cap = HISTORY_MAX_LINE_BYTES;
+                } else {
+                    over_long = true;
+                    buf = Vec::new();
                 }
-                None => {
-                    if !over_long {
-                        buf.extend_from_slice(available);
-                    }
-                    (false, available.len())
-                }
+            }
+            if over_long {
+                (newline.is_some(), bytes + usize::from(newline.is_some()))
+            } else {
+                let take = bytes.min(cap - buf.len());
+                // Exact reservation keeps Vec's geometric growth from exceeding the line cap.
+                buf.reserve_exact(take);
+                buf.extend_from_slice(&available[..take]);
+                let finished = newline.is_some() && take == bytes;
+                (finished, take + usize::from(finished))
             }
         };
         reader.consume(consumed);
-        if buf.len() > HISTORY_MAX_LINE_BYTES {
-            over_long = true;
-            buf = Vec::new();
-        }
         if finished {
             return Ok(Some(if over_long { Line::TooLong } else { Line::Complete(buf) }));
         }
@@ -1403,6 +1862,144 @@ pub(crate) fn real_session_files() -> Vec<std::path::PathBuf> {
 mod tests {
     use super::*;
     use std::io::Cursor;
+
+    // The bundled provider's content and transport limits; the handshake remains authoritative for sends.
+    use crate::providers::claude_sidecar::turn_content::{
+        BUNDLED_MAX_CONTENT_BYTES, BUNDLED_MAX_IMAGES_PER_TURN, BUNDLED_MAX_MESSAGE_BYTES,
+    };
+    const MAX_IMAGES_PER_TURN: usize = BUNDLED_MAX_IMAGES_PER_TURN;
+    const MAX_CONTENT_BYTES: usize = BUNDLED_MAX_CONTENT_BYTES as usize;
+    const MAX_TEXT_BYTES: usize = BUNDLED_MAX_MESSAGE_BYTES as usize;
+    const JSON_OVERHEAD_BYTES: usize = 64 * 1024;
+
+    #[test]
+    fn the_line_bound_covers_base64_images_escaped_text_and_json_overhead() {
+        assert_eq!(super::super::archive::ARCHIVE_MAX_LINE_BYTES, 4 * 1024 * 1024);
+        let base64_bytes = (MAX_CONTENT_BYTES + 2 * MAX_IMAGES_PER_TURN).div_ceil(3) * 4;
+        let worst = base64_bytes + 6 * MAX_TEXT_BYTES + JSON_OVERHEAD_BYTES;
+        assert_eq!(HISTORY_MAX_LINE_BYTES, worst.div_ceil(1024 * 1024) * 1024 * 1024);
+    }
+
+    #[test]
+    fn an_image_limit_prompt_survives_b_restore_and_the_next_save() {
+        use base64::Engine as _;
+        use sha2::{Digest, Sha256};
+        crate::state_dirs::redirect_state_to_a_test_root();
+        let png = base64::engine::general_purpose::STANDARD
+            .decode(
+                "iVBORw0KGgoAAAANSUhEUgAAAAMAAAACCAIAAAASFvFNAAAAEElEQVR4nGNocFCAIAY4CwA21AVBYVAZNAAAAABJRU5ErkJggg==",
+            )
+            .unwrap();
+        let text = "\u{1}".repeat(MAX_TEXT_BYTES);
+        let mut content = vec![serde_json::json!({"type": "text", "text": text})];
+        let mut expected = Vec::new();
+        for i in 0..MAX_IMAGES_PER_TURN {
+            let mut data = png.clone();
+            data.resize(MAX_CONTENT_BYTES / MAX_IMAGES_PER_TURN, i as u8);
+            expected.push(AttachmentMeta {
+                media_type: "image/png".into(),
+                bytes: data.len() as u64,
+                width: 3,
+                height: 2,
+                sha256: format!("{:x}", Sha256::digest(&data)),
+            });
+            content.push(serde_json::json!({"type": "image", "source": {"type": "base64",
+                "media_type": "image/png", "data": base64::engine::general_purpose::STANDARD.encode(data)}}));
+        }
+        // Keep the line kind before the large payload, as the CLI's transcript writer does.
+        let line = format!(
+            r#"{{"type":"user","uuid":"u","promptSource":"typed","message":{{"role":"user","content":{}}}}}"#,
+            serde_json::to_string(&content).unwrap()
+        );
+        let scratch = crate::state_dirs::test_workspace_dir("large-image-history");
+        let path = scratch.join("transcript.jsonl");
+        std::fs::write(&path, line).unwrap();
+        let history = read_transcript_history(&path).unwrap();
+        assert_eq!(history.counts.oversized_lines, 0);
+        let projection = projected(&history);
+        assert_eq!(projection.user_prompts.len(), 1);
+        assert_eq!(projection.user_prompts[0].text, text);
+        assert_eq!(projection.user_prompts[0].attachments, expected);
+        let stored = super::super::store::StoredHistory::from_collections(
+            uuid::Uuid::new_v4().to_string(),
+            "s".into(),
+            projection.user_prompts.clone(),
+            vec![],
+            vec![],
+        );
+        super::super::store::save(&stored).unwrap();
+        let loaded = super::super::store::load(&stored.conversation_id, "s").unwrap();
+        assert_eq!(loaded.user_prompts, stored.user_prompts);
+    }
+
+    #[test]
+    fn jpeg_sizes_survive_malformed_segments_after_the_frame_header() {
+        let frame = b"\xff\xd8\xff\xc0\x00\x07\x08\x00\x20\x00\x30";
+        for tail in [
+            &b"x"[..],
+            b"\xff",
+            b"\xff\xe1",
+            b"\xff\xe1\x00",
+            b"\xff\xe1\x00\x01",
+            b"\xff\xe1\x00\x10Ex",
+            b"\xff\xe1\x00\x08Exif\0\0",
+        ] {
+            let mut bytes = frame.to_vec();
+            bytes.extend(tail);
+            assert_eq!(image_size(&bytes), Some((48, 32)), "{tail:?}");
+            let tiff = exif_orientation(6, true);
+            let mut oriented = b"\xff\xd8\xff\xe1".to_vec();
+            oriented.extend(((tiff.len() + 8) as u16).to_be_bytes());
+            oriented.extend(b"Exif\0\0");
+            oriented.extend(tiff);
+            oriented.extend(&bytes[2..]);
+            assert_eq!(image_size(&oriented), Some((32, 48)), "{tail:?}");
+        }
+    }
+
+    fn exif_orientation(value: u16, little: bool) -> Vec<u8> {
+        if little {
+            let mut tiff = b"II\x2a\0\x08\0\0\0\x01\0\x12\x01\x03\0\x01\0\0\0".to_vec();
+            tiff.extend(value.to_le_bytes());
+            tiff.extend([0; 6]);
+            tiff
+        } else {
+            let mut tiff = b"MM\0\x2a\0\0\0\x08\0\x01\x01\x12\0\x03\0\0\0\x01".to_vec();
+            tiff.extend(value.to_be_bytes());
+            tiff.extend([0; 6]);
+            tiff
+        }
+    }
+
+    #[test]
+    fn restored_jpeg_and_png_dimensions_follow_exif_orientation() {
+        for little in [true, false] {
+            for orientation in 1..=8 {
+                let tiff = exif_orientation(orientation, little);
+                let mut jpeg = b"\xff\xd8\xff\xe1".to_vec();
+                jpeg.extend(((tiff.len() + 8) as u16).to_be_bytes());
+                jpeg.extend(b"Exif\0\0");
+                jpeg.extend(&tiff);
+                jpeg.extend(&include_bytes!("../../tests/fixtures/claude_scripted_images/jpeg_48x32.jpg")[2..]);
+                let mut png = b"\x89PNG\r\n\x1a\n\0\0\0\x0dIHDR".to_vec();
+                png.extend(48u32.to_be_bytes());
+                png.extend(32u32.to_be_bytes());
+                png.extend([8, 2, 0, 0, 0, 0, 0, 0, 0]);
+                png.extend((tiff.len() as u32).to_be_bytes());
+                png.extend(b"eXIf");
+                png.extend(tiff);
+                png.extend([0; 4]);
+                let expected = if orientation >= 5 { (32, 48) } else { (48, 32) };
+                assert_eq!(image_size(&jpeg), Some(expected), "JPEG orientation {orientation}");
+                assert_eq!(image_size(&png), Some(expected), "PNG orientation {orientation}");
+                for bytes in [&jpeg, &png] {
+                    for end in 0..bytes.len() {
+                        let _ = image_size(&bytes[..end]);
+                    }
+                }
+            }
+        }
+    }
 
     fn fold(lines: &str) -> TranscriptHistory {
         read_history_from(&mut Cursor::new(lines.as_bytes()), false).expect("a cursor cannot fail")
@@ -2697,6 +3294,123 @@ mod tests {
         assert_eq!(history.counts.dropped_blocks, 1);
     }
 
+    /// A prompt line whose content holds image blocks restores as the words plus what each image was: its type,
+    /// the length and digest of the bytes its base64 stands for, and the size from its header. Two images, then a
+    /// line of images alone (a prompt with no words).
+    #[test]
+    fn b_restores_image_metadata_from_base64_without_keeping_it() {
+        let text = include_str!("../../tests/fixtures/history_b/prompt_with_images.jsonl");
+        let history = fold(text);
+        let projection = projected(&history);
+        let prompts: Vec<(&str, Vec<(&str, u64, u32, u32, &str)>)> = projection
+            .user_prompts
+            .iter()
+            .map(|prompt| {
+                (
+                    prompt.text.as_str(),
+                    prompt
+                        .attachments
+                        .iter()
+                        .map(|a| (a.media_type.as_str(), a.bytes, a.width, a.height, a.sha256.as_str()))
+                        .collect(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            prompts,
+            vec![
+                (
+                    "what are these?",
+                    vec![
+                        (
+                            "image/png",
+                            73,
+                            3,
+                            2,
+                            "9a62b46b60d2e592f8735e031d75e24381d324be44b6285017562a9085c65e26"
+                        ),
+                        (
+                            "image/jpeg",
+                            42,
+                            7,
+                            5,
+                            "19085b5995efc8afb9ff00b481c2a70e3a2e6fcf7f1ea1356c22e6ed638317ad"
+                        ),
+                    ]
+                ),
+                (
+                    "",
+                    vec![
+                        (
+                            "image/gif",
+                            14,
+                            4,
+                            4,
+                            "4920534ee890f9758d84d55f9e07b93090a07bfb0c5e81d806e1ca3657174bca"
+                        ),
+                        (
+                            "image/webp",
+                            30,
+                            9,
+                            6,
+                            "a84a62c9ea62bb756444d60073839b494b1893bed0a6984d6c89132a6b42c62c"
+                        ),
+                    ]
+                ),
+            ]
+        );
+        assert_eq!(history.counts.dropped_blocks, 0);
+        assert_eq!(history.counts.rejected_user_lines, 0);
+        let kept = format!("{:?}", history.events);
+        assert!(!kept.contains("iVBOR"), "no base64 reaches the events");
+    }
+
+    /// A block whose base64 is over 8 MiB keeps its type and length and an empty digest: the reader never hashes
+    /// an unbounded block. (A whole line this long is skipped before it gets here, by the line limit; the block's
+    /// own bound is what holds wherever the line limit is raised.)
+    #[test]
+    fn an_oversized_base64_block_keeps_length_and_type() {
+        let data = "A".repeat(IMAGE_BASE64_MAX_BYTES + 4);
+        let block =
+            serde_json::json!({"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": data}});
+        let meta = image_meta(&block).expect("a block of base64");
+        assert_eq!(meta.media_type, "image/png");
+        assert_eq!(meta.bytes, ((IMAGE_BASE64_MAX_BYTES + 4) / 4 * 3) as u64);
+        assert_eq!(meta.sha256, "");
+        assert_eq!((meta.width, meta.height), (0, 0));
+        // One byte under the bound is read whole.
+        let under = "A".repeat(IMAGE_BASE64_MAX_BYTES);
+        let block = serde_json::json!({"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": under}});
+        assert_eq!(image_meta(&block).expect("a block of base64").sha256.len(), 64);
+    }
+
+    /// An image that is not inline base64, or names no type, is dropped and counted; the words stay a prompt.
+    #[test]
+    fn an_image_without_inline_data_is_dropped_and_the_prompt_stays() {
+        let line = r#"{"type":"user","uuid":"u","promptSource":"typed","message":{"role":"user","content":[{"type":"text","text":"look"},{"type":"image","source":{"type":"url","url":"http://x"}},{"type":"image","source":{"type":"base64","data":"AAAA"}}]}}"#;
+        let history = fold(line);
+        let projection = projected(&history);
+        assert_eq!(projection.user_prompts[0].text, "look");
+        assert!(projection.user_prompts[0].attachments.is_empty());
+        assert_eq!(history.counts.dropped_blocks, 2);
+    }
+
+    /// A prompt and its images are one item: eviction takes both or neither, so the images never land on another
+    /// prompt.
+    #[test]
+    fn a_prompt_s_images_are_evicted_with_it() {
+        let text = include_str!("../../tests/fixtures/history_b/prompt_with_images.jsonl");
+        let mut many = String::new();
+        for _ in 0..HISTORY_MAX_ITEMS {
+            many.push_str(text);
+        }
+        let history = fold(&many);
+        assert_eq!(history.parsed_items, HISTORY_MAX_ITEMS);
+        let projection = projected(&history);
+        // Every kept prompt of words has its two images, and every kept image-only prompt its two.
+        assert!(projection.user_prompts.iter().all(|p| p.attachments.len() == 2));
+    }
+
     /// Never produce `Some("")`: an empty id compares equal to every other empty id, which
     /// cross-links two unrelated records -- silently.
     #[test]
@@ -2929,6 +3643,47 @@ mod tests {
         assert_eq!(prompts(&history), vec!["after".to_string()]);
         assert_eq!(history.counts.oversized_lines, 1);
         assert_eq!(history.counts.skipped_lines, 1);
+    }
+
+    #[test]
+    fn non_user_lines_over_four_mib_are_skipped_even_with_nested_user_types() {
+        for kind in ["assistant", "system", "attachment", "api-request", "unknown"] {
+            let line = serde_json::json!({
+                "message": {"type": "user", "content": "z".repeat(HISTORY_OTHER_MAX_LINE_BYTES)},
+                "type": kind,
+            })
+            .to_string();
+            let history = fold(&format!("{line}\n{}", typed_prompt("after")));
+            assert_eq!(prompts(&history), ["after"], "{kind}");
+            assert_eq!(history.counts.oversized_lines, 1, "{kind}");
+            assert_eq!(history.counts.skipped_lines, 1, "{kind}");
+        }
+    }
+
+    #[test]
+    fn a_user_line_just_under_twenty_nine_mib_is_restored() {
+        let text = "z".repeat(HISTORY_MAX_LINE_BYTES - typed_prompt("").len() - 1);
+        let line = typed_prompt(&text);
+        assert_eq!(line.len(), HISTORY_MAX_LINE_BYTES - 1);
+        let history = fold(&line);
+        let restored = prompts(&history);
+        assert_eq!(restored.len(), 1);
+        assert!(restored[0] == text);
+        assert_eq!(history.counts.oversized_lines, 0);
+    }
+
+    #[test]
+    fn the_larger_line_allowance_requires_a_top_level_user_type_in_the_prefix() {
+        assert!(prefix_is_user_line(
+            br#"{ "other": {"type":"assistant"}, "ty\u0070e" : "user", "message":"unfinished"#
+        ));
+        assert!(!prefix_is_user_line(
+            br#"{"other":{"type":"user"},"type":"assistant","message":"unfinished"#
+        ));
+        assert!(!prefix_is_user_line(
+            br#"{"message":"a string containing \"type\":\"user\""#
+        ));
+        assert!(!prefix_is_user_line(br#"{"type":"us"#));
     }
 
     #[test]
@@ -3251,5 +4006,235 @@ mod tests {
              allow-list is refusing real data",
             files.len()
         );
+    }
+
+    // ---- plans ----
+
+    fn restored_plans(lines: &str) -> crate::projection::AgentSessionProjection {
+        let projection = projected(&fold(lines));
+        assert!(
+            projection.waiting_plan().is_none(),
+            "nothing restored waits for a decision"
+        );
+        assert!(!projection.is_planning(), "a restore starts no transition");
+        projection
+    }
+
+    fn settled(outcome: PlanOutcome, feedback: Option<&str>, reason: Option<&str>) -> crate::PlanState {
+        crate::PlanState::Settled {
+            outcome,
+            mode_after: None,
+            feedback: feedback.map(str::to_owned),
+            reason: reason.map(str::to_owned),
+        }
+    }
+
+    const APPROVED: &str = include_str!("../../tests/fixtures/history_b/plan_approved.jsonl");
+    const KEPT: &str = include_str!("../../tests/fixtures/history_b/plan_kept.jsonl");
+
+    /// The model's plan and its approval, as the CLI wrote them: the plan is the call's input, kept whole with
+    /// its digest and what it said it would need; the mode it was approved into is nowhere in the file.
+    #[test]
+    fn an_approved_plan_restores_with_its_text_and_no_mode() {
+        let projection = restored_plans(APPROVED);
+        assert_eq!(projection.plans.len(), 1);
+        let plan = &projection.plans[0];
+        assert_eq!(plan.interaction_id, "exit-1");
+        assert_eq!(plan.tool_use_id.as_deref(), Some("exit-1"));
+        assert_eq!(plan.turn_id.as_deref(), Some("prompt"));
+        assert_eq!(
+            plan.plan,
+            "# Rename the setting\n\n1. Change `hello.txt` to say hi.\n2. Run the tests.\n"
+        );
+        assert_eq!(plan.plan_sha256, plan_sha256_hex(&plan.plan));
+        assert_eq!(plan.plan_sha256.len(), 64);
+        assert_eq!(
+            plan.allowed_prompts,
+            vec![PlanAllowedPrompt {
+                tool: "Bash".into(),
+                prompt: "run the tests".into()
+            }]
+        );
+        assert_eq!(plan.state, settled(PlanOutcome::Approved, None, None));
+        // Both calls keep their ordinary tool rows beside the plan, and the entry says it happened.
+        let names: Vec<_> = projection.tool_calls.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(names, ["EnterPlanMode", "ExitPlanMode"]);
+        assert!(projection.tool_calls.iter().all(|c| c.result.is_some()));
+        let entered: Vec<_> = projection.notices.iter().filter_map(|n| n.content.as_deref()).collect();
+        assert_eq!(entered, ["entered plan mode"]);
+        // The notice follows the entry call's result and comes before the plan's call.
+        let notice = projection.notices[0].seq;
+        assert!(projection.tool_calls[0].seq < notice && notice < projection.tool_calls[1].seq);
+        assert!(projection.tool_calls[1].seq <= plan.seq);
+    }
+
+    /// Keeping planning reads back with the person's words after the terminal's own opening; the plain
+    /// rejection is a keep with no words. A second proposal after it is its own plan.
+    #[test]
+    fn a_kept_plan_restores_with_its_feedback() {
+        let projection = restored_plans(KEPT);
+        assert_eq!(projection.plans.len(), 2);
+        assert_eq!(
+            projection.plans[0].state,
+            settled(PlanOutcome::KeptPlanning, Some("also update README.md"), None)
+        );
+        assert_eq!(projection.plans[1].state, settled(PlanOutcome::Approved, None, None));
+        assert!(projection.plans[1].plan.ends_with("3. Update README.md.\n"));
+        assert_ne!(projection.plans[0].plan_sha256, projection.plans[1].plan_sha256);
+
+        let plain = KEPT.replace(
+            "To tell you how to proceed, the user said:\\nalso update README.md",
+            "STOP what you are doing and wait for the user to tell you how to proceed.",
+        );
+        assert_ne!(plain, KEPT);
+        assert_eq!(
+            restored_plans(&plain).plans[0].state,
+            settled(PlanOutcome::KeptPlanning, Some(""), None),
+            "the terminal's plain rejection is a keep without words"
+        );
+        // Words with line breaks and markup come back exactly.
+        let long = KEPT.replace("also update README.md", "line one\\n\\n- two <b>");
+        assert_eq!(
+            restored_plans(&long).plans[0].state,
+            settled(PlanOutcome::KeptPlanning, Some("line one\n\n- two <b>"), None)
+        );
+    }
+
+    /// Every other way the CLI's words say a plan ended, and none of them a decision: the interrupt (the CLI's own
+    /// structured result beside the rejection text), the withdrawal, the session closing, the provider failing.
+    #[test]
+    fn a_plan_that_ended_without_a_decision_says_how() {
+        let interrupted = include_str!("../../tests/fixtures/history_b/plan_interrupted.jsonl");
+        assert_eq!(
+            restored_plans(interrupted).plans[0].state,
+            settled(PlanOutcome::Interrupted, None, None),
+            "the rejection text with the CLI's own 'user rejected' result is an interrupt, not a keep"
+        );
+        let closed = include_str!("../../tests/fixtures/history_b/plan_closed.jsonl");
+        assert_eq!(
+            restored_plans(closed).plans[0].state,
+            settled(PlanOutcome::SessionClosed, None, None)
+        );
+        let words = |from: &str, to: &str| closed.replace(from, to);
+        let from = "Tool permission request failed: AbortError: Tool permission stream closed before response received";
+        for (text, outcome) in [
+            (
+                "The host denied this tool call because the session closed before permission was answered.",
+                PlanOutcome::SessionClosed,
+            ),
+            (
+                "The host denied this tool call because the turn was interrupted.",
+                PlanOutcome::Interrupted,
+            ),
+            (
+                "The host denied this tool call because the provider failed before permission was answered.",
+                PlanOutcome::ProviderFailed,
+            ),
+            (
+                "The host denied this plan because the CLI withdrew it.",
+                PlanOutcome::Expired,
+            ),
+        ] {
+            assert_eq!(
+                restored_plans(&words(from, text)).plans[0].state,
+                settled(outcome, None, None),
+                "{text}"
+            );
+        }
+        // An error the reader has no rule for keeps the ordinary tool row: nothing is invented about it.
+        let unknown = words(from, "ExitPlanMode is only available in plan mode.");
+        assert!(restored_plans(&unknown).plans.is_empty());
+    }
+
+    /// A plan the client could not carry has no text of its own on a live tab, and none here: the row says why.
+    #[test]
+    fn a_refused_plan_restores_with_the_reason_it_was_refused_for() {
+        let projection = restored_plans(include_str!("../../tests/fixtures/history_b/plan_refused.jsonl"));
+        let plan = &projection.plans[0];
+        assert!(plan.plan.is_empty() && plan.plan_sha256.is_empty() && plan.allowed_prompts.is_empty());
+        assert_eq!(
+            plan.unsupported_reason.as_deref(),
+            Some("the plan is larger than 262144 bytes")
+        );
+        assert_eq!(
+            plan.state,
+            settled(
+                PlanOutcome::HostRefused,
+                None,
+                Some("the plan is larger than 262144 bytes")
+            )
+        );
+    }
+
+    /// A plan too long to carry, empty, with prompts out of bounds, or edited by the person before they approved
+    /// it (so the approved text is not the proposed one) stays an ordinary tool row, whatever its result.
+    #[test]
+    fn an_oversized_plan_keeps_the_plain_tool_row() {
+        let original = "# Rename the setting\\n\\n1. Change `hello.txt` to say hi.\\n2. Run the tests.\\n";
+        assert!(APPROVED.contains(original));
+        let with_plan = |plan: &str| {
+            // The result's structured plan and its text carry the same words, as the CLI writes them.
+            APPROVED.replace(original, plan)
+        };
+        let at_limit = "a".repeat(PLAN_MAX_BYTES);
+        let over = "a".repeat(PLAN_MAX_BYTES + 1);
+        let fits = restored_plans(&with_plan(&at_limit));
+        assert_eq!(fits.plans.len(), 1, "a plan at the bound is carried whole");
+        assert_eq!(fits.plans[0].plan.len(), PLAN_MAX_BYTES);
+        let projection = restored_plans(&with_plan(&over));
+        assert!(
+            projection.plans.is_empty(),
+            "over the bound the call keeps its plain row"
+        );
+        assert_eq!(projection.tool_calls.len(), 2);
+        assert!(projection.tool_calls.iter().all(|c| c.result.is_some()));
+
+        let empty = restored_plans(&with_plan(""));
+        assert!(empty.plans.is_empty());
+        let many = format!(
+            r#""allowedPrompts": [{}]"#,
+            vec![r#"{"tool": "Bash", "prompt": "x"}"#; 33].join(", ")
+        );
+        let too_many = APPROVED.replace(
+            r#""allowedPrompts": [{"tool": "Bash", "prompt": "run the tests"}]"#,
+            &many,
+        );
+        assert_ne!(too_many, APPROVED);
+        assert!(restored_plans(&too_many).plans.is_empty());
+        let edited = APPROVED.replace(r#""isAgent": false"#, r#""isAgent": false, "planWasEdited": true"#);
+        assert_ne!(edited, APPROVED);
+        assert!(restored_plans(&edited).plans.is_empty());
+        // Not the result of an approval: an error-free result that says nothing of one.
+        let odd = APPROVED.replace("User has approved your plan.", "Something else happened.");
+        let odd = odd.replace(r#""toolUseResult": {"plan": "#, r#""toolUseResult": {"nope": "#);
+        assert!(restored_plans(&odd).plans.is_empty());
+    }
+
+    /// A plan whose call has no result (the CLI waited on it when the file ended) restores no plan, and a
+    /// restored plan never re-arms plan mode: not waiting, no phase, nothing to answer, offered or not.
+    #[test]
+    fn a_plan_is_never_rearmed_from_b() {
+        let without_result: String = APPROVED
+            .lines()
+            .filter(|line| !line.contains(r#""tool_use_id": "exit-1""#))
+            .map(|line| format!("{line}\n"))
+            .collect();
+        let projection = restored_plans(&without_result);
+        assert!(projection.plans.is_empty());
+        assert!(projection
+            .tool_calls
+            .iter()
+            .any(|c| c.name == "ExitPlanMode" && c.result.is_none()));
+
+        let mut projection = restored_plans(APPROVED);
+        assert!(projection.planning.phase == crate::PlanPhase::Executing && !projection.planning.offered);
+        // A session that is then created or resumed with plan mode offered starts executing, with the
+        // restored plans settled and the entry's notice only a row.
+        projection.offer_plan_mode(crate::process::CliExpectation {
+            requested: crate::process::RequestedCliMode::Auto,
+            plan_offered: true,
+        });
+        assert!(projection.waiting_plan().is_none() && !projection.is_planning() && !projection.plan_gate_applies());
+        assert_eq!(projection.latest_approval(), Some((projection.plans[0].seq, None)));
     }
 }

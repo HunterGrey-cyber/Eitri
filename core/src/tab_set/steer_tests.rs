@@ -1355,6 +1355,7 @@ fn hold_as_steer_keeps_after_turn_unsteered() {
         typed: "into the turn".into(),
         typed_by_person: true,
         shell_line: false,
+        attachments: Vec::new(),
     };
     assert!(matches!(
         set.send_prompt(tab, "p1", ViewId::BASE, turn),

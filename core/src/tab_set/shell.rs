@@ -467,6 +467,7 @@ mod tests {
             typed: "!touch ran".into(),
             typed_by_person: false,
             shell_line: true,
+            attachments: Vec::new(),
         };
         let saved = serde_json::to_string(&turn).unwrap();
         let restored: FirstTurn = serde_json::from_str(&saved).unwrap();
@@ -483,6 +484,7 @@ mod tests {
             typed: line.clone(),
             typed_by_person: true,
             shell_line: false,
+            attachments: Vec::new(),
         };
         f.set.send_first_turn(f.tab, "first", turn).expect("it goes");
         assert!(!f.set.shell_line_runs(f.tab));
@@ -497,6 +499,7 @@ mod tests {
             typed: "!true".into(),
             typed_by_person: false,
             shell_line: true,
+            attachments: Vec::new(),
         };
         f.set.send_first_turn(f.tab, "first", turn).expect("it starts");
         assert!(f.set.shell_line_runs(f.tab));
@@ -515,6 +518,7 @@ mod tests {
             typed: "words".into(),
             typed_by_person: true,
             shell_line: false,
+            attachments: Vec::new(),
         };
         assert!(matches!(
             f.set.send_prompt(f.tab, "p", ViewId::BASE, turn),

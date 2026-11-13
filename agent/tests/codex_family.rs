@@ -189,10 +189,7 @@ fn running(thread: &str, turn: &str, rest: Vec<Value>) -> (CodexProvider, String
 
 fn send(provider: &CodexProvider, thread: &str, text: &str) -> Result<String, ProviderError> {
     provider.send_turn_with(
-        SendTurnRequest {
-            session_id: thread.to_string(),
-            text: text.to_string(),
-        },
+        SendTurnRequest::text(thread.to_string(), text.to_string()),
         TurnPolicy {
             reviewer: Reviewer::User,
             sandbox: agent::Sandbox::Project,

@@ -1,7 +1,7 @@
 import { marked } from "marked";
 import { outputText } from "./copyText";
 import { fenced, pathsIn } from "./paths";
-import { noticeBody, noticeText, wakeText, type TimelineItem } from "./timeline";
+import { noticeBody, noticeText, planLines, wakeText, type TimelineItem } from "./timeline";
 import { turnEndingText } from "./turnEnding";
 import { toolInput } from "./yank";
 import type { HistoryNotice, SubagentStream, ToolCallRecord } from "./types";
@@ -74,6 +74,10 @@ function renderItem(item: TimelineItem, options: ExportOptions): string {
     case "prompt":
     case "message":
       return closeOpenBlocks(provenance(item.text));
+    case "plan":
+      return closeOpenBlocks(provenance([item.plan.plan, ...planLines(item.plan).slice(1).map((line) => line.text)].filter(Boolean).join("\n\n")));
+    case "planmark":
+      return quote(provenance(item.text));
     case "tool":
       return tool(item.call, options);
     case "run":

@@ -1,28 +1,28 @@
 //! Eitri's three records of a conversation, read into the normal form.
 //!
 //! - **E**, the domain event log with the final projection: the projection's rows (prompts, messages
-//!   taken into a running turn, replies, thinking, tool calls, settled question sets), each in the turn of
+//!   taken into a running turn, replies, thinking, tool calls, settled question sets and plans), each in the turn of
 //!   the event that wrote it, and the end of a turn that did not complete. A prompt opens a turn that the
 //!   next unseen turn id then names.
-//! - **A**, the stored history: prompts, replies, tool calls and settled question sets only, ordered by
+//! - **A**, the stored history: prompts, replies, tool calls and settled question sets and plans only, ordered by
 //!   `seq`. It has no turn endings and no thinking. A prompt that was not delivered into a running turn
 //!   opens a turn; a tool call's turn id names the turn it belongs to, so a call whose id differs from the
 //!   running turn's opens a turn of its own (one the CLI started without a prompt). A reply row, and a
-//!   question set, stays with the turn it follows: a turn the CLI started that holds only text cannot be
+//!   question set or plan, stays with the turn it follows: a turn the CLI started that holds only text cannot be
 //!   told apart from the turn before it.
 //! - **B**, Eitri's restore reader run on the CLI's files and folded into a projection, read like A. Its
 //!   tool calls carry their transcript segment's turn id, so call attribution can be compared with
-//!   the CLI's turns; its question rows are the ones it restored from the CLI's results.
+//!   the CLI's turns; its question and plan rows are the ones it restored from the CLI's results.
 //!
-//! A question set is read only as its key ([`super::normalise::question_entry`]): its words stay in the
-//! record.
+//! A question set is read only as its key ([`super::normalise::question_entry`]), and a plan as its digest and
+//! end ([`super::normalise::plan_entry`]): their words stay in the record.
 
-use super::normalise::question_entry;
+use super::normalise::{plan_entry, question_entry};
 use super::{Attribution, EitriForm, Entry, Omission, Origin, Pos, Source, Turn, Via};
 use crate::history::{read_transcript_history, HistoryLoadError, StoredHistory, HISTORY_FORMAT_VERSION};
 use crate::projection::{
-    AgentDomainEvent, AgentSessionProjection, QuestionRecord, ToolCallRecord, TranscriptMessage, TurnOutcome,
-    UserPromptRecord,
+    AgentDomainEvent, AgentSessionProjection, PlanRecord, QuestionRecord, ToolCallRecord, TranscriptMessage,
+    TurnOutcome, UserPromptRecord,
 };
 use serde_json::Value;
 use std::collections::{BTreeMap, HashMap};
@@ -150,6 +150,7 @@ pub fn read_e(events: &[AgentDomainEvent], projection: &AgentSessionProjection) 
             Entry::User {
                 text: prompt.text.clone(),
                 via,
+                images: image_keys(prompt),
             },
         ));
     }
@@ -222,6 +223,13 @@ pub fn read_e(events: &[AgentDomainEvent], projection: &AgentSessionProjection) 
         let at = row_turn(index, &mut turns);
         placed.push((at, index, 2, entry));
     }
+    // A plan sits where it was proposed, the same way.
+    for record in &projection.plans {
+        let Some(entry) = plan_entry(record) else { continue };
+        let Some(index) = writer(record.seq) else { continue };
+        let at = row_turn(index, &mut turns);
+        placed.push((at, index, 2, entry));
+    }
     placed.sort_by_key(|(turn, index, rank, _)| (*turn, *index, *rank));
     for (at, index, _, entry) in placed {
         turns[at].push(
@@ -251,6 +259,15 @@ pub fn read_e(events: &[AgentDomainEvent], projection: &AgentSessionProjection) 
     }
 }
 
+/// A prompt record's images as the entry key holds them: media type and digest, in the order they went.
+fn image_keys(prompt: &UserPromptRecord) -> Vec<(String, String)> {
+    prompt
+        .attachments
+        .iter()
+        .map(|a| (a.media_type.clone(), a.sha256.clone()))
+        .collect()
+}
+
 /// A: a stored history.
 pub fn read_a(stored: &StoredHistory) -> EitriForm {
     let (turns, changed_input) = from_collections(
@@ -258,6 +275,7 @@ pub fn read_a(stored: &StoredHistory) -> EitriForm {
         &stored.transcript,
         &stored.tool_calls,
         &stored.questions,
+        &stored.plans,
         true,
     );
     EitriForm {
@@ -312,6 +330,7 @@ pub fn read_b(chain: &[PathBuf], tool_turn_ids: bool) -> std::io::Result<EitriFo
         &projection.transcript,
         &projection.tool_calls,
         &projection.questions,
+        &projection.plans,
         tool_turn_ids,
     );
     Ok(EitriForm {
@@ -374,6 +393,7 @@ fn child_entry(parent: &ToolCallRecord, thinking: bool) -> Option<Entry> {
             Entry::User {
                 text: prompt.into(),
                 via: Via::Prompt,
+                images: Vec::new(),
             },
             Pos {
                 input: 0,
@@ -401,15 +421,17 @@ fn from_collections(
     transcript: &[TranscriptMessage],
     calls: &[ToolCallRecord],
     questions: &[QuestionRecord],
+    plans: &[PlanRecord],
     tool_turn_ids: bool,
 ) -> (Vec<Turn>, BTreeMap<String, Value>) {
     enum Item<'a> {
         Prompt(&'a UserPromptRecord),
         Message(&'a TranscriptMessage),
         Call(&'a ToolCallRecord),
-        Question(Entry),
+        /// A settled question set or plan.
+        Settled(Entry),
     }
-    // The same order the store cuts by: `seq`, then prompt before reply before call before question.
+    // The same order the store cuts by: `seq`, then prompt before reply before call before question before plan.
     let mut items: Vec<(u64, u8, usize, Item)> = Vec::new();
     items.extend(prompts.iter().enumerate().map(|(i, p)| (p.seq, 0, i, Item::Prompt(p))));
     items.extend(
@@ -423,7 +445,13 @@ fn from_collections(
         questions
             .iter()
             .enumerate()
-            .filter_map(|(i, q)| question_entry(q).map(|entry| (q.seq, 3, i, Item::Question(entry)))),
+            .filter_map(|(i, q)| question_entry(q).map(|entry| (q.seq, 3, i, Item::Settled(entry)))),
+    );
+    items.extend(
+        plans
+            .iter()
+            .enumerate()
+            .filter_map(|(i, p)| plan_entry(p).map(|entry| (p.seq, 4, i, Item::Settled(entry)))),
     );
     items.sort_by_key(|(seq, rank, index, _)| (*seq, *rank, *index));
 
@@ -447,6 +475,7 @@ fn from_collections(
                     Entry::User {
                         text: prompt.text.clone(),
                         via: Via::Prompt,
+                        images: image_keys(prompt),
                     },
                     pos,
                 );
@@ -459,12 +488,13 @@ fn from_collections(
                     Entry::User {
                         text: prompt.text.clone(),
                         via: Via::Steer,
+                        images: image_keys(prompt),
                     },
                     pos,
                 );
             }
             // Placed by order, in the turn it follows, as a reply is.
-            Item::Question(entry) => {
+            Item::Settled(entry) => {
                 if turns.is_empty() {
                     open(&mut turns, &mut turn_ids, Origin::Unknown, None);
                 }

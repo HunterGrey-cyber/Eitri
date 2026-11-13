@@ -1,5 +1,5 @@
 [English](agents.md) | 简体中文
-<!-- translated-from: agents.md sha256=1bdbda60a106557ae59e2ffde00c1ecc3cc34b8fb601cfb74e3aaca9cda47e98 -->
+<!-- translated-from: agents.md sha256=ba218b7adbce0294b09dc655bc64dd7263eb798e97c90e00b905deed1ec70299 -->
 
 # Codex 与其他 agent
 
@@ -61,6 +61,25 @@ Claude 用选择题问你时（Claude Code 的 `AskUserQuestion` 工具），提
 
 只有你能回答提问：bypass、卡片按键、保存的规则和 Claude Code 的分类器都不会替你回答（见[权限](permissions.zh-CN.md#claudes-questions-to-you)）。有提问在等时关闭标签页，会先问，并说明关闭会取消这个提问。全部按键见[按键](keys.zh-CN.md#claudes-questions)。
 
+<a id="plan-mode"></a>
+### plan 模式
+
+在 plan 模式下，Claude 阅读和探索项目，写出一份计划，然后等你批准，在这之前不改动任何东西。要进入它，在输入框里单独输入 `/plan`，或者在 BROWSE 里按 `<leader>p`；同样的键也用来离开。标签页必须空闲：有回合在运行，或者有卡片、提问、计划或留着的消息在等时，会闪出 `plan mode starts when the tab is idle`（或 `ends`）。在空标签页上，这两个键只是给标签页做个标记，它的第一条消息会等到 Claude Code 进入 plan 模式之后再发出。Claude 也可以像在终端里一样自己进入 plan 模式，标签页会跟着进入。plan 模式需要 Claude 标签页，并且它的 agent 后端提供这个功能；在其他地方这两个键会显示 `plan mode needs a Claude tab on a sidecar that offers it`。`/plan` 后面再跟别的文字时，会作为消息发给 Claude，什么也不切换。
+
+状态带上的模式标签显示标签页所处的位置：先是 `⏸ entering plan…`，然后是 `⏸ plan · from auto`（plan 模式开始时标签页所在的模式），离开时是 `⏸ leaving plan…`，做了标记的空标签页上是 `⏸ plan on start · from manual`。标签页在 plan 模式下时，`Shift+Tab` 和 `<leader>m` 不改变任何东西，只显示 `in plan mode: <leader>p leaves plan mode`。对话里会在相应的位置出现 `entered plan mode` 和 `left plan mode` 两行。
+
+Claude Code 在做计划时，Eitri 在任何模式下（包括 bypass）都不会自己批准文件编辑或命令。Claude Code 自己写它的计划文件。其他任何 `Write`、`Edit` 或 `NotebookEdit` 调用，以及每一条 `Bash` 命令，都会以卡片的形式交给你，你像对待其他卡片一样批准或拒绝。plan 模式还改变了什么、它管不到哪里，见[权限](permissions.zh-CN.md#plan-mode)。
+
+Claude 拿出计划时，计划框会取代输入框（你的草稿会保留，之后回来），活动行显示 `⚑ plan needs review`，标签页把这份计划和卡片一起计数。计划按 Markdown 显示，隐藏字符会显示成可见的转义。如果 Claude 列出了它预计需要的命令，它们会出现在计划下方；这份列表只供阅读，批准计划并不会放行它们。然后由你选择：
+
+- **Keep planning** 一开始就有焦点。它会打开一个输入区，让你写 Claude 应该改什么；可以不写，`Ctrl+Enter` 或 `Send` 把它发出，Claude 接着做计划。你写下的内容在切换到别的标签页、或重新加载页面之后都还在。反馈最多 16 KiB。
+- **Approve (Manual)** 和 **Approve (Auto)** 结束 plan 模式，并让标签页在接下来的工作里处于相应的模式。
+- **Approve and keep Bypass** 只在 plan 模式是从 Bypass 开始时才有，排在最后，焦点也从不先落在它上面。它让标签页回到 Bypass，像 plan 模式之前一样，由 Bypass 自己批准每一次调用。另外两种批准都会让 Bypass 标签页离开 Bypass。
+
+plan 模式之后的模式是标签页自己的：不管你选哪个，Claude Code 都回到它的会话开始时的模式，Eitri 站在它前面，按标签页的模式回答。用 `/plan` 或 `<leader>p` 自己离开 plan 模式（只在没有计划在等时可以），标签页会落到 Manual。只有你能对计划作出决定：bypass、卡片按键和保存的规则都不会。如果 Claude Code 还在决定它做计划时发出的调用，批准会等这些调用，并显示 `waiting for 2 calls to finish`；如果其中某个调用有卡片在等，先回答那张卡片。有计划在等时关闭标签页，会先问，并说明关闭会让 Claude 的计划在没有决定的情况下结束。
+
+计划会留在对话里，放在提出它的那次调用的那一行上，并写明结果（`approved · manual`，或者 `kept planning:` 加上你反馈的第一行）；在那一行上按 `Enter` 会展开整份计划，计划还在等时会转到计划框。全部按键见[按键](keys.zh-CN.md#claudes-plan)。
+
 <a id="resuming-a-conversation"></a>
 ### 恢复对话
 
@@ -68,7 +87,6 @@ Claude 用选择题问你时（Claude Code 的 `AskUserQuestion` 工具），提
 
 有几样东西不会回来：子 agent 自己的调用（Claude Code 把它们存在单独的文件里），以及另一个 Claude Code 会话在回合进行中送进来的消息（实时的标签页里也不显示它）。还有少数回合，是 Claude Code 出于 Eitri 暂时还不认识的原因自己发起的，它们会并到前一个回合里。被打断的提问，或者标签页关闭时还在等的提问，恢复后可能显示为已拒绝，因为 Claude Code 就是这样记录的。
 
-<a id="not-in-a-claude-tab-yet"></a>
 ### 输入框里的 `@` 和 `!`
 
 与 Claude Code 相同。在词首输入 `@` 会列出项目里的文件和文件夹：`Tab` 选中一行，`↑`/`↓` 移动，`Esc` 关闭。文件由 Claude Code 读取，所以 `@src/main.rs`、`@src/`、`@notes.md#L10-20` 和项目外的路径都可用，并遵循它自己的规则：`deny` 规则覆盖的文件会被跳过，不作任何提示。带空格的名字要加引号：`@"my file.txt"`。不是你输入的文字（比如在编辑器里选中的行）不会让 Claude Code 去读文件。
@@ -77,9 +95,30 @@ Claude 用选择题问你时（Claude Code 的 `AskUserQuestion` 工具），提
 
 在输入框开头输入 `!`，其余内容会作为你自己的 shell 命令在项目里运行，可以用你的 shell 的别名和函数。输出显示在它下方并发给 Claude，然后 Claude 会回答，和终端里一样。它在任何模式下都不询问，权限规则也不适用：这是你自己在运行命令。回合运行时它会等到回合结束。`Ctrl+c` 会停止它，不告诉 Claude，并把这一行放回输入框。它最多运行两分钟。`cd` 对这个标签页之后的 `!` 行有效，但不会移动 Claude 自己的命令。`respondToBashCommands` 不会被读取：Claude 总是会回答。
 
+<a id="images-in-a-message"></a>
+### 消息里的图片
+
+你可以随消息给 Claude 发图片。把图片粘贴进输入框（`Ctrl+V`），或者从文件管理器把图片文件拖到对话上。每张图片会变成输入框上方的一个小块，带缩略图、名字，准备好之后还有它的类型、尺寸和大小（`PNG · 1280×720 · 312 KB`）。一条消息可以只有图片。要去掉一张图片，点它的 `×`，或者在输入框最开头按 `←` 移到这些小块上再按 `x`（[按键](keys.zh-CN.md#in-insert)）。
+
+可以发送 PNG、JPEG、GIF 和 WebP。GIF 或动态 WebP 只发出第一帧。剪贴板里除了图片还有文字时（比如从电子表格复制的单元格），粘贴的是文字。只有这台电脑上的文件可以拖进来：文件夹会被拒绝，从浏览器拖来的链接或网络位置上的文件会被略去。每张图片在发出之前，Eitri 会先处理：
+
+- 超过 32 MB、宽或高超过 20,000 像素、或超过 4000 万像素的文件会被拒绝。
+- 长边超过 1568 像素或超过 115 万像素的图片会被缩小到两者都满足，然后有透明像素的以 PNG 发出，否则以 JPEG 发出。GIF 和 WebP 总是这样转换。
+- 已经在这些范围之内的 PNG 或 JPEG 按原样逐字节发出，文件里带的元数据也一起发出（比如照片的拍摄地点）。
+- 处理之后，一张图片最大 3.5 MB。
+
+一份草稿最多放 8 张图片，也就是一条消息最多能带的数量；一个窗口里所有标签页还没发出的图片合计最多 64 MB。这个版本自带的 agent 后端在一条消息里最多接收 8 张、合计 3.5 MB 的图片，文字还要和它们一起放进一条 4 MiB 的消息；超出时输入框会说明超出的是哪一项限制。
+
+带图片的消息总是一个单独的回合。回合运行时，`Enter` 把它留到回合结束，而不是插进正在运行的回合，`Ctrl+Enter` 会拒绝它（`Ctrl+Enter cannot send images: Enter queues the message with them`）。斜杠命令和 `!` 行不带图片：先把图片去掉。Eitri 自己运行的词，比如 `/plan` 或 `/tasks`，照样有效，图片留在草稿里。如果页面重新加载时，一张粘贴的图片还没有完整交给 Eitri，这张图片会失败，它的小块会请你再粘贴一次；已经交过去的图片（包括拖进来的文件）留在草稿里。把标签页移到另一个窗口时，草稿里的图片会留在原来的窗口，输入框会说明有几张。
+
+一个标签页发出的图片超过 16 MB 之后，它会提醒一次：`this conversation now carries 17 MB of images; /compact or a new tab if Claude starts failing`。Claude Code 会把你发的每张图片都存在它写在磁盘上的会话文件里，和在终端里一样，Eitri 不会删除它们。Eitri 自己对这个标签页的记录只保留每张图片的类型、尺寸和校验和。
+
+Eitri 在一个单独的进程里解码图片，并限制它的内存和时间，所以一个很大或损坏的文件结束的是那个进程，不是窗口。这个进程不是沙箱：它以你的身份运行，能访问你的文件（[已知问题](../known-issues.zh-CN.md#security)）。在比 Linux 5.11 更旧的内核上，或者在禁止它所需系统调用的容器里，任何图片都无法解码，图片的小块上会说明原因。图片只在 Claude 标签页里可用：Codex 或 ACP 标签页会拒绝它们并说明原因。
+
+<a id="not-in-a-claude-tab-yet"></a>
 ### Claude 标签页暂时还没有的
 
-plan 模式、给消息附带文件或图片，以及定时唤醒和 cron 任务的列表。只要标签页开着，它们照样会触发，每次都是一个单独的回合。关闭这个标签页、它所在的视图或整个窗口会取消它们；Eitri 没有它们的列表，所以不会先问。Claude Code 只会在会话结束后保留一种 cron 任务：被要求跨会话保留的那种，它会存在项目的 `.claude/scheduled_tasks.json` 里，之后在这个项目的另一个会话里可能还会运行。
+给消息附带图片以外的文件，以及定时唤醒和 cron 任务的列表。只要标签页开着，定时唤醒和 cron 任务照样会触发，每次都是一个单独的回合。关闭这个标签页、它所在的视图或整个窗口会取消它们；Eitri 没有它们的列表，所以不会先问。Claude Code 只会在会话结束后保留一种 cron 任务：被要求跨会话保留的那种，它会存在项目的 `.claude/scheduled_tasks.json` 里，之后在这个项目的另一个会话里可能还会运行。
 
 Claude Code 终端里把正在运行的前台命令移到后台的 `Ctrl+B`，在 Claude 标签页里没有对应的操作。在 Eitri 里，`Ctrl+b` 是前缀键。
 
@@ -181,6 +220,7 @@ Codex 在它的 `workspace-write` 沙箱里运行，批准策略是 `on-request`
 - 斜杠命令按输入的原样发给 Codex。没有被拦下的命令列表，没有 `/model` 或 `/effort` 选择器，也没有 `/` 命令菜单（Codex 不报告可补全的命令列表）。
 - 没有[Claude 标签页能看到的那些 Claude Code 自己做的事](#what-a-claude-tab-shows-of-claude-codes-own-work)：`/tasks` 和 `/workflows` 按原样发给 Codex，状态栏只统计还在后台运行的命令。
 - `<leader>t`（在终端里继续）会闪出 “Continuing a Codex session in a terminal is not available yet”。
+- 没有 plan 模式，也不能发图片：`/plan` 按输入的原样发给 Codex，粘贴或拖进来的图片会被拒绝并说明原因。
 - `prefix i` 没有只属于 Claude 的几行（Claude 会话 id、CLI 构建、权限规则、账号和模型）。
 - 保存的权限规则、Claude Code 的 auto 模式和 `agent.user_settings` 开关都不适用。
 

@@ -144,10 +144,7 @@ fn turn_outcome(events: &[AgentDomainEvent]) -> TurnOutcome {
 fn send(provider: &AcpProvider, session: &str, text: &str) {
     provider
         .send_turn_with(
-            SendTurnRequest {
-                session_id: session.to_string(),
-                text: text.to_string(),
-            },
+            SendTurnRequest::text(session.to_string(), text.to_string()),
             TurnPolicy {
                 reviewer: Reviewer::Agent,
                 sandbox: agent::Sandbox::Project,

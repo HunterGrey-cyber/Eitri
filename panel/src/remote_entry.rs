@@ -1324,6 +1324,7 @@ mod tests {
                 SessionModeChoice::Manual,
                 None,
                 agent::PromptOrigin::Typed,
+                Vec::new(),
             )
             .unwrap();
         handle.tick();

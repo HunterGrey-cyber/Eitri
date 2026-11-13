@@ -8347,6 +8347,7 @@ describe("App: the ? keymap overlay", () => {
       "Slash commands",
       "Background tasks (/tasks)",
       "Claude's question",
+      "Claude's plan",
       "Anywhere in the window",
       "After Ctrl+b",
     ]);

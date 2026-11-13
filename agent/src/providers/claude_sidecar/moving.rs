@@ -22,10 +22,7 @@
 
 use super::spawn::{HandedOutput, SidecarFds};
 use super::transport::{self, TransportHandoff, TransportKind};
-use super::{
-    handshake_with, lock, requested_cli_mode, ClaudeSidecarProvider, EventQueue, Handshaken, ParkedWatch, WatchMark,
-    WatchState,
-};
+use super::{handshake_with, lock, ClaudeSidecarProvider, EventQueue, Handshaken, ParkedWatch, WatchMark, WatchState};
 use crate::child::{ChildKind, ChildRecord};
 use crate::runtime_thread::RuntimeThread;
 use serde::{Deserialize, Serialize};
@@ -63,6 +60,10 @@ pub struct ClaudeProviderHandoff {
     pub last_text_open: Option<bool>,
     /// Whether the session's CLI-mode line was printed up to `folded_through`.
     pub cli_mode_noted: bool,
+    /// Whether the session was created with plan mode offered, so the taking side judges the CLI's `plan`
+    /// reports as the giving side did. Absent from a peer that predates it: no plan mode.
+    #[serde(default)]
+    pub plan_offered: bool,
     /// Messages reported dropped whose delivery may still come, with their typed text, oldest first.
     pub steers_given_up: Vec<(String, String)>,
     /// The drains' lines in progress, and the stderr tail as newline-ended lines.
@@ -153,6 +154,9 @@ impl ClaudeSidecarProvider {
             // Not carried: only a session create or resume reads it, and the taking side opens none.
             #[cfg(feature = "test-support")]
                 questions_override: _,
+            #[cfg(feature = "test-support")]
+                plan_mode_override: _,
+            plan_offered,
             watches,
             parked,
             released,
@@ -217,6 +221,7 @@ impl ClaudeSidecarProvider {
             last_text_open: Some(last_text_open),
             last_child_replies: child_replies,
             cli_mode_noted,
+            plan_offered: plan_offered.load(Ordering::SeqCst),
             steers_given_up,
             stdout_partial,
             stderr_partial,
@@ -253,6 +258,7 @@ impl ClaudeSidecarProvider {
             last_text_open,
             last_child_replies,
             cli_mode_noted,
+            plan_offered,
             steers_given_up,
             stdout_partial: _,
             stderr_partial: _,
@@ -296,6 +302,9 @@ impl ClaudeSidecarProvider {
             max_message_bytes,
             #[cfg(feature = "test-support")]
             questions_override: None,
+            #[cfg(feature = "test-support")]
+            plan_mode_override: None,
+            plan_offered: AtomicBool::new(plan_offered),
             watches: Mutex::new(Vec::new()),
             parked: Mutex::new(Some(ParkedWatch { session_id, mark })),
             released: AtomicBool::new(false),
@@ -312,7 +321,7 @@ impl ClaudeSidecarProvider {
             return Ok(());
         };
         let held = lock(&self.transport).start_holding();
-        let state = WatchState::resumed(&mark, self.splits_messages, requested_cli_mode(&self.capabilities));
+        let state = WatchState::resumed(&mark, self.splits_messages, self.session_expectation());
         self.watch_from(session_id, state);
         held
     }

@@ -73,6 +73,21 @@ pub struct RecordingProvider {
     held_calls: std::sync::Mutex<Option<std::sync::mpsc::Receiver<()>>>,
     /// How many calls have begun to wait on the hold.
     calls_waiting: AtomicUsize,
+    /// Offers plan mode (`plan_mode_v1`), and its sessions are created with it.
+    plan_mode: bool,
+    /// Every `SetPlanning` that reached it, as its `enter`.
+    planning_calls: std::sync::Mutex<Vec<bool>>,
+    /// While set, every `SetPlanning` is refused with this reply (the sidecar's refusal comes in the reply).
+    planning_refusal: std::sync::Mutex<Option<fn() -> agent::ProviderError>>,
+    /// Advertises `turn_content_v1` with the real sidecar's limits, and takes turns with images.
+    takes_images: bool,
+    /// With `takes_images`: lists `turn_content_v1` but states no limits.
+    states_no_content_limits: bool,
+    /// What the images of every send that reached it were, in order, one list per send.
+    turn_images: std::sync::Mutex<Vec<Vec<agent::AttachmentMeta>>>,
+    /// While set, every send carrying images is recorded and refused with these words, as the sidecar
+    /// refuses content (`TurnContentRefused`).
+    refusing_content: std::sync::Mutex<Option<String>>,
 }
 
 type ClientReadReply = std::sync::mpsc::Sender<Result<agent::ClientToolCallState, agent::ProviderError>>;
@@ -257,6 +272,55 @@ impl RecordingProvider {
     pub fn steers(&self) -> Vec<agent::SteerTurnRequest> {
         self.steers.lock().unwrap().clone()
     }
+    /// A provider that offers plan mode, its sessions created with it; `cli_auto` as [`Self::cli_auto`].
+    pub fn planning(cli_auto: bool) -> Self {
+        RecordingProvider {
+            plan_mode: true,
+            cli_auto,
+            interrupt_capable: true,
+            ..Default::default()
+        }
+    }
+    /// Every `SetPlanning` that reached the provider, as its `enter`.
+    pub fn planning_calls(&self) -> Vec<bool> {
+        self.planning_calls.lock().unwrap().clone()
+    }
+    /// Replies to every later `SetPlanning` with `error`, or with the target mode again with `None`.
+    pub fn refuse_planning(&self, error: Option<fn() -> agent::ProviderError>) {
+        *self.planning_refusal.lock().unwrap() = error;
+    }
+    /// A provider that takes images on a turn, as a Claude sidecar listing `turn_content_v1` does.
+    pub fn image_taking() -> Self {
+        RecordingProvider {
+            takes_images: true,
+            ..Default::default()
+        }
+    }
+    /// [`RecordingProvider::image_taking`] that also takes messages into the running turn.
+    pub fn image_taking_steering() -> Self {
+        RecordingProvider {
+            takes_images: true,
+            steering: true,
+            interrupt_capable: true,
+            ..Default::default()
+        }
+    }
+    /// [`RecordingProvider::image_taking`] whose handshake lists `turn_content_v1` and states no limits.
+    pub fn image_taking_without_limits() -> Self {
+        RecordingProvider {
+            takes_images: true,
+            states_no_content_limits: true,
+            ..Default::default()
+        }
+    }
+    /// What the images of every send that reached the provider were, one list per send.
+    pub fn turn_images(&self) -> Vec<Vec<agent::AttachmentMeta>> {
+        self.turn_images.lock().unwrap().clone()
+    }
+    /// Refuses every later send carrying images with `words` (`TurnContentRefused`), or none with `None`.
+    pub fn refuse_content(&self, words: Option<&str>) {
+        *self.refusing_content.lock().unwrap() = words.map(str::to_string);
+    }
     /// A provider whose sessions run the CLI's own auto mode under the gate
     /// (`ProviderCapabilities::cli_auto_mode`), so the host may defer to it.
     pub fn cli_auto() -> Self {
@@ -336,8 +400,41 @@ impl agent::AgentProvider for RecordingProvider {
             direct_settings: self.task_control,
             task_output_range: self.task_control,
             client_tools: self.client_tools,
+            plan_mode_v1: self.plan_mode,
+            turn_content_v1: self.takes_images,
+            turn_content_limits: (self.takes_images && !self.states_no_content_limits).then(|| {
+                agent::TurnContentLimits {
+                    image_media_types: ["image/png", "image/jpeg", "image/gif", "image/webp"]
+                        .map(String::from)
+                        .to_vec(),
+                    max_images_per_turn: 8,
+                    max_image_bytes: 3_670_016,
+                    max_content_bytes: 3_670_016,
+                }
+            }),
             ..ProviderCapabilities::default()
         }
+    }
+    fn cli_expectation(&self) -> agent::CliExpectation {
+        agent::CliExpectation {
+            requested: if self.cli_auto {
+                agent::RequestedCliMode::Auto
+            } else {
+                agent::RequestedCliMode::Default
+            },
+            plan_offered: self.plan_mode,
+        }
+    }
+    fn set_planning(&self, request: agent::SetPlanningRequest) -> Result<agent::PlanningSend, agent::ProviderError> {
+        if !self.plan_mode {
+            return Err(agent::ProviderError::UnsupportedCapability("plan_mode_v1"));
+        }
+        self.planning_calls.lock().unwrap().push(request.enter);
+        let reply = match *self.planning_refusal.lock().unwrap() {
+            Some(error) => Err(error()),
+            None => Ok(if request.enter { "plan" } else { "default" }.to_string()),
+        };
+        Ok(agent::PlanningSend::ready(reply))
     }
     fn answer_client_tool_call(&self, answer: agent::ClientToolAnswer) -> Result<(), agent::ProviderError> {
         if !self.client_tools {
@@ -401,7 +498,22 @@ impl agent::AgentProvider for RecordingProvider {
     }
     fn send_turn(&self, request: agent::SendTurnRequest) -> Result<String, agent::ProviderError> {
         self.wait_if_held();
+        if !request.images.is_empty() && !self.takes_images {
+            return Err(agent::ProviderError::UnsupportedCapability("turn_content_v1"));
+        }
+        self.turn_images
+            .lock()
+            .unwrap()
+            .push(request.images.iter().map(|image| image.meta.clone()).collect());
         self.turns.lock().unwrap().push(request.text);
+        if !request.images.is_empty() {
+            if let Some(words) = self.refusing_content.lock().unwrap().clone() {
+                return Err(agent::ProviderError::Provider {
+                    code: agent::ProviderErrorCode::TurnContentRefused,
+                    message: words,
+                });
+            }
+        }
         if self.refusing.load(Ordering::SeqCst) {
             return Err(agent::ProviderError::Provider {
                 code: agent::ProviderErrorCode::TurnAlreadyActive,

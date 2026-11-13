@@ -2068,6 +2068,7 @@ mod tests {
                 wire: "hello".into(),
                 typed: "hello".into(),
                 shell_line: false,
+                attachments: Vec::new(),
             },
         );
         assert!(held.is_none(), "held for the presence");
@@ -2114,6 +2115,7 @@ mod tests {
                 wire: "hello".into(),
                 typed: "hello".into(),
                 shell_line: false,
+                attachments: Vec::new(),
             },
         );
         assert!(held.is_none(), "held for the presence");
@@ -3073,6 +3075,7 @@ mod tests {
                 wire: "hello".into(),
                 typed: "hello".into(),
                 shell_line: false,
+                attachments: Vec::new(),
             },
         );
         assert!(held.is_none(), "held for the presence");

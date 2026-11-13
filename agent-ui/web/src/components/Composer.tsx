@@ -34,6 +34,10 @@ import { NO_TEXT_ASSIST } from "../textField";
 import { runningPlaceholder } from "../queueLines";
 import { isModifierKey } from "../typingGuard";
 import { CTRL_X_ONLY_ENTER_FLASH } from "../app/flashes";
+import { holdsImage, imageItemFiles, imagesBlocking } from "../attachments";
+import { revealedText } from "../revealHidden";
+import { AttachmentChips } from "./AttachmentChips";
+import type { DraftImage } from "../types";
 
 /** How long `Ctrl+x` waits for its second key. */
 export const CTRL_X_CHORD_MS = 2000;
@@ -46,6 +50,28 @@ export const CTRL_X_SHOWCMD = "Ctrl+x -";
  * row: a new string identical to the old one would not change the effect's dependency, and the
  * second restore would silently not happen. */
 export type RestoredDraft = { text: string; seq: number };
+
+/** The draft's images, for a composer that takes them: the host's chips, how many this page is still reading, whether
+ *  the tab takes images (and the host's words for why not), and where pasted image files and removals go. */
+export type ComposerImages = {
+  items: readonly DraftImage[];
+  pending: number;
+  imageInput: boolean;
+  why: string | null;
+  onFiles: (files: File[]) => void;
+  onRemove: (id: string) => void;
+  /** The host's words on an image it refused before any chip showed it, said at the box. `seq` so the same words
+   *  twice are said twice. */
+  notice?: { text: string; seq: number } | null;
+};
+
+/** What a paste or a drop of images says when the tab takes none. */
+export function noImagesWords(images: ComposerImages | undefined): string {
+  return revealedText(images?.why ?? "this tab cannot take images");
+}
+
+/** Why `Ctrl+Enter` cannot send a draft that holds images. */
+export const SEND_NOW_WITH_IMAGES = "Ctrl+Enter cannot send images: Enter queues the message with them";
 
 type Props = {
   disabled: boolean;
@@ -88,7 +114,8 @@ type Props = {
    *  passes the negation of `disabled`: a landing on a textarea that cannot take focus would put the
    *  panel in an INPUT with nothing to type into. */
   hintTarget?: boolean;
-  onSend: (text: string) => void;
+  /** `attachments`: the draft's images that go with it, in order (absent without images). */
+  onSend: (text: string, attachments?: string[]) => void;
   /** Enter on a `!` line in a Claude tab: it runs as the person's own command. The one way a line runs; the
    *  rest of the panel's paths send words. */
   onRunShell?: (text: string) => void;
@@ -105,7 +132,7 @@ type Props = {
   enterSteers?: boolean;
   /** A message for the running turn (Enter while one runs), or, with `afterTurn`, one that waits for the turn's
    *  end whatever Enter does with what is typed after it (`Ctrl+x Enter`, sent with or without a turn). */
-  onQueue?: (text: string, options?: { afterTurn: boolean }) => void;
+  onQueue?: (text: string, options?: { afterTurn?: boolean; attachments?: string[] }) => void;
   /** The `Ctrl+x` chord's showcmd: `CTRL_X_SHOWCMD` while it waits for its second key, `null` when it ends.
    *  Only a composer given this has the chord; without it (the start screen's) `Ctrl+x` is the box's own cut. */
   onChord?: (showcmd: string | null) => void;
@@ -154,6 +181,8 @@ type Props = {
    *  Only then: with the keys here the caret is the sign, and grey text behind an input method's preedit
    *  reads as a second line of input. */
   idleHint?: string;
+  /** The draft's images. Without it the box takes none: a pasted image is refused and nothing is read. */
+  images?: ComposerImages;
 };
 
 /** `Ctrl+x` itself, nothing else held (Caps Lock may make the letter upper case). */
@@ -204,6 +233,7 @@ export function Composer({
   onLineKey,
   browseKey = "i",
   idleHint,
+  images,
 }: Props) {
   const [text, setText] = useState("");
   const [walk, setWalk] = useState<HistoryWalk>({ index: null, stash: "" });
@@ -285,6 +315,8 @@ export function Composer({
      box reads as lag. That is only acceptable if a refused send puts the text back — otherwise the
      message is gone with no trace, which is the one outcome this must never produce. */
   const textareaRef = useRef<HTMLTextAreaElement>(null);
+  /** The whole box, chips included: where ← at the text's start finds the last chip. */
+  const rootRef = useRef<HTMLDivElement>(null);
   /** Where the caret goes on focus: the end, unless the user left it elsewhere in the same text. */
   const caretRef = useRef<number | null>(null);
 
@@ -466,6 +498,8 @@ export function Composer({
   function submit(how: "enter" | "now" | "after") {
     if (disabled || editingInNvim) return;
     const body = text;
+    const chips = images?.items ?? [];
+    const withImages = chips.length > 0 || (images?.pending ?? 0) > 0;
     const action = claudeSlashCommands ? slashAction(body) : null;
     if (action !== null) {
       onSlashAction?.(action);
@@ -477,6 +511,29 @@ export function Composer({
       }
       return;
     }
+    // A shell line takes no images: the draft keeps both until one of them goes.
+    if (withImages && claudeSlashCommands && body.startsWith("!")) {
+      showSlashFlash("remove the images first: a command takes none");
+      return;
+    }
+    if (withImages && body.trimStart().startsWith("/")) {
+      showSlashFlash("a message starting with / takes no images: remove the images first");
+      return;
+    }
+    if (withImages) {
+      // `Ctrl+Enter` refuses a draft with images during a turn; between turns it is Enter.
+      // With an empty box it sends what is queued, and the images wait in the draft.
+      const blocked = how === "now" && running
+        ? (body.trim() !== "" ? SEND_NOW_WITH_IMAGES : null)
+        : imagesBlocking(chips, images?.pending ?? 0);
+      if (blocked !== null) {
+        showSlashFlash(blocked);
+        return;
+      }
+    }
+    // The ready images, in order: a message may be images alone.
+    const attachments = withImages ? chips.map((chip) => chip.attachmentId) : undefined;
+    const hasContent = body.trim() !== "" || attachments !== undefined;
     if (claudeSlashCommands && body.startsWith("!")) {
       // `!` with nothing after it waits for the command, as Claude Code's shell mode does.
       if (body.slice(1).trim() === "") return;
@@ -494,15 +551,17 @@ export function Composer({
     if (how === "after") {
       // Always the queue, turn shown or not: the host holds it for the running turn's end, or sends it as the
       // next turn when none runs, and nothing on its way can put it into a turn.
-      if (!body.trim()) return;
-      onQueue(body, { afterTurn: true });
+      if (!hasContent) return;
+      onQueue(body, attachments === undefined ? { afterTurn: true } : { afterTurn: true, attachments });
     } else if (running) {
       if (how === "now") onSendNow(body);
+      else if (attachments !== undefined) onQueue(body, { attachments });
       else if (body.trim()) onQueue(body);
       else return;
     } else {
-      if (!body.trim()) return;
-      onSend(body);
+      if (!hasContent) return;
+      if (attachments === undefined) onSend(body);
+      else onSend(body, attachments);
     }
     setBox("");
     setWalk({ index: null, stash: "" });
@@ -605,6 +664,29 @@ export function Composer({
         return;
       }
     }
+    // ← with the caret at the very start and nothing selected moves onto the images before the text, the last first.
+    if (
+      e.key === "ArrowLeft" && !e.ctrlKey && !e.altKey && !e.metaKey && !e.shiftKey &&
+      el.selectionStart === 0 && el.selectionEnd === 0 && images !== undefined && images.items.length > 0
+    ) {
+      const chips = rootRef.current?.querySelectorAll<HTMLElement>(".attachment-chip[data-attachment-id]");
+      const last = chips?.[chips.length - 1];
+      if (last !== undefined) {
+        e.preventDefault();
+        last.focus();
+        return;
+      }
+    }
+    // Backspace with the caret at the very start and nothing selected takes the last image out, as a chat app's box
+    // does with what sits before its text.
+    if (
+      e.key === "Backspace" && !e.ctrlKey && !e.altKey && !e.metaKey && !e.shiftKey && !editingInNvim &&
+      el.selectionStart === 0 && el.selectionEnd === 0 && images !== undefined && images.items.length > 0
+    ) {
+      e.preventDefault();
+      if (!e.repeat) images.onRemove(images.items[images.items.length - 1].attachmentId);
+      return;
+    }
     // `modeKey.ts` claims Shift+Tab in document capture before this handler.
     if (e.key === "Enter" && !e.shiftKey) {
       e.preventDefault();
@@ -689,8 +771,74 @@ export function Composer({
     }
   }
 
+  // An image refused before it had a chip is said here, where it was pasted.
+  const imageNotice = images?.notice ?? null;
+  useEffect(() => {
+    if (imageNotice !== null) showSlashFlash(imageNotice.text);
+    else setSlashFlash(null);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [imageNotice]);
+
+  /** Image files pasted: imported when the tab takes images, else refused with the host's reason and
+   *  nothing read. */
+  function takeImages(files: () => File[]) {
+    if (disabled || editingInNvim) return;
+    if (images === undefined || !images.imageInput) {
+      showSlashFlash(noImagesWords(images));
+      return;
+    }
+    const taken = files();
+    if (taken.length > 0) images.onFiles(taken);
+  }
+
+  /** A paste holding an image imports it and inserts no text (a browser's copied image also offers its HTML); one
+   *  that also holds plain text (a spreadsheet's cells, say) is that text, as before images, and any other paste is
+   *  the box's own. */
+  function onPaste(e: React.ClipboardEvent<HTMLTextAreaElement>) {
+    const items = e.clipboardData?.items;
+    if (!holdsImage(items)) return;
+    const plain = typeof e.clipboardData?.getData === "function" ? e.clipboardData.getData("text/plain") : "";
+    if (plain.trim() !== "") return;
+    e.preventDefault();
+    takeImages(() => imageItemFiles(items));
+  }
+
+  /** A file dragged over the box may be dropped there. WebKitGTK gives a page a dropped file's link and not its bytes
+   *  (the window takes the file itself), so what reaches here is kept out of the box: never a file's link or path as
+   *  text. */
+  function dragCarriesFiles(e: React.DragEvent): boolean {
+    const types = Array.from(e.dataTransfer?.types ?? []);
+    return types.includes("Files") || types.includes("text/uri-list");
+  }
+  function onDragOver(e: React.DragEvent<HTMLDivElement>) {
+    if (dragCarriesFiles(e)) e.preventDefault();
+  }
+  function onDrop(e: React.DragEvent<HTMLDivElement>) {
+    if (!dragCarriesFiles(e)) return;
+    e.preventDefault();
+
+  }
+
+  const chips = images !== undefined && (images.items.length > 0 || images.pending > 0) ? (
+    <AttachmentChips
+      items={images.items}
+      pending={images.pending}
+      onRemove={images.onRemove}
+      onLeave={() => {
+        onModeChange("input");
+        focusAtCaret();
+      }}
+    />
+  ) : null;
+
   return (
-    <div className={shellMode ? "composer composer-shell" : "composer"} {...(hintTarget ? { [HINT_COMPOSER_ATTR]: "" } : {})}>
+    <div
+      ref={rootRef}
+      className={shellMode ? "composer composer-shell" : "composer"}
+      {...(hintTarget ? { [HINT_COMPOSER_ATTR]: "" } : {})}
+      onDragOver={onDragOver}
+      onDrop={onDrop}
+    >
       {closing && (
         <p className="composer-closing" role="status">
           This conversation is being closed so it can continue in a terminal. Anything still in the
@@ -702,6 +850,7 @@ export function Composer({
           {slashFlash.text}
         </p>
       )}
+      {chips}
       {mode === "input" ? (
         <>
           {searching && (
@@ -775,11 +924,15 @@ export function Composer({
             onBlur={(e) => {
               // The keys are going elsewhere: the chord's second key could not reach this box.
               endChord();
-              if (!(e.relatedTarget instanceof HTMLElement && e.relatedTarget.closest(".history-search"))) {
+              // The keys moving onto the draft's images (← at the start) stay in INPUT: the chips are the box's own.
+              if (
+                !(e.relatedTarget instanceof HTMLElement && e.relatedTarget.closest(".history-search, .attachment-chips"))
+              ) {
                 onModeChange("browse");
               }
             }}
             onKeyDown={onKeyDown}
+            onPaste={onPaste}
             onKeyUp={(e) => {
               caretRef.current = e.currentTarget.selectionStart;
               trackCaret(e.currentTarget);
@@ -798,7 +951,9 @@ export function Composer({
                     : // Only held messages: ↑ takes those back and Ctrl+Enter sends them, while a message
                       // already sent into the turn can be neither, so it leaves the running hint in place.
                       queueCount > 0
-                      ? "↑ to edit queued messages, Ctrl+Enter to send them now"
+                      ? images !== undefined && images.items.length > 0
+                        ? "↑ to edit queued messages"
+                        : "↑ to edit queued messages, Ctrl+Enter to send them now"
                       : running
                         ? runningPlaceholder(enterSteers)
                         : // Nothing in an ordinary empty box while it holds the keys: the caret and the box's

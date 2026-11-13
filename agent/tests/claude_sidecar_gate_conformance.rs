@@ -75,10 +75,10 @@ fn create(provider: &ClaudeSidecarProvider, cwd: &Path) -> String {
 fn write_request(provider: &ClaudeSidecarProvider, session: &str, permission: &str, target: &Path) -> String {
     assert!(!target.exists());
     let turn = provider
-        .send_turn(SendTurnRequest {
-            session_id: session.into(),
-            text: format!("ask-write {permission} {};end", serde_json::to_string(target).unwrap()),
-        })
+        .send_turn(SendTurnRequest::text(
+            session,
+            format!("ask-write {permission} {};end", serde_json::to_string(target).unwrap()),
+        ))
         .unwrap();
     let events = until(provider, |events| {
         events.iter().any(|event| {
@@ -282,10 +282,7 @@ fn two_providers_in_one_directory_answer_only_their_own_permissions() {
     // A completed control turn orders B's pump after its own sidecar has processed a request.
     let b_has_no_permission = || {
         let turn = provider_b
-            .send_turn(SendTurnRequest {
-                session_id: b.clone(),
-                text: "text marker pong;end".into(),
-            })
+            .send_turn(SendTurnRequest::text(b.clone(), "text marker pong;end"))
             .unwrap();
         let events = completed(&provider_b, &turn, TurnOutcome::Completed);
         assert!(
@@ -369,10 +366,7 @@ fn interrupting_a_pending_write_blocks_its_effect_and_keeps_the_session_usable()
         "an interrupted request must not accept a late Allow"
     );
     let follow_up = provider
-        .send_turn(SendTurnRequest {
-            session_id: session.clone(),
-            text: "text follow-up pong;end".into(),
-        })
+        .send_turn(SendTurnRequest::text(session.clone(), "text follow-up pong;end"))
         .unwrap();
     assert_ne!(turn, follow_up);
     let events = completed(&provider, &follow_up, TurnOutcome::Completed);
@@ -404,13 +398,13 @@ fn shutdown_after_interrupt_reaps_the_spawned_sidecar_child() {
     let start = agent::process_probe::start_time(pid).expect("the live child's OS start time");
     let target = scratch.0.join("shutdown.txt");
     provider
-        .send_turn(SendTurnRequest {
-            session_id: session.clone(),
-            text: format!(
+        .send_turn(SendTurnRequest::text(
+            session.clone(),
+            format!(
                 "ignore-eof;ask-write shutdown {};end",
                 serde_json::to_string(&target).unwrap()
             ),
-        })
+        ))
         .unwrap();
     until(&provider, |events| {
         events.iter().any(|event| {

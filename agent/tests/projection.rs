@@ -1312,6 +1312,7 @@ fn no_single_event_ever_creates_more_than_one_item() {
             .chain(projection.turn_starts.iter().map(|r| r.seq))
             .chain(projection.notices.iter().map(|r| r.seq))
             .chain(projection.questions.iter().map(|r| r.seq))
+            .chain(projection.plans.iter().map(|r| r.seq))
             .collect();
         let before_dedup = seqs.len();
         seqs.sort_unstable();
@@ -1363,6 +1364,17 @@ fn a_user_prompt_is_an_item_of_its_own_and_closes_an_open_assistant_message() {
     assert_eq!(projection.transcript.len(), 2, "{:?}", projection.transcript);
     assert!(projection.user_prompts[0].seq > projection.transcript[0].seq);
     assert!(projection.user_prompts[0].seq < projection.transcript[1].seq);
+}
+
+/// What one image sent with a prompt was.
+fn image_meta() -> agent::AttachmentMeta {
+    agent::AttachmentMeta {
+        media_type: "image/png".into(),
+        bytes: 1024,
+        width: 32,
+        height: 32,
+        sha256: "ab".repeat(32),
+    }
 }
 
 /// One of every `AgentDomainEvent` variant, in an order that exercises the arms that interact
@@ -1534,8 +1546,39 @@ fn every_event_variant() -> Vec<AgentDomainEvent> {
             answers: vec![],
             reason: None,
         },
+        AgentDomainEvent::PlanProposed {
+            interaction_id: "p-1".into(),
+            tool_use_id: Some("tu-p".into()),
+            plan: "# Plan".into(),
+            plan_sha256: "0".repeat(64),
+            allowed_prompts: vec![],
+            unsupported_reason: None,
+        },
+        AgentDomainEvent::PlanSettled {
+            interaction_id: "p-1".into(),
+            outcome: agent::PlanOutcome::KeptPlanning,
+            mode_after: None,
+            feedback: Some(String::new()),
+            reason: None,
+        },
+        AgentDomainEvent::CliPlanMode {
+            source: "SessionReady".into(),
+        },
+        AgentDomainEvent::PlanTransitionStarted {
+            enter: true,
+            cause: agent::PlanCause::Host,
+            at_ms: 1,
+        },
+        AgentDomainEvent::PlanTransitionUndone {
+            enter: true,
+            cause: agent::PlanCause::Host,
+        },
         AgentDomainEvent::CliWorkUnseen,
         AgentDomainEvent::UserPromptWithdrawn,
+        // Sets the newest prompt's images: no item of its own.
+        AgentDomainEvent::UserPromptAttachments {
+            attachments: vec![image_meta()],
+        },
         AgentDomainEvent::SessionServers {
             servers: vec![agent::InitServer {
                 name: "eitri".into(),
@@ -1620,8 +1663,14 @@ fn label(event: &AgentDomainEvent) -> &'static str {
         AgentDomainEvent::SessionNotice { .. } => "SessionNotice",
         AgentDomainEvent::QuestionAsked { .. } => "QuestionAsked",
         AgentDomainEvent::QuestionSettled { .. } => "QuestionSettled",
+        AgentDomainEvent::PlanProposed { .. } => "PlanProposed",
+        AgentDomainEvent::PlanSettled { .. } => "PlanSettled",
+        AgentDomainEvent::CliPlanMode { .. } => "CliPlanMode",
+        AgentDomainEvent::PlanTransitionStarted { .. } => "PlanTransitionStarted",
+        AgentDomainEvent::PlanTransitionUndone { .. } => "PlanTransitionUndone",
         AgentDomainEvent::CliWorkUnseen => "CliWorkUnseen",
         AgentDomainEvent::UserPromptWithdrawn => "UserPromptWithdrawn",
+        AgentDomainEvent::UserPromptAttachments { .. } => "UserPromptAttachments",
         AgentDomainEvent::TurnCauseUpdated { .. } => "TurnCauseUpdated",
         AgentDomainEvent::CliCycleStarted { .. } => "CliCycleStarted",
         AgentDomainEvent::BackgroundTasksChanged { .. } => "BackgroundTasksChanged",
@@ -1858,8 +1907,38 @@ fn thinking_open_after_says_what_apply_does() {
             client_message_id: "eitri-1-2".into(),
             reason: "the turn ended before the agent read it".into(),
         },
+        AgentDomainEvent::PlanProposed {
+            interaction_id: "p-1".into(),
+            tool_use_id: Some("tu-p".into()),
+            plan: "# Plan".into(),
+            plan_sha256: "0".repeat(64),
+            allowed_prompts: vec![],
+            unsupported_reason: None,
+        },
+        AgentDomainEvent::PlanSettled {
+            interaction_id: "p-1".into(),
+            outcome: agent::PlanOutcome::KeptPlanning,
+            mode_after: None,
+            feedback: Some(String::new()),
+            reason: None,
+        },
+        AgentDomainEvent::CliPlanMode {
+            source: "SessionReady".into(),
+        },
+        AgentDomainEvent::PlanTransitionStarted {
+            enter: true,
+            cause: agent::PlanCause::Host,
+            at_ms: 1,
+        },
+        AgentDomainEvent::PlanTransitionUndone {
+            enter: true,
+            cause: agent::PlanCause::Host,
+        },
         AgentDomainEvent::CliWorkUnseen,
         AgentDomainEvent::UserPromptWithdrawn,
+        AgentDomainEvent::UserPromptAttachments {
+            attachments: vec![image_meta()],
+        },
         AgentDomainEvent::SessionServers { servers: vec![] },
         AgentDomainEvent::ClientToolCall {
             call_id: "c1".into(),

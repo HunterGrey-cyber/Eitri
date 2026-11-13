@@ -106,6 +106,8 @@ pub enum Field {
     Text,
     /// One side has the words opening a turn, the other inside a running one.
     Via,
+    /// The message carried other images: another number, another type or another digest.
+    Images,
     Name,
     Input,
     IsError,
@@ -114,8 +116,10 @@ pub enum Field {
     Questions,
     /// A question set has answers to other questions.
     Answered,
-    /// A question set ended another way.
+    /// A question set or a plan ended another way.
     Outcome,
+    /// A plan has another text (another digest).
+    PlanText,
     /// The entry sits in another turn than its CLI turn's place in the record.
     Turn,
     /// The entry sits elsewhere in the order.
@@ -215,6 +219,7 @@ enum Key {
     Interrupted,
     Ended(String),
     Question(String),
+    Plan(String),
 }
 
 fn key(entry: &Entry) -> Key {
@@ -229,6 +234,7 @@ fn key(entry: &Entry) -> Key {
         Entry::Interrupted => Key::Interrupted,
         Entry::Ended { reason } => Key::Ended(format!("{reason:?}")),
         Entry::Question { id, .. } => Key::Question(id.clone()),
+        Entry::Plan { id, .. } => Key::Plan(id.clone()),
     }
 }
 
@@ -277,7 +283,7 @@ fn lcs<K: PartialEq>(a: &[K], b: &[K]) -> Vec<(usize, usize)> {
 enum Paired {
     /// By the subsequence within a segment.
     Lcs,
-    /// A tool result or a question set, by its tool-use id.
+    /// A tool result, a question set or a plan, by its tool-use id.
     ById,
     Order,
     Text,
@@ -296,9 +302,12 @@ fn entry_at(turns: &[Turn], at: At) -> &Entry {
 }
 
 /// Whether an entry belongs to a call and pairs by the call's tool-use id rather than by its place: a
-/// tool result, or the question set a question call settled.
+/// tool result, or the question set or plan a call settled.
 fn is_result(entry: &Entry) -> bool {
-    matches!(entry, Entry::ToolResult { .. } | Entry::Question { .. })
+    matches!(
+        entry,
+        Entry::ToolResult { .. } | Entry::Question { .. } | Entry::Plan { .. }
+    )
 }
 
 /// Whether the record can be held to the turn of the entry at `index` in its turn.
@@ -357,7 +366,7 @@ fn align_turns(cli: Vec<Turn>, eitri: Vec<Turn>, record: &EitriForm, pieces: &[V
         }
     }
 
-    // Tool results and question sets pair by id across the whole form.
+    // Tool results, question sets and plans pair by id across the whole form.
     let mut eitri_results: HashMap<Key, Vec<At>> = HashMap::new();
     for (t, turn) in eitri.iter().enumerate() {
         for (i, entry) in turn.entries.iter().enumerate() {
@@ -810,11 +819,25 @@ fn compare(cli: &Entry, eitri: &Entry, record: &EitriForm) -> (Vec<Field>, Vec<N
         }
     };
     match (cli, eitri) {
-        (Entry::User { text: a, via: va }, Entry::User { text: b, via: vb }) => {
+        (
+            Entry::User {
+                text: a,
+                via: va,
+                images: ia,
+            },
+            Entry::User {
+                text: b,
+                via: vb,
+                images: ib,
+            },
+        ) => {
             if user_text(a) != user_text(b) {
                 fields.push(Field::Text);
             } else {
                 text_notes(a, b, true, &mut notes);
+            }
+            if ia != ib {
+                fields.push(Field::Images);
             }
             if (*va == Via::Prompt) != (*vb == Via::Prompt) {
                 fields.push(Field::Via);
@@ -880,6 +903,14 @@ fn compare(cli: &Entry, eitri: &Entry, record: &EitriForm) -> (Vec<Field>, Vec<N
                 fields.push(Field::Outcome);
             }
         }
+        (Entry::Plan { key: ka, .. }, Entry::Plan { key: kb, .. }) => {
+            if ka.plan_sha256 != kb.plan_sha256 {
+                fields.push(Field::PlanText);
+            }
+            if ka.end != kb.end {
+                fields.push(Field::Outcome);
+            }
+        }
         (a, b) if a.kind() != b.kind() => fields.push(Field::Text),
         _ => {}
     }
@@ -890,7 +921,7 @@ fn compare(cli: &Entry, eitri: &Entry, record: &EitriForm) -> (Vec<Field>, Vec<N
 /// its own truncation, counted from the oldest.
 ///
 /// A record that counted what it left out accounts for that many items by the caps' measure (a person's
-/// prompt, each reply block, each tool call with its result and question set), and an older entry of no counted kind
+/// prompt, each reply block, each tool call with its result, question set and plan), and an older entry of no counted kind
 /// between them; what lies past the count is a loss of its own. A record that could not count accounts
 /// for the whole prefix, and so does the stored history when the newest item left out could not have
 /// fitted its caps.
@@ -920,8 +951,10 @@ fn truncated_prefix(omission: &Omission, cli: &[Turn], pieces: &[Vec<usize>], pr
                         cut_calls.push(id);
                         counted <= *n
                     }
-                    // A result and a question set go with their call, which the count already holds.
-                    Entry::ToolResult { id, .. } | Entry::Question { id, .. } => cut_calls.contains(&id.as_str()),
+                    // A result, a question set and a plan go with their call, which the count already holds.
+                    Entry::ToolResult { id, .. } | Entry::Question { id, .. } | Entry::Plan { id, .. } => {
+                        cut_calls.contains(&id.as_str())
+                    }
                     _ => counted < *n,
                 };
                 if !fits {

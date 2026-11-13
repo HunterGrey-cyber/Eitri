@@ -20,10 +20,10 @@ fn a_real_turn_s_reply_arrives_via_pump() {
         .unwrap();
 
     provider
-        .send_turn(agent::SendTurnRequest {
-            session_id: session_id.clone(),
-            text: "reply with exactly the word: pong".into(),
-        })
+        .send_turn(agent::SendTurnRequest::text(
+            session_id.clone(),
+            "reply with exactly the word: pong",
+        ))
         .unwrap();
 
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);

@@ -270,6 +270,11 @@ pub struct Scenario {
     pub classifier: Option<Classifier>,
     #[serde(default)]
     pub branches: BTreeMap<String, Vec<String>>,
+    /// By layer, the `BRANCH` lines the scenario's test must print in at least one run of a `--repeat` of more than
+    /// one: a row whose timing may take either branch still has to show the one it is about. Read only by the harness
+    /// runner that repeats scenarios, never by the scripted model.
+    #[serde(default)]
+    pub required_branches: BTreeMap<String, Vec<String>>,
     #[serde(default = "default_layers")]
     pub layers: Vec<String>,
     #[serde(default)]
@@ -292,7 +297,7 @@ fn default_layers() -> Vec<String> {
 }
 
 /// Capabilities a driver part or variant may require.
-pub const KNOWN_CAPABILITIES: [&str; 10] = [
+pub const KNOWN_CAPABILITIES: [&str; 11] = [
     "client_tools",
     "chat_move",
     "task_control",
@@ -301,6 +306,7 @@ pub const KNOWN_CAPABILITIES: [&str; 10] = [
     "background_tasks",
     "human_origin",
     "structured_questions_v1",
+    "plan_mode_v1",
     "direct_settings",
     "eitri_bash_ceiling",
 ];

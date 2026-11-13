@@ -31,6 +31,8 @@ pub enum PanelAction {
     Follow,
     /// The remote-control device list (only offered while remote control is on in the window).
     RemoteDevices,
+    /// The person's own move into or out of Claude's plan mode (`/plan` too).
+    PlanToggle,
 }
 
 /// BROWSE actions resolved as built-in motions, preserving counts and key repeat.
@@ -162,6 +164,7 @@ pub fn parse_action(name: &str) -> Result<PanelAction, String> {
         "tab.stop-background" => PanelAction::StopBackground,
         "tab.follow" => PanelAction::Follow,
         "remote.devices" => PanelAction::RemoteDevices,
+        "plan.toggle" => PanelAction::PlanToggle,
         other => {
             return Err(format!(
                 "{other:?} is not a panel action (init.lua's panel table names)"
@@ -223,6 +226,7 @@ impl PanelAction {
             PanelAction::StopBackground => "tab.stop-background",
             PanelAction::Follow => "tab.follow",
             PanelAction::RemoteDevices => "remote.devices",
+            PanelAction::PlanToggle => "plan.toggle",
         }
     }
 
@@ -278,6 +282,7 @@ impl PanelAction {
             PanelAction::StopBackground => "stop background work",
             PanelAction::Follow => "follow in the editor",
             PanelAction::RemoteDevices => "phones (remote control)",
+            PanelAction::PlanToggle => "plan mode",
         }
     }
 }
@@ -351,7 +356,7 @@ pub fn reserved(seq: &PanelSeq) -> Option<String> {
 /// `<leader>r` is `+remote`, the remote-control keys (an Eitri-only group).
 pub const DEFAULT_GROUPS: &[(&str, &str)] = &[("<leader>b", "+tab"), ("<leader>f", "+new"), ("<leader>r", "+remote")];
 
-/// The 21 default rows, in table order: direct
+/// The 22 default rows, in table order: direct
 /// tab-as-buffer keys first, then the `<leader>` rows. Every row's source is the
 /// LazyVim/nvim/which-key line it copies, or `eitri-only` with why, so no row is invented.
 pub fn default_bindings() -> Vec<PanelBinding> {
@@ -479,6 +484,13 @@ pub fn default_bindings() -> Vec<PanelBinding> {
         PanelBinding {
             seq: parse_seq("<leader>rd").unwrap(),
             action: PanelAction::RemoteDevices,
+            source: PanelSource::Default,
+        },
+        // eitri-only: LazyVim binds no `<leader>p`; p as in plan, Claude Code's `/plan` (its Shift+Tab stop is the
+        // mode key here, which cycles Eitri's own modes).
+        PanelBinding {
+            seq: parse_seq("<leader>p").unwrap(),
+            action: PanelAction::PlanToggle,
             source: PanelSource::Default,
         },
         // lazyvim: plugins/editor.lua:105-110 ("Buffer Keymaps (which-key)")
@@ -726,6 +738,24 @@ mod tests {
     use super::*;
 
     #[test]
+    fn plan_toggle_is_leader_p_by_default_and_named_plan_toggle() {
+        let row = default_bindings()
+            .into_iter()
+            .find(|b| b.action == PanelAction::PlanToggle)
+            .expect("a default row for plan mode");
+        assert_eq!(row.seq, parse_seq("<leader>p").unwrap());
+        assert_eq!(parse_action("plan.toggle").unwrap(), PanelAction::PlanToggle);
+        assert_eq!(PanelAction::PlanToggle.name(), "plan.toggle");
+        assert_eq!(PanelAction::PlanToggle.desc(), "plan mode");
+        // No other default row starts with `<leader>p`, so the key runs at once.
+        let others = default_bindings()
+            .into_iter()
+            .filter(|b| b.seq.0.starts_with(&[PanelKey::Leader, PanelKey::Char('p')]))
+            .count();
+        assert_eq!(others, 1);
+    }
+
+    #[test]
     fn vim_notation_parses_and_round_trips() {
         let seq = parse_seq("<leader>bd").unwrap();
         assert_eq!(seq.0, vec![PanelKey::Leader, PanelKey::Char('b'), PanelKey::Char('d')]);
@@ -807,6 +837,7 @@ mod tests {
             ("Space k", "tab.stop-background"),
             ("Space e", "tab.follow"),
             ("Space r d", "remote.devices"),
+            ("Space p", "plan.toggle"),
             ("Space ?", "panel.keymap"),
         ];
         assert_eq!(
@@ -836,6 +867,7 @@ mod tests {
             "tab.stop-background",
             "tab.follow",
             "remote.devices",
+            "plan.toggle",
         ] {
             assert_eq!(parse_action(name).unwrap().name(), name);
         }

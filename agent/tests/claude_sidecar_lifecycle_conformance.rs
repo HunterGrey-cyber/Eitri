@@ -145,10 +145,7 @@ fn run_turn(
     deadline_secs: u64,
 ) -> Vec<AgentDomainEvent> {
     provider
-        .send_turn(SendTurnRequest {
-            session_id: session_id.to_string(),
-            text: text.to_string(),
-        })
+        .send_turn(SendTurnRequest::text(session_id.to_string(), text.to_string()))
         .expect("send_turn should be accepted");
     let deadline = Instant::now() + Duration::from_secs(deadline_secs);
     let mut events = Vec::new();
@@ -380,10 +377,10 @@ fn real_interrupt_cancels_the_turn_and_the_session_still_accepts_another() {
     let session_id = create_gated_session(&provider);
 
     provider
-        .send_turn(SendTurnRequest {
-            session_id: session_id.clone(),
-            text: "Count slowly from 1 to 200, writing each number on its own line. Do not stop early.".into(),
-        })
+        .send_turn(SendTurnRequest::text(
+            session_id.clone(),
+            "Count slowly from 1 to 200, writing each number on its own line. Do not stop early.",
+        ))
         .unwrap();
 
     // Interrupt only once the turn is genuinely underway. Interrupting before the turn has started
@@ -539,11 +536,10 @@ fn real_drop_after_interrupt_leaves_no_sidecar_or_cli_child() {
     );
     let session_id = create_gated_session(&provider);
     provider
-        .send_turn(SendTurnRequest {
-            session_id: session_id.clone(),
-            text: "Count slowly from 1 to 10000, writing each number on its own line. Do not use tools or stop early."
-                .into(),
-        })
+        .send_turn(SendTurnRequest::text(
+            session_id.clone(),
+            "Count slowly from 1 to 10000, writing each number on its own line. Do not use tools or stop early.",
+        ))
         .unwrap();
     let started = drain_until(&provider, 60, |events| {
         events

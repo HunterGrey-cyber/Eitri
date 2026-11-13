@@ -250,6 +250,22 @@ one-window mode.
 - **In a bypass tab your own ask rules stop nothing.** Since 0.2.2 bypass also approves the questions Claude Code
   raises itself, those your `permissions.ask` rules (or a trusted project's) force included, with no card; the
   tool's row says it was allowed in bypass. Use a Manual or Auto tab where an ask rule has to hold.
+- **Plan mode supervises Claude; it is not a sandbox.** While Claude Code plans, Eitri approves no file edit or command
+  by itself and shows each as a card, but your hooks (and a trusted project's) still run, MCP servers stay loaded, and
+  other tools, an MCP server's included, run wherever the tab's mode lets them. Which calls count as made in plan mode
+  rests on the order in which Claude Code reports them: a call Eitri sees start more than 2 seconds late is judged both
+  ways, as made in plan mode and as made outside it, and is a card where the two answers differ. The plan is Claude's
+  text, drawn with no scripts, with remote images as links and hidden characters shown.
+- **A dynamic workflow's agents get cards in a Bypass tab.** Claude Code does not show Eitri those calls start, so Eitri
+  cannot tell whether one was made in plan mode: it waits 2 seconds and shows a card wherever the two answers would
+  differ, which in Bypass is every such call, also when nobody is planning. In Manual and Auto, their file edits,
+  commands and Claude Code questions that a saved rule or Claude Code's auto mode would have handled are cards too.
+- **Images are decoded under resource limits, not in a sandbox.** Eitri decodes a pasted or dropped image in a separate
+  process limited to 768 MiB of memory beyond its start-up size, 30 seconds of processor time and 60 seconds in all. A
+  file that is merely huge or broken ends that process when it reaches a limit, and the image's chip shows an error.
+  The limits do not contain a file built to exploit a bug in the image decoders: the process runs as you, with your
+  files, and has no system-call filter. It needs Linux 5.11 or newer; in a container or sandbox that forbids the calls it uses, no
+  image can be decoded and the image's chip says why.
 - **The bottom terminal can write to your clipboard, by design.** A program running there can set the clipboard
   or the primary selection with an OSC 52 escape sequence (the same default as Alacritty); Eitri shows no notice
   when it happens, so what you paste next may not be what you copied. Reading the clipboard is refused.
@@ -283,6 +299,13 @@ one-window mode.
   often just the task's description, without saying what happened to the task.
 - **Right after `/clear`, an empty highlighted block can stay in the middle of the empty view.** It goes away when
   the next turn draws.
+- **Claude Code keeps the images you send.** It writes each one into the session file it keeps on disk, as in a
+  terminal, and Eitri does not remove them. Eitri's own record of a tab keeps only each image's type, size and checksum.
+  After 16 MB of images a tab says once that the conversation is heavy and suggests `/compact` or a new tab.
+- **Plan mode and images have been on a screen only in a test session, against a scripted model service with Claude
+  Code 2.1.311.** The plan box, its buttons and the image chips were driven by keys in an isolated desktop session, in
+  dark and light, at a normal and a narrow width. No real model has planned or read an image through Eitri yet, and
+  nobody has used them on a real desktop. Reports of what you see are welcome.
 - **In a narrow chat pane (about 320 pixels) the status line is cut short.** The panel's mode shows as a single
   letter (`I`, `B`), the permission mode's name is cut off (`bypass permission`), and the activity line's spinner
   sits on a line of its own.

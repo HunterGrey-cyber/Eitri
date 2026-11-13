@@ -32,10 +32,21 @@ use crate::tabs::{self, TabFacts, TabId};
 mod agent_rows;
 pub use agent_rows::{AgentWatch, RowContext, RowKey};
 
+mod attachments;
+pub use attachments::{
+    AttachAnswer, AttachmentDesk, DeskEnd, DeskEvent, DeskRequest, DroppedFile, PreparedImage, QueuedDraft, ReadyImage,
+    TabAttachments, ABANDONED, CHUNK_MAX_BYTES, DRAFT_MAX_IMAGES, IMAGE_MAX_BYTES, NAME_MAX_CHARS, PARKED,
+    SESSION_WARN_BYTES,
+};
+#[cfg(test)]
+mod attachment_tests;
+
 mod live_edits;
 pub use live_edits::LiveEdit;
 mod moving;
 mod observers;
+mod plan;
+pub use plan::{PlanChoice, PLAN_APPROVAL_DRAINING, PLAN_CARD_FIRST, PLAN_CHANGING_REFUSAL, PLAN_CYCLE_REFUSAL};
 mod remote_turns;
 mod shell;
 pub use moving::{FrozenChat, FrozenTab, MoveRefusedWhy, SendGate, Sent, TabHandoff};
@@ -54,6 +65,10 @@ mod broker_card_tests;
 mod external_tab_tests;
 #[cfg(test)]
 mod move_tests;
+#[cfg(test)]
+mod plan_gate_tests;
+#[cfg(test)]
+mod plan_page_tests;
 #[cfg(test)]
 mod prompt_origin_tests;
 #[cfg(test)]
@@ -88,6 +103,10 @@ pub struct FirstTurn {
     /// composer's `run_shell` sets it, and like [`Queued::shell_line`] it does not survive being saved.
     #[serde(skip)]
     pub shell_line: bool,
+    /// The images that go with it, after the text and in order. Their bytes live in this process only: a
+    /// saved or moved first turn carries none.
+    #[serde(skip)]
+    pub attachments: Vec<ReadyImage>,
 }
 
 impl FirstTurn {
@@ -233,6 +252,11 @@ pub struct Queued {
     /// ([`QueuedFrom::may_go_in`]), and carries its device across a move.
     #[serde(default, skip_serializing_if = "QueuedFrom::is_desk")]
     pub from: QueuedFrom,
+    /// The images that go with it as one turn of its own, never put into a running turn (a message put into a
+    /// turn carries text alone). In this process only: a saved queue holds words, and a tab whose queue holds
+    /// images does not move ([`MoveRefusedWhy::QueuedImages`]).
+    #[serde(skip)]
+    pub attachments: Vec<ReadyImage>,
 }
 
 impl Queued {
@@ -253,6 +277,7 @@ impl Queued {
             shell_line: false,
             shell_report: false,
             from: QueuedFrom::Desk,
+            attachments: Vec::new(),
         }
     }
 
@@ -463,6 +488,38 @@ pub struct Tab {
     /// session would otherwise grow it for nothing.
     #[cfg(any(test, feature = "test-support"))]
     gate_log: Vec<crate::agent_backend::GateAnswer>,
+    /// The composer's draft images and the image bytes this tab's turns carried ([`TabAttachments`]). On the tab,
+    /// not its session state, so a first message's images survive the start of its session.
+    pub attachments: TabAttachments,
+    /// The tab's mode when its session left executing for plan mode, while it is planning or moving into or
+    /// out of it. The tab keeps that mode underneath; the page shows it as where plan mode started.
+    plan_origin: Option<SessionModeChoice>,
+    /// Plan mode was asked for before the tab's session existed (an empty tab, or a tab restored while it
+    /// was planning): the first message waits until the session has entered plan mode.
+    plan_on_start: bool,
+    /// The newest approved plan whose mode this tab has taken up (`latest_approval`'s seq). Set without
+    /// taking anything up the first time a session is seen, so a plan approved before this window had the
+    /// tab never sets its mode.
+    plan_mode_applied_seq: Option<u64>,
+    /// The plan-mode round this tab follows ([`TabSet::follow_plan_mode`]).
+    plan_cycle: PlanCycle,
+    /// The person's switch into plan mode sent for `plan_on_start`, until its reply is read.
+    plan_start: Option<crate::agent_backend::PlanningSwitch>,
+}
+
+/// Where a tab stands in one round of plan mode, between the session leaving executing and its return.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct PlanCycle {
+    /// A round is under way: the session left executing and the tab has not yet taken up the mode its
+    /// return gives.
+    pub(crate) open: bool,
+    /// The CLI reached plan mode in this round (not only an entry that came to nothing).
+    pub(crate) reached: bool,
+    /// An approval's mode was taken up in this round.
+    pub(crate) taken: bool,
+    /// The mode the latest round started from, kept past its end: an approval naming Bypass keeps Bypass
+    /// only for a round that started in Bypass.
+    pub(crate) origin: Option<SessionModeChoice>,
 }
 
 /// State replaced together when a tab installs or starts over a session. Public only because
@@ -575,6 +632,11 @@ pub struct SessionState {
     /// is the only thing that answers one. Not in [`CallNotes`], which a move carries: a card ends with its call
     /// when a tab leaves the window.
     editor_cards: Vec<crate::editor_tools::cards::EditorCardWire>,
+    /// What plan mode keeps about this session's requests: those held while the mode changes, the cards
+    /// raised in plan mode, and the calls deferred there. Private for the reason `host_answered` is.
+    plan: crate::agent_backend::PlanBook,
+    /// The feedback typed for each waiting plan's "keep planning", by plan id, mirrored from the page.
+    plan_feedback_draft: BTreeMap<String, String>,
 }
 
 /// What a pump found about a tab's calls of declared tools, for the panel's broker.
@@ -694,7 +756,13 @@ impl SessionState {
                     .then(|| id.clone())
             }))
             .filter(|id| !self.user_answered.contains(id));
-        self.host_answered.iter().cloned().chain(held).collect()
+        self.host_answered
+            .iter()
+            .cloned()
+            .chain(held)
+            .chain(self.plan.held.iter().cloned())
+            .chain(self.plan.unsequenced.keys().cloned())
+            .collect()
     }
 
     /// Reports a turn the clock now names and has not been reported. The clock is stamped from the projection on every
@@ -729,6 +797,8 @@ impl SessionState {
         self.user_answered.clear();
         self.client_calls = ClientCalls::default();
         self.editor_cards.clear();
+        self.plan = Default::default();
+        self.plan_feedback_draft.clear();
     }
 
     /// The part a freshly installed backend starts with. What the tab gathered while its backend
@@ -807,6 +877,12 @@ impl Tab {
             review_watchers: Vec::new(),
             #[cfg(any(test, feature = "test-support"))]
             gate_log: Vec::new(),
+            plan_origin: None,
+            plan_on_start: false,
+            plan_mode_applied_seq: None,
+            plan_cycle: PlanCycle::default(),
+            plan_start: None,
+            attachments: TabAttachments::default(),
         }
     }
 
@@ -895,6 +971,9 @@ impl Tab {
         self.backend = TabBackend::Live(backend);
         self.backend_generation += 1;
         self.unseen_stretch.counted_through = None;
+        // The approval taken up last is a `seq` of the projection that went: a new session numbers its own, and
+        // its first look sets this again from them (`follow_plan_mode`).
+        self.plan_mode_applied_seq = None;
     }
 
     /// A tab the set no longer holds ([`TabSet::remove`], [`TabSet::take_all`]) hands over what is left
@@ -973,6 +1052,22 @@ impl Tab {
     pub fn question_waiting(&self) -> bool {
         self.live()
             .is_some_and(|backend| backend.projection().waiting_questions().next().is_some())
+    }
+
+    /// A plan of Claude's waits for a decision.
+    pub fn plan_waiting(&self) -> bool {
+        self.live()
+            .is_some_and(|backend| backend.projection().waiting_plan().is_some())
+    }
+
+    /// The mode plan mode was entered from, while the session is planning or moving into or out of it.
+    pub fn plan_origin(&self) -> Option<SessionModeChoice> {
+        self.plan_origin
+    }
+
+    /// Whether plan mode is asked for before the tab's first message.
+    pub fn plan_on_start(&self) -> bool {
+        self.plan_on_start
     }
 
     pub fn turn_running(&self) -> bool {
@@ -1140,6 +1235,8 @@ impl Tab {
         TabView {
             following: self.following,
             question_draft: self.session.question_draft.clone(),
+            plan_feedback_draft: self.session.plan_feedback_draft.clone(),
+            plan_on_start: self.plan_on_start,
             id: self.id,
             number: self.number,
             label: tabs::label(self.number, &self.label_name()),
@@ -1704,6 +1801,8 @@ pub struct TabSet {
     ui_wake: Option<agent::UiWake>,
     /// The `!` lines running, and where each tab's next one starts.
     shells: shell::Shells,
+    /// The window's attachment desk and the answers owed for it ([`TabSet::install_attachments`]).
+    attach: attachments::Desk,
     /// The extra chat views the window's layout holds, in any workspace ([`TabSet::set_layout_views`]):
     /// the only views a restored tab may come back into.
     layout_views: Vec<ViewId>,
@@ -1724,6 +1823,10 @@ pub struct TabSet {
     /// `after_drain` (fired right after the drain, before any of those) cannot reach.
     #[cfg(test)]
     before_resync_snapshot: Option<BackendSeam>,
+    /// Test seam: run once at the start of the `Resync` arm, after the pump's last look at plan mode
+    /// (`follow_plan_mode`) and before the arm reads what is pending and the bypass sweep answers it.
+    #[cfg(test)]
+    before_resync_sweep: Option<BackendSeam>,
 }
 
 /// A test seam's one-shot hook: what a test folds into a backend at the exact point the seam names.
@@ -1794,6 +1897,7 @@ impl TabSet {
             flush_owed: BTreeSet::new(),
             ui_wake: None,
             shells: shell::Shells::default(),
+            attach: attachments::Desk::default(),
             layout_views: Vec::new(),
             #[cfg(test)]
             after_drain: None,
@@ -1801,6 +1905,8 @@ impl TabSet {
             redeliver_covered: false,
             #[cfg(test)]
             before_resync_snapshot: None,
+            #[cfg(test)]
+            before_resync_sweep: None,
         };
         set.open(AgentId::Claude);
         set.last_active = None;
@@ -1888,6 +1994,30 @@ impl TabSet {
             .turn_review
             .as_ref()
             .is_some_and(crate::turn_review::TurnReview::has_work_in_flight)
+    }
+
+    /// How long until a request held for its call on some tab is judged without it (`PlanBook::next_sequence_release`):
+    /// zero when one is already due, `None` when none is held. The tick is wake-driven and such a request raises no
+    /// wake of its own -- the CLI waits on its answer, and the sidecar may never show its call -- so the window runs a
+    /// tick by then. A tab frozen for a move is left out: it is not drained here, and its new window keeps the times.
+    pub fn next_plan_sequence_release(&self) -> Option<std::time::Duration> {
+        self.tabs
+            .iter()
+            .filter(|tab| !self.moving.contains(&tab.id.0))
+            .filter_map(|tab| tab.session.plan.next_sequence_release())
+            .min()
+    }
+
+    /// Moves the start of the wait of a request on tab `id` that already waits for its call to `first_ms`
+    /// (milliseconds since the epoch). For tests of what wakes the window.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn hold_for_its_call_since(&mut self, id: TabId, permission_id: &str, first_ms: u64) {
+        if let Some(since) = self
+            .get_mut(id)
+            .and_then(|tab| tab.session.plan.unsequenced.get_mut(permission_id))
+        {
+            *since = first_ms;
+        }
     }
 
     /// Starts reviewing turns on a backend that supports turn review. Legacy remains unsupported.
@@ -2005,6 +2135,7 @@ impl TabSet {
             || t.cli_unseen_busy()
             || t.background_calls() > 0
             || t.question_waiting()
+            || t.plan_waiting()
         {
             return None;
         }
@@ -2433,8 +2564,15 @@ impl TabSet {
         } else {
             backend.declared_client_tools()
         };
+        // In plan mode the broker never gives Bypass's answers: a round that started in Bypass is Auto to it.
+        let mode = match tab.mode {
+            SessionModeChoice::Bypass if backend.projection().is_planning() || tab.plan_cycle.open => {
+                SessionModeChoice::Auto
+            }
+            mode => mode,
+        };
         Some(crate::editor_tools::broker::TabFacts {
-            mode: tab.mode.into(),
+            mode: mode.into(),
             trust: tab
                 .session
                 .project_tiers
@@ -2614,6 +2752,8 @@ impl TabSet {
     /// base view's tabs, `before` the active tab before it left.
     fn tab_left(&mut self, tab: &Tab, base_index: Option<usize>, before: TabId) {
         let id = tab.id;
+        // Its staged images go with it: a moved tab carries none, and a closed one sends none.
+        self.forget_images_of(tab);
         self.removed_arrived += tab.attention.attention().arrived;
         self.recency.retain(|t| *t != id);
         if self.last_active == Some(id) {
@@ -2921,6 +3061,11 @@ impl TabSet {
                 return Err(format!("tab {} is not shown in this page", tab.number));
             }
         }
+        // Plan mode owns the CLI's mode until it ends: the mode underneath stays what plan mode started
+        // from, and leaving is the person's own switch.
+        if let Some(refusal) = self.plan_mode_refusal(id) {
+            return Err(refusal.to_string());
+        }
         // A fresh press supersedes whatever prompt was already open; `Confirm` below stores a
         // new one if it builds one.
         self.supersede_prompts(page);
@@ -3065,6 +3210,9 @@ impl TabSet {
                 }
                 if matches!(self.tabs[at].wire_state(), TabStateWire::Ended | TabStateWire::Failed) {
                     return Err("the session has ended".to_string());
+                }
+                if let Some(refusal) = self.plan_mode_refusal(id) {
+                    return Err(refusal.to_string());
                 }
                 if self.tabs[at].mode == SessionModeChoice::Bypass {
                     return Ok(ConfirmOutcome::AlreadyBypass);
@@ -3576,7 +3724,12 @@ impl TabSet {
         {
             parts.push(first_turn.typed.clone());
         }
-        parts.extend(std::mem::take(&mut tab.session.queue).into_iter().map(|q| q.text));
+        let mut images = Vec::new();
+        for queued in std::mem::take(&mut tab.session.queue) {
+            parts.push(queued.text);
+            images.extend(queued.attachments);
+        }
+        let abandoned = tab.attachments.advance_generation();
         if !tab.session.draft.trim().is_empty() {
             parts.push(tab.draft().to_string());
         }
@@ -3586,6 +3739,9 @@ impl TabSet {
         tab.replace_draft(parts.join("\n\n"));
         tab.attention.restart();
         self.pending_bypass = None;
+        self.release_abandoned_imports(id, abandoned);
+        self.images_back_to_draft(id, images);
+        self.draft_changed(id);
         Ok(match old {
             TabBackend::Live(backend) => Some(self.retire(id, backend)),
             _ => None,
@@ -3721,6 +3877,8 @@ impl TabSet {
             redeliver_covered: self.redeliver_covered,
             #[cfg(test)]
             before_resync_snapshot: &mut self.before_resync_snapshot,
+            #[cfg(test)]
+            before_resync_sweep: &mut self.before_resync_sweep,
         };
         for tab in &mut self.tabs {
             // A tab frozen for a move delivers nothing more here: its last pump ran at the freeze, and
@@ -3789,6 +3947,8 @@ impl TabSet {
         out: &mut PumpOutput,
     ) {
         Self::follow_cli_out_of_auto(tab);
+        Self::follow_plan_mode(tab);
+        Self::poll_plan_start(tab);
         let TabBackend::Live(backend) = &mut tab.backend else {
             if let Some(review) = review.as_deref_mut() {
                 review.tab_has_no_session(tab.id.0, wall_clock_ms());
@@ -3816,11 +3976,13 @@ impl TabSet {
             crate::agent_backend::GateMode {
                 mode: tab.mode.into(),
                 followed_out_of_auto: tab.session.followed_out_of_auto,
+                plan_followed: !tab.plan_cycle.open,
             },
             &mut tab.session.host_answered,
             &mut tab.session.human_allowed,
             &tab.session.user_answered,
             &mut answered_for_you,
+            &mut tab.session.plan,
         );
         #[cfg(test)]
         {
@@ -3829,6 +3991,8 @@ impl TabSet {
             }
         }
         Self::follow_cli_out_of_auto(tab);
+        Self::follow_plan_mode(tab);
+        Self::note_planning(tab);
         let TabBackend::Live(backend) = &mut tab.backend else {
             return;
         };
@@ -3920,7 +4084,8 @@ impl TabSet {
         } else if matches!(delivery, RevisedDelivery::Resync { .. }) {
             tab.notes.recover_remote_senders(&backend.projection());
         }
-        let remote_notes_dirty = tab.notes.remote_notes_dirty;
+        // Notes with no events behind them (a phone's message read, plan mode moved) go out on their own.
+        let notes_owed = tab.notes.remote_notes_dirty || tab.notes.planning_dirty;
         let resynced = matches!(delivery, RevisedDelivery::Resync { .. });
         let delivered_revision = match &delivery {
             RevisedDelivery::Events(events) => events.last().map(|(revision, _)| *revision),
@@ -3936,6 +4101,7 @@ impl TabSet {
             following: tab.following,
             id: tab.id,
             mode: tab.mode,
+            plan_followed: !tab.plan_cycle.open,
             backend,
             session: &mut tab.session,
             notes: &mut tab.notes,
@@ -3945,7 +4111,7 @@ impl TabSet {
         // The arms below count this drain's stretches; `pump_arm_events` and `pump_arm_resync` may raise this.
         live.unseen_stretch.counted_through = Some(folded_before);
         let mut arm = match delivery {
-            RevisedDelivery::Nothing if remote_notes_dirty => Self::pump_arm_events(
+            RevisedDelivery::Nothing if notes_owed => Self::pump_arm_events(
                 &mut live,
                 Vec::new(),
                 covered,
@@ -3968,20 +4134,59 @@ impl TabSet {
                 if observed {
                     tick.observers.owe_snapshot(live.id);
                 }
+                #[cfg(test)]
+                {
+                    if let Some(hook) = tick.before_resync_sweep.take() {
+                        hook(live.backend);
+                    }
+                }
                 let (turn_ended, pending) = Self::pump_arm_resync(&mut live);
+                // The snapshot draws or hides every request pending now: each has been looked at, as a drain looks at
+                // those it takes (`PlanBook::looked_at`).
+                live.session.plan.looked_at.extend(pending.iter().cloned());
+                // A request the resync dropped never went through `answer_what_needs_no_human`, which marks the
+                // cards raised in plan mode: while the session plans, every one it draws is such a card, a
+                // person's alone however the tab's mode changes later.
+                if live.backend.projection().is_planning() {
+                    let hidden = live.session.hidden_permissions(&live.backend.projection());
+                    for id in pending.iter().filter(|id| !hidden.contains(*id)) {
+                        live.session.plan.make_card(id);
+                    }
+                }
                 // A resync in bypass sweeps whatever the overflow dropped through the same
                 // `approve_pending` a confirm uses, so a request never drawn as a card is never rebuilt
                 // as one by the very mechanism meant to rebuild the panel honestly. This also hides
                 // what the classifier already answered in `Auto`, closing the gap `attention`'s module
                 // doc used to record for `resync` itself. Answered here, outside every guard of the
                 // projection: answering a permission must happen outside the lock.
-                if live.mode == SessionModeChoice::Bypass {
-                    let hidden = live.session.hidden_permissions(&live.backend.projection());
-                    let sweep: Vec<String> = pending
-                        .iter()
-                        .filter(|id| !hidden.contains(*id) && !live.session.user_answered.contains(*id))
-                        .cloned()
-                        .collect();
+                // Never in plan mode or while the mode changes, never before the tab has taken up the mode the end
+                // of plan mode gave it (a session that left plan mode after the pump's last look still shows the
+                // tab in the mode plan mode began in), and never a card raised in plan mode.
+                // Nor a request that cannot be placed against plan mode yet (its call not folded: the sidecar sends
+                // requests ahead of its message events, and a resync is what an overflow of those brings): it is
+                // put among the requests waiting for their call, so this snapshot hides it and a later drain judges
+                // it as the gate judges any other (`PlanBook::unsequenced`).
+                if live.mode == SessionModeChoice::Bypass
+                    && live.plan_followed
+                    && !live.backend.projection().is_planning()
+                {
+                    let (sweep, unplaced): (Vec<String>, Vec<String>) = {
+                        let projection = live.backend.projection();
+                        let hidden = live.session.hidden_permissions(&projection);
+                        pending
+                            .iter()
+                            .filter(|id| {
+                                !hidden.contains(*id)
+                                    && !live.session.user_answered.contains(*id)
+                                    && !live.session.plan.cards.contains(*id)
+                                    && !began_in_plan_mode(&projection, id)
+                            })
+                            .cloned()
+                            .partition(|id| projection.request_placed(id))
+                    };
+                    for id in unplaced {
+                        live.session.plan.wait_for_its_call(id);
+                    }
                     // The events (legacy's own resolutions) are not needed here: the snapshot is read
                     // after they were folded, so it already shows those cards answered.
                     let answered = live.backend.approve_pending(&sweep, "in bypass after a resync");
@@ -4175,6 +4380,13 @@ impl TabSet {
             } else {
                 Vec::new()
             },
+            // A tab no page shows is sent a snapshot when it is shown, which carries where it stands.
+            planning: if live.notes.planning_dirty {
+                live.notes.planning
+            } else {
+                None
+            },
+            planning_cleared: std::mem::take(&mut live.notes.planning_dirty) && live.notes.planning.is_none(),
             ..CallNotes::default()
         };
         live.notes.remote_notes_dirty = false;
@@ -4436,12 +4648,20 @@ impl TabSet {
             }
         }
         if let Some(backend) = tab.live() {
-            let waiting: Vec<String> = backend
-                .projection()
-                .waiting_questions()
-                .map(|q| q.interaction_id.clone())
-                .collect();
+            let (mut waiting, plan) = {
+                let projection = backend.projection();
+                (
+                    projection
+                        .waiting_questions()
+                        .map(|q| q.interaction_id.clone())
+                        .collect::<Vec<_>>(),
+                    projection
+                        .waiting_plan()
+                        .map(|plan| format!("plan:{}", plan.interaction_id)),
+                )
+            };
             tab.session.question_draft.retain(|id, _| waiting.contains(id));
+            waiting.extend(plan);
             tab.attention.sync_questions(waiting);
         } else {
             tab.session.question_draft.clear();
@@ -4450,6 +4670,19 @@ impl TabSet {
         tab.attention.retain_pending(|id| still.contains(id));
         tab.session.host_answered.retain(|id| still.contains(id));
         tab.session.user_answered.retain(|id| still.contains(id));
+        tab.session.plan.prune_answered(still);
+        if let TabBackend::Live(backend) = &tab.backend {
+            let projection = backend.projection();
+            tab.session.plan.prune_deferred(&projection);
+            let waiting: Vec<String> = projection
+                .waiting_plan()
+                .map(|plan| plan.interaction_id.clone())
+                .into_iter()
+                .collect();
+            tab.session.plan_feedback_draft.retain(|id, _| waiting.contains(id));
+        } else {
+            tab.session.plan_feedback_draft.clear();
+        }
         if refresh_offers(tab, project_root) {
             out.offers_changed.push(tab.id);
         }
@@ -4582,6 +4815,7 @@ impl TabSet {
         if !self.is_shown(tab) {
             return Vec::new();
         }
+        let image_input = self.image_input(tab);
         let tab = self.get_mut(tab).expect("a shown tab exists");
         tab.session.stale = false;
         let mut payloads = Vec::new();
@@ -4643,6 +4877,13 @@ impl TabSet {
         ));
         if with_draft {
             payloads.push(crate::agent_bridge::serialize_draft_for_js(tab.id, &tab.session.draft));
+            // The draft's images go with its text: a reload or a switch shows the same chips.
+            payloads.push(attachments::serialize_draft_attachments_for_js(
+                tab.id,
+                &tab.attachments,
+                &image_input,
+            ));
+            tab.attachments.clear_note();
         }
         if tab.live().is_some() {
             payloads.push(crate::agent_bridge::serialize_rule_offers_for_js(
@@ -4768,7 +5009,12 @@ impl TabSet {
     pub fn running_count(&self) -> usize {
         self.tabs
             .iter()
-            .filter(|t| matches!(t.backend, TabBackend::Starting(_)) || t.turn_running() || t.question_waiting())
+            .filter(|t| {
+                matches!(t.backend, TabBackend::Starting(_))
+                    || t.turn_running()
+                    || t.question_waiting()
+                    || t.plan_waiting()
+            })
             .count()
     }
 
@@ -4781,6 +5027,7 @@ impl TabSet {
                 matches!(t.backend, TabBackend::Starting(_))
                     || t.turn_running()
                     || t.question_waiting()
+                    || t.plan_waiting()
                     || t.cli_unseen_busy()
             })
             .count()
@@ -4801,6 +5048,7 @@ impl TabSet {
                 || t.cli_unseen_busy()
                 || t.background_calls() > 0
                 || t.question_waiting()
+                || t.plan_waiting()
                 || !t.session.queue.is_empty()
         })
     }
@@ -4816,6 +5064,7 @@ impl TabSet {
                 .live()
                 .and_then(|backend| tabs::background_summary(&backend.projection())),
             question_waiting: tab.question_waiting(),
+            plan_waiting: tab.plan_waiting(),
             queued: tab.session.queue.len() - tab.steered_unconfirmed(),
             steered: tab.steered_unconfirmed(),
             legacy: self.kind == BackendKind::Legacy && tab.agent == AgentId::Claude,
@@ -4838,7 +5087,8 @@ impl TabSet {
                     t.id,
                     matches!(t.backend, TabBackend::Starting(_) | TabBackend::AwaitingTrust(_))
                         || t.turn_running()
-                        || t.question_waiting(),
+                        || t.question_waiting()
+                        || t.plan_waiting(),
                 )
             })
             .collect();
@@ -4938,6 +5188,7 @@ impl TabSet {
             shell_line: false,
             shell_report: false,
             from: QueuedFrom::Desk,
+            attachments: Vec::new(),
         });
         Ok(tab.session.queue.len())
     }
@@ -5002,6 +5253,12 @@ impl TabSet {
             // Sent to wait for the turn's end: it stays held in its place, and what follows it is steered.
             if item.after_turn {
                 continue;
+            }
+            // A message put into a turn carries text alone: one with images is a turn of its own, after this one.
+            if !item.attachments.is_empty() {
+                refusal =
+                    Some("a message with images waits for the turn's end, and what follows it waits too".to_string());
+                break;
             }
             if !item.steerable {
                 refusal = Some("a review waits for the turn's end, and what follows it waits too".to_string());
@@ -5085,7 +5342,9 @@ impl TabSet {
     }
 
     /// Whether the queue of `id` can go out as a turn now: it holds something, the tab is live and
-    /// idle with no card waiting, and it is not handed off or moving. Settles what the agent reported
+    /// idle with no card, question or plan waiting, and it is not handed off or moving. A question or a
+    /// plan can wait with no turn open: one the CLI raised in a turn it started itself is folded before
+    /// that turn's start, since the sidecar's interactions overtake its message events. Settles what the agent reported
     /// about the messages put into its turn first, under the same hold of the projection.
     ///
     /// Work Claude Code does where this panel cannot see it (`cli_unseen_busy`) does not hold the queue:
@@ -5116,10 +5375,27 @@ impl TabSet {
             if projection.active_turn_id.is_some()
                 || !projection.pending_permissions.is_empty()
                 || projection.waiting_questions().next().is_some()
+                || projection.waiting_plan().is_some()
             {
                 return false;
             }
         }
+        // A tab asked to start in plan mode (a restored one) sends its switch first, whichever way its first message
+        // came: the queue then waits behind it as behind a card, and `release_after_card` sends it once the CLI is
+        // in plan mode (`card_waits` counts such a tab).
+        if tab.plan_on_start {
+            if self.start_in_plan(id, wall_clock_ms()) {
+                if let Some(tab) = self.get_mut(id) {
+                    for item in tab.session.queue.iter_mut() {
+                        item.behind_card = true;
+                    }
+                }
+                return false;
+            }
+        }
+        let Some(tab) = self.get_mut(id) else {
+            return false;
+        };
         // A phone's message goes only while the tab's mode is no wider than when it was taken. No turn runs, so
         // one put into the last turn that the agent never said it read would be sent again below: it is
         // refused as a held one is.
@@ -5189,10 +5465,10 @@ impl TabSet {
                 let after_turn = items().any(|item| item.after_turn);
                 let trace = crate::turn_trace::TurnTrace::start();
                 let mode = tab.mode;
-                let outcome =
-                    tab.live_mut()
-                        .expect("checked above")
-                        .send_turn_in(&wire, &typed, mode, root.as_deref(), origin);
+                let carried: Vec<ReadyImage> = items().flat_map(|item| item.attachments.iter().cloned()).collect();
+                let images = carried.iter().map(|ready| ready.image.clone()).collect();
+                let backend = tab.live_mut().expect("checked above");
+                let outcome = backend.send_turn_in(&wire, &typed, mode, root.as_deref(), origin, images);
                 match &outcome {
                     Ok(submitted) => {
                         if let QueuedFrom::Remote { asker, .. } = &tab.session.queue[turn[0]].from {
@@ -5208,6 +5484,8 @@ impl TabSet {
                         message.shell_report = origin == PromptOrigin::ShellLine;
                         message.steerable = !message.shell_report;
                         message.after_turn = after_turn;
+                        // Handed back to the queue and sent again, it goes with its images, from memory.
+                        message.attachments = carried.clone();
                         tab.session.opening_prompt = Some(OpeningPrompt {
                             submitted: submitted.clone(),
                             typed_by_person: message.typed_by_person,
@@ -5231,6 +5509,8 @@ impl TabSet {
                 let failed = outcome.is_err();
                 if failed {
                     self.end_start_of(&gate);
+                } else {
+                    self.images_sent(id, &carried);
                 }
                 Sent::Flushed {
                     tab: id,
@@ -5283,6 +5563,10 @@ impl TabSet {
                 if outcome.as_ref().is_err_and(BackendError::is_turn_busy) && self.hold_as_steer(id, &turn) {
                     outcome = Ok(());
                 }
+                // One with images cannot go into that turn: it waits whole for the turn's end.
+                if outcome.as_ref().is_err_and(BackendError::is_turn_busy_with_images) && self.hold_whole(id, &turn) {
+                    outcome = Ok(());
+                }
                 Sent::Prompt {
                     tab: id,
                     page,
@@ -5302,7 +5586,11 @@ impl TabSet {
             !tab.agent.is_external()
                 && tab.live().is_some_and(|backend| {
                     let projection = backend.projection();
-                    !projection.pending_permissions.is_empty() || projection.waiting_questions().next().is_some()
+                    !projection.pending_permissions.is_empty()
+                        || projection.waiting_questions().next().is_some()
+                        || projection.waiting_plan().is_some()
+                        // A message sent to a tab asked to start in plan mode waits for the CLI to be in it.
+                        || (tab.plan_on_start && !projection.plan_gate_applies())
                 })
         })
     }
@@ -5396,9 +5684,10 @@ impl TabSet {
             Some(tab) => {
                 tab.session.turn_trace = crate::turn_trace::TurnTrace::start();
                 let mode = tab.mode;
+                let images = turn.attachments.iter().map(|ready| ready.image.clone()).collect();
                 match tab.live_mut() {
                     Some(backend) => {
-                        backend.send_turn_in(&turn.wire, &turn.typed, mode, root.as_deref(), turn.origin())
+                        backend.send_turn_in(&turn.wire, &turn.typed, mode, root.as_deref(), turn.origin(), images)
                     }
                     None => Err(BackendError {
                         message: "no active session".to_string(),
@@ -5415,12 +5704,14 @@ impl TabSet {
             if let Some(tab) = self.get_mut(id) {
                 let mut message = Queued::held(&turn.typed, turn.wire.clone(), wall_clock_ms());
                 message.typed_by_person = turn.typed_by_person;
+                message.attachments = turn.attachments.clone();
                 tab.session.opening_prompt = Some(OpeningPrompt {
                     submitted: submitted.clone(),
                     typed_by_person: message.typed_by_person,
                     message,
                 });
             }
+            self.images_sent(id, &turn.attachments);
         } else {
             self.end_start_of(gate);
         }
@@ -5545,7 +5836,8 @@ impl TabSet {
 
     /// The held messages, oldest first, for the panel to merge into the box. A message already
     /// sent into the running turn stays: the agent may have read it, and taking it back would not unsay it.
-    pub fn take_back_queue(&mut self, id: TabId) -> Vec<String> {
+    /// Their images go back into the tab's draft, ready, and each message names its own in order.
+    pub fn take_back_queue(&mut self, id: TabId) -> Vec<QueuedDraft> {
         let Some(tab) = self.get_mut(id) else { return Vec::new() };
         tab.settle_steered();
         tab.session.queue_error = None;
@@ -5554,10 +5846,28 @@ impl TabSet {
             .into_iter()
             .partition(Queued::is_held);
         tab.session.queue = steered;
-        held.into_iter().map(|q| q.text).collect()
+        let mut images = Vec::new();
+        let mut drafts: Vec<QueuedDraft> = held
+            .into_iter()
+            .map(|q| {
+                let attachments = q.attachments.iter().map(|image| image.token.clone()).collect();
+                images.extend(q.attachments);
+                QueuedDraft {
+                    text: q.text,
+                    attachments,
+                }
+            })
+            .collect();
+        self.images_back_to_draft(id, images);
+        for draft in &mut drafts {
+            draft
+                .attachments
+                .retain(|token| self.draft_images(id, std::slice::from_ref(token)).is_ok());
+        }
+        drafts
     }
 
-    /// The panel's mirror. Never echoed.
+    /// The panel's text mirror. Never echoed. Images have their own lifecycle; mirroring empty text keeps them.
     /// A copy set here is newer than anything the page the tab last left could still post, so that
     /// page's late mirror ([`TabSet::take_late_draft`]) is no longer taken.
     pub fn set_draft(&mut self, id: TabId, text: &str) -> bool {
@@ -5691,10 +6001,9 @@ impl TabSet {
         true
     }
 
-    /// Clear the mirrored draft when `id` sends a prompt. The composer clears on Enter but mirrors
-    /// `""` only 300 ms later. `active_state_payloads` can run when the first connect finishes and
-    /// send this stale copy back to the composer, restoring text already sent. Clear it here
-    /// rather than waiting for the mirror.
+    /// A prompt was sent from `id`'s composer: clear its mirrored words at Enter. A first session's state
+    /// payload can arrive before the page's delayed empty mirror, so leaving the old words would restore them
+    /// into the box. Images leave separately when the message carrying them is accepted or queued.
     pub fn note_sent(&mut self, id: TabId) {
         if let Some(tab) = self.get_mut(id) {
             tab.replace_draft(String::new());
@@ -5796,6 +6105,7 @@ impl TabSet {
                         turn_running: tab.turn_running(),
                         draft: crate::saved_tabs::draft_to_save(tab.draft()),
                         row_key: Some(tab.row_key.as_str().to_string()),
+                        plan_origin: None,
                     },
                 ))
             })
@@ -5827,6 +6137,7 @@ impl TabSet {
                 turn_running: granted.planned.turn_running,
                 draft: granted.planned.draft.clone(),
                 row_key: granted.planned.row_key.clone(),
+                plan_origin: granted.planned.plan_origin,
             });
         }
         // A skipped tab's draft has no tab to wait in until the answer comes: the file keeps the entry until then.
@@ -5862,6 +6173,8 @@ impl TabSet {
                         turn_running: tab.turn_running(),
                         draft: crate::saved_tabs::draft_to_save(tab.draft()),
                         row_key: Some(tab.row_key.as_str().to_string()),
+                        // Planning, or asked to plan before its first message: plan mode is asked for again.
+                        plan_origin: tab.plan_origin.or(tab.plan_on_start.then_some(tab.mode)),
                     },
                 ))
             })
@@ -5896,6 +6209,7 @@ impl TabSet {
                     turn_running: granted.planned.turn_running,
                     draft: granted.planned.draft.clone(),
                     row_key: granted.planned.row_key.clone(),
+                    plan_origin: granted.planned.plan_origin,
                 },
             ));
         }
@@ -6253,6 +6567,8 @@ impl TabSet {
             self.tabs[at].agent = planned.agent;
             self.give_mode(at, mode);
             self.give_saved_row_key(at, planned.row_key.as_deref());
+            // Saved while planning: plan mode is asked for again before the first message.
+            self.tabs[at].plan_on_start = planned.plan_origin.is_some();
             self.give_restored_draft(target, planned.draft);
             let tab = &mut self.tabs[at];
             let request_id = format!("restore-{}", n + 1);
@@ -6837,7 +7153,8 @@ fn note_new_files(
 /// The delivered cards this tab could approve right now: its own attention
 /// tray, intersected with the projection's still-pending ids and with anything it has not already
 /// host- or human-answered (including answers in flight), `seq`-ordered (the order the panel shows
-/// them in). The CLI's own prompts are among
+/// them in). On a session that offered plan mode, a card that cannot be placed against plan mode yet
+/// (`request_placed`: its call not folded) is not among them, as `approve_pending` would not answer it. The CLI's own prompts are among
 /// them whatever they say about why they asked: bypass approves every card. Empty unless the tab is
 /// `Live` -- a `NotStarted`/`Starting`/`Failed` tab has no session to hold a pending request at all.
 ///
@@ -6860,12 +7177,24 @@ fn waiting_cards(tab: &Tab) -> Vec<String> {
                 cards.contains(&p.permission_id)
                     && !tab.session.host_answered.contains(&p.permission_id)
                     && !tab.session.user_answered.contains(&p.permission_id)
+                    && !tab.session.plan.cards.contains(&p.permission_id)
+                    && !projection.began_outside_executing(p.tool_use_id.as_deref().filter(|id| !id.is_empty()))
+                    && projection.request_placed(&p.permission_id)
             })
             .map(|p| (p.seq, p.permission_id.clone()))
             .collect()
     };
     ordered.sort_by_key(|(seq, _)| *seq);
     ordered.into_iter().map(|(_, id)| id).collect()
+}
+
+/// Whether the pending request `permission_id` is for a call that began while the session planned or changed mode:
+/// such a card is a person's alone, so no sweep answers it, whatever mode the tab is in by then.
+fn began_in_plan_mode(projection: &agent::AgentSessionProjection, permission_id: &str) -> bool {
+    projection
+        .pending_permissions
+        .get(permission_id)
+        .is_some_and(|p| projection.began_outside_executing(p.tool_use_id.as_deref().filter(|id| !id.is_empty())))
 }
 
 /// What one [`TabSet::pump_views`] shares across its tabs, borrowed from the set beside its tabs. The
@@ -6890,6 +7219,8 @@ struct PumpTick<'a> {
     redeliver_covered: bool,
     #[cfg(test)]
     before_resync_snapshot: &'a mut Option<BackendSeam>,
+    #[cfg(test)]
+    before_resync_sweep: &'a mut Option<BackendSeam>,
 }
 
 /// Where a tab is shown during one pump.
@@ -6909,6 +7240,9 @@ struct LiveTab<'a> {
     following: bool,
     id: TabId,
     mode: SessionModeChoice,
+    /// The tab has taken up the mode the end of its plan mode gave it (`GateMode::plan_followed`), as the pump's
+    /// last look found it: until it has, `mode` may still be the mode plan mode was entered from.
+    plan_followed: bool,
     backend: &'a mut AgentBackend,
     session: &'a mut SessionState,
     notes: &'a mut CallNotes,
@@ -6963,7 +7297,11 @@ fn refresh_offers(tab: &mut Tab, project_root: &Path) -> bool {
         let mut cards: Vec<&agent::PermissionRequestRecord> = projection
             .pending_permissions
             .values()
-            .filter(|p| p.provider_prompt.is_none() && !tab.session.user_answered.contains(&p.permission_id))
+            .filter(|p| {
+                p.provider_prompt.is_none()
+                    && !tab.session.user_answered.contains(&p.permission_id)
+                    && !tab.session.plan.cards.contains(&p.permission_id)
+            })
             .collect();
         cards.sort_by(|a, b| a.permission_id.cmp(&b.permission_id));
         // Compared by id before anything is copied: this runs on every tick, and a card's input
@@ -7060,7 +7398,9 @@ fn next_turn(queue: &[Queued], reads_commands: bool) -> Vec<usize> {
         {
             break;
         }
-        if item.is_command(reads_commands) || item.is_shell() {
+        // A message with images goes as its own turn: the limits on one turn's images are the sidecar's, and a
+        // turn joined past them would be refused at every turn's end.
+        if item.is_command(reads_commands) || item.is_shell() || !item.attachments.is_empty() {
             if turn.is_empty() {
                 turn.push(index);
             }

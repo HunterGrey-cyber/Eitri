@@ -11,7 +11,7 @@ import { isImeKey } from "../composerKeys";
 import { Composer } from "./Composer";
 import type { SlashAction } from "../slashCommands";
 import { completionSource } from "../slashCommands";
-import type { RestoredDraft } from "./Composer";
+import type { ComposerImages, RestoredDraft } from "./Composer";
 import { HandoffCommandCard } from "./TerminalHandoff";
 import { QueueLines } from "./QueueLines";
 import { Row } from "./Row";
@@ -93,7 +93,9 @@ export type EmptyTabProps = {
   /** This screen's mode, so the outer band agrees with where the keys land. */
   onModeChange?: (mode: PanelMode) => void;
   restoredDraft: RestoredDraft | null;
-  onSend: (text: string) => void;
+  onSend: (text: string, attachments?: string[]) => void;
+  /** The draft's images, for the box's chips, paste and drop. */
+  images?: ComposerImages;
   /** The box's `!` line and `@` menu, as the conversation's composer has them (`Composer`). */
   onRunShell?: (text: string) => void;
   atPaths?: { items: string[]; seq: number } | null;
@@ -132,7 +134,7 @@ export type EmptyTabProps = {
    *  on Ctrl+Enter. A starting tab has no turn to send to "now" either, so it falls back to the same
    *  effect as `onQueue` below, guarded against an empty box (`queue_message` has no such guard of
    *  its own and would happily queue a blank entry). */
-  onQueue?: (text: string) => void;
+  onQueue?: (text: string, options?: { afterTurn?: boolean; attachments?: string[] }) => void;
   history?: string[];
   queueCount?: number;
   /** Queue lines above the composer: a starting tab can already have messages queued behind its connect.
@@ -874,6 +876,7 @@ export function EmptyTab(props: EmptyTabProps) {
             hintTarget={!failed}
             onModeChange={setMode}
             onSend={props.onSend}
+            images={props.images}
             onRunShell={props.onRunShell}
             atPaths={props.atPaths}
             onAtQuery={props.onAtQuery}

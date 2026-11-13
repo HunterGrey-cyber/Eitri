@@ -482,7 +482,7 @@ fn observer_snapshot(tab: &Tab) -> Option<BuiltSnapshot> {
             conversation_id,
             session_id,
             provider_session_id: provider_session_id.clone(),
-            capabilities,
+            capabilities: capabilities.clone(),
             provider,
             projection: ProjectionRef::Borrowed(&copy),
             hidden_pending,
@@ -678,7 +678,7 @@ impl TabSet {
     }
 
     /// What a phone is shown of the tab `key` before its snapshot: the tab as the strip shows it (without the desk's
-    /// question drafts), a trust or bypass question it waits on (what it says, never what answers it), the live notices,
+    /// question and plan feedback drafts), a trust or bypass question it waits on (what it says, never what answers it), the live notices,
     /// whether a `!` line runs, the window's colours and why a phone may not send to it. `root_note` and `theme` are the
     /// window's. `None` for a tab this window does not hold.
     pub fn remote_greeting(
@@ -692,6 +692,7 @@ impl TabSet {
         let mut entry = serde_json::from_str::<serde_json::Value>(&strip).ok()?["tabs"][0].take();
         if let Some(fields) = entry.as_object_mut() {
             fields.remove("questionDraft");
+            fields.remove("planFeedbackDraft");
         }
         let prompt = match (&tab.backend, &self.pending_bypass) {
             (TabBackend::AwaitingTrust(_), _) => Some(PendingPrompt::Trust),

@@ -34,7 +34,8 @@ export function yankObject(item: TimelineItem, scope: "i" | "a", object: YankObj
 }): YankResult {
   const key = `${scope}${object}`;
   const kind = ({ message: "reply", tool: "tool call", permission: "permission card", thinking: "thought",
-    run: "group of tool calls", notice: "notice", wake: "notice", ending: "notice", prompt: "prompt" })[item.kind];
+    run: "group of tool calls", notice: "notice", wake: "notice", ending: "notice", prompt: "prompt", plan: "plan",
+    planmark: "notice" })[item.kind];
   const tryObject = item.kind === "message" || item.kind === "prompt" ? "im" : item.kind === "tool" || item.kind === "permission" ? "ic" : "yy";
   const hint = item.kind === "run" ? "press Enter to expand, then try yio or yic" : `try ${tryObject}`;
   const wrong = (wanted: string): YankResult => ({ refuse: `${key}: the cursor is on a ${kind}, not a ${wanted} — ${hint}` });

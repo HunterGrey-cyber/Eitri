@@ -22,7 +22,8 @@ pub(super) enum Admission {
 
 /// Which messages from `view`'s page meet the window's gate: every answer that resolves a card or one
 /// of Claude's questions, starts a session the user was asked about, or loosens permissions -- a card
-/// answer, a question's answer or decline, a bypass `y`, a restore `y` (it resumes the saved bypass
+/// answer, a question's answer or decline, a decision on Claude's plan or a switch into or out of plan
+/// mode, a bypass `y`, a restore `y` (it resumes the saved bypass
 /// tabs in bypass), a trust `y` or `n` (a covered page's question may not be the one the user
 /// read), turning following on (the consent that lets edited files be loaded in the editor) and a
 /// `y` to one of remote control's questions (it adds a device or opens the listener to a network).
@@ -129,7 +130,12 @@ pub(super) fn admission(
         }
         // A question is answered the way a card is: only from the page showing its tab, and only
         // while the window agrees that page is not covered.
-        InboundMessage::QuestionAnswer { .. } | InboundMessage::QuestionDecline { .. } => match target {
+        // A plan is settled, and plan mode left, only the way a card is answered: from the page showing the
+        // tab, while the window agrees that page is not covered.
+        InboundMessage::QuestionAnswer { .. }
+        | InboundMessage::QuestionDecline { .. }
+        | InboundMessage::PlanResolve(_)
+        | InboundMessage::SetPlanning { .. } => match target {
             Some(tab) => from_its_page(tab),
             // Unreachable (an answer names its tab, or it was refused when resolved); asking the
             // window is the side that refuses more.
@@ -146,6 +152,22 @@ pub(super) fn admission(
             },
             None => Admission::Gated(view),
         },
+        // A composer image is the person's own, given from the page that shows the tab: nothing a covered page or
+        // another view's page shows may put an image into a tab's draft or send one. Its arms refuse a tab that is
+        // moving.
+        InboundMessage::AttachBegin { tab, .. }
+        | InboundMessage::AttachChunk { tab, .. }
+        | InboundMessage::AttachEnd { tab, .. }
+        | InboundMessage::AttachCancel { tab, .. }
+        | InboundMessage::AttachRemove { tab, .. } => from_its_page(TabId(*tab)),
+        InboundMessage::SendMessage { attachments, .. } | InboundMessage::QueueMessage { attachments, .. }
+            if !attachments.is_empty() =>
+        {
+            match target {
+                Some(tab) => from_its_page(tab),
+                None => Admission::Gated(view),
+            }
+        }
         // Enabling following permits file loads, so only the tab's uncovered page can give that consent.
         InboundMessage::ToggleFollowing { .. } => match target {
             Some(tab) => match from_its_page(tab) {
@@ -237,6 +259,7 @@ pub(super) fn admission(
         | InboundMessage::EditDraft { .. }
         | InboundMessage::QuestionDraft { .. }
         | InboundMessage::EditQuestionOther { .. }
+        | InboundMessage::PlanFeedbackDraft { .. }
         | InboundMessage::HistoryPush { .. }
         | InboundMessage::OpenPath { .. }
         | InboundMessage::ReviewRequest { .. }
@@ -1832,5 +1855,651 @@ mod question_tests {
         assert_eq!(question_state(&handle, tab, "q1"), Some(agent::QuestionState::Waiting));
         shut_down_every_tab(&handle);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod plan_tests {
+    //! Claude's plan is settled, and plan mode switched, the way a card is answered: only from the page that
+    //! shows its tab, and only while the window agrees that page is not covered. A refusal leaves the plan
+    //! waiting and its feedback draft where it was. The draft itself is a mirror the window is never asked about.
+    use super::*;
+    use crate::agent_panel::tests::*;
+    use eitri_core::test_providers::RecordingProvider;
+
+    const SHA: &str = "00000000000000000000000000000000000000000000000000000000000000aa";
+
+    /// A Claude tab on a session that offers plan mode, in `default` and idle.
+    fn plan_tab(handle: &AgentPanelHandle, dir: &Path) -> (TabId, std::sync::Arc<RecordingProvider>) {
+        let provider = std::sync::Arc::new(RecordingProvider::planning(false));
+        let conversation = agent::AgentConversation::create(provider.clone(), dir, ProjectTrust::Untrusted).unwrap();
+        let backend = AgentBackend::Conversation {
+            agent: AgentId::Claude,
+            conversation: Box::new(conversation),
+        };
+        let tab = {
+            let mut state = handle.state.borrow_mut();
+            let tab = state.tabs.open(AgentId::Claude);
+            state.tabs.get_mut(tab).unwrap().set_backend(TabBackend::Live(backend));
+            tab
+        };
+        provider.queue(agent::AgentDomainEvent::CliPermissionMode {
+            reported: "default".into(),
+        });
+        tick_handle_until(handle, "the CLI's mode", || {
+            plan_projection(handle, tab, |p| p.cli_mode_reported.is_some()).unwrap_or(false)
+        });
+        (tab, provider)
+    }
+
+    fn plan_projection<T>(
+        handle: &AgentPanelHandle,
+        tab: TabId,
+        read: impl FnOnce(&agent::AgentSessionProjection) -> T,
+    ) -> Option<T> {
+        let state = handle.state.borrow();
+        let backend = state.tabs.get(tab)?.live()?;
+        let projection = backend.projection();
+        Some(read(&projection))
+    }
+
+    fn plan_state(handle: &AgentPanelHandle, tab: TabId) -> Option<agent::PlanState> {
+        plan_projection(handle, tab, |p| p.plan("p1").map(|record| record.state.clone())).flatten()
+    }
+
+    /// The model enters plan mode in a running turn and proposes `p1`.
+    fn propose(handle: &AgentPanelHandle, provider: &RecordingProvider, tab: TabId) {
+        for event in [
+            agent::AgentDomainEvent::TurnStarted { turn_id: "t1".into() },
+            agent::AgentDomainEvent::ToolCallStarted {
+                turn_id: "t1".into(),
+                tool_use_id: "toolu_enter".into(),
+                name: "EnterPlanMode".into(),
+                input: serde_json::json!({}),
+            },
+            agent::AgentDomainEvent::CliPlanMode {
+                source: "CliModeReported".into(),
+            },
+            agent::AgentDomainEvent::PlanProposed {
+                interaction_id: "p1".into(),
+                tool_use_id: Some("toolu_exit".into()),
+                plan: "# Plan\n\n1. Do it".into(),
+                plan_sha256: SHA.into(),
+                allowed_prompts: Vec::new(),
+                unsupported_reason: None,
+            },
+        ] {
+            provider.queue(event);
+        }
+        tick_handle_until(handle, "the plan", || {
+            plan_state(handle, tab) == Some(agent::PlanState::Waiting)
+        });
+    }
+
+    fn plan_message(handle: &AgentPanelHandle, from: ViewId, message: serde_json::Value) {
+        handle.page_message(from, &message.to_string());
+    }
+
+    fn resolve(request: &str, tab: TabId, choice: &str, feedback: Option<&str>) -> serde_json::Value {
+        let mut message = serde_json::json!({
+            "type": "plan_resolve", "request_id": request, "tab": tab.0, "interaction_id": "p1",
+            "choice": choice, "plan_sha256": SHA,
+        });
+        if let Some(feedback) = feedback {
+            message["feedback"] = serde_json::json!(feedback);
+        }
+        message
+    }
+
+    /// The newest `tabs` envelope `page` was sent, as the row of `tab`.
+    fn tab_row(page: &RecordingPage, tab: TabId) -> Option<serde_json::Value> {
+        page.sent
+            .borrow()
+            .iter()
+            .rev()
+            .map(|s| json_of(s))
+            .find(|v| v["kind"] == "tabs")
+            .and_then(|v| v["tabs"].as_array()?.iter().find(|row| row["id"] == tab.0).cloned())
+    }
+
+    /// A covered page's decision is refused by the window's gate, whatever it chose: the page is told why (on
+    /// which the dock keeps the feedback typed), nothing reaches the agent, and the plan and the draft wait.
+    /// Uncovered, the same page's approval goes.
+    #[test]
+    fn a_plan_resolve_from_a_covered_view_is_refused_and_the_dock_keeps_its_feedback() {
+        agent::state_dirs::redirect_state_to_a_test_root();
+        let dir = agent::state_dirs::test_workspace_dir("views-plan-covered");
+        let (handle, _base, second) = handle_with_two_pages();
+        let (tab, provider) = plan_tab(&handle, &dir);
+        assert_eq!(handle.break_out(view(2)), Ok(tab));
+        propose(&handle, &provider, tab);
+        let covered = Rc::new(Cell::new(true));
+        let asked_views = recording_gate(&handle, &[2], covered.clone());
+        plan_message(
+            &handle,
+            view(2),
+            serde_json::json!({
+                "type": "plan_feedback_draft", "request_id": "d1", "tab": tab.0, "interaction_id": "p1",
+                "text": "shorter, please",
+            }),
+        );
+        assert!(asked_views.borrow().is_empty(), "a draft is not an answer");
+
+        plan_message(
+            &handle,
+            view(2),
+            resolve("r1", tab, "keep_planning", Some("shorter, please")),
+        );
+        plan_message(&handle, view(2), resolve("r2", tab, "approve_manual", None));
+        for request in ["r1", "r2"] {
+            assert!(
+                matches!(result_for(&second.sent.borrow(), request), Some(Err(why)) if why.contains("under terminal 2")),
+                "{request}"
+            );
+        }
+        assert!(provider.interactions().is_empty(), "nothing reached the agent");
+        assert_eq!(plan_state(&handle, tab), Some(agent::PlanState::Waiting));
+        assert_eq!(*asked_views.borrow(), vec![view(2), view(2)], "asked at each decision");
+        handle.tick();
+        assert_eq!(
+            tab_row(&second, tab).unwrap()["planFeedbackDraft"],
+            serde_json::json!({ "p1": "shorter, please" }),
+            "the draft is kept for the dock"
+        );
+
+        covered.set(false);
+        plan_message(&handle, view(2), resolve("r3", tab, "approve_manual", None));
+        assert_eq!(
+            result_for(&second.sent.borrow(), "r3"),
+            None,
+            "told once the agent replied"
+        );
+        tick_handle_until(&handle, "the reply", || {
+            result_for(&second.sent.borrow(), "r3").is_some()
+        });
+        assert_eq!(result_for(&second.sent.borrow(), "r3"), Some(Ok(())));
+        assert_eq!(provider.interactions().len(), 1);
+        assert_eq!(plan_state(&handle, tab), Some(agent::PlanState::Answering));
+        shut_down_every_tab(&handle);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Another page's switch is refused naming the tab, before the window is asked, and sends nothing; the page
+    /// that shows the tab switches it, told once the agent acknowledged.
+    #[test]
+    fn set_planning_from_another_page_is_refused() {
+        agent::state_dirs::redirect_state_to_a_test_root();
+        let dir = agent::state_dirs::test_workspace_dir("views-plan-switch");
+        let (handle, base, second) = handle_with_two_pages();
+        let (tab, provider) = plan_tab(&handle, &dir);
+        assert_eq!(handle.break_out(view(2)), Ok(tab));
+        let asked_views = recording_gate(&handle, &[], Rc::new(Cell::new(false)));
+        let number = handle.state.borrow().tabs.get(tab).unwrap().number;
+        let switch = |request: &str| serde_json::json!({ "type": "set_planning", "request_id": request, "tab": tab.0, "enter": true });
+
+        plan_message(&handle, ViewId::BASE, switch("s1"));
+        assert_eq!(
+            result_for(&base.sent.borrow(), "s1"),
+            Some(Err(format!("tab {number} is not shown in this page")))
+        );
+        assert!(asked_views.borrow().is_empty(), "refused before the window is asked");
+        assert!(provider.planning_calls().is_empty());
+
+        plan_message(&handle, view(2), switch("s2"));
+        assert_eq!(*asked_views.borrow(), vec![view(2)]);
+        tick_handle_until(&handle, "the reply", || {
+            result_for(&second.sent.borrow(), "s2").is_some()
+        });
+        assert_eq!(result_for(&second.sent.borrow(), "s2"), Some(Ok(())));
+        assert_eq!(provider.planning_calls(), vec![true]);
+        assert_eq!(
+            plan_projection(&handle, tab, |p| p.is_planning()),
+            Some(true),
+            "the move is under way until the CLI reports it"
+        );
+        shut_down_every_tab(&handle);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The feedback mirror never meets the window's gate and is never echoed; it stays the tab's across a
+    /// switch to another tab and back, and is refused for a plan that is not waiting.
+    #[test]
+    fn plan_feedback_draft_is_ungated_and_survives_a_tab_switch() {
+        agent::state_dirs::redirect_state_to_a_test_root();
+        let dir = agent::state_dirs::test_workspace_dir("views-plan-draft");
+        let (handle, base, _second) = handle_with_two_pages();
+        let (tab, provider) = plan_tab(&handle, &dir);
+        handle.state.borrow_mut().tabs.select(tab);
+        propose(&handle, &provider, tab);
+        handle.set_answer_gate(Rc::new(|_| panic!("a feedback draft answers nothing")));
+        let before = base.sent.borrow().len();
+        plan_message(
+            &handle,
+            ViewId::BASE,
+            serde_json::json!({
+                "type": "plan_feedback_draft", "request_id": "d1", "tab": tab.0, "interaction_id": "p1",
+                "text": "split step 2",
+            }),
+        );
+        assert_eq!(base.sent.borrow().len(), before, "a draft is never echoed");
+        plan_message(
+            &handle,
+            ViewId::BASE,
+            serde_json::json!({
+                "type": "plan_feedback_draft", "request_id": "d2", "tab": tab.0, "interaction_id": "gone",
+                "text": "x",
+            }),
+        );
+        assert!(matches!(result_for(&base.sent.borrow(), "d2"), Some(Err(why)) if why.contains("no longer waiting")));
+        let other = handle.state.borrow_mut().tabs.open(AgentId::Claude);
+        handle.state.borrow_mut().tabs.select(other);
+        handle.tick();
+        handle.state.borrow_mut().tabs.select(tab);
+        handle.tick();
+        assert_eq!(
+            tab_row(&base, tab).unwrap()["planFeedbackDraft"],
+            serde_json::json!({ "p1": "split step 2" })
+        );
+        assert!(provider.interactions().is_empty());
+        assert_eq!(plan_state(&handle, tab), Some(agent::PlanState::Waiting));
+        shut_down_every_tab(&handle);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A move the CLI never confirms fails the tab on the tick, and the page that shows it is told why.
+    #[test]
+    fn an_overdue_switch_fails_the_tab_on_the_tick() {
+        agent::state_dirs::redirect_state_to_a_test_root();
+        let dir = agent::state_dirs::test_workspace_dir("views-plan-overdue");
+        let (handle, base, _second) = handle_with_two_pages();
+        let (tab, provider) = plan_tab(&handle, &dir);
+        handle.state.borrow_mut().tabs.select(tab);
+        // A move into plan mode dated long before now, which the CLI never reports.
+        provider.queue(agent::AgentDomainEvent::PlanTransitionStarted {
+            enter: true,
+            cause: agent::PlanCause::Tool {
+                tool_use_id: "toolu_enter".into(),
+            },
+            at_ms: 1,
+        });
+        tick_handle_until(&handle, "the guard", || {
+            matches!(
+                handle.state.borrow().tabs.get(tab).unwrap().backend(),
+                TabBackend::Failed { .. }
+            )
+        });
+        let told = base.sent.borrow().iter().map(|s| json_of(s)).any(|v| {
+            v["kind"] == "error" && v["tab"] == tab.0 && v["message"].as_str().unwrap_or("").contains("plan mode")
+        });
+        assert!(told, "the page is told why the tab failed");
+        assert!(matches!(
+            handle.state.borrow().tabs.get(tab).unwrap().backend(),
+            TabBackend::Failed { .. }
+        ));
+        shut_down_every_tab(&handle);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod attachment_tests {
+    use super::*;
+    use crate::agent_panel::tests::*;
+    use eitri_core::tab_set::{AttachmentDesk, DeskEvent, DeskRequest};
+    use std::time::Duration;
+
+    fn attach_messages(tab: TabId, n: usize) -> Vec<String> {
+        let id = "a".repeat(32);
+        [
+            serde_json::json!({"type": "attach_begin", "request_id": format!("b{n}"), "tab": tab.0, "generation": 0,
+                "byte_length": 10, "name": "shot.png"}),
+            serde_json::json!({"type": "attach_chunk", "request_id": format!("c{n}"), "tab": tab.0, "attachment_id": id,
+                "offset": 0, "data_b64": "AAAA"}),
+            serde_json::json!({"type": "attach_end", "request_id": format!("e{n}"), "tab": tab.0, "attachment_id": id,
+                "sha256": "0".repeat(64)}),
+            serde_json::json!({"type": "attach_cancel", "request_id": format!("x{n}"), "tab": tab.0, "attachment_id": id}),
+            serde_json::json!({"type": "attach_remove", "request_id": format!("r{n}"), "tab": tab.0, "attachment_id": id}),
+            serde_json::json!({"type": "send_message", "request_id": format!("s{n}"), "tab": tab.0, "text": "look",
+                "attachments": [id]}),
+            serde_json::json!({"type": "queue_message", "request_id": format!("q{n}"), "tab": tab.0, "text": "look",
+                "attachments": [id]}),
+        ]
+        .iter()
+        .map(|m| m.to_string())
+        .collect()
+    }
+
+    fn request_ids(n: usize) -> [String; 7] {
+        ["b", "c", "e", "x", "r", "s", "q"].map(|p| format!("{p}{n}"))
+    }
+
+    /// Every message that puts an image into a tab's draft, takes one out, or sends one comes only from the
+    /// uncovered page that shows the tab: a covered page and another view's page are refused before the desk or
+    /// the tab hears of it.
+    #[test]
+    fn attach_messages_from_a_covered_or_other_page_are_refused() {
+        let (handle, page, _) = handle_with_recording_page();
+        handle.page_message(ViewId::BASE, READY);
+        let (desk, end) = AttachmentDesk::channels();
+        handle.install_attachments(desk);
+        let tab = handle.state.borrow().tabs.active();
+
+        handle.set_answer_gate(Rc::new(|_| Err("agent is under terminal 2".into())));
+        for message in attach_messages(tab, 1) {
+            handle.page_message(ViewId::BASE, &message);
+        }
+        for id in request_ids(1) {
+            assert_eq!(
+                result_for(&page.sent.borrow(), &id),
+                Some(Err("agent is under terminal 2".into())),
+                "{id}"
+            );
+        }
+        handle.set_answer_gate(Rc::new(|_| Ok(())));
+
+        attach_recording_page(&handle, view(2));
+        handle.page_message(view(2), READY);
+        let other = handle.state.borrow_mut().tabs.open(AgentId::Claude);
+        assert_eq!(handle.break_out(view(2)), Ok(other));
+        for message in attach_messages(other, 2) {
+            handle.page_message(ViewId::BASE, &message);
+        }
+        for id in request_ids(2) {
+            let result = result_for(&page.sent.borrow(), &id).expect("answered");
+            assert!(result.unwrap_err().contains("not shown in this page"), "{id}");
+        }
+        assert!(end.requests.try_recv().is_err(), "the desk heard of none of them");
+    }
+
+    /// A page's import through the panel: the begin is answered with the image's token once the desk has made
+    /// room, and the page is told when the image is ready, with a thumbnail.
+    #[test]
+    fn an_import_is_answered_with_its_token_and_its_ready_state() {
+        let (handle, page, _) = handle_with_recording_page();
+        handle.page_message(ViewId::BASE, READY);
+        let (desk, end) = AttachmentDesk::channels();
+        handle.install_attachments(desk);
+        let tab = handle.state.borrow().tabs.active();
+        let token = "b".repeat(32);
+        let message = |m: serde_json::Value| handle.page_message(ViewId::BASE, &m.to_string());
+
+        message(
+            serde_json::json!({"type": "attach_begin", "request_id": "b1", "tab": tab.0, "generation": 0,
+            "byte_length": 3, "name": "shot.png"}),
+        );
+        let Ok(DeskRequest::Begin { reply, .. }) = end.requests.recv_timeout(Duration::from_secs(10)) else {
+            panic!("a begin")
+        };
+        assert_eq!(
+            result_for(&page.sent.borrow(), "b1"),
+            None,
+            "answered once the desk has"
+        );
+        end.events
+            .send(DeskEvent::Begun {
+                reply,
+                result: Ok(token.clone()),
+            })
+            .unwrap();
+        handle.tick();
+        let begun = page
+            .sent
+            .borrow()
+            .iter()
+            .map(|p| serde_json::from_str::<serde_json::Value>(p).unwrap())
+            .find(|v| v["kind"] == "command_result" && v["requestId"] == "b1")
+            .expect("the begin's answer");
+        assert_eq!(begun["attachmentId"], token.as_str());
+
+        message(
+            serde_json::json!({"type": "attach_chunk", "request_id": "c1", "tab": tab.0, "attachment_id": token,
+            "offset": 0, "data_b64": "YWJj"}),
+        );
+        let Ok(DeskRequest::Chunk { reply, data, .. }) = end.requests.recv_timeout(Duration::from_secs(10)) else {
+            panic!("a chunk")
+        };
+        assert_eq!(data, b"abc");
+        end.events.send(DeskEvent::Answered { reply, result: Ok(()) }).unwrap();
+        handle.tick();
+        assert_eq!(result_for(&page.sent.borrow(), "c1"), Some(Ok(())));
+
+        message(
+            serde_json::json!({"type": "attach_end", "request_id": "e1", "tab": tab.0, "attachment_id": token,
+            "sha256": "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"}),
+        );
+        let Ok(DeskRequest::End { reply, .. }) = end.requests.recv_timeout(Duration::from_secs(10)) else {
+            panic!("an end")
+        };
+        end.events.send(DeskEvent::Answered { reply, result: Ok(()) }).unwrap();
+        end.events
+            .send(DeskEvent::Prepared {
+                token: token.clone(),
+                result: Ok(eitri_core::tab_set::PreparedImage {
+                    meta: agent::AttachmentMeta {
+                        media_type: "image/png".into(),
+                        bytes: 3,
+                        width: 1,
+                        height: 1,
+                        sha256: "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad".into(),
+                    },
+                    data: std::sync::Arc::from(&b"abc"[..]),
+                    thumbnail_png: b"t".to_vec(),
+                }),
+            })
+            .unwrap();
+        handle.tick();
+        assert_eq!(result_for(&page.sent.borrow(), "e1"), Some(Ok(())));
+        let ready = page
+            .sent
+            .borrow()
+            .iter()
+            .map(|p| serde_json::from_str::<serde_json::Value>(p).unwrap())
+            .filter(|v| v["kind"] == "attachment_state")
+            .last()
+            .expect("the image's state");
+        assert_eq!(ready["state"], "ready");
+        assert_eq!(ready["thumbnail"], "data:image/png;base64,dA==");
+        assert!(
+            page.sent.borrow().iter().all(|p| !p.contains("YWJj")),
+            "never the bytes"
+        );
+    }
+    /// Imports one image into `tab`'s draft through the scripted desk `end`, all the way to ready.
+    fn ready_image(handle: &AgentPanelHandle, end: &eitri_core::tab_set::DeskEnd, tab: TabId, token: &str) {
+        let message = |m: serde_json::Value| handle.page_message(ViewId::BASE, &m.to_string());
+        message(
+            serde_json::json!({"type": "attach_begin", "request_id": format!("rb-{token}"), "tab": tab.0,
+            "generation": 0, "byte_length": 3, "name": "shot.png"}),
+        );
+        let Ok(DeskRequest::Begin { reply, .. }) = end.requests.recv_timeout(Duration::from_secs(10)) else {
+            panic!("a begin")
+        };
+        end.events
+            .send(DeskEvent::Begun {
+                reply,
+                result: Ok(token.into()),
+            })
+            .unwrap();
+        handle.tick();
+        message(
+            serde_json::json!({"type": "attach_chunk", "request_id": format!("rc-{token}"), "tab": tab.0,
+            "attachment_id": token, "offset": 0, "data_b64": "YWJj"}),
+        );
+        let Ok(DeskRequest::Chunk { reply, .. }) = end.requests.recv_timeout(Duration::from_secs(10)) else {
+            panic!("a chunk")
+        };
+        end.events.send(DeskEvent::Answered { reply, result: Ok(()) }).unwrap();
+        handle.tick();
+        message(
+            serde_json::json!({"type": "attach_end", "request_id": format!("re-{token}"), "tab": tab.0,
+            "attachment_id": token,
+            "sha256": "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"}),
+        );
+        let Ok(DeskRequest::End { reply, .. }) = end.requests.recv_timeout(Duration::from_secs(10)) else {
+            panic!("an end")
+        };
+        end.events.send(DeskEvent::Answered { reply, result: Ok(()) }).unwrap();
+        end.events
+            .send(DeskEvent::Prepared {
+                token: token.into(),
+                result: Ok(eitri_core::tab_set::PreparedImage {
+                    meta: agent::AttachmentMeta {
+                        media_type: "image/png".into(),
+                        bytes: 3,
+                        width: 1,
+                        height: 1,
+                        sha256: "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad".into(),
+                    },
+                    data: std::sync::Arc::from(&b"abc"[..]),
+                    thumbnail_png: b"t".to_vec(),
+                }),
+            })
+            .unwrap();
+        handle.tick();
+    }
+
+    /// `Ctrl+Enter` sends words only: with images in the draft its text is refused, never sent without them.
+    #[test]
+    fn send_now_with_text_is_refused_while_the_draft_holds_images() {
+        let (handle, page, _) = handle_with_recording_page();
+        handle.page_message(ViewId::BASE, READY);
+        let (desk, end) = AttachmentDesk::channels();
+        handle.install_attachments(desk);
+        let tab = handle.state.borrow().tabs.active();
+        ready_image(&handle, &end, tab, &"c".repeat(32));
+        handle.page_message(
+            ViewId::BASE,
+            &serde_json::json!({"type": "send_now", "request_id": "n1", "tab": tab.0, "text": "go"}).to_string(),
+        );
+        assert_eq!(
+            result_for(&page.sent.borrow(), "n1"),
+            Some(Err(super::super::inbound::SEND_NOW_BESIDE_IMAGES.into()))
+        );
+    }
+
+    /// A page loaded again in the middle of an upload: the import it was sending fails, so it does not wait as
+    /// importing for good, and the room the desk kept for it goes.
+    #[test]
+    fn a_page_reload_fails_the_upload_it_was_sending() {
+        let (handle, page, _) = handle_with_recording_page();
+        handle.page_message(ViewId::BASE, READY);
+        let (desk, end) = AttachmentDesk::channels();
+        handle.install_attachments(desk);
+        let tab = handle.state.borrow().tabs.active();
+        let token = "d".repeat(32);
+        handle.page_message(
+            ViewId::BASE,
+            &serde_json::json!({"type": "attach_begin", "request_id": "b1", "tab": tab.0, "generation": 0,
+                "byte_length": 30, "name": "big.png"})
+            .to_string(),
+        );
+        let Ok(DeskRequest::Begin { reply, .. }) = end.requests.recv_timeout(Duration::from_secs(10)) else {
+            panic!("a begin")
+        };
+        end.events
+            .send(DeskEvent::Begun {
+                reply,
+                result: Ok(token.clone()),
+            })
+            .unwrap();
+        handle.tick();
+        handle.page_message(ViewId::BASE, READY);
+        let Ok(DeskRequest::Remove { tokens }) = end.requests.recv_timeout(Duration::from_secs(10)) else {
+            panic!("its room goes")
+        };
+        assert_eq!(tokens, [token.clone()]);
+        let draft = page
+            .sent
+            .borrow()
+            .iter()
+            .rev()
+            .map(|p| serde_json::from_str::<serde_json::Value>(p).unwrap())
+            .find(|v| v["kind"] == "draft_attachments")
+            .expect("the reloaded page is sent the draft");
+        assert_eq!(draft["attachments"][0]["state"], "failed");
+        assert_eq!(draft["attachments"][0]["reason"], eitri_core::tab_set::ABANDONED);
+    }
+    /// A file dropped on a page goes to the tab that page shows, as a request to the desk: the page is never handed
+    /// its path. A page that shows no tab is told so, and nothing is read.
+    #[test]
+    fn a_drop_imports_into_the_tab_its_page_shows() {
+        let (handle, page, _) = handle_with_recording_page();
+        handle.page_message(ViewId::BASE, READY);
+        let (desk, end) = AttachmentDesk::channels();
+        handle.install_attachments(desk);
+        let tab = handle.state.borrow().tabs.active();
+        let dropped = || eitri_core::tab_set::DroppedFile {
+            path: Some(std::path::PathBuf::from("/pictures/one.png")),
+            name: "one.png".into(),
+        };
+        handle.drop_files(ViewId::BASE, vec![dropped()]);
+        let Ok(DeskRequest::ImportFile { tab: of, path, .. }) = end.requests.recv_timeout(Duration::from_secs(10))
+        else {
+            panic!("the file is read on the desk")
+        };
+        assert_eq!((of, path.to_str()), (tab.0, Some("/pictures/one.png")));
+
+        let second = attach_recording_page(&handle, view(2));
+        handle.page_message(view(2), READY);
+        handle.drop_files(view(2), vec![dropped()]);
+        assert!(end.requests.try_recv().is_err(), "nothing read for a page with no tab");
+        assert!(
+            second
+                .sent
+                .borrow()
+                .iter()
+                .any(|p| p.contains("\"notice\"") && p.contains("shows no tab")),
+            "the page is told why"
+        );
+        assert!(
+            page.sent.borrow().iter().all(|p| !p.contains("/pictures")),
+            "never the path"
+        );
+    }
+    /// A tab that leaves the window while one of its images is on its way still answers the page: the request the
+    /// page waits on is refused, so its next import and its Send are not held for good.
+    #[test]
+    fn a_tab_that_leaves_mid_upload_answers_its_page() {
+        let (handle, page, _) = handle_with_recording_page();
+        handle.page_message(ViewId::BASE, READY);
+        let (desk, end) = AttachmentDesk::channels();
+        handle.install_attachments(desk);
+        let tab = handle.state.borrow().tabs.active();
+        handle.state.borrow_mut().tabs.open(AgentId::Claude);
+        let token = "e".repeat(32);
+        let message = |m: serde_json::Value| handle.page_message(ViewId::BASE, &m.to_string());
+        message(
+            serde_json::json!({"type": "attach_begin", "request_id": "b1", "tab": tab.0, "generation": 0,
+            "byte_length": 6, "name": "big.png"}),
+        );
+        let Ok(DeskRequest::Begin { reply, .. }) = end.requests.recv_timeout(Duration::from_secs(10)) else {
+            panic!("a begin")
+        };
+        end.events
+            .send(DeskEvent::Begun {
+                reply,
+                result: Ok(token.clone()),
+            })
+            .unwrap();
+        handle.tick();
+        message(
+            serde_json::json!({"type": "attach_chunk", "request_id": "c1", "tab": tab.0,
+            "attachment_id": token, "offset": 0, "data_b64": "YWJj"}),
+        );
+        assert!(matches!(
+            end.requests.recv_timeout(Duration::from_secs(10)),
+            Ok(DeskRequest::Chunk { .. })
+        ));
+        assert_eq!(result_for(&page.sent.borrow(), "c1"), None, "with the desk");
+        handle.state.borrow_mut().tabs.remove(tab).expect("closed");
+        assert!(
+            super::super::tick::needs_polling(&handle.state.borrow()),
+            "the tick runs until it is answered"
+        );
+        handle.tick();
+        assert_eq!(
+            result_for(&page.sent.borrow(), "c1"),
+            Some(Err(super::super::inbound::IMPORT_TAB_GONE.into()))
+        );
     }
 }

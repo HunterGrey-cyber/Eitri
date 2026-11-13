@@ -23,7 +23,8 @@ Every tool call Claude Code wants to run is sent to Eitri first, in every mode, 
 next depends on the tab's mode and on how Claude Code is running. A tab is in one of three modes, and
 `Shift+Tab` (or `<leader>m`) cycles them in Claude Code's order: manual, auto, bypass, then manual again. A new
 tab starts in auto unless you set `agent.default_mode`
-([How a launch starts](configuration.md#how-a-launch-starts)).
+([How a launch starts](configuration.md#how-a-launch-starts)). While Claude Code plans, [plan mode](#plan-mode) changes
+some of the answers below.
 
 ### Manual
 
@@ -101,7 +102,8 @@ waiting cards?", and every waiting card is counted, except a card from an agent'
 on its own and a moment after the question appears, and only the cards still waiting at that moment are approved.
 Bypass is entered only from auto. Leaving bypass needs no question and lands in manual.
 
-Bypass never answers a question Claude asks you ([Claude's questions to you](#claudes-questions-to-you)).
+Bypass never answers a question Claude asks you ([Claude's questions to you](#claudes-questions-to-you)), never
+settles a plan, and approves nothing by itself while Claude Code plans ([Plan mode](#plan-mode)).
 
 Starting in bypass without the question is possible only by saying so in advance, with
 `agent.default_mode = "bypass"` in your `init.lua`; see
@@ -240,6 +242,40 @@ question wait together, those keys answer only the card.
 - The question, its options and its previews are drawn as plain text, and hidden or direction-changing characters
   are shown as visible escapes. A preview's Markdown is drawn with no images, scripts or controls.
 - Closing the tab while a question waits asks first and says that closing cancels the question.
+
+## Plan mode
+
+How to enter plan mode and decide on a plan is in [Codex and other agents](agents.md#plan-mode). While Claude Code
+plans, Eitri answers differently:
+
+- **No file edit or command is approved automatically, in any mode, bypass included.** Claude Code writes its own plan
+  file. Every other `Write`, `Edit` or `NotebookEdit` call and every `Bash` command is a card that only you answer: no
+  saved rule, no bypass and no sweep of waiting cards answers it, and it stays a card after plan mode ends, whatever
+  the tab's mode is then. In a folder that is [no boundary](#a-folder-that-is-no-boundary) the plan file's write is a
+  card too, and approving it can bring Claude Code's own question about the same call as a second card.
+- **Claude Code's own questions are always cards** while it plans ([When Claude Code itself asks](#when-claude-code-itself-asks)),
+  bypass included.
+- **Other tools are judged as in the mode plan mode started from.** In Manual and Auto that is the usual answer. From
+  Bypass nothing is approved by bypass: where Claude Code runs its auto mode the call goes to Claude Code's classifier,
+  and otherwise it is a card. Eitri's own [editor tools](editor-tools.md) answer a Bypass tab as an Auto one while it
+  plans.
+- **The tab's mode stays put.** `Shift+Tab` and `<leader>m` change nothing, bypass cannot be entered, and nothing
+  approves the waiting cards in bulk. After an approval, any request that arrived while plan mode was ending is judged
+  once, under the tab's new mode.
+- **A plan is not a permission card.** Only your choice in the plan box settles it; the card keys, `Ctrl+y`, bypass and
+  saved rules never do.
+
+Eitri tells a call made in plan mode from one made outside it by the order in which Claude Code reports them. For a
+file edit, a command or a question of Claude Code's own, and for every call in a Bypass tab, it waits until it has
+seen Claude Code start the call before it answers. That wait is usually about 0.2 seconds and was under one second in
+every recording. A call Eitri never sees start, such as a call by one of a
+[dynamic workflow's](#a-dynamic-workflows-card) agents, waits 2 seconds and is then judged both ways, as if Claude Code
+were planning and as if it were not; where the two answers differ, it is a card. This applies on every Claude tab that
+offers plan mode, also when nobody is planning. So in a Bypass tab every call of a workflow's agents is a card, and in a
+Manual or Auto tab so is every file edit, command and Claude Code question of theirs that a saved rule or Claude Code's
+auto mode would otherwise have handled.
+
+What plan mode does not stop is under [Known limits](#known-limits).
 
 ## Trusting a project
 
@@ -390,3 +426,10 @@ above is weaker than it may sound.
   after a resume.
 - **A reason is not proof of origin.** In an Auto or Manual tab, a question with a reason is answered on your approval of
   the same call, and Eitri cannot tell Claude Code's own check from a hook that asks with a reason.
+- **Plan mode is supervision, not a sandbox.** It keeps file edits and commands on cards while Claude Code plans, but
+  your hooks (and a trusted project's) still run, MCP servers stay loaded, and any other tool, an MCP server's included,
+  can still run wherever the rules above let it. Which calls count as made in plan
+  mode rests on the order in which Claude Code reports them: a call shown more than 2 seconds late is judged both
+  ways, a card where the answers differ.
+- **On a tab that offers plan mode, calls Eitri never sees start wait 2 seconds and may become cards.** The calls of a
+  dynamic workflow's agents are the common case: in a Bypass tab every one of them is a card.

@@ -231,16 +231,42 @@ pub enum CliModeReport {
     /// it, or a value this build does not know. The session is closed: an unknown value
     /// resolves toward stopping.
     Ungated,
+    /// `plan` on a session created with plan mode offered ([`CliExpectation::plan_offered`]): a
+    /// report of its own, which the projection judges against the plan phase it expects
+    /// (`AgentSessionProjection::planning`). Never returned for any other session, where `plan` is
+    /// `Stricter` on a `default` session and `Ungated` on an auto one, as before.
+    Plan,
 }
 
 /// The permission mode a session asked the CLI to run in under the gate.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum RequestedCliMode {
     /// `default`: every legacy session, and every sidecar session that cannot defer to auto.
     #[default]
     Default,
     /// The CLI's own `auto` (Verdandi `CLI_PERMISSION_MODE_AUTO`).
     Auto,
+}
+
+/// What a session's CLI reports are judged against: the mode it was created in, and whether it was
+/// created with plan mode offered (Verdandi's `client_interactions.plan_mode`). Only a session whose
+/// `CreateSession` stated the opt-in has `plan_offered`; every other session is judged exactly as one
+/// with `requested` alone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+pub struct CliExpectation {
+    pub requested: RequestedCliMode,
+    pub plan_offered: bool,
+}
+
+/// A session with no plan mode offered, judged by `requested` alone.
+impl From<RequestedCliMode> for CliExpectation {
+    fn from(requested: RequestedCliMode) -> Self {
+        CliExpectation {
+            requested,
+            plan_offered: false,
+        }
+    }
 }
 
 /// Classifies one CLI-reported permission mode on a session that asked for `default`. See
@@ -259,6 +285,21 @@ pub fn classify_reported_cli_mode(reported: &str, requested: RequestedCliMode) -
         (RequestedCliMode::Auto, "auto") => CliModeReport::Auto,
         (RequestedCliMode::Auto, "default") => CliModeReport::AutoUnavailable,
         _ => CliModeReport::Ungated,
+    }
+}
+
+/// [`classify_reported_cli_mode`] on a session that may have plan mode offered: `plan` there is
+/// [`CliModeReport::Plan`], a report the projection judges against the plan phase it expects. Every
+/// other report, and every report on a session without the offer, is classified as before.
+pub fn classify_reported_cli_mode_planning(
+    reported: &str,
+    requested: RequestedCliMode,
+    plan_offered: bool,
+) -> CliModeReport {
+    if plan_offered && reported == "plan" {
+        CliModeReport::Plan
+    } else {
+        classify_reported_cli_mode(reported, requested)
     }
 }
 
@@ -456,9 +497,10 @@ fn spawn_hook_listener(
                     eprintln!("{line}");
                 }
             }
-            // The two auto readings only come from a session that asked for auto, which a legacy
-            // session never does; were one to appear here it is treated as the trip it would be.
-            CliModeReport::Ungated | CliModeReport::Auto | CliModeReport::AutoUnavailable => {
+            // The two auto readings only come from a session that asked for auto, and `Plan` only from
+            // one that offered plan mode, which a legacy session never does; were one to appear here it
+            // is treated as the trip it would be.
+            CliModeReport::Ungated | CliModeReport::Auto | CliModeReport::AutoUnavailable | CliModeReport::Plan => {
                 write_fail_closed_deny(
                     &stream,
                     &format!(
@@ -1262,6 +1304,52 @@ mod deny_list_tests {
                 "{reported:?}: the default request is classify_cli_mode exactly"
             );
         }
+    }
+
+    /// `plan` is a report of its own only on a session that offered plan mode, and only `plan` is: every
+    /// other report there, and every report on a session without the offer, is classified as before.
+    #[test]
+    fn plan_is_its_own_report_only_on_a_plan_offered_session() {
+        for requested in [RequestedCliMode::Default, RequestedCliMode::Auto] {
+            assert_eq!(
+                classify_reported_cli_mode_planning("plan", requested, true),
+                CliModeReport::Plan
+            );
+            for reported in [
+                "default",
+                "auto",
+                "dontAsk",
+                "",
+                "bypassPermissions",
+                "acceptEdits",
+                "Plan",
+                "plan ",
+            ] {
+                assert_eq!(
+                    classify_reported_cli_mode_planning(reported, requested, true),
+                    classify_reported_cli_mode(reported, requested),
+                    "{reported:?} on {requested:?}"
+                );
+            }
+            for reported in ["plan", "default", "auto", "dontAsk", ""] {
+                assert_eq!(
+                    classify_reported_cli_mode_planning(reported, requested, false),
+                    classify_reported_cli_mode(reported, requested),
+                    "{reported:?} on {requested:?} without the offer"
+                );
+            }
+        }
+        assert_eq!(
+            classify_reported_cli_mode_planning("plan", RequestedCliMode::Auto, false),
+            CliModeReport::Ungated
+        );
+        assert_eq!(
+            CliExpectation::from(RequestedCliMode::Auto),
+            CliExpectation {
+                requested: RequestedCliMode::Auto,
+                plan_offered: false
+            }
+        );
     }
 
     /// Pins the exact contents of `CONSERVATIVE_DISALLOWED_TOOLS`, because a typo in it is silent

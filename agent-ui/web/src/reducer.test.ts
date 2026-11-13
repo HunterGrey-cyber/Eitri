@@ -10,7 +10,11 @@ import * as subagents322 from "./fold/subagents";
 import * as reset322 from "./fold/reset";
 import protocol322 from "./fixtures/protocol-322.json";
 import questionsFixture from "./fixtures/questions.json";
+/** Plan records and the plan phase as Rust's projection folds them; written by `agent/src/testkit/plans_fixture.rs`. */
+import plansFixture from "./fixtures/plans.json";
+import * as plans326 from "./fold/plans";
 import { describe, expect, it, vi } from "vitest";
+import { buildTimeline } from "./timeline";
 import { applyCallNotes, applyEvent, applyEvents, applySnapshot, keepAfterFailure, initialState, MAX_HELD_DENIALS, resetToStartScreen, withEditorCards } from "./reducer";
 import type { AgentDomainEvent, AgentUiSnapshot, AgentUiState, EditorCardWire, TurnEndDetail, TurnOutcome, UsageInfo } from "./types";
 /** What Rust really sends for the turn-ending cases; written from its serializer. */
@@ -1731,6 +1735,44 @@ describe("question states from Rust", () => {
   }
 });
 
+describe("plan states from Rust", () => {
+  for (const testCase of plansFixture.cases) {
+    it(testCase.name, () => {
+      let state = initialState();
+      for (const step of testCase.steps) {
+        const action = step.action as { event?: AgentDomainEvent; send?: string; interactionId?: string };
+        state = action.event ? applyEvent(state, action.event)
+          : { ...state, plans: state.plans.map((record) => record.interactionId === action.interactionId
+            && record.state.kind === (action.send === "answering" ? "waiting" : "answering")
+            ? { ...record, state: { kind: action.send === "answering" ? "answering" as const : "waiting" as const } } : record) };
+        // The records are the page's own fold; the phase is the host's, read from the snapshot.
+        const snapshot = step.snapshot as { plans?: unknown[]; planning: { phase: string } };
+        expect(state.plans).toEqual(snapshot.plans ?? []);
+        expect(state.nextSeq).toBe(step.throughRevision);
+        expect(plans326.waitingPlan(state)?.interactionId ?? null).toBe(step.waitingId);
+        const reloaded = applySnapshot(initialState(), { ...initialState(), ...snapshot } as unknown as AgentUiSnapshot, step.throughRevision);
+        expect(reloaded.plans).toEqual(state.plans);
+        expect(reloaded.planning).toEqual({ phase: snapshot.planning.phase, origin: null });
+        expect(reloaded.planning!.phase !== "executing").toBe(step.isPlanning);
+      }
+    });
+  }
+  it("the envelope's planningChanged sets plan mode and places page-only rows that a snapshot drops", () => {
+    let state = applyEvent(initialState(), { type: "turn_started", turn_id: "t1" });
+    state = plans326.withPlanning(state, { phase: "entering", origin: "auto" });
+    expect(state.planMarks).toEqual([]);
+    state = plans326.withPlanning(state, { phase: "planning", origin: "auto" });
+    expect(state.planning).toEqual({ phase: "planning", origin: "auto" });
+    expect(state.planMarks).toEqual([{ seq: 0.5, kind: "entered", key: "pm-1-entered" }]);
+    expect(plans326.withPlanning(state, undefined)).toBe(state);
+    state = plans326.withPlanning(state, { phase: "leaving", origin: "auto" });
+    state = plans326.withPlanning(state, { phase: "executing", origin: null });
+    expect(state.planMarks.map((m) => m.kind)).toEqual(["entered", "left"]);
+    expect(plans326.withPlanning(state, null).planning).toBeNull();
+    expect(applySnapshot(state, { ...initialState() } as unknown as AgentUiSnapshot, 1).planMarks).toEqual([]);
+  });
+});
+
 describe("turns Claude Code started, a prompt read after work of its own, endings without a result (cli-turns.json)", () => {
   type Case = {
     name: string;
@@ -2012,4 +2054,44 @@ it("conversation_reset_clears_phone_notes", () => {
   const cleared = applyEvent(state, { type: "conversation_reset", new_conversation_id: "new", trigger: null });
   expect(cleared.sentFrom).toEqual({});
   expect(cleared.stoppedFrom).toEqual({});
+});
+
+it("the newest unsettled plan is docked regardless of array order", () => {
+  let state = initialState();
+  for (const interaction_id of ["old", "new"]) state = applyEvent(state, {
+    type: "plan_proposed", interaction_id, tool_use_id: null, plan: "# Plan", plan_sha256: "a".repeat(64), allowed_prompts: [], unsupported_reason: null,
+  });
+  expect(plans326.waitingPlan(state)?.interactionId).toBe("new");
+  expect(plans326.waitingPlan({ plans: [...state.plans].reverse() })?.interactionId).toBe("new");
+  state = applyEvent(state, { type: "plan_settled", interaction_id: "new", outcome: "interrupted", mode_after: null, feedback: null, reason: null });
+  expect(plans326.waitingPlan(state)?.interactionId).toBe("old");
+});
+
+it("images sent with a prompt fold onto the newest prompt not put into a turn, as Rust folds them", () => {
+  const png = { media_type: "image/png", bytes: 302, width: 48, height: 32, sha256: "ab".repeat(32) };
+  const events: AgentDomainEvent[] = [
+    { type: "user_prompt_submitted", text: "first" },
+    { type: "user_prompt_submitted", text: "" },
+    { type: "user_prompt_attachments", attachments: [png, { ...png, media_type: "image/jpeg", width: 1429, height: 804 }] },
+  ];
+  const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+  const onUnknown = vi.fn();
+  const state = events.reduce((s, e) => applyEvent(s, e, onUnknown), initialState());
+  expect(onUnknown).not.toHaveBeenCalled();
+  expect(warn).not.toHaveBeenCalled();
+  warn.mockRestore();
+  expect(state.userPrompts[0]).toEqual({ seq: 0, text: "first" });
+  expect(state.userPrompts[1]).toEqual({
+    seq: 1, text: "",
+    attachments: [
+      { mediaType: "image/png", width: 48, height: 32, bytes: 302 },
+      { mediaType: "image/jpeg", width: 1429, height: 804, bytes: 302 },
+    ],
+  });
+  expect(buildTimeline(state).find((item) => item.kind === "prompt" && item.seq === 1)).toMatchObject({
+    images: "[2 images: PNG 48×32, JPEG 1429×804]",
+  });
+  // With no prompt to take them, nothing changes.
+  const empty = applyEvent(initialState(), events[2]);
+  expect(empty.userPrompts).toEqual([]);
 });

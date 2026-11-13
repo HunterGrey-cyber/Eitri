@@ -110,7 +110,7 @@ fn a_switch_sends_the_tabs_own_queue_draft_and_offers() {
     let empty = kinds(set.active_state_payloads());
     assert_eq!(
         empty.iter().map(|(k, _)| k.as_str()).collect::<Vec<_>>(),
-        vec!["queue", "draft", "scratch"],
+        vec!["queue", "draft", "draft_attachments", "scratch"],
         "an empty tab still resets the panel's queue and draft"
     );
     assert!(empty.iter().all(|(_, v)| v["tab"] == second.0));
@@ -118,7 +118,14 @@ fn a_switch_sends_the_tabs_own_queue_draft_and_offers() {
     let live_payloads = kinds(set.active_state_payloads());
     assert_eq!(
         live_payloads.iter().map(|(k, _)| k.as_str()).collect::<Vec<_>>(),
-        vec!["snapshot", "queue", "draft", "rule_offers", "scratch"]
+        vec![
+            "snapshot",
+            "queue",
+            "draft",
+            "draft_attachments",
+            "rule_offers",
+            "scratch"
+        ]
     );
     assert_eq!(live_payloads[1].1["items"][0]["text"], "queued");
     assert_eq!(live_payloads[2].1["text"], "typing");

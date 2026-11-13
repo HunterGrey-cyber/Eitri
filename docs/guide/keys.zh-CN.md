@@ -1,5 +1,5 @@
 [English](keys.md) | 简体中文
-<!-- translated-from: keys.md sha256=1b5ec8a851fd9b1605fb5ed20eb6a383df8704ec096f5101e2746ae149687812 -->
+<!-- translated-from: keys.md sha256=7cb4a62130ba706d4b4f0ae497d2f1d60249f87781790b7aba286ce7ae5e0992 -->
 
 # 按键
 
@@ -453,12 +453,16 @@ end
 
 底部状态条右侧显示 agent 的模型；agent 说明了 effort 时，旁边还会显示 effort。在 Claude 标签页上，点击其中任何一个会打开模型或 effort 列表，回合运行时也可以：不会给 Claude 发送消息，状态条会说明你的选择何时生效。Codex 标签页显示 Codex 报告的内容，不提供列表。
 
+<a id="in-insert"></a>
 ### 在 INSERT 里
 
 | 按键 | 作用 |
 |---|---|
 | `Enter` | 发送；回合运行期间，把消息插进这个回合而不打断它（agent 在下一步读到它）；标签页的 agent 不能在回合中途接收消息时，就先留着，等回合结束再发 |
-| `Ctrl+Enter` | 立刻发送：中断正在运行的回合，然后发送留着的消息和这条消息 |
+| `Ctrl+Enter` | 立刻发送：中断正在运行的回合，然后发送留着的消息和这条消息（带图片的消息除外：回合运行期间，`Enter` 把它们留到回合结束） |
+| `Ctrl+V` | 粘贴；剪贴板里的图片会变成输入框上方的一个小块（[消息里的图片](agents.zh-CN.md#images-in-a-message)） |
+| 最开头的 `←` | 草稿里有图片时：移到它们的小块上，先到最后一张（见下面） |
+| 最开头的 `Backspace` | 草稿里有图片时：去掉最后一张图片 |
 | `Shift+Enter`、`Alt+Enter`，或者反斜杠再加 `Enter` | 换行（反斜杠会被它替换掉） |
 | `Up` | 在第一行时：先把留着的消息取回，然后逐条翻看之前的提示（已经插进回合的消息不会取回） |
 | `Down` | 在最后一行时，并且已经在翻看之前的提示：再往前走一条 |
@@ -474,14 +478,16 @@ end
 | `Ctrl+x`，然后 `Enter` | 在回合结束之后发送草稿（见下面） |
 | `Ctrl+g` | 在 Neovim 里编辑草稿；`:wq` 把它带回输入框，回到 INSERT，光标在末尾，可以直接发送（`Enter` 发送），除非有卡片在等待，这时按键照常落在卡片上；`:q!` 也会这样返回，草稿不变，除非你已经用 `:w` 保存过，这时保存的文字会回来 |
 | `Ctrl+o` | 详细视图（在 BROWSE 里详细视图是 `zi`，那里的 `Ctrl+o` 是沿着你的跳转往回走） |
-| `Shift+Tab` | 轮换标签页的模式：Manual、Auto、Bypass，然后再回到 Manual（没有 Manual 模式的 agent：在 Auto 和 Bypass 之间）；进入 Bypass 会先问，并且只能从 Auto 进入，回答 `y` 还会批准这个标签页里已经在等的 Claude Code 提问（你的 ask 规则引起的也算），并替你回答之后的提问，见[Claude Code 自己提问时](permissions.zh-CN.md#when-claude-code-itself-asks)；Claude 问你的选择题它永远不会回答（[Claude 的提问](#claudes-questions)） |
+| `Shift+Tab` | 轮换标签页的模式：Manual、Auto、Bypass，然后再回到 Manual（没有 Manual 模式的 agent：在 Auto 和 Bypass 之间）；进入 Bypass 会先问，并且只能从 Auto 进入，回答 `y` 还会批准这个标签页里已经在等的 Claude Code 提问（你的 ask 规则引起的也算），并替你回答之后的提问，见[Claude Code 自己提问时](permissions.zh-CN.md#when-claude-code-itself-asks)；Claude 问你的选择题它永远不会回答（[Claude 的提问](#claudes-questions)）；标签页在 plan 模式下时，它不改变任何东西，只显示 `in plan mode: <leader>p leaves plan mode` |
 | `Esc` | 停止输入，回到 BROWSE；命令菜单打开时，先关闭菜单并保留文字 |
 | `?` | 按键列表，在输入框为空时 |
 | `F1` | 按键列表，不管输入框里有什么 |
 
 **回合结束之后再发。** 没有选中任何文字时，`Ctrl+x` 开始一个两秒的组合键，状态条显示 `Ctrl+x -`。接着按 `Enter`，草稿会在*回合结束之后*发出：这条消息留在输入框上方，显示为 `⧗ after the turn: <文字>`，等回合结束，或者 `Ctrl+Enter` 结束了回合，再随队列里的其他消息一起发出。不会有任何东西把它插进正在运行的回合，这就是它和 `Enter` 的区别。它等着的时候，你用 `Enter` 发的消息仍然进入这个回合，所以这是唯一一条不按你输入顺序发出的消息。`Up` 像取回其他留着的消息一样把它取回。没有回合在运行时，它就像普通消息一样发出。`Ctrl+x` 之后的任何其他键都会结束这个组合键，并显示 `Ctrl+x: only Ctrl+x Enter is bound (send after the turn)`，别的什么也不做；选中了文字时，`Ctrl+x` 像在任何文本框里一样是剪切。回合运行期间，空输入框会说明各个键做什么：`Enter steers the running turn, Ctrl+x Enter waits for its end…`。如果你的窗口前缀是 `Ctrl+x`，窗口会先拿走这个键。启动画面的输入框没有这个组合键。
 
-在 Claude 标签页中，单独输入以下七个斜杠词会运行 Eitri 自己的操作；仪表板的输入框和对话中的输入框都支持：
+**草稿里的图片。** 在图片小块上，`h` / `l`（或 `←` / `→`）沿着小块移动，在最后一块上按 `l` 回到输入框，`i`、`a` 和 `Enter` 也一样。`x`、`Delete` 或 `Backspace` 去掉这一块并移到旁边那块，一块都不剩时回到输入框。点小块上的 `×` 也能去掉它。
+
+在 Claude 标签页中，单独输入以下八个斜杠词会运行 Eitri 自己的操作；仪表板的输入框和对话中的输入框都支持：
 
 | 词 | 操作 |
 |---|---|
@@ -492,8 +498,9 @@ end
 | `/rewind` | 保留草稿并显示 `/rewind is not in Eitri — c reviews and reverts this turn's edits`（Eitri 没有 `/rewind`；用 `c` 审阅并撤销本轮的修改） |
 | `/tasks`（或 `/bashes`） | 打开[后台任务列表](#the-background-tasks-list) |
 | `/workflows` | 打开后台任务列表，并定位到动态工作流 |
+| `/plan` | 进入或离开 plan 模式（和 `<leader>p` 一样）；在空标签页上，给标签页做标记，让它以 plan 模式开始（[Claude 的计划](#claudes-plan)） |
 
-前四个操作会清空草稿。这些词都不会给 Claude 发送消息。其他斜杠命令的行为不变：`/clear`、`/compact`、`/cost`、`/context`、`/usage`、`/model`、`/mcp`、`/agents`、`/doctor` 和 `/output-style` 会产生效果；单独的 `/model` 或 `/effort` 会打开选择器，回合运行时也可以，`/model <名称>` 作为消息发送（ACP 标签页里它设置 agent 列出的模型）。`/login` 和 `/config`，以及带参数的 `/resume`，需要完整终端，会被拒绝并显示消息。其他词，包括提示词模板和你自己的命令，按输入的原样发出。`?` 列出能用的 CLI 命令。在 Codex 标签页中，这七个词都作为文字发出，没有 Claude 命令的拦截或选择器。在你注册的 agent 的标签页中，`/model` 和 `/effort` 从 agent 列出的选项里选（见[agents](agents.zh-CN.md#model-and-effort)），其余五个作为文字发出。
+前四个操作会清空草稿。这些词都不会给 Claude 发送消息。其他斜杠命令的行为不变：`/clear`、`/compact`、`/cost`、`/context`、`/usage`、`/model`、`/mcp`、`/agents`、`/doctor` 和 `/output-style` 会产生效果；单独的 `/model` 或 `/effort` 会打开选择器，回合运行时也可以，`/model <名称>` 作为消息发送（ACP 标签页里它设置 agent 列出的模型）。`/login` 和 `/config`，以及带参数的 `/resume`，需要完整终端，会被拒绝并显示消息。其他词，包括提示词模板和你自己的命令，按输入的原样发出。`?` 列出能用的 CLI 命令。在 Codex 标签页中，这八个词都作为文字发出，没有 Claude 命令的拦截或选择器。在你注册的 agent 的标签页中，`/model` 和 `/effort` 从 agent 列出的选项里选（见[agents](agents.zh-CN.md#model-and-effort)），其余的作为文字发出。
 
 ### 在 BROWSE 里
 
@@ -596,6 +603,7 @@ end
 | `<leader>i` | 这个标签页的详情 |
 | `<leader>t` | 在终端里继续这个对话（Claude 标签页；Codex 或已注册 agent 的标签页会提示这还不可用） |
 | `<leader>m` | 轮换标签页的模式（和 `Shift+Tab` 一样） |
+| `<leader>p` | 进入或离开 plan 模式（和 `/plan` 一样；Claude 标签页） |
 | `<leader>M` | 选择模型（和点击状态带的模型一样），回合运行时也可以：正在生成的回复按旧模型结束，下一个请求就用新模型。Claude 标签页可用，已注册 agent 的标签页从 agent 列出的模型里选；Codex 标签页会提示此功能不可用。 |
 | `<leader>E` | 选择推理力度（和点击状态带的推理力度一样），回合运行时也可以：从下一个请求起生效。Claude 标签页可用，已注册 agent 的标签页从 agent 列出的推理力度里选；Codex 标签页会提示此功能不可用。 |
 | `<leader>k` | 在 Claude 标签页里，先问一个列出任务的 `y/n`（`Stop 2 shells, 1 monitor? y/n`），然后停掉所有后台任务，对话继续；只在没有回合运行时可用。在 Codex 标签页里，停止它留在后台运行的命令，这会结束它的会话（之后可以恢复），会先问一个 `y/n` |
@@ -643,6 +651,22 @@ Claude 用选择题问你时，提问框会取代输入框，直到你回答为�
 | `F1` | 按键列表 |
 
 提问框出现之前就按住的键不会选中任何东西，按住不放产生的重复按键也不会。关于提问的更多内容，见[Codex 与其他 agent](agents.zh-CN.md#claudes-questions)。
+
+<a id="claudes-plan"></a>
+### Claude 的计划
+
+Claude Code 拿出计划给你看时，计划框会取代输入框，直到你作出决定为止，下面这些键在计划框里起作用。在 BROWSE 里，活动行显示 `⚑ plan needs review — i to review`，按 `i` 回到计划框。
+
+| 按键 | 作用 |
+|---|---|
+| `Tab` / `Shift+Tab`，或 `l` / `h` | 下一个 / 上一个选择：`Keep planning`、`Approve (Manual)`、`Approve (Auto)`，以及 plan 模式从 Bypass 开始时的 `Approve and keep Bypass` |
+| `Enter` | 执行有焦点的选择；在 `Keep planning` 上，打开反馈输入区 |
+| `j` / `k`、`Ctrl+d` / `Ctrl+u`、`gg` / `G` | 滚动计划 |
+| `Ctrl+Enter` | 在反馈输入区里：发出反馈，Claude 接着做计划 |
+| `Esc` | 在反馈输入区里：回到各个选择，你写的内容保留；其他地方：回到 BROWSE，计划继续等着 |
+| `F1` | 按键列表 |
+
+`Enter` 只有单独按下时才算数：不能在计划框出现后的四分之一秒内，不能在之前按住的键还没松开时，也不能紧跟在另一个键之后。不算数的 `Enter` 会显示 `Enter again after a pause: the plan takes only an Enter pressed on its own`。数字和字母都不会作出任何决定，按住不放产生的重复按键也不会。各个选择也是按钮，计划框出现片刻之后，点击才算数。`Esc` 不作任何决定：计划会一直等到你选择。关于计划的更多内容，见[Codex 与其他 agent](agents.zh-CN.md#plan-mode)。
 
 <a id="the-sessions-list-and-the-pickers"></a>
 ### 会话列表和选择器

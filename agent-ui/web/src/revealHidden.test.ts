@@ -69,3 +69,10 @@ describe("revealPath", () => {
     }
   });
 });
+
+describe("default-ignorable code points", () => {
+  it("escapes the unassigned ones too, which a renderer draws as nothing", () => {
+    const text = "a\u2065b\uFFF0c\u{E0000}d\u{E0002}e\u{E0080}f\u{E01F0}g\u{E0FFF}h";
+    expect(shown(text)).toBe("a⟨U+2065⟩b⟨U+FFF0⟩c⟨U+E0000⟩d⟨U+E0002⟩e⟨U+E0080⟩f⟨U+E01F0⟩g⟨U+E0FFF⟩h");
+  });
+});

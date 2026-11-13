@@ -34,6 +34,7 @@ fn tabs(sessions: &[&str]) -> SavedTabs {
             turn_running: false,
             draft: None,
             row_key: None,
+            plan_origin: None,
         })
         .collect();
     SavedTabs::from_parts(tabs, 0, Vec::new(), None)

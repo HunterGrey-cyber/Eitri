@@ -175,6 +175,9 @@ pub(super) enum Owed {
     /// A message of this tab typed in the page, held until the presence marks its turn as running:
     /// answered when it goes out or is not sent. A tab has at most one held.
     HeldPrompt(TabId),
+    /// An image import request of this tab (`attach_begin`, `attach_chunk`, `attach_end`), answered once the
+    /// window's attachment desk has done it.
+    Attach(TabId),
 }
 
 /// One answer owed to a page.

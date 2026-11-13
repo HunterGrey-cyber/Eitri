@@ -801,7 +801,7 @@ out="$(run_in_filedir --quiet --account x a.rs)"
 assert_eq "$(args_of "$out")" "--new-window|a.rs" "--account as a flag asks for a new window"
 assert_contains "$out" "STUB_ARG:--new-window" "and the stub saw it"
 mkdir -p "$FILEDIR/choose-project"
-for sub in panel split page run-guard linked-window choose-project agents remote; do
+for sub in panel split page run-guard linked-window choose-project agents remote attachment-decoder; do
 	out="$(run_in_filedir --quiet "$sub")"
 	assert_eq "$(args_of "$out")" "./$sub" "a path named $sub is not read as the $sub subcommand"
 	out="$(run_in_filedir --quiet "$sub" b.rs)"

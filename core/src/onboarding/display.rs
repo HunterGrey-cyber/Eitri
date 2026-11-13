@@ -73,7 +73,7 @@ pub(crate) fn is_hidden(c: char) -> bool {
     c.is_control()
         || matches!(
             c as u32,
-            // Format characters.
+            // Format and default-ignorable ranges.
             0xad
                 | 0x600..=0x605
                 | 0x61c
@@ -84,17 +84,15 @@ pub(crate) fn is_hidden(c: char) -> bool {
                 | 0x180e
                 | 0x200b..=0x200f
                 | 0x202a..=0x202e
-                | 0x2060..=0x2064
-                | 0x2066..=0x206f
+                | 0x2060..=0x206f
                 | 0xfeff
-                | 0xfff9..=0xfffb
+                | 0xfff0..=0xfffb
                 | 0x110bd
                 | 0x110cd
                 | 0x13430..=0x1343f
                 | 0x1bca0..=0x1bca3
                 | 0x1d173..=0x1d17a
-                | 0xe0001
-                | 0xe0020..=0xe007f
+                | 0xe0000..=0xe0fff
                 // Line and paragraph separators.
                 | 0x2028..=0x2029
                 // Spaces other than the plain one.
@@ -113,13 +111,22 @@ pub(crate) fn is_hidden(c: char) -> bool {
                 | 0x3164
                 | 0xfe00..=0xfe0f
                 | 0xffa0
-                | 0xe0100..=0xe01ef
         )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unassigned_default_ignorables_are_shown_as_escapes() {
+        for code in [
+            0x2065, 0xfff0, 0xfff8, 0xe0000, 0xe0002, 0xe001f, 0xe0080, 0xe00ff, 0xe01f0, 0xe0fff,
+        ] {
+            let c = char::from_u32(code).unwrap();
+            assert_eq!(display_name(&format!("a{c}b")), format!("a\\u{{{code:x}}}b"));
+        }
+    }
 
     #[test]
     fn display_name_escapes_format_and_control_characters_and_does_not_cut() {

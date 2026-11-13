@@ -176,10 +176,7 @@ fn answers_until(scratch: &Scratch, done: impl Fn(&str) -> bool) -> Vec<String> 
 /// Sends `script` as a turn and waits for the provider to hand over a `ClientToolCall` of `call_id`.
 fn call(provider: &ClaudeSidecarProvider, session: &str, script: &str, call_id: &str) {
     provider
-        .send_turn(SendTurnRequest {
-            session_id: session.to_string(),
-            text: script.to_string(),
-        })
+        .send_turn(SendTurnRequest::text(session.to_string(), script.to_string()))
         .expect("the stand-in takes the turn");
     let started = Instant::now();
     loop {
@@ -340,10 +337,7 @@ fn answering_never_blocks_the_caller() {
     let lines = answers_until(&scratch, |line| line.starts_with("c1 taken"));
     assert!(!lines.contains(&"replied c1".to_string()), "the reply is still held");
     provider
-        .send_turn(SendTurnRequest {
-            session_id: session,
-            text: "release-answers".to_string(),
-        })
+        .send_turn(SendTurnRequest::text(session, "release-answers".to_string()))
         .unwrap();
     answers_until(&scratch, |line| line == "replied c1");
 }

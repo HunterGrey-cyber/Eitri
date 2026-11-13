@@ -119,7 +119,7 @@ impl Chat {
             text: as_typed.to_string(),
         });
         self.conversation
-            .send_turn_as(script, as_typed, PromptOrigin::Typed, client_id)
+            .send_turn_as(script, as_typed, PromptOrigin::Typed, client_id, Vec::new())
             .expect("the stand-in takes the turn");
     }
 
@@ -388,13 +388,7 @@ fn a_send_carries_the_prompts_client_id_and_the_typed_mark_only_where_the_sideca
         let session = open(&provider);
         let send = |script: &str, stamp: TurnStamp| {
             provider
-                .send_turn_stamped(
-                    SendTurnRequest {
-                        session_id: session.clone(),
-                        text: script.to_string(),
-                    },
-                    stamp,
-                )
+                .send_turn_stamped(SendTurnRequest::text(session.clone(), script.to_string()), stamp)
                 .expect("the turn is taken")
         };
         send("end", stamp(Some("eitri-1"), true));
@@ -402,10 +396,7 @@ fn a_send_carries_the_prompts_client_id_and_the_typed_mark_only_where_the_sideca
         send("end", stamp(Some("eitri-2"), false));
         let _ = started(&provider);
         provider
-            .send_turn(SendTurnRequest {
-                session_id: session.clone(),
-                text: "ask hold; end".to_string(),
-            })
+            .send_turn(SendTurnRequest::text(session.clone(), "ask hold; end".to_string()))
             .expect("the turn is taken");
         let turn = started(&provider);
         let steer = |id: &str, typed: bool| {
@@ -456,10 +447,7 @@ fn a_mention_reaches_the_cli_as_one_only_in_what_a_person_typed() {
     let send = |typed: bool| {
         provider
             .send_turn_stamped(
-                SendTurnRequest {
-                    session_id: session.clone(),
-                    text: "end; @/home/me/.ssh/id_rsa".to_string(),
-                },
+                SendTurnRequest::text(session.clone(), "end; @/home/me/.ssh/id_rsa".to_string()),
                 stamp(None, typed),
             )
             .expect("the turn is taken")
@@ -469,10 +457,7 @@ fn a_mention_reaches_the_cli_as_one_only_in_what_a_person_typed() {
     send(false);
     let _ = started(&provider);
     provider
-        .send_turn(SendTurnRequest {
-            session_id: session.clone(),
-            text: "ask hold; end".to_string(),
-        })
+        .send_turn(SendTurnRequest::text(session.clone(), "ask hold; end".to_string()))
         .expect("the turn is taken");
     let turn = started(&provider);
     let steer = |id: &str, typed: bool| {

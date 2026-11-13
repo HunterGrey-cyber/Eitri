@@ -168,10 +168,7 @@ fn started(script: Vec<Value>, auto_mode: Option<&str>) -> AcpProvider {
 
 fn send(provider: &AcpProvider, text: &str) -> Result<String, ProviderError> {
     provider.send_turn_with(
-        SendTurnRequest {
-            session_id: "s1".to_string(),
-            text: text.to_string(),
-        },
+        SendTurnRequest::text("s1".to_string(), text.to_string()),
         TurnPolicy {
             reviewer: Reviewer::Agent,
             sandbox: agent::Sandbox::Project,
@@ -1363,10 +1360,7 @@ fn load_replays_then_checks_mode() {
 
 fn send_to(provider: &AcpProvider, session: &str, text: &str) -> Result<String, ProviderError> {
     provider.send_turn_with(
-        SendTurnRequest {
-            session_id: session.to_string(),
-            text: text.to_string(),
-        },
+        SendTurnRequest::text(session.to_string(), text.to_string()),
         TurnPolicy {
             reviewer: Reviewer::Agent,
             sandbox: agent::Sandbox::Project,
@@ -1445,10 +1439,7 @@ fn a_refused_load_is_the_agents_own_verdict() {
 fn the_plain_claude_shaped_calls_refuse() {
     let provider = connect(handshake(false), None).expect("connects");
     assert!(matches!(
-        provider.send_turn(SendTurnRequest {
-            session_id: "s".into(),
-            text: "x".into()
-        }),
+        provider.send_turn(SendTurnRequest::text("s", "x")),
         Err(ProviderError::UnsupportedCapability("external"))
     ));
     // Closing a provider that never started a session is quiet.
@@ -2169,4 +2160,43 @@ fn invalid_set_mode_responses_cannot_confirm_the_mode() {
             .any(|e| matches!(e, AgentDomainEvent::PolicyMismatch { .. })));
         assert!(send(&provider, "x").is_err());
     }
+}
+
+/// An ACP prompt is text: a turn with images is refused first, with nothing sent, and the next text turn
+/// is the prompt the agent receives (its request id is the one the refused turn did not take).
+#[test]
+fn a_turn_with_images_is_refused_with_nothing_sent() {
+    let mut script = boot("agent");
+    script.push(expect_prompt(3, "hi"));
+    script.push(reply(3, json!({"stopReason": "end_turn"})));
+    let provider = started(script, None);
+    provider.pump();
+    let image = agent::TurnImage {
+        meta: agent::AttachmentMeta {
+            media_type: "image/png".into(),
+            bytes: 8,
+            width: 1,
+            height: 1,
+            sha256: String::new(),
+        },
+        data: std::sync::Arc::from(vec![0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a]),
+    };
+    let refused = provider
+        .send_turn_with(
+            SendTurnRequest {
+                images: vec![image],
+                ..SendTurnRequest::text("s1".to_string(), "look".to_string())
+            },
+            TurnPolicy {
+                reviewer: Reviewer::Agent,
+                sandbox: agent::Sandbox::Project,
+            },
+        )
+        .expect_err("ACP prompts carry text here");
+    assert!(
+        matches!(refused, ProviderError::UnsupportedCapability("turn_content_v1")),
+        "{refused}"
+    );
+    send(&provider, "hi").expect("the next text turn goes");
+    until_completed(&provider);
 }

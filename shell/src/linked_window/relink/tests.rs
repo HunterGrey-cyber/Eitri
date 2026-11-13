@@ -1223,6 +1223,7 @@ fn an_orphan_chat_windows_tabs_survive_window_1s_restart() {
             turn_running: false,
             draft: None,
             row_key: None,
+            plan_origin: None,
         };
         SavedTabs::from_parts(sessions.iter().map(saved).collect(), 0, Vec::new(), None)
     };

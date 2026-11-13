@@ -3,8 +3,11 @@
 //! folds the events it was handed into a projection of its own and the layer (b) host reads the tab's, so the
 //! two answer the same waits the same way.
 
-use super::driver::{DeclineKind, DriverError, QuestionAnswer, RosterEntry};
-use crate::{AgentSessionProjection, QuestionRecord, QuestionState, TaskKind, TaskStatus};
+use super::driver::{DeclineKind, DriverError, PlanDecision, QuestionAnswer, RosterEntry};
+use crate::{
+    AgentSessionProjection, InteractionResolution, PlanExecutionMode, PlanPhase, PlanRecord, PlanState, QuestionRecord,
+    QuestionState, TaskKind, TaskStatus,
+};
 use serde_json::{json, Value};
 
 /// A value in the words the projection serializes it with (`running`, `local_agent`, `chat_requested`).
@@ -146,6 +149,109 @@ pub fn interaction_holds(projection: &AgentSessionProjection, want: &Value) -> R
     Ok(true)
 }
 
+/// Whether a refusal says the agent did not make the move out of plan mode an approval started
+/// (`planning::refusal_undoes_move`).
+pub fn refusal_undoes_move(error: &crate::ProviderError) -> bool {
+    crate::projection::planning::refusal_undoes_move(error)
+}
+
+/// The plan a decision goes to: the oldest one still waiting for the person, or, when none waits, the newest, so
+/// a late decision reaches a plan that has gone and is refused there.
+pub fn plan_to_decide(projection: &AgentSessionProjection) -> Option<&PlanRecord> {
+    projection
+        .plans
+        .iter()
+        .find(|p| p.state == PlanState::Waiting)
+        .or_else(|| projection.plans.last())
+}
+
+/// What the provider is asked for a driver's decision on `plan`: an approval names the digest of the plan
+/// the person read, which here is the one in the record.
+pub fn plan_resolution(decision: &PlanDecision, plan: &PlanRecord) -> InteractionResolution {
+    let approve = |mode| InteractionResolution::PlanApprove {
+        mode,
+        plan_sha256: plan.plan_sha256.clone(),
+    };
+    match decision {
+        PlanDecision::ApproveManual => approve(PlanExecutionMode::Manual),
+        PlanDecision::ApproveAuto => approve(PlanExecutionMode::Auto),
+        PlanDecision::ApproveBypass => approve(PlanExecutionMode::Bypass),
+        PlanDecision::Keep { feedback } => InteractionResolution::PlanKeep {
+            feedback: feedback.clone(),
+        },
+    }
+}
+
+/// Whether the plan records hold what `want` describes: `{plan: "waiting"|"settled"}` for the newest plan,
+/// `{planning: "executing"|"planning"}` for the session's phase as the CLI's reports left it (`planning` once the
+/// CLI reported plan mode, `executing` once it is out of it), or `{plan_outcome, mode_after?, feedback?, count?}`
+/// for the plans settled with that outcome (at least `count` of them, default 1), `mode_after` and `feedback`
+/// being the newest such plan's.
+pub fn plan_holds(projection: &AgentSessionProjection, want: &Value) -> Result<bool, DriverError> {
+    let Some(object) = want.as_object() else {
+        return Err(DriverError::Failed("a plan wait is an object".into()));
+    };
+    if let Some(state) = object.get("plan") {
+        let newest = projection.plans.last().map(|p| &p.state);
+        return match state.as_str() {
+            Some("waiting") => Ok(matches!(newest, Some(PlanState::Waiting))),
+            Some("settled") => Ok(matches!(newest, Some(PlanState::Settled { .. }))),
+            other => Err(DriverError::Failed(format!(
+                "a plan wait is `waiting` or `settled`, not {other:?}"
+            ))),
+        };
+    }
+    if let Some(phase) = object.get("planning") {
+        let now = &projection.planning.phase;
+        return match phase.as_str() {
+            Some("planning") => Ok(*now == PlanPhase::Planning),
+            Some("executing") => Ok(*now == PlanPhase::Executing),
+            other => Err(DriverError::Failed(format!(
+                "a planning wait is `executing` or `planning`, not {other:?}"
+            ))),
+        };
+    }
+    if let Some(key) = object
+        .keys()
+        .find(|k| !["plan_outcome", "mode_after", "feedback", "count"].contains(&k.as_str()))
+    {
+        return Err(DriverError::Failed(format!("a plan wait has no `{key}`")));
+    }
+    let outcome = object.get("plan_outcome").and_then(Value::as_str);
+    let count = object.get("count").and_then(Value::as_u64).unwrap_or(1) as usize;
+    let matching: Vec<(&Option<PlanExecutionMode>, &Option<String>)> = projection
+        .plans
+        .iter()
+        .filter_map(|p| match &p.state {
+            PlanState::Settled {
+                outcome: got,
+                mode_after,
+                feedback,
+                ..
+            } if outcome.is_none_or(|want| want == word(got)) => Some((mode_after, feedback)),
+            _ => None,
+        })
+        .collect();
+    if matching.len() < count {
+        return Ok(false);
+    }
+    let Some((mode_after, feedback)) = matching.last() else {
+        return Ok(false);
+    };
+    if let Some(want) = object.get("mode_after") {
+        let got = mode_after.as_ref().map(word);
+        if want.as_str().map(str::to_owned) != got {
+            return Ok(false);
+        }
+    }
+    if let Some(want) = object.get("feedback") {
+        if want.as_str() != feedback.as_deref() {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
 /// The lines of a timeout report that come from the projection: each turn's origin and cause, the roster and the
 /// question records.
 pub fn report_lines(projection: &AgentSessionProjection) -> String {
@@ -176,7 +282,22 @@ pub fn report_lines(projection: &AgentSessionProjection) -> String {
             json!({"interaction": q.interaction_id, "state": state})
         })
         .collect();
-    format!("turn starts {turns:?}; roster {roster:?}; questions {questions:?}")
+    let plans: Vec<Value> = projection
+        .plans
+        .iter()
+        .map(|p| {
+            let state = match &p.state {
+                PlanState::Waiting => "waiting".to_owned(),
+                PlanState::Answering => "answering".to_owned(),
+                PlanState::Settled { outcome, .. } => format!("settled:{}", word(outcome)),
+            };
+            json!({"interaction": p.interaction_id, "state": state})
+        })
+        .collect();
+    format!(
+        "turn starts {turns:?}; roster {roster:?}; questions {questions:?}; plans {plans:?}; plan phase {}",
+        crate::projection::planning::phase_word(&projection.planning.phase)
+    )
 }
 
 #[cfg(test)]
@@ -309,5 +430,115 @@ mod tests {
         assert_eq!(answers[0].option_indexes, [0, 2]);
         assert_eq!(answers[0].other_text.as_deref(), Some("text"));
         assert_eq!(decline_kind(DeclineKind::Chat), crate::QuestionDeclineKind::Chat);
+    }
+    fn plan(id: &str, state: PlanState) -> PlanRecord {
+        PlanRecord {
+            seq: 1,
+            interaction_id: id.into(),
+            tool_use_id: Some("toolu_exit".into()),
+            turn_id: None,
+            plan: "# Plan".into(),
+            plan_sha256: "ab".repeat(32),
+            allowed_prompts: Vec::new(),
+            state,
+            unsupported_reason: None,
+        }
+    }
+
+    fn settled_plan(
+        outcome: crate::PlanOutcome,
+        mode_after: Option<PlanExecutionMode>,
+        feedback: Option<&str>,
+    ) -> PlanState {
+        PlanState::Settled {
+            outcome,
+            mode_after,
+            feedback: feedback.map(str::to_owned),
+            reason: None,
+        }
+    }
+
+    #[test]
+    fn a_plan_wait_reads_the_newest_plan_and_the_phase() {
+        let mut projection = AgentSessionProjection::default();
+        let holds = |p: &AgentSessionProjection, want: Value| plan_holds(p, &want).unwrap();
+        assert!(!holds(&projection, json!({"plan": "waiting"})), "no plan yet");
+        assert!(holds(&projection, json!({"planning": "executing"})));
+        projection.plans.push(plan("p1", PlanState::Waiting));
+        assert!(holds(&projection, json!({"plan": "waiting"})));
+        assert!(!holds(&projection, json!({"plan": "settled"})));
+        projection.plans[0].state = PlanState::Answering;
+        assert!(
+            !holds(&projection, json!({"plan": "waiting"})),
+            "an answer on its way is not waiting"
+        );
+        projection.plans[0].state = settled_plan(crate::PlanOutcome::KeptPlanning, None, Some("more"));
+        assert!(holds(&projection, json!({"plan": "settled"})));
+        projection.planning.phase = PlanPhase::Planning;
+        assert!(holds(&projection, json!({"planning": "planning"})));
+        assert!(!holds(&projection, json!({"planning": "executing"})));
+        projection.planning.phase = PlanPhase::Leaving {
+            cause: crate::PlanCause::Host,
+            since_ms: 0,
+            saw_default: false,
+        };
+        assert!(
+            !holds(&projection, json!({"planning": "planning"}))
+                && !holds(&projection, json!({"planning": "executing"})),
+            "a move under way is neither"
+        );
+        assert!(plan_holds(&projection, &json!({"plan": "answering"})).is_err());
+        assert!(plan_holds(&projection, &json!({"planning": "entering"})).is_err());
+    }
+
+    #[test]
+    fn a_plan_outcome_wait_compares_outcome_mode_feedback_and_count() {
+        let mut projection = AgentSessionProjection::default();
+        projection.plans.push(plan(
+            "p1",
+            settled_plan(crate::PlanOutcome::KeptPlanning, None, Some("also the README")),
+        ));
+        projection.plans.push(plan(
+            "p2",
+            settled_plan(crate::PlanOutcome::Approved, Some(PlanExecutionMode::Auto), None),
+        ));
+        let holds = |want: Value| plan_holds(&projection, &want).unwrap();
+        assert!(holds(json!({"plan_outcome": "approved"})));
+        assert!(holds(json!({"plan_outcome": "approved", "mode_after": "auto"})));
+        assert!(!holds(json!({"plan_outcome": "approved", "mode_after": "manual"})));
+        assert!(holds(
+            json!({"plan_outcome": "kept_planning", "feedback": "also the README"})
+        ));
+        assert!(!holds(json!({"plan_outcome": "kept_planning", "feedback": "other"})));
+        assert!(!holds(json!({"plan_outcome": "approved", "count": 2})));
+        assert!(holds(json!({"plan_outcome": "kept_planning", "mode_after": null})));
+        assert!(plan_holds(&projection, &json!({"plan_outcome": "approved", "colour": 1})).is_err());
+    }
+
+    #[test]
+    fn a_decision_names_the_digest_of_the_plan_it_goes_to_and_a_late_one_the_newest() {
+        let mut projection = AgentSessionProjection::default();
+        assert!(plan_to_decide(&projection).is_none());
+        projection
+            .plans
+            .push(plan("old", settled_plan(crate::PlanOutcome::KeptPlanning, None, None)));
+        assert_eq!(plan_to_decide(&projection).unwrap().interaction_id, "old");
+        projection.plans.push(plan("live", PlanState::Waiting));
+        projection
+            .plans
+            .push(plan("newer", settled_plan(crate::PlanOutcome::Interrupted, None, None)));
+        let record = plan_to_decide(&projection).unwrap();
+        assert_eq!(record.interaction_id, "live", "the oldest plan still waiting");
+        assert_eq!(
+            plan_resolution(&PlanDecision::ApproveAuto, record),
+            InteractionResolution::PlanApprove {
+                mode: PlanExecutionMode::Auto,
+                plan_sha256: "ab".repeat(32)
+            }
+        );
+        assert_eq!(
+            plan_resolution(&PlanDecision::Keep { feedback: "x".into() }, record),
+            InteractionResolution::PlanKeep { feedback: "x".into() }
+        );
     }
 }

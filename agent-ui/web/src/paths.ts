@@ -105,6 +105,10 @@ export function pathsIn(item: TimelineItem): PathRef[] {
     case "prompt":
     case "message":
       return pathsInText(item.text);
+    // The files a plan names, as it names them.
+    case "plan":
+      return pathsInText(item.plan.plan);
+    case "planmark":
     case "run":
     case "ending":
     // A notice names no file it is about.
@@ -140,6 +144,11 @@ export function viewText(item: TimelineItem): { title: string; text: string } {
       return { title: "prompt", text: item.text };
     case "message":
       return { title: "reply", text: item.text };
+    // The scratch buffer is markdown, and so is a plan.
+    case "plan":
+      return { title: "plan", text: item.plan.plan };
+    case "planmark":
+      return { title: "notice", text: item.text };
     case "tool": {
       const head = item.call.name === "Bash" ? `$ ${primaryText(item)}` : primaryText(item);
       // Fenced: the scratch buffer is markdown (right for a reply), and a bare output's `_`s and `*`s

@@ -356,13 +356,16 @@ struct RunningTurn {
 fn may_start_a_turn(event: &AgentDomainEvent) -> bool {
     match event {
         AgentDomainEvent::UserPromptSubmitted { .. }
+        // The rest of the prompt it follows: its images.
+        | AgentDomainEvent::UserPromptAttachments { .. }
         | AgentDomainEvent::UserMessageDelivered { .. }
         | AgentDomainEvent::TurnStarted { .. }
         | AgentDomainEvent::ContentDelta { .. }
         | AgentDomainEvent::ToolCallStarted { .. }
         | AgentDomainEvent::PermissionRequested { .. }
-        // A waiting question is live state, as a waiting card is.
+        // A waiting question or plan is live state, as a waiting card is.
         | AgentDomainEvent::QuestionAsked { .. }
+        | AgentDomainEvent::PlanProposed { .. }
         | AgentDomainEvent::MoveSeeded(_) => true,
         AgentDomainEvent::SessionOpened { .. }
         | AgentDomainEvent::EffortReported { .. }
@@ -389,6 +392,11 @@ fn may_start_a_turn(event: &AgentDomainEvent) -> bool {
         | AgentDomainEvent::TurnAttributed { .. }
         | AgentDomainEvent::SessionNotice { .. }
         | AgentDomainEvent::QuestionSettled { .. }
+        | AgentDomainEvent::PlanSettled { .. }
+        // A report of the CLI's mode and a move this side started are the session's, carried in the seed.
+        | AgentDomainEvent::CliPlanMode { .. }
+        | AgentDomainEvent::PlanTransitionStarted { .. }
+        | AgentDomainEvent::PlanTransitionUndone { .. }
         // A note about work out of sight starts no turn here, and a prompt taken back removes a record.
         | AgentDomainEvent::CliWorkUnseen
         | AgentDomainEvent::UserPromptWithdrawn
@@ -551,8 +559,11 @@ impl IngestState {
         note_lifecycle(&mut self.lifecycle_since_open, &event);
         if let Some(turn) = &mut self.running_turn {
             turn.events.push(event.clone());
-            // A prompt leaves the projection settled and is still the turn's start.
-            let prompt = matches!(event, AgentDomainEvent::UserPromptSubmitted { .. });
+            // A prompt (with its images) leaves the projection settled and is still the turn's start.
+            let prompt = matches!(
+                event,
+                AgentDomainEvent::UserPromptSubmitted { .. } | AgentDomainEvent::UserPromptAttachments { .. }
+            );
             if self.projection.is_settled() && !prompt {
                 self.running_turn = None;
             }
@@ -571,13 +582,14 @@ impl IngestState {
         // arrive before the frame that starts its call, so that frame is written too, or the stored
         // question would stand without its call. The settle is written so a question answered or
         // declined before a close is not stored as still waiting. A turn holds a handful of
-        // questions at most, and the turn's own end writes again.
+        // questions at most, and the turn's own end writes again. A plan is marked the same way, for the
+        // same reason: the CLI waits on it as it waits on a question.
         let asks_a_question = match &event {
-            AgentDomainEvent::ToolCallStarted { tool_use_id, .. } => self
-                .projection
-                .questions
-                .iter()
-                .any(|q| q.tool_use_id.as_deref() == Some(tool_use_id.as_str())),
+            AgentDomainEvent::ToolCallStarted { tool_use_id, .. } => {
+                let asks = |id: Option<&str>| id == Some(tool_use_id.as_str());
+                self.projection.questions.iter().any(|q| asks(q.tool_use_id.as_deref()))
+                    || self.projection.plans.iter().any(|p| asks(p.tool_use_id.as_deref()))
+            }
             _ => false,
         };
         if asks_a_question
@@ -588,6 +600,8 @@ impl IngestState {
                     | AgentDomainEvent::SessionUnavailable { .. }
                     | AgentDomainEvent::QuestionAsked { .. }
                     | AgentDomainEvent::QuestionSettled { .. }
+                    | AgentDomainEvent::PlanProposed { .. }
+                    | AgentDomainEvent::PlanSettled { .. }
             )
         {
             self.history_dirty = true;
@@ -678,18 +692,28 @@ impl IngestState {
         if !pending_ui.is_empty() || *resync_pending || !self.evicted_calls.is_empty() {
             return Err(HandoffRefused::Undelivered);
         }
+        // A move into or out of plan mode is confirmed by a report only this window's watch is waiting for,
+        // and refused or overdue by a reply or a clock that does not cross: it settles first.
+        if matches!(
+            projection.planning.phase,
+            crate::PlanPhase::Entering { .. } | crate::PlanPhase::Leaving { .. }
+        ) {
+            return Err(HandoffRefused::ModeChanging);
+        }
         let core = match running_turn {
             Some(turn) => ChatMoveCore {
                 lifecycle: turn.lifecycle.clone(),
                 seed: turn.seed.clone(),
                 running_turn: turn.events.clone(),
                 folded_through: *folded_through,
+                call_marks: projection.planning.call_marks.clone(),
             },
             None if projection.is_settled() => ChatMoveCore {
                 lifecycle: lifecycle_since_open.clone(),
                 seed: projection.export_settled(),
                 running_turn: Vec::new(),
                 folded_through: *folded_through,
+                call_marks: projection.planning.call_marks.clone(),
             },
             None => return Err(HandoffRefused::Unsettled),
         };
@@ -729,6 +753,8 @@ impl IngestState {
             seed,
             running_turn,
             folded_through,
+            // Placed in `projection` when it was adopted; a later move reads them from the live projection again.
+            call_marks: _,
         } = core;
         let mut lifecycle_since_open = Vec::new();
         for event in lifecycle.iter().chain(running_turn.iter()) {
@@ -1359,6 +1385,51 @@ impl ConversationIngest {
         } else {
             state.projection.question_send_failed(interaction_id)
         }
+    }
+
+    /// Marks the plan `interaction_id` as having a decision on its way (`sending`), or as waiting again after
+    /// that decision was refused or failed; `false` when it was not in the state the change starts from.
+    /// Host state only, as [`Self::mark_question_send`].
+    pub(crate) fn mark_plan_send(&self, interaction_id: &str, sending: bool) -> bool {
+        let mut state = self.lock_state("mark_plan_send");
+        if sending {
+            state.projection.mark_plan_answering(interaction_id)
+        } else {
+            state.projection.plan_send_failed(interaction_id)
+        }
+    }
+
+    /// The reply to a request for the host's own plan-mode move was read
+    /// (`AgentSessionProjection::planning_reply_read`); whether the move is to be undone. Host state only.
+    pub(crate) fn planning_reply_read(&self, enter: bool, error: Option<&crate::ProviderError>, now_ms: u64) -> bool {
+        self.lock_state("planning_reply_read")
+            .projection
+            .planning_reply_read(enter, error, now_ms)
+    }
+
+    /// Another request for the host's plan-mode move under way went out. Host state only.
+    pub(crate) fn planning_resent(&self) {
+        self.lock_state("planning_resent").projection.planning_resent();
+    }
+
+    /// Why the plan-mode move under way is overdue at `now_ms`, if it is
+    /// (`AgentSessionProjection::plan_transition_overdue`). That check can itself end a move, as the CLI's
+    /// fallback out of auto, which no event says: the page is then sent a snapshot and woken.
+    pub(crate) fn plan_transition_overdue(&self, now_ms: u64) -> Option<String> {
+        let (overdue, changed) = {
+            let mut state = self.lock_state("plan_transition_overdue");
+            let before = (state.projection.planning.phase.clone(), state.projection.cli_left_auto);
+            let overdue = state.projection.plan_transition_overdue(now_ms);
+            let changed = before != (state.projection.planning.phase.clone(), state.projection.cli_left_auto);
+            if changed {
+                state.resync_pending = true;
+            }
+            (overdue, changed)
+        };
+        if changed {
+            wake_ui(&self.ui_wake);
+        }
+        overdue
     }
 
     /// Stops the ingestion thread and waits for it. Idempotent.
@@ -3346,6 +3417,7 @@ pub(crate) mod tests {
                     seq: turn,
                     text: format!("prompt {turn}"),
                     delivered: false,
+                    attachments: Vec::new(),
                 })],
             })
             .collect();

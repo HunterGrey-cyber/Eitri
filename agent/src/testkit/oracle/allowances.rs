@@ -486,6 +486,7 @@ mod tests {
         let notified = || Entry::User {
             text: "<task-notification/>".to_owned(),
             via: Via::TaskNotification,
+            images: Vec::new(),
         };
         let call = || Entry::ToolUse {
             id: "toolu_1".to_owned(),
@@ -528,10 +529,12 @@ mod tests {
         let prompt = || Entry::User {
             text: "go".to_owned(),
             via: Via::Prompt,
+            images: Vec::new(),
         };
         let notified = || Entry::User {
             text: "<task-notification/>".to_owned(),
             via: Via::TaskNotification,
+            images: Vec::new(),
         };
         assert!(shapes_of(&[turn(Origin::Human, vec![prompt()])]).is_empty());
         assert_eq!(
@@ -553,6 +556,7 @@ mod tests {
         let user = |via: Via| Entry::User {
             text: "words".to_owned(),
             via,
+            images: Vec::new(),
         };
         let reply = || Entry::Assistant { text: "ok".to_owned() };
         // A turn another session's message opened is not a delivery into a running turn.

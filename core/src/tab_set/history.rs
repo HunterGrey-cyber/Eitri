@@ -63,6 +63,7 @@ fn envelope(tab: TabId, request_id: &str, page: Page) -> String {
                     ArchivedRecord::TurnEnding(r) => p.turn_endings.push(r),
                     ArchivedRecord::Notice(r) => p.notices.push(r),
                     ArchivedRecord::Question(r) => p.questions.push(r),
+                    ArchivedRecord::Plan(r) => p.plans.push(r),
                 }
             }
             let view = SnapshotView {

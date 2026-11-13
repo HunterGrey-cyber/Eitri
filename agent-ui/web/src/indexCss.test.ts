@@ -1735,7 +1735,7 @@ describe("index.css cascade (which rule actually wins)", () => {
      a thick accent line outside the block's frame, in a colour no theme chose. Their rows or their frame show where
      the keys are, so the ring is turned off on the block itself and a field inside keeps its own. */
   it("draws no default focus ring on a block that takes the keys whole", () => {
-    for (const block of ["question-dock", "chooser", "slash-picker", "tasks-overlay"]) {
+    for (const block of ["question-dock", "plan-dock", "chooser", "slash-picker", "tasks-overlay"]) {
       document.head.innerHTML = `<style>${css}</style>`;
       document.body.innerHTML = `<div class="${block}" tabindex="0"></div><div class="${block}" tabindex="0"></div>`;
       const [el, unfocused] = Array.from(document.body.children);

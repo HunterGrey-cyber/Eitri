@@ -144,6 +144,16 @@ fn followed_chunk_check() -> neovide_editor::ChunkCheck {
 }
 
 fn main() -> glib::ExitCode {
+    // `eitri attachment-decoder` is the child one composer image is decoded in (`eitri_core::attachments`): it is
+    // started with an empty environment, the request on stdin and its result pipe on descriptor 3, and serves before
+    // anything here reads the environment, opens or hands on a descriptor, starts a thread or reaches GTK.
+    #[cfg(target_os = "linux")]
+    if std::env::args_os()
+        .nth(1)
+        .is_some_and(|a| a == eitri_core::attachments::SUBCOMMAND)
+    {
+        eitri_core::attachments::decoder_child_main();
+    }
     // What the launcher says about this start, first: a start from the desktop takes its `PATH` from the login shell
     // here, before any thread or child, and the lines about it (and the launcher's note) wait for the log below.
     let launch_lines = launch_env::take(std::env::args_os().nth(1).as_deref());

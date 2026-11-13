@@ -423,10 +423,7 @@ fn a_list_the_agent_sends_by_itself_replaces_the_held_one() {
     pump_all(&provider);
     provider
         .send_turn_with(
-            agent::SendTurnRequest {
-                session_id: "s1".to_string(),
-                text: "go".to_string(),
-            },
+            agent::SendTurnRequest::text("s1".to_string(), "go".to_string()),
             TurnPolicy {
                 reviewer: Reviewer::Agent,
                 sandbox: agent::Sandbox::Project,
@@ -571,10 +568,7 @@ fn an_agent_that_lists_no_sessions_is_not_asked() {
         provider.refresh_sessions();
         provider
             .send_turn_with(
-                agent::SendTurnRequest {
-                    session_id: "s1".into(),
-                    text: "go".into(),
-                },
+                agent::SendTurnRequest::text("s1", "go"),
                 TurnPolicy {
                     reviewer: Reviewer::Agent,
                     sandbox: agent::Sandbox::Project,

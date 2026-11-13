@@ -1,5 +1,7 @@
 import type {
   AgentUiState,
+  PlanMark,
+  PlanRecord,
   QuestionRecord,
   NoticeRecord,
   PermissionRequestRecord,
@@ -37,8 +39,13 @@ import type {
  * reducer-level consequence of the same hazard and wants its own change. */
 export type TimelineItem = (
   /** `delivered`: a message the agent read inside its running turn (`UserPromptRecord.delivered`). */
-  | { kind: "prompt"; seq: Seq; key: string; text: string; delivered?: true }
+  | { kind: "prompt"; seq: Seq; key: string; text: string; promptText?: string; images?: string; delivered?: true }
   | { kind: "message"; seq: Seq; key: string; text: string; question?: QuestionRecord; plain?: true }
+  /** A plan Claude proposed, in the place of its `ExitPlanMode` call (keyed as that call's row) or, with no call
+   *  seen, at its own `seq`. Collapsed it is its first heading or line and how it ended; Enter shows it whole. */
+  | { kind: "plan"; seq: Seq; key: string; text: string; plan: PlanRecord }
+  /** Where the page saw plan mode start or end (`PlanMark`): a row of the page's own, not the host's. */
+  | { kind: "planmark"; seq: Seq; key: string; text: string }
   | { kind: "tool"; seq: Seq; key: string; call: ToolCallRecord }
   | { kind: "permission"; seq: Seq; key: string; request: PermissionRequestRecord }
   /** Where a turn that did not complete stopped: failed, hit a limit, interrupted, or cut off by the
@@ -293,14 +300,18 @@ const noticeItems = new WeakMap<NoticeRecord, TimelineItem>();
 const thinkingItems = new WeakMap<ThinkingBlock, { open?: TimelineItem; closed?: TimelineItem }>();
 
 function promptItem(prompt: UserPromptRecord): TimelineItem {
+  const images = prompt.attachments?.length ? `[${prompt.attachments.length} ${prompt.attachments.length === 1 ? "image" : "images"}: ${prompt.attachments.map((image) =>
+    `${image.mediaType.replace(/^image\//, "").toUpperCase()} ${image.width}×${image.height}`).join(", ")}]` : "";
+  const text = [prompt.text, images].filter(Boolean).join("\n");
   const held = promptItems.get(prompt);
-  if (held?.kind === "prompt" && held.seq === prompt.seq && held.text === prompt.text && held.delivered === prompt.delivered)
+  if (held?.kind === "prompt" && held.seq === prompt.seq && held.text === text && held.delivered === prompt.delivered)
     return held;
   const item: TimelineItem = {
     kind: "prompt",
     seq: prompt.seq,
     key: `u-${prompt.seq}`,
-    text: prompt.text,
+    text,
+    ...(images ? { promptText: prompt.text, images } : {}),
     ...(prompt.delivered ? { delivered: true as const } : {}),
   };
   promptItems.set(prompt, item);
@@ -380,6 +391,13 @@ function thinkingItem(block: ThinkingBlock, open: boolean): TimelineItem {
   return item;
 }
 
+const unanswered: Record<string, string> = {
+  interrupted: "(not answered: interrupted)",
+  session_closed: "(not answered: session closed)",
+  provider_failed: "(not answered: provider failed)",
+  host_refused: "(not answered: host refused)",
+};
+
 /** The transcript keeps exactly the answers sent to the CLI, including partial answers. */
 export function questionLines(record: QuestionRecord): { text: string; muted: boolean }[] {
   const lines: { text: string; muted: boolean }[] = [];
@@ -395,15 +413,54 @@ export function questionLines(record: QuestionRecord): { text: string; muted: bo
   const status = !settled ? "waiting for your answer"
     : outcome === "chat_requested" ? "→ chat about this"
     : outcome === "declined" ? "User declined to answer questions"
-    : outcome === "interrupted" ? "(not answered: interrupted)"
     : outcome === "expired" ? "(not answered: Claude Code withdrew the question)"
-    : outcome === "session_closed" ? "(not answered: session closed)"
-    : outcome === "provider_failed" ? "(not answered: provider failed)"
-    : outcome === "host_refused" ? "(not answered: host refused)" : "";
+    : unanswered[outcome ?? ""] ?? "";
   if (status) lines.push({ text: status, muted: true });
   if (settled?.reason) lines.push({ text: settled.reason, muted: true });
   if (record.unsupportedReason) lines.push({ text: record.unsupportedReason, muted: true });
   return lines;
+}
+
+/** A plan's collapsed row: its first heading (or first line), then how it ended. The text is the model's; the row
+ *  draws it as text with its hidden characters shown, and only the expanded row draws it as Markdown. */
+export function planLines(record: PlanRecord): { text: string; muted: boolean }[] {
+  const lines = record.plan.split("\n").map((line) => line.trim()).filter((line) => line !== "");
+  const heading = lines.find((line) => /^#{1,6}\s/.test(line))?.replace(/^#{1,6}\s+/, "") ?? lines[0] ?? "";
+  const out = [{ text: heading === "" ? "Claude's plan" : `Plan: ${heading}`, muted: false }];
+  const settled = record.state.kind === "settled" ? record.state : null;
+  const firstLine = (text: string | null) => (text ?? "").split("\n").find((line) => line.trim() !== "")?.trim() ?? "";
+  const outcome = settled?.outcome;
+  const status = !settled ? (record.unsupportedReason ? "" : "waiting for your review")
+    : outcome === "approved" ? `approved · ${settled.modeAfter ?? "manual"}`
+    : outcome === "kept_planning" ? (firstLine(settled.feedback) ? `kept planning: ${firstLine(settled.feedback)}` : "kept planning")
+    : outcome === "expired" ? "(not answered: Claude Code withdrew the plan)"
+    : unanswered[outcome ?? ""] ?? "";
+  if (status) out.push({ text: status, muted: true });
+  if (record.unsupportedReason) out.push({ text: record.unsupportedReason, muted: true });
+  return out;
+}
+
+const planItems = new WeakMap<PlanRecord, TimelineItem>();
+
+function planItem(record: PlanRecord, call?: ToolCallRecord): TimelineItem {
+  const key = call ? `t-${call.seq}` : `pl-${record.seq}`;
+  const held = planItems.get(record);
+  if (held?.key === key) return held;
+  const item: TimelineItem = { kind: "plan", seq: call?.seq ?? record.seq, key,
+    text: planLines(record).map((line) => line.text).join("\n"), plan: record };
+  planItems.set(record, item);
+  return item;
+}
+
+const markItems = new WeakMap<PlanMark, TimelineItem>();
+
+function markItem(mark: PlanMark): TimelineItem {
+  const held = markItems.get(mark);
+  if (held !== undefined) return held;
+  const item: TimelineItem = { kind: "planmark", seq: mark.seq, key: mark.key,
+    text: mark.kind === "entered" ? "entered plan mode" : "left plan mode" };
+  markItems.set(mark, item);
+  return item;
 }
 
 const questionItems = new WeakMap<QuestionRecord, TimelineItem>();
@@ -456,6 +513,10 @@ export function buildTimeline(state: AgentUiState): TimelineItem[] {
 
   const questionByCall = new Map<string, QuestionRecord>();
   for (const record of state.questions ?? []) if (record.toolUseId && !questionByCall.has(record.toolUseId)) questionByCall.set(record.toolUseId, record);
+  // A plan takes its `ExitPlanMode` call's row (each proposal is a call of its own); a second record naming the same
+  // call, which the wire does not make, would be drawn at its own `seq`.
+  const planByCall = new Map<string, PlanRecord>();
+  for (const record of state.plans ?? []) if (record.toolUseId) planByCall.set(record.toolUseId, record);
 
   const base: TimelineItem[] = [
     ...state.userPrompts.map(promptItem),
@@ -463,11 +524,16 @@ export function buildTimeline(state: AgentUiState): TimelineItem[] {
     ...state.toolCalls.map((call) => {
       const record = questionByCall.get(call.toolUseId);
       if (record) return questionItem(record, call);
+      const plan = planByCall.get(call.toolUseId);
+      if (plan) return planItem(plan, call);
       if (call.name === "AskUserQuestion") return questionFallback(call);
       const background = state.backgroundTasks?.rows.some((task) => task.tool_use_id === call.toolUseId && task.is_backgrounded === true);
       return toolItem(background && !call.background ? { ...call, background: true } : call);
     }),
     ...(state.questions ?? []).filter((record) => !record.toolUseId || !knownToolUseIds.has(record.toolUseId)).map((record) => questionItem(record)),
+    ...(state.plans ?? []).filter((record) => !record.toolUseId || !knownToolUseIds.has(record.toolUseId) || planByCall.get(record.toolUseId) !== record)
+      .map((record) => planItem(record)),
+    ...(state.planMarks ?? []).map(markItem),
     ...unanchored.map(permissionItem),
     ...state.turnEndings.map(endingItem),
     // `?? []` for a hand-built state in a test, as for thinking below.

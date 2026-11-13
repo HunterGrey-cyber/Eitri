@@ -206,8 +206,9 @@ pub(crate) fn events_lost_reason(first: u64, last: u64) -> String {
 /// so this reaches back far past any question that could still be waiting.
 const QUESTION_IDS_KEPT: usize = 256;
 
-/// The question sets one watch has delivered an ask or a settlement for, newest last, and the asks a
-/// reconcile holds back until the replay reaches the sequence its list was read at.
+/// The question sets and plans one watch has delivered an ask or a settlement for, newest last, and the
+/// asks a reconcile holds back until the replay reaches the sequence its list was read at. A plan is an
+/// interaction like a question, listed beside them by `GetInteractionState`, and is handled the same way.
 #[derive(Debug, Default)]
 pub(crate) struct QuestionLedger {
     seen: VecDeque<String>,
@@ -228,7 +229,9 @@ impl QuestionLedger {
     pub(crate) fn observe(&mut self, event: &AgentDomainEvent) {
         match event {
             AgentDomainEvent::QuestionAsked { interaction_id, .. }
-            | AgentDomainEvent::QuestionSettled { interaction_id, .. } => self.note(interaction_id),
+            | AgentDomainEvent::QuestionSettled { interaction_id, .. }
+            | AgentDomainEvent::PlanProposed { interaction_id, .. }
+            | AgentDomainEvent::PlanSettled { interaction_id, .. } => self.note(interaction_id),
             AgentDomainEvent::SubagentFrame { frame, .. } => self.observe(frame),
             _ => {}
         }
@@ -264,7 +267,9 @@ impl QuestionLedger {
     fn unseen(&mut self, asks: Vec<AgentDomainEvent>) -> Vec<AgentDomainEvent> {
         let mut added = Vec::new();
         for event in asks {
-            let AgentDomainEvent::QuestionAsked { interaction_id, .. } = &event else {
+            let (AgentDomainEvent::QuestionAsked { interaction_id, .. }
+            | AgentDomainEvent::PlanProposed { interaction_id, .. }) = &event
+            else {
                 continue;
             };
             if interaction_id.is_empty() || self.knows(interaction_id) {
@@ -468,6 +473,47 @@ mod tests {
         ledger.observe(&settled("q1"));
         ledger.observe(&asked("q2"));
         assert!(ledger.due(8).is_empty());
+    }
+
+    /// A plan waits in the sidecar's list beside the questions: one this watch never delivered comes back
+    /// from it, and one it saw settled never does.
+    #[test]
+    fn the_reconcile_takes_plans_as_it_takes_questions() {
+        let plan = |id: &str| AgentDomainEvent::PlanProposed {
+            interaction_id: id.into(),
+            tool_use_id: Some(format!("toolu_{id}")),
+            plan: "# Plan".into(),
+            plan_sha256: String::new(),
+            allowed_prompts: Vec::new(),
+            unsupported_reason: None,
+        };
+        let mut ledger = QuestionLedger::default();
+        ledger.observe(&plan("p0"));
+        ledger.observe(&AgentDomainEvent::PlanSettled {
+            interaction_id: "p0".into(),
+            outcome: crate::PlanOutcome::KeptPlanning,
+            mode_after: None,
+            feedback: Some(String::new()),
+            reason: None,
+        });
+        let added = reconcile_questions(
+            &mut ledger,
+            InteractionState {
+                through_sequence: 4,
+                pending: vec![plan("p0"), asked("q1"), plan("p1")],
+            },
+            4,
+        );
+        assert_eq!(added, vec![asked("q1"), plan("p1")]);
+        assert!(reconcile_questions(
+            &mut ledger,
+            InteractionState {
+                through_sequence: 4,
+                pending: vec![plan("p1")],
+            },
+            4,
+        )
+        .is_empty());
     }
 
     #[test]

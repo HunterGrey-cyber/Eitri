@@ -101,10 +101,7 @@ fn text_of(event: &AgentDomainEvent) -> Option<&str> {
 
 fn send(provider: &ClaudeSidecarProvider, session_id: &str, script: &str) -> String {
     provider
-        .send_turn(SendTurnRequest {
-            session_id: session_id.to_string(),
-            text: script.to_string(),
-        })
+        .send_turn(SendTurnRequest::text(session_id.to_string(), script.to_string()))
         .expect("the turn is taken")
 }
 
@@ -131,10 +128,7 @@ fn adopt_with_a_stand_in_that_sends_nothing_commits_at_once() {
         "the opening was folded, so its sequence is handed on"
     );
     let destination = ClaudeSidecarProvider::adopt(handoff, fds).unwrap();
-    let refused = destination.send_turn(SendTurnRequest {
-        session_id: session.clone(),
-        text: "end".to_string(),
-    });
+    let refused = destination.send_turn(SendTurnRequest::text(session.clone(), "end".to_string()));
     assert!(refused.is_err(), "nothing is sent to the sidecar before the commit");
 
     // The sidecar has nothing newer than what the source folded: a commit that waited for an event
@@ -292,10 +286,7 @@ fn a_frozen_source_sends_nothing_to_the_sidecar_until_it_is_unfrozen() {
     assert!(source.steer_turn(steer).is_err(), "refused while frozen");
     assert!(
         source
-            .send_turn(SendTurnRequest {
-                session_id: session.clone(),
-                text: "end".to_string(),
-            })
+            .send_turn(SendTurnRequest::text(session.clone(), "end".to_string()))
             .is_err(),
         "refused while frozen"
     );
@@ -661,10 +652,7 @@ fn an_idle_claude_chat_moves_and_commits_with_no_new_event() {
     );
 
     destination
-        .send_turn(SendTurnRequest {
-            session_id: session.clone(),
-            text: "text m1 hello;end".to_string(),
-        })
+        .send_turn(SendTurnRequest::text(session.clone(), "text m1 hello;end".to_string()))
         .expect("the destination drives the session");
     let start = Instant::now();
     let mut after = Vec::new();

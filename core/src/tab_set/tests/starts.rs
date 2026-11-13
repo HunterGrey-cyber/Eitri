@@ -248,6 +248,7 @@ fn a_finished_start_installs_into_its_own_tab_with_its_first_turn() {
             wire: "ctx\n\nhi".into(),
             typed: "hi".into(),
             shell_line: false,
+            attachments: Vec::new(),
         }),
         resume: None,
         resumed_title: None,

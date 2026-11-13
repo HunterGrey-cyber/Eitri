@@ -2,6 +2,7 @@ import * as roster from "./fold/roster";
 import * as notices from "./fold/notices";
 import * as subagents from "./fold/subagents";
 import * as questions from "./fold/questions";
+import * as plans from "./fold/plans";
 import * as reset from "./fold/reset";
 import { cleanCommands } from "./slashCommands";
 import { isEditorCardWire } from "./editorCardWire";
@@ -64,6 +65,9 @@ export function initialState(): AgentUiState {
     fallbackModel: null,
     notification: null,
     questions: [],
+    plans: [],
+    planning: null,
+    planMarks: [],
     cliUnseenBusy: false,
     cliUnseenEpisode: 0,
     openingPromptSeq: null,
@@ -284,6 +288,7 @@ export function applyEvent(
     case "tool_call_started":
       state = notices.onContent(state, event);
       state = questions.onCallStarted(state, event, seq);
+      state = plans.onCallStarted(state, event, seq);
       break;
     case "resume_outcome":
       state = { ...roster.onSessionEnd(state, event), effort: null };
@@ -292,6 +297,7 @@ export function applyEvent(
     case "session_unavailable":
       state = roster.onSessionEnd(state, event);
       state = questions.onSessionEnd(state, event);
+      state = plans.onSessionEnd(state);
       break;
   }
   if (event.type === "permission_mode_changed") return { ...incoming, nextSeq: seq + 1 };
@@ -323,12 +329,13 @@ const knownEventTypes: ReadonlySet<string> = new Set(Object.keys({
   cli_work_unseen: true, commands_available: true, content_delta: true, conversation_reset: true,
   effort_reported: true, model_reported: true, permission_mode_changed: true, permission_requested: true,
   permission_denied: true, permission_resolved: true, policy_mismatch: true, question_asked: true,
-  question_settled: true, resume_outcome: true,
+  question_settled: true, resume_outcome: true, plan_proposed: true, plan_settled: true, cli_plan_mode: true,
+  plan_transition_started: true, plan_transition_undone: true,
   session_closed: true, session_notice: true, session_opened: true, session_servers: true,
   session_unavailable: true, subagent_frame: true, task_event: true, tool_call_completed: true,
   tool_call_started: true, tool_input_changed: true, turn_attributed: true, turn_cause_updated: true,
   turn_completed: true, turn_started: true, user_message_delivered: true, user_message_dropped: true,
-  user_prompt_submitted: true, user_prompt_withdrawn: true,
+  user_prompt_submitted: true, user_prompt_withdrawn: true, user_prompt_attachments: true,
 } satisfies Record<AgentDomainEvent["type"], true>));
 
 function foldEvent(state: AgentUiState, event: AgentDomainEvent, seq: Seq, onUnknown?: (event: AgentDomainEvent) => void): AgentUiState {
@@ -340,7 +347,8 @@ function foldEvent(state: AgentUiState, event: AgentDomainEvent, seq: Seq, onUnk
         userPrompts: state.userPrompts.filter(keep), transcript: state.transcript.filter(keep),
         thinking: state.thinking.filter(keep), toolCalls: state.toolCalls.filter(keep),
         turnStarts: state.turnStarts.filter(keep), turnEndings: state.turnEndings.filter(keep),
-        notices: state.notices.filter(keep), questions: state.questions.filter(keep),
+        notices: state.notices.filter(keep), questions: state.questions.filter(keep), plans: state.plans.filter(keep),
+        planMarks: state.planMarks.filter(keep),
         evicted: { throughSeq: event.through_seq, turns: event.turns },
       };
       const owners = new Set([
@@ -798,9 +806,37 @@ function foldEvent(state: AgentUiState, event: AgentDomainEvent, seq: Seq, onUnk
         openingPromptSeq: state.openingPromptSeq === removed ? null : state.openingPromptSeq,
       };
     }
+    case "user_prompt_attachments": {
+      // The images belong to the prompt they were sent with, the newest one not put into a turn; nothing to
+      // attach them to changes nothing. MUST stay identical to `AgentSessionProjection::apply`. Rust's
+      // `AttachmentMeta` is snake_case on the wire; the record keeps what the row draws.
+      let at = -1;
+      for (let i = state.userPrompts.length - 1; i >= 0; i--) {
+        if (state.userPrompts[i].delivered !== true) {
+          at = i;
+          break;
+        }
+      }
+      if (at < 0) return state;
+      const attachments = event.attachments.map((image) => ({
+        mediaType: image.media_type, width: image.width, height: image.height, bytes: image.bytes,
+      }));
+      return {
+        ...state,
+        userPrompts: state.userPrompts.map((prompt, i) => (i === at ? { ...prompt, attachments } : prompt)),
+      };
+    }
     case "question_asked":
     case "question_settled":
       return questions.fold(state, event);
+    case "plan_proposed":
+    case "plan_settled":
+      return plans.fold(state, event);
+    // The host's reading of plan mode: it reaches the page as `planningChanged` beside the events.
+    case "cli_plan_mode":
+    case "plan_transition_started":
+    case "plan_transition_undone":
+      return state;
     case "permission_mode_changed":
       // The mode lives on the tab (`tabs` envelope), not the projection: `TabInfo.mode` is what the
       // band and the box read, and Rust's own `tabs` envelope already reflects an acknowledged
@@ -895,6 +931,7 @@ function holdsItemAfter(state: AgentUiState, seq: Seq): boolean {
     after(state.thinking) ||
     after(state.notices) ||
     after(state.questions) ||
+    after(state.plans) ||
     after(state.turnEndings) ||
     after(state.turnStarts) ||
     after(state.pendingPermissions)
@@ -1040,6 +1077,7 @@ export function applySnapshot(previous: AgentUiState, snapshot: AgentUiSnapshot,
   state = notices.fromSnapshot(state, snapshot);
   state = subagents.fromSnapshot(state, snapshot);
   state = questions.fromSnapshot(state, snapshot);
+  state = plans.fromSnapshot(state, snapshot);
   return reset.fromSnapshot(state, snapshot);
 }
 

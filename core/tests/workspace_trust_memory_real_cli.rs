@@ -393,7 +393,7 @@ fn drive_turn(set: &mut TabSet, tab: TabId, project: &Path, prompt: &str, label:
         .unwrap()
         .live_mut()
         .unwrap()
-        .send_turn(prompt, prompt, agent::PromptOrigin::Composed)
+        .send_turn(prompt, prompt, agent::PromptOrigin::Composed, Vec::new())
         .map_err(|e| e.message)
         .unwrap();
     let mut started = false;

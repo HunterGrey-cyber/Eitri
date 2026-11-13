@@ -92,6 +92,9 @@ const LEGACY_CAPABILITIES: ProviderCapabilities = ProviderCapabilities {
     client_tools: false,
     direct_settings: false,
     task_output_range: false,
+    plan_mode_v1: false,
+    turn_content_v1: false,
+    turn_content_limits: None,
 };
 
 // Compile-time, not a test: resume and fork are not exposed in this milestone, and the UI gates its
@@ -470,7 +473,28 @@ impl BackendError {
     pub fn is_turn_busy(&self) -> bool {
         self.benign && self.message == ConversationError::TurnAlreadyActive.to_string()
     }
+
+    /// The same refusal for a turn carrying images. Kept apart from [`BackendError::is_turn_busy`] because a
+    /// message put into a running turn carries text alone: the tab holds this one whole, for a turn of its own
+    /// after the running one ends, so its images are never dropped on the way.
+    fn turn_busy_with_images() -> Self {
+        Self {
+            message: TURN_BUSY_WITH_IMAGES.to_string(),
+            benign: true,
+        }
+    }
+
+    /// Whether this is [`AgentBackend::send_turn`]'s refusal of a turn with images sent while one was open.
+    pub fn is_turn_busy_with_images(&self) -> bool {
+        self.benign && self.message == TURN_BUSY_WITH_IMAGES
+    }
 }
+
+/// [`BackendError::turn_busy_with_images`]'s words, shown only if the tab cannot hold the message.
+const TURN_BUSY_WITH_IMAGES: &str = "a turn is already running: a message with images waits for it to end";
+
+/// A slash command's turn carries no images: what the CLI does with images beside a command is not known.
+pub const NO_IMAGES_WITH_A_COMMAND: &str = "a message starting with / takes no images: remove the images first";
 
 /// An answer to one of Claude's questions on its way to the agent ([`AgentBackend::answer_question`]),
 /// read back with [`AgentBackend::finish_question_send`] on the backend that sent it. Holding it may
@@ -497,6 +521,118 @@ impl QuestionSend {
     }
 }
 
+/// A decision on one of Claude's plans on its way to the agent ([`AgentBackend::approve_plan`],
+/// [`AgentBackend::keep_planning`]), or an approval waiting for the calls the CLI is still deciding in plan
+/// mode before it may go (`TabSet::approve_plan`). Read back with `TabSet::finish_plan_send`; holding it may
+/// keep the chat in this window, as a question's answer does.
+#[derive(Debug)]
+pub struct PlanSend {
+    interaction_id: String,
+    /// The mode an approval names; `None` for "keep planning".
+    approval: Option<agent::PlanExecutionMode>,
+    pub(crate) state: PlanSendState,
+}
+
+#[derive(Debug)]
+pub(crate) enum PlanSendState {
+    /// An approval not sent yet: calls deferred in plan mode are still running. `since_ms` is when it was
+    /// asked for; past `PLAN_TRANSITION_GUARD_MS` it is refused and the plan keeps waiting.
+    Draining {
+        plan_sha256: String,
+        since_ms: u64,
+        waiting: usize,
+    },
+    Sent(agent::InteractionSend),
+}
+
+impl PlanSend {
+    /// The plan the decision is for.
+    pub fn interaction_id(&self) -> &str {
+        &self.interaction_id
+    }
+
+    /// The mode an approval names, `None` for "keep planning".
+    pub fn approval(&self) -> Option<agent::PlanExecutionMode> {
+        self.approval
+    }
+
+    /// An approval that waits for `waiting` calls before it is sent.
+    pub(crate) fn draining(
+        interaction_id: &str,
+        mode: agent::PlanExecutionMode,
+        plan_sha256: &str,
+        since_ms: u64,
+        waiting: usize,
+    ) -> Self {
+        PlanSend {
+            interaction_id: interaction_id.to_string(),
+            approval: Some(mode),
+            state: PlanSendState::Draining {
+                plan_sha256: plan_sha256.to_string(),
+                since_ms,
+                waiting,
+            },
+        }
+    }
+
+    /// The reply as it stands, putting nothing back: for a send whose session is gone.
+    pub(crate) fn reply(&self) -> Option<Result<(), agent::ProviderError>> {
+        match &self.state {
+            PlanSendState::Draining { .. } => None,
+            PlanSendState::Sent(send) => send.try_reply().map(|reply| reply.map(|_| ())),
+        }
+    }
+
+    /// How many calls an approval still waits for before it is sent; 0 once it went.
+    pub fn waiting_calls(&self) -> usize {
+        match &self.state {
+            PlanSendState::Draining { waiting, .. } => *waiting,
+            PlanSendState::Sent(_) => 0,
+        }
+    }
+}
+
+/// A person's own move into or out of plan mode on its way to the agent ([`AgentBackend::set_planning`]).
+/// Its reply is the agent's acknowledgement only: the CLI's report of its mode confirms the move.
+#[derive(Debug)]
+pub struct PlanningSwitch {
+    enter: bool,
+    send: agent::PlanningSend,
+}
+
+impl PlanningSwitch {
+    /// Whether this is a move into plan mode.
+    pub fn enter(&self) -> bool {
+        self.enter
+    }
+
+    /// The reply as it stands, handed to no session: for a switch whose session is gone.
+    pub(crate) fn reply(&self) -> Option<agent::PlanningReply> {
+        self.send.try_reply()
+    }
+}
+
+/// Why a plan decision did not go through, and whether it may still have reached the agent: a timeout or a
+/// lost connection after the request left says nothing of what the CLI did.
+#[derive(Debug)]
+pub struct PlanSendFailure {
+    pub error: BackendError,
+    pub outcome_unknown: bool,
+}
+
+/// Whether `error`, the reply to a request that left, leaves its outcome unknown.
+fn outcome_unknown(error: &agent::ProviderError) -> bool {
+    matches!(
+        error,
+        agent::ProviderError::Timeout
+            | agent::ProviderError::Transport(_)
+            | agent::ProviderError::Provider {
+                code: agent::ProviderErrorCode::DeadlineExceeded,
+                ..
+            }
+    )
+}
+
 /// An answer the agent refused or that did not reach it, for the page: benign, since the question just
 /// waits for another answer and the session goes on (a lost connection is reported by the session's own
 /// stream). The agent's refusal is shown in its own words.
@@ -504,6 +640,18 @@ fn answer_refusal(error: agent::ProviderError) -> BackendError {
     let message = match error {
         agent::ProviderError::Provider { message, .. } => message,
         other => format!("the answer may not have reached Claude ({other}); the question is waiting again"),
+    };
+    BackendError { message, benign: true }
+}
+
+/// A plan decision or a plan-mode switch the agent refused or that did not reach it, for the page: benign,
+/// since the plan waits for another decision or the tab stays where it was. The agent's refusal is shown in
+/// its own words.
+fn plan_refusal(error: agent::ProviderError) -> BackendError {
+    let message = match error {
+        agent::ProviderError::Provider { message, .. } => message,
+        agent::ProviderError::UnsupportedCapability(_) => "plan mode is not offered on this session".to_string(),
+        other => format!("the decision may not have reached Claude ({other})"),
     };
     BackendError { message, benign: true }
 }
@@ -575,6 +723,17 @@ impl SpawnedTurn {
             turn_id: Some(turn_id),
             after_revision: self.after_revision,
         }
+    }
+}
+
+/// The words of a provider's refusal of a turn's images (`TurnContentRefused`), as they stand.
+fn content_refusal(error: &ConversationError) -> Option<String> {
+    match error {
+        ConversationError::Provider(agent::ProviderError::Provider {
+            code: agent::ProviderErrorCode::TurnContentRefused,
+            message,
+        }) => Some(message.clone()),
+        _ => None,
     }
 }
 
@@ -1026,11 +1185,19 @@ impl AgentBackend {
     /// session lives on. A fatal failure retires the session before another pump, so its queued
     /// prompt is never drawn: the page says the message was not sent and puts it back in the box,
     /// and a failed tab's state carries no conversation, so a reload shows no row for it either.
+    ///
+    /// `images` go with the text, after it and in order, only to a Claude sidecar that takes them
+    /// (`ProviderCapabilities::turn_content_v1`). Any other backend refuses a turn with images before
+    /// anything is folded or sent, and so does the provider when they break the limits its sidecar stated
+    /// (or the sidecar itself): that refusal withdraws the row folded for the prompt, since no part of the
+    /// turn was sent. The prompt's row records what each image was ([`agent::AttachmentMeta`]), never its
+    /// bytes.
     pub fn send_turn(
         &mut self,
         wire_text: &str,
         as_typed: &str,
         origin: agent::PromptOrigin,
+        images: Vec<agent::TurnImage>,
     ) -> Result<SubmittedPrompt, BackendError> {
         if self.agent().is_external() {
             return Err(BackendError {
@@ -1038,6 +1205,19 @@ impl AgentBackend {
                 benign: true,
             });
         }
+        if let Some(why) = self.why_no_images().filter(|_| !images.is_empty()) {
+            return Err(BackendError {
+                message: why,
+                benign: true,
+            });
+        }
+        if !images.is_empty() && as_typed.trim_start().starts_with('/') {
+            return Err(BackendError {
+                message: NO_IMAGES_WITH_A_COMMAND.to_string(),
+                benign: true,
+            });
+        }
+        let carries_images = !images.is_empty();
         let client_message_id = uuid::Uuid::new_v4().to_string();
         let after_revision = self.projection().last_revision;
         match self {
@@ -1059,8 +1239,13 @@ impl AgentBackend {
                 let row = origin != agent::PromptOrigin::ShellLine;
                 if row {
                     conversation.fold_locally(user_prompt_event(as_typed));
+                    if !images.is_empty() {
+                        conversation.fold_locally(AgentDomainEvent::UserPromptAttachments {
+                            attachments: images.iter().map(|image| image.meta.clone()).collect(),
+                        });
+                    }
                 }
-                let turn_id = match conversation.send_turn_as(wire_text, as_typed, origin, &client_message_id) {
+                let turn_id = match conversation.send_turn_as(wire_text, as_typed, origin, &client_message_id, images) {
                     Ok(turn_id) => turn_id,
                     Err(error) => {
                         // A turn was open that this side had not folded yet: the prompt it recorded was not
@@ -1069,7 +1254,17 @@ impl AgentBackend {
                             if row {
                                 conversation.fold_locally(AgentDomainEvent::UserPromptWithdrawn);
                             }
+                            if carries_images {
+                                return Err(BackendError::turn_busy_with_images());
+                            }
                             return Err(BackendError::turn_busy());
+                        }
+                        // The images were refused before any of the turn left: no row for a prompt never sent.
+                        if let Some(message) = content_refusal(&error) {
+                            if row {
+                                conversation.fold_locally(AgentDomainEvent::UserPromptWithdrawn);
+                            }
+                            return Err(BackendError { message, benign: true });
                         }
                         return Err(error.into());
                     }
@@ -1143,9 +1338,16 @@ impl AgentBackend {
         mode: SessionModeChoice,
         project_root: Option<&Path>,
         origin: agent::PromptOrigin,
+        images: Vec<agent::TurnImage>,
     ) -> Result<SubmittedPrompt, BackendError> {
         if !self.agent().is_external() {
-            return self.send_turn(wire_text, as_typed, origin);
+            return self.send_turn(wire_text, as_typed, origin, images);
+        }
+        if let Some(why) = self.why_no_images().filter(|_| !images.is_empty()) {
+            return Err(BackendError {
+                message: why,
+                benign: true,
+            });
         }
         let AgentBackend::Conversation { conversation, .. } = self else {
             unreachable!();
@@ -1163,6 +1365,31 @@ impl AgentBackend {
             turn_id: Some(turn_id),
             after_revision,
         })
+    }
+
+    /// Why this tab's turns cannot carry images, in words for the composer, or `None` when they can: only a
+    /// Claude sidecar that lists `turn_content_v1` takes them, and an external agent's turns are text alone.
+    pub fn why_no_images(&self) -> Option<String> {
+        let agent = self.agent();
+        match self {
+            AgentBackend::Legacy(_) => Some("this tab cannot take images: its backend sends text only".to_string()),
+            AgentBackend::Conversation { conversation, .. } => {
+                if agent.is_external() {
+                    Some(format!(
+                        "this tab cannot take images: {} takes text only here",
+                        agent.label()
+                    ))
+                } else if !conversation.capabilities().turn_content_v1
+                    || conversation.capabilities().turn_content_limits.is_none()
+                {
+                    // A sidecar that lists the capability without its limits has the provider refuse the turn
+                    // as an unsupported capability, which retires the session: it is refused here instead.
+                    Some("this tab cannot take images: its Claude sidecar does not accept them".to_string())
+                } else {
+                    None
+                }
+            }
+        }
     }
 
     /// Whether a message typed while a turn runs can go into that turn (the provider's capability
@@ -1262,7 +1489,7 @@ impl AgentBackend {
             after_revision,
         };
         if matches!(self, AgentBackend::Legacy(_)) {
-            let outcome = self.send_turn(&turn.wire, &turn.typed, turn.origin);
+            let outcome = self.send_turn(&turn.wire, &turn.typed, turn.origin, Vec::new());
             done(outcome.map(|submitted| submitted.turn_id.unwrap_or_default()));
             return Ok(spawned);
         }
@@ -1649,6 +1876,135 @@ impl AgentBackend {
         Err(answer_refusal(error))
     }
 
+    /// Approves Claude's plan `interaction_id` into `mode`, naming the digest of the plan the person read.
+    ///
+    /// Reached only from a page's own plan answer through `TabSet::approve_plan`: a plan is never in
+    /// `pending_permissions` or `questions`, so nothing that answers cards or questions reaches one. The
+    /// decision is checked against the record before anything is sent (`PlanRecord::check_resolution`), and
+    /// nothing waits for the agent here. Every refusal is benign and leaves the plan waiting.
+    pub fn approve_plan(
+        &mut self,
+        interaction_id: &str,
+        mode: agent::PlanExecutionMode,
+        plan_sha256: &str,
+    ) -> Result<PlanSend, BackendError> {
+        self.resolve_plan(
+            interaction_id,
+            Some(mode),
+            agent::InteractionResolution::PlanApprove {
+                mode,
+                plan_sha256: plan_sha256.to_string(),
+            },
+        )
+    }
+
+    /// "Keep planning" on Claude's plan `interaction_id`, with the person's `feedback` for the model
+    /// (possibly empty). The same door and checks as [`Self::approve_plan`].
+    pub fn keep_planning(&mut self, interaction_id: &str, feedback: String) -> Result<PlanSend, BackendError> {
+        self.resolve_plan(
+            interaction_id,
+            None,
+            agent::InteractionResolution::PlanKeep { feedback },
+        )
+    }
+
+    fn resolve_plan(
+        &mut self,
+        interaction_id: &str,
+        approval: Option<agent::PlanExecutionMode>,
+        resolution: agent::InteractionResolution,
+    ) -> Result<PlanSend, BackendError> {
+        match self {
+            // The legacy backend's CLI is never offered the plan tools.
+            AgentBackend::Legacy(_) => Err(BackendError {
+                message: "this session has no plan mode".to_string(),
+                benign: true,
+            }),
+            AgentBackend::Conversation { conversation, .. } => {
+                match conversation.resolve_plan(interaction_id, resolution) {
+                    Ok(send) => Ok(PlanSend {
+                        interaction_id: interaction_id.to_string(),
+                        approval,
+                        state: PlanSendState::Sent(send),
+                    }),
+                    Err(ConversationError::Provider(error)) => Err(plan_refusal(error)),
+                    Err(error) => Err(BackendError {
+                        message: error.to_string(),
+                        benign: true,
+                    }),
+                }
+            }
+        }
+    }
+
+    /// What became of a decision this backend sent: `None` while it is on its way, never waiting for it. A
+    /// failure puts the plan back to waiting before it is returned (`AgentConversation::plan_send_failed`,
+    /// which also undoes the move out of plan mode an approval started when the agent refused it).
+    pub fn finish_plan_send(&mut self, send: &PlanSend) -> Option<Result<(), PlanSendFailure>> {
+        let PlanSendState::Sent(sent) = &send.state else {
+            return None;
+        };
+        let error = match sent.try_reply()? {
+            Ok(_) => return Some(Ok(())),
+            Err(error) => error,
+        };
+        if let AgentBackend::Conversation { conversation, .. } = self {
+            conversation.plan_send_failed(&send.interaction_id, &error);
+        }
+        Some(Err(PlanSendFailure {
+            outcome_unknown: outcome_unknown(&error),
+            error: plan_refusal(error),
+        }))
+    }
+
+    /// Asks the agent to move the session into plan mode (`enter`) or out of it, for a person's own switch
+    /// (`TabSet::set_planning`, which checks the tab is idle). Refused, with nothing sent, by the legacy
+    /// backend and by a session that did not offer plan mode or is not where the move starts.
+    pub fn set_planning(&mut self, enter: bool, now_ms: u64) -> Result<PlanningSwitch, BackendError> {
+        match self {
+            AgentBackend::Legacy(_) => Err(BackendError {
+                message: "this session has no plan mode".to_string(),
+                benign: true,
+            }),
+            AgentBackend::Conversation { conversation, .. } => match conversation.set_planning(enter, now_ms) {
+                Ok(send) => Ok(PlanningSwitch { enter, send }),
+                Err(ConversationError::Provider(error)) => Err(plan_refusal(error)),
+                Err(error) => Err(BackendError {
+                    message: error.to_string(),
+                    benign: true,
+                }),
+            },
+        }
+    }
+
+    /// What became of a switch this backend sent: `None` while it is on its way. Either way the reply is
+    /// handed to the conversation, so the guard counts from it and a refusal undoes the move.
+    pub fn finish_planning_switch(&mut self, switch: &PlanningSwitch) -> Option<Result<(), BackendError>> {
+        let reply = switch.send.try_reply()?;
+        let AgentBackend::Conversation { conversation, .. } = self else {
+            return Some(reply.map(|_| ()).map_err(plan_refusal));
+        };
+        Some(match reply {
+            Ok(_) => {
+                conversation.planning_send_taken(switch.enter);
+                Ok(())
+            }
+            Err(error) => {
+                conversation.planning_send_failed(switch.enter, &error);
+                Err(plan_refusal(error))
+            }
+        })
+    }
+
+    /// Why the session's move into or out of plan mode is overdue at `now_ms`, if it is
+    /// (`AgentConversation::plan_transition_overdue`). Never for the legacy backend, which has no plan mode.
+    pub fn plan_transition_overdue(&self, now_ms: u64) -> Option<String> {
+        match self {
+            AgentBackend::Legacy(_) => None,
+            AgentBackend::Conversation { conversation, .. } => conversation.plan_transition_overdue(now_ms),
+        }
+    }
+
     /// Records that the panel was just handed a snapshot of this backend read at `revision`, for the
     /// next drain to take back ([`Self::take_ui_snapshot_revision`]) and leave every event tagged at
     /// or below it out of its `events` payload, so the page never applies an event twice that the
@@ -1737,6 +2093,7 @@ impl AgentBackend {
             approvals,
             &BTreeSet::new(),
             answered_for_you,
+            &mut PlanBook::default(),
         )
     }
 
@@ -1753,10 +2110,12 @@ impl AgentBackend {
         approvals: &mut HumanApprovals,
         user_answered: &BTreeSet<String>,
         answered_for_you: &mut AnsweredForYou,
+        plan: &mut PlanBook,
     ) -> RevisedDelivery {
         let GateMode {
             mode,
             followed_out_of_auto,
+            plan_followed,
         } = mode.into();
         let delivery = match self {
             AgentBackend::Legacy(session) => {
@@ -1787,7 +2146,7 @@ impl AgentBackend {
         if resync {
             approvals.forget_recorded();
         }
-        let (retry, waiting) = if !approvals.in_flight.is_empty() || !approvals.held.is_empty() {
+        let (mut retry, waiting) = if !approvals.in_flight.is_empty() || !approvals.held.is_empty() {
             let projection = self.projection();
             approvals.held.retain(|id| !user_answered.contains(id));
             for (id, p) in &projection.pending_permissions {
@@ -1820,6 +2179,73 @@ impl AgentBackend {
         } else {
             (Vec::new(), BTreeSet::new())
         };
+        // Requests held while the session left plan mode are judged once more as soon as nothing holds them
+        // any more, under the mode the tab took up; one that is a card then is drawn by a snapshot, since its
+        // event was kept from the page.
+        if !plan.held.is_empty() {
+            let projection = self.projection();
+            if !plan_holds(&projection, plan_followed) {
+                for id in std::mem::take(&mut plan.held) {
+                    let Some(p) = projection.pending_permissions.get(&id) else {
+                        continue;
+                    };
+                    if user_answered.contains(&id) || retry.iter().any(|(_, event)| matches!(event, AgentDomainEvent::PermissionRequested { permission_id, .. } if *permission_id == id)) {
+                        continue;
+                    }
+                    retry.push((
+                        projection.last_revision,
+                        AgentDomainEvent::PermissionRequested {
+                            permission_id: id,
+                            tool_use_id: p.tool_use_id.clone(),
+                            tool_name: p.tool_name.clone(),
+                            input: p.input.clone(),
+                            provider_prompt: p.provider_prompt.clone(),
+                        },
+                    ));
+                }
+            }
+        }
+        // Requests waiting for their call are judged once their call has been folded or the wait is over; one that
+        // is a card then is drawn by a snapshot, since its event was kept from the page. The others stay hidden and
+        // are looked at again on the next drain.
+        if !plan.unsequenced.is_empty() {
+            let now_ms = wall_clock_ms();
+            let projection = self.projection();
+            for (id, first_ms) in plan.unsequenced.iter_mut() {
+                // The wall clock stepped back: the wait starts again from now rather than lasting until the clock has
+                // caught up, with the CLI waiting on the answer all that time. A step forward ends it early, which
+                // only judges the request in both modes.
+                if *first_ms > now_ms {
+                    *first_ms = now_ms;
+                }
+                let Some(p) = projection.pending_permissions.get(id) else {
+                    continue;
+                };
+                if user_answered.contains(id)
+                    || retry.iter().any(|(_, event)| matches!(event, AgentDomainEvent::PermissionRequested { permission_id, .. } if permission_id == id))
+                {
+                    continue;
+                }
+                // A plan card is a person's to answer whatever its call turns out to be: it is drawn at once.
+                let sequence = Sequence::read(&projection, id, named_call(&p.tool_use_id).as_deref());
+                if sequence.waits()
+                    && !plan.cards.contains(id)
+                    && now_ms.saturating_sub(*first_ms) < PLAN_SEQUENCE_WAIT_MS
+                {
+                    continue;
+                }
+                retry.push((
+                    projection.last_revision,
+                    AgentDomainEvent::PermissionRequested {
+                        permission_id: id.clone(),
+                        tool_use_id: p.tool_use_id.clone(),
+                        tool_name: p.tool_name.clone(),
+                        input: p.input.clone(),
+                        provider_prompt: p.provider_prompt.clone(),
+                    },
+                ));
+            }
+        }
         let retried: BTreeSet<String> = retry
             .iter()
             .filter_map(|(_, event)| match event {
@@ -1844,9 +2270,11 @@ impl AgentBackend {
                 rules,
                 mode,
                 followed_out_of_auto,
+                plan_followed,
                 host_answered,
                 approvals,
                 answered_for_you,
+                plan,
             },
         );
         // Releasing a held card needs a snapshot: its fold revision may already have
@@ -2036,9 +2464,11 @@ impl AgentBackend {
             rules,
             mode,
             followed_out_of_auto,
+            plan_followed,
             host_answered,
             approvals,
             answered_for_you,
+            plan,
         } = cx;
         // What the batch's own events have shown so far; the projection is read again for every
         // request below, because ingestion keeps folding while earlier answers of this batch are
@@ -2072,17 +2502,22 @@ impl AgentBackend {
                 kept.push((revision, event));
                 continue;
             };
+            plan.looked_at.insert(permission_id.clone());
             // Read afresh for each request, as its own statement: on the sidecar `projection()`
             // holds the ingestion mutex and `respond_permission` locks it again (the 2026-09-15 GTK
             // freeze), so the guard is gone before any answer below. Both halves are needed for a
             // deferral: the session asked for the CLI's auto mode, and the CLI says it is running it.
-            let (projection_tripped, cli_reports_auto, one_own_server, cli_left_auto) = {
+            let call = named_call(tool_use_id);
+            let (projection_tripped, cli_reports_auto, one_own_server, cli_left_auto, plan_hold, main_thread, sequence) = {
                 let projection = self.projection();
                 (
                     session_tripped(&projection),
                     projection.cli_runs_auto(),
                     projection.single_sdk_server(SERVER_NAME),
                     projection.cli_left_auto,
+                    plan_holds(&projection, plan_followed),
+                    on_the_main_thread(&projection, call.as_deref()),
+                    Sequence::read(&projection, permission_id, call.as_deref()),
                 )
             };
             tripped |= projection_tripped;
@@ -2112,28 +2547,98 @@ impl AgentBackend {
             if host_answered.contains(permission_id) {
                 continue;
             }
+            // A card raised while the CLI ran plan mode is a person's to answer, whatever the tab's mode now. It waits
+            // for nothing: left among `unsequenced`, it would stay hidden, and hold back an approval, for good.
+            if plan.cards.contains(permission_id) {
+                eprintln!("[permission] asking the user: {tool_name} (asked in plan mode)");
+                plan.unsequenced.remove(permission_id);
+                kept.push((revision, event));
+                continue;
+            }
             let declared = self.declared_client_tools();
-            let planned = decide(
-                GateRequest {
-                    permission_id,
-                    tool_use_id,
-                    tool_name,
-                    input,
-                    provider_prompt: provider_prompt.as_ref(),
-                },
-                Judge {
-                    mode,
-                    external: self.agent().is_external(),
-                    defers_to_the_cli,
-                    own_tools: (one_own_server && !declared.is_empty()).then_some(declared),
-                    rules,
-                    project_root,
-                    approvals,
-                },
-            );
-            let answered = planned
-                .is_some_and(|planned| self.answer_and_record(planned, host_answered, approvals, answered_for_you));
-            if !answered {
+            let own_tools = (one_own_server && !declared.is_empty()).then_some(declared);
+            let external = self.agent().is_external();
+            // On a session that offered plan mode a request is not judged before the call it gates has been
+            // folded: the sidecar sends hook requests ahead of its message events, so until then the host does
+            // not know whether the CLI made the call in plan mode. It waits hidden, answered by nobody, and every
+            // drain looks at it again (`take_revised_ui_delivery_after_answers`) until its call is seen or
+            // `PLAN_SEQUENCE_WAIT_MS` has passed (a call the sidecar never shows, a request that names none). One whose
+            // wait ran out is judged in either mode (`Sequence::phase`): nothing else says where the CLI stood.
+            let ordered = sequence.offered
+                && !external
+                && waits_for_its_call(tool_name, provider_prompt.is_some(), mode, own_tools);
+            if ordered && sequence.waits() {
+                if plan.waited_ms(permission_id, wall_clock_ms()) < PLAN_SEQUENCE_WAIT_MS {
+                    continue;
+                }
+                eprintln!("[permission] judging {tool_name} without its call: the call did not arrive in time");
+            }
+            plan.unsequenced.remove(permission_id);
+            let request = GateRequest {
+                permission_id,
+                tool_use_id,
+                tool_name,
+                input,
+                provider_prompt: provider_prompt.as_ref(),
+            };
+            let judge = |planning: Option<PlanGate>| Judge {
+                mode,
+                external,
+                defers_to_the_cli,
+                own_tools,
+                rules,
+                project_root,
+                approvals: &*approvals,
+                planning,
+            };
+            // The tab's mode is the mode plan mode was entered from: while the CLI runs plan mode, its table
+            // decides (`plan_verdict`).
+            let in_plan = PlanGate {
+                origin: mode,
+                cli_runs_auto: cli_reports_auto,
+                main_thread,
+            };
+            let phase = sequence.phase(ordered);
+            let planned = match phase {
+                RequestPhase::Executing => decide(request, judge(None)),
+                RequestPhase::Planning => decide(request, judge(Some(in_plan))),
+                // Either mode may be the one the CLI asked in: an answer only where both give the same one, and
+                // otherwise a card. A deferral is no safe middle: outside plan mode a Manual tab's deferral would
+                // reach an auto CLI's classifier.
+                RequestPhase::Uncertain => {
+                    let executing = decide(request, judge(None));
+                    let planning = decide(request, judge(Some(in_plan)));
+                    match (executing, planning) {
+                        (Some(executing), Some(planning)) if executing.decision == planning.decision => Some(planning),
+                        (None, _) | (_, None) => None,
+                        (Some(_), Some(_)) => {
+                            eprintln!("[permission] asking the user: {tool_name} (plan mode may or may not apply)");
+                            None
+                        }
+                    }
+                }
+            };
+            let Some(planned) = planned else {
+                if phase != RequestPhase::Executing {
+                    plan.make_card(permission_id);
+                }
+                kept.push((revision, event));
+                continue;
+            };
+            // Nothing is answered automatically while the session leaves plan mode, nor before the tab has
+            // taken up the mode leaving gave it: the request waits, drawn as no card, to be judged under
+            // that mode (`take_revised_ui_delivery_after_answers`).
+            if plan_hold {
+                eprintln!("[permission] holding {tool_name} until the mode change settles");
+                plan.held.insert(permission_id.clone());
+                continue;
+            }
+            let deferred_call = (phase != RequestPhase::Executing && planned.decision.defers())
+                .then(|| planned.call.clone())
+                .flatten();
+            if self.answer_and_record(planned, host_answered, approvals, answered_for_you) {
+                plan.deferred_in_flight.extend(deferred_call);
+            } else {
                 kept.push((revision, event));
             }
         }
@@ -2245,12 +2750,30 @@ impl AgentBackend {
             eprintln!("[permission] not answering {why}: the agent reported a policy it was not asked for");
             return Approved::default();
         }
+        // Plan mode, or a move into or out of it: every card is a person's (`PlanBook::cards`, and every call that
+        // began then, `began_outside_executing`), and a request answered on entering bypass now would be answered
+        // under a mode the CLI is not in.
+        if self.projection().is_planning() {
+            eprintln!("[permission] not answering {why}: the session is in plan mode");
+            return Approved::default();
+        }
         let external = self.agent().is_external();
         let pending: std::collections::BTreeMap<String, PendingAnswer> = {
             let projection = self.projection();
             ids.iter()
                 .filter_map(|id| {
                     let p = projection.pending_permissions.get(id)?;
+                    // A request for a call that began while the session planned or changed mode is a person's
+                    // alone, whatever mode the tab is in now.
+                    if projection.began_outside_executing(named_call(&p.tool_use_id).as_deref()) {
+                        return None;
+                    }
+                    // Nor, on a session that offered plan mode, one that cannot be placed yet: its call has not been
+                    // folded (the sidecar sends requests ahead of its message events), so where the CLI stood when
+                    // it asked is not known. The gate judges it once it can be placed (`PlanBook::unsequenced`).
+                    if !projection.request_placed(id) {
+                        return None;
+                    }
                     // Every external request is an escalation past the agent's own sandbox, so each
                     // one approved here gets its row note; a Claude gate request does not.
                     let prompt = if external {
@@ -2415,6 +2938,10 @@ fn approve_each(
 pub struct GateMode {
     pub mode: PermissionMode,
     pub followed_out_of_auto: bool,
+    /// The tab has taken up the mode the end of its plan mode gave it (`TabSet::follow_plan_mode`): until
+    /// it has, `mode` may still be the mode the plan was entered from, and nothing is answered
+    /// automatically once the session executes again.
+    pub plan_followed: bool,
 }
 
 impl From<PermissionMode> for GateMode {
@@ -2422,6 +2949,7 @@ impl From<PermissionMode> for GateMode {
         Self {
             mode,
             followed_out_of_auto: false,
+            plan_followed: true,
         }
     }
 }
@@ -2430,12 +2958,117 @@ struct AnswerContext<'a> {
     rules: &'a agent::PrefixRules,
     mode: PermissionMode,
     followed_out_of_auto: bool,
+    plan_followed: bool,
     host_answered: &'a mut BTreeSet<String>,
     approvals: &'a mut HumanApprovals,
     answered_for_you: &'a mut AnsweredForYou,
+    plan: &'a mut PlanBook,
+}
+
+/// What a tab keeps about its requests because of plan mode, read and written where requests are answered.
+#[derive(Debug, Default, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct PlanBook {
+    /// Requests that would have been answered automatically while the session was leaving plan mode, or
+    /// before the tab took up the mode leaving gave it. Answered by nobody and drawn as no card until then;
+    /// then each is judged once more under the tab's new mode, and a card is drawn for what needs one.
+    #[serde(default)]
+    pub held: BTreeSet<String>,
+    /// Requests that became cards while the CLI ran plan mode. Only a person's answer on the card settles
+    /// one: no sweep, no bypass and no later automatic answer allows it, whatever mode the tab is in by then.
+    #[serde(default)]
+    pub cards: BTreeSet<String>,
+    /// The calls a request was deferred for while the CLI ran plan mode, until they complete, are refused,
+    /// or their turn ends. An approval of a plan waits for these: the CLI is still deciding them in plan mode.
+    #[serde(default)]
+    pub deferred_in_flight: BTreeSet<String>,
+    /// Requests on a session that offered plan mode whose call has not been folded yet, each with when it was
+    /// first seen (milliseconds since the epoch). Answered by nobody and drawn as no card: until its call arrives
+    /// the host cannot tell whether the CLI asked in plan mode. Each drain judges again those whose call has
+    /// arrived, whose turn has ended, or that have waited [`PLAN_SEQUENCE_WAIT_MS`]. A move carries them, with
+    /// their times, so the wait is not started again.
+    #[serde(default)]
+    pub unsequenced: std::collections::BTreeMap<String, u64>,
+    /// Pending requests a drain has looked at: the gate judged them or put them among `unsequenced`, or a resync drew
+    /// them. A request the ingestion folded after the last drain is in none of these, and an approval of a plan waits
+    /// until it is (`approval_not_ready`): the CLI may have made it in plan mode and still be deciding it there. A move
+    /// carries it, as the ids do not change.
+    #[serde(default)]
+    pub looked_at: BTreeSet<String>,
+    /// The plan an approval made in this window waits on calls for (`TabSet::approve_plan`): while it does, no
+    /// second approval of it is taken. This window's own bookkeeping, so a move does not carry it: the waiting
+    /// approval stays with the window that holds it, which then finds the tab gone.
+    #[serde(skip)]
+    pub draining: Option<String>,
+}
+
+impl PlanBook {
+    /// Drops every deferred call the projection shows finished, refused or out of its turn: what is left is
+    /// still running in the CLI. A call not seen yet counts while a turn runs.
+    pub fn prune_deferred(&mut self, projection: &agent::AgentSessionProjection) {
+        if projection.active_turn_id.is_none() {
+            self.deferred_in_flight.clear();
+            return;
+        }
+        self.deferred_in_flight.retain(|id| {
+            !projection
+                .tool_calls
+                .iter()
+                .any(|call| call.tool_use_id == *id && (call.result.is_some() || call.denied.is_some()))
+        });
+    }
+
+    /// Puts the request `permission_id` among those waiting for their call, from now, unless it already waits.
+    pub fn wait_for_its_call(&mut self, permission_id: String) {
+        self.unsequenced.entry(permission_id).or_insert_with(wall_clock_ms);
+    }
+
+    /// How long the request `permission_id` has waited for its call at `now_ms`, putting it among those waiting from
+    /// then unless it already waits. A start later than `now_ms` (the wall clock stepped back) is moved to `now_ms`, so
+    /// the wait starts again instead of lasting until the clock has caught up.
+    fn waited_ms(&mut self, permission_id: &str, now_ms: u64) -> u64 {
+        let first_ms = self.unsequenced.entry(permission_id.to_string()).or_insert(now_ms);
+        if *first_ms > now_ms {
+            *first_ms = now_ms;
+        }
+        now_ms - *first_ms
+    }
+
+    /// How long until the first request waiting for its call has waited [`PLAN_SEQUENCE_WAIT_MS`] and is judged
+    /// without it: zero for one already past it, `None` when none waits, and never more than the wait itself (after
+    /// the wall clock stepped back, the drain starts that request's wait again). Nothing else may wake the drain that
+    /// judges it -- the CLI waits on the answer, and for a call the sidecar never shows nothing more arrives -- so the
+    /// window runs its tick by then.
+    pub fn next_sequence_release(&self) -> Option<std::time::Duration> {
+        let now = wall_clock_ms();
+        self.unsequenced
+            .values()
+            .map(|first_ms| {
+                let left = (first_ms + PLAN_SEQUENCE_WAIT_MS).saturating_sub(now);
+                std::time::Duration::from_millis(left.min(PLAN_SEQUENCE_WAIT_MS))
+            })
+            .min()
+    }
+
+    /// Makes the pending request `permission_id` a plan card, which only a person's answer settles. A card waits for
+    /// nothing: it leaves the requests waiting for their call, which are drawn as no card, so a request is never
+    /// both. It has been looked at.
+    pub fn make_card(&mut self, permission_id: &str) {
+        self.unsequenced.remove(permission_id);
+        self.looked_at.insert(permission_id.to_string());
+        self.cards.insert(permission_id.to_string());
+    }
+
+    /// Drops every id the projection no longer lists as pending.
+    pub fn prune_answered(&mut self, still: &std::collections::HashSet<String>) {
+        self.held.retain(|id| still.contains(id));
+        self.cards.retain(|id| still.contains(id));
+        self.unsequenced.retain(|id, _| still.contains(id));
+        self.looked_at.retain(|id| still.contains(id));
+    }
 }
 
 /// One `PermissionRequested`, as `decide` reads it.
+#[derive(Clone, Copy)]
 struct GateRequest<'a> {
     permission_id: &'a str,
     tool_use_id: &'a Option<String>,
@@ -2471,6 +3104,187 @@ struct Judge<'a> {
     rules: &'a agent::PrefixRules,
     project_root: &'a Path,
     approvals: &'a HumanApprovals,
+    /// Set when the request is judged as one the CLI made in plan mode (`RequestPhase::Planning`, and the plan
+    /// half of an uncertain one): the plan table answers first, and every prompt of the CLI's own is a card.
+    planning: Option<PlanGate>,
+}
+
+/// The CLI runs plan mode, entered from the tab's mode `origin`. `cli_runs_auto` is whether the session runs
+/// the CLI's own auto mode when it executes (a `plan` report leaves that as it was).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PlanGate {
+    pub origin: PermissionMode,
+    pub cli_runs_auto: bool,
+    /// The request's call is one of the main thread's (a call the projection holds at the top level, not a
+    /// subagent's): only there was the CLI's plan mode measured to ask before writing.
+    pub main_thread: bool,
+}
+
+/// What the plan table says of a gate request while the CLI runs plan mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PlanVerdict {
+    /// Left to the CLI's plan mode, which lets read-only tools through and asks about the rest.
+    Defer,
+    /// Judged as a tab of this mode judges it outside plan mode.
+    AsMode(PermissionMode),
+    /// A card, for a person alone to answer.
+    Card,
+}
+
+/// The tools that write files or run commands. While the CLI runs plan mode the host never answers `allow`
+/// for one: a gate request is left to the CLI only where its plan mode was seen to ask before acting
+/// ([`PLAN_DEFERRED_TOOLS`]), and is a card everywhere else; every prompt the CLI raises is a card.
+pub const PLAN_ASKED_TOOLS: [&str; 4] = ["Edit", "Write", "NotebookEdit", "Bash"];
+
+/// Of [`PLAN_ASKED_TOOLS`], those a main-thread gate request for is left to the CLI in plan mode. Claude Code
+/// 2.1.311 in plan mode writes its own plan file and asks the host before a `Write` anywhere else, and sends a
+/// `Bash` that is not read-only to its classifier, which Verdandi turns into the CLI's own ask. `Edit` and
+/// `NotebookEdit` were not seen doing the same, so they are cards.
+pub const PLAN_DEFERRED_TOOLS: [&str; 2] = ["Write", "Bash"];
+
+/// Whether `tool_use_id` names a call of the main thread: one the projection holds at the top level. A
+/// subagent's calls are held under the call that started it, and a request with no id or for a call not seen
+/// yet cannot be tied to the main thread.
+fn on_the_main_thread(projection: &agent::AgentSessionProjection, tool_use_id: Option<&str>) -> bool {
+    tool_use_id.is_some_and(|id| projection.tool_calls.iter().any(|call| call.tool_use_id == id))
+}
+
+/// How long a request on a session that offered plan mode waits for the call it gates before it is judged
+/// without it. The sidecar sends hook requests ahead of its message events; in every recorded run (Claude Code
+/// 2.1.311, sidecar 0.5.0: 136 requests whose call the sidecar showed, the c40 family and every other row) the
+/// call's `ToolCallStarted` came 0.1 to 0.95 s after its request, 0.2 s at the median and 0.66 s at the 95th
+/// percentile, and it kept coming while the request waited unanswered (2 s held, 0.5 s). Twice the longest leaves
+/// room for a slower machine; only a call the sidecar never shows (a workflow's own calls) waits the whole time.
+pub const PLAN_SEQUENCE_WAIT_MS: u64 = 2_000;
+
+/// Milliseconds since the epoch; 0 on a clock before 1970.
+fn wall_clock_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// How a request is judged: as one the CLI made outside plan mode, in it, or in either.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RequestPhase {
+    Executing,
+    Planning,
+    Uncertain,
+}
+
+/// What the projection says about where the CLI stood for one request, read in one statement.
+struct Sequence {
+    /// The session offered plan mode: nothing else here changes a session without it.
+    offered: bool,
+    /// The request's call has been folded: never for a request that names none.
+    seen: bool,
+    /// Where the session stood when that call began, when it was anywhere but executing.
+    mark: Option<agent::CallPlanMark>,
+    /// Where the session stands now.
+    now: Option<agent::CallPlanMark>,
+    /// The request is still pending: one that is not has nothing to wait for, since whatever answers it goes nowhere.
+    pending: bool,
+}
+
+impl Sequence {
+    fn read(projection: &agent::AgentSessionProjection, permission_id: &str, call: Option<&str>) -> Sequence {
+        Sequence {
+            offered: projection.planning.offered,
+            seen: call.is_some_and(|id| projection.call_seen(id)),
+            mark: call.and_then(|id| projection.call_mark(id)),
+            now: projection.plan_mark_now(),
+            pending: projection.pending_permissions.contains_key(permission_id),
+        }
+    }
+
+    /// Whether the request should wait before it is judged: while it is pending and its call has not been folded. Only
+    /// that call's own start places it (`AgentSessionProjection::request_placed`), so a request that names no call
+    /// waits the whole [`PLAN_SEQUENCE_WAIT_MS`], as one whose call never comes does, and nothing on the message path
+    /// ends a wait early: a turn's end folded after the request may have been sent before it, and the CLI may then
+    /// have started a turn of its own whose call the request is.
+    fn waits(&self) -> bool {
+        self.pending && !self.seen
+    }
+
+    /// How the request is judged: by where the CLI stood for its call, and where the session stands now. Plan
+    /// mode at either is plan mode; a move into it at either, or plan mode now for a call never seen, is either.
+    /// A session leaving plan mode whose CLI has reported its way out is executing here; nothing is answered
+    /// automatically until the tab has taken up its new mode (`plan_holds`).
+    ///
+    /// The scripted host of layer (a) keeps a hand copy of this rule, which cannot depend on this crate
+    /// (`agent::testkit::claude_scripted::gate_answer::judged_phase`); change both together.
+    ///
+    /// `ordered` is whether the request is one that waits to be placed (`waits_for_its_call` on a session that
+    /// offered plan mode). Such a request is executing only when its own call was folded with no mark. Nothing else is
+    /// evidence. A wait that ran out is none: the message path may simply lag, with a `plan` report still queued. Nor
+    /// is any event folded after the request, since requests overtake the message events sent before them: another
+    /// call's start, a subagent's or a turn's end folded after the request may have been sent before it, and before
+    /// the `EnterPlanMode` and the `plan` report that came between. Such a request is judged in either mode, which
+    /// gives a card wherever the two disagree.
+    fn phase(&self, ordered: bool) -> RequestPhase {
+        use agent::CallPlanMark::{Moving, Planning};
+        match (self.seen.then_some(self.mark).flatten(), self.now) {
+            (Some(Moving), _) | (_, Some(Moving)) => RequestPhase::Uncertain,
+            (_, Some(Planning)) if !self.seen => RequestPhase::Uncertain,
+            (Some(Planning), _) | (_, Some(Planning)) => RequestPhase::Planning,
+            (None, None) if ordered && !self.seen => RequestPhase::Uncertain,
+            (None, None) => RequestPhase::Executing,
+        }
+    }
+}
+
+/// Whether a request must wait for its call before it is judged: unless the plan table and the tab's mode give it
+/// the same verdict whatever the call turns out to be. That holds for a session's own editor tools (answered
+/// before the plan table, in every mode) and, in a Manual or Auto tab, for a gate request for a tool that neither
+/// writes nor runs (the plan table judges it as the tab's mode does); everything else waits, every prompt of the
+/// CLI's own and everything in a Bypass tab included. Layer (a)'s scripted host keeps a hand copy
+/// (`agent::testkit::claude_scripted::gate_answer::waits_for_its_call`); change both together.
+fn waits_for_its_call(
+    tool_name: &str,
+    provider_prompt: bool,
+    mode: PermissionMode,
+    own_tools: Option<&BTreeSet<String>>,
+) -> bool {
+    if is_own_tool(tool_name, own_tools) && !provider_prompt {
+        return false;
+    }
+    provider_prompt || mode == PermissionMode::Bypass || PLAN_ASKED_TOOLS.contains(&tool_name)
+}
+
+/// The plan table for one request while the CLI runs plan mode. A session's own editor tools are answered
+/// before it (`decide`), in every mode, as outside plan mode. `boundary` is whether the project root is a
+/// boundary (`root_is_a_boundary`): at a root that is none nothing is deferred, as everywhere else.
+pub fn plan_verdict(tool_name: &str, provider_prompt: bool, gate: PlanGate, boundary: bool) -> PlanVerdict {
+    // Every prompt the CLI raises in plan mode, for whatever tool: no saved approval, no rule and no bypass
+    // answers it.
+    if provider_prompt {
+        return PlanVerdict::Card;
+    }
+    if PLAN_ASKED_TOOLS.contains(&tool_name) {
+        // A subagent may run another mode than the main thread's plan mode, and nobody measured what the CLI
+        // does with the other edit tools: those fail toward a card.
+        return if boundary && gate.main_thread && PLAN_DEFERRED_TOOLS.contains(&tool_name) {
+            PlanVerdict::Defer
+        } else {
+            PlanVerdict::Card
+        };
+    }
+    match gate.origin {
+        PermissionMode::Manual => PlanVerdict::AsMode(PermissionMode::Manual),
+        PermissionMode::Auto => PlanVerdict::AsMode(PermissionMode::Auto),
+        // Bypass answers nothing itself in plan mode: what the CLI's own auto mode would decide is left to
+        // it, and the rest is a card. No saved rule allows anything here.
+        PermissionMode::Bypass if boundary && gate.cli_runs_auto => PlanVerdict::Defer,
+        PermissionMode::Bypass => PlanVerdict::Card,
+    }
+}
+
+/// Whether nothing is answered automatically now: the session is leaving plan mode, or executes again and
+/// the tab has not yet taken up the mode that gave it (`GateMode::plan_followed`).
+fn plan_holds(projection: &agent::AgentSessionProjection, plan_followed: bool) -> bool {
+    matches!(projection.planning.phase, agent::PlanPhase::Leaving { .. })
+        || (!projection.is_planning() && !plan_followed)
 }
 
 /// The answer `decide` chose for one request, with everything its row says once it is sent; only
@@ -2547,6 +3361,7 @@ fn decide(request: GateRequest<'_>, judge: Judge<'_>) -> Option<PlannedAnswer> {
         rules,
         project_root,
         approvals,
+        planning,
     } = judge;
     let GateRequest {
         tool_use_id,
@@ -2585,6 +3400,10 @@ fn decide(request: GateRequest<'_>, judge: Judge<'_>) -> Option<PlannedAnswer> {
                 format!("allow {tool_name} in bypass"),
             )
         });
+    }
+    if planning.is_some() && provider_prompt.is_some() {
+        eprintln!("[permission] asking the user: {tool_name} (the CLI asked in plan mode)");
+        return None;
     }
     if let Some(prompt) = provider_prompt {
         // Never the classifier's or a rule's: the CLI asked after the gate had already allowed the
@@ -2639,6 +3458,23 @@ fn decide(request: GateRequest<'_>, judge: Judge<'_>) -> Option<PlannedAnswer> {
             format!("leave {tool_name} to the editor broker"),
         ));
     }
+    let mode = match planning.map(|gate| plan_verdict(tool_name, false, gate, root_is_a_boundary(project_root))) {
+        None => mode,
+        Some(PlanVerdict::AsMode(mode)) => mode,
+        Some(PlanVerdict::Card) => {
+            eprintln!("[permission] asking the user: {tool_name} (plan mode)");
+            return None;
+        }
+        Some(PlanVerdict::Defer) => {
+            return Some(PlannedAnswer::plain(
+                &request,
+                PermissionDecision::Defer,
+                GateOrigin::GateRequest,
+                format!("left to the CLI's plan mode: {tool_name}"),
+                format!("leave to the CLI's plan mode {tool_name}"),
+            ));
+        }
+    };
     if mode == PermissionMode::Bypass {
         return Some(PlannedAnswer {
             creates_file: creates_file(),
@@ -3921,6 +4757,7 @@ mod tests {
             "wire text with context composed in",
             "what does this do?",
             agent::PromptOrigin::Composed,
+            Vec::new(),
         );
 
         let error = result.expect_err("RejectingProvider's send_turn always fails");
@@ -3955,7 +4792,7 @@ mod tests {
         };
 
         let error = backend
-            .send_turn("wire text", "and the docs", agent::PromptOrigin::Composed)
+            .send_turn("wire text", "and the docs", agent::PromptOrigin::Composed, Vec::new())
             .expect_err("the provider refuses it as busy");
 
         assert!(error.is_turn_busy());
@@ -3986,6 +4823,7 @@ mod tests {
             "Editor context: /p/src/main.rs, line 3\n\nfix the picker",
             "fix the picker",
             agent::PromptOrigin::Composed,
+            Vec::new(),
         );
         assert!(sent.is_ok(), "RecordingProvider accepts every turn");
         provider.queue(AgentDomainEvent::SessionOpened {
@@ -7055,7 +7893,7 @@ mod external_tests {
         let dir = workspace("external-plain-send");
         let (provider, mut backend) = codex_backend(&dir);
         let refused = backend
-            .send_turn("hello", "hello", agent::PromptOrigin::Composed)
+            .send_turn("hello", "hello", agent::PromptOrigin::Composed, Vec::new())
             .expect_err("no mode, no turn");
         assert!(refused.benign, "{}", refused.message);
         assert!(provider.policies().is_empty());
@@ -7066,6 +7904,7 @@ mod external_tests {
                 SessionModeChoice::Bypass,
                 Some(&dir),
                 agent::PromptOrigin::Composed,
+                Vec::new(),
             )
             .expect("the tab's door carries the mode");
         assert_eq!(
@@ -7103,6 +7942,7 @@ mod external_tests {
                     SessionModeChoice::Auto,
                     Some(&dir),
                     agent::PromptOrigin::Composed,
+                    Vec::new(),
                 )
                 .expect("the turn goes");
         };
@@ -7158,6 +7998,7 @@ mod external_tests {
                 SessionModeChoice::Auto,
                 Some(&window_root),
                 agent::PromptOrigin::Composed,
+                Vec::new(),
             )
             .expect("the turn goes");
         assert_eq!(provider.policies(), vec![read_only]);
@@ -7330,6 +8171,158 @@ mod external_tests {
         assert_eq!(external, vec!["codex-thread".to_string(), "gemini-session".to_string()]);
     }
 }
+
+#[cfg(test)]
+mod plan_tests {
+    //! A plan is settled only through `approve_plan` / `keep_planning`, checked before anything is sent.
+    use super::*;
+    use crate::test_providers::RecordingProvider;
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
+    const SHA: &str = "00000000000000000000000000000000000000000000000000000000000000aa";
+
+    /// A session that offers plan mode, planning, with plan `p1` waiting.
+    fn planning(label: &str) -> (Arc<RecordingProvider>, AgentBackend) {
+        agent::state_dirs::redirect_state_to_a_test_root();
+        let dir = agent::state_dirs::test_workspace_dir(label);
+        let provider = Arc::new(RecordingProvider::planning(true));
+        let conversation = AgentConversation::create(provider.clone(), &dir, ProjectTrust::Untrusted).unwrap();
+        let backend = AgentBackend::Conversation {
+            agent: AgentId::Claude,
+            conversation: Box::new(conversation),
+        };
+        provider.queue_all(vec![
+            AgentDomainEvent::CliPermissionMode {
+                reported: "auto".into(),
+            },
+            AgentDomainEvent::TurnStarted { turn_id: "t1".into() },
+            AgentDomainEvent::ToolCallStarted {
+                turn_id: "t1".into(),
+                tool_use_id: "toolu_enter".into(),
+                name: "EnterPlanMode".into(),
+                input: serde_json::json!({}),
+            },
+            AgentDomainEvent::CliPlanMode {
+                source: "CliModeReported".into(),
+            },
+            AgentDomainEvent::PlanProposed {
+                interaction_id: "p1".into(),
+                tool_use_id: Some("toolu_exit".into()),
+                plan: "# Plan".into(),
+                plan_sha256: SHA.into(),
+                allowed_prompts: Vec::new(),
+                unsupported_reason: None,
+            },
+        ]);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while backend.projection().waiting_plan().is_none() {
+            assert!(Instant::now() < deadline, "the plan never arrived");
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        (provider, backend)
+    }
+
+    #[test]
+    fn approve_plan_validates_before_sending() {
+        let (provider, mut backend) = planning("plan-validates");
+        let refused = backend
+            .approve_plan("p1", agent::PlanExecutionMode::Auto, "not-the-plan-read")
+            .unwrap_err();
+        assert!(refused.benign);
+        assert!(
+            refused.message.contains("not the plan that is waiting"),
+            "{}",
+            refused.message
+        );
+        assert!(backend.approve_plan("p9", agent::PlanExecutionMode::Auto, SHA).is_err());
+        assert!(
+            provider.interactions().is_empty(),
+            "nothing is sent for a decision that cannot stand"
+        );
+        assert_eq!(backend.projection().planning.phase, agent::PlanPhase::Planning);
+        let send = backend.approve_plan("p1", agent::PlanExecutionMode::Auto, SHA).unwrap();
+        assert!(backend.finish_plan_send(&send).unwrap().is_ok());
+        assert_eq!(provider.interactions().len(), 1);
+        backend.shutdown();
+    }
+
+    #[test]
+    fn a_refused_approval_keeps_the_plan_waiting() {
+        let (provider, mut backend) = planning("plan-refused-approval");
+        provider.refuse_interactions(Some(agent::ProviderErrorCode::InteractionAnswerRefused));
+        let send = backend
+            .approve_plan("p1", agent::PlanExecutionMode::Manual, SHA)
+            .unwrap();
+        let failure = backend.finish_plan_send(&send).unwrap().unwrap_err();
+        assert!(failure.error.benign);
+        assert!(!failure.outcome_unknown, "the agent said no: nothing may have happened");
+        let projection = backend.projection();
+        assert_eq!(projection.waiting_plan().unwrap().state, agent::PlanState::Waiting);
+        assert_eq!(
+            projection.planning.phase,
+            agent::PlanPhase::Planning,
+            "the move out is undone"
+        );
+        drop(projection);
+        // A move into plan mode while it plans is refused before anything is sent.
+        assert!(backend.set_planning(true, 0).is_err());
+        assert!(provider.planning_calls().is_empty());
+        backend.shutdown();
+    }
+
+    /// A plan the sidecar sent ahead of the CLI's `plan` report: an approval now would lose its move out of plan
+    /// mode, so the conversation refuses it, benign, with nothing sent; "keep planning" needs no plan mode.
+    #[test]
+    fn an_approval_is_refused_until_the_cli_reports_plan_mode() {
+        agent::state_dirs::redirect_state_to_a_test_root();
+        let dir = agent::state_dirs::test_workspace_dir("plan-not-yet");
+        let provider = Arc::new(RecordingProvider::planning(true));
+        let conversation = AgentConversation::create(provider.clone(), &dir, ProjectTrust::Untrusted).unwrap();
+        let mut backend = AgentBackend::Conversation {
+            agent: AgentId::Claude,
+            conversation: Box::new(conversation),
+        };
+        provider.queue_all(vec![
+            AgentDomainEvent::TurnStarted { turn_id: "t1".into() },
+            AgentDomainEvent::PlanProposed {
+                interaction_id: "p1".into(),
+                tool_use_id: Some("toolu_exit".into()),
+                plan: "# Plan".into(),
+                plan_sha256: SHA.into(),
+                allowed_prompts: Vec::new(),
+                unsupported_reason: None,
+            },
+        ]);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while backend.projection().waiting_plan().is_none() {
+            assert!(Instant::now() < deadline, "the plan never arrived");
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        let refused = backend
+            .approve_plan("p1", agent::PlanExecutionMode::Manual, SHA)
+            .unwrap_err();
+        assert!(refused.benign);
+        assert!(
+            refused.message.contains("has not reported plan mode"),
+            "{}",
+            refused.message
+        );
+        assert!(provider.interactions().is_empty());
+        assert_eq!(backend.projection().planning.phase, agent::PlanPhase::Executing);
+        assert_eq!(
+            backend.projection().waiting_plan().unwrap().state,
+            agent::PlanState::Waiting
+        );
+        let kept = backend.keep_planning("p1", String::new()).unwrap();
+        assert!(backend.finish_plan_send(&kept).unwrap().is_ok());
+        assert_eq!(provider.interactions().len(), 1);
+        backend.shutdown();
+    }
+}
+
+#[cfg(test)]
+mod image_tests;
 
 #[cfg(test)]
 mod question_tests {
@@ -7961,6 +8954,7 @@ mod eitri_gate_tests {
                 rules: &agent::PrefixRules::default(),
                 project_root: Path::new("/nonexistent"),
                 approvals: &HumanApprovals::default(),
+                planning: None,
             },
         )
         .map(|planned| planned.sent)
@@ -8203,6 +9197,7 @@ mod eitri_gate_tests {
         let cycled_back = GateMode {
             mode: PermissionMode::Auto,
             followed_out_of_auto: true,
+            plan_followed: true,
         };
         let got = edit_on_cli_auto(cycled_back, left_auto(), "Write");
         assert_eq!(got.decisions, allowed("p1"));

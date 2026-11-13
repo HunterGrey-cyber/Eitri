@@ -76,6 +76,7 @@ const AUTO_SITES: &[(&str, &str)] = &[
     (
         "providers/claude_sidecar/mod.rs",
         "cli_permission_mode: match cli_mode { crate::RequestedCliMode::Auto => CliPermissionMode::Auto as i32, \
+         crate::RequestedCliMode::Default if offers_plan_mode => CliPermissionMode::Default as i32, \
          crate::RequestedCliMode::Default => CliPermissionMode::Unspecified as i32, },",
     ),
     (
@@ -791,7 +792,9 @@ fn check_host_policy_literals(rel: &str, code: &str, aliases: &[String], offende
             )),
         }
         // Rule 6: stated, never left to a default or a `..` base, and only ever UNSPECIFIED (what a
-        // client before the field sends) or the request's one `match` on the mode it was asked for.
+        // client before the field sends) or the request's one `match` on the mode it was asked for, whose
+        // `Default` states DEFAULT exactly when the session offers plan mode (Verdandi refuses the offer
+        // without a stated mode) and UNSPECIFIED otherwise.
         let cli_aliases = proto_aliases(code, PROTO_CLI_PERMISSION_MODE);
         let accepted = cli_mode.as_deref().is_some_and(|value| {
             cli_aliases.iter().any(|a| {
@@ -799,6 +802,7 @@ fn check_host_policy_literals(rel: &str, code: &str, aliases: &[String], offende
                     || value
                         == format!(
                             "match cli_mode {{ crate::RequestedCliMode::Auto => {a}::Auto as i32, \
+                             crate::RequestedCliMode::Default if offers_plan_mode => {a}::Default as i32, \
                              crate::RequestedCliMode::Default => {a}::Unspecified as i32, }}"
                         )
             })
@@ -1335,14 +1339,16 @@ fn a_session_request_states_a_policy() {
 }
 
 /// Rule 6, the literal half: UNSPECIFIED passes, and so does the request's one `match` on the
-/// requested mode -- but only in `mod.rs`, where it is a listed site, since its proto `Auto` is a
-/// site. Anything else as the value fails: the proto `Auto` stated outright, DEFAULT, a number, a
-/// different `match`, or no statement at all.
+/// requested mode, whose `Default` states DEFAULT only under `offers_plan_mode` -- but only in `mod.rs`,
+/// where it is a listed site, since its proto `Auto` is a site. Anything else as the value fails: the
+/// proto `Auto` stated outright, DEFAULT outright or under another condition, a number, a different
+/// `match` (the one before plan mode included), or no statement at all.
 #[test]
 fn the_cli_mode_is_unspecified_or_the_one_gated_match() {
     let interactive = "ProtoPermissionMode::Interactive as i32";
     assert!(one("x.rs", &policy(interactive, "false")).offenders.is_empty());
     let gated = "match cli_mode {\n crate::RequestedCliMode::Auto => CliPermissionMode::Auto as i32,\n \
+                 crate::RequestedCliMode::Default if offers_plan_mode => CliPermissionMode::Default as i32,\n \
                  crate::RequestedCliMode::Default => CliPermissionMode::Unspecified as i32,\n }";
     let in_mod = one(
         "providers/claude_sidecar/mod.rs",
@@ -1362,6 +1368,14 @@ fn the_cli_mode_is_unspecified_or_the_one_gated_match() {
         "CliPermissionMode::Default as i32",
         "2",
         "match cli_mode { _ => CliPermissionMode::Unspecified as i32 }",
+        // The match without its plan-mode arm, or with DEFAULT stated whatever the session offers.
+        "match cli_mode { crate::RequestedCliMode::Auto => CliPermissionMode::Auto as i32, \
+         crate::RequestedCliMode::Default => CliPermissionMode::Unspecified as i32, }",
+        "match cli_mode { crate::RequestedCliMode::Auto => CliPermissionMode::Auto as i32, \
+         crate::RequestedCliMode::Default => CliPermissionMode::Default as i32, }",
+        "match cli_mode { crate::RequestedCliMode::Auto => CliPermissionMode::Auto as i32, \
+         crate::RequestedCliMode::Default if true => CliPermissionMode::Default as i32, \
+         crate::RequestedCliMode::Default => CliPermissionMode::Unspecified as i32, }",
     ] {
         let report = one(
             "providers/claude_sidecar/mod.rs",

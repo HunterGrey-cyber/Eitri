@@ -74,6 +74,9 @@ pub enum Entry {
     User {
         text: String,
         via: Via,
+        /// The images the message carried, in order, as (media type, SHA-256 in hex): what each was, never the
+        /// bytes. A digest is empty for an image too large for the record to have hashed.
+        images: Vec<(String, String)>,
     },
     Assistant {
         text: String,
@@ -108,6 +111,13 @@ pub enum Entry {
         /// The call's tool-use id (a record without one gives its interaction id), for pairing only.
         id: String,
         key: QuestionKey,
+    },
+    /// A plan Claude proposed (`ExitPlanMode`) and how it ended. Only its digest and end are kept: the plan's
+    /// words never enter the normal form, so no report can print them.
+    Plan {
+        /// The call's tool-use id (a record without one gives its interaction id), for pairing only.
+        id: String,
+        key: PlanKey,
     },
 }
 
@@ -157,6 +167,37 @@ impl QuestionKey {
     }
 }
 
+/// How a plan ended, in the oracle's own closed list.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum PlanEnd {
+    /// The person approved it and the model went on.
+    Approved,
+    /// The person kept planning, with or without words.
+    KeptPlanning,
+    /// Any other end: an interrupt, the session closing, an expiry, a plan the client could not carry, a
+    /// result the reader has no rule for.
+    Other,
+}
+
+impl PlanEnd {
+    pub fn word(self) -> &'static str {
+        match self {
+            PlanEnd::Approved => "approved",
+            PlanEnd::KeptPlanning => "kept_planning",
+            PlanEnd::Other => "other",
+        }
+    }
+}
+
+/// All the oracle keeps of a plan, and all a report prints of it: the SHA-256 of its text (lower-case hex,
+/// empty for a plan the client could not carry, which holds no text) and how it ended. The feedback a person
+/// gave and the mode they approved into are not in it: the CLI's file holds neither.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct PlanKey {
+    pub plan_sha256: String,
+    pub end: PlanEnd,
+}
+
 impl Entry {
     /// The entry's kind as one word, for counts and tests.
     pub fn kind(&self) -> &'static str {
@@ -171,6 +212,7 @@ impl Entry {
             Entry::Interrupted => "interrupted",
             Entry::Ended { .. } => "ended",
             Entry::Question { .. } => "question",
+            Entry::Plan { .. } => "plan",
         }
     }
 }

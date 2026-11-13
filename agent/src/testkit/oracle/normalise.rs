@@ -15,13 +15,17 @@
 //!   answer, and how it ended. Eitri's own ends map onto the oracle's words in [`question_end`]: an interrupt,
 //!   an expiry and a closed session are all `cancelled`, a host that could not show the form and a failed
 //!   provider are `other`. A set still waiting has no key: the CLI writes no result for it either.
+//! - A plan compares by its key alone ([`super::PlanKey`]): the digest of its text and how it ended. Eitri's own
+//!   ends map onto the oracle's words in [`plan_end`]: an approval and a keep are their own, every other end
+//!   (an interrupt, an expiry, a closed session, a plan the client could not carry) is `other`. A plan still
+//!   waiting has no key: the CLI writes no result for it either.
 //! - The CLI form is projected onto what each record holds before it is compared: A and B store no
 //!   thinking and no turn endings, and B does not open subagent transcripts. These are differences of
 //!   kind, counted by [`project`], never compared entry by entry.
 
-use super::{Entry, QuestionEnd, QuestionKey, Source, Turn};
+use super::{Entry, PlanEnd, PlanKey, QuestionEnd, QuestionKey, Source, Turn};
 use crate::history::strip_composed_block;
-use crate::projection::{QuestionOutcome, QuestionRecord, QuestionState};
+use crate::projection::{PlanOutcome, PlanRecord, PlanState, QuestionOutcome, QuestionRecord, QuestionState};
 use serde_json::Value;
 use std::collections::BTreeMap;
 
@@ -122,6 +126,36 @@ pub fn question_entry(record: &QuestionRecord) -> Option<Entry> {
             .clone()
             .unwrap_or_else(|| record.interaction_id.clone()),
         key: QuestionKey::new(record.questions.len(), answered, question_end(*outcome)),
+    })
+}
+
+/// An end Eitri records for a plan, in the oracle's words.
+pub fn plan_end(outcome: PlanOutcome) -> PlanEnd {
+    match outcome {
+        PlanOutcome::Approved => PlanEnd::Approved,
+        PlanOutcome::KeptPlanning => PlanEnd::KeptPlanning,
+        PlanOutcome::Interrupted
+        | PlanOutcome::Expired
+        | PlanOutcome::SessionClosed
+        | PlanOutcome::ProviderFailed
+        | PlanOutcome::HostRefused => PlanEnd::Other,
+    }
+}
+
+/// A plan record of Eitri's as an entry, once it has settled; `None` while it waits.
+pub fn plan_entry(record: &PlanRecord) -> Option<Entry> {
+    let PlanState::Settled { outcome, .. } = &record.state else {
+        return None;
+    };
+    Some(Entry::Plan {
+        id: record
+            .tool_use_id
+            .clone()
+            .unwrap_or_else(|| record.interaction_id.clone()),
+        key: PlanKey {
+            plan_sha256: record.plan_sha256.clone(),
+            end: plan_end(*outcome),
+        },
     })
 }
 
@@ -297,6 +331,64 @@ mod tests {
                 (HostRefused, "other"),
             ]
         );
+    }
+
+    fn plan_record(state: PlanState, tool_use_id: Option<&str>) -> PlanRecord {
+        PlanRecord {
+            seq: 1,
+            interaction_id: "interaction".into(),
+            tool_use_id: tool_use_id.map(str::to_owned),
+            turn_id: None,
+            plan: "# Plan\n".into(),
+            plan_sha256: "abc123".into(),
+            allowed_prompts: Vec::new(),
+            state,
+            unsupported_reason: None,
+        }
+    }
+
+    fn plan_settled(outcome: PlanOutcome) -> PlanState {
+        PlanState::Settled {
+            outcome,
+            mode_after: None,
+            feedback: Some("words".into()),
+            reason: Some("words".into()),
+        }
+    }
+
+    #[test]
+    fn a_plan_is_its_digest_and_one_word_of_the_oracle_s_list() {
+        use PlanOutcome::*;
+        let words: Vec<_> = [
+            Approved,
+            KeptPlanning,
+            Interrupted,
+            Expired,
+            SessionClosed,
+            ProviderFailed,
+            HostRefused,
+        ]
+        .into_iter()
+        .map(|outcome| plan_end(outcome).word())
+        .collect();
+        assert_eq!(
+            words,
+            ["approved", "kept_planning", "other", "other", "other", "other", "other"]
+        );
+        assert_eq!(
+            plan_entry(&plan_record(plan_settled(Approved), Some("toolu"))),
+            Some(Entry::Plan {
+                id: "toolu".into(),
+                key: PlanKey {
+                    plan_sha256: "abc123".into(),
+                    end: PlanEnd::Approved
+                },
+            })
+        );
+        let by_interaction = plan_entry(&plan_record(plan_settled(KeptPlanning), None));
+        assert!(matches!(by_interaction, Some(Entry::Plan { id, .. }) if id == "interaction"));
+        assert_eq!(plan_entry(&plan_record(PlanState::Waiting, Some("toolu"))), None);
+        assert_eq!(plan_entry(&plan_record(PlanState::Answering, Some("toolu"))), None);
     }
 
     #[test]

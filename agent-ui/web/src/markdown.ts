@@ -290,32 +290,40 @@ function markHiddenInCode(html: string): string {
 }
 
 /** Sanitized code may contain entity-decoded characters or nested markup. Replace only text nodes,
- *  using fixed spans and text children, so revealing a character cannot introduce active HTML. */
-function revealCodeText(fragment: DocumentFragment): void {
+ *  using fixed spans and text children, so revealing a character cannot introduce active HTML. Text nodes are read
+ *  after the HTML parser decoded every character reference, so `&#x202e;` and `&rlm;` count as what they become.
+ *  `everywhere` also reveals prose (`proseHiddenAt`). Returns how many characters it found; past `cap` it changes
+ *  nothing. */
+function revealCodeText(fragment: DocumentFragment, everywhere = false, cap = Infinity): number {
   const walker = document.createTreeWalker(fragment, NodeFilter.SHOW_TEXT);
-  const texts: Text[] = [];
+  const found: { node: Text; chars: string[]; at: number[] }[] = [];
+  let count = 0;
   while (walker.nextNode()) {
-    if (walker.currentNode.parentElement?.closest("code, pre, kbd, samp, tt")) texts.push(walker.currentNode as Text);
+    const node = walker.currentNode as Text;
+    const inCode = node.parentElement?.closest("code, pre, kbd, samp, tt") != null;
+    if (!inCode && !everywhere) continue;
+    const chars = [...node.data];
+    const at = inCode ? codeHiddenAt(chars) : proseHiddenAt(chars);
+    if (at.length === 0) continue;
+    found.push({ node, chars, at });
+    count += at.length;
   }
-  for (const node of texts) {
+  if (count > cap) return count;
+  for (const { node, chars, at } of found) {
     const parts = document.createDocumentFragment();
-    let plain = "";
-    let marked = false;
-    for (const ch of node.data) {
-      if (!isHiddenChar(ch)) { plain += ch; continue; }
-      parts.append(document.createTextNode(plain));
-      plain = "";
+    let from = 0;
+    for (const i of at) {
+      parts.append(document.createTextNode(chars.slice(from, i).join("")));
       const span = document.createElement("span");
       span.className = "code-escape";
-      span.textContent = escapeText(ch);
+      span.textContent = escapeText(chars[i]);
       parts.append(span);
-      marked = true;
+      from = i + 1;
     }
-    if (marked) {
-      parts.append(document.createTextNode(plain));
-      node.replaceWith(parts);
-    }
+    parts.append(document.createTextNode(chars.slice(from).join("")));
+    node.replaceWith(parts);
   }
+  return count;
 }
 
 function escapeHtml(text: string): string {
@@ -402,6 +410,84 @@ export function renderMarkdown(text: string): string {
     cache.set(text, html);
     cacheChars += chars;
   }
+  return html;
+}
+
+/** In prose, every character `revealHidden` escapes (controls, format and bidi characters, every default-ignorable
+ *  code point, the blank-rendering fillers and variation selectors) except two kinds that are how text is written,
+ *  not a disguise: the spaces other than the plain one (`\p{Zs}`: a no-break space draws as a space), and the parts
+ *  of an emoji (`proseHiddenAt`). Code keeps the full set (`isHiddenChar`). */
+const SPACE = /\p{Zs}/u;
+/** What a presentation selector (U+FE0E text, U+FE0F emoji) may follow and stay: a character with an emoji form. */
+const EMOJI = /\p{Emoji}/u;
+/** What may come right before a joiner of an emoji ZWJ sequence: an emoji, its presentation selector or its skin tone. */
+const BEFORE_JOINER = /[\p{Extended_Pictographic}\uFE0F\u{1F3FB}-\u{1F3FF}]/u;
+const PICTOGRAPH = /\p{Extended_Pictographic}/u;
+/** The tag characters that stay unescaped: the tag specs and CANCEL TAG of the recommended subdivision flags, each
+ *  after U+1F3F4 BLACK FLAG. An emoji tag sequence (UTS #51 ED-14a) is a base, one or more tag characters from
+ *  U+E0020 to U+E007E and U+E007F CANCEL TAG; the only ones Unicode defines as valid are flags of a subdivision
+ *  (U+1F3F4, a CLDR subdivision id spelled in tag lowercase letters and digits, CANCEL TAG), and of those only
+ *  England, Scotland and Wales are recommended for interchange. Any other spelling, even a valid subdivision such
+ *  as `usca`, draws as a plain black flag in most fonts while its tags carry up to seven letters no one sees, so
+ *  it is revealed: a run after another emoji, a run with no CANCEL TAG, a longer run, tags that are not lowercase
+ *  letters or digits. */
+const FLAG_TAGS = ["gbeng", "gbsct", "gbwls"].map((code) => [
+  ...[...code].map((c) => String.fromCodePoint(0xe0000 + c.charCodeAt(0))),
+  "\u{E007F}",
+]);
+
+/** The indexes in `chars` of the characters code reveals: all that `revealHidden` escapes. */
+function codeHiddenAt(chars: string[]): number[] {
+  const at: number[] = [];
+  for (let i = 0; i < chars.length; i++) if (isHiddenChar(chars[i])) at.push(i);
+  return at;
+}
+
+/** The indexes in `chars` (one text node's code points) of the characters prose reveals, in one pass. A joiner
+ *  stays only between an emoji and the emoji it joins, a presentation selector only right after a character with an
+ *  emoji form, a tag character only inside a recommended flag. */
+function proseHiddenAt(chars: string[]): number[] {
+  const at: number[] = [];
+  for (let i = 0; i < chars.length; i++) {
+    const ch = chars[i];
+    if (ch === "\u{1F3F4}") {
+      const tags = FLAG_TAGS.find((flag) => flag.every((tag, k) => chars[i + 1 + k] === tag));
+      if (tags !== undefined) i += tags.length;
+      continue;
+    }
+    if (!isHiddenChar(ch) || SPACE.test(ch)) continue;
+    if (ch === "\u200D" && i > 0 && BEFORE_JOINER.test(chars[i - 1]) && PICTOGRAPH.test(chars[i + 1] ?? "")) continue;
+    if ((ch === "\uFE0E" || ch === "\uFE0F") && i > 0 && EMOJI.test(chars[i - 1])) continue;
+    at.push(i);
+  }
+  return at;
+}
+
+/** At most this many characters are drawn as escapes in a plan's prose; past it the plan is not drawn as
+ *  Markdown at all (`renderMarkdownRevealed` returns `null`) and its reader shows it as escaped plain text. */
+export const MAX_PROSE_ESCAPES = 4_000;
+const revealed = new Map<string, string | null>();
+
+/** `renderMarkdown(text)` with the characters that disguise prose (`proseHiddenAt`) drawn as outlined escapes outside
+ *  code too: for text a person approves (Claude's plan), where a bidi control or a zero-width character in a sentence
+ *  could make it read as something it does not say. The sanitized HTML is parsed into an inert template and only
+ *  its text nodes change, with fixed spans and text children, so revealing a character cannot introduce active
+ *  HTML. They are found in the parsed text, not in `text`: markdown leaves a character reference (`&#x202e;`, `&rlm;`)
+ *  for the HTML parser to decode, so a plan can hold none of them literally and still draw them. `null` when the
+ *  page would hold more than `MAX_PROSE_ESCAPES` escapes, counting the ones code already drew (`draw` reveals code
+ *  before this sees it). Kept for the last few plans, so a render of the dock does not draw it again. */
+export function renderMarkdownRevealed(text: string): string | null {
+  const held = revealed.get(text);
+  if (held !== undefined) return held;
+  let html: string | null = renderMarkdown(text);
+  const template = document.createElement("template");
+  template.innerHTML = html;
+  const drawn = template.content.querySelectorAll(".code-escape").length;
+  const count = revealCodeText(template.content, true, MAX_PROSE_ESCAPES - drawn);
+  if (drawn + count > MAX_PROSE_ESCAPES) html = null;
+  else if (count > 0) html = template.innerHTML;
+  if (revealed.size >= 8) revealed.delete(revealed.keys().next().value as string);
+  revealed.set(text, html);
   return html;
 }
 

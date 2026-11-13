@@ -651,7 +651,7 @@ fi
 # same directory.
 if [[ ${#SHELL_ARGS[@]} -eq 0 && ${#BEFORE[@]} -gt 0 ]]; then
 	case "${BEFORE[0]}" in
-		open | panel | split | page | agents | remote | run-guard | linked-window | choose-project) BEFORE[0]="./${BEFORE[0]}" ;;
+		open | panel | split | page | agents | remote | run-guard | linked-window | choose-project | attachment-decoder) BEFORE[0]="./${BEFORE[0]}" ;;
 	esac
 fi
 if [[ -n "$SAW_DASHES" ]]; then

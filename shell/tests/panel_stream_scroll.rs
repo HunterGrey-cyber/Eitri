@@ -2871,6 +2871,8 @@ fn trace_dir() -> PathBuf {
 fn sole_tab_envelope(sole_tab: eitri_core::tabs::TabId) -> String {
     let tabs = vec![TabView {
         question_draft: Default::default(),
+        plan_feedback_draft: Default::default(),
+        plan_on_start: false,
         id: sole_tab,
         number: 1,
         label: "1".into(),

@@ -2762,3 +2762,19 @@ describe("MessageList keeps a parked reader's place across a width change", () =
     expect(geo.scrollTop).toBe(list.scrollHeight - geo.height);
   });
 });
+
+it.each(["look at these", ""])("prompt %j shows image metadata as a muted text line", (text) => {
+  const attachments = [
+    { mediaType: "image/png", width: 1280, height: 720, bytes: 100 },
+    { mediaType: "image/jpeg", width: 800, height: 600, bytes: 200 },
+  ];
+  const { container } = render(<MessageList state={state({ userPrompts: [{ seq: 1, text, attachments }] })}
+    sessionEnded={false} expanded={{}} cursor={-1} onAnswerPermission={vi.fn()} />);
+  const row = container.querySelector(".row-prompt")!;
+  expect(row.textContent).toContain("[2 images: PNG 1280×720, JPEG 800×600]");
+  expect(row.querySelector(".prompt-images")?.textContent).toBe("[2 images: PNG 1280×720, JPEG 800×600]");
+  expect(row.querySelector("img")).toBeNull();
+  expect(buildTimeline(state({ userPrompts: [{ seq: 1, text, attachments }] }))[0]).toMatchObject({
+    text: [text, "[2 images: PNG 1280×720, JPEG 800×600]"].filter(Boolean).join("\n"),
+  });
+});

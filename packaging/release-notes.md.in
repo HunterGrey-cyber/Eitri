@@ -73,6 +73,25 @@ you. Your Neovim stays the editor: a real `nvim --embed` with your own `init.lua
 - This starts with this release: 0.3.0 cannot take updates. After a `.deb` or `.rpm` upgrade run `eitri setup` once
   before `eitri sidecar update`, since the update needs the bundled sidecar built behind it.
 
+**Plan mode and images in Claude tabs**
+
+- Plan mode: `/plan` or `<leader>p` on an idle Claude tab, or on a new one before its first message. Claude reads and
+  plans, and its plan comes up in a box in place of the message box with four choices: Keep planning (with optional
+  feedback for Claude), Approve (Manual), Approve (Auto), and, only when plan mode started from Bypass, Approve and keep
+  Bypass. The band shows `⏸ plan · from <mode>` while the tab plans. Claude can also enter plan mode by itself.
+- While Claude Code plans, Eitri approves no file edit or command by itself, in any mode, Bypass included: Claude Code
+  writes its own plan file, and every other `Write`, `Edit`, `NotebookEdit` or `Bash` call is a card. Only your choice
+  in the plan box settles a plan; bypass, the card keys and saved rules never do.
+- Images: paste an image into the box (`Ctrl+V`) or drop image files onto the conversation. PNG, JPEG, GIF (its first
+  frame) and WebP; an image over 1568 pixels on its long side or 1.15 megapixels is scaled down to fit. The bundled
+  agent backend takes up to 8 images and 3.5 MB of them in one message, and a draft holds up to those 8. A message with
+  images always goes as a turn of its own, never into a running one, and never with a slash command or a `!` line.
+- Claude Code keeps the images you send in the session file it writes on disk; Eitri does not remove them. After
+  16 MB of images a tab says once that the conversation is heavy.
+- Known limits: plan mode supervises Claude and is not a sandbox (your hooks still run, and MCP servers stay loaded);
+  images are decoded in a separate process under memory and time limits, as you, not in a sandbox, and need Linux
+  5.11 or newer. Codex and ACP tabs have neither plan mode nor images. Details in the known issues.
+
 **Fixed**
 
 - An idle Claude session's sidecar no longer grows. In 0.3.0 each one grew 30 to 47 MB an hour for as long as the tab
@@ -93,6 +112,12 @@ you. Your Neovim stays the editor: a real `nvim --embed` with your own `init.lua
   the startup message names the key and what holds it.
 - **On sway or i3 with Alt as `$mod`, the Alt keys after the prefix move to Ctrl+Alt** unless your `init.lua` touches
   any of them.
+- **In a Bypass tab, the calls of a dynamic workflow's agents are now cards.** Claude Code does not show Eitri those
+  calls start, so Eitri cannot tell whether one was made in plan mode; it waits 2 seconds and shows a card. In Manual
+  and Auto tabs the same applies to their file edits and commands that a saved rule or Claude Code's auto mode would
+  have handled. Every file edit and command, and in Bypass every call, now waits until Eitri sees Claude Code start
+  it, usually about 0.2 seconds.
+- **A bare `/plan` no longer goes to Claude Code as a message.** It switches plan mode in Eitri.
 - **In companion mode on Hyprland, a key at a real edge now stops there.** Hyprland's own move picks a window even when
   nothing lies that way, so `Ctrl+k` and `Ctrl+j` could leave for the panel. Windows that overlap are still left to it.
 
@@ -327,6 +352,17 @@ subagents, compaction, a message steered into a running turn, `/clear`, a schedu
 question box, where an answer typed through an input method was sent. Restoring a resumed conversation was also
 compared with real Claude Code session files. Steering was seen on a screen only in a Claude Code tab, and typing
 through an input method into the companion panel, in its message box or its question box, has not been verified.
+
+Plan mode and image attachments were tested with the real Claude Code 2.1.311 against a scripted stand-in for the
+model service, end to end through Eitri's agent host: an approval into each of the three modes, keep planning with
+feedback and a second plan, entering and leaving plan mode yourself, interrupting or closing the tab while a plan
+waits, file edits and commands while Claude plans, and turns with one or four images, images alone and images queued
+behind a running turn. The plan box and the image chips were then driven by keys in the isolated, headless session,
+in dark and light, at a normal width, at a 320-pixel chat pane and in a full-width companion panel: all three
+approvals, keep planning, a plan waiting through an interrupt, a closed tab, a stopped agent backend and a page reload,
+a hostile plan drawn inert, pasted and dropped images, their errors, and images queued, taken back and carried across a
+tab switch and a reload. Nobody has looked at those screens on a real desktop, no real model has planned or read an
+image on this backend, and no other version of Claude Code was tried.
 
 None of 0.3.0 has been through real hardware and a person's hands yet, so it is not yet stable enough for everyday
 use. That waits for real hardware and a week of daily use, not for a version number; reports from real desktops

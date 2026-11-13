@@ -73,7 +73,9 @@ import { initialPageModel, pageModel, withoutHint } from "./page_model";
 import type { CommandRecord, PageModel } from "./page_model";
 import { pruneCardViews, pruneTabEntries } from "./pageLookups";
 import type { CardView } from "./pageLookups";
-import { installDispatch, installRemoteDesk, postToRust, nextMirrorId, nextRequestId } from "./bridge";
+import { installDispatch, installRemoteDesk, postForResult, postToRust, nextMirrorId, nextRequestId } from "./bridge";
+import { cancelImport, importBlob, ImportRefused } from "./attachments";
+import type { ComposerImages } from "./components/Composer";
 import type { OutboundMessage, PanelKeysMode, PermissionDecision } from "./bridge";
 import { noteUserScroll, resumeFollowing, watchUserScroll } from "./follow";
 import {
@@ -169,6 +171,9 @@ import type { TabViewState } from "./tabs";
 import { EmptyTab } from "./components/EmptyTab";
 import type { NavKeyRequest } from "./components/EmptyTab";
 import { QuestionDock } from "./components/QuestionDock";
+import { PlanDock } from "./components/PlanDock";
+import type { PlanDockHandle } from "./components/PlanDock";
+import { isPlanModeRefusal, PLAN_UNAVAILABLE, waitingPlan as waitingPlanOf } from "./fold/plans";
 import type { QuestionDockHandle } from "./components/QuestionDock";
 import { Composer } from "./components/Composer";
 import type { RestoredDraft } from "./components/Composer";
@@ -221,11 +226,11 @@ import { RemoteDesk } from "./remoteDesk";
 import type { SlashAction } from "./slashCommands";
 import { barePickerCommand, completionSource, settingCommand } from "./slashCommands";
 import { EFFORT_FROM_SETTINGS, effortPicker, modelPicker, parseEffortReply, parseModelReply, settingsChangedWords } from "./slashPicker";
-import { DRAFT_MIRROR_DELAY_MS, modePill, REFUSED_ECHO_MS, showTabBar } from "./tabs";
+import { DRAFT_MIRROR_DELAY_MS, modePill, planPill, REFUSED_ECHO_MS, showTabBar } from "./tabs";
 import { liveTasks, shortModel, usageSegment } from "./band";
 import { NOTHING_TO_STOP, STOP_TURN_QUESTION, stopAskFor, stopTurnAnswer, workToStop, type StopWork } from "./stopAsk";
 import { latestTurnEnding } from "./turnEnding";
-import type { AgentUiState, DetailRow, PermissionRequestRecord, TabId, TabsEnvelope } from "./types";
+import type { AgentUiState, DetailRow, DraftImage, PermissionRequestRecord, TabId, TabsEnvelope } from "./types";
 import { applyTheme } from "./theme";
 import { applyEditorTyping } from "./typingCadence";
 import { copyToPrimary } from "./primaryCopy";
@@ -275,6 +280,7 @@ export default function App() {
     queue, queueError, queueNote, queueSteers, shellRunning, history, ruleOffers, editorContext, editorLink, scratchEditing,
     review, reviewHints, reviewRecovery, reviewSettings, chooser,
     inputRequest, arriveRequest, permissionRequest, navKey, keymapHelp, pages, heldTrust, confirm, renaming, queueTaken,
+    draftImages,
   } = page;
   const {
     setFatalError, setHandoffRequests, setCommandNotice, setRootNote, setReview, setReviewHints, setChooser,
@@ -297,6 +303,15 @@ export default function App() {
   /** Whether `interaction` still waits for an answer in `tab`, judged from the model as the dispatch left it (ahead
    *  of the render the dock was drawn in). A closed tab's questions are gone with it. A tab switched away from is no
    *  longer this page's state, so its question is taken to wait: the host keeps the draft only if it does. */
+  /** `questionStillWaiting`, for a plan. */
+  function planStillWaiting(tab: TabId, interaction: string): () => boolean {
+    return () => {
+      const page = pageRef.current;
+      if (!page.tabs?.tabs.some((entry) => entry.id === tab)) return false;
+      if (page.tabs.active !== tab) return true;
+      return page.state.plans.some((p) => p.interactionId === interaction && p.state.kind !== "settled");
+    };
+  }
   function questionStillWaiting(tab: TabId, interaction: string): () => boolean {
     return () => {
       const page = pageRef.current;
@@ -374,6 +389,18 @@ export default function App() {
   const [restoredDraft, setRestoredDraft] = useState<RestoredDraft | null>(null);
   /** Monotonic, so two refusals of the same text are two distinct restores. */
   const restoreSeq = useRef(0);
+  /** Draft images a send, a queued message or a removal took from the box before the host answered: not drawn while
+   *  that is in flight, drawn again if it is refused, and forgotten once the host's draft no longer has them. */
+  const [hiddenImages, setHiddenImages] = useState<ReadonlySet<string>>(new Set());
+  /** Images this page is reading, by tab, before the host has named them: drawn as importing and holding Send. */
+  const [readingImages, setReadingImages] = useState<ReadonlyMap<TabId, number>>(new Map());
+  /** One import at a time per tab, in the order the images were pasted or dropped, so their chips keep that order. A
+   *  tab's imports never wait on another tab's. */
+  const importChains = useRef(new Map<TabId, Promise<void>>());
+  /** What the composer says of an image refused before it had a chip (`ComposerImages.notice`). */
+  const [imageNotices, setImageNotices] = useState<ReadonlyMap<TabId, { text: string; seq: number }>>(new Map());
+  /** Cancelled imports keep a failed chip until it is removed, even after the host drops their tokens. */
+  const [failedImages, setFailedImages] = useState<ReadonlyMap<TabId, DraftImage[]>>(new Map());
   /** Bumped only when the `snapshot` arm actually applies a saved view's cursor and expansions. The
    *  scroll-restoring layout effect keys on THIS, not on `state`: `state` also changes on the switch's own reset,
    *  in the same render as `restoreRef.current` is first set, and a `[state]` dependency fired there too --
@@ -409,6 +436,19 @@ export default function App() {
   const waitingQuestions = state.questions.filter((q) => q.state.kind !== "settled").sort((a, b) => a.seq - b.seq);
   const waitingQuestion = waitingQuestions[0];
   const questionIdentity = waitingQuestion ? `${activeTab?.id}:${waitingQuestion.interactionId}` : null;
+  /** Claude's plan, when one waits and no question does: a question asked first keeps the composer's slot until it
+   *  settles. Only the tab on screen offers one, so only a plan a person can see is ever decided here. */
+  const planDock = useRef<PlanDockHandle>(null);
+  const waitingPlan = waitingQuestion ? undefined : waitingPlanOf(state);
+  // The digest too: a plan replayed under the same id with other text is a new arrival, guard and all.
+  const planIdentity = waitingPlan ? `${activeTab?.id}:plan:${waitingPlan.interactionId}:${waitingPlan.planSha256}` : null;
+  /** Whichever dock has the composer's slot: while one does, INPUT is the dock's. */
+  const dockIdentity = questionIdentity ?? planIdentity;
+  const docked = dockIdentity !== null;
+  function focusDock() {
+    if (waitingQuestion) questionDock.current?.focus();
+    else planDock.current?.focus();
+  }
   const questionArrival = useRef({ identity: null as string | null, at: 0, held: new Set<string>() });
   const questionHeld = useRef(new Set<string>());
   /** Whether the key being handled belongs to an unbroken run that began at an arrival (`noteArrival`): each key
@@ -440,13 +480,13 @@ export default function App() {
   }, []);
   useLayoutEffect(() => {
     const composer = containerRef.current?.querySelector<HTMLElement>(".composer");
-    if (composer) composer.hidden = questionIdentity !== null;
+    if (composer) composer.hidden = dockIdentity !== null;
     const previous = questionArrival.current.identity;
-    if (previous === questionIdentity) return;
-    questionArrival.current = { identity: questionIdentity, at: performance.now(), held: new Set(questionHeld.current) };
-    if (questionIdentity !== null && mode === "input") questionDock.current?.focus();
-    else if (previous !== null && questionIdentity === null && mode === "input") setComposerFocusRequest((n) => n + 1);
-  }, [questionIdentity, sessionStarted]);
+    if (previous === dockIdentity) return;
+    questionArrival.current = { identity: dockIdentity, at: performance.now(), held: new Set(questionHeld.current) };
+    if (dockIdentity !== null && mode === "input") focusDock();
+    else if (previous !== null && dockIdentity === null && mode === "input") setComposerFocusRequest((n) => n + 1);
+  }, [dockIdentity, sessionStarted]);
   function questionBlocked() {
     return performance.now() - questionArrival.current.at < 250 || questionArrival.current.held.size > 0 || arrivalRunRef.current;
   }
@@ -1100,6 +1140,9 @@ export default function App() {
       case "remote.devices":
         if (!remoteDesk.openList()) showFlash("remote control is off in this window");
         break;
+      case "plan.toggle":
+        togglePlan();
+        break;
       case "mode.cycle":
         // Disabled in the box once the tab is fixed (`modeFixed`, `leader.ts`'s own `boxEntries` doc
         // comment): cycling makes no sense any more, so this flashes rather than posting. Routed
@@ -1137,7 +1180,7 @@ export default function App() {
    *  `resolveKey` at all) and by the handful of places that must force it shut: the session ending,
    *  the start screen coming back, and a HINT starting elsewhere in the window. */
   const [keymapOpen, setKeymapOpen] = useState(false);
-  const [keymapSection, setKeymapSection] = useState<"browse" | "input" | "selecting" | "question" | "card">("browse");
+  const [keymapSection, setKeymapSection] = useState<"browse" | "input" | "selecting" | "question" | "plan" | "card">("browse");
   function openKeymap(section: typeof keymapSection) {
     keymapOpening.current = null;
     keymapClosedByKey.current = false;
@@ -1439,7 +1482,34 @@ export default function App() {
       case "pointer":
         showFlash(action.text);
         break;
+      case "plan":
+        togglePlan();
+        break;
     }
+  }
+  /** Whether `<leader>p` and `/plan` can do anything on the tab on screen: a session that took up plan mode, or a
+   *  Claude tab with no session yet in a sidecar window, which is then asked to start in plan mode. */
+  function planOffered(): boolean {
+    const info = activeTabInfo(tabsRef.current);
+    if (info === null || isExternalAgent(info.agent)) return false;
+    if (info.state === "not_started") return pageRef.current.hello?.backend === "sidecar";
+    return stateRef.current.capabilities.planMode === true;
+  }
+  /** `<leader>p` and `/plan`: the person's own move into plan mode, or out of it while the tab plans. The host decides
+   *  whether it may happen now (only on an idle tab) and says why not; the CLI's own report confirms the move. */
+  function togglePlan() {
+    const info = activeTabInfo(tabsRef.current);
+    const tab = activeTabRef.current;
+    if (info === null || tab === null) return;
+    if (!planOffered()) {
+      showFlash(PLAN_UNAVAILABLE);
+      return;
+    }
+    const enter = info.state === "not_started" ? info.planOnStart !== true
+      : (stateRef.current.planning?.phase ?? "executing") === "executing";
+    const requestId = nextRequestId();
+    trackRequest(requestId, { kind: "plan", tab });
+    postToRust({ type: "set_planning", request_id: requestId, tab, enter });
   }
   function openTasksOverlay(workflows = false, taskId: string | null = null) {
     endKeyPrompts();
@@ -1629,11 +1699,11 @@ export default function App() {
     exLine !== null ||
     review !== null;
   useEffect(() => {
-    if (waitingQuestion && mode === "input" && paneFocused && !overlayOpen && confirm === null) {
+    if (docked && mode === "input" && paneFocused && !overlayOpen && confirm === null) {
       const focused = document.activeElement;
-      if (!focused?.closest(".question-dock, .permission-card")) questionDock.current?.focus();
+      if (!focused?.closest(".question-dock, .plan-dock, .permission-card")) focusDock();
     }
-  }, [questionIdentity, mode, paneFocused, overlayOpen, confirm]);
+  }, [dockIdentity, mode, paneFocused, overlayOpen, confirm]);
   /** For the document replay (installed once): see its note on the empty layout. */
   const overlayOpenRef = useRef(overlayOpen);
   overlayOpenRef.current = overlayOpen;
@@ -2152,7 +2222,8 @@ export default function App() {
         showFlash(cancelledByTab ?? SHIFT_TAB_IN_CARD_FLASH);
         return;
       }
-      if (event.target instanceof Element && event.target.closest(".question-dock")) return;
+      // A dock's own Shift+Tab moves within it (the previous question, the previous plan action).
+      if (event.target instanceof Element && event.target.closest(".question-dock, .plan-dock")) return;
       event.preventDefault();
       // The composer's `Ctrl+x` waiting for its second key: Shift+Tab is that key, so it ends the chord as any
       // key but Enter does, and the mode stays as it is.
@@ -2351,6 +2422,18 @@ export default function App() {
   /** The session is gone (lost or closed). Read before the start-screen branch below, because the
    *  effect under it is a hook and cannot live after a conditional return. */
   const sessionEnded = state.status.kind === "unavailable" || state.status.kind === "closed";
+  /** The composer's images: the host's draft less what a send, a queued message or a removal took meanwhile. */
+  const failures = failedImages.get(tabs?.active ?? -1) ?? [];
+  const composerImages: ComposerImages = {
+    items: [...draftImages.items.filter((item) => !failures.some((failed) => failed.attachmentId === item.attachmentId)), ...failures]
+      .filter((item) => !hiddenImages.has(item.attachmentId)),
+    pending: tabs === null ? 0 : (readingImages.get(tabs.active) ?? 0),
+    imageInput: draftImages.imageInput,
+    why: draftImages.why,
+    onFiles: addImageFiles,
+    onRemove: removeImage,
+    notice: imageNotices.get(tabs?.active ?? -1) ?? null,
+  };
   useEffect(() => {
     const edit = editReturnRef.current;
     if (edit === null) return;
@@ -2843,6 +2926,8 @@ export default function App() {
         return;
       }
       if (questionDock.current?.reply(payload)) return;
+      if (planDock.current?.reply(payload)) return;
+      if (payload.kind === "plan_waiting") return;
       if (payload.kind === "question_other_edited") return;
       if ((payload.kind === "task_output_result" || payload.kind === "command_result") && taskRequests.current.has(payload.requestId)) {
         const tab = taskRequests.current.get(payload.requestId);
@@ -3381,6 +3466,8 @@ export default function App() {
               // A refused send never started a turn, so a picker it armed must not wait to be matched against
               // some later, unrelated reply -- whichever tab the refusal names, since the flag is not per tab.
               pendingSlashPickerRef.current = null;
+              // Its images are still the draft's: the host leaves them there when it refuses a message.
+              showImages(record.attachments ?? []);
               if (record.tab === activeTabRef.current) {
                 // The composer cleared this optimistically; Rust refused it, so it goes back. `draftRef` names
                 // exactly what the box holds now: if nothing was typed since the clear the refused text comes back
@@ -3394,7 +3481,7 @@ export default function App() {
                 mirrorDraft(recovered);
                 refusedEchoRef.current = { tab: record.tab, requestId: payload.requestId, at: performance.now() };
               }
-            } else if (record?.kind === "history" || record?.kind === "editor" || record?.kind === "link" || record?.kind === "tabnew" || record?.kind === "stop-background" || record?.kind === "follow" || record?.kind === "reset") {
+            } else if (record?.kind === "history" || record?.kind === "editor" || record?.kind === "link" || record?.kind === "tabnew" || record?.kind === "stop-background" || record?.kind === "follow" || record?.kind === "reset" || record?.kind === "plan" || (record?.kind === "mode" && isPlanModeRefusal(payload.error))) {
               // A footer nicety, not the banner reserved for conversation-breaking errors.
               showFlash(payload.error);
             } else {
@@ -3477,6 +3564,13 @@ export default function App() {
           showFlash(revealedText(payload.text));
           break;
         }
+        case "draft_attachments": {
+          // An image the host's draft no longer has went with its message or was removed: nothing waits on it.
+          const kept = new Set(payload.attachments.map((item) => item.attachmentId));
+          setHiddenImages((prev) => (prev.size === 0 ? prev : new Set([...prev].filter((id) => kept.has(id)))));
+          if (payload.note !== undefined) sayOfImages(payload.note, payload.tab);
+          break;
+        }
         case "view_export": {
           // A move to the other window takes this tab: its view goes with it, read from the live list when it is
           // the tab on screen, else the one a switch parked.
@@ -3487,7 +3581,7 @@ export default function App() {
           // debounce goes ahead of the answer: the tab freezes once the answer is in, and a mirror sent after that
           // reaches a tab that is no longer this window's, so the other window would get it without that edit.
           flushDraft();
-          if (payload.tab === activeTabRef.current) questionDock.current?.flush();
+          if (payload.tab === activeTabRef.current) { questionDock.current?.flush(); planDock.current?.flush(); }
           postToRust({ type: "view_exported", request_id: nextRequestId(), request: payload.request, view });
           break;
         }
@@ -3769,6 +3863,8 @@ export default function App() {
       trackRequest(requestId, { kind: "editor", tab });
     }
     if (message.type === "toggle_following") trackRequest(requestId, { kind: "follow", tab });
+    // A cycle refused because plan mode holds the tab is said where the key was pressed (`isPlanModeRefusal`).
+    if (message.type === "cycle_mode") trackRequest(requestId, { kind: "mode", tab });
     postToRust({ ...message, request_id: requestId, tab } as unknown as OutboundMessage);
   }
 
@@ -3797,9 +3893,10 @@ export default function App() {
    *  here rather than restoring the composer's own send path -- see `inFlight`'s own doc comment on
    *  `"picker-send"` for why the two need different refusal handling even though both post the same
    *  `send_message`. */
-  function sendMessage(text: string, options?: { fromPicker?: boolean }) {
+  function sendMessage(text: string, options?: { fromPicker?: boolean; attachments?: string[] }) {
     const tab = activeTabRef.current;
     if (tab === null) return;
+    const attachments = options?.attachments ?? [];
     // A bare command is a question about the session, which it can answer with no turn, so nothing is queued.
     const bare = options?.fromPicker ? null : barePickerCommand(text);
     if (bare !== null && picksDirectly()) {
@@ -3812,7 +3909,10 @@ export default function App() {
     // The text is kept so a refusal can put it back (ordinary sends only -- `"picker-send"`'s own
     // refusal never reads `record.text` back into the box). Dropped again as soon as the reply
     // arrives.
-    trackRequest(requestId, { kind: options?.fromPicker ? "picker-send" : "send", tab, text });
+    trackRequest(requestId, {
+      kind: options?.fromPicker ? "picker-send" : "send", tab, text, ...(attachments.length > 0 ? { attachments } : {}),
+    });
+    hideImages(attachments);
     setCommandNotice(null);
     // Arms `pendingSlashPickerRef` for the `events` handler above. Set
     // optimistically, before the post is even answered; the `command_result` handler below clears
@@ -3822,7 +3922,7 @@ export default function App() {
     // two.
     // Another agent's tab gets a leading `/` as typed, and no picker: `/model` and `/effort` are Claude's.
     pendingSlashPickerRef.current = isExternalAgent(activeTabInfo(tabsRef.current)?.agent) ? null : barePickerCommand(text);
-    postToRust({ type: "send_message", request_id: requestId, tab, text });
+    postToRust({ type: "send_message", request_id: requestId, tab, text, ...(attachments.length > 0 ? { attachments } : {}) });
     // Rust clears the tab's stored draft at any send. This one never touched the box, so what the box holds is
     // mirrored again, or a tab switch would come back to an empty box.
     if (options?.fromPicker && draftRef.current !== "") mirrorDraft(draftRef.current);
@@ -3991,7 +4091,7 @@ export default function App() {
    *  twice. Rust saves a `send_now`'s text to history before either outcome, so `↑` recovers it. */
   /** `afterTurn` (`Ctrl+x Enter`): held for the running turn's end, never put into it, and sent as the next
    *  turn when none runs -- the host decides which, so it is posted whether a turn shows or not. */
-  function queueMessage(text: string, options?: { afterTurn: boolean }) {
+  function queueMessage(text: string, options?: { afterTurn?: boolean; attachments?: string[] }) {
     // Enter during a turn lands here, and a bare command needs no turn at all: this is where it would queue.
     const bare = barePickerCommand(text);
     if (bare !== null && picksDirectly()) {
@@ -4004,12 +4104,13 @@ export default function App() {
     if ((!afterTurn || isAcpAgent(activeTabInfo(tabsRef.current)?.agent)) && settingRunsNow(text)) return;
     const tab = activeTabRef.current;
     if (tab === null) return;
-    queueInto(tab, text, afterTurn);
+    queueInto(tab, text, afterTurn, options?.attachments ?? []);
   }
 
-  function queueInto(tab: TabId, text: string, afterTurn = false) {
+  function queueInto(tab: TabId, text: string, afterTurn = false, attachments: string[] = []) {
     const requestId = nextRequestId();
-    trackRequest(requestId, { kind: "send", tab, text });
+    trackRequest(requestId, { kind: "send", tab, text, ...(attachments.length > 0 ? { attachments } : {}) });
+    hideImages(attachments);
     setCommandNotice(null);
     postToRust({
       type: "queue_message",
@@ -4018,7 +4119,85 @@ export default function App() {
       text,
       turn_id: stateRef.current.activeTurnId,
       ...(afterTurn ? { after_turn: true } : {}),
+      ...(attachments.length > 0 ? { attachments } : {}),
     });
+  }
+
+  /** Takes `ids` off the composer until the host answers what took them (`showImages` puts them back). */
+  function hideImages(ids: readonly string[]) {
+    if (ids.length === 0) return;
+    setHiddenImages((prev) => new Set([...prev, ...ids]));
+  }
+
+  function showImages(ids: readonly string[]) {
+    if (ids.length === 0) return;
+    setHiddenImages((prev) => new Set([...prev].filter((id) => !ids.includes(id))));
+  }
+
+  /** Pasted image files keep the tab and generation of their paste as they import in order. A refusal stays with
+   *  that tab: before a token it is a notice, and after one it is a failed chip. */
+  function addImageFiles(files: readonly File[]) {
+    const tab = activeTabRef.current;
+    if (tab === null) return;
+    const generation = pageRef.current.draftImages.generation;
+    const reading = (by: number) =>
+      setReadingImages((prev) => new Map(prev).set(tab, Math.max(0, (prev.get(tab) ?? 0) + by)));
+    for (const file of files) {
+      reading(1);
+      let counted = true;
+      const done = () => {
+        if (counted) reading(-1);
+        counted = false;
+      };
+      const chain = (importChains.current.get(tab) ?? Promise.resolve()).then(async () => {
+        try {
+          await importBlob(tab, generation, file, file.name || "image", {
+            onBegun: done,
+            onFailed: (attachmentId, reason) => setFailedImages((prev) => new Map(prev).set(tab, [
+              ...(prev.get(tab) ?? []), { attachmentId, name: file.name || "image", state: "failed", reason },
+            ])),
+          });
+        } catch (error) {
+          if (error instanceof ImportRefused && error.stage === "begin") {
+            sayOfImages(error.message, tab);
+          } else if (!(error instanceof ImportRefused)) {
+            console.warn("agent-ui: an image could not be read", error);
+            sayOfImages("the image could not be read", tab);
+          }
+        } finally {
+          done();
+        }
+      });
+      importChains.current.set(tab, chain);
+      // A tab's chain that has run out is forgotten, so a closed tab leaves nothing behind.
+      void chain.then(() => {
+        if (importChains.current.get(tab) === chain) importChains.current.delete(tab);
+      });
+    }
+  }
+
+  /** `x` on a chip, its `×`, or Backspace at the start of the box: an import still sending stops, any other image is
+   *  taken out of the draft. Refused (the image goes with a message waiting to be sent), it comes back with why. */
+  function removeImage(id: string) {
+    const tab = activeTabRef.current;
+    if (tab === null) return;
+    hideImages([id]);
+    if (failedImages.get(tab)?.some((item) => item.attachmentId === id)) {
+      setFailedImages((prev) => new Map(prev).set(tab, (prev.get(tab) ?? []).filter((item) => item.attachmentId !== id)));
+      return;
+    }
+    if (cancelImport(tab, id)) return;
+    void postForResult({ type: "attach_remove", request_id: nextRequestId(), tab, attachment_id: id }).then((answer) => {
+      if (answer.ok) return;
+      showImages([id]);
+      if (activeTabRef.current === tab) sayOfImages(answer.error);
+    });
+  }
+
+  /** The host's words on an image, said at the composer with their hidden characters shown. */
+  function sayOfImages(text: string, tab = activeTabRef.current) {
+    if (tab === null) return;
+    setImageNotices((prev) => new Map(prev).set(tab, { text: revealedText(text), seq: (prev.get(tab)?.seq ?? 0) + 1 }));
   }
 
   function interrupt() {
@@ -5244,10 +5423,11 @@ export default function App() {
               onRunShell={runShell}
               atPaths={atPaths}
               onAtQuery={askAtPaths}
-              onSend={(text) => {
+              onSend={(text, attachments) => {
                 setMode("input");
-                sendMessage(text);
+                sendMessage(text, attachments === undefined ? undefined : { attachments });
               }}
+              images={composerImages}
               onResume={(id) => post({ type: "resume", provider_session_id: id })}
               onRestoreLast={() => post({ type: "restore_last" })}
               onCycleMode={() => post({ type: "cycle_mode" })}
@@ -5260,9 +5440,9 @@ export default function App() {
               onChooseSessions={() => postToRust({ type: "tab_verb", request_id: nextRequestId(), verb: "choose" })}
               onDraftChange={mirrorDraft}
               answerConfirm={answerConfirm}
-              onQueue={(text) => {
+              onQueue={(text, options) => {
                 setMode("input");
-                queueMessage(text);
+                queueMessage(text, options);
               }}
               history={history}
               queueCount={heldCount(queue)}
@@ -5293,7 +5473,7 @@ export default function App() {
         <StatusBand
           facts={{
             mode: emptyMode,
-            pill: modePill(activeTab?.mode ?? "auto", true, true),
+            pill: planPill(null, activeTab?.mode ?? "auto", activeTab?.planOnStart === true) ?? modePill(activeTab?.mode ?? "auto", true, true),
             showcmd: null,
             message: bandFlash?.text ?? null,
             prompt: confirmBandPrompt,
@@ -6219,10 +6399,10 @@ export default function App() {
       }
       return;
     }
-    // Card mode from the question dock, whose typed answer is a text field the branch below would leave alone; the
+    // Card mode from a dock, whose typed answer is a text field the branch below would leave alone; the
     // dock leaves Alt chords to the page. INPUT's `Ctrl+y` is claimed there as in the box: it answers nothing, and the
     // band says where cards are answered.
-    if (mode === "input" && event.target instanceof Element && event.target.closest(".question-dock") !== null) {
+    if (mode === "input" && event.target instanceof Element && event.target.closest(".question-dock, .plan-dock") !== null) {
       const delta = cardModeDelta(event.nativeEvent as unknown as KeyLike);
       if (delta !== null) {
         event.preventDefault();
@@ -6408,7 +6588,7 @@ export default function App() {
     // question waiting, the keys are the dock's and go back there.
     if (action.kind === "card-mode") {
       event.preventDefault();
-      const from = mode === "input" ? (waitingQuestion ? "dock" : "input") : "browse";
+      const from = mode === "input" ? (docked ? "dock" : "input") : "browse";
       enterCardByChord(action.delta, typedAt, from, droppedFlash(pending, count, droppedSequence, operator), event.repeat);
       return;
     }
@@ -6557,14 +6737,15 @@ export default function App() {
             const walks =
               count === null &&
               !onCard &&
-              !waitingQuestion &&
+              !docked &&
               !sessionEnded &&
               typingGuard.walkIntoBox(event, typedAt, () => {
                 // A session can end, or a question or a card arrive, inside the wait. An ended session's box takes no
                 // keys, INPUT with a question waiting is its dock, and a new card is where the reader's answer is.
-                const { status, questions, pendingPermissions } = stateRef.current;
+                const { status, questions, plans, pendingPermissions } = stateRef.current;
                 const ended = status.kind === "unavailable" || status.kind === "closed";
-                const asked = questions.some((q) => q.state.kind !== "settled") || pendingPermissions.length > cardsAtPress;
+                const asked = questions.some((q) => q.state.kind !== "settled") || plans.some((p) => p.state.kind !== "settled") ||
+                  pendingPermissions.length > cardsAtPress;
                 if (modeRef.current !== "browse" || ended || asked) return;
                 setMode("input");
                 setComposerCaret("kept");
@@ -6615,7 +6796,7 @@ export default function App() {
         // Entering INPUT (`i`/`o`/`A`) asks `Composer` to place the caret itself, rather than
         // leaving it to whatever a bare `autoFocus` on a freshly re-mounted, non-empty box happens
         // to land on. Leaving BROWSE (`to === "browse"`) carries no caret to place.
-        if (action.to === "input" && !waitingQuestion) {
+        if (action.to === "input" && !docked) {
           setComposerCaret(action.caret);
           setComposerFocusRequest((n) => n + 1);
         }
@@ -6646,6 +6827,12 @@ export default function App() {
         if (!item?.key.startsWith("h:") && waitingQuestion && item?.kind === "message" && item.question?.interactionId === waitingQuestion.interactionId) {
           setMode("input");
           questionDock.current?.focus();
+          break;
+        }
+        // Enter on the waiting plan's row goes to its dock, where it is decided; a settled plan's row unfolds.
+        if (!item?.key.startsWith("h:") && waitingPlan && item?.kind === "plan" && item.plan.interactionId === waitingPlan.interactionId) {
+          setMode("input");
+          planDock.current?.focus();
           break;
         }
         const toolId = item?.kind === "tool" ? item.call.toolUseId : item?.kind === "permission" ? item.request.toolUseId : null;
@@ -7233,7 +7420,7 @@ export default function App() {
    *  to decide between them. */
   const box: { title: string; entries: BoxEntry[] } | null =
     seq !== null
-      ? { title: sequenceTitle(panelTable, seq.typed), entries: boxEntries(panelTable, seq.typed, modeFixed) }
+      ? { title: sequenceTitle(panelTable, seq.typed), entries: boxEntries(panelTable, seq.typed, modeFixed, !planOffered()) }
       : operatorRef.current !== null
         ? {
             title: `y${operatorRef.current.scope ?? operatorRef.current.prefix ?? ""}`,
@@ -7246,7 +7433,7 @@ export default function App() {
         ? {
             // `Ctrl+w`'s own spelling, not tmux's `"C-w"` (`PendingPrefix`'s): the other four are one character.
             title: pendingRef.current === "C-w" ? "Ctrl+w" : pendingRef.current,
-            entries: pendingEntries(panelTable, pendingRef.current, modeFixed),
+            entries: pendingEntries(panelTable, pendingRef.current, modeFixed, !planOffered()),
           }
         : null;
 
@@ -7278,13 +7465,14 @@ export default function App() {
 
         const target = event.target instanceof Element ? event.target : null;
         const questionCovered = overlayOpen || keymapOpen || detail !== null || handoffOpen || pathPick !== null || linkPick !== null || yankPick !== null;
-        if (waitingQuestion && target?.closest(".question-dock") && questionCovered) {
+        if (docked && target?.closest(".question-dock, .plan-dock") && questionCovered) {
           onKeyDown(event);
           event.stopPropagation();
           return;
         }
-        if (waitingQuestion && !questionCovered && mode === "input" && !target?.closest(".permission-card, .question-dock")) {
-          questionDock.current?.key(event);
+        if (docked && !questionCovered && mode === "input" && !target?.closest(".permission-card, .question-dock, .plan-dock")) {
+          if (waitingQuestion) questionDock.current?.key(event);
+          else planDock.current?.key(event);
           if (event.isPropagationStopped()) return;
         }
         onVisualKeyDownCapture(event);
@@ -7594,6 +7782,15 @@ export default function App() {
         onHelp={() => openKeymap("question")}
         stillWaiting={questionStillWaiting(activeTab.id, waitingQuestion.interactionId)}
       />}
+      {waitingPlan && activeTab && <PanelErrorBoundary key={planIdentity} name="plan dock"
+        fallback={() => <div className="plan-dock" role="alert">The plan could not be drawn. It still waits; closing the tab ends it.</div>}><PlanDock
+        ref={planDock} tab={activeTab.id} record={waitingPlan} origin={state.planning?.origin ?? null}
+        draft={activeTab.planFeedbackDraft?.[waitingPlan.interactionId]}
+        active={mode === "input" && paneFocused} blocked={questionBlocked} onActivate={() => setMode("input")}
+        onBrowse={() => { setMode("browse"); containerRef.current?.focus({ preventScroll: true }); }}
+        onHelp={() => openKeymap("plan")} onRefused={showFlash}
+        stillWaiting={planStillWaiting(activeTab.id, waitingPlan.interactionId)}
+      /></PanelErrorBoundary>}
       <Composer
         onSlashAction={runSlashAction}
         // A running turn no longer disables the composer -- it queues a follow-up instead. Only
@@ -7612,7 +7809,7 @@ export default function App() {
         // would take the `Esc` that answers it, and the question owns the keys.
         slashCommands={confirm !== null ? null : completionSource(activeTab?.agent, state.availableCommands)}
         atPaths={atPaths}
-        onAtQuery={confirm !== null || waitingQuestion ? undefined : askAtPaths}
+        onAtQuery={confirm !== null || docked ? undefined : askAtPaths}
         // The raw `inputRequest` used to reach `Composer` directly here, so its own
         // `[focusRequest, mode]` effect (focusing the textarea whenever `mode === "input"`) had no
         // way to know an overlay was drawn over it. `composerFocusRequest` is bumped from the
@@ -7622,9 +7819,10 @@ export default function App() {
         caretOnFocus={composerCaret}
         // Only while the box can take a message: a landing on a disabled textarea could not focus it.
         hintTarget={!(sessionEnded || handingOff)}
-        onModeChange={(next) => { if (!waitingQuestion) setMode(next); }}
-        onSend={sendMessage}
+        onModeChange={(next) => { if (!docked) setMode(next); }}
+        onSend={(text, attachments) => sendMessage(text, attachments === undefined ? undefined : { attachments })}
         onRunShell={runShell}
+        images={composerImages}
         onDraftChange={mirrorDraft}
         running={turnInProgress || shellRunning}
         enterSteers={enterSteers && !shellRunning}
@@ -7762,7 +7960,8 @@ export default function App() {
           mode,
           // `true` for `cycleOffered`: ignored entirely in short form (`modePill`'s own doc
           // comment) -- the capability this used to read is gone.
-          pill: modePill(activeTab?.mode ?? "auto", true, true),
+          // Plan mode shows over the tab's mode while it holds the tab; outside it the pill is as ever.
+          pill: planPill(state.planning, activeTab?.mode ?? "auto") ?? modePill(activeTab?.mode ?? "auto", true, true),
           showcmd: box !== null ? `${box.title}…` : composerChord,
           message: bandFlash?.text ?? null,
           messageLook: bandFlash?.look,
@@ -7774,7 +7973,7 @@ export default function App() {
           unread: unreadLabel,
           cards: allCards(state).length,
           cardMode: bandCard.cardMode,
-          questions: waitingQuestions.length,
+          questions: waitingQuestions.length + (waitingPlanOf(state) ? 1 : 0),
           queued: queue.length,
           context: sessionEnded ? null : contextFact(editorContext),
           // About the window, not the session: an ended session still has an editor beside it.

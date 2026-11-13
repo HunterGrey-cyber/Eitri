@@ -1,12 +1,12 @@
 //! `/clear`: Claude Code starts a new conversation in the same process. The view keeps nothing of the
 //! conversation before it and keeps what the process still holds, since the process goes on: the
 //! session's identity and status, the running turn (the `/clear` turn itself ends after the reset),
-//! cards still waiting for an answer with the calls they ask about, questions still waiting, the
-//! count of commands left running and the roster of background tasks, the account's limits, the CLI's
-//! reported mode and command list, the live band fields, and the bookkeeping held for calls not folded
-//! yet.
+//! cards still waiting for an answer with the calls they ask about, questions and plans still waiting,
+//! the plan phase, the count of commands left running and the roster of background tasks, the account's
+//! limits, the CLI's reported mode and command list, the live band fields, and the bookkeeping held for
+//! calls not folded yet.
 
-use super::{AgentDomainEvent, AgentSessionProjection, CallIndex, QuestionState};
+use super::{AgentDomainEvent, AgentSessionProjection, CallIndex, PlanState, QuestionState};
 
 pub(super) fn fold(state: &mut AgentSessionProjection, event: &AgentDomainEvent) {
     #[cfg(test)]
@@ -42,6 +42,9 @@ pub(super) fn fold(state: &mut AgentSessionProjection, event: &AgentDomainEvent)
         cli_left_auto: _,
         notification: _,
         questions,
+        plans,
+        // The process's: `/clear` leaves the CLI in the mode it was in.
+        planning: _,
         last_turn_end_seq,
         usage,
         assistant_message_open,
@@ -95,6 +98,7 @@ pub(super) fn fold(state: &mut AgentSessionProjection, event: &AgentDomainEvent)
     turn_starts.clear();
     notices.clear();
     questions.retain(|set| !matches!(set.state, QuestionState::Settled { .. }));
+    plans.retain(|plan| !matches!(plan.state, PlanState::Settled { .. }));
     *last_turn_end_seq = None;
     // The figure was the old conversation's context; the next report is the new one's.
     *usage = None;

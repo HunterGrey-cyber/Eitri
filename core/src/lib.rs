@@ -14,6 +14,9 @@ pub mod agent_backend;
 pub mod agent_bridge;
 pub mod agent_prefs;
 pub mod agents;
+// Images are decoded only in a child process set up with Linux-only calls; the macOS host has no decoder yet.
+#[cfg(target_os = "linux")]
+pub mod attachments;
 pub mod attention;
 pub mod buffer_reload;
 pub mod companion;

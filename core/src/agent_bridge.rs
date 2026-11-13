@@ -118,6 +118,9 @@ pub enum InboundMessage {
         #[serde(default)]
         tab: Option<u64>,
         text: String,
+        /// The draft images that go with it, in order, by the tokens the host gave them (`attach_begin`).
+        #[serde(default)]
+        attachments: Vec<String>,
     },
     /// A `!` line the person entered in the composer. The only message that can run a command: no other
     /// path reads a leading `!`.
@@ -267,6 +270,28 @@ pub enum InboundMessage {
         #[serde(default)]
         so_far: Vec<QuestionAnswerWire>,
     },
+    /// The plan dock's decision on Claude's plan `interaction_id`: keep planning (with the person's feedback)
+    /// or approve it into one of the closed set of modes, naming the digest of the plan the person read. Only
+    /// the named fields, and no other, parse ([`PlanResolveMessage`]); gated exactly as a card answer. The one
+    /// message that settles a plan.
+    PlanResolve(PlanResolveMessage),
+    /// `<leader>p` or `/plan`: the person's own move into plan mode (`enter`) or out of it. `enter` has no
+    /// default. Gated as a card answer: leaving plan mode is the end of plan mode's restrictions.
+    SetPlanning {
+        request_id: String,
+        #[serde(default)]
+        tab: Option<u64>,
+        enter: bool,
+    },
+    /// The plan dock's "keep planning" feedback, mirrored as it is typed; it never sends a decision. No
+    /// `command_result` unless it is refused.
+    PlanFeedbackDraft {
+        request_id: String,
+        #[serde(default)]
+        tab: Option<u64>,
+        interaction_id: String,
+        text: String,
+    },
     /// `resume{tab, provider_session_id}` carries the Claude provider session id to continue on the
     /// tab the user was in. `start_session` is removed: a fresh session
     /// on a `NotStarted` tab now starts lazily off `send_message` rather than an explicit message.
@@ -330,6 +355,50 @@ pub enum InboundMessage {
         /// (`TabSet::queue_after_turn`); with no turn running it goes out as the next turn.
         #[serde(default)]
         after_turn: bool,
+        /// Draft images that go with it, as for `send_message`. A message with images is never put into the
+        /// running turn: it waits for the turn's end and goes as its own turn.
+        #[serde(default)]
+        attachments: Vec<String>,
+    },
+    /// A composer image to import into the tab's draft of `generation` (the `draft_attachments` envelope's):
+    /// `byte_length` bytes follow in `attach_chunk`s. `name` is display text only, never a path. Answered, once
+    /// the host has room for it, by a `command_result` whose `attachmentId` names the image from then on.
+    AttachBegin {
+        request_id: String,
+        tab: u64,
+        generation: u64,
+        byte_length: u64,
+        #[serde(default)]
+        name: String,
+    },
+    /// The next bytes of an import, base64, at `offset`, at most 256 KiB decoded, one at a time: the next waits
+    /// for this one's `command_result`.
+    AttachChunk {
+        request_id: String,
+        tab: u64,
+        attachment_id: String,
+        offset: u64,
+        data_b64: String,
+    },
+    /// The import's bytes are all sent; `sha256` is their digest, lowercase hex. The image is then prepared and
+    /// its `attachment_state` says when it is ready, or why it failed.
+    AttachEnd {
+        request_id: String,
+        tab: u64,
+        attachment_id: String,
+        sha256: String,
+    },
+    /// Stops an import under way. Its image leaves the draft.
+    AttachCancel {
+        request_id: String,
+        tab: u64,
+        attachment_id: String,
+    },
+    /// Takes an image out of the draft.
+    AttachRemove {
+        request_id: String,
+        tab: u64,
+        attachment_id: String,
     },
     /// `↑` on the box's first line with a queue: the whole queue back, as `queue_taken`.
     TakeBackQueue {
@@ -832,7 +901,12 @@ impl InboundMessage {
             // These name their tab as a plain number: a message without one does not parse.
             InboundMessage::TrustAnswer { tab, .. }
             | InboundMessage::TrustCancel { tab, .. }
-            | InboundMessage::EditorSymbol { tab, .. } => Some(*tab),
+            | InboundMessage::EditorSymbol { tab, .. }
+            | InboundMessage::AttachBegin { tab, .. }
+            | InboundMessage::AttachChunk { tab, .. }
+            | InboundMessage::AttachEnd { tab, .. }
+            | InboundMessage::AttachCancel { tab, .. }
+            | InboundMessage::AttachRemove { tab, .. } => Some(*tab),
             InboundMessage::SendMessage { tab, .. }
             | InboundMessage::RunShell { tab, .. }
             | InboundMessage::Interrupt { tab, .. }
@@ -851,6 +925,8 @@ impl InboundMessage {
             | InboundMessage::EditorCardView { tab, .. }
             | InboundMessage::QuestionAnswer { tab, .. }
             | InboundMessage::QuestionDecline { tab, .. }
+            | InboundMessage::SetPlanning { tab, .. }
+            | InboundMessage::PlanFeedbackDraft { tab, .. }
             | InboundMessage::Resume { tab, .. }
             | InboundMessage::RestoreLast { tab, .. }
             | InboundMessage::SelectTab { tab, .. }
@@ -875,6 +951,7 @@ impl InboundMessage {
             | InboundMessage::ReviewCommentRemove { tab, .. }
             | InboundMessage::ReviewSend { tab, .. }
             | InboundMessage::OpenInEditor { tab, .. } => *tab,
+            InboundMessage::PlanResolve(message) => message.tab,
         };
         match tab {
             Some(id) => TabRef::Named(crate::tabs::TabId(id)),
@@ -956,6 +1033,63 @@ impl QuestionAnswerWire {
             option_indexes,
             other_text,
             notes,
+        }
+    }
+}
+
+/// A `plan_resolve`: every field named and no other taken, so a page cannot carry a mode, a rule or an
+/// input the sidecar did not build; a malformed one is a parse failure, never a default.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PlanResolveMessage {
+    pub request_id: String,
+    #[serde(default)]
+    pub tab: Option<u64>,
+    pub interaction_id: String,
+    pub choice: PlanChoiceWire,
+    /// The digest of the plan the person read, as the snapshot gave it: an approval of another plan is refused.
+    pub plan_sha256: String,
+    /// Keep planning's typed feedback; absent or `null` is none. An approval carries none.
+    #[serde(default)]
+    pub feedback: Option<String>,
+}
+
+/// A `plan_resolve`'s choice, as a closed set: an unknown word is a parse failure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PlanChoiceWire {
+    KeepPlanning,
+    ApproveManual,
+    ApproveAuto,
+    ApproveBypass,
+}
+
+/// What a `plan_resolve` asks for.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PlanDecision {
+    Approve(crate::tab_set::PlanChoice),
+    /// Possibly empty: the CLI then tells the model only that the plan was not approved.
+    KeepPlanning {
+        feedback: String,
+    },
+}
+
+impl PlanResolveMessage {
+    /// The decision this message asks for. An approval that carries feedback is a protocol error: the dock
+    /// never sends one, and the feedback would reach nobody.
+    pub fn decision(&self) -> Result<PlanDecision, String> {
+        use crate::tab_set::PlanChoice;
+        let approve = |choice| match self.feedback {
+            Some(_) => Err("protocol: an approval of a plan carries no feedback".to_string()),
+            None => Ok(PlanDecision::Approve(choice)),
+        };
+        match self.choice {
+            PlanChoiceWire::KeepPlanning => Ok(PlanDecision::KeepPlanning {
+                feedback: self.feedback.clone().unwrap_or_default(),
+            }),
+            PlanChoiceWire::ApproveManual => approve(PlanChoice::ApproveManual),
+            PlanChoiceWire::ApproveAuto => approve(PlanChoice::ApproveAuto),
+            PlanChoiceWire::ApproveBypass => approve(PlanChoice::ApproveBypass),
         }
     }
 }
@@ -1051,6 +1185,8 @@ impl InboundMessage {
             | InboundMessage::EditorCardView { request_id, .. }
             | InboundMessage::QuestionAnswer { request_id, .. }
             | InboundMessage::QuestionDecline { request_id, .. }
+            | InboundMessage::SetPlanning { request_id, .. }
+            | InboundMessage::PlanFeedbackDraft { request_id, .. }
             | InboundMessage::Resume { request_id, .. }
             | InboundMessage::SelectTab { request_id, .. }
             | InboundMessage::RenameTab { request_id, .. }
@@ -1062,6 +1198,11 @@ impl InboundMessage {
             | InboundMessage::HintTargets { request_id, .. }
             | InboundMessage::QueueMessage { request_id, .. }
             | InboundMessage::TakeBackQueue { request_id, .. }
+            | InboundMessage::AttachBegin { request_id, .. }
+            | InboundMessage::AttachChunk { request_id, .. }
+            | InboundMessage::AttachEnd { request_id, .. }
+            | InboundMessage::AttachCancel { request_id, .. }
+            | InboundMessage::AttachRemove { request_id, .. }
             | InboundMessage::SendNow { request_id, .. }
             | InboundMessage::Draft { request_id, .. }
             | InboundMessage::EditDraft { request_id, .. }
@@ -1104,6 +1245,7 @@ impl InboundMessage {
             | InboundMessage::RemoteRevokeAsk { request_id, .. }
             | InboundMessage::RemoteRevoke { request_id, .. }
             | InboundMessage::OpenUrl { request_id, .. } => request_id,
+            InboundMessage::PlanResolve(message) => &message.request_id,
         }
     }
 }
@@ -1282,6 +1424,14 @@ pub fn serialize_command_result_for_js(request_id: &str, result: Result<(), &str
             json!({ "kind": "command_result", "requestId": request_id, "ok": false, "error": error }).to_string()
         }
     }
+}
+
+/// `{"kind":"plan_waiting","requestId":...,"tab":...,"calls":N}`: the approval `request_id` asked for waits
+/// for `calls` calls Claude Code is still deciding in plan mode before it goes; sent when it starts waiting and
+/// whenever the count changes. Its `command_result` follows once the approval went and the agent replied, or
+/// was refused.
+pub fn serialize_plan_waiting_for_js(request_id: &str, tab: crate::tabs::TabId, calls: usize) -> String {
+    json!({ "kind": "plan_waiting", "requestId": request_id, "tab": tab.0, "calls": calls }).to_string()
 }
 
 /// `{"kind":"command_result","requestId":...,"ok":true,"message":"..."}`: a success that has a word of
@@ -2043,6 +2193,42 @@ pub struct CallNotes {
     /// the duration on a turn-ending row read them, so a turn with no entry (history from a resume,
     /// a turn that began before this process) shows no time rather than a wrong one.
     pub turn_times: Vec<TurnTime>,
+    /// The tab's plan mode as the page shows it, on a session that offers plan mode: in the tab's own notes
+    /// the latest the pump saw, and in a batch's notes only when it changed (the events envelope's
+    /// `planningChanged`). Recomputed from the tab after a move, so not carried.
+    #[serde(skip)]
+    pub planning: Option<PlanningNote>,
+    /// The tab's `planning` changed since an events envelope last carried it.
+    #[serde(skip)]
+    pub planning_dirty: bool,
+    /// In a batch's notes: the session no longer offers plan mode, said as `planningChanged: null`.
+    #[serde(skip)]
+    pub planning_cleared: bool,
+}
+
+/// Where a plan-offered session stands, for the page: the projection's phase (`executing`, `entering`,
+/// `planning`, `leaving`) and the mode plan mode was entered from (`Tab::plan_origin`), which is the tab's.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PlanningNote {
+    pub phase: &'static str,
+    pub origin: Option<SessionModeChoice>,
+}
+
+impl PlanningNote {
+    /// The note for a session in `phase` whose tab entered plan mode from `origin`.
+    pub fn of(phase: &agent::PlanPhase, origin: Option<SessionModeChoice>) -> Self {
+        let phase = match phase {
+            agent::PlanPhase::Executing => "executing",
+            agent::PlanPhase::Entering { .. } => "entering",
+            agent::PlanPhase::Planning => "planning",
+            agent::PlanPhase::Leaving { .. } => "leaving",
+        };
+        PlanningNote { phase, origin }
+    }
+
+    fn to_json(self) -> Value {
+        json!({ "phase": self.phase, "origin": self.origin.map(SessionModeChoice::as_str) })
+    }
 }
 
 /// The enrolled device responsible for a transcript action.
@@ -2192,6 +2378,8 @@ impl CallNotes {
             && self.allowed_by_auto.is_empty()
             && self.auto_creates_file.is_empty()
             && self.turn_times.is_empty()
+            && self.planning.is_none()
+            && !self.planning_cleared
     }
 
     /// Whether this tool-use id's `Write` created its file (see `creates_file` and, for the
@@ -2274,6 +2462,13 @@ pub fn serialize_events_with_notes_and_revisions_for_js(
     }
     if !notes.turn_times.is_empty() {
         payload["turnTimes"] = notes.turn_times.iter().map(TurnTime::to_json).collect();
+    }
+    // Beside the events, not among them: the page numbers the conversation by Rust's folds, one per event, and
+    // this is the tab's own reading after the batch, not a fold.
+    if let Some(planning) = notes.planning {
+        payload["planningChanged"] = planning.to_json();
+    } else if notes.planning_cleared {
+        payload["planningChanged"] = Value::Null;
     }
     add_remote_notes(&mut payload, notes);
     payload.to_string()
@@ -2387,13 +2582,28 @@ pub fn serialize_snapshot_with_notes_for_js(
         .user_prompts
         .iter()
         .map(|prompt| {
-            // `delivered` only when true: a message read inside the running turn. Every other prompt
-            // keeps the shape it always had.
+            // `delivered` only when true: a message read inside the running turn; `attachments` only when
+            // images went with it, in the page's spelling (what the row draws, never a digest or bytes).
+            // Every other prompt keeps the shape it always had.
+            let mut record = json!({ "seq": prompt.seq, "text": prompt.text });
             if prompt.delivered {
-                json!({ "seq": prompt.seq, "text": prompt.text, "delivered": true })
-            } else {
-                json!({ "seq": prompt.seq, "text": prompt.text })
+                record["delivered"] = json!(true);
             }
+            if !prompt.attachments.is_empty() {
+                record["attachments"] = prompt
+                    .attachments
+                    .iter()
+                    .map(|image| {
+                        json!({
+                            "mediaType": image.media_type,
+                            "width": image.width,
+                            "height": image.height,
+                            "bytes": image.bytes,
+                        })
+                    })
+                    .collect();
+            }
+            record
         })
         .collect();
 
@@ -2515,7 +2725,7 @@ pub fn serialize_snapshot_with_notes_for_js(
         agent::ProjectionStatus::Closed { reason } => json!({ "kind": "closed", "reason": reason }),
     };
 
-    let capabilities = view.capabilities;
+    let capabilities = view.capabilities.clone();
     let provider = view.provider.map(|info| {
         json!({
             "sidecarVersion": info.sidecar_version,
@@ -2662,10 +2872,36 @@ pub fn serialize_snapshot_with_notes_for_js(
             state["capabilities"][name] = json!(true);
         }
     }
+    // Images on a turn: only from a sidecar that lists `turn_content_v1` and states its limits, which the page
+    // shows and checks against before it imports anything.
+    if let Some(limits) = capabilities
+        .turn_content_limits
+        .as_ref()
+        .filter(|_| capabilities.turn_content_v1)
+    {
+        state["capabilities"]["imageInput"] = json!(true);
+        state["capabilities"]["imageLimits"] = json!({
+            "mediaTypes": limits.image_media_types,
+            "maxImagesPerTurn": limits.max_images_per_turn,
+            "maxImageBytes": limits.max_image_bytes,
+            "maxContentBytes": limits.max_content_bytes,
+        });
+    }
     if let Some(evicted) = &projection.evicted {
         state["evicted"] = json!({ "throughSeq": evicted.through_seq, "turns": evicted.turns });
     }
     projection.snapshot_modules(&mut state);
+    // Plan mode is the page's to offer only on a session that took up the offer, from a sidecar that made it.
+    if capabilities.plan_mode_v1 && projection.planning.offered {
+        state["capabilities"]["planMode"] = json!(true);
+    }
+    // The projection says where the session stands; where plan mode was entered from is the tab's.
+    if let Some(planning) = state.get_mut("planning") {
+        planning["origin"] = json!(notes
+            .planning
+            .and_then(|note| note.origin)
+            .map(SessionModeChoice::as_str));
+    }
     if !cards.is_empty() {
         state["editorCards"] = json!(cards);
     }
@@ -3048,6 +3284,11 @@ pub struct TabView {
     pub following: bool,
     /// Live form mirrors keyed by interaction id; absent on the wire when empty.
     pub question_draft: std::collections::BTreeMap<String, Value>,
+    /// The "keep planning" feedback typed for each waiting plan, by plan id; absent on the wire when empty.
+    pub plan_feedback_draft: std::collections::BTreeMap<String, String>,
+    /// The tab is asked to enter plan mode before its first message (`TabSet::set_planning` on a tab with no
+    /// session, or a restored tab saved while planning); absent on the wire when not.
+    pub plan_on_start: bool,
     pub id: crate::tabs::TabId,
     pub number: u16,
     pub label: String,
@@ -3105,6 +3346,12 @@ pub fn serialize_tabs_for_js(active: crate::tabs::TabId, tabs: &[TabView], defau
             }
             if !t.question_draft.is_empty() {
                 row["questionDraft"] = json!(t.question_draft);
+            }
+            if !t.plan_feedback_draft.is_empty() {
+                row["planFeedbackDraft"] = json!(t.plan_feedback_draft);
+            }
+            if t.plan_on_start {
+                row["planOnStart"] = json!(true);
             }
             row
         })
@@ -3253,7 +3500,15 @@ pub fn serialize_queue_for_js(
 ) -> String {
     let items: Vec<Value> = items
         .iter()
-        .map(|q| json!({ "text": q.text, "queuedAt": q.queued_at_ms, "steered": !q.is_held(), "afterTurn": q.after_turn }))
+        .map(|q| {
+            let mut item =
+                json!({ "text": q.text, "queuedAt": q.queued_at_ms, "steered": !q.is_held(), "afterTurn": q.after_turn });
+            // How many images go with it: the page draws a count, never the images.
+            if !q.attachments.is_empty() {
+                item["images"] = json!(q.attachments.len());
+            }
+            item
+        })
         .collect();
     json!({ "kind": "queue", "tab": tab.0, "items": items, "error": error, "note": note, "enterSteers": enter_steers })
         .to_string()
@@ -3286,6 +3541,23 @@ pub fn serialize_refused_draft_for_js(tab: crate::tabs::TabId, text: &str, refus
 /// The reply to `take_back_queue`: the whole queue, oldest first.
 pub fn serialize_queue_taken_for_js(tab: crate::tabs::TabId, texts: &[String]) -> String {
     json!({ "kind": "queue_taken", "tab": tab.0, "texts": texts }).to_string()
+}
+
+/// [`serialize_queue_taken_for_js`] for messages given back with their images: `attachments` lists, for each
+/// text, the tokens of its images in order (they are in the tab's draft again, sent with `draft_attachments`).
+/// Present only when some message had images, so a text-only take-back reads as before.
+pub fn serialize_queue_taken_drafts_for_js(tab: crate::tabs::TabId, drafts: &[crate::tab_set::QueuedDraft]) -> String {
+    let texts: Vec<&str> = drafts.iter().map(|d| d.text.as_str()).collect();
+    let mut value = json!({ "kind": "queue_taken", "tab": tab.0, "texts": texts });
+    if drafts.iter().any(|d| !d.attachments.is_empty()) {
+        value["attachments"] = json!(drafts.iter().map(|d| &d.attachments).collect::<Vec<_>>());
+    }
+    value.to_string()
+}
+
+/// A begin's `command_result`: `{"kind":"command_result","requestId":..,"ok":true,"attachmentId":..}`.
+pub fn serialize_attach_begun_for_js(request_id: &str, attachment_id: &str) -> String {
+    json!({ "kind": "command_result", "requestId": request_id, "ok": true, "attachmentId": attachment_id }).to_string()
 }
 
 /// The project's prompt history, oldest first. Window-level: every tab shares it.
@@ -3385,6 +3657,10 @@ pub fn serialize_confirm_restore_for_js(prompt: &crate::tab_set::RestorePrompt) 
     json!({ "kind": "confirm_restore", "nonce": prompt.nonce, "lines": prompt.lines }).to_string()
 }
 
+#[cfg(test)]
+mod attachment_message_tests;
+#[cfg(test)]
+mod plan_message_tests;
 #[cfg(test)]
 mod question_message_tests;
 #[cfg(test)]

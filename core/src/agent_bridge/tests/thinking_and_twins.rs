@@ -382,6 +382,76 @@ fn questions_fixture_matches_events_and_canonical_snapshots() {
     }
 }
 
+/// `plans.json` (written by the agent crate's `plans_fixture`) holds what a page is shown of the plans and the
+/// phase after each step: every event it folds goes out as itself, and the snapshot this side sends carries the
+/// same records and phase. The page's fold is held to the same file.
+#[test]
+fn plans_fixture_matches_events_and_canonical_snapshots() {
+    let fixture: Value =
+        serde_json::from_str(include_str!("../../../../agent-ui/web/src/fixtures/plans.json")).unwrap();
+    let cases = fixture["cases"].as_array().unwrap();
+    assert!(!cases.is_empty());
+    for case in cases {
+        let mut projection = AgentSessionProjection::default();
+        let requested: agent::RequestedCliMode = serde_json::from_value(case["requested"].clone()).unwrap();
+        projection.offer_plan_mode(agent::CliExpectation {
+            requested,
+            plan_offered: true,
+        });
+        for (at, step) in case["steps"].as_array().unwrap().iter().enumerate() {
+            let action = &step["action"];
+            if let Some(event) = action.get("event") {
+                let event: AgentDomainEvent = serde_json::from_value(event.clone()).unwrap();
+                let payload: Value = serde_json::from_str(&serialize_events_for_js(
+                    TabId(1),
+                    projection.last_revision,
+                    projection.last_revision + 1,
+                    std::slice::from_ref(&event),
+                ))
+                .unwrap();
+                assert_eq!(payload["events"][0], action["event"]);
+                // The fixture's own clock: one millisecond per step from the same start.
+                projection.apply_at(&event, 1_800_000_000_000 + at as u64);
+            } else {
+                let id = action["interactionId"].as_str().unwrap();
+                let changed = match action["send"].as_str().unwrap() {
+                    "answering" => projection.mark_plan_answering(id),
+                    "failed" => projection.plan_send_failed(id),
+                    other => panic!("unknown send action: {other}"),
+                };
+                assert_eq!(changed, action["changed"].as_bool().unwrap());
+            }
+            let view = SnapshotView {
+                backend: "sidecar",
+                conversation_id: None,
+                session_id: None,
+                provider_session_id: None,
+                capabilities: agent::ProviderCapabilities::default(),
+                provider: None,
+                projection: crate::agent_backend::ProjectionRef::Borrowed(&projection),
+                hidden_pending: None,
+            };
+            let canonical: Value = serde_json::from_str(&serialize_snapshot_for_js(TabId(1), &view, None)).unwrap();
+            let name = &case["name"];
+            assert_eq!(canonical["throughRevision"], step["throughRevision"], "{name}");
+            assert_eq!(canonical["state"].get("plans"), step["snapshot"].get("plans"), "{name}");
+            assert_eq!(
+                canonical["state"]["planning"]["phase"], step["snapshot"]["planning"]["phase"],
+                "{name}"
+            );
+            // The origin is the tab's, not the projection's: no tab here, so none.
+            assert_eq!(canonical["state"]["planning"]["origin"], Value::Null, "{name}");
+            assert_eq!(canonical["state"]["activeTurnId"], step["snapshot"]["activeTurnId"]);
+            assert_eq!(
+                json!(projection.waiting_plan().map(|record| &record.interaction_id)),
+                step["waitingId"],
+                "{name}"
+            );
+            assert_eq!(json!(projection.is_planning()), step["isPlanning"], "{name}");
+        }
+    }
+}
+
 #[test]
 fn background_tasks_events_and_snapshots_are_twins() {
     let path =

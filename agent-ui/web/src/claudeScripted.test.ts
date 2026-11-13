@@ -30,12 +30,15 @@ const KEYS = [
   "thinking",
   "thinkingOpen",
   "backgroundCalls",
+  "plans",
 ] as const;
 
 const agrees = (state: AgentUiState, twin: Twin) => {
   const final = twin.snapshot.state as unknown as Record<string, unknown>;
+  /* A snapshot leaves `plans` out while there are none; the fold keeps an empty list. */
+  const sent = (key: (typeof KEYS)[number]) => (key === "plans" ? (final.plans ?? []) : final[key]);
   for (const key of KEYS) {
-    expect((state as unknown as Record<string, unknown>)[key], key).toEqual(final[key]);
+    expect((state as unknown as Record<string, unknown>)[key], key).toEqual(sent(key));
   }
   expect(state.nextSeq).toBe(twin.snapshot.throughRevision);
 };

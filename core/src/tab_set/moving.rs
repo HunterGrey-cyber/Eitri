@@ -89,6 +89,26 @@ pub struct TabHandoff {
     #[cfg(any(test, feature = "test-support"))]
     #[serde(default)]
     gate_log: Vec<crate::agent_backend::GateAnswer>,
+    /// The mode plan mode was entered from, and the round the tab follows: the window it lands in shows
+    /// the same origin and takes up the same approval.
+    #[serde(default)]
+    plan_origin: Option<SessionModeChoice>,
+    #[serde(default)]
+    plan_cycle: PlanCycle,
+    #[serde(default)]
+    plan_mode_applied_seq: Option<u64>,
+    /// Plan mode asked for before the first message.
+    #[serde(default)]
+    plan_on_start: bool,
+    /// The cards raised in plan mode, and the calls deferred there that an approval waits for.
+    #[serde(default)]
+    plan: crate::agent_backend::PlanBook,
+    /// The feedback typed for a waiting plan's "keep planning", by plan id.
+    #[serde(default)]
+    plan_feedback_draft: BTreeMap<String, String>,
+    /// How many images its draft held: they stay in the window it left, and the window it lands in says so.
+    #[serde(default)]
+    draft_images_left: usize,
 }
 
 impl TabHandoff {
@@ -229,6 +249,9 @@ pub enum MoveRefusedWhy {
     Folding,
     /// Its conversation could not be frozen or its records taken.
     Conversation(String),
+    /// A message waiting to be sent carries images, whose bytes are this window's: one in its queue, a first message
+    /// waiting for its start, or a sent one the CLI may still hand back.
+    QueuedImages,
 }
 
 impl MoveRefusedWhy {
@@ -254,6 +277,9 @@ impl std::fmt::Display for MoveRefusedWhy {
             }
             MoveRefusedWhy::Folding => f.write_str("the conversation is folding its events"),
             MoveRefusedWhy::Conversation(why) => f.write_str(why),
+            MoveRefusedWhy::QueuedImages => {
+                f.write_str("a message waiting to be sent carries images: send it or take it back first")
+            }
         }
     }
 }
@@ -429,6 +455,14 @@ fn handoff_of(tab: &Tab, review: Option<ReviewHandoff>) -> TabHandoff {
         row_key,
         #[cfg(any(test, feature = "test-support"))]
         gate_log,
+        plan_origin,
+        plan_on_start,
+        plan_mode_applied_seq,
+        plan_cycle,
+        // A move during a mode change is refused, and so is one with a switch's reply unread.
+        plan_start: _,
+        // The draft's images are this window's files and memory: they stay, and the landing window says so.
+        attachments,
     } = tab;
     let SessionState {
         title,
@@ -474,6 +508,8 @@ fn handoff_of(tab: &Tab, review: Option<ReviewHandoff>) -> TabHandoff {
         editor_declared: _,
         // A card ends with its call when the tab leaves: the other window's broker never raised it.
         editor_cards: _,
+        plan,
+        plan_feedback_draft,
     } = session;
     let state = match backend {
         TabBackend::NotStarted => MovedState::Empty,
@@ -494,6 +530,14 @@ fn handoff_of(tab: &Tab, review: Option<ReviewHandoff>) -> TabHandoff {
         TabBackend::Failed { reason } => MovedState::Failed { reason: reason.clone() },
         TabBackend::Live(_) => MovedState::Live,
         TabBackend::Starting(_) => unreachable!("a start in flight is refused by the freeze"),
+    };
+    // The calls' plan-mode marks cross with the chat's records (`ChatMoveCore::call_marks`), so the window the tab
+    // lands in judges and sweeps each pending request as this one would: the book crosses as it is.
+    let plan = crate::agent_backend::PlanBook {
+        // An approval waiting for calls stays with this window's panel, which finds the tab gone: the adopting
+        // window takes approvals afresh.
+        draining: None,
+        ..plan.clone()
     };
     TabHandoff {
         name: name.clone(),
@@ -546,6 +590,13 @@ fn handoff_of(tab: &Tab, review: Option<ReviewHandoff>) -> TabHandoff {
         agent_watch: agent_watch.clone(),
         #[cfg(any(test, feature = "test-support"))]
         gate_log: gate_log.clone(),
+        plan_origin: *plan_origin,
+        plan_cycle: plan_cycle.clone(),
+        plan_mode_applied_seq: *plan_mode_applied_seq,
+        plan_on_start: *plan_on_start,
+        plan,
+        plan_feedback_draft: plan_feedback_draft.clone(),
+        draft_images_left: attachments.len(),
     }
 }
 
@@ -882,6 +933,16 @@ impl TabSet {
                 outcome: Err(BackendError { message, benign: true }),
             });
         }
+        // A tab asked to start in plan mode: its first message waits for the CLI to be in it.
+        if self.start_in_plan(tab, wall_clock_ms()) {
+            let outcome = self.hold_behind_card(tab, &turn);
+            return Some(Sent::First {
+                tab,
+                request_id: request_id.to_string(),
+                typed: turn.typed,
+                outcome,
+            });
+        }
         let gate = self.begin_turn_send(tab);
         self.send_when_allowed(
             gate,
@@ -908,9 +969,11 @@ impl TabSet {
                 outcome: Err(BackendError { message, benign: true }),
             });
         }
+        // A tab asked to start in plan mode (a restored one) sends its switch first; the message waits below.
+        let in_plan_first = self.start_in_plan(tab, wall_clock_ms());
         // A card or question waits for an answer: keep the message in the queue until it settles,
         // because the session is stopped on the user. A running `!` line stops it the same way.
-        if self.card_waits(tab) || self.shell_line_runs(tab) {
+        if in_plan_first || self.card_waits(tab) || self.shell_line_runs(tab) {
             let outcome = self.hold_behind_card(tab, &turn);
             return Some(Sent::Prompt {
                 tab,
@@ -949,6 +1012,7 @@ impl TabSet {
             if let Some(item) = self.get_mut(tab).and_then(|t| t.session.queue.last_mut()) {
                 item.behind_card = true;
             }
+            self.carry_images_onto_last(tab, turn.attachments.clone());
         }
         outcome
     }
@@ -1047,14 +1111,19 @@ impl TabSet {
             TurnSend::First { request_id, turn } => (Some(request_id), None, Some(turn)),
             TurnSend::Prompt { request_id, page, turn } => (Some(request_id), Some(page), Some(turn)),
         };
+        let mut images = Vec::new();
         if let Some(t) = self.get_mut(tab) {
             if let Some(turn) = turn {
                 let mut item = Queued::held(&turn.typed, turn.wire, wall_clock_ms());
                 item.typed_by_person = turn.typed_by_person;
+                // Its images wait with it, out of the draft: sent again, it goes as it was typed.
+                item.attachments = turn.attachments;
+                images = item.attachments.clone();
                 t.session.queue.insert(0, item);
             }
             t.session.queue_error = Some(note.clone());
         }
+        self.images_left_draft(tab, &images);
         Sent::NotSent {
             tab,
             note,
@@ -1167,8 +1236,27 @@ impl TabSet {
         if t.pending_handoff.is_some() {
             return Some(MoveRefusedWhy::TerminalHandoff);
         }
+        // A move into or out of plan mode that the tab has not settled: the reply to its switch is still to be
+        // read here, or the session executes again and the tab has not taken up its mode yet. The session's own
+        // `Entering`/`Leaving` is refused by the conversation's freeze.
+        if t.plan_start.is_some() || (t.plan_cycle.open && t.live().is_some_and(|b| !b.projection().is_planning())) {
+            return Some(MoveRefusedWhy::Conversation(
+                "the mode is changing; move the tab when it settles".to_string(),
+            ));
+        }
         if t.session.queue.iter().any(|q| !q.is_held()) {
             return Some(MoveRefusedWhy::Steered);
+        }
+        // Images live in this process only: a queued message with images, or a sent one the CLI may still hand
+        // back to the queue (`opening_prompt`), would arrive in the other window without them.
+        if t.session.queue.iter().any(|q| !q.attachments.is_empty())
+            || t.session
+                .opening_prompt
+                .as_ref()
+                .is_some_and(|opening| !opening.message.attachments.is_empty())
+            || !self.parked_images(tab).is_empty()
+        {
+            return Some(MoveRefusedWhy::QueuedImages);
         }
         match &t.backend {
             TabBackend::Starting(_) => Some(MoveRefusedWhy::Starting),
@@ -1308,6 +1396,8 @@ impl TabSet {
             redeliver_covered: self.redeliver_covered,
             #[cfg(test)]
             before_resync_snapshot: &mut self.before_resync_snapshot,
+            #[cfg(test)]
+            before_resync_sweep: &mut self.before_resync_sweep,
         };
         let t = &mut self.tabs[at];
         let is_active = t.id == active;
@@ -1515,6 +1605,13 @@ impl TabSet {
             agent_watch,
             #[cfg(any(test, feature = "test-support"))]
             gate_log,
+            plan_origin,
+            plan_cycle,
+            plan_mode_applied_seq,
+            plan_on_start,
+            plan,
+            plan_feedback_draft,
+            draft_images_left,
         } = handoff;
         for (item, typed) in queue.iter_mut().zip(queue_typed_by_person) {
             item.typed_by_person = typed;
@@ -1538,6 +1635,10 @@ impl TabSet {
         let t = &mut self.tabs[at];
         t.name = name;
         t.mode = mode;
+        t.plan_origin = plan_origin;
+        t.plan_cycle = plan_cycle;
+        t.plan_mode_applied_seq = plan_mode_applied_seq;
+        t.plan_on_start = plan_on_start;
         t.backend = backend;
         t.attention = attention_from(attention);
         t.agent_watch = agent_watch;
@@ -1589,11 +1690,14 @@ impl TabSet {
             client_calls: ClientCalls::default(),
             editor_declared: BTreeSet::new(),
             editor_cards: Vec::new(),
+            plan,
+            plan_feedback_draft,
         };
         #[cfg(any(test, feature = "test-support"))]
         {
             t.gate_log = gate_log;
         }
+        t.attachments.note_left_behind(draft_images_left);
         if !view.is_base() && self.tab_in(view).is_none() {
             self.tabs[at].view = view;
         } else {

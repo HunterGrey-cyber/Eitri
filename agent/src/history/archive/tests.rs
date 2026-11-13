@@ -25,6 +25,7 @@ fn turn(n: u64, text: &str) -> ArchivedTurn {
             seq: n * 10,
             text: text.into(),
             delivered: false,
+            attachments: Vec::new(),
         })],
     }
 }
@@ -109,11 +110,11 @@ fn torn_tail_is_truncated_and_next_append_is_a_separate_line() {
 fn oversized_text_is_cut_at_utf8_head_and_turn_survives() {
     let scratch = Scratch::new();
     let id = id();
-    let huge = "界".repeat(super::super::HISTORY_MAX_LINE_BYTES);
+    let huge = "界".repeat(super::ARCHIVE_MAX_LINE_BYTES);
     let mut writer = ArchiveWriter::open(&scratch.0, &id, true).unwrap();
     writer.append(&[turn(0, &huge)]).unwrap();
     let bytes = std::fs::read(id.path(&writer.dir, 0)).unwrap();
-    assert!(bytes.len() <= super::super::HISTORY_MAX_LINE_BYTES + 1);
+    assert!(bytes.len() <= super::ARCHIVE_MAX_LINE_BYTES + 1);
     let line: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
     assert_eq!(line["cut"], true);
     let text = line["record"]["text"].as_str().unwrap();
@@ -246,12 +247,22 @@ fn cancellation_after_the_first_line_discards_partial_results() {
 fn oversized_thinking_reply_and_tool_payloads_remain_readable() {
     let scratch = Scratch::new();
     let id = id();
-    let huge = "x".repeat(super::super::HISTORY_MAX_LINE_BYTES + 1);
+    let huge = "x".repeat(super::ARCHIVE_MAX_LINE_BYTES + 1);
     let records = vec![
-        ArchivedRecord::Thinking(ThinkingBlock { seq: 1, turn_id:"t".into(), text:huge.clone() }),
-        ArchivedRecord::Transcript(TranscriptMessage { seq:2, text:huge.clone() }),
-        serde_json::from_value(json!({"kind":"tool_call","record":{"seq":3,"turn_id":"t","tool_use_id":"call","name":"Read",
-            "input":{"text":huge},"result":{"content":"y".repeat(super::super::HISTORY_MAX_LINE_BYTES+1),"is_error":false}}})).unwrap(),
+        ArchivedRecord::Thinking(ThinkingBlock {
+            seq: 1,
+            turn_id: "t".into(),
+            text: huge.clone(),
+        }),
+        ArchivedRecord::Transcript(TranscriptMessage {
+            seq: 2,
+            text: huge.clone(),
+        }),
+        serde_json::from_value(
+            json!({"kind":"tool_call","record":{"seq":3,"turn_id":"t","tool_use_id":"call","name":"Read",
+            "input":{"text":huge},"result":{"content":"y".repeat(super::ARCHIVE_MAX_LINE_BYTES+1),"is_error":false}}}),
+        )
+        .unwrap(),
     ];
     let mut writer = ArchiveWriter::open(&scratch.0, &id, true).unwrap();
     writer.append(&[ArchivedTurn { turn: 0, records }]).unwrap();
@@ -259,7 +270,7 @@ fn oversized_thinking_reply_and_tool_payloads_remain_readable() {
     assert_eq!(page.turns[0].records.len(), 3);
     for bytes in PrivateLines::open(
         &id.path(&writer.dir, 0),
-        super::super::HISTORY_MAX_LINE_BYTES,
+        super::ARCHIVE_MAX_LINE_BYTES,
         &AtomicBool::new(false),
     )
     .unwrap()
@@ -388,7 +399,7 @@ fn cut_children_are_reported_and_last_cut_flag_wins_per_record_key() {
     let mut writer = ArchiveWriter::open(&scratch.0, &id, true).unwrap();
     let tool: ArchivedRecord = serde_json::from_value(json!({"kind":"tool_call","record":{
         "seq":1,"turn_id":"t","tool_use_id":"call","name":"Task","input":null,
-        "children":{"transcript":[{"seq":2,"text":"x".repeat(super::super::HISTORY_MAX_LINE_BYTES)}],"thinking":[],"tool_calls":[],"assistant_message_open":false,"thinking_open":false}
+        "children":{"transcript":[{"seq":2,"text":"x".repeat(super::ARCHIVE_MAX_LINE_BYTES)}],"thinking":[],"tool_calls":[],"assistant_message_open":false,"thinking_open":false}
     }})).unwrap();
     writer
         .append(&[ArchivedTurn {
@@ -409,7 +420,7 @@ fn cut_children_are_reported_and_last_cut_flag_wins_per_record_key() {
         }])
         .unwrap();
     assert!(read(&scratch.0, &id, 1, 10, 100).unwrap().cut.is_empty());
-    tool.input = json!("x".repeat(super::super::HISTORY_MAX_LINE_BYTES));
+    tool.input = json!("x".repeat(super::ARCHIVE_MAX_LINE_BYTES));
     writer
         .append(&[
             ArchivedTurn {
@@ -499,7 +510,7 @@ fn metadata_heavy_record_uses_minimal_cut_instead_of_failing_forever() {
     let scratch = Scratch::new();
     let id = id();
     let mut writer = ArchiveWriter::open(&scratch.0, &id, true).unwrap();
-    let huge_key = "k".repeat(super::super::HISTORY_MAX_LINE_BYTES + 1);
+    let huge_key = "k".repeat(super::ARCHIVE_MAX_LINE_BYTES + 1);
     let record: ArchivedRecord = serde_json::from_value(json!({"kind":"tool_call","record":{
         "seq":1,"turn_id":"t","tool_use_id":"call","name":"Read","input":null,
         "changed_input":{"fields":{huge_key:"value"}}
@@ -524,7 +535,7 @@ fn metadata_heavy_record_uses_minimal_cut_instead_of_failing_forever() {
     assert!(tool.name.is_empty());
     assert!(tool.input.is_null());
     assert!(tool.result.is_none());
-    assert!(writer.bytes < super::super::HISTORY_MAX_LINE_BYTES as u64);
+    assert!(writer.bytes < super::ARCHIVE_MAX_LINE_BYTES as u64);
 }
 
 #[test]

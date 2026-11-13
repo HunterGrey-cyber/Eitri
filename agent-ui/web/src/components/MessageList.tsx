@@ -4,9 +4,9 @@ import { Fragment, memo, useContext, useEffect, useLayoutEffect, useMemo, useRef
 import type { AgentUiState, ThinkingBlock, ThinkingDisplay, ToolCallRecord } from "../types";
 import { renderToolCall, TouchRows } from "../toolRegistry";
 import { ProjectDirContext } from "../projectPath";
-import { allCards, buildTimeline, isUsableLink, noticeText, noticeBody, wakeText, questionLines, type TimelineItem } from "../timeline";
+import { allCards, buildTimeline, isUsableLink, noticeText, noticeBody, wakeText, questionLines, planLines, type TimelineItem } from "../timeline";
 import { buildDisplay, runSummary } from "../display";
-import { forgetMarkdown, renderMarkdown, streamMarkdown, type StreamedMarkdown } from "../markdown";
+import { forgetMarkdown, renderMarkdown, renderMarkdownRevealed, streamMarkdown, type StreamedMarkdown } from "../markdown";
 import { turnEndingText } from "../turnEnding";
 import { endingDuration, NO_TURN_DURATIONS, placeFooters, workedFooters } from "../turnTimes";
 import type { TurnDurations } from "../turnTimes";
@@ -16,7 +16,7 @@ import { PermissionCard } from "./PermissionCard";
 import type { CardModeView } from "./PermissionCard";
 import { Row } from "./Row";
 import { Revealed } from "./Revealed";
-import { revealHidden } from "../revealHidden";
+import { revealedText, revealHidden } from "../revealHidden";
 import { followSelection } from "../visualPaint";
 import type { PermissionDecision } from "../bridge";
 import type { PointerAnswerProof } from "../answerProof";
@@ -1209,7 +1209,8 @@ const TimelineRow = memo(function TimelineRow({
         .join(" ");
       return (
         <Row kind="prompt" sign="›" current={current} className={promptClass || undefined} navStop="row" rowKey={item.key}>
-          {item.text}
+          {item.promptText ?? item.text}
+          {item.images && <div className="prompt-images">{revealedText(item.images)}</div>}
           {sentHere && <div className="phone-source"><small>sent from this phone</small></div>}
           {sentFrom !== null && <div className="phone-source"><small>from <Revealed pieces={revealHidden(sentFrom)} /></small></div>}
         </Row>
@@ -1294,6 +1295,23 @@ const TimelineRow = memo(function TimelineRow({
         </Row>
       );
     }
+    case "plan": {
+      // Claude's plan: its first heading and how it ended, the whole plan behind the row's fold (Enter), drawn as
+      // the dock draws it -- sanitized Markdown with its hidden characters shown. The rest is text.
+      const lines = planLines(item.plan);
+      const whole = (expanded || detailed) && item.plan.plan !== "";
+      return <Row kind="plan" sign="≡" current={current} className={yanked ? "row-yanked" : undefined} navStop="row" rowKey={item.key}>
+        {lines.map((line, i) => <div key={i} className={line.muted ? "question-line question-status" : "question-line"}>
+          <Revealed pieces={revealHidden(line.text)} />
+          {i === 0 && item.plan.plan !== "" && <span className="fold-marker" aria-label={whole ? "expanded" : "collapsed"}>{whole ? " ▾" : " ▸"}</span>}
+        </div>)}
+        {whole && <PlanBody text={item.plan.plan} />}
+      </Row>;
+    }
+    case "planmark":
+      return <Row kind="notice" sign="·" current={current} className={yanked ? "row-yanked" : undefined} navStop="row" rowKey={item.key}>
+        <div className="notice-text">{item.text}</div>
+      </Row>;
     case "wake": {
       return (
         <Row kind="wake" sign="●" current={current} className={yanked ? "row-yanked" : undefined} navStop="row" rowKey={item.key}>
@@ -1537,4 +1555,11 @@ const StreamingMarkdown = memo(function StreamingMarkdown({ text, streaming, sel
   }, [text, streaming, selecting]);
   useEffect(() => stopResting, []);
   return <div ref={boxRef} />;
+});
+
+/** A plan unfolded in its row, drawn as the dock draws it, once per text; past the escape cap, as escaped text. */
+const PlanBody = memo(function PlanBody({ text }: { text: string }) {
+  const html = renderMarkdownRevealed(text);
+  return html === null ? <pre className="plan-row-body plan-text">{revealedText(text)}</pre>
+    : <div className="plan-row-body" dangerouslySetInnerHTML={{ __html: html }} />;
 });

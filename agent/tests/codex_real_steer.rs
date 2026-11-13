@@ -274,15 +274,7 @@ fn the_provider_delivers_a_message_read_and_drops_one_an_interrupt_lost() {
     }
 
     // Delivered: sent while the card waits, read once the card is answered.
-    let send = |text: &str| {
-        provider.send_turn_with(
-            SendTurnRequest {
-                session_id: thread.clone(),
-                text: text.to_string(),
-            },
-            policy,
-        )
-    };
+    let send = |text: &str| provider.send_turn_with(SendTurnRequest::text(thread.clone(), text.to_string()), policy);
     let turn = send("PROMPT-GATED").expect("the turn starts");
     let mut events = Vec::new();
     pump_until(&provider, &mut events, Duration::from_secs(30), |e| {

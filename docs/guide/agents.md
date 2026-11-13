@@ -110,6 +110,50 @@ Only you answer a question: bypass, the card keys, saved rules and Claude Code's
 [Permissions](permissions.md#claudes-questions-to-you)). Closing the tab while a question waits asks first and says
 that closing cancels it. All the keys are in [Keys](keys.md#claudes-questions).
 
+### Plan mode
+
+In plan mode Claude reads and explores the project, writes a plan and waits for you to approve it before it changes
+anything. To enter it, type `/plan` alone in the box or press `<leader>p` in BROWSE; the same keys leave it. The tab
+has to be idle: while a turn runs, or a card, a question, a plan or a held message waits, a flash says `plan mode
+starts when the tab is idle` (or `ends`). On an empty tab the keys mark the tab instead, and its first message waits
+until Claude Code is in plan mode. Claude can also enter plan mode by itself, as in a terminal, and the tab follows.
+Plan mode needs a Claude tab whose agent backend offers it; anywhere else the keys say `plan mode needs a Claude tab
+on a sidecar that offers it`. `/plan` with words after it is sent to Claude as a message and switches nothing.
+
+The band's mode pill shows where the tab is: `⏸ entering plan…`, then `⏸ plan · from auto` (the mode the tab was in
+when plan mode started), `⏸ leaving plan…` on the way out, and `⏸ plan on start · from manual` on an empty tab you
+marked. While the tab plans, `Shift+Tab` and `<leader>m` change nothing and say `in plan mode: <leader>p leaves plan
+mode`. The conversation shows `entered plan mode` and `left plan mode` rows where it happened.
+
+While Claude Code plans, Eitri never approves a file edit or a command by itself, in any mode, bypass included.
+Claude Code writes its own plan file. Any other `Write`, `Edit` or `NotebookEdit` call and every `Bash` command comes
+to you as a card, which you approve or deny like any other. What else plan mode changes, and where it stops, is in
+[Permissions](permissions.md#plan-mode).
+
+When Claude has a plan, a plan box takes the place of the message box (your draft is kept and comes back after), the
+activity line reads `⚑ plan needs review`, and the tab counts the plan with its cards. The plan is drawn as Markdown,
+with hidden characters shown as visible escapes. If Claude listed commands it expects to need, they appear under the
+plan; the list is for reading only, and approving the plan does not allow them. Then you choose:
+
+- **Keep planning** has the focus first. It opens a field for what Claude should change; the field is optional, and
+  `Ctrl+Enter` or `Send` sends it and Claude plans again. What you typed survives a switch to another tab and a reload
+  of the page. Feedback is limited to 16 KiB.
+- **Approve (Manual)** and **Approve (Auto)** end plan mode and put the tab in that mode for the work that follows.
+- **Approve and keep Bypass** is there only when plan mode started from Bypass, comes last and never has the focus
+  first. It puts the tab back in Bypass, which approves every call itself again, as it did before plan mode. Either of
+  the other approvals takes a Bypass tab out of Bypass.
+
+The mode after plan mode is the tab's own: Claude Code goes back to the mode its session started in whichever you
+choose, and Eitri answers in front of it as the tab's mode says. Leaving plan mode yourself with `/plan` or
+`<leader>p`, which works while no plan waits, puts the tab in Manual. Only you settle a plan: bypass, the card keys and saved rules
+never do. If Claude Code is still deciding about calls it made while planning, an approval waits for them and says
+`waiting for 2 calls to finish`; if one of those calls has a card up, answer the card first. Closing the tab while a
+plan waits asks first and says that closing ends Claude's plan without a decision.
+
+The plan stays in the conversation on the row of the call that proposed it, with how it ended (`approved · manual`,
+or `kept planning:` and the first line of your feedback); `Enter` on that row unfolds the whole plan, and while the
+plan still waits it goes to the plan box. All the keys are in [Keys](keys.md#claudes-plan).
+
 ### Resuming a conversation
 
 A resumed conversation is rebuilt from Claude Code's own session file, and it follows Claude Code's turns. A turn
@@ -146,10 +190,53 @@ mode, and no permission rule applies: it is you running a command. During a turn
 stops it, tells Claude nothing and puts the line back in the box. It has two minutes. `cd` lasts for your next `!` line
 in that tab, but does not move Claude's own commands. `respondToBashCommands` is not read: Claude always answers.
 
+### Images in a message
+
+You can send Claude images with a message. Paste an image into the box (`Ctrl+V`), or drag image files from your file
+manager onto the conversation. Each one becomes a chip above the box with a thumbnail, its name and, once it is
+ready, its type, size and weight (`PNG · 1280×720 · 312 KB`). A message can be images alone. To take an image out,
+click its `×`, or press `←` at the very start of the box to move onto the chips and press `x`
+([Keys](keys.md#in-insert)).
+
+PNG, JPEG, GIF and WebP can be sent. Of a GIF or an animated WebP only the first frame goes. A clipboard that holds
+text beside an image (cells copied from a spreadsheet, say) pastes the text. Only files on this computer can be
+dropped: a folder is refused, and a link dragged from a browser or a file on a network location is left out. Eitri
+prepares each image before it goes:
+
+- A file over 32 MB, wider or taller than 20,000 pixels, or over 40 megapixels is refused.
+- An image over 1568 pixels on its long side or over 1.15 megapixels is scaled down to fit both, then sent as PNG if
+  it has transparent pixels and as JPEG otherwise. A GIF or WebP is always converted this way.
+- A PNG or JPEG already within those bounds is sent as it is, byte for byte, with whatever metadata the file carries
+  (a photo's location, for instance).
+- After that, one image may be at most 3.5 MB.
+
+A draft holds at most 8 images, the most one message can carry, and a window holds at most 64 MB of images that have
+not been sent yet, across its tabs. The agent backend that comes with this release takes at most 8 images and 3.5 MB of images in one message, and
+the text has to fit beside them in a 4 MiB message; the box says which limit a message passed.
+
+A message with images is always a turn of its own. While a turn runs, `Enter` holds it for the turn's end instead of
+putting it into the running turn, and `Ctrl+Enter` refuses it (`Ctrl+Enter cannot send images: Enter queues the
+message with them`). A slash command or a `!` line takes no images: remove them first. A word Eitri runs itself, such
+as `/plan` or `/tasks`, still works and leaves the images in the draft. If the page reloads while a pasted image is still
+being handed to Eitri, that image fails and its chip asks you to paste it again; images already handed over, dropped
+files among them, stay in the draft. Moving a tab to another window leaves its draft's images behind; the box says
+how many.
+
+Once a tab has sent more than 16 MB of images, it says so once: `this conversation now carries 17 MB of images;
+/compact or a new tab if Claude starts failing`. Claude Code keeps every image you send in the session file it writes
+on disk, as it does in a terminal, and Eitri does not remove them. Eitri's own record of the tab keeps only each
+image's type, size and checksum.
+
+Eitri decodes images in a separate process with limits on its memory and time, so a huge or broken file ends that
+process and not the window. The process is not a sandbox: it runs as you, with your files
+([Known issues](../known-issues.md#security)). On a kernel older than Linux 5.11, or in a container that forbids the
+system calls it needs, no image can be decoded and the chip says why. Images work in Claude tabs only: a Codex or ACP tab refuses
+them and says why.
+
 ### Not in a Claude tab yet
 
-Plan mode, attaching files or images to a message, and a list of the scheduled wake-ups and cron tasks. Those still
-fire while the tab stays open, each as a turn of its own. Closing the tab, its view or the window ends them, and
+Attaching files other than images to a message, and a list of the scheduled wake-ups and cron tasks. The wake-ups
+and cron tasks still fire while the tab stays open, each as a turn of its own. Closing the tab, its view or the window ends them, and
 since Eitri has no list of them it does not ask first. The only cron task Claude Code keeps after its session ends is
 one it was told to keep across sessions: it saves that one in the project's `.claude/scheduled_tasks.json`, and may
 run it in a later session there.
@@ -343,6 +430,8 @@ tab's mode.
   `/tasks` and `/workflows` are sent to Codex as typed, and the band only counts the commands still running in the
   background.
 - `<leader>t` (continue in a terminal) flashes "Continuing a Codex session in a terminal is not available yet".
+- No plan mode and no images: `/plan` is sent to Codex as typed, and a pasted or dropped image is refused with the
+  reason.
 - `prefix i` lacks the Claude-only rows (the Claude session ids, the CLI build, permission rules, account and
   model).
 - Saved permission rules, Claude Code's auto mode and the `agent.user_settings` switch do not apply.

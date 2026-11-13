@@ -1839,13 +1839,7 @@ fn plain_tool_spawn_is_followed_by_the_family() {
         })
         .expect("the session starts");
     provider
-        .send_turn_with(
-            SendTurnRequest {
-                session_id: thread.clone(),
-                text: PARENT_PROMPT.to_string(),
-            },
-            policy,
-        )
+        .send_turn_with(SendTurnRequest::text(thread.clone(), PARENT_PROMPT.to_string()), policy)
         .expect("the turn starts");
 
     let mut events: Vec<AgentDomainEvent> = Vec::new();
@@ -2035,10 +2029,7 @@ fn interrupt_a_loop(
         .expect("the session starts");
     provider
         .send_turn_with(
-            SendTurnRequest {
-                session_id: thread.clone(),
-                text: prompt.to_string(),
-            },
+            SendTurnRequest::text(thread.clone(), prompt.to_string()),
             TurnPolicy {
                 reviewer: Reviewer::User,
                 sandbox: agent::Sandbox::Project,
@@ -2270,10 +2261,7 @@ fn an_interrupt_with_a_command_card_waiting_does_not_stop_the_session() {
         .expect("the session starts");
     provider
         .send_turn_with(
-            SendTurnRequest {
-                session_id: thread.clone(),
-                text: "PROMPT-CARD".to_string(),
-            },
+            SendTurnRequest::text(thread.clone(), "PROMPT-CARD".to_string()),
             policy(),
         )
         .expect("the turn starts");
@@ -2348,10 +2336,7 @@ fn an_interrupt_the_moment_a_turn_starts_ends_it() {
             .expect("the session starts");
         provider
             .send_turn_with(
-                SendTurnRequest {
-                    session_id: thread.clone(),
-                    text: "PROMPT-AT-START".to_string(),
-                },
+                SendTurnRequest::text(thread.clone(), "PROMPT-AT-START".to_string()),
                 policy,
             )
             .expect("the turn starts");

@@ -493,6 +493,33 @@ fn the_linked_window_subcommand_is_dispatched_before_the_project_resolver() {
     );
 }
 
+/// The image decoder child is served before anything in `main` reads the environment or a descriptor: its dispatch
+/// is `main`'s first statement, so nothing can be added above it without this test seeing it.
+#[test]
+fn the_attachment_decoder_is_dispatched_first() {
+    // Split literals, so this test's own text is not counted.
+    let src = include_str!("main.rs");
+    let start = src.find(concat!("fn main() -> glib", "::ExitCode {")).expect("main");
+    let body = eitri_core::rust_mask::code_only(&src[start..]);
+    let flat: String = body.split_whitespace().collect();
+    let first = eitri_core::rust_mask::code_only(concat!(
+        "fn main() -> glib::ExitCode {\n",
+        "    #[cfg(target_os = \"linux\")]\n",
+        "    if std::env::args_os().nth(1).is_some_and(|a| a == eitri_core::attachments::",
+        "SUBCOMMAND) {\n",
+        "        eitri_core::attachments::decoder_child",
+        "_main();\n",
+        "    }\n",
+    ));
+    let first: String = first.split_whitespace().collect();
+    assert!(
+        flat.starts_with(&first),
+        "main must open with the decoder's dispatch: {}",
+        &flat[..first.len().min(flat.len())]
+    );
+    assert_eq!(eitri_core::attachments::SUBCOMMAND, "attachment-decoder");
+}
+
 /// Window 2 builds every module but the editor, so nothing in `build_ui` may assume the editor exists: its
 /// pane is an `Option` from the editor phase on, and nothing takes the pane out of it by force.
 #[test]

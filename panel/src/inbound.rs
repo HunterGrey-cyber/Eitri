@@ -278,6 +278,81 @@ fn question_sent(
     }
 }
 
+/// Why `Ctrl+Enter` is refused while the draft holds images: it sends words only, and Enter queues the message whole.
+pub(super) const SEND_NOW_BESIDE_IMAGES: &str =
+    "Ctrl+Enter sends text only: press Enter to send the message with its images, or remove them first";
+
+/// What the window's attachment desk answered: each page request's `command_result` (a begin's names its image),
+/// then the draft changes and warnings each tab's page is owed.
+pub(super) fn poll_attachments(state: &mut AgentPanelState, out: &mut Outbox) {
+    for answer in state.tabs.poll_attachments() {
+        let Some(owed) = state.owed.take(&answer.owed) else {
+            continue;
+        };
+        let Some(page) = owed.page else { continue };
+        let told = match &answer.result {
+            Ok(Some(id)) => eitri_core::agent_bridge::serialize_attach_begun_for_js(&owed.request_id, id),
+            Ok(None) => serialize_command_result_for_js(&owed.request_id, Ok(())),
+            Err(why) => serialize_command_result_for_js(&owed.request_id, Err(why)),
+        };
+        out.send(page, told);
+    }
+    send_attachment_payloads(state, out);
+    // A warning about a tab no page shows waits in the tab set until one does.
+    let shown: Vec<TabId> = state
+        .tabs
+        .tabs()
+        .iter()
+        .map(|t| t.id)
+        .filter(|tab| state.page_of(*tab).is_some())
+        .collect();
+    for (tab, warning) in state.tabs.take_image_warnings(|tab| shown.contains(&tab)) {
+        if let Some(view) = state.page_of(tab) {
+            out.send(view, eitri_core::agent_bridge::serialize_notice_for_js(&warning));
+        }
+    }
+    // An import whose tab has gone (closed, or moved to the other window) is answered now: its page waits on each
+    // request in turn, and an answer never sent would hold that page's next import and its Send for good.
+    let gone: Vec<String> = state
+        .owed
+        .owed
+        .iter()
+        .filter(|(_, answer)| matches!(answer.what, Owed::Attach(tab) if state.tabs.get(tab).is_none()))
+        .map(|(key, _)| key.clone())
+        .collect();
+    for key in gone {
+        let Some(owed) = state.owed.take(&key) else { continue };
+        if let Some(page) = owed.page {
+            out.send(
+                page,
+                serialize_command_result_for_js(&owed.request_id, Err(IMPORT_TAB_GONE)),
+            );
+        }
+    }
+}
+
+/// What a page is told of an import whose tab left this window while the image was on its way.
+pub(super) const IMPORT_TAB_GONE: &str = "this image's tab is no longer in this window: paste it again";
+
+/// Whether an import's answer is owed for a tab that has gone: the tick runs until it is given.
+pub(super) fn owes_gone_imports(state: &AgentPanelState) -> bool {
+    state
+        .owed
+        .owed
+        .values()
+        .any(|answer| matches!(answer.what, Owed::Attach(tab) if state.tabs.get(tab).is_none()))
+}
+
+/// The draft image changes owed to the page of each tab; a tab no page shows takes its draft with its next
+/// snapshot instead.
+pub(super) fn send_attachment_payloads(state: &mut AgentPanelState, out: &mut Outbox) {
+    for (tab, payload) in state.tabs.take_attachment_payloads() {
+        if let Some(view) = state.page_of(tab) {
+            out.send(view, payload);
+        }
+    }
+}
+
 /// Tells each page whose answer the agent replied to: a `command_result`, a refusal with the question
 /// waiting again. Every refusal or failure of an answer is benign, so none ends a session here. The
 /// handle is dropped once read, which lets the chat move again.
@@ -632,10 +707,19 @@ pub(super) fn handle_inbound_message(
             for pending in &mut state.question_sends {
                 pending.orphaned |= pending.view == view;
             }
+            for pending in &mut state.plan_sends {
+                pending.orphaned |= pending.view() == view;
+            }
+            for pending in &mut state.planning_switches {
+                pending.orphaned |= pending.view() == view;
+            }
             // A held message of the document that was here answers a page that is gone.
             super::mentions::drop_view(state, view, &mut out);
             super::symbol_lookup::drop_view(state, view);
             super::review_glue::drop_view(state, view);
+            // An image the document that was here was still sending has no one left to finish it: it fails now,
+            // before the snapshot below carries the draft, rather than waiting as "importing" for good.
+            state.tabs.abandon_imports_of(view);
             // A stream envelope the typing cadence still holds is already in the snapshot below
             // (it was drained from the queue and folded into the projection before it was held);
             // sent after that snapshot it would draw the same text twice.
@@ -807,8 +891,21 @@ pub(super) fn handle_inbound_message(
                 Err(why) => refuse(&mut out, &why),
             }
         }
-        InboundMessage::SendMessage { text, .. } => {
+        InboundMessage::SendMessage { text, attachments, .. } => {
             let tab = tab_of(target);
+            // The draft's images it names, ready, in order; they leave the draft only once the message has
+            // gone (or is queued), so a refusal leaves text and images where they were.
+            let images = match state.tabs.draft_images(tab, &attachments) {
+                Ok(images) => images,
+                Err(why) => {
+                    refuse(&mut out, &why);
+                    return out;
+                }
+            };
+            if !images.is_empty() && text.trim_start().starts_with('/') {
+                refuse(&mut out, eitri_core::agent_backend::NO_IMAGES_WITH_A_COMMAND);
+                return out;
+            }
             // A sent prompt is history whether or not the backend takes it, as in Claude Code.
             remember_prompts(state, std::slice::from_ref(&text), &mut out);
             // ...and no longer the tab's draft (a refusal puts it back in the box panel-side).
@@ -846,6 +943,7 @@ pub(super) fn handle_inbound_message(
                             wire: composed,
                             typed: text.clone(),
                             shell_line: false,
+                            attachments: images,
                         }),
                         // The session waits for the trust check (and, when it must, the question)
                         // before anything is spawned.
@@ -854,6 +952,7 @@ pub(super) fn handle_inbound_message(
                             wire: composed,
                             typed: text.clone(),
                             shell_line: false,
+                            attachments: images,
                         }),
                         TabBackend::Starting(_) => Plan::Refused("the session is still starting"),
                         TabBackend::AwaitingTrust(_) => Plan::Refused("waiting for the trust question"),
@@ -1112,6 +1211,28 @@ pub(super) fn handle_inbound_message(
                 .decline_question(tab, view, &interaction_id, kind.kind(), so_far);
             question_sent(state, screen, view, tab, &request_id, sent, &mut out);
         }
+        // Only the person settles Claude's plan, from the page that shows its tab, past the window's gate
+        // (admission); the tab set checks the page, the plan and the digest again. The decision goes out
+        // without waiting for the agent; its `command_result` follows from the tick (`poll_plan_sends`).
+        InboundMessage::PlanResolve(message) => {
+            super::plan_glue::resolve_plan(state, screen, view, tab_of(target), message, &mut out);
+        }
+        // The person's own move into or out of plan mode, admitted as a plan decision is.
+        InboundMessage::SetPlanning { enter, .. } => {
+            super::plan_glue::set_planning(state, screen, view, tab_of(target), &request_id, enter, &mut out);
+        }
+        // A mirror only, never a decision: refused when the plan no longer waits or the page does not show the
+        // tab, silent otherwise.
+        InboundMessage::PlanFeedbackDraft {
+            interaction_id, text, ..
+        } => {
+            if let Err(why) = state
+                .tabs
+                .set_plan_feedback_draft(tab_of(target), view, &interaction_id, text)
+            {
+                refuse(&mut out, &why);
+            }
+        }
         // The window's HINT session reacts by calling back into this panel, so it is told once the
         // step is over.
         InboundMessage::HintRequest { .. } => out.effect(Effect::Hint(HintInbound::Request)),
@@ -1367,6 +1488,7 @@ pub(super) fn handle_inbound_message(
                         wire: text.clone(),
                         typed: text,
                         shell_line: true,
+                        attachments: Vec::new(),
                     },
                 };
                 match gate_start(state, tab, start) {
@@ -1400,12 +1522,31 @@ pub(super) fn handle_inbound_message(
             text,
             turn_id,
             after_turn,
+            attachments,
             ..
         } => {
             let tab = tab_of(target);
+            let images = match state.tabs.draft_images(tab, &attachments) {
+                Ok(images) => images,
+                Err(why) => {
+                    refuse(&mut out, &why);
+                    return out;
+                }
+            };
             // Captured now: what the editor shows when Enter is pressed.
             let wire = super::mentions::compose(state, &text);
-            let queued = if after_turn {
+            let queued = if !images.is_empty() {
+                // Never into the running turn: a message with images waits for its end, as its own turn.
+                state.tabs.queue_message_with_images(
+                    tab,
+                    &text,
+                    wire,
+                    now_ms(),
+                    after_turn,
+                    agent::PromptOrigin::Typed,
+                    images,
+                )
+            } else if after_turn {
                 state
                     .tabs
                     .queue_after_turn(tab, &text, wire, now_ms(), agent::PromptOrigin::Typed)
@@ -1434,16 +1575,73 @@ pub(super) fn handle_inbound_message(
         }
         InboundMessage::TakeBackQueue { .. } => {
             let tab = tab_of(target);
-            let texts = state.tabs.take_back_queue(tab);
+            let drafts = state.tabs.take_back_queue(tab);
             out.send(
                 view,
-                eitri_core::agent_bridge::serialize_queue_taken_for_js(tab, &texts),
+                eitri_core::agent_bridge::serialize_queue_taken_drafts_for_js(tab, &drafts),
             );
+            // The images it gave back are in the draft again: the page is sent the draft's images with them.
+            send_attachment_payloads(state, &mut out);
             send_queue(state, tab, &mut out);
             ok(&mut out);
         }
+        // Each answer comes once the window's attachment desk has done the work off this thread
+        // (`poll_attachments`); a refusal here comes now.
+        InboundMessage::AttachBegin {
+            generation,
+            byte_length,
+            name,
+            ..
+        } => {
+            let tab = tab_of(target);
+            let owed = state.owed.owe(view, &request_id, Owed::Attach(tab));
+            let begun = state.tabs.attach_begin(tab, generation, byte_length, &name, &owed);
+            if let Err(why) = begun {
+                state.owed.take(&owed);
+                refuse(&mut out, &why);
+            }
+        }
+        InboundMessage::AttachChunk {
+            attachment_id,
+            offset,
+            data_b64,
+            ..
+        } => {
+            let tab = tab_of(target);
+            let owed = state.owed.owe(view, &request_id, Owed::Attach(tab));
+            let taken = state.tabs.attach_chunk(tab, &attachment_id, offset, &data_b64, &owed);
+            if let Err(why) = taken {
+                state.owed.take(&owed);
+                refuse(&mut out, &why);
+            }
+            send_attachment_payloads(state, &mut out);
+        }
+        InboundMessage::AttachEnd {
+            attachment_id, sha256, ..
+        } => {
+            let tab = tab_of(target);
+            let owed = state.owed.owe(view, &request_id, Owed::Attach(tab));
+            let taken = state.tabs.attach_end(tab, &attachment_id, &sha256, &owed);
+            if let Err(why) = taken {
+                state.owed.take(&owed);
+                refuse(&mut out, &why);
+            }
+            send_attachment_payloads(state, &mut out);
+        }
+        InboundMessage::AttachCancel { attachment_id, .. } | InboundMessage::AttachRemove { attachment_id, .. } => {
+            let tab = tab_of(target);
+            match state.tabs.attach_remove(tab, &attachment_id) {
+                Ok(()) => ok(&mut out),
+                Err(why) => refuse(&mut out, &why),
+            }
+        }
         InboundMessage::SendNow { text, .. } => {
             let tab = tab_of(target);
+            // `send_now` carries words only: with images in the draft it would send the text without them.
+            if !text.trim().is_empty() && state.tabs.get(tab).is_some_and(|t| !t.attachments.is_empty()) {
+                refuse(&mut out, SEND_NOW_BESIDE_IMAGES);
+                return out;
+            }
             let wire = super::mentions::compose(state, &text);
             let result = state.tabs.send_now(tab, &text, wire, now_ms());
             if !text.trim().is_empty() {

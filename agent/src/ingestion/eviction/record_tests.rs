@@ -234,7 +234,7 @@ fn canonical(mut parts: HistoryParts) -> HistoryParts {
 }
 
 #[test]
-fn eviction_preserves_all_six_saved_kinds_without_thinking_or_endings() {
+fn eviction_preserves_all_seven_saved_kinds_without_thinking_or_endings() {
     let scratch = Scratch::new();
     let state = filled(12);
     let expected = {
@@ -251,6 +251,12 @@ fn eviction_preserves_all_six_saved_kinds_without_thinking_or_endings() {
             )
             .unwrap(),
         );
+        st.projection.plans.push(
+            serde_json::from_value(
+                json!({"seq":4,"interaction_id":"p","plan":"# Plan\n","state":{"kind":"settled","outcome":"approved"}}),
+            )
+            .unwrap(),
+        );
         background(&mut st);
         crate::history::store::newest_that_fit(crate::history::store::HistoryView::of(&st.projection))
     };
@@ -260,6 +266,7 @@ fn eviction_preserves_all_six_saved_kinds_without_thinking_or_endings() {
     assert_eq!(st.history_tail.turn_starts.len(), 1);
     assert_eq!(st.history_tail.notices.len(), 1);
     assert_eq!(st.history_tail.questions.len(), 1);
+    assert_eq!(st.history_tail.plans.len(), 1);
     assert!(!serde_json::to_value(&st.history_tail)
         .unwrap()
         .as_object()
@@ -271,7 +278,7 @@ fn eviction_preserves_all_six_saved_kinds_without_thinking_or_endings() {
             .as_object()
             .unwrap()
             .len(),
-        6
+        7
     );
 }
 

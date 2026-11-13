@@ -14,11 +14,12 @@ import { failRequest, receiveDiff, receiveDraft, receivePreview, receiveRecovery
 import type { ReviewState } from "./review";
 import type { StopWork } from "./stopAsk";
 import { acceptsEnvelope, withoutHandoff } from "./tabs";
+import { isPlanModeRefusal, withPlanning } from "./fold/plans";
 import { durationsFromSnapshot, durationsWith, NO_TURN_DURATIONS } from "./turnTimes";
 import type { TurnDurations } from "./turnTimes";
 import { REVIEW_SETTINGS_OFF, THINKING_DISPLAYS } from "./types";
 import type {
-  PageLine, AgentUiState, ChooserEnvelope, ContextSummary, EditorLink, HandoffCommand, Hello, QueueItem,
+  DraftImage, DraftImages, PageLine, AgentUiState, ChooserEnvelope, ContextSummary, EditorLink, HandoffCommand, Hello, QueueItem,
   ReviewRecoveryEntry, ReviewSettings, TabId, TabsEnvelope, ThinkingDisplay, TurnClock,
 } from "./types";
 
@@ -65,9 +66,14 @@ export type Envelope = InboundPayload & { receivedAt: number; monotonicAt?: numb
  *  - `"follow"`: `<leader>e`. Rust refuses it for a tab a float covers, one that is moving, or one that is gone; the
  *    page has already said what it expects, so the refusal is the flash that follows it. */
 export type CommandRecord = {
-  kind: "history" | "send" | "handoff" | "editor" | "link" | "permission" | "picker-send" | "review" | "review-command" | "trust" | "tabnew" | "stop-background" | "follow" | "reset";
+  kind: "history" | "send" | "handoff" | "editor" | "link" | "permission" | "picker-send" | "review" | "review-command" | "trust" | "tabnew" | "stop-background" | "follow" | "reset"
+    /** `set_planning` (`<leader>p`, `/plan`): a refusal is a flash. `mode`: a `cycle_mode`, whose refusal while plan
+     *  mode holds the tab is a flash too (`isPlanModeRefusal`); any other refusal is the banner, as before. */
+    | "plan" | "mode";
   tab: TabId;
   text?: string;
+  /** The draft images a send named: a refusal shows them again with its text. */
+  attachments?: string[];
   permissionId?: string;
   /** An `open_in_editor` from the review overlay: its answer, good or bad, is the overlay's status line. */
   review?: true;
@@ -145,6 +151,9 @@ export type PageModel = {
   renaming: { tab: TabId; initial: string } | null;
   /** `queue_taken`, for the composer to merge into its box. */
   queueTaken: { texts: string[]; seq: number } | null;
+  /** The active tab's draft images (`draft_attachments`, `attachment_state`); none and not offered until the host
+   *  says, and after a switch until the new tab's draft arrives. */
+  draftImages: DraftImages;
   queueTakenSequence: number;
   state: AgentUiState;
   hello: Hello | null;
@@ -234,12 +243,21 @@ export type PageModel = {
   chooser: ChooserEnvelope | null;
 };
 
+/** A draft with no images, before the host has said whether the tab takes them. */
+export const NO_DRAFT_IMAGES: DraftImages = { generation: 0, imageInput: false, why: null, items: [] };
+
+/** A draft image with only the fields the host sends for it. */
+function chipOf(value: DraftImage): DraftImage {
+  const { attachmentId, name, state, mediaType, width, height, bytes, thumbnail, reason } = value;
+  return { attachmentId, name, state, mediaType, width, height, bytes, thumbnail, reason };
+}
+
 export function initialPageModel(): PageModel {
   return {
     answerEpoch: 0, inputRequest: 0, arriveRequest: 0, permissionRequest: 0, navKey: null,
     pages: [],
     keymapHelp: { prefix: "Ctrl+b", window: [], prefixKeys: [], panel: EMPTY_PANEL_TABLE, newTabChord: "" },
-    heldTrust: null, confirm: null, renaming: null, queueTaken: null, queueTakenSequence: 0,
+    heldTrust: null, confirm: null, renaming: null, queueTaken: null, queueTakenSequence: 0, draftImages: NO_DRAFT_IMAGES,
     state: initialState(), hello: null, tabs: null, keptStates: new Map(), fatalError: null,
     handoff: null, handoffRequests: new Map(), commandNotice: null, rootNote: null, inFlight: new Map(),
     turnClock: null, turnDurations: NO_TURN_DURATIONS, thinkingDisplay: "collapsed", paneFocused: false,
@@ -343,6 +361,21 @@ function reduceEnvelope(model: PageModel, envelope: Envelope): PageModel {
       };
     case "trust_prompt":
       return { ...model, heldTrust: envelope };
+    case "draft_attachments":
+      return {
+        ...model, draftImages: {
+          generation: envelope.generation, imageInput: envelope.imageInput, why: envelope.why ?? null,
+          items: envelope.attachments.map(chipOf),
+        },
+      };
+    case "attachment_state": {
+      // One image changed: it keeps its place in the draft, and a new one joins at the end.
+      const item = chipOf(envelope);
+      const items = model.draftImages.items.some((i) => i.attachmentId === item.attachmentId)
+        ? model.draftImages.items.map((i) => (i.attachmentId === item.attachmentId ? item : i))
+        : [...model.draftImages.items, item];
+      return { ...model, draftImages: { ...model.draftImages, items } };
+    }
     case "queue_taken":
       return {
         ...model, queueTakenSequence: model.queueTakenSequence + 1,
@@ -394,7 +427,7 @@ function reduceEnvelope(model: PageModel, envelope: Envelope): PageModel {
       return {
         ...model,
         ...(switched ? {
-          answerEpoch: model.answerEpoch + 1, queueTaken: null,
+          answerEpoch: model.answerEpoch + 1, queueTaken: null, draftImages: NO_DRAFT_IMAGES,
           turnClock: null, turnDurations: NO_TURN_DURATIONS, handoff: null, fatalError: null,
           commandNotice: null, queue: [], queueError: null, queueNote: null, queueSteers: null, shellRunning: false,
           ruleOffers: {}, scratchEditing: false, chooser: null,
@@ -443,7 +476,8 @@ function reduceEnvelope(model: PageModel, envelope: Envelope): PageModel {
         }
       }
       return {
-        ...model, state: applyCallNotes(applyEvents(model.state, envelope.events, envelope.revisions), envelope),
+        // Plan mode as the host reads it after this batch, beside the events rather than among them.
+        ...model, state: withPlanning(applyCallNotes(applyEvents(model.state, envelope.events, envelope.revisions), envelope), envelope.planningChanged),
         turnClock, turnDurations: durationsWith(model.turnDurations, envelope.turnTimes),
       };
     }
@@ -479,7 +513,9 @@ function reduceEnvelope(model: PageModel, envelope: Envelope): PageModel {
           // nothing waited for it and the conversation is untouched, so it is not the user's error. The page's
           // log keeps it. Any other refusal of a mirror (a draft too large to keep) means the person's text will
           // not survive a switch, so it is said like any other refusal.
-        } else if (!record || !["history", "trust", "picker-send", "editor", "link", "tabnew", "stop-background", "follow", "reset"].includes(record.kind)) {
+        } else if (record?.kind === "mode" && isPlanModeRefusal(envelope.error)) {
+          // Said where the key was pressed, as a flash (`App.tsx`).
+        } else if (!record || !["history", "trust", "picker-send", "editor", "link", "tabnew", "stop-background", "follow", "reset", "plan"].includes(record.kind)) {
           // The kinds left out are already said (trust) or are a footer flash the page shows; everything else,
           // a refused permission answer included, is the banner.
           next.commandNotice = envelope.error;

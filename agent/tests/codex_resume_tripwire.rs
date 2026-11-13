@@ -422,10 +422,7 @@ fn a_turn_after_an_unread_tripwire_is_refused() {
     until(|| provider.lines_read_for_tests() >= 4);
     let started = std::time::Instant::now();
     let sent = provider.send_turn_with(
-        SendTurnRequest {
-            session_id: "th-t".into(),
-            text: "go".into(),
-        },
+        SendTurnRequest::text("th-t", "go"),
         TurnPolicy {
             reviewer: Reviewer::User,
             sandbox: agent::Sandbox::Project,
@@ -538,10 +535,7 @@ fn a_tripped_session_takes_no_turn() {
     );
     pump_until(&provider, |events| mismatch_in(events).is_some());
     let refused = provider.send_turn_with(
-        SendTurnRequest {
-            session_id: "th-t".into(),
-            text: "go".into(),
-        },
+        SendTurnRequest::text("th-t", "go"),
         TurnPolicy {
             reviewer: Reviewer::User,
             sandbox: agent::Sandbox::Project,
@@ -811,10 +805,7 @@ fn resume_of_a_thread_held_elsewhere_is_rejected_with_codex_message() {
         ] if requested_provider_session_id == "th-held" && detail == "thread th-held is open in another Codex client"
     ));
     let refused = provider.send_turn_with(
-        SendTurnRequest {
-            session_id: "th-held".into(),
-            text: "go".into(),
-        },
+        SendTurnRequest::text("th-held", "go"),
         TurnPolicy {
             reviewer: Reviewer::User,
             sandbox: agent::Sandbox::Project,
@@ -856,10 +847,7 @@ fn a_resume_that_continues_another_thread_is_not_taken() {
     );
     assert!(provider.take_history().is_empty());
     let refused = provider.send_turn_with(
-        SendTurnRequest {
-            session_id: "th-old".into(),
-            text: "go".into(),
-        },
+        SendTurnRequest::text("th-old", "go"),
         TurnPolicy {
             reviewer: Reviewer::User,
             sandbox: agent::Sandbox::Project,
@@ -910,10 +898,7 @@ fn a_tripwire_behind_a_flood_still_stops_the_next_turn() {
     let _ = std::fs::remove_file(&file);
 
     let sent = provider.send_turn_with(
-        SendTurnRequest {
-            session_id: "th-old".into(),
-            text: "go".into(),
-        },
+        SendTurnRequest::text("th-old", "go"),
         TurnPolicy {
             reviewer: Reviewer::User,
             sandbox: agent::Sandbox::Project,

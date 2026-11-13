@@ -113,10 +113,7 @@ fn a_broken_watch_stream_recovers_without_loss_or_duplication() {
     let session_id = open(&provider);
 
     provider
-        .send_turn(SendTurnRequest {
-            session_id: session_id.clone(),
-            text: STREAMING_PROMPT.into(),
-        })
+        .send_turn(SendTurnRequest::text(session_id.clone(), STREAMING_PROMPT))
         .unwrap();
 
     let all = drain_until(&provider, Duration::from_secs(180), turn_ended);
@@ -176,10 +173,10 @@ fn a_broken_watch_stream_recovers_without_loss_or_duplication() {
     // And the session is still usable afterwards -- a recovery that leaves a one-turn conversation
     // is not a recovery.
     provider
-        .send_turn(SendTurnRequest {
-            session_id: session_id.clone(),
-            text: "reply with exactly: still-here".into(),
-        })
+        .send_turn(SendTurnRequest::text(
+            session_id.clone(),
+            "reply with exactly: still-here",
+        ))
         .unwrap();
     let second = drain_until(&provider, Duration::from_secs(120), turn_ended);
     assert!(
@@ -225,10 +222,7 @@ fn a_gap_too_large_to_replay_ends_the_session_visibly() {
     let session_id = open(&provider);
 
     provider
-        .send_turn(SendTurnRequest {
-            session_id,
-            text: STREAMING_PROMPT.into(),
-        })
+        .send_turn(SendTurnRequest::text(session_id, STREAMING_PROMPT))
         .unwrap();
 
     let all = drain_until(&provider, Duration::from_secs(180), |events| {
@@ -376,10 +370,7 @@ fn a_stalled_consumer_is_lossless_and_its_cost_is_measured() {
     assert_eq!(before.pending_events, 0);
 
     provider
-        .send_turn(SendTurnRequest {
-            session_id: session_id.clone(),
-            text: STREAMING_PROMPT.into(),
-        })
+        .send_turn(SendTurnRequest::text(session_id.clone(), STREAMING_PROMPT))
         .unwrap();
 
     // Sample without pumping until the queue proves a backlog has accumulated.

@@ -75,6 +75,8 @@ mod pair_review;
 mod path_lookup;
 #[path = "path_menu.rs"]
 mod path_menu;
+#[path = "plan_glue.rs"]
+mod plan_glue;
 #[path = "remote_enroll.rs"]
 mod remote_enroll;
 #[path = "remote_entry.rs"]
@@ -313,6 +315,10 @@ struct AgentPanelState {
     /// Answers to Claude's questions on their way to the agent, polled by the tick: the GTK thread
     /// never waits for the agent's reply, and the page that answered is told once it came.
     question_sends: Vec<PendingQuestionSend>,
+    /// Decisions on Claude's plans on their way to the agent (or an approval waiting for calls to finish), and
+    /// the person's switches into or out of plan mode, polled by the tick as `question_sends` are.
+    plan_sends: Vec<plan_glue::PendingPlanSend>,
+    planning_switches: Vec<plan_glue::PendingPlanningSwitch>,
     permission_sends: Vec<PendingPermissionSend>,
     /// A phone's calls out to the provider, polled by the tick, and their results for the socket to take.
     remote: RemoteCalls,
@@ -661,6 +667,8 @@ impl AgentPanelState {
             task_commands: Vec::new(),
             review_jobs: Vec::new(),
             question_sends: Vec::new(),
+            plan_sends: Vec::new(),
+            planning_switches: Vec::new(),
             permission_sends: Vec::new(),
             remote: RemoteCalls::default(),
             proposal_jobs: Vec::new(),
@@ -1259,6 +1267,7 @@ mod tests {
                         turn_running: false,
                         draft: None,
                         row_key: None,
+                        plan_origin: None,
                     })
                     .collect(),
                 0,
@@ -1611,6 +1620,7 @@ mod tests {
                 wire: format!("wire: {text}"),
                 typed: text.to_string(),
                 shell_line: false,
+                attachments: Vec::new(),
             },
         }
     }

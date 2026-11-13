@@ -527,6 +527,7 @@ fn a_turn_ends_on_the_agents_last_row_even_with_a_prompt_already_after_it() {
         seq: 5,
         text: "next".to_string(),
         delivered: false,
+        attachments: Vec::new(),
     });
     projection.active_turn_id = None;
     observe_turn_clock(&mut clock, &mut times, &mut unsent, &projection, 3_000);

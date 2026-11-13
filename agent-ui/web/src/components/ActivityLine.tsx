@@ -58,6 +58,10 @@ export function ActivityLine({ state, turnClock = null, canInterrupt, onInterrup
   if (state.questions.some((q) => q.state.kind !== "settled")) return (
     <div className="activity-line activity-question">⚑ Claude has a question{mode === "browse" ? " — i to answer" : ""}</div>
   );
+  // Only a person's choice on the dock settles a plan: the line names where that is, never a card key.
+  if ((state.plans ?? []).some((p) => p.state.kind !== "settled")) return (
+    <div className="activity-line activity-question">⚑ plan needs review{mode === "browse" ? " — i to review" : ""}</div>
+  );
   if (!working && shellRunning) return (
     <div className="activity-line" data-nav-stop="status">
       <span className="turn-activity">Running…</span>

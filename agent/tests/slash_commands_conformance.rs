@@ -98,10 +98,7 @@ fn run_probe_turn(provider: &ClaudeSidecarProvider, session_id: &str, text: &str
         final_status: "timed_out",
     };
 
-    if let Err(err) = provider.send_turn(SendTurnRequest {
-        session_id: session_id.to_string(),
-        text: text.to_string(),
-    }) {
+    if let Err(err) = provider.send_turn(SendTurnRequest::text(session_id.to_string(), text.to_string())) {
         result.events.push(format!("send_turn error: {err:?}"));
         result.final_status = "send_error";
         return result;

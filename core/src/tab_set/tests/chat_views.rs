@@ -416,7 +416,7 @@ fn legacy_events_reach_the_page_on_the_next_pump() {
     let tab = set.active();
     let mut backend = AgentBackend::Legacy(agent::AgentSession::for_tests());
     let outcome: Result<(), BackendError> = backend
-        .send_turn("wire text", "typed text", PromptOrigin::Composed)
+        .send_turn("wire text", "typed text", PromptOrigin::Composed, Vec::new())
         .map(|_| ());
     assert!(
         outcome.is_ok(),
@@ -439,7 +439,9 @@ fn a_rejected_legacy_send_keeps_its_prompt_in_the_pump() {
     let mut set = set();
     let tab = set.active();
     let mut backend = AgentBackend::Legacy(agent::AgentSession::for_tests());
-    backend.send_turn("first", "first", PromptOrigin::Composed).unwrap();
+    backend
+        .send_turn("first", "first", PromptOrigin::Composed, Vec::new())
+        .unwrap();
     set.get_mut(tab).unwrap().backend = TabBackend::Live(backend);
     set.pump_views(&dir, &|_| true);
     let error = set
@@ -447,7 +449,7 @@ fn a_rejected_legacy_send_keeps_its_prompt_in_the_pump() {
         .unwrap()
         .live_mut()
         .unwrap()
-        .send_turn("second", "second", PromptOrigin::Composed)
+        .send_turn("second", "second", PromptOrigin::Composed, Vec::new())
         .unwrap_err();
     assert!(
         error.benign,
@@ -467,7 +469,9 @@ fn a_legacy_snapshot_covers_queued_local_events() {
     let mut set = set();
     let tab = set.active();
     let mut backend = AgentBackend::Legacy(agent::AgentSession::for_tests());
-    backend.send_turn("first", "first", PromptOrigin::Composed).unwrap();
+    backend
+        .send_turn("first", "first", PromptOrigin::Composed, Vec::new())
+        .unwrap();
     let revision = backend.projection().last_revision;
     backend.note_ui_snapshot(revision);
     set.get_mut(tab).unwrap().backend = TabBackend::Live(backend);

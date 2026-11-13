@@ -156,10 +156,18 @@ fn is_plain_stream_content(event: &AgentDomainEvent) -> bool {
         | AgentDomainEvent::SessionNotice { .. }
         | AgentDomainEvent::QuestionAsked { .. }
         | AgentDomainEvent::QuestionSettled { .. } => false,
-        // Work going on out of sight changes what closing asks, and a prompt taken back changes a
-        // row the user is looking at.
+        // A plan the person has to decide on, its end, and a change of the plan phase: each changes the
+        // dock or the mode badge the user is looking at.
+        AgentDomainEvent::PlanProposed { .. }
+        | AgentDomainEvent::PlanSettled { .. }
+        | AgentDomainEvent::CliPlanMode { .. }
+        | AgentDomainEvent::PlanTransitionStarted { .. }
+        | AgentDomainEvent::PlanTransitionUndone { .. } => false,
+        // Work going on out of sight changes what closing asks, and a prompt taken back, or the images
+        // its row shows, change a row the user is looking at.
         AgentDomainEvent::CliWorkUnseen
         | AgentDomainEvent::UserPromptWithdrawn
+        | AgentDomainEvent::UserPromptAttachments { .. }
         | AgentDomainEvent::TurnCauseUpdated { .. }
         | AgentDomainEvent::CliCycleStarted { .. }
         | AgentDomainEvent::BackgroundTasksChanged { .. }

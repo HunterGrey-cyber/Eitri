@@ -30,9 +30,9 @@
 use std::path::{Path, PathBuf};
 
 use crate::projection::{
-    AgentDomainEvent, AgentSessionProjection, ContentKind, HistoryNotice, HistorySource, NoticeRecord, QuestionOutcome,
-    QuestionRecord, QuestionState, ToolCallRecord, TranscriptMessage, TurnEndDetail, TurnOutcome, TurnStartRecord,
-    UserPromptRecord,
+    AgentDomainEvent, AgentSessionProjection, ContentKind, HistoryNotice, HistorySource, NoticeRecord, PlanOutcome,
+    PlanRecord, PlanState, QuestionOutcome, QuestionRecord, QuestionState, ToolCallRecord, TranscriptMessage,
+    TurnEndDetail, TurnOutcome, TurnStartRecord, UserPromptRecord,
 };
 
 use super::store::{self, HistoryLoadError, StoredHistory};
@@ -123,6 +123,7 @@ fn restorable_item_count(projection: &AgentSessionProjection) -> usize {
         + projection.turn_starts.len()
         + projection.notices.len()
         + projection.questions.len()
+        + projection.plans.len()
 }
 
 /// What came of trying to read the Claude CLI's own transcript.
@@ -302,6 +303,7 @@ fn load_stored(
     let items_before = restorable_item_count(projection);
     let refold = stored_events(&capped);
     let mut question_turns = refold.question_turns.into_iter();
+    let mut plan_turns = refold.plan_turns.into_iter();
     for event in refold.events {
         projection.apply(&event);
         match event {
@@ -320,6 +322,12 @@ fn load_stored(
             AgentDomainEvent::QuestionAsked { .. } => {
                 if let Some(record) = projection.questions.last_mut() {
                     record.turn_id = question_turns.next().flatten();
+                }
+            }
+            // Likewise a plan: `PlanProposed` names no turn either.
+            AgentDomainEvent::PlanProposed { .. } => {
+                if let Some(record) = projection.plans.last_mut() {
+                    record.turn_id = plan_turns.next().flatten();
                 }
             }
             _ => {}
@@ -355,10 +363,11 @@ fn load_stored(
 /// Restored turns are closed turns: a stored turn start becomes its `TurnStarted` and attribution,
 /// and the turn ends, completed, before the next turn start or the next prompt of the user's own
 /// (a delivered prompt was read inside the running turn and does not end it), or after the last
-/// item. A question stored while it waited is settled `SessionClosed`: nothing can answer it now.
+/// item. A question or a plan stored while it waited is settled `SessionClosed`: nothing can answer it now.
 ///
-/// `question_turns` holds each refolded question's stored turn, in the order of its `QuestionAsked`
-/// in `events`: the event carries none, and the folder puts it back on the record.
+/// `question_turns` and `plan_turns` hold each refolded question's and plan's stored turn, in the order of
+/// its `QuestionAsked` or `PlanProposed` in `events`: the event carries none, and the folder puts it back on
+/// the record.
 fn stored_events(stored: &StoredHistory) -> Refold {
     enum Item<'a> {
         Prompt(&'a UserPromptRecord),
@@ -367,6 +376,7 @@ fn stored_events(stored: &StoredHistory) -> Refold {
         TurnStart(&'a TurnStartRecord),
         Notice(&'a NoticeRecord),
         Question(&'a QuestionRecord),
+        Plan(&'a PlanRecord),
     }
     let mut items: Vec<(u64, u8, Item<'_>)> = Vec::new();
     for prompt in &stored.user_prompts {
@@ -387,6 +397,9 @@ fn stored_events(stored: &StoredHistory) -> Refold {
     for question in &stored.questions {
         items.push((question.seq, 5, Item::Question(question)));
     }
+    for plan in &stored.plans {
+        items.push((plan.seq, 6, Item::Plan(plan)));
+    }
     // A stable sort on (seq, kind). Items of different kinds can share a `seq`: a question the CLI
     // asked before announcing the turn it woke for takes the `seq` of the call it asks about once that
     // call starts, so the call (kind 2) is folded first and its question (kind 5) after it. Two items
@@ -397,6 +410,7 @@ fn stored_events(stored: &StoredHistory) -> Refold {
 
     let mut events = Vec::new();
     let mut question_turns = Vec::new();
+    let mut plan_turns = Vec::new();
     let mut open_turn: Option<String> = None;
     for (_, _, item) in items {
         match item {
@@ -412,6 +426,13 @@ fn stored_events(stored: &StoredHistory) -> Refold {
                 events.push(AgentDomainEvent::UserPromptSubmitted {
                     text: prompt.text.clone(),
                 });
+                // What the images were (type, size, digest) comes back with the words they went with; their
+                // bytes were never stored.
+                if !prompt.attachments.is_empty() {
+                    events.push(AgentDomainEvent::UserPromptAttachments {
+                        attachments: prompt.attachments.clone(),
+                    });
+                }
             }
             Item::Message(message) => events.push(AgentDomainEvent::ContentDelta {
                 // A stores no turn ids for replies; its stored message boundaries keep replies apart.
@@ -466,6 +487,35 @@ fn stored_events(stored: &StoredHistory) -> Refold {
                     reason,
                 });
             }
+            Item::Plan(plan) => {
+                plan_turns.push(plan.turn_id.clone());
+                events.push(AgentDomainEvent::PlanProposed {
+                    interaction_id: plan.interaction_id.clone(),
+                    tool_use_id: plan.tool_use_id.clone(),
+                    plan: plan.plan.clone(),
+                    plan_sha256: plan.plan_sha256.clone(),
+                    allowed_prompts: plan.allowed_prompts.clone(),
+                    unsupported_reason: plan.unsupported_reason.clone(),
+                });
+                // Never re-armed: a plan the stored copy held as waiting is closed, and a settled one reads as
+                // it was settled. Its approval's `mode_after` stays the record's own; nothing here moves a mode.
+                let (outcome, mode_after, feedback, reason) = match &plan.state {
+                    PlanState::Settled {
+                        outcome,
+                        mode_after,
+                        feedback,
+                        reason,
+                    } => (*outcome, *mode_after, feedback.clone(), reason.clone()),
+                    PlanState::Waiting | PlanState::Answering => (PlanOutcome::SessionClosed, None, None, None),
+                };
+                events.push(AgentDomainEvent::PlanSettled {
+                    interaction_id: plan.interaction_id.clone(),
+                    outcome,
+                    mode_after,
+                    feedback,
+                    reason,
+                });
+            }
             Item::Call(call) => {
                 events.push(AgentDomainEvent::ToolCallStarted {
                     turn_id: call.turn_id.clone(),
@@ -509,13 +559,18 @@ fn stored_events(stored: &StoredHistory) -> Refold {
         }
     }
     close_turn(&mut events, &mut open_turn);
-    Refold { events, question_turns }
+    Refold {
+        events,
+        question_turns,
+        plan_turns,
+    }
 }
 
-/// What [`stored_events`] makes of A: the events, and the stored turn of each question among them.
+/// What [`stored_events`] makes of A: the events, and the stored turn of each question and plan among them.
 struct Refold {
     events: Vec<AgentDomainEvent>,
     question_turns: Vec<Option<String>>,
+    plan_turns: Vec<Option<String>>,
 }
 
 /// Ends the restored turn that is open, if one is, as completed: it is over, and how it ended
@@ -635,6 +690,7 @@ mod tests {
             seq,
             text: text.to_string(),
             delivered: false,
+            attachments: Vec::new(),
         }
     }
 
@@ -1583,6 +1639,55 @@ mod tests {
         );
     }
 
+    /// A prompt's images come back as what they were: type, size and digest, in the order they went, on the
+    /// prompt they went with, and the next write stores them again. A prompt without images has none.
+    #[test]
+    fn a_prompt_with_images_round_trips_metadata() {
+        let conversation_id = setup();
+        let meta = |media_type: &str, bytes: u64, digit: char| crate::provider::AttachmentMeta {
+            media_type: media_type.into(),
+            bytes,
+            width: 640,
+            height: 480,
+            sha256: digit.to_string().repeat(64),
+        };
+        let mut with_images = prompt(1, "what is in these?");
+        with_images.attachments = vec![meta("image/png", 1200, 'a'), meta("image/jpeg", 800, 'b')];
+        store_copy(
+            &conversation_id,
+            "sess-images",
+            vec![with_images.clone(), prompt(3, "and now?")],
+            vec![message(2, "Two pictures.")],
+            vec![],
+        );
+
+        let restored = seed_from(Ok(missing_transcript()), &conversation_id, "sess-images");
+
+        assert_eq!(restored.user_prompts.len(), 2);
+        assert_eq!(restored.user_prompts[0].attachments, with_images.attachments);
+        assert!(restored.user_prompts[1].attachments.is_empty());
+        let stored = serde_json::to_string(&restored.user_prompts).unwrap();
+        assert!(
+            !stored.contains("\"data\""),
+            "no bytes ride with the metadata: {stored}"
+        );
+
+        store_projection(&conversation_id, "sess-images-2", &restored);
+        let again = seed_from(Ok(missing_transcript()), &conversation_id, "sess-images-2");
+        assert_eq!(
+            again
+                .user_prompts
+                .iter()
+                .map(|p| p.attachments.clone())
+                .collect::<Vec<_>>(),
+            restored
+                .user_prompts
+                .iter()
+                .map(|p| p.attachments.clone())
+                .collect::<Vec<_>>()
+        );
+    }
+
     /// The two marks A always stored but did not restore: a message read inside a running turn stays
     /// one (not the start of a new turn), and a call the CLI refused keeps its refusal.
     #[test]
@@ -1602,6 +1707,7 @@ mod tests {
             seq: 4,
             text: "in the background".into(),
             delivered: true,
+            attachments: Vec::new(),
         };
         store_copy(
             &conversation_id,
@@ -1699,6 +1805,154 @@ mod tests {
         assert!(restored.pending_permissions.is_empty());
     }
 
+    fn proposed(id: &str, plan: &str) -> AgentDomainEvent {
+        AgentDomainEvent::PlanProposed {
+            interaction_id: id.into(),
+            tool_use_id: Some(format!("toolu_{id}")),
+            plan: plan.into(),
+            plan_sha256: format!("sha-of-{plan}"),
+            allowed_prompts: vec![crate::PlanAllowedPrompt {
+                tool: "Bash".into(),
+                prompt: "run the tests".into(),
+            }],
+            unsupported_reason: None,
+        }
+    }
+
+    fn plan_settled(id: &str, outcome: PlanOutcome) -> AgentDomainEvent {
+        AgentDomainEvent::PlanSettled {
+            interaction_id: id.into(),
+            outcome,
+            mode_after: (outcome == PlanOutcome::Approved).then_some(crate::PlanExecutionMode::Auto),
+            feedback: (outcome == PlanOutcome::KeptPlanning).then(|| "also the docs".to_string()),
+            reason: None,
+        }
+    }
+
+    /// Plans come back from Eitri's own copy as they were stored, in the turn they were proposed in and
+    /// in their place among the other rows, but for the numbers `apply` gives again and a waiting one,
+    /// which comes back closed. Nothing about the restore starts a transition or leaves a plan waiting.
+    #[test]
+    fn a_round_trip_keeps_plans() {
+        let conversation_id = setup();
+        let mut live = AgentSessionProjection::default();
+        for event in [
+            AgentDomainEvent::UserPromptSubmitted { text: "plan it".into() },
+            AgentDomainEvent::TurnStarted { turn_id: "t1".into() },
+            proposed("p1", "# One\n1. do it\n"),
+            plan_settled("p1", PlanOutcome::KeptPlanning),
+            proposed("p2", "# Two\n1. do it better\n"),
+            plan_settled("p2", PlanOutcome::Approved),
+            AgentDomainEvent::ContentDelta {
+                turn_id: "t1".into(),
+                kind: ContentKind::Text,
+                text: "Going ahead.".into(),
+            },
+            proposed("p3", "# Three\n"),
+        ] {
+            live.apply(&event);
+        }
+        assert_eq!(live.plans.len(), 3);
+        assert_eq!(live.plans[2].state, PlanState::Waiting);
+        store_projection(&conversation_id, "sess-plans", &live);
+
+        let restored = seed_from(Ok(missing_transcript()), &conversation_id, "sess-plans");
+
+        assert_eq!(
+            without_seq(&restored.plans[..2], |r| r.seq = 0),
+            without_seq(&live.plans[..2], |r| r.seq = 0),
+            "a settled plan comes back as it was settled, with its text, digest, feedback, mode and turn"
+        );
+        assert_eq!(restored.plans[0].turn_id.as_deref(), Some("t1"));
+        assert_eq!(
+            restored.plans[2].plan, live.plans[2].plan,
+            "a closed plan keeps its words"
+        );
+        assert_eq!(
+            restored.plans[2].state,
+            PlanState::Settled {
+                outcome: PlanOutcome::SessionClosed,
+                mode_after: None,
+                feedback: None,
+                reason: None
+            }
+        );
+        assert!(
+            restored.waiting_plan().is_none(),
+            "nothing restored waits for a decision"
+        );
+        assert!(!restored.is_planning() && restored.pending_permissions.is_empty());
+        let order = |p: &AgentSessionProjection| {
+            let mut rows: Vec<(u64, &str)> = p
+                .user_prompts
+                .iter()
+                .map(|r| (r.seq, "prompt"))
+                .chain(p.transcript.iter().map(|r| (r.seq, "reply")))
+                .chain(p.plans.iter().map(|r| (r.seq, "plan")))
+                .collect();
+            rows.sort_unstable();
+            rows.into_iter().map(|(_, kind)| kind).collect::<Vec<_>>()
+        };
+        assert_eq!(order(&restored), order(&live));
+        // The write after a restore keeps the turn each plan was proposed in.
+        let again = store::newest_that_fit(store::HistoryView::of(&restored));
+        assert_eq!(
+            again.plans.iter().map(|r| r.turn_id.clone()).collect::<Vec<_>>(),
+            live.plans.iter().map(|r| r.turn_id.clone()).collect::<Vec<_>>()
+        );
+    }
+
+    /// A plan stored while it waited, or while a decision was on its way, comes back closed: the provider
+    /// that proposed it is gone and nothing can decide it. A settled one keeps its outcome.
+    #[test]
+    fn a_waiting_plan_restores_as_closed() {
+        let conversation_id = setup();
+        let record = |seq: u64, id: &str, state: PlanState| PlanRecord {
+            seq,
+            interaction_id: id.into(),
+            tool_use_id: Some(format!("toolu_{id}")),
+            turn_id: None,
+            plan: "# Plan\n".into(),
+            plan_sha256: "abc".into(),
+            allowed_prompts: vec![],
+            state,
+            unsupported_reason: None,
+        };
+        let kept = PlanState::Settled {
+            outcome: PlanOutcome::KeptPlanning,
+            mode_after: None,
+            feedback: Some("less".into()),
+            reason: None,
+        };
+        store_parts(
+            &conversation_id,
+            "sess-p",
+            store::HistoryParts {
+                plans: vec![
+                    record(1, "waiting", PlanState::Waiting),
+                    record(2, "answering", PlanState::Answering),
+                    record(3, "kept", kept.clone()),
+                ],
+                ..store::HistoryParts::default()
+            },
+        );
+
+        let restored = seed_from(Ok(missing_transcript()), &conversation_id, "sess-p");
+
+        let closed = PlanState::Settled {
+            outcome: PlanOutcome::SessionClosed,
+            mode_after: None,
+            feedback: None,
+            reason: None,
+        };
+        assert_eq!(
+            restored.plans.iter().map(|p| p.state.clone()).collect::<Vec<_>>(),
+            vec![closed.clone(), closed, kept]
+        );
+        assert!(restored.waiting_plan().is_none());
+        assert!(restored.pending_permissions.is_empty());
+    }
+
     #[test]
     fn a_cli_segment_at_the_end_of_b_is_closed_before_the_first_live_prompt() {
         let conversation_id = setup();
@@ -1780,6 +2034,7 @@ mod tests {
                         seq: 2,
                         text: "read inside".into(),
                         delivered: true,
+                        attachments: Vec::new(),
                     },
                     prompt(5, "mine"),
                 ],

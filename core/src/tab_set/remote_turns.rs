@@ -335,6 +335,7 @@ impl TabSet {
             typed: text.to_owned(),
             typed_by_person: false,
             shell_line: false,
+            attachments: Vec::new(),
         };
         // Sent now, or held for the presence; either way its outcome comes through `poll_remote_sends`.
         let sent = self.send_when_allowed(

@@ -40,10 +40,10 @@ fn real_pretooluse_permission_allow_end_to_end() {
         .unwrap();
 
     provider
-        .send_turn(agent::SendTurnRequest {
-            session_id: session_id.clone(),
-            text: "run: echo hello, and tell me the output".into(),
-        })
+        .send_turn(agent::SendTurnRequest::text(
+            session_id.clone(),
+            "run: echo hello, and tell me the output",
+        ))
         .unwrap();
 
     // Answer EVERY permission this turn raises, each by its own id, until the turn completes.
@@ -159,13 +159,13 @@ fn real_pretooluse_permission_deny_end_to_end() {
         })
         .unwrap();
     provider
-        .send_turn(agent::SendTurnRequest {
-            session_id: session_id.clone(),
-            text: format!(
+        .send_turn(agent::SendTurnRequest::text(
+            session_id.clone(),
+            format!(
                 "Use a tool to create {} containing 'marker'. If permission is denied, stop and report the denial.",
                 target.display()
             ),
-        })
+        ))
         .unwrap();
 
     let mut answered = std::collections::HashSet::new();
@@ -245,10 +245,10 @@ fn real_interrupt_mid_permission_fail_closes_the_pending_request() {
         .unwrap();
 
     provider
-        .send_turn(agent::SendTurnRequest {
-            session_id: session_id.clone(),
-            text: "run: sleep 30, and tell me when it finishes".into(),
-        })
+        .send_turn(agent::SendTurnRequest::text(
+            session_id.clone(),
+            "run: sleep 30, and tell me when it finishes",
+        ))
         .unwrap();
 
     let events = drain_until(&provider, 30, |events| {
@@ -335,10 +335,10 @@ fn real_interrupt_mid_permission_fail_closes_the_pending_request() {
     );
 
     provider
-        .send_turn(agent::SendTurnRequest {
-            session_id: session_id.clone(),
-            text: "reply with exactly the word: pong".into(),
-        })
+        .send_turn(agent::SendTurnRequest::text(
+            session_id.clone(),
+            "reply with exactly the word: pong",
+        ))
         .unwrap();
     let follow_up = drain_until(&provider, 60, |events| {
         events
@@ -384,10 +384,10 @@ fn real_close_session_fail_closes_a_pending_permission() {
         .unwrap();
 
     provider
-        .send_turn(agent::SendTurnRequest {
-            session_id: session_id.clone(),
-            text: "run: sleep 30, and tell me when it finishes".into(),
-        })
+        .send_turn(agent::SendTurnRequest::text(
+            session_id.clone(),
+            "run: sleep 30, and tell me when it finishes",
+        ))
         .unwrap();
 
     drain_until(&provider, 30, |events| {
@@ -447,13 +447,13 @@ fn real_edit_under_the_auto_gate_on_the_sidecar_path() {
         })
         .unwrap();
     provider
-        .send_turn(agent::SendTurnRequest {
-            session_id: session_id.clone(),
-            text: format!(
+        .send_turn(agent::SendTurnRequest::text(
+            session_id.clone(),
+            format!(
                 "Use the Edit tool to change the word 'bravo' to 'BRAVO' in {}. Do not use a shell.",
                 target.display()
             ),
-        })
+        ))
         .unwrap();
 
     // Every permission, by its own id -- tools are deferred on 2.1.272, so one turn raises several.

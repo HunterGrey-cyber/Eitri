@@ -5,7 +5,10 @@
 //! pure reducer/translator in isolation before any real-process integration test exercises it.
 
 use super::translate_322;
-use crate::process::{classify_cli_mode, classify_reported_cli_mode, CliModeReport, RequestedCliMode};
+use crate::process::{
+    classify_cli_mode, classify_reported_cli_mode, classify_reported_cli_mode_planning, CliExpectation, CliModeReport,
+    RequestedCliMode,
+};
 use crate::projection::TEXT_BLOCK_SEPARATOR;
 use crate::{
     AgentDomainEvent, ContentKind, InitServer, PermissionOutcome, ResumeStatus, TokenUsage, TurnEndDetail, TurnOutcome,
@@ -26,12 +29,19 @@ use claude_runtime_protocol::v1::{
 /// session accepts closes it without a look at the string, a number this build has no kind for included
 /// (read from the field, since the generated getter turns one into `Unspecified`), and so does a kind
 /// that contradicts the string, which no correct sidecar sends: this check stops a session when in doubt.
-fn classify_session_ready(ready: &SessionReady, requested: RequestedCliMode) -> CliModeReport {
+/// On a session that offered plan mode, `plan` (kind and string agreeing) is its own report.
+fn classify_session_ready(ready: &SessionReady, expect: CliExpectation) -> CliModeReport {
+    let CliExpectation {
+        requested,
+        plan_offered,
+    } = expect;
     let Ok(kind) = CliPermissionModeKind::try_from(ready.cli_permission_mode_kind) else {
         return CliModeReport::Ungated;
     };
     let spelling = match kind {
-        CliPermissionModeKind::Unspecified => return classify_reported_cli_mode(&ready.permission_mode, requested),
+        CliPermissionModeKind::Unspecified => {
+            return classify_reported_cli_mode_planning(&ready.permission_mode, requested, plan_offered)
+        }
         CliPermissionModeKind::Default => "default",
         CliPermissionModeKind::Plan => "plan",
         CliPermissionModeKind::DontAsk => "dontAsk",
@@ -39,7 +49,7 @@ fn classify_session_ready(ready: &SessionReady, requested: RequestedCliMode) -> 
         _ => return CliModeReport::Ungated,
     };
     if spelling == ready.permission_mode {
-        classify_reported_cli_mode(spelling, requested)
+        classify_reported_cli_mode_planning(spelling, requested, plan_offered)
     } else {
         CliModeReport::Ungated
     }
@@ -58,14 +68,22 @@ fn classify_session_ready(ready: &SessionReady, requested: RequestedCliMode) -> 
 /// (`CliPermissionMode`), which the host's answer path reads. A `SessionReady` that carries the CLI's
 /// init report adds its MCP servers last (`SessionServers`).
 ///
-/// `requested` is what this session asked the CLI to run in (`build_create_request`), and is what
-/// the CLI's report is judged against (`classify_reported_cli_mode`).
-pub(crate) fn translate(event: ProtoSessionEvent, requested: RequestedCliMode) -> Vec<AgentDomainEvent> {
-    translate_one(event, requested).into_iter().flatten().collect()
+/// `expect` is what this session asked the CLI to run in (`build_create_request`) and whether it
+/// offered plan mode, and is what the CLI's report is judged against
+/// (`classify_reported_cli_mode_planning`).
+///
+/// **A session that offered plan mode** reports `plan` as `CliPlanMode`, and every mode it accepts
+/// besides (`default` included, on a session created in `default`) as `CliPermissionMode`, never
+/// `CliLeftAuto`: whether a report is a step out of plan mode, a fallback out of auto or a contradiction
+/// depends on the plan phase, which the projection holds (`projection::planning`). A session without
+/// the offer gets exactly the events it always did.
+pub(crate) fn translate(event: ProtoSessionEvent, expect: impl Into<CliExpectation>) -> Vec<AgentDomainEvent> {
+    translate_one(event, expect.into()).into_iter().flatten().collect()
 }
 
 /// `translate`'s body: `None` is nothing, and `Some` is one or two events.
-fn translate_one(event: ProtoSessionEvent, requested: RequestedCliMode) -> Option<Vec<AgentDomainEvent>> {
+fn translate_one(event: ProtoSessionEvent, expect: CliExpectation) -> Option<Vec<AgentDomainEvent>> {
+    let requested = expect.requested;
     // The ENVELOPE's session_id, captured before the oneof is destructured. This is the sidecar's
     // own session id -- the value `CreateSession` returned and the one every subsequent RPC must be
     // addressed with.
@@ -92,7 +110,7 @@ fn translate_one(event: ProtoSessionEvent, requested: RequestedCliMode) -> Optio
         // by `CliModeNote`. On a session that asked for the CLI's auto mode, `auto` and its
         // `default` fallback are reported on as `CliPermissionMode`, and anything else closes it.
         ProtoEvent::SessionReady(ready) => {
-            let report = classify_session_ready(&ready, requested);
+            let report = classify_session_ready(&ready, expect);
             let reported = ready.permission_mode;
             let effort = ready.effort;
             let mut out = vec![AgentDomainEvent::SessionOpened {
@@ -106,7 +124,14 @@ fn translate_one(event: ProtoSessionEvent, requested: RequestedCliMode) -> Optio
                     reported,
                     detail: "SessionReady".to_string(),
                 }),
+                CliModeReport::Plan => out.push(AgentDomainEvent::CliPlanMode {
+                    source: "SessionReady".to_string(),
+                }),
                 CliModeReport::Auto | CliModeReport::AutoUnavailable => {
+                    out.push(AgentDomainEvent::CliPermissionMode { reported });
+                }
+                // The creation mode, which ends a step out of plan mode.
+                CliModeReport::Default if expect.plan_offered => {
                     out.push(AgentDomainEvent::CliPermissionMode { reported });
                 }
                 CliModeReport::Default | CliModeReport::Stricter | CliModeReport::Unreported => {}
@@ -135,12 +160,20 @@ fn translate_one(event: ProtoSessionEvent, requested: RequestedCliMode) -> Optio
         // that report. Out of `auto` it goes on as `CliPermissionMode` plus what makes a live tab follow.
         ProtoEvent::CliModeReported(report) => {
             let reported = report.permission_mode;
-            match classify_reported_cli_mode(&reported, requested) {
+            match classify_reported_cli_mode_planning(&reported, requested, expect.plan_offered) {
                 CliModeReport::Ungated => one(AgentDomainEvent::UngatedCliMode {
                     reported,
                     detail: "CliModeReported".to_string(),
                 }),
+                CliModeReport::Plan => one(AgentDomainEvent::CliPlanMode {
+                    source: "CliModeReported".to_string(),
+                }),
                 CliModeReport::Auto => one(AgentDomainEvent::CliPermissionMode { reported }),
+                // Whether this is a fallback out of auto or a step out of plan mode is the projection's
+                // to say (`projection::planning`).
+                CliModeReport::AutoUnavailable | CliModeReport::Default if expect.plan_offered => {
+                    one(AgentDomainEvent::CliPermissionMode { reported })
+                }
                 CliModeReport::AutoUnavailable => Some(vec![
                     AgentDomainEvent::CliPermissionMode { reported },
                     AgentDomainEvent::CliLeftAuto,
@@ -417,7 +450,7 @@ fn translate_one(event: ProtoSessionEvent, requested: RequestedCliMode) -> Optio
         ProtoEvent::TaskEvent(value) => translate_322::task(value, occurred_at).and_then(one),
         ProtoEvent::SessionNotice(value) => translate_322::notice(value).and_then(one),
         ProtoEvent::ConversationReset(value) => one(translate_322::reset(value)),
-        ProtoEvent::InteractionRequested(value) => one(translate_322::requested(value)),
+        ProtoEvent::InteractionRequested(value) => one(translate_322::requested(value, expect.plan_offered)),
         ProtoEvent::InteractionResolved(value) => translate_322::resolved(value).and_then(one),
     }
 }
@@ -715,18 +748,21 @@ impl MessageSplit {
 /// `default` instead, so Eitri's own policy answers its requests and none is deferred.
 #[derive(Default)]
 pub(crate) struct CliModeNote {
-    requested: RequestedCliMode,
+    expect: CliExpectation,
     noted: bool,
 }
 
 impl CliModeNote {
-    pub(crate) fn new(requested: RequestedCliMode) -> Self {
-        Self::resuming(requested, false)
+    pub(crate) fn new(expect: impl Into<CliExpectation>) -> Self {
+        Self::resuming(expect, false)
     }
 
     /// A note that goes on from another process's, which may have printed its one line already.
-    pub(crate) fn resuming(requested: RequestedCliMode, noted: bool) -> Self {
-        Self { requested, noted }
+    pub(crate) fn resuming(expect: impl Into<CliExpectation>, noted: bool) -> Self {
+        Self {
+            expect: expect.into(),
+            noted,
+        }
     }
 
     /// Whether the session's one line was printed.
@@ -740,12 +776,12 @@ impl CliModeNote {
             ProtoEvent::SessionReady(ready) => (
                 ready.permission_mode.as_str(),
                 "SessionReady",
-                classify_session_ready(ready, self.requested),
+                classify_session_ready(ready, self.expect),
             ),
             ProtoEvent::PermissionModeChanged(changed) => (
                 changed.permission_mode.as_str(),
                 "PermissionModeChanged",
-                classify_reported_cli_mode(&changed.permission_mode, self.requested),
+                classify_reported_cli_mode(&changed.permission_mode, self.expect.requested),
             ),
             _ => return None,
         };
@@ -761,7 +797,8 @@ impl CliModeNote {
                 "[permission] the CLI reports permission mode '{reported}' in {source} although this session \
                  asked for its auto mode (unavailable to it): Eitri's own policy answers, nothing is deferred"
             ),
-            CliModeReport::Default | CliModeReport::Auto | CliModeReport::Ungated => return None,
+            // A plan session's `plan` is the mode it was asked into, and its steps are the projection's.
+            CliModeReport::Default | CliModeReport::Auto | CliModeReport::Ungated | CliModeReport::Plan => return None,
         };
         if std::mem::replace(&mut self.noted, true) {
             return None;

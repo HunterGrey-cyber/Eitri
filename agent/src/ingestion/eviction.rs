@@ -1,6 +1,6 @@
 use super::*;
 use crate::history::archive::{ArchiveId, ArchiveWriter, ArchivedRecord, ArchivedTurn};
-use crate::projection::{turns::Turns, QuestionState, TaskStatus, ToolCallRecord};
+use crate::projection::{turns::Turns, PlanState, QuestionState, TaskStatus, ToolCallRecord};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
@@ -16,6 +16,10 @@ fn ready(state: &mut IngestState, budget: usize) -> (bool, Option<String>) {
                 .iter()
                 .any(|q| !matches!(q.state, QuestionState::Settled { .. })),
             "waiting/answering question",
+        ),
+        (
+            p.plans.iter().any(|r| !matches!(r.state, PlanState::Settled { .. })),
+            "waiting/answering plan",
         ),
     ];
     if ceiling && !state.eviction_ceiling_logged && blockers.iter().any(|(blocked, _)| *blocked) {
@@ -40,6 +44,7 @@ fn ready(state: &mut IngestState, budget: usize) -> (bool, Option<String>) {
         && p.questions
             .iter()
             .all(|q| matches!(q.state, QuestionState::Settled { .. }))
+        && p.plans.iter().all(|r| matches!(r.state, PlanState::Settled { .. }))
         && (!state.reload_held || ceiling);
     (eligible, warning)
 }
@@ -185,6 +190,7 @@ pub(super) fn flush_in(
         copy!(turn_endings, TurnEnding);
         copy!(notices, Notice);
         copy!(questions, Question);
+        copy!(plans, Plan);
         let revision = p.last_revision;
         let absolute = turns.absolute(cut);
         if st.archive_id.is_none() {
@@ -298,6 +304,7 @@ pub(super) fn flush_in(
             ArchivedRecord::TurnStart(r) => removed.turn_starts.push(r),
             ArchivedRecord::Notice(r) => removed.notices.push(r),
             ArchivedRecord::Question(r) => removed.questions.push(r),
+            ArchivedRecord::Plan(r) => removed.plans.push(r),
             ArchivedRecord::Thinking(_) | ArchivedRecord::TurnEnding(_) => {}
         }
     }

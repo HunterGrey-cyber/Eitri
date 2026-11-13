@@ -314,7 +314,7 @@ pub(super) fn notice(value: wire::SessionNotice) -> Option<Domain> {
     })
 }
 
-fn fits(text: &str, max: usize) -> bool {
+pub(super) fn fits(text: &str, max: usize) -> bool {
     text.encode_utf16().take(max + 1).count() <= max
 }
 fn valid_questions(questions: &[wire::Question]) -> bool {
@@ -364,7 +364,13 @@ fn valid_questions(questions: &[wire::Question]) -> bool {
         .collect();
     bytes <= 256 * 1024 && serde_json::to_vec(&payload).is_ok_and(|v| v.len() <= 256 * 1024)
 }
-pub(super) fn requested(value: wire::InteractionRequested) -> Domain {
+/// A question set, or a plan (`PLAN_APPROVAL`, read by `translate_326`) on a session that offered plan mode
+/// (`plans_offered`). On any other session a plan is refused as a kind it does not know: no plan record is
+/// made that nothing could ever settle.
+pub(super) fn requested(value: wire::InteractionRequested, plans_offered: bool) -> Domain {
+    if plans_offered && value.kind == wire::InteractionKind::PlanApproval as i32 {
+        return super::translate_326::plan_requested(value);
+    }
     let mut unsupported = value.unsupported_reason;
     let questions = match (wire::InteractionKind::try_from(value.kind), value.payload) {
         (Ok(wire::InteractionKind::Question), Some(wire::interaction_requested::Payload::Questions(set)))
@@ -381,8 +387,8 @@ pub(super) fn requested(value: wire::InteractionRequested) -> Domain {
             unsupported.get_or_insert_with(|| "Question payload is missing".into());
             Vec::new()
         }
-        // A plan approval is never offered by this tree (no `plan_mode` opt-in), so one is refused like any kind
-        // it does not know.
+        // A plan approval on a session that offered plan mode was taken above; on any other it is refused, as
+        // a kind this build does not know is.
         (Ok(wire::InteractionKind::Unspecified | wire::InteractionKind::PlanApproval), _) | (Err(_), _) => {
             unsupported = Some("Unsupported interaction kind".into());
             Vec::new()
@@ -434,13 +440,19 @@ fn question_outcome(value: i32) -> Option<QuestionOutcome> {
         wire::InteractionOutcome::SessionClosed => QuestionOutcome::SessionClosed,
         wire::InteractionOutcome::ProviderFailed => QuestionOutcome::ProviderFailed,
         wire::InteractionOutcome::HostRefused => QuestionOutcome::HostRefused,
-        // Plan outcomes belong to plan approvals, which this tree never takes; on a question they are unreadable.
+        // Plan outcomes belong to plan approvals (`translate_326`); on a question they are unreadable.
         wire::InteractionOutcome::Unspecified
         | wire::InteractionOutcome::Approved
         | wire::InteractionOutcome::KeptPlanning => return absent("InteractionOutcome"),
     })
 }
+/// A question's settlement, or a plan's (`kind` `PLAN_APPROVAL`, read by `translate_326`). An unset kind,
+/// which a sidecar older than the field sends, is a question's; so is a kind this build does not know,
+/// which settles no plan.
 pub(super) fn resolved(value: wire::InteractionResolved) -> Option<Domain> {
+    if value.kind == wire::InteractionKind::PlanApproval as i32 {
+        return super::translate_326::plan_resolved(value);
+    }
     if !fits(&value.interaction_id, 128) {
         return absent("interaction identifier");
     }
@@ -611,14 +623,17 @@ pub(super) fn resolve_outcome(value: wire::ResolveInteractionResponse) -> Option
 }
 /// The questions still waiting, as `GetInteractionState` answered after the stream was opened again:
 /// each pending request is checked like a live `InteractionRequested`.
-pub(super) fn interaction_state(value: wire::GetInteractionStateResponse) -> InteractionState {
+pub(super) fn interaction_state(value: wire::GetInteractionStateResponse, plans_offered: bool) -> InteractionState {
     let wire::GetInteractionStateResponse {
         through_sequence,
         pending,
     } = value;
     InteractionState {
         through_sequence,
-        pending: pending.into_iter().map(requested).collect(),
+        pending: pending
+            .into_iter()
+            .map(|value| requested(value, plans_offered))
+            .collect(),
     }
 }
 
@@ -1181,20 +1196,26 @@ mod tests {
         }
         let mut too_long = question();
         edit_question(&mut too_long).header = "x".repeat(257);
-        let state = interaction_state(wire::GetInteractionStateResponse {
-            through_sequence: 41,
-            pending: vec![question(), too_long],
-        });
+        let state = interaction_state(
+            wire::GetInteractionStateResponse {
+                through_sequence: 41,
+                pending: vec![question(), too_long],
+            },
+            false,
+        );
         assert_eq!(state.through_sequence, 41);
         assert_eq!(
             state.pending,
             vec![
-                requested(question()),
-                requested({
-                    let mut q = question();
-                    edit_question(&mut q).header = "x".repeat(257);
-                    q
-                })
+                requested(question(), false),
+                requested(
+                    {
+                        let mut q = question();
+                        edit_question(&mut q).header = "x".repeat(257);
+                        q
+                    },
+                    false
+                )
             ]
         );
         assert!(
@@ -1330,7 +1351,7 @@ mod tests {
         let mut value = question();
         edit_question(&mut value).options[0].label = "𐀀".repeat(501);
         assert!(
-            matches!(requested(value),Domain::QuestionAsked { unsupported_reason:Some(_),questions,.. } if questions.is_empty())
+            matches!(requested(value, false),Domain::QuestionAsked { unsupported_reason:Some(_),questions,.. } if questions.is_empty())
         );
     }
     #[test]
@@ -1367,24 +1388,51 @@ mod tests {
                 _ => unreachable!(),
             }
             assert!(
-                matches!(requested(value),Domain::QuestionAsked { unsupported_reason:Some(_),questions,.. } if questions.is_empty()),
+                matches!(requested(value, false),Domain::QuestionAsked { unsupported_reason:Some(_),questions,.. } if questions.is_empty()),
                 "{mode}"
             );
         }
     }
+    /// On a session that did not offer plan mode a plan approval is refused as a kind this build does not know,
+    /// as before plans existed: no plan record waits for a decision nothing could send.
     #[test]
-    fn a_plan_approval_and_plan_outcomes_are_not_read_as_questions() {
+    fn a_plan_approval_without_the_offer_is_an_unsupported_kind() {
         let mut value = question();
         value.kind = wire::InteractionKind::PlanApproval as i32;
         assert!(matches!(
-            requested(value),
+            requested(value.clone(), false),
+            Domain::QuestionAsked { unsupported_reason: Some(reason), questions, .. }
+                if questions.is_empty() && reason == "Unsupported interaction kind"
+        ));
+        let state = interaction_state(
+            wire::GetInteractionStateResponse {
+                through_sequence: 3,
+                pending: vec![value],
+            },
+            false,
+        );
+        assert!(matches!(&state.pending[0], Domain::QuestionAsked { .. }));
+    }
+    #[test]
+    fn a_plan_approval_and_plan_outcomes_are_not_read_as_questions() {
+        // A plan approval carrying a question set is a plan whose payload is missing, never a question.
+        let mut value = question();
+        value.kind = wire::InteractionKind::PlanApproval as i32;
+        assert!(matches!(
+            requested(value, true),
+            Domain::PlanProposed { unsupported_reason: Some(_), plan, .. } if plan.is_empty()
+        ));
+        let mut value = question();
+        value.kind = 9;
+        assert!(matches!(
+            requested(value, true),
             Domain::QuestionAsked { unsupported_reason: Some(reason), questions, .. }
                 if questions.is_empty() && reason == "Unsupported interaction kind"
         ));
         let mut value = question();
         value.payload = Some(wire::interaction_requested::Payload::Plan(wire::PlanProposal::default()));
         assert!(matches!(
-            requested(value),
+            requested(value, true),
             Domain::QuestionAsked { unsupported_reason: Some(_), questions, .. } if questions.is_empty()
         ));
         for outcome in [

@@ -21,7 +21,9 @@ use super::align::{Alignment, EntryPair, Field, Mark, Note, TurnMatch};
 use super::allowances::AllowanceSet;
 use super::normalise::{result_text, text, user_text};
 use super::redact::{utf16_len, Redactor};
-use super::{CliForm, EndReason, Entry, Inconsistency, InputKind, Origin, Pos, QuestionKey, Source, Turn, Via};
+use super::{
+    CliForm, EndReason, Entry, Inconsistency, InputKind, Origin, PlanKey, Pos, QuestionKey, Source, Turn, Via,
+};
 use serde_json::{json, Map, Value};
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
@@ -125,6 +127,7 @@ pub fn field_word(field: &Field) -> &'static str {
     match field {
         Field::Text => "text",
         Field::Via => "via",
+        Field::Images => "images",
         Field::Name => "name",
         Field::Input => "input",
         Field::IsError => "is_error",
@@ -132,6 +135,7 @@ pub fn field_word(field: &Field) -> &'static str {
         Field::Questions => "questions",
         Field::Answered => "answered",
         Field::Outcome => "outcome",
+        Field::PlanText => "plan",
         Field::Turn => "turn",
         Field::Order => "order",
     }
@@ -185,6 +189,7 @@ pub const FIELD_WORDS: &[&str] = &[
     "questions",
     "answered",
     "outcome",
+    "plan",
     "turn",
     "order",
 ];
@@ -200,6 +205,7 @@ pub const KIND_WORDS: &[&str] = &[
     "interrupted",
     "ended",
     "question",
+    "plan",
     "turn",
 ];
 
@@ -905,7 +911,12 @@ fn end_word(reason: &EndReason, r: &Redactor) -> String {
 /// One entry as the report prints it.
 pub fn describe(entry: &Entry, r: &Redactor) -> String {
     match entry {
-        Entry::User { text: t, via } => format!("user[{}] {}", via_word(via), r.text(&user_text(t))),
+        Entry::User { text: t, via, images } => format!(
+            "user[{}] {}{}",
+            via_word(via),
+            r.text(&user_text(t)),
+            images_words(images, r)
+        ),
         Entry::Assistant { text: t } => format!("assistant {}", r.text(&text(t))),
         Entry::Thinking { text: t } => format!("thinking {}", r.text(&text(t))),
         Entry::ToolUse { id, name, input } => {
@@ -925,7 +936,46 @@ pub fn describe(entry: &Entry, r: &Redactor) -> String {
         Entry::Interrupted => "interrupted".to_owned(),
         Entry::Ended { reason } => format!("ended {}", end_word(reason, r)),
         Entry::Question { key, .. } => question_line(key),
+        Entry::Plan { key, .. } => plan_line(key, r),
     }
+}
+
+/// A plan as the report prints it, with or without text shown: its end and a keyed digest of its text, never
+/// the text itself, the digest the sidecar computed (a short plan could be recovered from it by guessing) or
+/// an id.
+fn plan_line(key: &PlanKey, r: &Redactor) -> String {
+    format!("plan outcome={} digest={}", key.end.word(), plan_digest(key, r))
+}
+
+fn plan_digest(key: &PlanKey, r: &Redactor) -> String {
+    if key.plan_sha256.is_empty() {
+        "none".to_owned()
+    } else {
+        r.digest(&key.plan_sha256)
+    }
+}
+
+/// An image's digest as a report prints it: the record's own digest of an image it could not hash stays empty.
+fn image_digest(sha: &str, r: &Redactor) -> String {
+    if sha.is_empty() {
+        String::new()
+    } else if r.shows_text() {
+        sha.to_owned()
+    } else {
+        r.digest(sha)
+    }
+}
+
+/// The images of a user entry as a report prints them: each one's type (from the closed list) and digest.
+fn images_words(images: &[(String, String)], r: &Redactor) -> String {
+    if images.is_empty() {
+        return String::new();
+    }
+    let each: Vec<String> = images
+        .iter()
+        .map(|(kind, sha)| format!("{} sha:{}", r.word(kind), image_digest(sha, r)))
+        .collect();
+    format!(" images=[{}]", each.join(", "))
 }
 
 /// A question set as the report prints it, with or without text shown: its key, nothing it asked or was
@@ -951,9 +1001,15 @@ fn text_json(t: &str, r: &Redactor) -> Value {
 /// One entry as the JSON report holds it.
 pub fn describe_json(entry: &Entry, r: &Redactor) -> Value {
     let mut value = match entry {
-        Entry::User { text: t, via } => {
+        Entry::User { text: t, via, images } => {
             let mut v = text_json(&user_text(t), r);
             v["via"] = json!(via_word(via));
+            if !images.is_empty() {
+                v["images"] = json!(images
+                    .iter()
+                    .map(|(kind, sha)| json!({"type": r.word(kind), "sha": image_digest(sha, r)}))
+                    .collect::<Vec<_>>());
+            }
             v
         }
         Entry::Assistant { text: t } | Entry::Thinking { text: t } => text_json(&text(t), r),
@@ -987,6 +1043,10 @@ pub fn describe_json(entry: &Entry, r: &Redactor) -> Value {
             "count": key.count,
             "answered": key.answered,
             "outcome": key.end.word(),
+        }),
+        Entry::Plan { key, .. } => json!({
+            "outcome": key.end.word(),
+            "digest": plan_digest(key, r),
         }),
     };
     value["kind"] = json!(entry.kind());
@@ -1074,6 +1134,7 @@ fn record_only_by_kind(record: &Entry, pair: &super::align::TurnPair) -> Option<
         Entry::User {
             text: t,
             via: Via::Prompt,
+            ..
         } if pair.how == TurnMatch::EitriOnly && pair.entries.len() == 1 && is_cli_local_command(t) => {
             Some(ByKind::EitriLocalCommand)
         }

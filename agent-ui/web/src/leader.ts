@@ -89,7 +89,7 @@ export function advanceSequence(table: PanelTable, typed: string[], key: string)
 
 /** One row of the which-key popup box: a real binding's own key and description, or a group label
  *  (`+tab`) standing in for everything under it. `disabled` greys out `mode.cycle` where cycling
- *  makes no sense (`boxEntries`' `modeFixed`). */
+ *  makes no sense (`boxEntries`' `modeFixed`), and `plan.toggle` where plan mode is not offered (`planOff`). */
 export type BoxEntry = { key: string; label: string; group: boolean; disabled: boolean };
 
 /** How a table key reads to a person: the leader as its label (`Space`), anything else as itself. */
@@ -105,7 +105,7 @@ function humanKey(table: PanelTable, k: string): string {
  *  `modeFixed` (App.tsx's own const): whether `mode.cycle` would flash rather than post --
  *  it means cycling makes no sense, not merely that a session started: a live, switch-capable tab
  *  can still cycle (`modeKey.ts`'s `modeKeyRoute`). */
-export function boxEntries(table: PanelTable, typed: string[], modeFixed: boolean): BoxEntry[] {
+export function boxEntries(table: PanelTable, typed: string[], modeFixed: boolean, planOff = false): BoxEntry[] {
   const depth = typed.length;
   const atDepth = table.bindings.filter(isPanelCommand).filter((b) => b.keys.length > depth && typed.every((k, i) => b.keys[i] === k));
   const nextKeys: string[] = [];
@@ -122,7 +122,7 @@ export function boxEntries(table: PanelTable, typed: string[], modeFixed: boolea
           ?.label ?? `+${humanKey(table, nextKey)}`)
       : (atDepth.find((b) => b.keys.length === depth + 1 && b.keys[depth] === nextKey)?.desc ?? "");
     const binding = atDepth.find((b) => b.keys.length === depth + 1 && b.keys[depth] === nextKey);
-    const disabled = !isGroup && binding?.action === "mode.cycle" && modeFixed;
+    const disabled = !isGroup && ((binding?.action === "mode.cycle" && modeFixed) || (binding?.action === "plan.toggle" && planOff));
     const entry: BoxEntry = { key: humanKey(table, nextKey), label, group: isGroup, disabled: Boolean(disabled) };
     (isGroup ? groups : leaves).push(entry);
   }
@@ -194,12 +194,12 @@ export const FIXED_PENDING_ENTRIES: Record<PendingPrefix, BoxEntry[]> = {
 };
 
 /** A reserved prefix lists the actions its next key actually runs, including rebound motion pairs. */
-export function pendingEntries(table: PanelTable, prefix: PendingPrefix, modeFixed: boolean): BoxEntry[] {
+export function pendingEntries(table: PanelTable, prefix: PendingPrefix, modeFixed: boolean, planOff = false): BoxEntry[] {
   const motions = table.bindings.filter((b) => !isPanelCommand(b) && b.keys.length === 2 && b.keys[0] === prefix);
   const overrides = new Set(motions.map((b) => b.keys[1]));
   return [
     ...FIXED_PENDING_ENTRIES[prefix].filter((entry) => !overrides.has(entry.key)),
-    ...boxEntries(table, [prefix], modeFixed),
+    ...boxEntries(table, [prefix], modeFixed, planOff),
     ...motions.map((b) => ({ key: humanKey(table, b.keys[1]), label: b.desc, group: false, disabled: false })),
   ];
 }

@@ -2,7 +2,10 @@
 /// <reference types="vite/client" />
 import { describe, expect, it } from "vitest";
 import css from "./index.css?raw";
-import { CODE_TEXT_ATTR, codeBlockText, markdownParseCount, renderedText, renderMarkdown, setMarkdownCacheChars } from "./markdown";
+import {
+  CODE_TEXT_ATTR, codeBlockText, markdownParseCount, MAX_PROSE_ESCAPES, renderedText, renderMarkdown, renderMarkdownRevealed,
+  setMarkdownCacheChars,
+} from "./markdown";
 
 describe("renderMarkdown", () => {
   it("highlights a fenced block in a language it knows", () => {
@@ -542,4 +545,119 @@ it.each([
   expect(el.querySelectorAll(".code-escape")).toHaveLength(1);
   expect(el.querySelector("code, pre, kbd, samp, tt")!.textContent).toBe("a⟨U+200B⟩b");
   expect(renderedText(el).trim()).toBe("a⟨U+200B⟩b");
+});
+
+describe("renderMarkdownRevealed: what the page holds is what is revealed", () => {
+  /** `s` spelled in Unicode tag characters (U+E0000 + its ASCII code). */
+  const tags = (s: string) => [...s].map((c) => String.fromCodePoint(0xe0000 + c.codePointAt(0)!)).join("");
+  const CANCEL = "\u{E007F}";
+  const FLAG = "\u{1F3F4}";
+  const escapeOf = (cp: number) => `⟨U+${cp.toString(16).toUpperCase().padStart(4, "0")}⟩`;
+  const escapesIn = (html: string | null) => {
+    const el = document.createElement("div");
+    el.innerHTML = html!;
+    return [...el.querySelectorAll(".code-escape")].map((e) => e.textContent);
+  };
+  /** The text the reader sees, outside the escapes. */
+  const plainText = (html: string | null) => {
+    const el = document.createElement("div");
+    el.innerHTML = html!;
+    for (const e of el.querySelectorAll(".code-escape")) e.remove();
+    return el.textContent ?? "";
+  };
+
+  it("tag characters after a pictograph that are not a flag are each revealed", () => {
+    const hidden = tags("delete checks");
+    const html = renderMarkdownRevealed(`\u2705${hidden} Run the suite`);
+    expect(escapesIn(html)).toEqual([...hidden].map((c) => escapeOf(c.codePointAt(0)!)));
+    expect(plainText(html)).not.toMatch(/[\u{E0000}-\u{E007F}]/u);
+  });
+
+  it("the three recommended subdivision flags stay as written, as do ZWJ sequences", () => {
+    const flags = ["gbeng", "gbsct", "gbwls"].map((code) => FLAG + tags(code) + CANCEL);
+    const text = `Flags ${flags.join(" ")} and \u{1F468}\u200D\u{1F4BB} and \u{1F3F3}\uFE0F\u200D\u{1F308} \u{1F468}\u200D\u{1F9B0} \u{1F9D1}\u{1F3FB}\u200D\u{1F91D}\u200D\u{1F9D1}\u{1F3FC}`;
+    const html = renderMarkdownRevealed(text);
+    expect(escapesIn(html)).toEqual([]);
+    for (const flag of flags) expect(html).toContain(flag);
+  });
+
+  it.each([
+    ["a run with no CANCEL TAG", FLAG + tags("gbeng") + " x", tags("gbeng")],
+    ["a valid subdivision that is not recommended", FLAG + tags("usca") + CANCEL, tags("usca") + CANCEL],
+    ["a subdivision spelling a word", FLAG + tags("delete") + CANCEL, tags("delete") + CANCEL],
+    ["an over-long run", FLAG + tags("gbengland") + CANCEL, tags("gbengland") + CANCEL],
+    ["tags that are not lowercase letters or digits", FLAG + tags("GBENG") + CANCEL, tags("GBENG") + CANCEL],
+    ["a flag's tags after another pictograph", "\u2705" + tags("gbeng") + CANCEL, tags("gbeng") + CANCEL],
+    ["tags after a recommended flag", FLAG + tags("gbeng") + CANCEL + tags("gbsct") + CANCEL, tags("gbsct") + CANCEL],
+    ["a lone CANCEL TAG after the black flag", FLAG + CANCEL, CANCEL],
+  ])("%s is revealed, every tag character", (_name, text, revealed) => {
+    const html = renderMarkdownRevealed(`Plan ${text} end`);
+    expect(escapesIn(html)).toEqual([...revealed].map((c) => escapeOf(c.codePointAt(0)!)));
+  });
+
+  it("a joiner that does not join two pictographs is revealed", () => {
+    expect(escapesIn(renderMarkdownRevealed("\u2705\u200Dship it"))).toEqual(["⟨U+200D⟩"]);
+  });
+
+  it("entity-encoded bidi controls are revealed, not decoded into active controls", () => {
+    const html = renderMarkdownRevealed("Keep &#x202e;secret&#x202c; visible");
+    expect(escapesIn(html)).toEqual(["⟨U+202E⟩", "⟨U+202C⟩"]);
+    expect(plainText(html)).not.toMatch(/[\u202A-\u202E\u2066-\u2069]/);
+  });
+
+  it.each([
+    ["decimal", "a&#8238;b&#8203;c", ["⟨U+202E⟩", "⟨U+200B⟩"]],
+    ["hex, either case", "a&#X200F;b&#xfeff;c", ["⟨U+200F⟩", "⟨U+FEFF⟩"]],
+    ["named", "a&rlm;b&lrm;c&zwj;d&zwnj;e&ZeroWidthSpace;f&NoBreak;g", ["⟨U+200F⟩", "⟨U+200E⟩", "⟨U+200D⟩", "⟨U+200C⟩", "⟨U+200B⟩", "⟨U+2060⟩"]],
+    ["tag characters", "\u2705&#xE0064;&#xE0065;", ["⟨U+E0064⟩", "⟨U+E0065⟩"]],
+    ["in a heading, a list and a link", "# a&#x2066;b\n\n- c&#x2067;d\n\n[e&#x2068;f](https://example.com)", ["⟨U+2066⟩", "⟨U+2067⟩", "⟨U+2068⟩"]],
+  ])("%s character references are revealed", (_name, text, expected) => {
+    expect(escapesIn(renderMarkdownRevealed(text))).toEqual(expected);
+  });
+
+  it("a flag written as character references is the same flag and stays", () => {
+    const text = "&#x1F3F4;" + [..."gbsct"].map((c) => `&#x${(0xe0000 + c.codePointAt(0)!).toString(16)};`).join("") + "&#xE007F;";
+    expect(escapesIn(renderMarkdownRevealed(text))).toEqual([]);
+  });
+
+  it("mixed: a flag stays, a hidden tag run, a literal and an encoded bidi control are revealed", () => {
+    const flag = FLAG + tags("gbwls") + CANCEL;
+    const html = renderMarkdownRevealed(`${flag} \u{1F525}${tags("rm")} keep \u202Eab &#x2067;cd and \`x\u200By\``);
+    expect(escapesIn(html)).toEqual(["⟨U+E0072⟩", "⟨U+E006D⟩", "⟨U+202E⟩", "⟨U+2067⟩", "⟨U+200B⟩"]);
+    expect(html).toContain(flag);
+  });
+
+  it("the escape cap counts the escapes code already holds", () => {
+    const over = MAX_PROSE_ESCAPES + 1;
+    expect(renderMarkdownRevealed("```\n" + "\u200b".repeat(over) + "\n```") === null, "a fenced block").toBe(true);
+    expect(renderMarkdownRevealed("Plan `" + "\u200b".repeat(over) + "`") === null, "inline code").toBe(true);
+    const half = "a\u200b".repeat(MAX_PROSE_ESCAPES / 2);
+    expect(renderMarkdownRevealed("`" + half + "` and " + half + "\u200b") === null, "code and prose together").toBe(true);
+    expect(escapesIn(renderMarkdownRevealed("`" + half + "` and " + half))).toHaveLength(MAX_PROSE_ESCAPES);
+  });
+
+  it.each([
+    ["the Mongolian vowel separator", "Keep&#x180e;checks", ["⟨U+180E⟩"]],
+    ["a soft hyphen", "Keep&shy;checks", ["⟨U+00AD⟩"]],
+    ["the combining grapheme joiner", "Keep&#x034f;checks", ["⟨U+034F⟩"]],
+    ["Hangul fillers", "a\u115Fb\u1160c\u3164d\uFFA0e", ["⟨U+115F⟩", "⟨U+1160⟩", "⟨U+3164⟩", "⟨U+FFA0⟩"]],
+    ["variation selectors on letters", "a\uFE00b\uFE0Fc\u{E0100}d", ["⟨U+FE00⟩", "⟨U+FE0F⟩", "⟨U+E0100⟩"]],
+    ["Mongolian selectors and shorthand format controls", "a\u180Bb\u180Fc\u{1BCA0}d\u{1BCA3}e", ["⟨U+180B⟩", "⟨U+180F⟩", "⟨U+1BCA0⟩", "⟨U+1BCA3⟩"]],
+    ["invisible operators and deprecated format characters", "a\u2061b\u2065c\u206Ad\u206Fe", ["⟨U+2061⟩", "⟨U+2065⟩", "⟨U+206A⟩", "⟨U+206F⟩"]],
+    ["interlinear annotation", "a\uFFF9b\uFFFAc\uFFFBd", ["⟨U+FFF9⟩", "⟨U+FFFA⟩", "⟨U+FFFB⟩"]],
+    ["unassigned default-ignorables", "a\uFFF0b\u{E0000}c\u{E0080}d", ["⟨U+FFF0⟩", "⟨U+E0000⟩", "⟨U+E0080⟩"]],
+    ["a control and a line separator", "a\u0007b\u2028c", ["⟨U+0007⟩", "⟨U+2028⟩"]],
+  ])("%s in prose is revealed", (_name, text, expected) => {
+    expect(escapesIn(renderMarkdownRevealed(text))).toEqual(expected);
+  });
+
+  it("emoji presentation and the other spaces stay as written", () => {
+    const text = "\u2705\uFE0F done \u263A\uFE0E 1\uFE0F\u20E3 step\u00A0one\u202Ftwo\u3000three";
+    expect(escapesIn(renderMarkdownRevealed(text))).toEqual([]);
+  });
+
+  it("the escape cap counts what the page holds", () => {
+    expect(renderMarkdownRevealed(`# Plan\n\n${"a&#x200b;".repeat(MAX_PROSE_ESCAPES + 1)}`) === null, "past the cap").toBe(true);
+    expect(escapesIn(renderMarkdownRevealed(`# Plan\n\n${"a&#x200b;".repeat(3)}`))).toHaveLength(3);
+  });
 });

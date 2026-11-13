@@ -5,7 +5,8 @@
 //! A fixture directory holds `manifest.json`, `proto.bin` (length-delimited `SessionEvent` frames; a resumed
 //! session adds `proto-resume1.bin`, `proto-resume2.bin`, ... in order), `outgoing.jsonl` (what the host sent,
 //! each line with the position in the wire recording it was sent at) and `expected-events.json`. The manifest's
-//! `facts.replay_settings` tells how the recording provider translated: `{splits_messages, requested_cli_mode}`.
+//! `facts.replay_settings` tells how the recording provider translated: `{splits_messages, requested_cli_mode, plan_offered}`
+//! (`plan_offered` absent reads as false: a recording made before plan mode offered none).
 use crate::providers::claude_sidecar::{replay_frames, ReplaySettings, ReplaySteer, ReplaySteerOutcome};
 use crate::RequestedCliMode;
 use claude_runtime_protocol::v1::SessionEvent;
@@ -163,9 +164,12 @@ pub fn settings_of(manifest: &Value) -> Result<ReplaySettings, String> {
             ))
         }
     };
+    // A recording made before plan mode existed has no word of it: the session offered none.
+    let plan_offered = settings["plan_offered"].as_bool().unwrap_or(false);
     Ok(ReplaySettings {
         splits_messages,
         requested_cli_mode,
+        plan_offered,
     })
 }
 

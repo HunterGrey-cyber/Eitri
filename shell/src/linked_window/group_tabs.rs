@@ -264,6 +264,7 @@ mod tests {
             turn_running: false,
             draft: None,
             row_key: None,
+            plan_origin: None,
         }
     }
 

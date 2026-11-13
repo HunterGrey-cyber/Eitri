@@ -170,6 +170,10 @@ pub(super) fn tick_send(
         }
     }
     poll_question_sends(state, out);
+    super::plan_glue::poll_plan_sends(state, out);
+    super::plan_glue::poll_planning_switches(state, out);
+    super::plan_glue::check_plan_transitions(state, out);
+    super::inbound::poll_attachments(state, out);
     super::remote_entry::poll_remote(state, screen, out);
     super::editor_glue::poll(state, out);
     poll_proposal_jobs(state, out);
@@ -405,6 +409,8 @@ pub(super) fn needs_polling(state: &AgentPanelState) -> bool {
         || state.chat_moves.is_waiting()
         || state.hand_overs.is_waiting()
         || state.tabs.needs_polling()
+        || state.tabs.attachments_pending()
+        || super::inbound::owes_gone_imports(state)
         || state.tabs.history_pending()
         || !state.retiring.is_empty()
         || !state.pending_edits.is_empty()
@@ -413,6 +419,8 @@ pub(super) fn needs_polling(state: &AgentPanelState) -> bool {
         || state.path_lookup.is_running()
         || state.symbol_lookup.is_running()
         || !state.question_sends.is_empty()
+        || !state.plan_sends.is_empty()
+        || !state.planning_switches.is_empty()
         || !state.permission_sends.is_empty()
         || state.remote.needs_polling()
         || !state.proposal_jobs.is_empty()
@@ -1091,6 +1099,95 @@ mod tests {
         // The tick that saw it go idle asked for one more; the one after waits.
         let next = handle.run_tick(at + AgentPanelHandle::TICK);
         assert_eq!(next, NextTick::OnWake);
+    }
+
+    /// A request held for its call raises no wake (the CLI waits on its answer, and the sidecar may never show the
+    /// call), so the tick itself is due when the wait runs out; the tick then judges it (a card here: nothing says
+    /// whether the CLI planned when it asked), and only the wake is waited on again.
+    #[test]
+    fn a_request_held_for_its_call_keeps_the_tick_due_until_it_is_released() {
+        use crate::panel_wake::NextTick;
+        agent::state_dirs::redirect_state_to_a_test_root();
+        let dir = agent::state_dirs::test_workspace_dir("panel-held-request-tick");
+        let (handle, _page) = settled_panel();
+        let provider = std::sync::Arc::new(RecordingProvider::planning(false));
+        let conversation =
+            agent::AgentConversation::create(provider.clone(), &dir, agent::setting_sources::ProjectTrust::Untrusted)
+                .unwrap();
+        let tab = {
+            let mut state = handle.state.borrow_mut();
+            let tab = state.tabs.open(AgentId::Claude);
+            state
+                .tabs
+                .get_mut(tab)
+                .unwrap()
+                .set_backend(TabBackend::Live(AgentBackend::Conversation {
+                    agent: AgentId::Claude,
+                    conversation: Box::new(conversation),
+                }));
+            tab
+        };
+        provider.queue(agent::AgentDomainEvent::CliPermissionMode {
+            reported: "default".into(),
+        });
+        provider.queue(agent::AgentDomainEvent::TurnStarted { turn_id: "t1".into() });
+        provider.queue(agent::AgentDomainEvent::PermissionRequested {
+            permission_id: "perm-b".into(),
+            tool_use_id: Some("toolu_b".into()),
+            tool_name: "Bash".into(),
+            input: serde_json::json!({ "command": "touch x" }),
+            provider_prompt: None,
+        });
+        let held = || handle.state.borrow().tabs.next_plan_sequence_release();
+        tick_handle_until(&handle, "the request to wait for its call", || held().is_some());
+        let at = std::time::Instant::now();
+        let wait = std::time::Duration::from_millis(eitri_core::agent_backend::PLAN_SEQUENCE_WAIT_MS);
+        match handle.run_tick(at) {
+            NextTick::At(due) => {
+                assert!(
+                    due > at + AgentPanelHandle::TICK,
+                    "not before the wait runs out: {due:?}"
+                );
+                assert!(due <= at + wait + std::time::Duration::from_millis(5), "by its end");
+            }
+            other => panic!("a held request with nothing else to wake the tick is never released: {other:?}"),
+        }
+        assert!(held().is_some(), "still waiting");
+        // Its wait is over: the next tick judges it.
+        let wall_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        handle.state.borrow_mut().tabs.hold_for_its_call_since(
+            tab,
+            "perm-b",
+            wall_ms - eitri_core::agent_backend::PLAN_SEQUENCE_WAIT_MS - 1,
+        );
+        let mut at = at + AgentPanelHandle::TICK;
+        handle.run_tick(at);
+        assert_eq!(held(), None, "judged");
+        assert!(
+            handle
+                .state
+                .borrow()
+                .tabs
+                .get(tab)
+                .unwrap()
+                .attention
+                .card_ids()
+                .contains(&"perm-b".to_string()),
+            "a card"
+        );
+        assert!(provider.decisions().is_empty(), "{:?}", provider.decisions());
+        let mut settled = false;
+        for _ in 0..5 {
+            at += AgentPanelHandle::TICK;
+            if handle.run_tick(at) == NextTick::OnWake {
+                settled = true;
+                break;
+            }
+        }
+        assert!(settled, "nothing is due once it is judged");
     }
 
     /// The typing cadence's deadlines: the first key of a typing window wakes the tick, which tells the

@@ -218,10 +218,7 @@ fn started(dir: &Path, thread: &str, rest: Vec<Value>) -> CodexProvider {
 fn send(provider: &CodexProvider, thread: &str) -> String {
     provider
         .send_turn_with(
-            SendTurnRequest {
-                session_id: thread.to_string(),
-                text: "go".into(),
-            },
+            SendTurnRequest::text(thread.to_string(), "go"),
             TurnPolicy {
                 reviewer: Reviewer::User,
                 sandbox: agent::Sandbox::Project,
@@ -829,10 +826,7 @@ fn a_real_codex_turn_with_an_approval_pending_completes_after_adoption() {
         .expect("the session starts");
     source
         .send_turn_with(
-            SendTurnRequest {
-                session_id: thread.clone(),
-                text: "PROMPT-GATED".to_string(),
-            },
+            SendTurnRequest::text(thread.clone(), "PROMPT-GATED".to_string()),
             policy,
         )
         .expect("the turn starts");

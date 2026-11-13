@@ -604,6 +604,7 @@ fn a_moved_tab_waiting_for_the_trust_question_is_asked_again_where_it_lands() {
                     wire: "hi".into(),
                     typed: "hi".into(),
                     shell_line: false,
+                    attachments: Vec::new(),
                 },
             },
         )
@@ -945,6 +946,7 @@ fn a_resumed_sessions_first_prompt_waits_as_starting() {
             wire: "first".into(),
             typed: "first".into(),
             shell_line: false,
+            attachments: Vec::new(),
         },
     );
     assert!(matches!(sent, Some(Sent::First { ref request_id, outcome: Ok(()), .. }) if request_id == "req-1"));
@@ -1434,6 +1436,7 @@ fn typed(text: &str) -> FirstTurn {
         wire: text.into(),
         typed: text.into(),
         shell_line: false,
+        attachments: Vec::new(),
     }
 }
 
@@ -2776,6 +2779,7 @@ fn a_record_without_a_key_gets_a_new_one() {
             turn_running: false,
             draft: None,
             row_key: saved_key.clone(),
+            plan_origin: None,
         };
         let saved = SavedTabs::from_parts(vec![tab], 0, Vec::new(), None);
         let (mut target, arrived) = restored(&saved, "sess-old");
@@ -2805,6 +2809,7 @@ fn a_failed_restore_into_the_empty_tab_does_not_keep_the_records_key() {
         turn_running: false,
         draft: None,
         row_key: Some(key.as_str().to_string()),
+        plan_origin: None,
     };
     let saved = SavedTabs::from_parts(vec![tab], 0, Vec::new(), None);
     let plan = crate::tab_restore::plan(&saved, &[record_of("sess-refused")], &[], |_, _| false);
@@ -2883,4 +2888,109 @@ fn a_withdrawn_phone_send_waiting_for_presence_never_runs() {
         assert!(!set.send_is_held(tab) && !set.starting.contains(&tab.0));
         shut_down(&mut set);
     }
+}
+
+/// Plan mode asked for on an empty tab goes with it: the window it lands in holds its first message until
+/// the session it opens is in plan mode.
+#[test]
+fn an_empty_tab_marked_plan_on_start_still_plans_after_a_move() {
+    let mut source = set();
+    let tab = source.active();
+    assert!(source.set_planning(tab, ViewId::BASE, true, 0).unwrap().is_none());
+    let frozen = freeze_settled(&mut source, tab).expect("an empty tab moves");
+    let record: TabHandoff = serde_json::from_str(&serde_json::to_string(&frozen.tab).unwrap()).unwrap();
+    let mut dest = set();
+    let arrived = dest.adopt_moved_unstarted(record, ViewId::BASE).unwrap();
+    assert!(dest.get(arrived).unwrap().plan_on_start());
+    assert_eq!(dest.get(arrived).unwrap().plan_origin(), None);
+}
+
+/// What a planning tab keeps about plan mode crosses with it: where plan mode started, the round it
+/// follows, the approval it already took up, the cards raised in plan mode, the requests waiting for their calls and
+/// the calls an approval waits for.
+#[test]
+fn a_move_while_planning_keeps_the_origin_and_the_drain_set() {
+    let mut source = set();
+    let tab = source.active();
+    {
+        let t = source.get_mut(tab).unwrap();
+        t.plan_origin = Some(SessionModeChoice::Bypass);
+        t.plan_cycle.open = true;
+        t.plan_cycle.origin = Some(SessionModeChoice::Bypass);
+        t.plan_mode_applied_seq = Some(7);
+        t.session.plan.deferred_in_flight.insert("toolu_b".into());
+        t.session.plan.cards.insert("perm-w".into());
+        t.session.plan.unsequenced.insert("perm-u".into(), 42);
+        t.session.plan_feedback_draft.insert("p1".into(), "shorter".into());
+    }
+    let frozen = freeze_settled(&mut source, tab).expect("the tab moves");
+    let record: TabHandoff = serde_json::from_str(&serde_json::to_string(&frozen.tab).unwrap()).unwrap();
+    let mut dest = set();
+    let arrived = dest.adopt_moved_unstarted(record, ViewId::BASE).unwrap();
+    let t = dest.get(arrived).unwrap();
+    assert_eq!(t.plan_origin(), Some(SessionModeChoice::Bypass));
+    assert_eq!(t.plan_cycle.origin, Some(SessionModeChoice::Bypass));
+    assert!(t.plan_cycle.open);
+    assert_eq!(t.plan_mode_applied_seq, Some(7));
+    assert!(t.session.plan.deferred_in_flight.contains("toolu_b"));
+    assert!(t.session.plan.cards.contains("perm-w"));
+    assert_eq!(
+        t.session.plan.unsequenced.get("perm-u"),
+        Some(&42),
+        "a request waiting for its call keeps waiting from when it arrived"
+    );
+    assert_eq!(
+        t.session.plan_feedback_draft.get("p1").map(String::as_str),
+        Some("shorter")
+    );
+}
+
+/// A message with an image that the presence never let go waits at the head of the queue with its image: sent again,
+/// it goes as it was typed, and the image is no longer the draft's. While it was held, the image could not be taken
+/// out of the draft.
+#[test]
+fn a_held_message_that_could_not_go_waits_in_the_queue_with_its_images() {
+    let scratch = scratch("move-held-images");
+    let dir = scratch.join("project");
+    let review_dir = scratch.join("state/eitri/review/0123456789abcdef");
+    let mut set = set();
+    let (holder, _parked) = PresenceHolder::start_parked(review_dir, 4253);
+    set.hold_presence(holder);
+    let _ = set.set_partner(Some(partner()));
+    let (_provider, tab) = live_tab(&mut set, &dir);
+    let image = ReadyImage {
+        token: "a".repeat(32),
+        name: "shot.png".into(),
+        image: agent::TurnImage {
+            meta: agent::AttachmentMeta {
+                media_type: "image/png".into(),
+                bytes: 1,
+                width: 1,
+                height: 1,
+                sha256: String::new(),
+            },
+            data: Arc::from(&b"x"[..]),
+        },
+        thumbnail: String::new(),
+    };
+    set.put_ready_for_test(tab, image.clone());
+    let images = set.draft_images(tab, std::slice::from_ref(&image.token)).unwrap();
+    assert!(set
+        .send_prompt(
+            tab,
+            "r1",
+            ViewId::BASE,
+            super::attachment_tests::turn_with("look", images)
+        )
+        .is_none());
+    assert_eq!(set.attach_remove(tab, &image.token), Err(PARKED.to_string()));
+    let _ = set.poll_turn_sends(Instant::now() + crate::turn_review::CONFIRM_WAIT);
+    let sent = set.poll_turn_sends(Instant::now() + crate::turn_review::CONFIRM_WAIT * 3);
+    assert!(matches!(&sent[..], [Sent::NotSent { .. }]), "{}", sent.len());
+    let t = set.get(tab).unwrap();
+    assert_eq!(t.session.queue[0].text, "look");
+    assert_eq!(t.session.queue[0].attachments, [image]);
+    assert!(t.attachments.is_empty(), "it left the draft with its message");
+    shut_down(&mut set);
+    let _ = std::fs::remove_dir_all(&scratch);
 }

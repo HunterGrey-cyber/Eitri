@@ -228,6 +228,12 @@ const PANEL_ROWS_ADDED_AFTER_V1: &[(&str, &str, &str)] = &[
         "eitri-only: the remote-control device list, r as in remote and d as in devices; LazyVim binds no <leader>r \
          group, and the page offers it only while remote control is on",
     ),
+    (
+        "<leader> p",
+        "plan.toggle",
+        "eitri-only: p as in plan, Claude Code's /plan; LazyVim binds no <leader>p, and without a session offering \
+         plan mode the page says why instead",
+    ),
 ];
 
 #[test]

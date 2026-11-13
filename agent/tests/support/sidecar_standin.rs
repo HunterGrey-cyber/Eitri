@@ -46,9 +46,36 @@
 //! - `client-call <call id> <tool> [<tool use id>]`: the model called a tool, with fixed arguments;
 //! - `hold-answers`: every later `AnswerClientToolCall` gets no reply until `release-answers`.
 //!
+//! With `--turn-content` the stand-in offers protocol 3.26's `turn_content_v1` with the real sidecar's
+//! `turn_content_limits` (four media types, 8 images, 3,670,016 bytes each and together), or with
+//! `--content-limits <images>/<bytes each>/<bytes together>/<media types, comma separated>` those instead. It
+//! takes whatever content arrives (the host's own checks are what the tests read), unless
+//! `--refuse-content <reason>` makes it refuse every `SendTurn` carrying content with
+//! `INVALID_CONFIGURATION` and that reason, before anything else happens, as the sidecar refuses content
+//! it does not accept. A `SendTurn`'s line in `--record-sends` then names each image after the
+//! typed mark, in order, as `image:<media type>:<length>:<sha-256 hex>`; never its bytes.
+//! `--record-turns <file>` appends each `SendTurn` request as it arrived, length-prefixed as
+//! `--record-create` writes, with every image's bytes emptied.
+//!
 //! `--record-answers <file>` appends a line per `AnswerClientToolCall`, as it arrives and before any
 //! hold: `<call id> <taken, or the refusal> <is_error> <its text, blocks joined by |>`, and
-//! `replied <call id>` when its reply goes out.
+//! `replied <call id>` when its reply goes out. With `--plan-mode` it also appends a line per plan decision,
+//! `plan <interaction id> approve <mode> <digest>` or `plan <interaction id> keep <feedback>`, followed by
+//! ` refused <reason>` when it was refused, and one per `SetPlanning`, `set-planning <enter> <the mode
+//! acknowledged, or refused <reason>>`.
+//!
+//! With `--plan-mode` the stand-in offers protocol 3.26's `plan_mode_v1` (with the CLI's own prompts, which
+//! Verdandi requires beside it). A session created with `client_interactions.plan_mode` must state its CLI
+//! mode, as Verdandi requires, and reports that mode in `SessionReady`. `SetPlanning` moves it at once and
+//! reports the move with `CliModeReported`; it refuses as Verdandi does (`planning_not_offered`,
+//! `planning_interaction_pending`, `planning_already`). An approval reports the session's creation mode after
+//! its settlement; "keep planning" settles with the feedback as sent. A script can drive it:
+//! - `plan <text>`: the model proposes a plan with that text; the rest of the script runs once it is settled;
+//! - `refuse-planning <reason>`: the next `SetPlanning` is refused with that reason (`TURN_ALREADY_ACTIVE`
+//!   for `planning_turn_running`, `INVALID_CONFIGURATION` otherwise), nothing moved;
+//! - `slow-planning`: the next `SetPlanning` moves the session and reports it, then answers
+//!   `DEADLINE_EXCEEDED` with no reason, as the sidecar does when the CLI acknowledged late;
+//! - `late-planning <ms>`: the next `SetPlanning` waits that long before it moves and answers.
 //!
 //! A sidecar this client did not ship with is scripted through the environment, so a launcher can give
 //! one stand-in its own script while the tests that start it share theirs:
@@ -73,7 +100,14 @@
 //!   refusing evicted cursors with `EVENT_GAP`.
 
 use claude_runtime_protocol::v1::client_tool_content::Kind as ContentKind;
+use claude_runtime_protocol::v1::resolve_interaction_request::Result as Decision;
 use claude_runtime_protocol::v1::session_event::Event;
+use claude_runtime_protocol::v1::{
+    interaction_requested::Payload, CliModeReported, CliPermissionMode, InteractionKind, InteractionOutcome,
+    InteractionRequested, InteractionResolved, PlanProposal, ResolveInteractionRequest, ResolveInteractionResponse,
+    SetPlanningRequest, SetPlanningResponse,
+};
+use claude_runtime_protocol::v1::{turn_content_block, TurnContentBlock, TurnContentLimits};
 use claude_runtime_protocol::v1::{
     AnswerClientToolCallRequest, AnswerClientToolCallResponse, CliCycleStarted, ClientToolCall, ClientToolCallOutcome,
     ClientToolCallSettled, CloseSessionRequest, CloseSessionResponse, CreateSessionRequest, CreateSessionResponse,
@@ -198,6 +232,28 @@ struct Session {
     open_calls: Vec<OpenClientToolCall>,
     /// The client tool calls answered, each of them spent.
     answered_calls: HashSet<String>,
+    /// Created with `client_interactions.plan_mode`.
+    plan_offered: bool,
+    /// The CLI's word for the mode the session was created in.
+    creation: String,
+    /// Whether the session's CLI runs plan mode.
+    in_plan: bool,
+    /// The plan waiting for a decision.
+    waiting_plan: Option<WaitingPlan>,
+    /// The reason the next `SetPlanning` is refused with.
+    refuse_planning: Option<String>,
+    /// The next `SetPlanning` moves, then answers `DEADLINE_EXCEEDED`.
+    slow_planning: bool,
+    /// The next `SetPlanning` waits this long before it moves and answers.
+    late_planning_ms: Option<u64>,
+}
+
+/// A plan the model proposed and nobody decided yet: the rest of its script waits for the decision.
+struct WaitingPlan {
+    interaction_id: String,
+    plan_sha256: String,
+    turn_id: String,
+    rest: Vec<String>,
 }
 
 struct PendingPermission {
@@ -222,6 +278,52 @@ struct Shared {
     holding_answers: tokio::sync::watch::Sender<bool>,
     scripted: Scripted,
     ring_capacity: Option<usize>,
+    plan_mode: bool,
+    /// The handshake's `turn_content_limits` and `turn_content_v1`, when offered.
+    turn_content: Option<TurnContentLimits>,
+    /// The reason every `SendTurn` carrying content is refused with.
+    refuse_content: Option<String>,
+    record_turns: Mutex<Option<std::fs::File>>,
+}
+
+/// The limits the real sidecar states.
+fn sidecar_content_limits() -> TurnContentLimits {
+    TurnContentLimits {
+        image_media_types: ["image/png", "image/jpeg", "image/gif", "image/webp"]
+            .map(String::from)
+            .to_vec(),
+        max_images_per_turn: 8,
+        max_image_bytes: 3_670_016,
+        max_content_bytes: 3_670_016,
+    }
+}
+
+/// `<images>/<bytes each>/<bytes together>/<media types, comma separated>`.
+fn parse_content_limits(text: &str) -> TurnContentLimits {
+    let parts: Vec<&str> = text.splitn(4, '/').collect();
+    assert_eq!(parts.len(), 4, "content limits: {text}");
+    TurnContentLimits {
+        max_images_per_turn: parts[0].parse().expect("a count"),
+        max_image_bytes: parts[1].parse().expect("a size"),
+        max_content_bytes: parts[2].parse().expect("a size"),
+        image_media_types: parts[3].split(',').map(String::from).collect(),
+    }
+}
+
+/// Each image of a turn's content as `--record-sends` names it.
+fn content_marks(content: &[TurnContentBlock]) -> String {
+    use sha2::Digest as _;
+    content
+        .iter()
+        .map(|block| match &block.block {
+            Some(turn_content_block::Block::Image(image)) => {
+                let digest = sha2::Sha256::digest(&image.data);
+                let hex: String = digest.iter().map(|byte| format!("{byte:02x}")).collect();
+                format!(" image:{}:{}:{hex}", image.media_type, image.data.len())
+            }
+            None => " block:unknown".to_string(),
+        })
+        .collect()
 }
 
 static IGNORE_EOF: AtomicBool = AtomicBool::new(false);
@@ -328,14 +430,15 @@ impl Shared {
         }
     }
 
-    fn record_send(&self, rpc: &str, client_id: Option<&str>, typed: bool, text: &str) {
+    fn record_send(&self, rpc: &str, client_id: Option<&str>, typed: bool, text: &str, content: &[TurnContentBlock]) {
         if let Some(file) = self.record_sends.lock().unwrap().as_mut() {
             let mention = if text.contains('@') {
                 format!(" {text:?}")
             } else {
                 String::new()
             };
-            writeln!(file, "{rpc} {} {typed}{mention}", client_id.unwrap_or("-")).unwrap();
+            let images = content_marks(content);
+            writeln!(file, "{rpc} {} {typed}{images}{mention}", client_id.unwrap_or("-")).unwrap();
             file.flush().unwrap();
         }
     }
@@ -358,6 +461,13 @@ fn refusal_saying(status: tonic::Code, code: ErrorCode, message: &str, reason: &
         .encode_to_vec()
         .into(),
     )
+}
+
+/// The reason a refusal carries, empty when it carries none.
+fn reason_of(status: &Status) -> String {
+    ErrorDetail::decode(status.details())
+        .map(|detail| detail.reason)
+        .unwrap_or_default()
 }
 
 /// A cause of `kind`, with the slots that kind fills.
@@ -519,6 +629,52 @@ fn run(shared: Arc<Shared>, session_id: String, mut turn_id: String, mut steps: 
                         }),
                     );
                 }
+                Some("plan") => {
+                    let text = words.collect::<Vec<_>>().join(" ");
+                    let interaction_id = shared.id("plan");
+                    let plan_sha256 = sha256_hex(&text);
+                    if let Some(session) = shared.sessions.lock().unwrap().get_mut(&session_id) {
+                        session.waiting_plan = Some(WaitingPlan {
+                            interaction_id: interaction_id.clone(),
+                            plan_sha256: plan_sha256.clone(),
+                            turn_id: turn_id.clone(),
+                            rest: std::mem::take(&mut steps),
+                        });
+                    }
+                    shared.emit(
+                        &session_id,
+                        Some(&turn_id),
+                        Event::InteractionRequested(InteractionRequested {
+                            tool_use_id: format!("tool-{interaction_id}"),
+                            interaction_id,
+                            kind: InteractionKind::PlanApproval as i32,
+                            payload: Some(Payload::Plan(PlanProposal {
+                                plan: text,
+                                plan_sha256,
+                                allowed_prompts: Vec::new(),
+                            })),
+                            unsupported_reason: None,
+                        }),
+                    );
+                    return;
+                }
+                Some("refuse-planning") => {
+                    let reason = words.next().unwrap_or("planning_cli_refused").to_string();
+                    if let Some(session) = shared.sessions.lock().unwrap().get_mut(&session_id) {
+                        session.refuse_planning = Some(reason);
+                    }
+                }
+                Some("late-planning") => {
+                    let ms = words.next().and_then(|ms| ms.parse().ok()).unwrap_or(500);
+                    if let Some(session) = shared.sessions.lock().unwrap().get_mut(&session_id) {
+                        session.late_planning_ms = Some(ms);
+                    }
+                }
+                Some("slow-planning") => {
+                    if let Some(session) = shared.sessions.lock().unwrap().get_mut(&session_id) {
+                        session.slow_planning = true;
+                    }
+                }
                 Some("unknown-event") => shared.emit_any(&session_id, Some(&turn_id), None),
                 Some("hold-answers") => {
                     shared.holding_answers.send_replace(true);
@@ -604,6 +760,105 @@ fn run(shared: Arc<Shared>, session_id: String, mut turn_id: String, mut steps: 
     });
 }
 
+fn sha256_hex(text: &str) -> String {
+    use sha2::Digest as _;
+    sha2::Sha256::digest(text.as_bytes())
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+/// One `SetPlanning`, decided at once: the mode acknowledged, and whether the answer is the sidecar's
+/// deadline instead.
+fn set_planning(shared: &Shared, request: &SetPlanningRequest) -> Result<(String, bool), Status> {
+    let mut sessions = shared.sessions.lock().unwrap();
+    let session = sessions
+        .get_mut(&request.session_id)
+        .filter(|session| !session.closed)
+        .ok_or_else(|| refusal(tonic::Code::NotFound, ErrorCode::SessionNotFound, ""))?;
+    let invalid = |reason: &str| refusal(tonic::Code::FailedPrecondition, ErrorCode::InvalidConfiguration, reason);
+    if !session.plan_offered {
+        return Err(invalid("planning_not_offered"));
+    }
+    if let Some(reason) = session.refuse_planning.take() {
+        return Err(if reason == "planning_turn_running" {
+            refusal(tonic::Code::FailedPrecondition, ErrorCode::TurnAlreadyActive, &reason)
+        } else {
+            invalid(&reason)
+        });
+    }
+    if session.waiting_plan.is_some() {
+        return Err(invalid("planning_interaction_pending"));
+    }
+    if session.in_plan == request.enter {
+        return Err(invalid("planning_already"));
+    }
+    session.in_plan = request.enter;
+    let mode = if request.enter {
+        "plan".to_string()
+    } else {
+        session.creation.clone()
+    };
+    Ok((mode, std::mem::take(&mut session.slow_planning)))
+}
+
+/// One plan decision, decided at once: the settlement and what the CLI reports after it, with the rest of
+/// the plan's script and its turn.
+fn decide_plan(
+    shared: &Shared,
+    request: &ResolveInteractionRequest,
+) -> Result<(InteractionResolved, Option<String>, String, Vec<String>), Status> {
+    let refused = |reason: &str| {
+        refusal(
+            tonic::Code::FailedPrecondition,
+            ErrorCode::InteractionAnswerRefused,
+            reason,
+        )
+    };
+    let mut sessions = shared.sessions.lock().unwrap();
+    let session = sessions
+        .get_mut(&request.session_id)
+        .filter(|session| !session.closed)
+        .ok_or_else(|| refusal(tonic::Code::NotFound, ErrorCode::SessionNotFound, ""))?;
+    let Some(waiting) = session
+        .waiting_plan
+        .as_ref()
+        .filter(|plan| plan.interaction_id == request.interaction_id)
+    else {
+        return Err(refusal(tonic::Code::NotFound, ErrorCode::InteractionNotFound, ""));
+    };
+    let mut settled = InteractionResolved {
+        interaction_id: request.interaction_id.clone(),
+        kind: InteractionKind::PlanApproval as i32,
+        ..Default::default()
+    };
+    let report = match &request.result {
+        Some(Decision::Approve(approval)) => {
+            if approval.mode == 0 {
+                return Err(refused("plan_mode_unspecified"));
+            }
+            if approval.plan_sha256 != waiting.plan_sha256 {
+                return Err(refused("plan_digest_mismatch"));
+            }
+            settled.outcome = InteractionOutcome::Approved as i32;
+            settled.mode_after = Some(approval.mode);
+            session.in_plan = false;
+            Some(session.creation.clone())
+        }
+        Some(Decision::KeepPlanning(keep)) => {
+            if keep.feedback.len() > 16 * 1024 {
+                return Err(refused("feedback_too_long"));
+            }
+            settled.outcome = InteractionOutcome::KeptPlanning as i32;
+            settled.feedback = Some(keep.feedback.clone());
+            None
+        }
+        _ => return Err(refused("kind_mismatch")),
+    };
+    let waiting = session.waiting_plan.take().expect("matched above");
+    Ok((settled, report, waiting.turn_id, waiting.rest))
+}
+
 fn handshake(shared: &Shared) -> HandshakeResponse {
     let mut response = HandshakeResponse {
         protocol_major: 3,
@@ -641,6 +896,17 @@ fn handshake(shared: &Shared) -> HandshakeResponse {
     if shared.client_tools {
         response.protocol_minor = 23;
         response.capabilities.push("client_tools".to_string());
+    }
+    if shared.plan_mode {
+        response.protocol_minor = 26;
+        response
+            .capabilities
+            .extend(["plan_mode_v1".to_string(), "provider_permission_prompts".to_string()]);
+    }
+    if let Some(limits) = &shared.turn_content {
+        response.protocol_minor = 26;
+        response.capabilities.push("turn_content_v1".to_string());
+        response.turn_content_limits = Some(limits.clone());
     }
     let scripted = &shared.scripted;
     if let Some(capabilities) = &scripted.capabilities {
@@ -729,15 +995,40 @@ impl Service<http::Request<Body>> for StandIn {
                             file.write_all(&bytes).unwrap();
                             file.flush().unwrap();
                         }
+                        let plan_offered = request
+                            .client_interactions
+                            .as_ref()
+                            .is_some_and(|offer| offer.plan_mode);
+                        let stated = request
+                            .policy
+                            .as_ref()
+                            .map_or(CliPermissionMode::Unspecified as i32, |policy| {
+                                policy.cli_permission_mode
+                            });
+                        if plan_offered && stated == CliPermissionMode::Unspecified as i32 {
+                            return Err(refusal(
+                                tonic::Code::InvalidArgument,
+                                ErrorCode::InvalidConfiguration,
+                                "client_interactions_plan_needs_cli_mode",
+                            ));
+                        }
+                        let creation = if stated == CliPermissionMode::Auto as i32 {
+                            "auto"
+                        } else {
+                            "default"
+                        };
                         let session_id = shared.id("session");
                         let provider_session_id = request
                             .resume_provider_session_id
                             .unwrap_or_else(|| format!("claude-{session_id}"));
-                        shared
-                            .sessions
-                            .lock()
-                            .unwrap()
-                            .insert(session_id.clone(), Session::default());
+                        shared.sessions.lock().unwrap().insert(
+                            session_id.clone(),
+                            Session {
+                                plan_offered,
+                                creation: creation.to_string(),
+                                ..Session::default()
+                            },
+                        );
                         shared.emit(
                             &session_id,
                             None,
@@ -746,7 +1037,7 @@ impl Service<http::Request<Body>> for StandIn {
                                 provider_session_id,
                                 model: "stand-in".to_string(),
                                 cwd: request.cwd,
-                                permission_mode: "default".to_string(),
+                                permission_mode: creation.to_string(),
                                 ..Default::default()
                             }),
                         );
@@ -759,11 +1050,33 @@ impl Service<http::Request<Body>> for StandIn {
                 }
                 "SendTurn" => {
                     unary(req, move |request: SendTurnRequest| async move {
+                        if let Some(file) = shared.record_turns.lock().unwrap().as_mut() {
+                            let mut kept = request.clone();
+                            for block in &mut kept.content {
+                                if let Some(turn_content_block::Block::Image(image)) = &mut block.block {
+                                    image.data.clear();
+                                }
+                            }
+                            let bytes = kept.encode_to_vec();
+                            file.write_all(&(bytes.len() as u32).to_le_bytes()).unwrap();
+                            file.write_all(&bytes).unwrap();
+                            file.flush().unwrap();
+                        }
+                        if let Some(reason) = shared.refuse_content.as_deref()
+                            && !request.content.is_empty()
+                        {
+                            return Err(refusal(
+                                tonic::Code::InvalidArgument,
+                                ErrorCode::InvalidConfiguration,
+                                reason,
+                            ));
+                        }
                         shared.record_send(
                             "send",
                             request.client_message_id.as_deref(),
                             request.typed_by_person,
                             &request.text,
+                            &request.content,
                         );
                         if let Some(session) = shared.sessions.lock().unwrap().get_mut(&request.session_id) {
                             session.last_client_id = request.client_message_id.clone();
@@ -790,6 +1103,7 @@ impl Service<http::Request<Body>> for StandIn {
                             Some(&request.client_message_id),
                             request.typed_by_person,
                             &request.text,
+                            &[],
                         );
                         let after = request.text.trim().parse().unwrap_or(500);
                         let turn_id = request.expected_turn_id.clone();
@@ -915,6 +1229,68 @@ impl Service<http::Request<Body>> for StandIn {
                             through_sequence: session.latest_sequence,
                             open: session.open_calls.clone(),
                         })
+                    })
+                    .await
+                }
+                "SetPlanning" => {
+                    unary(req, move |request: SetPlanningRequest| async move {
+                        let late = shared
+                            .sessions
+                            .lock()
+                            .unwrap()
+                            .get_mut(&request.session_id)
+                            .and_then(|session| session.late_planning_ms.take());
+                        if let Some(ms) = late {
+                            tokio::time::sleep(Duration::from_millis(ms)).await;
+                        }
+                        let decided = set_planning(&shared, &request);
+                        let verdict = match &decided {
+                            Ok((mode, _)) => mode.clone(),
+                            Err(status) => format!("refused {}", reason_of(status)),
+                        };
+                        shared.record_answer(&format!("set-planning {} {verdict}", request.enter));
+                        let (mode, slow) = decided?;
+                        shared.emit(
+                            &request.session_id,
+                            None,
+                            Event::CliModeReported(CliModeReported {
+                                permission_mode: mode.clone(),
+                            }),
+                        );
+                        if slow {
+                            return Err(refusal(tonic::Code::DeadlineExceeded, ErrorCode::DeadlineExceeded, ""));
+                        }
+                        Ok(SetPlanningResponse { permission_mode: mode })
+                    })
+                    .await
+                }
+                "ResolveInteraction" => {
+                    unary(req, move |request: ResolveInteractionRequest| async move {
+                        let decided = decide_plan(&shared, &request);
+                        let what = match &request.result {
+                            Some(Decision::Approve(approval)) => {
+                                format!("approve {} {}", approval.mode, approval.plan_sha256)
+                            }
+                            Some(Decision::KeepPlanning(keep)) => format!("keep {}", keep.feedback),
+                            _ => "other".to_string(),
+                        };
+                        let refused = match &decided {
+                            Ok(_) => String::new(),
+                            Err(status) => format!(" refused {}", reason_of(status)),
+                        };
+                        shared.record_answer(&format!("plan {} {what}{refused}", request.interaction_id));
+                        let (settled, report, turn_id, rest) = decided?;
+                        let outcome = settled.outcome;
+                        shared.emit(&request.session_id, Some(&turn_id), Event::InteractionResolved(settled));
+                        if let Some(mode) = report {
+                            shared.emit(
+                                &request.session_id,
+                                Some(&turn_id),
+                                Event::CliModeReported(CliModeReported { permission_mode: mode }),
+                            );
+                        }
+                        run(Arc::clone(&shared), request.session_id, turn_id, rest);
+                        Ok(ResolveInteractionResponse { outcome })
                     })
                     .await
                 }
@@ -1066,6 +1442,7 @@ fn main() {
             Some("--without-system-prompt-preset") => shared.without_system_prompt_preset = true,
             Some("--cli-turns") => shared.cli_turns = true,
             Some("--client-tools") => shared.client_tools = true,
+            Some("--plan-mode") => shared.plan_mode = true,
             Some("--max-message-bytes") => {
                 let limit = args.next().expect("a limit");
                 shared.max_message_bytes = Some(limit.to_str().and_then(|n| n.parse().ok()).expect("a number"));
@@ -1082,6 +1459,21 @@ fn main() {
             }
             Some("--record-create") => {
                 record_create = Some(args.next().expect("record file"));
+            }
+            Some("--turn-content") => {
+                shared.turn_content.get_or_insert_with(sidecar_content_limits);
+            }
+            Some("--content-limits") => {
+                let limits = args.next().expect("the limits");
+                shared.turn_content = Some(parse_content_limits(limits.to_str().expect("text")));
+            }
+            Some("--refuse-content") => {
+                shared.refuse_content = Some(args.next().expect("a reason").into_string().expect("text"));
+            }
+            Some("--record-turns") => {
+                let path = std::path::PathBuf::from(args.next().expect("record file"));
+                assert!(path.is_absolute(), "record file must be absolute");
+                *shared.record_turns.get_mut().unwrap() = Some(agent::private_fs::open_private(&path).unwrap());
             }
             _ => panic!("unknown stand-in argument: {arg:?}"),
         }

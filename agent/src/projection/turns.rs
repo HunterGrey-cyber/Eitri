@@ -94,6 +94,7 @@ mod tests {
             lifecycle: Vec::new(),
             running_turn: Vec::new(),
             folded_through: 0,
+            call_marks: Default::default(),
         })
         .unwrap();
         assert_eq!(moved.evicted, p.evicted);
@@ -113,11 +114,13 @@ mod tests {
                 seq: 20,
                 text: "second".into(),
                 delivered: false,
+                attachments: Vec::new(),
             },
             UserPromptRecord {
                 seq: 10,
                 text: "first".into(),
                 delivered: false,
+                attachments: Vec::new(),
             },
         ];
         p.turn_starts = vec![TurnStartRecord {

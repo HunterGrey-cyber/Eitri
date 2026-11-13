@@ -723,7 +723,10 @@ a message, and the band says when your choice takes effect. A Codex tab shows wh
 | keys | what they do |
 |---|---|
 | `Enter` | send; while a turn runs, put the message into that turn without stopping it (the agent reads it at its next step), or, when the tab's agent cannot take messages mid-turn, hold it until the turn ends |
-| `Ctrl+Enter` | send now: interrupts a running turn, then sends what is held and this message |
+| `Ctrl+Enter` | send now: interrupts a running turn, then sends what is held and this message (not a message with images: during a turn `Enter` holds those for the turn's end) |
+| `Ctrl+V` | paste; an image on the clipboard becomes a chip above the box ([Images in a message](agents.md#images-in-a-message)) |
+| `←` at the very start | with images in the draft: move onto their chips, the last one first (below) |
+| `Backspace` at the very start | with images in the draft: take the last image out |
 | `Shift+Enter`, `Alt+Enter`, or a backslash then `Enter` | a new line (the backslash is replaced by it) |
 | `Up` | from the first line: take the held messages back, then step through earlier prompts (a message already put into the turn stays) |
 | `Down` | from the last line, once you are stepping through earlier prompts: one step forward again |
@@ -739,7 +742,7 @@ a message, and the band says when your choice takes effect. A Codex tab shows wh
 | `Ctrl+x`, then `Enter` | send the draft after the turn (see below) |
 | `Ctrl+g` | edit the draft in Neovim; `:wq` brings it back into the box in INSERT, caret at the end, ready to send (`Enter` sends), unless a card is waiting, which the keys land on as usual; `:q!` returns the same way with the draft unchanged unless you already saved it with `:w`, in which case the saved text comes back |
 | `Ctrl+o` | the detailed view (in BROWSE the detailed view is `zi`, and `Ctrl+o` goes back through your jumps) |
-| `Shift+Tab` | cycle the tab's mode: Manual, Auto, Bypass, then Manual again (an agent with no Manual mode: Auto and Bypass); entering Bypass asks first, only from Auto, and a `y` also approves the Claude Code questions already waiting in the tab (ones your ask rules caused too) and answers the later ones for you, see [When Claude Code itself asks](permissions.md#when-claude-code-itself-asks); it never answers a question Claude asks you ([Claude's questions](#claudes-questions)) |
+| `Shift+Tab` | cycle the tab's mode: Manual, Auto, Bypass, then Manual again (an agent with no Manual mode: Auto and Bypass); entering Bypass asks first, only from Auto, and a `y` also approves the Claude Code questions already waiting in the tab (ones your ask rules caused too) and answers the later ones for you, see [When Claude Code itself asks](permissions.md#when-claude-code-itself-asks); it never answers a question Claude asks you ([Claude's questions](#claudes-questions)); while the tab is in plan mode it changes nothing and says `in plan mode: <leader>p leaves plan mode` |
 | `Esc` | stop typing and go back to BROWSE; with the command menu open, it closes the menu first and keeps the text |
 | `?` | the list of keys, from an empty box |
 | `F1` | the list of keys, whatever the box holds |
@@ -754,7 +757,11 @@ Enter is bound (send after the turn)` and does nothing else; with text selected,
 The empty box says which keys do what while a turn runs: `Enter steers the running turn, Ctrl+x Enter waits for its
 end…`. If your window prefix is `Ctrl+x`, the window takes the key first. The start screen's box has no chord.
 
-On a Claude tab, seven slash words run Eitri's own actions when typed alone, in either the dashboard's
+**Images in the draft.** On a chip, `h` / `l` (or `←` / `→`) move along the chips, and `l` past the last one goes back
+to the box, as do `i`, `a` and `Enter`. `x`, `Delete` or `Backspace` takes the chip out and moves to the chip beside
+it, or back to the box when none is left. A click on a chip's `×` takes it out too.
+
+On a Claude tab, eight slash words run Eitri's own actions when typed alone, in either the dashboard's
 box or a conversation:
 
 | word | what it does |
@@ -766,6 +773,7 @@ box or a conversation:
 | `/rewind` | keep the draft and show `/rewind is not in Eitri — c reviews and reverts this turn's edits` |
 | `/tasks` (or `/bashes`) | open the [background tasks list](#the-background-tasks-list) |
 | `/workflows` | open the background tasks list at its dynamic workflows |
+| `/plan` | enter plan mode, or leave it (as `<leader>p`); on an empty tab, mark the tab to start in plan mode ([Claude's plan](#claudes-plan)) |
 
 The first four clear the draft. None of these sends a message to Claude. Other slash commands keep
 their usual behavior: `/clear`, `/compact`, `/cost`, `/context`, `/usage`, `/model`, `/mcp`, `/agents`,
@@ -773,9 +781,9 @@ their usual behavior: `/clear`, `/compact`, `/cost`, `/context`, `/usage`, `/mod
 `/model <name>` is sent as a message (in an ACP tab it sets the model the agent lists). `/login` and
 `/config`, and `/resume` with arguments, need a full terminal and are refused with a message. Other
 words, including prompt templates and your own commands, are sent as typed. `?` lists the working
-CLI commands. In a Codex tab, all seven words are sent as text: there are no Claude command holdbacks or pickers. In a tab
+CLI commands. In a Codex tab, all eight words are sent as text: there are no Claude command holdbacks or pickers. In a tab
 of an agent you registered, `/model` and `/effort` choose from the options the agent lists (see
-[agents](agents.md#model-and-effort)) and the other five are sent as text.
+[agents](agents.md#model-and-effort)) and the others are sent as text.
 
 ### In BROWSE
 
@@ -924,6 +932,7 @@ After it, a short list of what can follow appears. These keys work in BROWSE.
 | `<leader>i` | this tab's details |
 | `<leader>t` | continue this conversation in a terminal (Claude tabs; a Codex or registered agent's tab says it is not available yet) |
 | `<leader>m` | cycle the tab's mode (as `Shift+Tab`) |
+| `<leader>p` | enter or leave plan mode (as `/plan`; Claude tabs) |
 | `<leader>M` | choose the model (as a click on the band's model), also while a turn runs: the running response finishes on the old model, and the next request uses the new one. Claude tabs, and a registered agent's tab from the models the agent lists; a Codex tab says it is not available. |
 | `<leader>E` | choose the effort (as a click on the band's effort), also while a turn runs: it holds from the next request. Claude tabs, and a registered agent's tab from the effort levels the agent lists; a Codex tab says it is not available. |
 | `<leader>k` | in a Claude tab, stop every background task after a `y/n` question that names them (`Stop 2 shells, 1 monitor? y/n`); the conversation goes on, and it works only while no turn runs. In a Codex tab, stop the commands it left running in the background, which ends its session (it can be resumed), after a `y/n` question |
@@ -974,6 +983,27 @@ to the box.
 
 A key held down before the box appeared does not pick anything, and a held key's repeat does not either. More on
 questions in [Codex and other agents](agents.md#claudes-questions).
+
+### Claude's plan
+
+When Claude Code has a plan for you, a plan box replaces the message box until you decide, and these keys work there.
+In BROWSE the activity line reads `⚑ plan needs review — i to review`, and `i` goes back to the box.
+
+| keys | what they do |
+|---|---|
+| `Tab` / `Shift+Tab`, or `l` / `h` | the next / the previous choice: `Keep planning`, `Approve (Manual)`, `Approve (Auto)`, and `Approve and keep Bypass` when plan mode started from Bypass |
+| `Enter` | the focused choice; on `Keep planning`, open the feedback field |
+| `j` / `k`, `Ctrl+d` / `Ctrl+u`, `gg` / `G` | scroll the plan |
+| `Ctrl+Enter` | in the feedback field: send it, and Claude plans again |
+| `Esc` | in the feedback field: back to the choices, with what you typed kept; anywhere else: back to BROWSE, the plan still waiting |
+| `F1` | the list of keys |
+
+`Enter` counts only when it is pressed on its own: not within a quarter of a second of the box appearing, not
+while a key held from before is down, and not right after another key. One that does not count says `Enter again
+after a pause: the plan takes only an Enter pressed on its own`. No number or letter decides anything, and a held
+key's repeat never does. The choices are buttons too, and a click on one counts once the box has been up for a
+moment. `Esc` decides nothing: the plan waits until you choose. More on plans in
+[Codex and other agents](agents.md#plan-mode).
 
 ### The sessions list and the pickers
 

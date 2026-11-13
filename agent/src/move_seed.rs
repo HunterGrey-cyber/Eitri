@@ -19,14 +19,14 @@
 use crate::ingestion::{IngestStats, ResumeOutcomeRecord};
 use crate::lease::SessionLease;
 use crate::projection::{
-    AccountLimitsRecord, AgentDomainEvent, AgentSessionProjection, CallIndex, GateInput, HistoryNotice, InitServer,
-    InputChange, NoticeRecord, QuestionRecord, SlashCommand, SteerOutcome, ThinkingBlock, ToolCallDenial,
-    ToolCallRecord, TranscriptMessage, TurnEndingKind, TurnEndingRecord, TurnStartRecord, UngatedCliModeRecord,
-    UsageInfo, UserPromptRecord,
+    AccountLimitsRecord, AgentDomainEvent, AgentSessionProjection, CallIndex, CallPlanMark, GateInput, HistoryNotice,
+    InitServer, InputChange, NoticeRecord, PlanRecord, PlanningState, QuestionRecord, SlashCommand, SteerOutcome,
+    ThinkingBlock, ToolCallDenial, ToolCallRecord, TranscriptMessage, TurnEndingKind, TurnEndingRecord,
+    TurnStartRecord, UngatedCliModeRecord, UsageInfo, UserPromptRecord,
 };
 use crate::provider::{AgentProvider, ProviderCapabilities, ProviderInfo};
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -49,6 +49,12 @@ pub struct MoveSeed {
     pub(crate) notices: Vec<NoticeRecord>,
     #[serde(default)]
     pub(crate) questions: Vec<QuestionRecord>,
+    #[serde(default)]
+    pub(crate) plans: Vec<PlanRecord>,
+    /// Whether the session offered plan mode and where it stood: the CLI's reports after the move are
+    /// judged against the same expected move.
+    #[serde(default)]
+    pub(crate) planning: PlanningState,
     pub(crate) last_turn_ending: Option<TurnEndingKind>,
     pub(crate) usage: Option<UsageInfo>,
     pub(crate) thinking: Vec<ThinkingBlock>,
@@ -90,7 +96,8 @@ pub struct MoveSeed {
     pub through_revision: u64,
 }
 
-/// What the destination folds, in this order: `lifecycle`, then `seed`, then `running_turn`.
+/// What the destination folds, in this order: `lifecycle`, then `seed`, then `running_turn`; and the call
+/// marks it places on top.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ChatMoveCore {
     /// The last `SessionOpened` folded before the export and every resume verdict, unavailability or
@@ -106,6 +113,13 @@ pub struct ChatMoveCore {
     /// provider reads on from the next one. 0 when the provider numbers nothing or had reported no
     /// position yet.
     pub folded_through: u64,
+    /// The source's call marks at the freeze (`PlanningState::call_marks`), which no serialized record carries
+    /// otherwise. The folds rebuild a mark only for a call whose start is among the running turn's events, by the
+    /// phase the seed and those events give; a call that began in an earlier turn would come back unmarked, and a
+    /// request for it judged as one made while executing. Placed after the folds, for each call the folds left
+    /// unmarked: the source saw the phase at the call's real start.
+    #[serde(default)]
+    pub call_marks: BTreeMap<String, CallPlanMark>,
 }
 
 /// Why a move's records were not taken.
@@ -214,6 +228,8 @@ pub enum HandoffRefused {
     Seed(SeedRefused),
     /// The provider or the lease handed to the destination is not the conversation's.
     Mismatch(&'static str),
+    /// The session is moving into or out of plan mode.
+    ModeChanging,
 }
 
 impl std::fmt::Display for HandoffRefused {
@@ -226,6 +242,7 @@ impl std::fmt::Display for HandoffRefused {
             HandoffRefused::LastPump(why) => write!(f, "the last answers were not taken: {why}"),
             HandoffRefused::Seed(refused) => write!(f, "the conversation could not be rebuilt: {refused}"),
             HandoffRefused::Mismatch(what) => write!(f, "{what} is not this conversation's"),
+            HandoffRefused::ModeChanging => f.write_str("the mode is changing; move the tab when it settles"),
         }
     }
 }
@@ -290,6 +307,8 @@ impl AgentSessionProjection {
             // Live, as the phases above.
             notification: _,
             questions,
+            plans,
+            planning,
             last_turn_ending,
             // Not carried: it tells the window that started a turn whether it ended, and a tab moves
             // only once no turn of its own is starting.
@@ -343,6 +362,8 @@ impl AgentSessionProjection {
             turn_starts: turn_starts.clone(),
             notices: notices.clone(),
             questions: questions.clone(),
+            plans: plans.clone(),
+            planning: planning.clone(),
             last_turn_ending: *last_turn_ending,
             usage: usage.clone(),
             thinking: thinking.clone(),
@@ -407,6 +428,9 @@ impl AgentSessionProjection {
         for event in &core.running_turn {
             projection.apply(event);
         }
+        for (call, mark) in &core.call_marks {
+            projection.planning.call_marks.entry(call.clone()).or_insert(*mark);
+        }
         Ok(projection)
     }
 
@@ -432,6 +456,7 @@ impl AgentSessionProjection {
             .chain(seed.turn_starts.iter().map(|r| r.seq))
             .chain(seed.notices.iter().map(|r| r.seq))
             .chain(seed.questions.iter().map(|r| r.seq))
+            .chain(seed.plans.iter().map(|r| r.seq))
             .chain(seed.thinking.iter().map(|r| r.seq))
             .chain(seed.rate_limit_warning.iter().map(|r| r.seq));
         if seqs.into_iter().any(|seq| seq >= through)
@@ -457,6 +482,7 @@ impl AgentSessionProjection {
             && self.notices.is_empty()
             && self.background_tasks.rows.is_empty()
             && self.questions.is_empty()
+            && self.plans.is_empty()
             && self.thinking.is_empty()
             && self.history.is_none()
             && self.evicted.is_none()
@@ -487,6 +513,8 @@ impl AgentSessionProjection {
             turn_starts,
             notices,
             questions,
+            plans,
+            planning,
             last_turn_ending,
             usage,
             thinking,
@@ -524,6 +552,8 @@ impl AgentSessionProjection {
         self.turn_starts = turn_starts.clone();
         self.notices = notices.clone();
         self.questions = questions.clone();
+        self.plans = plans.clone();
+        self.planning = planning.clone();
         self.last_turn_ending = *last_turn_ending;
         self.usage = usage.clone();
         self.thinking = thinking.clone();
@@ -712,6 +742,7 @@ mod tests {
             seed,
             running_turn,
             folded_through: 0,
+            call_marks: Default::default(),
         }
     }
 

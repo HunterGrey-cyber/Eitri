@@ -358,6 +358,8 @@ fn on_ready_batch(projection: &AgentSessionProjection) -> Vec<String> {
     // (`serialize_tabs_for_js`'s own doc), because the page drops a snapshot for a tab it does not know yet.
     let tabs = vec![TabView {
         question_draft: Default::default(),
+        plan_feedback_draft: Default::default(),
+        plan_on_start: false,
         id: eitri_core::tabs::TabId(1),
         number: 1,
         label: "1".into(),

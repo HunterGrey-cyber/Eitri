@@ -17,7 +17,11 @@ export function primaryText(item: TimelineItem): string {
   switch (item.kind) {
     case "prompt":
     case "message":
+    case "planmark":
       return item.text;
+    case "plan":
+      // The plan as Claude wrote it: its Markdown source.
+      return item.plan.plan;
     case "tool":
       return toolPrimary(item.call.name, item.call.input);
     case "permission":

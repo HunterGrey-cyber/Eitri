@@ -10,6 +10,8 @@
 //! Streaming output (assistant text, tool calls, permission requests, ...) is never
 //! returned directly from these methods; it arrives via `pump()`, mirroring `AgentSession::pump()`.
 
+use std::sync::Arc;
+
 use crate::setting_sources::ProjectTrust;
 use crate::AgentDomainEvent;
 
@@ -117,10 +119,48 @@ pub struct ClientToolCallState {
     pub open: Vec<ClientCallRef>,
 }
 
-#[derive(Debug, Clone)]
+/// What the host knows about one image attached to a turn: what the bytes are, not the bytes. Kept with the
+/// prompt it went with ([`crate::UserPromptRecord::attachments`]), so it is serialized; the bytes never are.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct AttachmentMeta {
+    /// One of the media types the provider's `turn_content_limits` list, e.g. `image/png`.
+    pub media_type: String,
+    /// The length of the image's bytes.
+    pub bytes: u64,
+    pub width: u32,
+    pub height: u32,
+    /// Lowercase hex SHA-256 of the image's bytes.
+    pub sha256: String,
+}
+
+/// One image sent with a turn's text: its description and the bytes themselves, shared so a queued
+/// turn and a retry hold one copy.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TurnImage {
+    pub meta: AttachmentMeta,
+    pub data: Arc<[u8]>,
+}
+
+/// One user turn: its text and, after the text and in order, its images. Only the Claude sidecar
+/// provider carries images, and only when its `ProviderCapabilities::turn_content_v1` is set and they fit
+/// its `turn_content_limits`; every other provider, and that one without the capability, refuses a turn
+/// with images (`UnsupportedCapability("turn_content_v1")`) with nothing sent.
+#[derive(Debug, Clone, Default)]
 pub struct SendTurnRequest {
     pub session_id: String,
     pub text: String,
+    pub images: Vec<TurnImage>,
+}
+
+impl SendTurnRequest {
+    /// A turn of text alone.
+    pub fn text(session_id: impl Into<String>, text: impl Into<String>) -> Self {
+        Self {
+            session_id: session_id.into(),
+            text: text.into(),
+            images: Vec::new(),
+        }
+    }
 }
 
 /// A user message for the turn that is running ([`AgentProvider::steer_turn`]).
@@ -242,7 +282,7 @@ pub enum QuestionDeclineKind {
     Chat,
 }
 
-/// What the person did with one question set.
+/// What the person did with one question set, or with one plan.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum InteractionResolution {
     /// Submitted; a question left out was not answered.
@@ -252,6 +292,24 @@ pub enum InteractionResolution {
         kind: QuestionDeclineKind,
         so_far: Vec<QuestionAnswer>,
     },
+    /// A plan approved into `mode`, naming the digest of the plan the person read: a plan that changed
+    /// since is refused, never approved.
+    PlanApprove {
+        mode: crate::PlanExecutionMode,
+        plan_sha256: String,
+    },
+    /// "Keep planning", with the person's feedback for the model, possibly empty.
+    PlanKeep { feedback: String },
+}
+
+impl InteractionResolution {
+    /// Whether this settles a plan rather than a question set.
+    pub fn is_plan(&self) -> bool {
+        match self {
+            InteractionResolution::Answers(_) | InteractionResolution::Decline { .. } => false,
+            InteractionResolution::PlanApprove { .. } | InteractionResolution::PlanKeep { .. } => true,
+        }
+    }
 }
 
 /// The person's answer to one question set Claude asked ([`AgentProvider::resolve_interaction`]).
@@ -263,35 +321,55 @@ pub struct ResolveInteractionRequest {
 }
 
 /// What became of an answer to a question set: the outcome the provider reported when it reported
-/// one, or why it was not taken.
+/// one, or why it was not taken. A plan decision that was taken replies `Ok(None)`: what became of
+/// the plan arrives as its `PlanSettled`.
 pub type InteractionReply = Result<Option<crate::QuestionOutcome>, ProviderError>;
 
-/// An answer to a question set on its way to the provider ([`AgentProvider::resolve_interaction`]).
-/// Sending never waits for the provider: the reply comes through this handle, read without blocking
-/// ([`Self::try_reply`]) by whoever polls it, or waited for ([`Self::wait`]) by a caller that may
-/// block. A provider may tie a guard to the handle that lasts until the handle is dropped, so the
-/// session is not handed elsewhere while the reply is still unread.
-pub struct InteractionSend {
-    rx: std::sync::mpsc::Receiver<InteractionReply>,
+/// An answer to a question set, or a decision on a plan, on its way to the provider
+/// ([`AgentProvider::resolve_interaction`]).
+pub type InteractionSend = ReplySend<Option<crate::QuestionOutcome>>;
+
+/// A request to move a session into plan mode (`enter`), or out of it to the mode the session was
+/// created in ([`AgentProvider::set_planning`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SetPlanningRequest {
+    pub session_id: String,
+    pub enter: bool,
+}
+
+/// What became of a [`SetPlanningRequest`]: the permission mode the agent acknowledged, or why it was
+/// not taken. An acknowledgement is not the move: the CLI's own report of its mode confirms it.
+pub type PlanningReply = Result<String, ProviderError>;
+
+/// A [`SetPlanningRequest`] on its way to the provider.
+pub type PlanningSend = ReplySend<String>;
+
+/// A command on its way to the provider whose reply comes later. Sending never waits for the
+/// provider: the reply comes through this handle, read without blocking ([`Self::try_reply`]) by
+/// whoever polls it, or waited for ([`Self::wait`]) by a caller that may block. A provider may tie a
+/// guard to the handle that lasts until the handle is dropped, so the session is not handed elsewhere
+/// while the reply is still unread.
+pub struct ReplySend<T> {
+    rx: std::sync::mpsc::Receiver<Result<T, ProviderError>>,
     _guard: Option<Box<dyn Send>>,
 }
 
-impl std::fmt::Debug for InteractionSend {
+impl<T> std::fmt::Debug for ReplySend<T> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("InteractionSend").finish_non_exhaustive()
+        f.debug_struct("ReplySend").finish_non_exhaustive()
     }
 }
 
-impl InteractionSend {
+impl<T> ReplySend<T> {
     /// A send still on its way, and the sender its reply goes through. A sender dropped with no reply
     /// reads as a transport failure.
-    pub fn channel() -> (std::sync::mpsc::Sender<InteractionReply>, Self) {
+    pub fn channel() -> (std::sync::mpsc::Sender<Result<T, ProviderError>>, Self) {
         let (tx, rx) = std::sync::mpsc::channel();
-        (tx, InteractionSend { rx, _guard: None })
+        (tx, ReplySend { rx, _guard: None })
     }
 
     /// A send whose reply is already known.
-    pub fn ready(reply: InteractionReply) -> Self {
+    pub fn ready(reply: Result<T, ProviderError>) -> Self {
         let (tx, send) = Self::channel();
         let _ = tx.send(reply);
         send
@@ -305,7 +383,7 @@ impl InteractionSend {
 
     /// The reply once it came, `None` while the answer is still on its way. Read once: a later call
     /// after a reply was taken reads as a transport failure.
-    pub fn try_reply(&self) -> Option<InteractionReply> {
+    pub fn try_reply(&self) -> Option<Result<T, ProviderError>> {
         match self.rx.try_recv() {
             Ok(reply) => Some(reply),
             Err(std::sync::mpsc::TryRecvError::Empty) => None,
@@ -314,7 +392,7 @@ impl InteractionSend {
     }
 
     /// Waits for the reply up to `timeout`, for a caller that may block; past it, `Timeout`.
-    pub fn wait(&self, timeout: std::time::Duration) -> InteractionReply {
+    pub fn wait(&self, timeout: std::time::Duration) -> Result<T, ProviderError> {
         match self.rx.recv_timeout(timeout) {
             Ok(reply) => reply,
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Err(ProviderError::Timeout),
@@ -408,9 +486,10 @@ pub struct EffortChoice {
 /// no command is sent on the theory that the server will ignore it. That only works if every field
 /// here has a real wire source, so this struct
 /// stays deliberately small -- one bool per thing a caller genuinely branches on, each derivable
-/// from a real `HandshakeResponse`. `Copy` on purpose: callers pass it around freely, and anything
-/// that needs an owned list (advertised names, versions, diagnostics) belongs in `ProviderInfo`.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+/// from a real `HandshakeResponse`. Cloned by the few callers that keep one: the only owned list in
+/// it is the turn-content limits the sidecar states; every other list (advertised names, versions,
+/// diagnostics) belongs in `ProviderInfo`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ProviderCapabilities {
     /// The provider can continue an existing provider session by id.
     pub resume: bool,
@@ -499,6 +578,30 @@ pub struct ProviderCapabilities {
     /// Protocol 3.24: [`AgentProvider::task_output_range`].
     #[serde(default)]
     pub task_output_range: bool,
+    // Protocol 3.26, read from the handshake alone; nothing here puts anything on the wire by itself.
+    /// The sidecar can hold a plan back for the host's approval (`PlanApproval`) and a session can
+    /// switch into and out of planning.
+    #[serde(default)]
+    pub plan_mode_v1: bool,
+    /// The sidecar accepts a turn's content blocks (images after the text), within
+    /// `turn_content_limits`.
+    #[serde(default)]
+    pub turn_content_v1: bool,
+    /// What the sidecar accepts as a turn's content; `None` when its handshake states none.
+    #[serde(default)]
+    pub turn_content_limits: Option<TurnContentLimits>,
+}
+
+/// The limits on one turn's content as the sidecar's handshake states them.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct TurnContentLimits {
+    /// The media types an image may name, e.g. `image/png`.
+    pub image_media_types: Vec<String>,
+    pub max_images_per_turn: u32,
+    /// One image's bytes.
+    pub max_image_bytes: u64,
+    /// All of one turn's content bytes together.
+    pub max_content_bytes: u64,
 }
 
 /// Descriptive, non-branching facts about the connected provider: versions to show a human, the
@@ -594,6 +697,13 @@ pub enum ProviderErrorCode {
     /// A change of the model or the effort that the agent cannot or will not make; the message says why in
     /// words fit to show as they stand.
     SettingRefused,
+    /// A move into or out of plan mode that the agent refused before making it (a turn running, an answer
+    /// waiting, or the CLI's own refusal); the message says why in words fit to show as they stand.
+    PlanningRefused,
+    /// A turn's images were refused before any of the turn was sent: by this host against the limits the
+    /// sidecar stated, or by the sidecar itself (`INVALID_CONFIGURATION` with a `turn_content_*` reason).
+    /// The message says why in words fit to show as they stand; the session is untouched.
+    TurnContentRefused,
 }
 
 impl ProviderErrorCode {
@@ -620,6 +730,8 @@ impl ProviderErrorCode {
                 | ProviderErrorCode::ClientToolCallNotFound
                 | ProviderErrorCode::ClientToolCallAlreadyAnswered
                 | ProviderErrorCode::SettingRefused
+                | ProviderErrorCode::PlanningRefused
+                | ProviderErrorCode::TurnContentRefused
         )
     }
 }
@@ -801,6 +913,20 @@ pub trait AgentProvider {
         let _ = request;
         Err(ProviderError::UnsupportedCapability("structured_questions_v1"))
     }
+    /// Moves the session into plan mode (`enter`), or out of it to the mode it was created in, without
+    /// waiting for the provider: `Err` is a refusal before anything was sent, `Ok` the request on its
+    /// way. Its reply is the agent's acknowledgement only; the move is the CLI's own report of its new
+    /// mode, which arrives through [`pump`](Self::pump). A provider without plan mode refuses every one.
+    fn set_planning(&self, request: SetPlanningRequest) -> Result<PlanningSend, ProviderError> {
+        let _ = request;
+        Err(ProviderError::UnsupportedCapability("plan_mode_v1"))
+    }
+    /// What the reports of a session this provider opened are judged against: the mode it asked the CLI
+    /// for, and whether plan mode was offered. Read once a session is created, resumed or taken over,
+    /// before its first event is folded.
+    fn cli_expectation(&self) -> crate::CliExpectation {
+        crate::CliExpectation::default()
+    }
     /// The question sets the session still waits on, asked after its event stream was opened again.
     fn get_interaction_state(&self, session_id: &str) -> Result<InteractionState, ProviderError> {
         let _ = session_id;
@@ -904,5 +1030,30 @@ impl EventSignal {
     pub(crate) fn blocked_for_tests(&self, seen: u64) -> bool {
         let raised = self.raised.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         *raised == seen && self.waiting.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+#[cfg(test)]
+mod turn_request_tests {
+    use super::*;
+
+    #[test]
+    fn a_text_turn_built_with_text_has_no_images() {
+        let request = SendTurnRequest::text("s1", String::from("hello"));
+        assert_eq!(request.session_id, "s1");
+        assert_eq!(request.text, "hello");
+        assert!(request.images.is_empty());
+        let default = SendTurnRequest::default();
+        assert!(default.session_id.is_empty() && default.text.is_empty() && default.images.is_empty());
+    }
+
+    /// A capabilities value serialized before the 3.26 fields existed reads as "not offered".
+    #[test]
+    fn capabilities_serialized_before_plan_mode_and_turn_content_read_as_not_offered() {
+        let old = r#"{"resume":false,"fork":false,"interrupt":true,"bypass_permission_mode":false,
+            "interactive_permission_mode":true,"cli_auto_mode":false,"steer":false}"#;
+        let read: ProviderCapabilities = serde_json::from_str(old).unwrap();
+        assert!(!read.plan_mode_v1 && !read.turn_content_v1);
+        assert_eq!(read.turn_content_limits, None);
     }
 }

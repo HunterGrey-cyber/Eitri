@@ -534,6 +534,11 @@ impl AgentConversation {
     ) -> Self {
         let conversation_id = conversation_id_for_cwd(&canonical_cwd);
         let resumable = external.as_ref().map_or(capabilities.resume, |e| e.resumes());
+        // A fresh session has nothing to restore. `create` never reads either history record -- not even
+        // to check -- because a conversation that has not happened yet cannot have one. What its CLI's
+        // reports are judged against is declared before the first event folds.
+        let mut seed = crate::AgentSessionProjection::default();
+        seed.offer_plan_mode(provider.cli_expectation());
         let ingest = ConversationIngest::start(
             Arc::clone(&provider),
             provider_name,
@@ -542,9 +547,7 @@ impl AgentConversation {
             resumable,
             None,
             None,
-            // A fresh session has nothing to restore. `create` never reads either history record --
-            // not even to check -- because a conversation that has not happened yet cannot have one.
-            crate::AgentSessionProjection::default(),
+            seed,
         );
         Self {
             conversation_id,
@@ -675,7 +678,7 @@ impl AgentConversation {
         // `AgentBackend::start` was spawned onto (`panel/src/starts.rs`), never on the GTK
         // main loop, so what it costs is the panel filling in that much later after a resume of
         // that one outsized session. Every other transcript here is a few milliseconds.
-        let seed = crate::history::load::seed_for_resume(&cwd_string, &conversation_id, provider_session_id);
+        let mut seed = crate::history::load::seed_for_resume(&cwd_string, &conversation_id, provider_session_id);
 
         let declared_client_tools = declared_tools(&capabilities, client_tools.as_ref());
         let session_id = provider.resume_session(crate::provider::ResumeSessionRequest {
@@ -685,6 +688,8 @@ impl AgentConversation {
             project,
             client_tools,
         })?;
+        // The resumed session's own request decides how its reports are judged, never the stored history.
+        seed.offer_plan_mode(provider.cli_expectation());
 
         let ingest = ConversationIngest::start(
             Arc::clone(&provider),
@@ -997,7 +1002,7 @@ impl AgentConversation {
     pub fn capabilities(&self) -> ProviderCapabilities {
         ProviderCapabilities {
             steer: self.steers(),
-            ..self.capabilities
+            ..self.capabilities.clone()
         }
     }
 
@@ -1139,10 +1144,7 @@ impl AgentConversation {
         }
         let session_id = self.require_session()?;
         self.provider
-            .send_turn(SendTurnRequest {
-                session_id,
-                text: text.to_string(),
-            })
+            .send_turn(SendTurnRequest::text(session_id, text.to_string()))
             .map_err(Self::turn_error)
     }
 
@@ -1150,12 +1152,16 @@ impl AgentConversation {
     /// `origin`: the provider names the id back if the agent reads the message later than the send
     /// (`UserMessageDelivered`, whose row shows `as_typed`) or drops it (`UserMessageDropped`), and
     /// marks a `Typed` message as the person's where its agent accepts the mark.
+    ///
+    /// `images` go after the text, in order; a provider that cannot carry them, or not these, refuses the
+    /// whole turn with nothing sent (`AgentProvider::send_turn_stamped`).
     pub fn send_turn_as(
         &mut self,
         text: &str,
         as_typed: &str,
         origin: PromptOrigin,
         client_message_id: &str,
+        images: Vec<crate::provider::TurnImage>,
     ) -> Result<String, ConversationError> {
         if self.external.is_some() {
             return Err(ConversationError::Unsupported);
@@ -1167,8 +1173,8 @@ impl AgentConversation {
         self.provider
             .send_turn_stamped(
                 SendTurnRequest {
-                    session_id,
-                    text: text.to_string(),
+                    images,
+                    ..SendTurnRequest::text(session_id, text.to_string())
                 },
                 TurnStamp {
                     client_message_id: Some(client_message_id.to_string()),
@@ -1192,13 +1198,7 @@ impl AgentConversation {
         }
         let session_id = self.require_session()?;
         external
-            .send_turn_with(
-                SendTurnRequest {
-                    session_id,
-                    text: text.to_string(),
-                },
-                policy,
-            )
+            .send_turn_with(SendTurnRequest::text(session_id, text.to_string()), policy)
             .map_err(Self::turn_error)
     }
 
@@ -1315,10 +1315,7 @@ impl AgentConversation {
         }
         let session_id = self.require_session()?;
         let provider = Arc::clone(&self.provider);
-        let request = SendTurnRequest {
-            session_id,
-            text: text.to_string(),
-        };
+        let request = SendTurnRequest::text(session_id, text.to_string());
         let stamp = TurnStamp {
             client_message_id: Some(client_message_id.to_string()),
             typed_by_person: origin == PromptOrigin::Typed,
@@ -1480,6 +1477,182 @@ impl AgentConversation {
     /// settled meanwhile.
     pub fn question_send_failed(&self, interaction_id: &str) {
         self.ingest.mark_question_send(interaction_id, false);
+    }
+
+    /// Hands the person's decision on the plan `interaction_id` to the provider: an approval
+    /// (`PlanApprove`, the mode and the digest of the plan read) or "keep planning" (`PlanKeep`, the
+    /// feedback). Checked against the record first (`PlanRecord::check_resolution`: still waiting, could
+    /// be shown, the digest is the plan's, the feedback within its bound), so nothing is sent for a
+    /// decision that cannot stand. The plan is `Answering` while the decision goes out. An approval also
+    /// folds the move out of plan mode before anything is sent (`PlanTransitionStarted`, caused by the
+    /// plan's call), so the CLI's report of its creation mode is expected however soon it comes. A send
+    /// refused here puts both back; a reply read later goes to [`Self::plan_send_failed`]. Plans never
+    /// enter `pending_permissions` or `questions`, so nothing that answers a card or a question reaches
+    /// one: this is the one door.
+    pub fn resolve_plan(
+        &mut self,
+        interaction_id: &str,
+        resolution: crate::InteractionResolution,
+    ) -> Result<crate::InteractionSend, ConversationError> {
+        let refused = |code, message: String| ConversationError::Provider(ProviderError::Provider { code, message });
+        let approval = matches!(resolution, crate::InteractionResolution::PlanApprove { .. });
+        // Its own statement, so the projection's lock is released before anything else locks it.
+        let checked = {
+            let projection = self.projection();
+            match projection.plan(interaction_id) {
+                // An approval moves the session out of plan mode, which only a session that is in it can do: the
+                // sidecar sends a plan ahead of the CLI's report of plan mode, and an approval folded before that
+                // report would lose its move and leave the CLI's next report unexplained.
+                Some(_) if approval && projection.planning.phase != crate::PlanPhase::Planning => {
+                    Err("Claude Code has not reported plan mode yet; the plan is still waiting".to_string())
+                }
+                Some(record) if resolution.is_plan() => record
+                    .check_resolution(&resolution)
+                    .map(|()| record.tool_use_id.clone().unwrap_or_default()),
+                Some(_) => Err("a plan is approved or kept planning, never answered as a question".to_string()),
+                None => Err("no plan with that id is waiting for a decision".to_string()),
+            }
+        };
+        let tool_use_id = checked.map_err(|why| refused(crate::ProviderErrorCode::InteractionAnswerRefused, why))?;
+        let session_id = self.require_session()?;
+        if !self.ingest.mark_plan_send(interaction_id, true) {
+            return Err(refused(
+                crate::ProviderErrorCode::InteractionNotFound,
+                "this plan is no longer waiting for a decision".to_string(),
+            ));
+        }
+        let cause = crate::PlanCause::Tool { tool_use_id };
+        if approval {
+            self.fold_locally(AgentDomainEvent::PlanTransitionStarted {
+                enter: false,
+                cause: cause.clone(),
+                at_ms: crate::projection::planning::wall_clock_ms(),
+            });
+        }
+        let sent = self.provider.resolve_interaction(crate::ResolveInteractionRequest {
+            session_id,
+            interaction_id: interaction_id.to_string(),
+            resolution,
+        });
+        sent.map_err(|error| {
+            self.ingest.mark_plan_send(interaction_id, false);
+            if approval {
+                self.fold_locally(AgentDomainEvent::PlanTransitionUndone { enter: false, cause });
+            }
+            ConversationError::Provider(error)
+        })
+    }
+
+    /// The reply to a decision sent through [`Self::resolve_plan`] says it was not taken (`error`): the plan
+    /// waits for another decision. When the provider refused it outright
+    /// (`planning::refusal_undoes_move`), the move out of plan mode an approval started is undone too; a
+    /// timeout or a lost connection undoes nothing, since the approval may have reached the agent. Nothing
+    /// changes for a plan that settled meanwhile (another window's decision came first).
+    pub fn plan_send_failed(&self, interaction_id: &str, error: &ProviderError) {
+        self.ingest.mark_plan_send(interaction_id, false);
+        let tool_use_id = match self.projection().plan(interaction_id) {
+            Some(record) if !matches!(record.state, crate::PlanState::Settled { .. }) => {
+                record.tool_use_id.clone().unwrap_or_default()
+            }
+            _ => return,
+        };
+        if crate::projection::planning::refusal_undoes_move(error) {
+            self.fold_locally(AgentDomainEvent::PlanTransitionUndone {
+                enter: false,
+                cause: crate::PlanCause::Tool { tool_use_id },
+            });
+        }
+    }
+
+    /// Asks the agent to move the session into plan mode (`enter`) or back to the mode it was created in,
+    /// on the host's own behalf (a person's switch). Refused here, with nothing sent, on a session that
+    /// did not offer plan mode, and when the session is not where the move starts: entering needs it
+    /// executing, leaving needs it planning. The same move asked again while it is still unconfirmed (after
+    /// a reply that left it open, such as a deadline) is sent again without starting another. The move is
+    /// folded before anything is sent (`PlanTransitionStarted`, at `now_ms`), so the CLI's report of it is
+    /// expected however soon it comes; the CLI's report confirms it, never the reply. A send refused here
+    /// is undone at once; a reply read later goes to [`Self::planning_send_failed`].
+    pub fn set_planning(&mut self, enter: bool, now_ms: u64) -> Result<crate::PlanningSend, ConversationError> {
+        let refused = |message: &str| {
+            ConversationError::Provider(ProviderError::Provider {
+                code: crate::ProviderErrorCode::PlanningRefused,
+                message: message.to_string(),
+            })
+        };
+        let (offered, phase) = {
+            let projection = self.projection();
+            (projection.planning.offered, projection.planning.phase.clone())
+        };
+        if !offered {
+            return Err(refused("plan mode is not offered on this session"));
+        }
+        let again = match (enter, &phase) {
+            (true, crate::PlanPhase::Executing) | (false, crate::PlanPhase::Planning) => false,
+            (
+                true,
+                crate::PlanPhase::Entering {
+                    cause: crate::PlanCause::Host,
+                    ..
+                },
+            )
+            | (
+                false,
+                crate::PlanPhase::Leaving {
+                    cause: crate::PlanCause::Host,
+                    ..
+                },
+            ) => true,
+            (true, crate::PlanPhase::Planning) => return Err(refused("the session is already in plan mode")),
+            (false, crate::PlanPhase::Executing) => return Err(refused("the session is not in plan mode")),
+            _ => return Err(refused("the mode is changing; try again when it settles")),
+        };
+        let session_id = self.require_session()?;
+        if again {
+            self.ingest.planning_resent();
+        } else {
+            self.fold_locally(AgentDomainEvent::PlanTransitionStarted {
+                enter,
+                cause: crate::PlanCause::Host,
+                at_ms: now_ms,
+            });
+        }
+        self.provider
+            .set_planning(crate::SetPlanningRequest { session_id, enter })
+            .map_err(|error| {
+                self.planning_send_failed(enter, &error);
+                ConversationError::Provider(error)
+            })
+    }
+
+    /// The reply to a move asked for through [`Self::set_planning`] says it was not taken (`error`). When
+    /// the agent refused it outright (`planning::refusal_undoes_move`) the session goes back to where the
+    /// move started, unless an earlier request for the same move timed out or was lost: the CLI may still
+    /// make that one. A timeout, a lost connection or the agent's own deadline leave the move to the CLI's
+    /// report or the guard, whose clock starts again now. Whoever reads a reply calls this or
+    /// [`Self::planning_send_taken`]: until then the move is not overdue.
+    pub fn planning_send_failed(&self, enter: bool, error: &ProviderError) {
+        let now_ms = crate::projection::planning::wall_clock_ms();
+        if self.ingest.planning_reply_read(enter, Some(error), now_ms) {
+            self.fold_locally(AgentDomainEvent::PlanTransitionUndone {
+                enter,
+                cause: crate::PlanCause::Host,
+            });
+        }
+    }
+
+    /// The reply to a move asked for through [`Self::set_planning`] says the agent took it: the CLI's report
+    /// confirms the move, within the guard counted from now.
+    pub fn planning_send_taken(&self, enter: bool) {
+        let now_ms = crate::projection::planning::wall_clock_ms();
+        self.ingest.planning_reply_read(enter, None, now_ms);
+    }
+
+    /// Why the plan-mode move under way is overdue at `now_ms`, if it is: not confirmed by the CLI within
+    /// `PLAN_TRANSITION_GUARD_MS`. The caller fails the session with the reason. An auto session whose CLI
+    /// stayed at `default` on its way out of plan mode ends the move here as the CLI's fallback out of
+    /// auto, and the page is sent a snapshot.
+    pub fn plan_transition_overdue(&self, now_ms: u64) -> Option<String> {
+        self.ingest.plan_transition_overdue(now_ms)
     }
 
     /// Drains whatever the provider has produced since the last call, folding each event into the
@@ -1703,7 +1876,7 @@ impl AgentConversation {
         let handoff = ConversationHandoff {
             conversation_id: conversation_id.clone(),
             canonical_cwd: canonical_cwd.clone(),
-            capabilities: *capabilities,
+            capabilities: capabilities.clone(),
             info: info.clone(),
             session_id: session_id.clone(),
             title_noted: *title_noted,
@@ -1783,6 +1956,11 @@ impl AgentConversation {
         }
         if conversation_id != conversation_id_for_cwd(&canonical_cwd) {
             return Err(HandoffRefused::Mismatch("the directory"));
+        }
+        // The seed's plan-mode offer and the adopted provider's come from the same session's request; a
+        // disagreement would judge the CLI's reports against an offer the session never made.
+        if projection.planning.offered != agent.cli_expectation().plan_offered {
+            return Err(HandoffRefused::Mismatch("the plan-mode offer"));
         }
         let cwd_string = canonical_cwd.to_string_lossy().to_string();
         if let Some(lease) = &lease {
@@ -1913,7 +2091,7 @@ mod tests {
 
     impl AgentProvider for FakeProvider {
         fn capabilities(&self) -> ProviderCapabilities {
-            self.capabilities
+            self.capabilities.clone()
         }
         fn info(&self) -> ProviderInfo {
             ProviderInfo {
@@ -2050,11 +2228,7 @@ mod tests {
             for n in 0..60 {
                 let text = format!("live {n}");
                 ingest.fold_locally(AgentDomainEvent::UserPromptSubmitted { text: text.clone() });
-                fake.send_turn(SendTurnRequest {
-                    session_id: "session".into(),
-                    text: text.clone(),
-                })
-                .unwrap();
+                fake.send_turn(SendTurnRequest::text("session", text.clone())).unwrap();
                 fake.queue(AgentDomainEvent::TurnStarted {
                     turn_id: format!("t{n}"),
                 });
@@ -2382,6 +2556,7 @@ mod tests {
                 seq: 1,
                 text: "what did we say?".into(),
                 delivered: false,
+                attachments: Vec::new(),
             }],
             vec![crate::TranscriptMessage {
                 seq: 2,
@@ -3366,6 +3541,7 @@ mod tests {
                 seq: 1,
                 text: "check every hour".into(),
                 delivered: false,
+                attachments: Vec::new(),
             }],
             turn_starts: vec![crate::TurnStartRecord {
                 seq: 2,

@@ -60,6 +60,7 @@ fn draws_a_row(event: &AgentDomainEvent) -> bool {
         | AgentDomainEvent::ToolCallStarted { .. }
         | AgentDomainEvent::PermissionRequested { .. }
         | AgentDomainEvent::QuestionAsked { .. }
+        | AgentDomainEvent::PlanProposed { .. }
         | AgentDomainEvent::SubagentFrame { .. } => true,
         _ => false,
     }
@@ -68,7 +69,7 @@ fn draws_a_row(event: &AgentDomainEvent) -> bool {
 /// What the agent's tray chip shows.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Attention {
-    /// Permission cards, structured questions and the tool broker's cards waiting for the user.
+    /// Permission cards, structured questions, proposed plans and the tool broker's cards waiting for the user.
     pub pending: usize,
     /// A turn completed, or the session ended, while the chat was not on screen, and it has not
     /// been on screen since.
@@ -413,6 +414,42 @@ mod tests {
             usage: None,
             detail: Default::default(),
         }
+    }
+
+    #[test]
+    fn a_plan_keeps_a_cli_turn_with_no_result_unread() {
+        let mut tracker = AttentionTracker::default();
+        tracker.observe(
+            &[
+                started("t1"),
+                AgentDomainEvent::TurnAttributed {
+                    turn_id: "t1".into(),
+                    origin: agent::TurnOrigin::Cli,
+                    cause: None,
+                },
+                AgentDomainEvent::PlanProposed {
+                    interaction_id: "p1".into(),
+                    tool_use_id: None,
+                    plan: "# Plan".into(),
+                    plan_sha256: "0".repeat(64),
+                    allowed_prompts: vec![],
+                    unsupported_reason: None,
+                },
+                AgentDomainEvent::TurnCompleted {
+                    turn_id: "t1".into(),
+                    outcome: TurnOutcome::Failed,
+                    result_text: String::new(),
+                    stop_reason: None,
+                    usage: None,
+                    detail: agent::TurnEndDetail {
+                        reason: Some(agent::NO_RESULT_REASON.into()),
+                        ..Default::default()
+                    },
+                },
+            ],
+            false,
+        );
+        assert!(tracker.attention().unread);
     }
 
     #[test]

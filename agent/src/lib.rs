@@ -109,8 +109,8 @@ pub use persistence::{
 #[cfg(feature = "legacy-backend")]
 pub use process::AgentProcess;
 pub use process::{
-    classify_cli_mode, classify_reported_cli_mode, disallowed_tools, CliModeReport, PermissionMode, RequestedCliMode,
-    CONSERVATIVE_DISALLOWED_TOOLS,
+    classify_cli_mode, classify_reported_cli_mode, classify_reported_cli_mode_planning, disallowed_tools,
+    CliExpectation, CliModeReport, PermissionMode, RequestedCliMode, CONSERVATIVE_DISALLOWED_TOOLS,
 };
 pub use provider_move::MoveRefusedWhy;
 #[cfg(feature = "legacy-backend")]
@@ -133,24 +133,28 @@ pub const LEGACY_NOT_IN_BUILD: &str =
 
 pub use projection::{
     describe_failed_resume, thinking_open_after, AccountLimitsRecord, AgentDomainEvent, AgentSessionProjection,
-    BackgroundTask, BackgroundTaskRecord, ContentKind, Evicted, HistoryNotice, HistorySource, InitServer, InputChange,
-    MatchedAskRule, NoticeLevel, NoticeRecord, OpenClientCall, PermissionOutcome, PermissionRequestRecord,
+    BackgroundTask, BackgroundTaskRecord, CallPlanMark, ContentKind, Evicted, HistoryNotice, HistorySource, InitServer,
+    InputChange, MatchedAskRule, NoticeLevel, NoticeRecord, OpenClientCall, PermissionOutcome, PermissionRequestRecord,
+    PlanAllowedPrompt, PlanCause, PlanExecutionMode, PlanOutcome, PlanPhase, PlanRecord, PlanState, PlanningState,
     ProjectionStatus, ProviderPrompt, QuestionOptionSpec, QuestionOutcome, QuestionRecord, QuestionSpec, QuestionState,
     ResumeStatus, SessionNoticeKind, ShownAnswer, SlashCommand, SteerOutcome, TaskEdge, TaskKind, TaskRoster,
     TaskStatus, TaskUsage, ThinkingBlock, TokenUsage, ToolCallDenial, ToolCallRecord, ToolCallResult,
     TranscriptMessage, TurnCause, TurnCauseKind, TurnEndDetail, TurnEndingKind, TurnEndingRecord, TurnOrigin,
     TurnOutcome, TurnStartRecord, UngatedCliModeRecord, UsageInfo, UserPromptRecord, WorkflowAgent, WorkflowPhase,
     WorkflowProgress, CLI_REFUSED_DROP, MAX_HOOK_BLOCK_CHARS, MAX_STEER_OUTCOMES, MAX_TURN_END_MESSAGE_CHARS,
-    NO_OPEN_TURN_ID, NO_RESULT_REASON,
+    NO_OPEN_TURN_ID, NO_RESULT_REASON, PLAN_FEEDBACK_MAX_BYTES, PLAN_TRANSITION_GUARD_MS,
 };
 pub use provider::{
-    AgentProvider, AppliedSettings, ClientCallRef, ClientToolAnswer, ClientToolCallState, ClientToolDecl,
-    ClientToolSet, CloseSessionRequest, CreateSessionRequest, EffortChoice, EventSignal, InteractionReply,
-    InteractionResolution, InteractionSend, InteractionState, InterruptTurnRequest, ModelList, ModelOption,
-    PermissionDecision, ProviderCapabilities, ProviderError, ProviderErrorCode, ProviderInfo, QuestionAnswer,
-    QuestionDeclineKind, RemoteLinkState, ResolveInteractionRequest, ResolvePermissionRequest, ResumeSessionRequest,
-    SendTurnRequest, SteerTurnRequest, StreamingPreference, TaskOutput, TaskReply, TurnStamp,
+    AgentProvider, AppliedSettings, AttachmentMeta, ClientCallRef, ClientToolAnswer, ClientToolCallState,
+    ClientToolDecl, ClientToolSet, CloseSessionRequest, CreateSessionRequest, EffortChoice, EventSignal,
+    InteractionReply, InteractionResolution, InteractionSend, InteractionState, InterruptTurnRequest, ModelList,
+    ModelOption, PermissionDecision, PlanningReply, PlanningSend, ProviderCapabilities, ProviderError,
+    ProviderErrorCode, ProviderInfo, QuestionAnswer, QuestionDeclineKind, RemoteLinkState, ReplySend,
+    ResolveInteractionRequest, ResolvePermissionRequest, ResumeSessionRequest, SendTurnRequest, SetPlanningRequest,
+    SteerTurnRequest, StreamingPreference, TaskOutput, TaskReply, TurnContentLimits, TurnImage, TurnStamp,
 };
+/// Images on a Claude turn: the sidecar's reason words for a refusal and the composer's words for them.
+pub use providers::claude_sidecar::turn_content;
 pub use providers::claude_sidecar::{
     claude_cli_missing_here, claude_problem_here, failure_names_missing_cli, locate_claude_here, locate_claude_in,
     sidecar_availability, sidecar_env_policy, sidecar_missing_message, sidecar_origin, user_sidecar_path,

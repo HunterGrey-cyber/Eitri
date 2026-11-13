@@ -1,6 +1,6 @@
 import { forwardRef, useLayoutEffect, useRef } from "react";
 import type { Ref } from "react";
-import { isPanelCommand, browseKeys, CARD_KEYS, CARET_KEYS, INPUT_KEYS, QUESTION_KEYS, REVIEW_KEYS, TASKS_KEYS, VISUAL_KEYS } from "../keymap";
+import { isPanelCommand, browseKeys, CARD_KEYS, CARET_KEYS, INPUT_KEYS, PLAN_KEYS, QUESTION_KEYS, REVIEW_KEYS, TASKS_KEYS, VISUAL_KEYS } from "../keymap";
 import type { KeyHelp, PanelBinding, PanelTable, PluginKeysHelp } from "../keymap";
 import { sequenceTitle } from "../leader";
 import { listedSlashCommands } from "../slashCommands";
@@ -49,7 +49,7 @@ type Props = {
   /** Open at the window prefix keys when no plugin section takes precedence. */
   startAt?: "prefix";
   /** Otherwise open at the section of the mode `F1` was pressed in (`card`: card mode's own keys). */
-  openAt?: "browse" | "input" | "selecting" | "question" | "card";
+  openAt?: "browse" | "input" | "selecting" | "question" | "plan" | "card";
   /** Which opening request `startAt` belongs to. A different number while the sheet is up positions it again;
    *  the same number never does, so ordinary re-renders leave the reader's scroll alone. */
   startRequest?: number;
@@ -302,6 +302,7 @@ export const KeymapOverlay = forwardRef<HTMLDivElement, Props>(function KeymapOv
   const inputHeading = useRef<HTMLHeadingElement>(null);
   const selectingHeading = useRef<HTMLHeadingElement>(null);
   const questionHeading = useRef<HTMLHeadingElement>(null);
+  const planHeading = useRef<HTMLHeadingElement>(null);
   // Positioned once per request, not per render: a re-render must not undo the reader's own scrolling,
   // but a new request that arrives while the sheet is up (prefix ? over the chat's ?) moves it.
   const positionedFor = useRef<number | null>(null);
@@ -311,7 +312,7 @@ export const KeymapOverlay = forwardRef<HTMLDivElement, Props>(function KeymapOv
     if (startAt === "prefix" && plugin === undefined) {
       prefixHeading.current?.scrollIntoView({ block: "start" });
     } else if (openAt !== undefined && plugin === undefined) {
-      const heading = { browse: browseHeading, input: inputHeading, selecting: selectingHeading, question: questionHeading, card: cardHeading }[openAt];
+      const heading = { browse: browseHeading, input: inputHeading, selecting: selectingHeading, question: questionHeading, plan: planHeading, card: cardHeading }[openAt];
       heading.current?.scrollIntoView({ block: "start" });
     }
   }, [startRequest]);
@@ -430,6 +431,8 @@ export const KeymapOverlay = forwardRef<HTMLDivElement, Props>(function KeymapOv
           note="While Claude asks, the question takes the box's place; only keys you press answer it."
         />
       )}
+      {claudeSlashCommands && <Section title="Claude's plan" headingRef={planHeading} rows={PLAN_KEYS}
+        note="A plan waiting for review takes the box's place; only an Enter pressed on its own decides it." />}
       <Section title="Anywhere in the window" rows={windowKeys} />
       <Section
         title={`After ${prefixLabel}`}

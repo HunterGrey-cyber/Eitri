@@ -20,6 +20,9 @@ agent = { path = "../agent" }
 # File names in the editor's record are base64 of their bytes, since JSON strings must be UTF-8 and names need
 # not be. Already linked through `eitri-panel` and `agent`'s `tonic` at 0.22, so no new crate ships.
 base64 = "0.22"
+# Composer image attachments: sniffing, bounded decode, resize and re-encode. Already linked through the Neovide fork
+# with png only; jpeg, gif and webp add shipped crates (see the commit that introduced them).
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp"] }
 libc = "0.2"
 mlua = { version = "0.12", features = ["lua54", "vendored"] }
 # msgpack-RPC to a user's own nvim (companion mode). Already linked into `shell` through the Neovide fork at

@@ -26,6 +26,7 @@ export type SentFrom = { deviceId: string; name: string };
 export type UserPromptRecord = {
   seq: Seq;
   text: string;
+  attachments?: { mediaType: string; width: number; height: number; bytes: number }[];
   /** A message put into a running turn that the agent read there (`user_message_delivered`): drawn as
    *  part of that turn, not as the start of a new one. Absent on every other prompt; Rust sends the key
    *  only when it is true, so the two folds stay equal. */
@@ -142,6 +143,49 @@ export type QuestionRecord = {
   state: QuestionState;
   unsupportedReason: string | null;
 };
+/** How a plan ended (Rust's `PlanOutcome`). */
+export type PlanOutcome =
+  | "approved"
+  | "kept_planning"
+  | "interrupted"
+  | "expired"
+  | "session_closed"
+  | "provider_failed"
+  | "host_refused";
+/** The execution mode an approval named (Rust's `PlanExecutionMode`). A label the host keeps: the CLI itself
+ *  goes back to the mode its session was created in, and the tab's mode follows the CLI's own report. */
+export type PlanExecutionMode = "manual" | "auto" | "bypass";
+/** One command the model says its plan will need (`ExitPlanMode`'s `allowedPrompts`): shown as information only,
+ *  never a rule and never an answer. */
+export type PlanAllowedPrompt = { tool: string; prompt: string };
+export type PlanState =
+  | { kind: "waiting" }
+  | { kind: "answering" }
+  | { kind: "settled"; outcome: PlanOutcome; modeAfter: PlanExecutionMode | null; feedback: string | null; reason: string | null };
+/** One plan Claude proposed (`ExitPlanMode`), as a row of the conversation (Rust's `PlanRecord`). The text is the
+ *  model's, verbatim; `planSha256` is what an answer names so it answers the plan the person read. Not a
+ *  permission card: nothing that answers cards reads it. */
+export type PlanRecord = {
+  seq: Seq;
+  interactionId: string;
+  toolUseId: string | null;
+  turnId: string | null;
+  plan: string;
+  planSha256: string;
+  allowedPrompts: PlanAllowedPrompt[];
+  state: PlanState;
+  /** Why the plan cannot be shown (too long, malformed): such a plan has no text and settles as refused. */
+  unsupportedReason: string | null;
+};
+/** Where a plan-offered session stands (Rust's `PlanPhase`, worded). */
+export type PlanningPhase = "executing" | "entering" | "planning" | "leaving";
+/** The session's plan mode as the host reads it: the phase, and the mode plan mode was entered from (`null`
+ *  outside plan mode). `null` as a whole on a session that does not offer plan mode. */
+export type PlanningState = { phase: PlanningPhase; origin: PermissionModeChoice | null };
+/** Where a plan-mode move the page saw happened, as a conversation row of its own. Page-only: the host has no
+ *  record of it, so a snapshot (a reload, a switch back) carries none. `seq` sits between the last event folded
+ *  before the move was seen and the next one. */
+export type PlanMark = { seq: Seq; kind: "entered" | "left"; key: string };
 /** How the panel shows thinking (`init.lua`'s `agent.thinking`, the `display` envelope): `collapsed`
  * (the default) is one muted row per block, its text behind the row's fold; `preview` shows a block's
  * last lines in a box of fixed height while it is written, then the collapsed row; `expanded` shows every
@@ -384,6 +428,11 @@ export type Capabilities = {
   /** The model and the effort change directly, also during a turn; without it, only by the CLI's slash commands. */
   directSettings?: boolean;
   workflowProgress?: boolean;
+  /** The session took up plan mode, offered by a sidecar that has it: `<leader>p` and `/plan` work. */
+  planMode?: boolean;
+  /** The tab's agent takes images on a turn, within `imageLimits`. */
+  imageInput?: boolean;
+  imageLimits?: ImageLimits;
 };
 
 /** What the CLI says it will use. Each is empty when it did not say. */
@@ -466,7 +515,30 @@ export type HistoryNotice = {
  * against the editor context, and the id it was sent under, are Rust's own concern and never reach here.
  * `steered` is optional only for callers written before it existed; Rust always sends it. */
 /** `afterTurn`: sent with `Ctrl+x Enter`, it waits for the turn's end and is never put into the turn. */
-export type QueueItem = { text: string; queuedAt: number; steered?: boolean; afterTurn?: boolean };
+/** `images`: how many images go with the message, which goes as a turn of its own (`serialize_queue_for_js`). */
+export type QueueItem = { text: string; queuedAt: number; steered?: boolean; afterTurn?: boolean; images?: number };
+
+/** One image of the composer's draft as the host draws it (`attachment_state`, `draft_attachments`): never its
+ *  bytes. `name` is the page's own display text, `reason` the host's sentence for a failure; both are plain text,
+ *  drawn through `revealHidden`. `thumbnail` is the host's `data:image/png;base64,` PNG. */
+export type DraftImage = {
+  attachmentId: string;
+  name: string;
+  state: "importing" | "ready" | "failed";
+  mediaType?: string;
+  width?: number;
+  height?: number;
+  bytes?: number;
+  thumbnail?: string;
+  reason?: string;
+};
+
+/** The active tab's draft images: the generation a new import names, whether the composer takes images (and why
+ *  not), and the images in order. */
+export type DraftImages = { generation: number; imageInput: boolean; why: string | null; items: DraftImage[] };
+
+/** The limits a Claude sidecar states for images on a turn (`imageLimits`). */
+export type ImageLimits = { mediaTypes: string[]; maxImagesPerTurn: number; maxImageBytes: number; maxContentBytes: number };
 /** V1's editor-context line the file relative to the project root (or
  * absolute outside it), and the selected line range when there is a selection. */
 /** Where the panel stands with the editor beside it, in a companion window (`editor_link`,
@@ -562,6 +634,13 @@ export type AgentUiState = {
   /** Every question set Claude asked, waiting or settled (Rust's `questions`). A snapshot carries them
    *  while there are any. */
   questions: QuestionRecord[];
+  /** Every plan Claude proposed, waiting or settled (Rust's `plans`). A snapshot carries them while there are any. */
+  plans: PlanRecord[];
+  /** The session's plan mode (`planning` on a snapshot, `planningChanged` on an events envelope); `null` on a
+   *  session that does not offer it. Never folded from events here: the host decides the phase. */
+  planning: PlanningState | null;
+  /** Page-only: the moves into and out of plan mode this page saw (`PlanMark`). */
+  planMarks: PlanMark[];
   /** Claude Code is working where this panel cannot show it (Rust's `cli_unseen_busy`): set by
    *  `cli_work_unseen`, cleared by the next `turn_completed` whichever turn it names or by the
    *  session's end (`session_closed`, `session_unavailable`, a `resume_outcome` that did not attach).
@@ -649,6 +728,9 @@ export type AgentUiSnapshot = Omit<
   | "notification"
   | "backgroundTasks"
   | "questions"
+  | "plans"
+  | "planning"
+  | "planMarks"
   | "cliUnseenBusy"
   | "openingPromptSeq"
   | "runningTurnCli"
@@ -670,6 +752,10 @@ export type AgentUiSnapshot = Omit<
   notification?: NoticeRecord | null;
   backgroundTasks?: TaskRoster;
   questions?: AgentUiState["questions"];
+  /** Sent only while there are any. */
+  plans?: AgentUiState["plans"];
+  /** Sent only on a session that offers plan mode. */
+  planning?: PlanningState | null;
   /** Sent only while it is set. */
   cliUnseenBusy?: boolean;
   /** Sent only while set; a page's own state carries `null` for none. */
@@ -969,7 +1055,33 @@ export type AgentDomainEvent =
   | { type: "cli_work_unseen" }
   /** The newest prompt not put into a running turn is taken back (`AgentDomainEvent::UserPromptWithdrawn`):
    *  its send was refused and the message reaches the agent another way, where it is folded again. */
-  | { type: "user_prompt_withdrawn" };
+  | { type: "user_prompt_withdrawn" }
+  /** The images sent with the newest prompt not put into a running turn (`AgentDomainEvent::UserPromptAttachments`):
+   *  what each was, never its bytes. Folded only for a turn that carries images. */
+  | {
+      type: "user_prompt_attachments";
+      attachments: { media_type: string; bytes: number; width: number; height: number; sha256: string }[];
+    }
+  /** Claude proposed a plan (`AgentDomainEvent::PlanProposed`, `ExitPlanMode`); it waits until its settlement. A
+   *  refused plan (too long) has no text and an `unsupported_reason`, and its `host_refused` settlement follows. */
+  | {
+      type: "plan_proposed";
+      interaction_id: string;
+      tool_use_id: string | null;
+      plan: string;
+      plan_sha256: string;
+      allowed_prompts: PlanAllowedPrompt[];
+      unsupported_reason: string | null;
+    }
+  /** A plan ended (`AgentDomainEvent::PlanSettled`): the only thing that settles one. */
+  | { type: "plan_settled"; interaction_id: string; outcome: PlanOutcome; mode_after: PlanExecutionMode | null; feedback: string | null; reason: string | null }
+  /** The CLI says it runs plan mode (`AgentDomainEvent::CliPlanMode`): read by the host, which sends the page its
+   *  phase as `planningChanged`. Nothing for the view. */
+  | { type: "cli_plan_mode"; source: string }
+  /** The host started or undid a move into or out of plan mode (`PlanTransitionStarted`/`PlanTransitionUndone`).
+   *  The host's own bookkeeping; the page reads the phase from `planningChanged`. Nothing for the view. */
+  | { type: "plan_transition_started"; enter: boolean; cause: unknown; at_ms: number }
+  | { type: "plan_transition_undone"; enter: boolean; cause: unknown };
 
 /** A session tab's identity for its whole life, and the bridge's (`eitri_core::tabs::TabId`). */
 export type TabId = number;
@@ -982,6 +1094,11 @@ export type TabInfo = {
   following?: boolean;
   /** Opaque host mirrors, keyed by interaction id; the dock checks each draft before using it. */
   questionDraft?: Record<string, unknown>;
+  /** The "keep planning" feedback typed for a waiting plan, by plan id (a host mirror); absent when empty. */
+  planFeedbackDraft?: Record<string, string>;
+  /** The tab has no session yet and is asked to start it in plan mode (`<leader>p` on the empty tab, or a restored
+   *  tab saved while planning). */
+  planOnStart?: boolean;
   id: TabId;
   number: number;
   /** `<n> <name>`, worded by Rust (`tabs::label`). */

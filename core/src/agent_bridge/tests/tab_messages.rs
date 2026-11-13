@@ -189,6 +189,8 @@ fn the_tabs_envelope_lists_every_tab_with_its_marker_and_the_active_one() {
         TabView {
             following: false,
             question_draft: Default::default(),
+            plan_feedback_draft: Default::default(),
+            plan_on_start: false,
             id: TabId(1),
             number: 1,
             label: "1 fix-parser".into(),
@@ -207,6 +209,8 @@ fn the_tabs_envelope_lists_every_tab_with_its_marker_and_the_active_one() {
         TabView {
             following: false,
             question_draft: Default::default(),
+            plan_feedback_draft: Default::default(),
+            plan_on_start: false,
             id: TabId(4),
             number: 2,
             label: "2 new".into(),
@@ -250,6 +254,8 @@ fn a_manual_tab_and_a_manual_default_are_sent_as_manual() {
     let tabs = vec![TabView {
         following: false,
         question_draft: Default::default(),
+        plan_feedback_draft: Default::default(),
+        plan_on_start: false,
         id: TabId(1),
         number: 1,
         label: "1 new".into(),

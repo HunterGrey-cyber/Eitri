@@ -97,6 +97,9 @@ export const COMPOSER_CHORDS: string[] = [
   "/ command",
   "Ctrl+n / Ctrl+p",
   "Tab",
+  // The draft's images: a paste or a drop, and the keys that reach the chips (`Composer`, `AttachmentChips`).
+  "Ctrl+v / drop",
+  "← / Backspace",
   "Ctrl+w / Ctrl+u",
   "Ctrl+a / Ctrl+e",
   "Ctrl+c",

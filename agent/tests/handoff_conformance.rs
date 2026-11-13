@@ -68,10 +68,10 @@ fn a_real_session_hands_off_to_a_real_claude_resume_process_holding_the_lease() 
     // first version of this test waited for it before send_turn and timed out for exactly this
     // reason.) So: send the turn first, then read the id out of the events collected along the way.
     provider
-        .send_turn(agent::SendTurnRequest {
-            session_id: session_id.clone(),
-            text: "reply with exactly the word: pong".into(),
-        })
+        .send_turn(agent::SendTurnRequest::text(
+            session_id.clone(),
+            "reply with exactly the word: pong",
+        ))
         .unwrap();
     let events = drain_until(&provider, 30, |events| {
         events

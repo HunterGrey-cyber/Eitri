@@ -182,10 +182,7 @@ fn running_as(argv: Vec<OsString>) -> AcpProvider {
         .expect("starts");
     provider
         .send_turn_with(
-            SendTurnRequest {
-                session_id: "s1".to_string(),
-                text: "go".to_string(),
-            },
+            SendTurnRequest::text("s1".to_string(), "go".to_string()),
             TurnPolicy {
                 reviewer: Reviewer::Agent,
                 sandbox: agent::Sandbox::Project,

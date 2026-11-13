@@ -42,13 +42,21 @@
 //!   interruption or for the failed permission request of a stream that closed while the question waited,
 //!   `answered` for a structured result with answers, `other` for anything else. Only that
 //!   key is kept; the questions, options, answers and notes are not.
+//! - **An `ExitPlanMode` call's result is followed by a plan entry** ([`plan_key`]): the SHA-256 of the call's
+//!   `input.plan` (none for a plan the client says it could not show) and an end read from the result:
+//!   `approved` for a result that is not an error and says so (the CLI's approval text, or a structured result
+//!   carrying the plan), `kept_planning` for the CLI's rejection text of a plan the person kept planning on, and
+//!   `other` for anything else, an interrupt (the structured result `User rejected tool use`) included.
+//!   Only that key is kept; the plan's words, the feedback and the file path are not.
 //!
 //! Every other line is skipped and counted. A line of a kind the pinned CLI was never recorded writing is
 //! never decoded, and is counted as unrecorded as well, so a new shape shows up in the counts instead of
 //! being misread. Shapes of a recorded kind that no recording holds yet (the result of a tool call cut short
 //! to deliver a message) are counted as unrecorded and give no entry of their own.
 
-use super::{CliForm, Entry, Inconsistency, InputKind, Origin, Pos, QuestionEnd, QuestionKey, Turn, Via};
+use super::{
+    CliForm, Entry, Inconsistency, InputKind, Origin, PlanEnd, PlanKey, Pos, QuestionEnd, QuestionKey, Turn, Via,
+};
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 use std::io::{self, BufRead, BufReader};
@@ -117,6 +125,23 @@ pub const QUESTION_CHAT_PREFIXES: &[&str] = &[
 pub const QUESTION_STREAM_CLOSED: &str =
     "Tool permission request failed: AbortError: Tool permission stream closed before response received";
 
+/// The tool whose calls are Claude's plans for the person to approve.
+pub const PLAN_TOOL: &str = "ExitPlanMode";
+
+/// How the CLI's result of an approved plan begins.
+pub const PLAN_APPROVED_PREFIX: &str = "User has approved your plan.";
+
+/// How the CLI's rejection of any tool call begins, which is what the model reads when the person keeps planning
+/// (with their words after it, or without).
+pub const PLAN_KEPT_PREFIX: &str =
+    "The user doesn't want to proceed with this tool use. The tool use was rejected (eg. if it was a file edit, the new_string was NOT written to the file). ";
+
+/// What the CLI's structured result of a call its turn's abort reached while it waited says.
+pub const PLAN_USER_REJECTED: &str = "User rejected tool use";
+
+/// How the client's words begin when it could not show a plan: it holds no text of one.
+pub const PLAN_REFUSED_PREFIX: &str = "This client could not show the plan: ";
+
 /// How the result of a tool call the CLI cut short to deliver a message begins.
 pub const ENDED_TO_DELIVER_PREFIX: &str = "[Tool call did not complete: the turn was ended to deliver";
 
@@ -170,6 +195,31 @@ pub fn line_kind(line: &Value) -> String {
     }
 }
 
+/// An `image` block's key: its media type and the SHA-256 of the bytes its base64 stands for, hashed here and
+/// not by the restore reader. An image over 8 MiB of base64 has no digest, as no record of Eitri's hashes one.
+/// `None` for a block that is not inline base64.
+fn image_key(block: &Value) -> Option<(String, String)> {
+    use base64::Engine as _;
+    use sha2::{Digest, Sha256};
+    let source = block.get("source")?;
+    if source.get("type").and_then(Value::as_str) != Some("base64") {
+        return None;
+    }
+    let media_type = source.get("media_type").and_then(Value::as_str)?.to_owned();
+    let data = source.get("data").and_then(Value::as_str)?;
+    if data.len() > crate::history::transcript_jsonl::IMAGE_BASE64_MAX_BYTES {
+        return Some((media_type, String::new()));
+    }
+    let bytes = base64::engine::general_purpose::STANDARD.decode(data.as_bytes()).ok()?;
+    Some((
+        media_type,
+        Sha256::digest(&bytes)
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect(),
+    ))
+}
+
 fn flag(line: &Value, key: &str) -> bool {
     line.get(key).and_then(Value::as_bool) == Some(true)
 }
@@ -211,6 +261,8 @@ struct Reader {
     seen_blocks: HashMap<String, HashSet<String>>,
     /// The input of each question call whose result has not been read, by tool-use id.
     asks: HashMap<String, Value>,
+    /// The input of each plan call whose result has not been read, by tool-use id.
+    plans: HashMap<String, Value>,
 }
 
 impl Reader {
@@ -223,6 +275,7 @@ impl Reader {
             pending_turn_duration: None,
             seen_blocks: HashMap::new(),
             asks: HashMap::new(),
+            plans: HashMap::new(),
         }
     }
 
@@ -310,6 +363,7 @@ impl Reader {
         let content = line.pointer("/message/content");
         let mut text: Option<String> = None;
         let mut results = Vec::new();
+        let mut images: Vec<(String, String)> = Vec::new();
         match content {
             Some(Value::String(s)) => text = Some(s.clone()),
             Some(Value::Array(blocks)) => {
@@ -320,6 +374,13 @@ impl Reader {
                             text.get_or_insert_with(String::new).push_str(piece);
                         }
                         Some("tool_result") => results.push(block),
+                        Some("image") => match image_key(block) {
+                            Some(key) => images.push(key),
+                            None => {
+                                bump(&mut form.skipped, "user:block/image".to_string());
+                                bump(&mut form.unrecorded, "user:block/image".to_string());
+                            }
+                        },
                         other => {
                             let key = format!("user:block/{}", other.unwrap_or("(no type)"));
                             bump(&mut form.skipped, key.clone());
@@ -338,8 +399,12 @@ impl Reader {
             1 => line.get("toolUseResult"),
             _ => None,
         };
-        for block in results {
+        for block in &results {
             self.tool_result(form, block, structured, pos);
+        }
+        // A message of images alone has no words, and is a message all the same.
+        if text.is_none() && !images.is_empty() && results.is_empty() {
+            text = Some(String::new());
         }
         let Some(text) = text else {
             return;
@@ -394,6 +459,7 @@ impl Reader {
             Entry::User {
                 text: command.unwrap_or(text),
                 via,
+                images,
             },
             origin,
             pos,
@@ -451,6 +517,10 @@ impl Reader {
             .asks
             .remove(&id)
             .map(|input| question_key(&input, &content, structured));
+        let plan = self
+            .plans
+            .remove(&id)
+            .map(|input| plan_key(&input, &content, is_error, structured));
         self.mid_turn(
             form,
             Entry::ToolResult {
@@ -461,7 +531,10 @@ impl Reader {
             pos,
         );
         if let Some(key) = question {
-            self.mid_turn(form, Entry::Question { id, key }, pos);
+            self.mid_turn(form, Entry::Question { id: id.clone(), key }, pos);
+        }
+        if let Some(key) = plan {
+            self.mid_turn(form, Entry::Plan { id, key }, pos);
         }
     }
 
@@ -513,6 +586,9 @@ impl Reader {
                     let input = block.get("input").cloned().unwrap_or(Value::Null);
                     if name == QUESTION_TOOL {
                         self.asks.insert(id.clone(), input.clone());
+                    }
+                    if name == PLAN_TOOL {
+                        self.plans.insert(id.clone(), input.clone());
                     }
                     Entry::ToolUse { id, name, input }
                 }
@@ -597,7 +673,15 @@ impl Reader {
         } else {
             Via::Unknown
         };
-        self.mid_turn(form, Entry::User { text, via }, pos);
+        self.mid_turn(
+            form,
+            Entry::User {
+                text,
+                via,
+                images: Vec::new(),
+            },
+            pos,
+        );
     }
 
     fn compact_boundary(&mut self, form: &mut CliForm, line: &Value, pos: Pos) {
@@ -728,6 +812,41 @@ pub fn question_key(input: &Value, content: &Value, structured: Option<&Value>) 
         QuestionEnd::Other
     };
     QuestionKey::new(asked.len(), answered, end)
+}
+
+/// A plan call's key, from its input and its result: the digest of the plan the input carries and the end the
+/// result says. This reader is the oracle's own: it shares no rule with the one that restores plans.
+pub fn plan_key(input: &Value, content: &Value, is_error: bool, structured: Option<&Value>) -> PlanKey {
+    let text = super::normalise::result_text(content);
+    let text = text.trim_start();
+    let refused = is_error && text.starts_with(PLAN_REFUSED_PREFIX);
+    let rejected = structured.and_then(Value::as_str) == Some(PLAN_USER_REJECTED);
+    let end = if !is_error
+        && (text.starts_with(PLAN_APPROVED_PREFIX)
+            || structured
+                .and_then(|result| result.get("plan"))
+                .is_some_and(Value::is_string))
+    {
+        PlanEnd::Approved
+    } else if is_error && !rejected && !refused && text.starts_with(PLAN_KEPT_PREFIX) {
+        PlanEnd::KeptPlanning
+    } else {
+        PlanEnd::Other
+    };
+    let plan_sha256 = match input.get("plan").and_then(Value::as_str) {
+        Some(plan) if !refused => sha256_hex(plan),
+        _ => String::new(),
+    };
+    PlanKey { plan_sha256, end }
+}
+
+/// SHA-256 of `text`'s UTF-8 bytes, lower-case hex.
+fn sha256_hex(text: &str) -> String {
+    use sha2::{Digest, Sha256};
+    Sha256::digest(text.as_bytes())
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
 }
 
 /// A slash command's echo (`<command-name>/x</command-name> … <command-args>y</command-args>`, or with the
@@ -1008,7 +1127,7 @@ mod tests {
         assert_eq!(form.turns.len(), 2);
         assert_eq!(form.turns[1].origin, Origin::Scheduled);
         assert!(
-            matches!(&form.turns[1].entries[0], Entry::User { text, via: Via::TaskNotification } if text == "check the build")
+            matches!(&form.turns[1].entries[0], Entry::User { text, via: Via::TaskNotification, .. } if text == "check the build")
         );
         assert!(form.inconsistencies.is_empty(), "{:?}", form.inconsistencies);
     }
@@ -1197,6 +1316,130 @@ mod tests {
         );
     }
 
+    fn exit_input() -> Value {
+        serde_json::json!({"plan": "# P\n1. go\n", "planFilePath": "/p/plan.md"})
+    }
+
+    #[test]
+    fn a_plan_key_is_the_input_s_digest_and_the_result_s_end() {
+        let digest = sha256_hex("# P\n1. go\n");
+        assert_eq!(digest.len(), 64);
+        let key = |content: &str, is_error: bool, structured: Option<Value>| {
+            plan_key(
+                &exit_input(),
+                &Value::String(content.into()),
+                is_error,
+                structured.as_ref(),
+            )
+        };
+        let approved = key(
+            "User has approved your plan. You can now start coding.",
+            false,
+            Some(serde_json::json!({"plan": "# P\n1. go\n", "isAgent": false})),
+        );
+        assert_eq!(
+            approved,
+            PlanKey {
+                plan_sha256: digest.clone(),
+                end: PlanEnd::Approved
+            }
+        );
+        // A structured result carrying the plan is an approval whatever its text says.
+        assert_eq!(
+            key("anything", false, Some(serde_json::json!({"plan": "x"}))).end,
+            PlanEnd::Approved
+        );
+        let kept = key(
+            &format!("{PLAN_KEPT_PREFIX}To tell you how to proceed, the user said:\nmore"),
+            true,
+            Some(Value::String("Error: more".into())),
+        );
+        assert_eq!(
+            kept,
+            PlanKey {
+                plan_sha256: digest.clone(),
+                end: PlanEnd::KeptPlanning
+            }
+        );
+        assert_eq!(
+            key(&format!("{PLAN_KEPT_PREFIX}STOP what you are doing."), true, None).end,
+            PlanEnd::KeptPlanning,
+            "the plain rejection is a keep"
+        );
+        assert_eq!(
+            key(
+                &format!("{PLAN_KEPT_PREFIX}STOP what you are doing."),
+                true,
+                Some(Value::String(PLAN_USER_REJECTED.into()))
+            )
+            .end,
+            PlanEnd::Other,
+            "the same words beside the CLI's own 'user rejected' result are an interrupt"
+        );
+        assert_eq!(key("Tool permission request failed", true, None).end, PlanEnd::Other);
+        assert_eq!(
+            key("User has approved your plan.", true, None).end,
+            PlanEnd::Other,
+            "an error is never an approval"
+        );
+        let refused = key(
+            "This client could not show the plan: the plan is larger than 262144 bytes. Shorten the plan and call ExitPlanMode again.",
+            true,
+            None,
+        );
+        assert_eq!(
+            refused,
+            PlanKey {
+                plan_sha256: String::new(),
+                end: PlanEnd::Other
+            }
+        );
+        // No plan in the input is a plan with no digest.
+        let none = plan_key(&serde_json::json!({}), &Value::Null, false, None);
+        assert_eq!(
+            none,
+            PlanKey {
+                plan_sha256: String::new(),
+                end: PlanEnd::Other
+            }
+        );
+    }
+
+    #[test]
+    fn a_plan_entry_follows_its_call_s_first_result_only() {
+        let call = r##"{"type":"assistant","isSidechain":false,"message":{"id":"m1","content":[{"type":"tool_use","id":"exit","name":"ExitPlanMode","input":{"plan":"# P\n1. go\n","planFilePath":"/p/plan.md"}}]}}"##;
+        let prompt =
+            r#"{"type":"user","isSidechain":false,"promptSource":"sdk","message":{"role":"user","content":"go"}}"#;
+        let result = |text: &str| {
+            format!(
+                r##"{{"type":"user","isSidechain":false,"message":{{"role":"user","content":[{{"type":"tool_result","tool_use_id":"exit","content":"{text}"}}]}},"toolUseResult":{{"plan":"# P\n1. go\n","isAgent":false}}}}"##
+            )
+        };
+        let text = [
+            prompt.to_owned(),
+            call.to_owned(),
+            result("User has approved your plan."),
+            result("again"),
+        ]
+        .join("\n");
+        let form = read_texts(&[&text]);
+        assert_eq!(
+            kinds(&form),
+            vec![vec!["user", "tool_use", "tool_result", "plan", "tool_result"]],
+            "a second result of the same call makes no second plan"
+        );
+        assert_eq!(
+            form.turns[0].entries[3],
+            Entry::Plan {
+                id: "exit".into(),
+                key: PlanKey {
+                    plan_sha256: sha256_hex("# P\n1. go\n"),
+                    end: PlanEnd::Approved
+                },
+            }
+        );
+    }
+
     #[test]
     fn a_command_echo_reads_as_the_command_typed() {
         assert_eq!(
@@ -1226,7 +1469,7 @@ mod tests {
         .join("\n");
         let form = read_texts(&[&text]);
         assert_eq!(kinds(&form), vec![vec!["user"], vec!["user", "assistant"]]);
-        assert!(matches!(&form.turns[0].entries[0], Entry::User { text, via: Via::Prompt } if text == "!ls -la"));
+        assert!(matches!(&form.turns[0].entries[0], Entry::User { text, via: Via::Prompt, .. } if text == "!ls -la"));
         assert!(matches!(&form.turns[1].entries[0], Entry::User { text, .. } if text == "/review"));
         assert_eq!(form.skipped.get("user:bash-output"), Some(&1));
         assert_eq!(form.unrecorded.get("user:bash-input"), Some(&1));
@@ -1243,7 +1486,7 @@ mod tests {
         let form = read_texts(&[typed]);
         assert!(matches!(
             &form.turns[0].entries[0],
-            Entry::User { text, via: Via::Prompt } if text == "<bash-input>git status</bash-input> -- why does this show up?"
+            Entry::User { text, via: Via::Prompt, .. } if text == "<bash-input>git status</bash-input> -- why does this show up?"
         ));
         assert_eq!(form.unrecorded.get("user:bash-input"), None);
         let system = r#"{"type":"user","isSidechain":false,"promptSource":"system","message":{"role":"user","content":"<command-name>/compact</command-name><command-args>written by something else</command-args>"}}"#;

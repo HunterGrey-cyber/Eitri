@@ -99,7 +99,8 @@ export type PanelActionName =
   | "effort.pick"
   | "tab.stop-background"
   | "tab.follow"
-  | "remote.devices";
+  | "remote.devices"
+  | "plan.toggle";
 
 /** One binding in the panel's key table, as `serialize_keymap_for_js`'s `panel.bindings` sends it:
  *  `keys` is vim notation split into tokens (`["<leader>", "b", "d"]`, `["H"]`), `source` says which
@@ -1277,6 +1278,15 @@ export const QUESTION_KEYS: KeyHelp[] = [
   { keys: "Esc", what: "In the typed answer: back to the options. Elsewhere: cancel the question, which stops the turn" },
 ];
 
+export const PLAN_KEYS: KeyHelp[] = [
+  { keys: "Tab / Shift+Tab", what: "Next / previous action (h / l too)" },
+  { keys: "Enter", what: "The action under the cursor, after a pause; Keep planning opens a field for what to change" },
+  { keys: "j / k, Ctrl+d / Ctrl+u, gg / G", what: "Scroll the plan" },
+  { keys: "Ctrl+Enter", what: "In the field: keep planning with what it says" },
+  { keys: "Esc", what: "In the field: back to the actions. Elsewhere: back to the transcript; the plan keeps waiting (i returns)" },
+  { keys: "<leader>p", what: "Enter or leave plan mode on an idle tab (/plan too)" },
+];
+
 export const INPUT_KEYS: KeyHelp[] = [
   { keys: "Enter", what: "Send; while a turn runs, into that turn (the agent reads it at its next step), or held for its end when the agent cannot take it" },
   { keys: "Ctrl+Enter", what: "Send now: interrupts a running turn, then sends what is held and this" },
@@ -1290,6 +1300,9 @@ export const INPUT_KEYS: KeyHelp[] = [
   { keys: "/ command", what: "Start the box with / for the command menu; typing narrows it, a space closes it" },
   { keys: "Ctrl+n / Ctrl+p", what: "In the command menu: next / previous command (↑ / ↓ too, ahead of prompt history)" },
   { keys: "Tab", what: "In the command menu: complete the selected command and a space; Enter does too when what you typed begins the name" },
+  // The draft's images (`AttachmentChips.tsx`), above the box.
+  { keys: "Ctrl+v / drop", what: "Paste or drop a PNG, JPEG, GIF or WebP image: it goes with the message" },
+  { keys: "← / Backspace", what: "At the box's very start: onto the images (h/l move, x removes, i or l past the last returns) / remove the last image" },
   { keys: "Ctrl+w / Ctrl+u", what: "Delete a word / to the line's start" },
   { keys: "Ctrl+a / Ctrl+e", what: "Caret to the line's start / end" },
   { keys: "Ctrl+c", what: "Interrupt a running turn; idle, clear the box into history" },

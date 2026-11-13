@@ -30,7 +30,7 @@ const MAX_DEPTH: usize = 32;
 const MAX_DESCENDANTS: usize = 10_000;
 const DROPPED_ACTIVITY: &str = "Child activity was dropped because the subagent nesting or call limit was reached.";
 
-fn locate<'a>(calls: &'a [ToolCallRecord], id: &str, depth: usize) -> Option<(&'a ToolCallRecord, usize)> {
+pub(super) fn locate<'a>(calls: &'a [ToolCallRecord], id: &str, depth: usize) -> Option<(&'a ToolCallRecord, usize)> {
     for call in calls {
         if call.tool_use_id == id {
             return Some((call, depth));

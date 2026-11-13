@@ -229,15 +229,13 @@ fn setting_sources_decide_whether_the_user_tier_loads_at_runtime() {
         requested_cli_mode(&control.capabilities),
         ProjectTrust::Trusted,
         control.question_policy(),
+        control.plan_policy(),
         None,
     );
     request.policy.as_mut().unwrap().setting_sources = None;
     let session_id = control.open_session(request).expect("control session");
     control
-        .send_turn(SendTurnRequest {
-            session_id: session_id.clone(),
-            text: ask.clone(),
-        })
+        .send_turn(SendTurnRequest::text(session_id.clone(), ask.clone()))
         .expect("control turn");
     let control_events = drain_until(&control, 120, turn_finished);
     trace("control (setting_sources absent)", &control_events);
@@ -272,10 +270,7 @@ fn setting_sources_decide_whether_the_user_tier_loads_at_runtime() {
         })
         .expect("default session");
     provider
-        .send_turn(SendTurnRequest {
-            session_id: session_id.clone(),
-            text: ask.clone(),
-        })
+        .send_turn(SendTurnRequest::text(session_id.clone(), ask.clone()))
         .expect("default turn");
     let events = drain_until(&provider, 120, turn_finished);
     trace("default (setting_sources = [USER, PROJECT, LOCAL])", &events);
@@ -317,13 +312,11 @@ fn setting_sources_decide_whether_the_user_tier_loads_at_runtime() {
         ProjectTrust::Trusted,
         requested_cli_mode(&opted_out.capabilities),
         opted_out.question_policy(),
+        opted_out.plan_policy(),
     );
     let session_id = opted_out.open_session(request).expect("opt-out session");
     opted_out
-        .send_turn(SendTurnRequest {
-            session_id: session_id.clone(),
-            text: ask.clone(),
-        })
+        .send_turn(SendTurnRequest::text(session_id.clone(), ask.clone()))
         .expect("opt-out turn");
     let events = drain_until(&opted_out, 120, turn_finished);
     trace("opt-out (setting_sources = [PROJECT, LOCAL])", &events);
@@ -419,15 +412,13 @@ fn ask_arm(cwd: &Scratch, ask: &str, user_settings: bool, project: ProjectTrust,
         project,
         requested_cli_mode(&provider.capabilities),
         provider.question_policy(),
+        provider.plan_policy(),
     );
     let session_id = provider
         .open_session(request)
         .unwrap_or_else(|e| panic!("{label} session: {e:?}"));
     provider
-        .send_turn(SendTurnRequest {
-            session_id: session_id.clone(),
-            text: ask.to_string(),
-        })
+        .send_turn(SendTurnRequest::text(session_id.clone(), ask.to_string()))
         .unwrap_or_else(|e| panic!("{label} turn: {e:?}"));
     let events = drain_until(&provider, 120, turn_finished);
     trace(label, &events);
@@ -484,6 +475,7 @@ fn questions_opt_in_requires_capability_and_host_readiness() {
                         crate::RequestedCliMode::Auto,
                         ProjectTrust::Trusted,
                         QuestionPolicy::default(),
+                        PlanPolicy::default(),
                         None,
                     );
                     let mut request = build_create_request(
@@ -499,6 +491,7 @@ fn questions_opt_in_requires_capability_and_host_readiness() {
                             capable,
                             client_implements,
                         },
+                        PlanPolicy::default(),
                         None,
                     );
                     assert_eq!(
@@ -510,6 +503,84 @@ fn questions_opt_in_requires_capability_and_host_readiness() {
                     }
                     request.client_interactions = None;
                     assert_eq!(request.encode_to_vec(), baseline.encode_to_vec());
+                }
+            }
+        }
+    }
+}
+
+/// Plan mode is offered only when the peer offers `plan_mode_v1`, the host is ready, and the session has the
+/// CLI's own prompts (Verdandi refuses the offer otherwise). An offered session states its CLI mode: `DEFAULT`
+/// for a session that does not run the CLI's auto (unstated, the CLI would start in the mode the user's
+/// settings name), `AUTO` as before; it is never switchable and never anything but INTERACTIVE. Apart from the
+/// offer and that statement the request is unchanged, and questions are a separate opt-in.
+#[test]
+fn plan_opt_in_requires_capability_and_host_readiness() {
+    use claude_runtime_protocol::v1::CliPermissionMode;
+    use prost::Message as _;
+    for capable in [false, true] {
+        for client_implements in [false, true, CLIENT_IMPLEMENTS_PLAN_MODE] {
+            for provider_prompts in [false, true] {
+                for resume in [None, Some("previous-session".to_string())] {
+                    for streaming in [StreamingPreference::Complete, StreamingPreference::Partial] {
+                        for cli_mode in [crate::RequestedCliMode::Default, crate::RequestedCliMode::Auto] {
+                            for questions in [false, true] {
+                                let build = |plans| {
+                                    build_create_request(
+                                        "/project".into(),
+                                        streaming,
+                                        resume.clone(),
+                                        false,
+                                        provider_prompts,
+                                        true,
+                                        cli_mode,
+                                        ProjectTrust::Trusted,
+                                        QuestionPolicy::resolve(questions, None),
+                                        plans,
+                                        None,
+                                    )
+                                };
+                                let baseline = build(PlanPolicy::default());
+                                let mut request = build(PlanPolicy {
+                                    capable,
+                                    client_implements,
+                                });
+                                let offered = capable && client_implements && provider_prompts;
+                                let what = format!(
+                                    "capable {capable}, ready {client_implements}, prompts {provider_prompts}, \
+                                     {cli_mode:?}, questions {questions}"
+                                );
+                                assert_eq!(
+                                    request.client_interactions.as_ref().map(|c| c.plan_mode),
+                                    (offered || questions).then_some(offered),
+                                    "{what}"
+                                );
+                                assert_eq!(
+                                    request.client_interactions.as_ref().map(|c| c.questions),
+                                    (offered || questions).then_some(questions),
+                                    "{what}"
+                                );
+                                let policy = request.policy.clone().unwrap();
+                                assert_eq!(policy.permissions, ProtoPermissionMode::Interactive as i32, "{what}");
+                                assert!(!policy.permission_mode_switchable, "{what}");
+                                let stated = match (cli_mode, offered) {
+                                    (crate::RequestedCliMode::Auto, _) => CliPermissionMode::Auto,
+                                    (crate::RequestedCliMode::Default, true) => CliPermissionMode::Default,
+                                    (crate::RequestedCliMode::Default, false) => CliPermissionMode::Unspecified,
+                                };
+                                assert_eq!(policy.cli_permission_mode, stated as i32, "{what}");
+                                if offered && cli_mode == crate::RequestedCliMode::Default {
+                                    assert_ne!(request.encode_to_vec(), baseline.encode_to_vec(), "{what}");
+                                }
+                                // Take away the offer and its statement: what is left is the request without it.
+                                request.client_interactions = baseline.client_interactions.clone();
+                                if let Some(policy) = request.policy.as_mut() {
+                                    policy.cli_permission_mode = baseline.policy.as_ref().unwrap().cli_permission_mode;
+                                }
+                                assert_eq!(request.encode_to_vec(), baseline.encode_to_vec(), "{what}");
+                            }
+                        }
+                    }
                 }
             }
         }

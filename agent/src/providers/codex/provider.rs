@@ -4218,6 +4218,10 @@ impl ExternalProvider for CodexProvider {
     }
 
     fn send_turn_with(&self, req: SendTurnRequest, policy: TurnPolicy) -> Result<String, ProviderError> {
+        // This agent's turns carry text only: a turn with images is refused whole, never sent without them.
+        if !req.images.is_empty() {
+            return Err(ProviderError::UnsupportedCapability("turn_content_v1"));
+        }
         let (thread_id, pending) = {
             let mut st = lock(&self.state);
             let busy = || provider_error(ProviderErrorCode::TurnAlreadyActive, "a turn is already running");

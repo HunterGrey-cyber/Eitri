@@ -3,7 +3,7 @@ import { allCards, buildTimeline, oldestPendingPermission, nextStop, promptIndex
 import type { TimelineItem } from "./timeline";
 import { primaryText } from "./copyText";
 import { editorCardRecord, initialState } from "./reducer";
-import type { AgentUiState, EditorCardWire, PermissionRequestRecord, ToolCallRecord, TranscriptMessage, TurnEnding } from "./types";
+import type { AgentUiState, EditorCardWire, PlanMark, PlanOutcome, PlanRecord, PermissionRequestRecord, ToolCallRecord, TranscriptMessage, TurnEnding } from "./types";
 
 function msg(seq: number, text: string): TranscriptMessage {
   return { seq, text };
@@ -38,6 +38,10 @@ function labels(s: AgentUiState): string[] {
         return `notice:${item.notice.kind}`;
       case "thinking":
         return `thinking:${item.block.text}${item.open ? "…" : ""}`;
+      case "plan":
+        return `plan:${item.key}:${item.text}`;
+      case "planmark":
+        return `mark:${item.text}`;
       case "run":
         // `buildTimeline` itself never produces this kind -- only `display.ts`'s `buildDisplay`
         // does, over `buildTimeline`'s own output, but `TimelineItem`'s union includes it,
@@ -825,3 +829,30 @@ describe("structural stops", () => {
     stops([call(1, "MultiEdit", { input: { file_path: "a.rs", edits: [] } })], "edit", [0]);
   });
 });
+
+describe("plan rows", () => {
+  const plan = (over: Partial<PlanRecord> = {}): PlanRecord => ({
+    seq: 3, interactionId: "p1", toolUseId: "toolu_exit", turnId: "t1", plan: "intro line\n\n## Ship it\n\n1. Do", planSha256: "0".repeat(64),
+    allowedPrompts: [], state: { kind: "waiting" }, unsupportedReason: null, ...over,
+  });
+  it("a plan takes its ExitPlanMode call's row and says how it ended", () => {
+    const exit = { ...tool(2, "toolu_exit"), name: "ExitPlanMode" };
+    const settled = (outcome: PlanOutcome, extra: Partial<Extract<PlanRecord["state"], { kind: "settled" }>> = {}) =>
+      plan({ state: { kind: "settled", outcome, modeAfter: null, feedback: null, reason: null, ...extra } });
+    expect(labels(state({ toolCalls: [exit], plans: [plan()] }))).toEqual(["plan:t-2:Plan: Ship it\nwaiting for your review"]);
+    expect(labels(state({ toolCalls: [exit], plans: [settled("approved", { modeAfter: "auto" })] }))).toEqual(["plan:t-2:Plan: Ship it\napproved · auto"]);
+    expect(labels(state({ toolCalls: [exit], plans: [settled("kept_planning", { feedback: "\nfewer files\nand more" })] })))
+      .toEqual(["plan:t-2:Plan: Ship it\nkept planning: fewer files"]);
+    expect(labels(state({ toolCalls: [exit], plans: [settled("interrupted")] }))).toEqual(["plan:t-2:Plan: Ship it\n(not answered: interrupted)"]);
+  });
+  it("a plan with no call seen sits at its own seq, its first line when it has no heading", () => {
+    expect(labels(state({ transcript: [msg(1, "before")], plans: [plan({ plan: "just do it\nnow", toolUseId: null })] })))
+      .toEqual(["text:before", "plan:pl-3:Plan: just do it\nwaiting for your review"]);
+  });
+  it("the entered and left rows sit where the page saw the move", () => {
+    const marks: PlanMark[] = [{ seq: 1.5, kind: "entered", key: "pm-2-entered" }, { seq: 3.5, kind: "left", key: "pm-4-left" }];
+    expect(labels(state({ transcript: [msg(1, "a"), msg(3, "b")], planMarks: marks })))
+      .toEqual(["text:a", "mark:entered plan mode", "text:b", "mark:left plan mode"]);
+  });
+});
+

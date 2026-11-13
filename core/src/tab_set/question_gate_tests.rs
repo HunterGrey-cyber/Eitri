@@ -273,6 +273,7 @@ fn a_typed_message_waits_behind_a_waiting_question() {
         wire: "next with context".into(),
         typed_by_person: true,
         shell_line: false,
+        attachments: Vec::new(),
     };
     assert!(matches!(
         set.send_prompt(tab, "r1", ViewId::BASE, turn),
@@ -593,6 +594,7 @@ fn set_restored_in_bypass() -> TabSet {
             turn_running: false,
             draft: None,
             row_key: None,
+            plan_origin: None,
         }],
         skipped: Vec::new(),
         active_session: Some("r1".into()),

@@ -40,20 +40,20 @@ const SEND_METHODS: &[&str] = &[
 const SENDS: &[(&str, &str)] = &[
     (
         "core/src/tab_set.rs",
-        ".send_turn_in(&wire, &typed, mode, root.as_deref(), origin)",
+        ".send_turn_in(&wire, &typed, mode, root.as_deref(), origin, images)",
     ),
     (
         "core/src/tab_set.rs",
-        ".send_turn_in(&turn.wire, &turn.typed, mode, root.as_deref(), turn.origin())",
+        ".send_turn_in(&turn.wire, &turn.typed, mode, root.as_deref(), turn.origin(), images)",
     ),
     ("core/src/agent_backend.rs", "session.send_turn(wire_text)"),
     (
         "core/src/agent_backend.rs",
-        "conversation.send_turn_as(wire_text, as_typed, origin, &client_message_id)",
+        "conversation.send_turn_as(wire_text, as_typed, origin, &client_message_id, images)",
     ),
     (
         "core/src/agent_backend.rs",
-        "self.send_turn(wire_text, as_typed, origin)",
+        "self.send_turn(wire_text, as_typed, origin, images)",
     ),
     (
         "core/src/agent_backend.rs",

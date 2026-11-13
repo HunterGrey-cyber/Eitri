@@ -16,7 +16,9 @@ export type SlashAction =
   | { kind: "sessions" }
   | { kind: "tasks"; workflows: boolean }
   | { kind: "open-path"; path: string }
-  | { kind: "pointer"; text: string };
+  | { kind: "pointer"; text: string }
+  /** `/plan`: the person's own move into or out of plan mode, as `<leader>p`. */
+  | { kind: "plan" };
 
 export interface SlashCommandEntry {
   /** Without the leading "/", lower-case (the CLI's own commands are lower-case; anything else is
@@ -70,7 +72,13 @@ const TASK_COMMANDS: readonly SlashCommandEntry[] = [
   { name: "bashes", class: "sent-as-text", action: { kind: "tasks", workflows: false } },
   { name: "workflows", class: "sent-as-text", action: { kind: "tasks", workflows: true } },
 ];
-const BY_NAME: ReadonlyMap<string, SlashCommandEntry> = new Map([...SLASH_COMMANDS, ...TASK_COMMANDS].map((entry) => [entry.name, entry]));
+/** `/plan` postdates the classification too. Sent to the CLI as a message it switches nothing (CLI 2.1.311 stays in
+ *  its mode), so a bare `/plan` is the page's own switch, which works only on a Claude tab whose session offers
+ *  plan mode. */
+const PLAN_COMMANDS: readonly SlashCommandEntry[] = [
+  { name: "plan", class: "sent-as-text", action: { kind: "plan" } },
+];
+const BY_NAME: ReadonlyMap<string, SlashCommandEntry> = new Map([...SLASH_COMMANDS, ...TASK_COMMANDS, ...PLAN_COMMANDS].map((entry) => [entry.name, entry]));
 
 /** Held back regardless of the table's class above, because a real interactive terminal opens a
  *  picker/wizard for these that a headless turn cannot draw -- each degraded to a plain-text

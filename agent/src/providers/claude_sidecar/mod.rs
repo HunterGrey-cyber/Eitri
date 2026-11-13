@@ -11,12 +11,15 @@ mod effort_reply;
 /// Handing a sidecar to another process (a chat moving to the other window): pidfds, Linux only.
 #[cfg(target_os = "linux")]
 mod moving;
+mod plan_rpc;
 mod spawn;
 mod steer;
 mod system_prompt;
 mod translate;
 pub(crate) mod translate_322;
+mod translate_326;
 mod transport;
+pub mod turn_content;
 mod watch;
 
 /// Real, billed A/B runs proving that protocol 3's two narrowing fields do what they say at
@@ -121,6 +124,9 @@ const CAP_SET_MODEL: &str = claude_runtime_protocol::CAP_SET_MODEL;
 const CAP_LIST_MODELS: &str = claude_runtime_protocol::CAP_LIST_MODELS;
 const CAP_APPLY_EFFORT: &str = claude_runtime_protocol::CAP_APPLY_EFFORT;
 const CAP_TASK_OUTPUT_RANGE: &str = claude_runtime_protocol::CAP_TASK_OUTPUT_RANGE;
+/// Protocol 3.26: `ProviderCapabilities::plan_mode_v1` and `turn_content_v1`.
+const CAP_PLAN_MODE_V1: &str = claude_runtime_protocol::CAP_PLAN_MODE_V1;
+const CAP_TURN_CONTENT_V1: &str = claude_runtime_protocol::CAP_TURN_CONTENT_V1;
 const PERMISSION_MODE_BYPASS: &str = "bypass";
 const PERMISSION_MODE_INTERACTIVE: &str = "interactive";
 
@@ -162,6 +168,11 @@ fn per_task_stop_policy(capable: bool, readiness: Option<bool>) -> bool {
 /// (`CreateSessionRequest.client_interactions.questions`, offered with `structured_questions_v1`).
 /// The panel has an explicit question dock; permission policy never supplies its answers.
 pub const CLIENT_IMPLEMENTS_QUESTIONS: bool = true;
+/// Whether sessions ask the sidecar for plan mode (`CreateSessionRequest.client_interactions.plan_mode`,
+/// offered with `plan_mode_v1`): `EnterPlanMode`/`ExitPlanMode` offered, each plan handed to this host as
+/// an interaction, and `SetPlanning` for the person's own switch. A plan is settled only by what the
+/// person does on its dock, never by permission policy.
+pub const CLIENT_IMPLEMENTS_PLAN_MODE: bool = true;
 
 /// Whether sessions on this sidecar ask for the CLI's own prompts: the intersection of
 /// what the handshake advertised and what this client implements, like every capability here. A
@@ -223,6 +234,19 @@ fn capabilities_from_handshake(response: &HandshakeResponse) -> ProviderCapabili
         client_tools: has(CAP_CLIENT_TOOLS),
         direct_settings: has(CAP_SET_MODEL) && has(CAP_LIST_MODELS) && has(CAP_APPLY_EFFORT),
         task_output_range: has(CAP_TASK_OUTPUT_RANGE),
+        plan_mode_v1: has(CAP_PLAN_MODE_V1),
+        turn_content_v1: has(CAP_TURN_CONTENT_V1),
+        // Copied as stated, whether or not the capability is listed: the limits are the sidecar's
+        // words, and `turn_content_v1` alone says whether it takes content.
+        turn_content_limits: response
+            .turn_content_limits
+            .as_ref()
+            .map(|limits| crate::provider::TurnContentLimits {
+                image_media_types: limits.image_media_types.clone(),
+                max_images_per_turn: limits.max_images_per_turn,
+                max_image_bytes: limits.max_image_bytes,
+                max_content_bytes: limits.max_content_bytes,
+            }),
     }
 }
 
@@ -408,6 +432,12 @@ pub struct ClaudeSidecarProvider {
     max_message_bytes: u64,
     #[cfg(feature = "test-support")]
     questions_override: Option<bool>,
+    #[cfg(feature = "test-support")]
+    plan_mode_override: Option<bool>,
+    /// Whether the session this provider opened (or took over) was created with plan mode offered: what
+    /// its CLI's reports are judged against (`cli_expectation`). Set from the request actually sent, or
+    /// from the handoff of the process that sent it.
+    plan_offered: AtomicBool,
     /// The watch task of each session opened, newest last; a move cancels the source's. Only a move
     /// reads it, so a build without moves keeps none.
     #[cfg(target_os = "linux")]
@@ -471,7 +501,7 @@ struct WatchMark {
 }
 
 impl WatchState {
-    fn fresh(splits_messages: bool, requested: crate::RequestedCliMode) -> Self {
+    fn fresh(splits_messages: bool, requested: impl Into<crate::CliExpectation>) -> Self {
         WatchState {
             tracker: watch::SequenceTracker::new(),
             split: translate::MessageSplit::new(splits_messages),
@@ -482,7 +512,7 @@ impl WatchState {
     }
 
     #[cfg(target_os = "linux")]
-    fn resumed(mark: &WatchMark, splits_messages: bool, requested: crate::RequestedCliMode) -> Self {
+    fn resumed(mark: &WatchMark, splits_messages: bool, requested: impl Into<crate::CliExpectation>) -> Self {
         WatchState {
             tracker: watch::SequenceTracker::after(mark.sequence),
             split: translate::MessageSplit::resuming(
@@ -818,6 +848,9 @@ impl ClaudeSidecarProvider {
             max_message_bytes,
             #[cfg(feature = "test-support")]
             questions_override: None,
+            #[cfg(feature = "test-support")]
+            plan_mode_override: None,
+            plan_offered: AtomicBool::new(false),
             #[cfg(target_os = "linux")]
             watches: Mutex::new(Vec::new()),
             parked: Mutex::new(None),
@@ -840,6 +873,21 @@ impl ClaudeSidecarProvider {
         #[cfg(not(feature = "test-support"))]
         let readiness = None;
         QuestionPolicy::resolve(self.capabilities.structured_questions_v1, readiness)
+    }
+
+    /// Overrides host readiness for plan mode in scripted tests; the peer must still offer `plan_mode_v1`.
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    pub fn set_plan_mode_override_for_tests(&mut self, enabled: bool) {
+        self.plan_mode_override = Some(enabled);
+    }
+
+    fn plan_policy(&self) -> PlanPolicy {
+        #[cfg(feature = "test-support")]
+        let readiness = self.plan_mode_override;
+        #[cfg(not(feature = "test-support"))]
+        let readiness = None;
+        PlanPolicy::resolve(self.capabilities.plan_mode_v1, readiness)
     }
 
     /// A private harness choice, made before creating a session; it never overrides a missing capability.
@@ -915,6 +963,7 @@ impl ClaudeSidecarProvider {
         ReplaySettings {
             splits_messages: self.splits_messages,
             requested_cli_mode: requested_cli_mode(&self.capabilities),
+            plan_offered: self.plan_offered.load(Ordering::SeqCst),
         }
     }
 
@@ -930,6 +979,27 @@ impl ClaudeSidecarProvider {
 
     fn map_status(&self, status: tonic::Status) -> ProviderError {
         map_status(status)
+    }
+
+    /// [`Self::run_unary`] for `SendTurn`: the sidecar's refusal of a turn's images is
+    /// [`ProviderErrorCode::TurnContentRefused`], which leaves the session as it was.
+    fn send_turn_unary<F, T>(&self, future: F) -> Result<T, ProviderError>
+    where
+        F: std::future::Future<Output = Result<tonic::Response<T>, tonic::Status>> + Send + 'static,
+        T: Send + 'static,
+    {
+        let result = self
+            .runtime
+            .block_on(future, UNARY_RPC_TIMEOUT)
+            .map_err(|_| ProviderError::Timeout)?;
+        match result {
+            Ok(response) => Ok(response.into_inner()),
+            Err(status) => Err(error_detail(&status)
+                .and_then(|detail| {
+                    turn_content::sidecar_refusal(&detail, self.capabilities.turn_content_limits.as_ref())
+                })
+                .unwrap_or_else(|| self.map_status(status))),
+        }
     }
 
     fn run_unary<F, T>(&self, future: F) -> Result<T, ProviderError>
@@ -955,8 +1025,14 @@ impl ClaudeSidecarProvider {
         if let Some(policy) = request.policy.as_mut() {
             policy.per_task_stop = self.per_task_stop();
         }
+        // Read off the request itself, so the reports are judged against the offer that was made.
+        let plan_offered = request
+            .client_interactions
+            .as_ref()
+            .is_some_and(|offer| offer.plan_mode);
         let mut client = self.client.clone();
         let response = self.run_unary(async move { client.create_session(request).await })?;
+        self.plan_offered.store(plan_offered, Ordering::SeqCst);
         self.start_watching(response.session_id.clone());
         Ok(response.session_id)
     }
@@ -994,8 +1070,17 @@ impl ClaudeSidecarProvider {
     /// real sidecar killed mid-reply, that produced zero further events, a projection stuck on an
     /// active turn, and a truncated assistant message no UI had any way to flag.
     fn start_watching(&self, session_id: String) {
-        let state = WatchState::fresh(self.splits_messages, requested_cli_mode(&self.capabilities));
+        let state = WatchState::fresh(self.splits_messages, self.session_expectation());
         self.watch_from(session_id, state);
+    }
+
+    /// What the reports of this provider's session are judged against: the mode every session it opens
+    /// asks for, and whether the one it opened offered plan mode.
+    fn session_expectation(&self) -> crate::CliExpectation {
+        crate::CliExpectation {
+            requested: requested_cli_mode(&self.capabilities),
+            plan_offered: self.plan_offered.load(Ordering::SeqCst),
+        }
     }
 
     /// Opens `session_id`'s watch with `state`: a fresh one, or one going on from where another
@@ -1004,10 +1089,11 @@ impl ClaudeSidecarProvider {
         let client = self.client.clone();
         let events = Arc::clone(&self.events);
         let backpressure = Arc::clone(&self.backpressure);
-        // The mode this session's `CreateSession` asked for, the one its CLI's reports are judged
-        // against: every session this provider creates asks for the same one.
-        let requested = requested_cli_mode(&self.capabilities);
-        let asks_questions = self.capabilities.structured_questions_v1;
+        // What this session's `CreateSession` asked for, which its CLI's reports are judged against.
+        let requested = self.session_expectation();
+        // Questions and plans still waiting are read back after a re-opened stream.
+        let plans_offered = requested.plan_offered;
+        let asks_questions = self.capabilities.structured_questions_v1 || plans_offered;
         #[cfg(target_os = "linux")]
         let watched = session_id.clone();
         let watch = async move {
@@ -1037,7 +1123,7 @@ impl ClaudeSidecarProvider {
                 let mut stream = match opened {
                     Ok(response) => {
                         let snapshot = (std::mem::replace(&mut reopening, true) && asks_questions)
-                            .then(|| read_interaction_state(&client, &session_id));
+                            .then(|| read_interaction_state(&client, &session_id, plans_offered));
                         stream_reopened(&events, &mut state, snapshot).await;
                         response.into_inner()
                     }
@@ -1191,14 +1277,18 @@ where
 /// The sidecar's list of questions still waiting, after a re-opened watch. The replay itself carries
 /// every ask and settlement the break hid, so a failed read loses nothing; it is logged and the watch
 /// goes on.
-async fn read_interaction_state(client: &RuntimeClient, session_id: &str) -> Option<crate::InteractionState> {
+async fn read_interaction_state(
+    client: &RuntimeClient,
+    session_id: &str,
+    plans_offered: bool,
+) -> Option<crate::InteractionState> {
     let request = claude_runtime_protocol::v1::GetInteractionStateRequest {
         session_id: session_id.to_string(),
     };
     let mut client = client.clone();
     let read = tokio::time::timeout(UNARY_RPC_TIMEOUT, client.get_interaction_state(request)).await;
     match read {
-        Ok(Ok(response)) => Some(translate_322::interaction_state(response.into_inner())),
+        Ok(Ok(response)) => Some(translate_322::interaction_state(response.into_inner(), plans_offered)),
         Ok(Err(status)) => {
             eprintln!(
                 "agent: ClaudeSidecarProvider: the questions still waiting could not be read after a re-watch: {}",
@@ -1433,8 +1523,9 @@ fn require_interactive(capabilities: &ProviderCapabilities, info: &ProviderInfo)
 /// effect, so it is sent. `provider_prompts` is another: `provider_prompts_from_handshake`, a
 /// policy field that depends on the peer. `claude_code_prompt` opts into the preset only when
 /// offered. `cli_mode` (`requested_cli_mode`): `Auto` only when the handshake offered both `cli_auto_mode` and
-/// `permission_defer`, and `Default` leaves the field unset, so a request to a sidecar without them
-/// is byte-for-byte what it was before the field existed.
+/// `permission_defer`; `Default` leaves the field unset, so a request to a sidecar without them is
+/// byte-for-byte what it was before the field existed, except on a session that offers plan mode, which
+/// states `DEFAULT` (`plans`).
 #[allow(clippy::too_many_arguments)]
 fn build_create_request(
     cwd: String,
@@ -1446,6 +1537,7 @@ fn build_create_request(
     cli_mode: crate::RequestedCliMode,
     project: ProjectTrust,
     questions: QuestionPolicy,
+    plans: PlanPolicy,
     client_tools: Option<ClientTools>,
 ) -> ProtoCreateSessionRequest {
     let mut request = build_create_request_loading(
@@ -1459,6 +1551,7 @@ fn build_create_request(
         project,
         cli_mode,
         questions,
+        plans,
     );
     request.client_tools = client_tools;
     request
@@ -1524,8 +1617,13 @@ fn build_create_request_loading(
     project: ProjectTrust,
     cli_mode: crate::RequestedCliMode,
     questions: QuestionPolicy,
+    plans: PlanPolicy,
 ) -> ProtoCreateSessionRequest {
     let denied = crate::process::disallowed_tools();
+    let asks_questions = questions.capable && questions.client_implements;
+    // Verdandi offers plan mode only on an INTERACTIVE session with the CLI's own prompts, which is every
+    // session here once the peer offers those prompts.
+    let offers_plan_mode = plans.capable && plans.client_implements && provider_prompts;
     ProtoCreateSessionRequest {
         cwd,
         policy: Some(ClaudeHostPolicy {
@@ -1600,11 +1698,14 @@ fn build_create_request_loading(
             // `Auto`: the CLI runs its own auto mode under the gate, so a call this host defers
             // (`PermissionDecision::Defer`) meets the CLI's classifier rather than its ordinary
             // ask. Verdandi accepts it only with INTERACTIVE and not switchable, both fixed above.
-            // UNSPECIFIED otherwise, never DEFAULT: DEFAULT would opt a session that cannot defer
-            // into `PermissionDenied` events, so its request would no longer be the one sent
-            // before the field existed.
+            // `DEFAULT` on a session that offers plan mode: Verdandi refuses the offer without a stated
+            // mode, since unstated the CLI would start in whatever `defaultMode` the user's settings name
+            // while leaving plan mode returns to `default`. Stating it also turns on `PermissionDenied`
+            // events, which land on their call as they do on an auto session. UNSPECIFIED otherwise:
+            // the request is the one sent before the field existed.
             cli_permission_mode: match cli_mode {
                 crate::RequestedCliMode::Auto => CliPermissionMode::Auto as i32,
+                crate::RequestedCliMode::Default if offers_plan_mode => CliPermissionMode::Default as i32,
                 crate::RequestedCliMode::Default => CliPermissionMode::Unspecified as i32,
             },
             // Never set: a sidecar that refuses its CLI refuses the session, and Eitri has no way
@@ -1616,12 +1717,12 @@ fn build_create_request_loading(
         }),
         resume_provider_session_id,
         fork,
-        // Absence preserves the CLI's own question handling until both ends support the host path.
-        client_interactions: (questions.capable && questions.client_implements).then_some(
+        // Absence preserves the CLI's own question handling (and keeps the plan tools denied) until both
+        // ends support the host path; each opt-in is independent of the other.
+        client_interactions: (asks_questions || offers_plan_mode).then_some(
             claude_runtime_protocol::v1::ClientInteractions {
-                questions: true,
-                // Plan approval is not offered: a plan session needs host support this tree does not have.
-                plan_mode: false,
+                questions: asks_questions,
+                plan_mode: offers_plan_mode,
             },
         ),
         // Keep model, effort and output format at their defaults. A replacement would discard
@@ -1668,6 +1769,33 @@ impl Default for QuestionPolicy {
     }
 }
 
+/// The peer's offer of plan mode (`plan_mode_v1`) and the host's readiness, as [`QuestionPolicy`].
+#[derive(Clone, Copy)]
+struct PlanPolicy {
+    capable: bool,
+    client_implements: bool,
+}
+
+impl PlanPolicy {
+    /// The peer's offer, and the host's readiness: the shipped constant unless a scripted run replaces it.
+    /// The peer's offer is never replaced.
+    fn resolve(capable: bool, readiness_override: Option<bool>) -> Self {
+        Self {
+            capable,
+            client_implements: readiness_override.unwrap_or(CLIENT_IMPLEMENTS_PLAN_MODE),
+        }
+    }
+}
+
+impl Default for PlanPolicy {
+    fn default() -> Self {
+        Self {
+            capable: false,
+            client_implements: CLIENT_IMPLEMENTS_PLAN_MODE,
+        }
+    }
+}
+
 /// The wire request for a fresh session. Destructured whole, so a field added to the request has to
 /// be placed here rather than dropped on the way to the wire.
 fn fresh_request(
@@ -1676,6 +1804,7 @@ fn fresh_request(
     claude_code_prompt: bool,
     cli_mode: crate::RequestedCliMode,
     questions: QuestionPolicy,
+    plans: PlanPolicy,
     offers_client_tools: bool,
 ) -> ProtoCreateSessionRequest {
     let CreateSessionRequest {
@@ -1694,6 +1823,7 @@ fn fresh_request(
         cli_mode,
         project,
         questions,
+        plans,
         client_tools_for(client_tools, offers_client_tools),
     )
 }
@@ -1706,6 +1836,7 @@ fn resume_request(
     claude_code_prompt: bool,
     cli_mode: crate::RequestedCliMode,
     questions: QuestionPolicy,
+    plans: PlanPolicy,
     offers_client_tools: bool,
 ) -> ProtoCreateSessionRequest {
     let ResumeSessionRequest {
@@ -1725,6 +1856,7 @@ fn resume_request(
         cli_mode,
         project,
         questions,
+        plans,
         client_tools_for(client_tools, offers_client_tools),
     )
 }
@@ -1762,7 +1894,7 @@ pub fn task_refusal(error: ProviderError) -> String {
 
 impl AgentProvider for ClaudeSidecarProvider {
     fn capabilities(&self) -> ProviderCapabilities {
-        self.capabilities
+        self.capabilities.clone()
     }
 
     fn info(&self) -> ProviderInfo {
@@ -1779,6 +1911,7 @@ impl AgentProvider for ClaudeSidecarProvider {
             self.claude_code_prompt,
             requested_cli_mode(&self.capabilities),
             self.question_policy(),
+            self.plan_policy(),
             self.capabilities.client_tools,
         ))
     }
@@ -1812,6 +1945,7 @@ impl AgentProvider for ClaudeSidecarProvider {
             self.claude_code_prompt,
             requested_cli_mode(&self.capabilities),
             self.question_policy(),
+            self.plan_policy(),
             self.capabilities.client_tools,
         ))
     }
@@ -1827,6 +1961,8 @@ impl AgentProvider for ClaudeSidecarProvider {
     /// accepts the mark (capability `human_origin`; one without it refuses the mark).
     fn send_turn_stamped(&self, request: SendTurnRequest, stamp: TurnStamp) -> Result<String, ProviderError> {
         self.require_driving()?;
+        // Images go only to a sidecar that takes them, within what it stated; else nothing is sent.
+        let content = turn_content::blocks(&request.images, &self.capabilities)?;
         let mut client = self.client.clone();
         let client_message_id = stamp
             .client_message_id
@@ -1843,10 +1979,12 @@ impl AgentProvider for ClaudeSidecarProvider {
             text,
             client_message_id: client_message_id.clone(),
             typed_by_person: stamp.typed_by_person && self.capabilities.human_origin,
-            // Turns carry text only; image content is not sent.
-            content: Vec::new(),
+            content,
         };
-        let result = self.run_unary(async move { client.send_turn(proto_request).await });
+        let result = match turn_content::fits(&proto_request, self.max_message_bytes) {
+            Ok(()) => self.send_turn_unary(async move { client.send_turn(proto_request).await }),
+            Err(refused) => Err(refused),
+        };
         if result.is_err() {
             self.events.forget_effort_ask();
             if let Some(id) = &client_message_id {
@@ -2146,14 +2284,20 @@ impl AgentProvider for ClaudeSidecarProvider {
 
     /// One `ResolveInteraction`, spawned on the provider's runtime and bounded by `UNARY_RPC_TIMEOUT`;
     /// the caller is never kept waiting for the sidecar (the person's answer comes from the GTK
-    /// thread). Refused here, with nothing sent, on a sidecar that does not offer questions. Until
-    /// the returned handle is dropped, which its holder does after reading the reply, the session is
-    /// not handed to another window: a refused answer has to put its question back where it was asked.
+    /// thread). Refused here, with nothing sent, on a sidecar that does not offer questions (for an
+    /// answer) or on a session that did not offer plan mode (for a plan decision). Until the returned
+    /// handle is dropped, which its holder does after reading the reply, the session is not handed to
+    /// another window: a refused answer has to put its question or plan back where it was asked. A plan
+    /// decision that was taken replies `Ok(None)`: its settlement arrives as an event.
     fn resolve_interaction(
         &self,
         request: crate::ResolveInteractionRequest,
     ) -> Result<crate::InteractionSend, ProviderError> {
-        if !self.capabilities.structured_questions_v1 {
+        let plan = request.resolution.is_plan();
+        if plan && !(self.capabilities.plan_mode_v1 && self.plan_offered.load(Ordering::SeqCst)) {
+            return Err(ProviderError::UnsupportedCapability("plan_mode_v1"));
+        }
+        if !plan && !self.capabilities.structured_questions_v1 {
             return Err(ProviderError::UnsupportedCapability("structured_questions_v1"));
         }
         self.require_driving()?;
@@ -2164,6 +2308,7 @@ impl AgentProvider for ClaudeSidecarProvider {
         let (tx, send) = crate::InteractionSend::channel();
         self.runtime.handle().spawn(async move {
             let reply = match tokio::time::timeout(UNARY_RPC_TIMEOUT, client.resolve_interaction(proto_request)).await {
+                Ok(Ok(_)) if plan => Ok(None),
                 Ok(Ok(response)) => Ok(translate_322::resolve_outcome(response.into_inner())),
                 Ok(Err(status)) => Err(map_status(status)),
                 Err(_) => Err(ProviderError::Timeout),
@@ -2174,8 +2319,44 @@ impl AgentProvider for ClaudeSidecarProvider {
         Ok(send.with_guard(answering))
     }
 
+    /// One `SetPlanning`, spawned on the provider's runtime and bounded by `plan_rpc::PLANNING_RPC_TIMEOUT`
+    /// (longer than the sidecar's own wait for the CLI). Refused here, with nothing sent, on a session that
+    /// did not offer plan mode. Its reply is the CLI's acknowledgement only; the CLI's report of its mode
+    /// confirms the move. Until the handle is dropped the session is not handed to another window.
+    fn set_planning(&self, request: crate::SetPlanningRequest) -> Result<crate::PlanningSend, ProviderError> {
+        if !(self.capabilities.plan_mode_v1 && self.plan_offered.load(Ordering::SeqCst)) {
+            return Err(ProviderError::UnsupportedCapability("plan_mode_v1"));
+        }
+        self.require_driving()?;
+        let crate::SetPlanningRequest { session_id, enter } = request;
+        let target = plan_rpc::target_word(enter, requested_cli_mode(&self.capabilities));
+        let proto_request = claude_runtime_protocol::v1::SetPlanningRequest {
+            session_id,
+            command_id: uuid::Uuid::new_v4().to_string(),
+            enter,
+        };
+        let mut client = self.client.clone();
+        let answering = Answering::begin(&self.events);
+        let (tx, send) = crate::PlanningSend::channel();
+        self.runtime.handle().spawn(async move {
+            let reply =
+                match tokio::time::timeout(plan_rpc::PLANNING_RPC_TIMEOUT, client.set_planning(proto_request)).await {
+                    Ok(Ok(response)) => Ok(response.into_inner().permission_mode),
+                    Ok(Err(status)) => plan_rpc::planning_failure(status, target),
+                    Err(_) => Err(ProviderError::Timeout),
+                };
+            let _ = tx.send(reply);
+        });
+        Ok(send.with_guard(answering))
+    }
+
+    fn cli_expectation(&self) -> crate::CliExpectation {
+        self.session_expectation()
+    }
+
     fn get_interaction_state(&self, session_id: &str) -> Result<crate::InteractionState, ProviderError> {
-        if !self.capabilities.structured_questions_v1 {
+        let plans_offered = self.plan_offered.load(Ordering::SeqCst);
+        if !self.capabilities.structured_questions_v1 && !plans_offered {
             return Err(ProviderError::UnsupportedCapability("structured_questions_v1"));
         }
         let mut client = self.client.clone();
@@ -2183,7 +2364,7 @@ impl AgentProvider for ClaudeSidecarProvider {
             session_id: session_id.to_string(),
         };
         let response = self.run_unary(async move { client.get_interaction_state(proto_request).await })?;
-        Ok(translate_322::interaction_state(response))
+        Ok(translate_322::interaction_state(response, plans_offered))
     }
 
     /// One `AnswerClientToolCall`, spawned on the provider's runtime and bounded by `UNARY_RPC_TIMEOUT`.
@@ -3045,6 +3226,9 @@ fn resolve_interaction_request_for(
         resolution,
     } = request;
     let result = match resolution {
+        // A plan decision carries the mode and the digest, or the feedback, and nothing else.
+        crate::InteractionResolution::PlanApprove { mode, plan_sha256 } => plan_rpc::approve(mode, plan_sha256),
+        crate::InteractionResolution::PlanKeep { feedback } => plan_rpc::keep_planning(feedback),
         crate::InteractionResolution::Answers(given) => {
             wire::resolve_interaction_request::Result::Answers(answers(given))
         }
@@ -3099,6 +3283,8 @@ pub struct ReplaySettings {
     pub splits_messages: bool,
     /// The permission mode the session asked the CLI to run in.
     pub requested_cli_mode: crate::RequestedCliMode,
+    /// The session offered plan mode: its `plan` reports are the moves of a plan session, not an ungated mode.
+    pub plan_offered: bool,
 }
 
 /// A steered message the host handed the provider, at the point of the recorded wire it was handed over.
@@ -3190,7 +3376,13 @@ pub fn replay_frames(
             translated.push(boundary);
         }
         let occurred_at = event.occurred_at;
-        translated.extend(translate::translate(event, settings.requested_cli_mode));
+        translated.extend(translate::translate(
+            event,
+            crate::CliExpectation {
+                requested: settings.requested_cli_mode,
+                plan_offered: settings.plan_offered,
+            },
+        ));
         for domain_event in translated {
             if let AgentDomainEvent::TurnStarted { turn_id: started } = &domain_event {
                 turn_id = started.clone();
@@ -3265,6 +3457,7 @@ mod tests {
                 last_text_open: None,
                 last_child_replies: Vec::new(),
                 cli_mode_noted: false,
+                plan_offered: false,
                 steers_given_up: Vec::new(),
                 stdout_partial: Vec::new(),
                 stderr_partial: Vec::new(),
@@ -3452,6 +3645,7 @@ mod tests {
                                 project,
                                 cli_mode,
                                 QuestionPolicy::default(),
+                                PlanPolicy::default(),
                             );
                             let decoded =
                                 ProtoCreateSessionRequest::decode(request.encode_to_vec().as_slice()).unwrap();
@@ -3520,6 +3714,7 @@ mod tests {
                 offered,
                 crate::RequestedCliMode::Default,
                 QuestionPolicy::default(),
+                PlanPolicy::default(),
                 false,
             );
             let resumed = resume_request(
@@ -3534,6 +3729,7 @@ mod tests {
                 offered,
                 crate::RequestedCliMode::Default,
                 QuestionPolicy::default(),
+                PlanPolicy::default(),
                 false,
             );
             assert_eq!(fresh.system_prompt_preset.is_some(), offered);
@@ -3563,6 +3759,7 @@ mod tests {
                         cli_mode,
                         ProjectTrust::Untrusted,
                         QuestionPolicy::default(),
+                        PlanPolicy::default(),
                         None,
                     ),
                 ),
@@ -3578,6 +3775,7 @@ mod tests {
                         cli_mode,
                         ProjectTrust::Untrusted,
                         QuestionPolicy::default(),
+                        PlanPolicy::default(),
                         None,
                     ),
                 ),
@@ -3593,6 +3791,7 @@ mod tests {
                         cli_mode,
                         ProjectTrust::Untrusted,
                         QuestionPolicy::default(),
+                        PlanPolicy::default(),
                         None,
                     ),
                 ),
@@ -3652,6 +3851,7 @@ mod tests {
                     crate::RequestedCliMode::Default,
                     ProjectTrust::Untrusted,
                     QuestionPolicy::default(),
+                    PlanPolicy::default(),
                     None,
                 )
                 .policy
@@ -3685,6 +3885,7 @@ mod tests {
             project,
             crate::RequestedCliMode::Default,
             QuestionPolicy::default(),
+            PlanPolicy::default(),
         )
         .policy
         .expect("a policy is always sent")
@@ -3713,6 +3914,7 @@ mod tests {
                     ProjectTrust::Untrusted,
                     crate::RequestedCliMode::Default,
                     QuestionPolicy::default(),
+                    PlanPolicy::default(),
                 )
                 .policy
                 .expect("a policy is always sent")
@@ -3742,6 +3944,7 @@ mod tests {
                 ProjectTrust::Untrusted,
                 crate::RequestedCliMode::Default,
                 QuestionPolicy::default(),
+                PlanPolicy::default(),
             );
             let selection = request.policy.clone().expect("a policy is always sent").setting_sources;
             assert_ne!(selection, None, "{shape}: never absent");
@@ -3795,6 +3998,7 @@ mod tests {
                 false,
                 crate::RequestedCliMode::Default,
                 QuestionPolicy::default(),
+                PlanPolicy::default(),
                 false,
             )
         };
@@ -3810,6 +4014,7 @@ mod tests {
                 false,
                 crate::RequestedCliMode::Default,
                 QuestionPolicy::default(),
+                PlanPolicy::default(),
                 false,
             )
         };
@@ -3886,6 +4091,7 @@ mod tests {
                 crate::RequestedCliMode::Default,
                 project,
                 QuestionPolicy::default(),
+                PlanPolicy::default(),
                 None,
             )
             .policy
@@ -4234,6 +4440,53 @@ mod tests {
         assert!(!capabilities_from_handshake(&without).client_tools);
     }
 
+    /// Protocol 3.26: the two flags come from the capability list, the limits from the handshake's own
+    /// field, and each is read without the others.
+    #[test]
+    fn capabilities_from_handshake_reads_plan_mode_and_turn_content() {
+        let today = real_handshake_today();
+        let none = capabilities_from_handshake(&today);
+        assert!(
+            !none.plan_mode_v1 && !none.turn_content_v1,
+            "flags false when not listed"
+        );
+        assert_eq!(none.turn_content_limits, None, "absent limits are None");
+
+        let mut listed = today.clone();
+        listed.capabilities.push("plan_mode_v1".to_string());
+        listed.capabilities.push("turn_content_v1".to_string());
+        listed.turn_content_limits = Some(claude_runtime_protocol::v1::TurnContentLimits {
+            image_media_types: vec!["image/png".into(), "image/webp".into()],
+            max_images_per_turn: 8,
+            max_image_bytes: 3_670_016,
+            max_content_bytes: 3_670_016,
+        });
+        let got = capabilities_from_handshake(&listed);
+        assert!(got.plan_mode_v1 && got.turn_content_v1);
+        assert_eq!(
+            got.turn_content_limits,
+            Some(crate::provider::TurnContentLimits {
+                image_media_types: vec!["image/png".into(), "image/webp".into()],
+                max_images_per_turn: 8,
+                max_image_bytes: 3_670_016,
+                max_content_bytes: 3_670_016,
+            })
+        );
+        // Nothing else moves.
+        let moved = ProviderCapabilities {
+            plan_mode_v1: false,
+            turn_content_v1: false,
+            turn_content_limits: None,
+            ..got
+        };
+        assert_eq!(moved, none);
+
+        let mut plan_only = today.clone();
+        plan_only.capabilities.push("plan_mode_v1".to_string());
+        let got = capabilities_from_handshake(&plan_only);
+        assert!(got.plan_mode_v1 && !got.turn_content_v1);
+    }
+
     /// `capabilities` with every 3.22 flag cleared.
     fn all_off(capabilities: ProviderCapabilities) -> ProviderCapabilities {
         ProviderCapabilities {
@@ -4310,6 +4563,7 @@ mod tests {
                         ProjectTrust::Trusted,
                         cli_mode,
                         QuestionPolicy::default(),
+                        PlanPolicy::default(),
                     );
                     assert!(request.client_interactions.is_none());
                     let mut policy = request.policy.clone().expect("a policy is always sent");
@@ -5336,6 +5590,7 @@ mod tests {
                     ProjectTrust::Untrusted,
                     cli_mode,
                     QuestionPolicy::default(),
+                    PlanPolicy::default(),
                 )
             };
             let default = build(crate::RequestedCliMode::Default);

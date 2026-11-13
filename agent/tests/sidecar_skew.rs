@@ -121,10 +121,7 @@ fn open_session(provider: &ClaudeSidecarProvider) -> String {
 
 fn send(provider: &ClaudeSidecarProvider, session_id: &str, script: &str) {
     provider
-        .send_turn(SendTurnRequest {
-            session_id: session_id.to_string(),
-            text: script.to_string(),
-        })
+        .send_turn(SendTurnRequest::text(session_id.to_string(), script.to_string()))
         .expect("the turn is taken");
 }
 

@@ -23,8 +23,8 @@
 //! them (`persistence::tests::a_record_written_before_provider_advertised_resume_existed_still_loads`).
 
 use crate::projection::{
-    AgentSessionProjection, NoticeRecord, QuestionRecord, QuestionState, ToolCallRecord, TranscriptMessage,
-    TurnStartRecord, UserPromptRecord,
+    AgentSessionProjection, NoticeRecord, PlanRecord, PlanState, QuestionRecord, QuestionState, ToolCallRecord,
+    TranscriptMessage, TurnStartRecord, UserPromptRecord,
 };
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -39,12 +39,12 @@ pub const HISTORY_FORMAT_VERSION: u32 = 1;
 /// One conversation's history as Eitri recorded it.
 ///
 /// Deliberately not a serialized projection. It holds the collections that ARE history (prompts,
-/// replies, tool calls, the starts of turns the user did not send, notice rows and question sets) and
+/// replies, tool calls, the starts of turns the user did not send, notice rows, question sets and plans) and
 /// nothing that is live state: no `status`, no `active_turn_id`, no `session_id`/
 /// `provider_session_id` inside a projection, no `model`, no `cwd`, no `usage`, and above all no
 /// `pending_permissions` -- a permission card restored from a file would be a request nobody can
-/// answer, since the provider that raised it is gone. A question stored while it waited is kept as
-/// it stood, and is read back as settled with `SessionClosed` for the same reason.
+/// answer, since the provider that raised it is gone. A question or a plan stored while it waited is kept
+/// as it stood, and is read back as settled with `SessionClosed` for the same reason.
 ///
 /// It also carries no `next_seq`. Loading this back is a REFOLD: each item's `seq` is a sorting key
 /// on disk and the projection's own `apply` assigns the numbers again. A stored counter would be a
@@ -73,6 +73,10 @@ pub struct StoredHistory {
     /// Claude's question sets, as they stood when written: a waiting one restores as closed.
     #[serde(default)]
     pub questions: Vec<QuestionRecord>,
+    /// The plans the model proposed, as they stood when written: a waiting one restores as closed. An
+    /// older file has none, and an older build ignores them.
+    #[serde(default)]
+    pub plans: Vec<PlanRecord>,
 }
 
 /// Why a stored history could not be loaded. Three outcomes, kept apart on purpose.
@@ -148,6 +152,7 @@ impl StoredHistory {
             turn_starts,
             notices,
             questions,
+            plans,
         } = truncate(parts);
         Self {
             version: HISTORY_FORMAT_VERSION,
@@ -160,6 +165,7 @@ impl StoredHistory {
             turn_starts,
             notices,
             questions,
+            plans,
         }
     }
 
@@ -172,6 +178,7 @@ impl StoredHistory {
             turn_starts: self.turn_starts,
             notices: self.notices,
             questions: self.questions,
+            plans: self.plans,
         }
     }
 
@@ -184,6 +191,7 @@ impl StoredHistory {
             + self.turn_starts.len()
             + self.notices.len()
             + self.questions.len()
+            + self.plans.len()
     }
 
     /// How many characters this holds by the measure the caps cut by: every item's cost, summed.
@@ -195,6 +203,7 @@ impl StoredHistory {
             turn_starts: &self.turn_starts,
             notices: &self.notices,
             questions: &self.questions,
+            plans: &self.plans,
         };
         EVERY_WHICH
             .into_iter()
@@ -212,6 +221,7 @@ pub struct HistoryParts {
     pub turn_starts: Vec<TurnStartRecord>,
     pub notices: Vec<NoticeRecord>,
     pub questions: Vec<QuestionRecord>,
+    pub plans: Vec<PlanRecord>,
 }
 
 impl HistoryParts {
@@ -223,6 +233,7 @@ impl HistoryParts {
             turn_starts: &self.turn_starts,
             notices: &self.notices,
             questions: &self.questions,
+            plans: &self.plans,
         }
     }
 }
@@ -236,6 +247,7 @@ pub(crate) struct HistoryView<'a> {
     pub turn_starts: &'a [TurnStartRecord],
     pub notices: &'a [NoticeRecord],
     pub questions: &'a [QuestionRecord],
+    pub plans: &'a [PlanRecord],
 }
 
 impl<'a> HistoryView<'a> {
@@ -247,6 +259,7 @@ impl<'a> HistoryView<'a> {
             turn_starts: &projection.turn_starts,
             notices: &projection.notices,
             questions: &projection.questions,
+            plans: &projection.plans,
         }
     }
 
@@ -258,6 +271,7 @@ impl<'a> HistoryView<'a> {
             Which::TurnStart => self.turn_starts.len(),
             Which::Notice => self.notices.len(),
             Which::Question => self.questions.len(),
+            Which::Plan => self.plans.len(),
         }
     }
 
@@ -269,6 +283,7 @@ impl<'a> HistoryView<'a> {
             Which::TurnStart => self.turn_starts[index].seq,
             Which::Notice => self.notices[index].seq,
             Which::Question => self.questions[index].seq,
+            Which::Plan => self.plans[index].seq,
         }
     }
 
@@ -281,6 +296,7 @@ impl<'a> HistoryView<'a> {
             Which::TurnStart => turn_start_chars(&self.turn_starts[index]),
             Which::Notice => notice_chars(&self.notices[index]),
             Which::Question => question_chars(&self.questions[index]),
+            Which::Plan => plan_chars(&self.plans[index]),
         }
     }
 
@@ -293,6 +309,7 @@ impl<'a> HistoryView<'a> {
             turn_starts: self.turn_starts[from[Which::TurnStart as usize]..].to_vec(),
             notices: self.notices[from[Which::Notice as usize]..].to_vec(),
             questions: self.questions[from[Which::Question as usize]..].to_vec(),
+            plans: self.plans[from[Which::Plan as usize]..].to_vec(),
         }
     }
 }
@@ -307,9 +324,10 @@ enum Which {
     TurnStart,
     Notice,
     Question,
+    Plan,
 }
 
-const WHICH_COUNT: usize = 6;
+const WHICH_COUNT: usize = 7;
 const EVERY_WHICH: [Which; WHICH_COUNT] = [
     Which::Prompt,
     Which::Message,
@@ -317,6 +335,7 @@ const EVERY_WHICH: [Which; WHICH_COUNT] = [
     Which::TurnStart,
     Which::Notice,
     Which::Question,
+    Which::Plan,
 ];
 
 /// Keeps the newest items that fit both caps, and returns each collection with its survivors in
@@ -372,6 +391,7 @@ fn truncate_to(mut parts: HistoryParts, max_items: usize, max_chars: usize) -> H
     retain_by(&mut parts.turn_starts, &keep[Which::TurnStart as usize]);
     retain_by(&mut parts.notices, &keep[Which::Notice as usize]);
     retain_by(&mut parts.questions, &keep[Which::Question as usize]);
+    retain_by(&mut parts.plans, &keep[Which::Plan as usize]);
     parts
 }
 
@@ -472,7 +492,15 @@ impl HistoryParts {
                 self.$field.sort_by_key(|r| r.seq);
             )*};
         }
-        merge!(user_prompts, transcript, tool_calls, turn_starts, notices, questions);
+        merge!(
+            user_prompts,
+            transcript,
+            tool_calls,
+            turn_starts,
+            notices,
+            questions,
+            plans
+        );
     }
 
     pub(crate) fn trim(&mut self, live: HistoryView<'_>) {
@@ -483,7 +511,15 @@ impl HistoryParts {
                 self.$field.retain(|r| selected.$field.iter().any(|kept| kept.seq == r.seq));
             )*};
         }
-        retain_selected!(user_prompts, transcript, tool_calls, turn_starts, notices, questions);
+        retain_selected!(
+            user_prompts,
+            transcript,
+            tool_calls,
+            turn_starts,
+            notices,
+            questions,
+            plans
+        );
     }
 }
 
@@ -569,6 +605,25 @@ pub(super) fn question_chars(question: &QuestionRecord) -> usize {
         QuestionState::Waiting | QuestionState::Answering => 0,
     };
     asked + settled + opt(&question.unsupported_reason)
+}
+
+/// A plan costs every text it holds: the plan itself (never cut for the budget's sake, so a long one weighs
+/// what it weighs), what it said it would need, and the feedback or reason it settled with.
+pub(super) fn plan_chars(plan: &PlanRecord) -> usize {
+    let count = |text: &str| text.chars().count();
+    let opt = |text: &Option<String>| text.as_deref().map(count).unwrap_or(0);
+    let asked = count(&plan.plan)
+        + count(&plan.plan_sha256)
+        + plan
+            .allowed_prompts
+            .iter()
+            .map(|p| count(&p.tool) + count(&p.prompt))
+            .sum::<usize>();
+    let settled = match &plan.state {
+        PlanState::Settled { feedback, reason, .. } => opt(feedback) + opt(reason),
+        PlanState::Waiting | PlanState::Answering => 0,
+    };
+    asked + settled + opt(&plan.unsupported_reason)
 }
 
 /// `$XDG_STATE_HOME/eitri/history/<conversation_id>/`.
@@ -704,6 +759,7 @@ mod tests {
             seq,
             text: text.to_string(),
             delivered: false,
+            attachments: Vec::new(),
         }
     }
 
@@ -783,6 +839,48 @@ mod tests {
         }
     }
 
+    fn plan(seq: u64, text: &str) -> PlanRecord {
+        PlanRecord {
+            seq,
+            interaction_id: format!("p-{seq}"),
+            tool_use_id: None,
+            turn_id: None,
+            plan: text.to_string(),
+            plan_sha256: String::new(),
+            allowed_prompts: vec![],
+            state: PlanState::Waiting,
+            unsupported_reason: None,
+        }
+    }
+
+    /// A plan is bounded with the rest by the same rule: whole, newest first, weighed by every text it
+    /// holds -- the plan is never shortened to fit, so a long one ends the walk instead.
+    #[test]
+    fn newest_that_fit_bounds_plans_whole() {
+        let parts = HistoryParts {
+            user_prompts: vec![prompt(1, "go")],
+            plans: vec![plan(2, &"a long first plan ".repeat(10)), plan(4, "short second plan")],
+            transcript: vec![message(3, "ok")],
+            ..HistoryParts::default()
+        };
+        // The newest plan (17) and the reply (2) fit in 25; the older plan (180) ends the walk whole.
+        let kept = newest_that_fit_to(parts.view(), usize::MAX, 25);
+        assert_eq!(kept.plans.iter().map(|r| r.seq).collect::<Vec<_>>(), vec![4]);
+        assert_eq!(kept.transcript.len(), 1);
+        assert!(kept.user_prompts.is_empty());
+        assert_eq!(kept, truncate_to(parts.clone(), usize::MAX, 25));
+        assert_eq!(plan_chars(&parts.plans[1]), "short second plan".len());
+        // A stored copy keeps them, and a file written before plans existed reads with none.
+        let stored = StoredHistory::from_parts("c".into(), "s".into(), parts.clone());
+        assert_eq!(stored.item_count(), 4);
+        assert_eq!(stored.into_parts(), parts);
+        let old: StoredHistory = serde_json::from_value(serde_json::json!({
+            "version": HISTORY_FORMAT_VERSION, "conversation_id": "c", "provider_session_id": "s", "written_at": "0",
+        }))
+        .unwrap();
+        assert!(old.plans.is_empty());
+    }
+
     /// The three collections added after the first three are bounded with them, by the same rule:
     /// the newest items of the whole conversation within both caps, a turn start, a notice and a
     /// question weighed by their text like any other item.
@@ -795,6 +893,7 @@ mod tests {
             turn_starts: vec![turn_start(3, "a task ended"), turn_start(7, "tick")],
             notices: vec![notice(4, "compacted"), notice(8, "fell back")],
             questions: vec![question(5, "which one?"), question(9, "and now?")],
+            plans: vec![],
         };
         // Item cap: the newest three of the conversation, whichever collections they are in.
         let kept = newest_that_fit_to(parts.view(), 3, usize::MAX);
@@ -1196,6 +1295,11 @@ mod tests {
                 .into_iter()
                 .map(|q| question(q, &"q".repeat(next(40) as usize)))
                 .collect();
+            let n = next(4);
+            let plans: Vec<_> = seqs(&mut next, n)
+                .into_iter()
+                .map(|q| plan(q, &"p".repeat(next(40) as usize)))
+                .collect();
             let parts = HistoryParts {
                 user_prompts: prompts,
                 transcript: messages,
@@ -1203,6 +1307,7 @@ mod tests {
                 turn_starts: starts,
                 notices,
                 questions,
+                plans,
             };
             let max_items = next(25) as usize;
             let max_chars = next(400) as usize;

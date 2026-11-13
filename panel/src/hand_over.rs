@@ -369,6 +369,7 @@ mod tests {
             turn_running: false,
             draft: None,
             row_key: None,
+            plan_origin: None,
         }
     }
 
@@ -535,6 +536,7 @@ mod tests {
                 typed: "hello".into(),
                 typed_by_person: true,
                 shell_line: false,
+                attachments: Vec::new(),
             },
         };
         state.borrow_mut().tabs.defer_start(tab, start).unwrap();

@@ -240,6 +240,42 @@ impl AgentPanelHandle {
         println!("[agent_panel] backend: {}", self.state.borrow().backend_kind.as_str());
     }
 
+    /// The window's attachment desk (`eitri_core::attachments::start_desk`): from now on its tabs' composers take
+    /// images. A window with none refuses them with the composer's words.
+    pub fn install_attachments(&self, desk: eitri_core::tab_set::AttachmentDesk) {
+        self.wake();
+        self.state.borrow_mut().tabs.install_attachments(desk);
+    }
+
+    /// Files the person dropped on `view`'s page (the window's drop target on its WebView, which takes a file list
+    /// before WebKit does): imported into the draft of the tab that page shows, each read, staged and prepared on the
+    /// attachment desk, never on this thread. The page is never handed a path; it hears of each image as a chip. A
+    /// refusal of the whole drop (no tab there, a tab that takes no images, a full draft) is said on that page.
+    pub fn drop_files(&self, view: ViewId, files: Vec<eitri_core::tab_set::DroppedFile>) {
+        self.wake();
+        if self.state.borrow().shutting_down || files.is_empty() {
+            return;
+        }
+        self.run(|state, out| {
+            let taken = match state.tab_of_page(view) {
+                None => Err(super::admission::NO_TAB_HERE.to_string()),
+                Some(tab) => super::admission::page_may_answer(&state.tabs, tab, view)
+                    .and_then(|()| state.tabs.attach_files(tab, files)),
+            };
+            if let Err(why) = taken {
+                out.send(view, eitri_core::agent_bridge::serialize_notice_for_js(&why));
+            }
+            super::inbound::send_attachment_payloads(state, out);
+        });
+    }
+
+    /// What tells this panel's tick to run, for a worker of the window's that reports through the panel: `None`
+    /// when the panel has no wake and polls instead.
+    pub fn waker(&self) -> Option<agent::UiWake> {
+        self.wake();
+        self.raise.clone()
+    }
+
     /// Says on the log that this window has a backend and no panel: WebKit's sandbox cannot start here.
     pub fn say_no_panel(&self) {
         self.wake();
@@ -932,6 +968,18 @@ impl AgentPanelHandle {
         // A card nobody answers ends at its limit, and nothing else would run a tick then.
         next = earliest(next, state.editor_tools.next_card_limit().map(after_now));
         next = earliest(next, state.tabs.remote_poll_deadline(now));
+        // A request held for its call is judged when it has waited its time, by a drain nothing else may wake; one
+        // already due is looked at on the steady cadence until a drain has judged it.
+        next = earliest(
+            next,
+            state.tabs.next_plan_sequence_release().map(|left| {
+                if left.is_zero() {
+                    now + Self::TICK
+                } else {
+                    after_now(now + left)
+                }
+            }),
+        );
         // Every live page's typing cadence, each against its own document.
         for (view, page) in self.pages.live_views() {
             let paced = page
@@ -2104,7 +2152,9 @@ impl AgentPanelHandle {
     }
 
     /// `prefix c`: opens a tab running the window's default agent (`agent.default`) in the base view,
-    /// selects it, and sends `tabs` -- nothing else: an empty tab has no state yet.
+    /// selects it, and sends `tabs` and the new tab's (empty) draft images: an empty tab has no other state
+    /// yet, but the page starts a tab it switches to with a composer that takes no images, and only the host
+    /// knows whether this one does, and if not why.
     pub fn new_tab(&self) {
         self.wake();
         let agent = self.state.borrow().default_agent.clone();
@@ -2120,6 +2170,10 @@ impl AgentPanelHandle {
         self.run(|state, out| {
             state.tabs.open(agent);
             send_tabs(state, out);
+            let tab = state.tabs.active();
+            if let Some(images) = state.tabs.draft_attachments_payload(tab) {
+                out.send(ViewId::BASE, images);
+            }
         });
     }
 
@@ -3091,6 +3145,40 @@ mod tests {
         }
     }
 
+    /// The draft images `new_tab` sent for the tab it opened, after its `tabs`.
+    fn new_tabs_images(page: &RecordingPage, before: usize) -> serde_json::Value {
+        let sent = page.sent.borrow();
+        let tabs_at = sent[before..]
+            .iter()
+            .position(|p| kind_of(p) == "tabs")
+            .expect("tabs went first");
+        let images = sent[before + tabs_at..]
+            .iter()
+            .find(|p| kind_of(p) == "draft_attachments")
+            .expect("the new tab's draft images were sent after its tabs");
+        serde_json::from_str(images).unwrap()
+    }
+
+    #[test]
+    fn a_new_tab_tells_its_page_whether_it_takes_images() {
+        let (handle, page) = settled_panel();
+        let (desk, _end) = eitri_core::tab_set::AttachmentDesk::channels();
+        handle.install_attachments(desk);
+        let before = page.sent.borrow().len();
+        handle.new_tab();
+        let claude = new_tabs_images(&page, before);
+        assert_eq!(claude["tab"], handle.state.borrow().tabs.active().0);
+        assert_eq!(claude["imageInput"], true, "{claude}");
+        assert_eq!(claude["attachments"], serde_json::json!([]));
+
+        let before = page.sent.borrow().len();
+        handle.new_tab_for(AgentId::Codex);
+        let codex = new_tabs_images(&page, before);
+        assert_eq!(codex["tab"], handle.state.borrow().tabs.active().0);
+        assert_eq!(codex["imageInput"], false, "{codex}");
+        assert!(codex["why"].as_str().unwrap().contains("Codex"), "{codex}");
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     fn a_partner_chooser_answer_after_a_tab_switch_is_dropped() {
@@ -3812,6 +3900,7 @@ mod tests {
                     turn_running: false,
                     draft: None,
                     row_key: None,
+                    plan_origin: None,
                 }],
                 0,
                 Vec::new(),

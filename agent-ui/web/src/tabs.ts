@@ -1,5 +1,5 @@
 import type { PanelMode } from "./keymap";
-import type { PermissionModeChoice, TabId, TabInfo, TabMarker, TabsEnvelope } from "./types";
+import type { PermissionModeChoice, PlanningState, TabId, TabInfo, TabMarker, TabsEnvelope } from "./types";
 
 /** Envelopes about ONE tab. Everything else is about the window.
  *
@@ -12,7 +12,7 @@ import type { PermissionModeChoice, TabId, TabInfo, TabMarker, TabsEnvelope } fr
 const TAB_SCOPED = new Set([
   "events", "snapshot", "history_page", "editor_cards", "handoff", "error", "focus_permission", "tab_detail", "confirm_close", "begin_rename",
   "queue", "shell_running", "draft", "queue_taken", "rule_offers", "scratch", "review", "review_diff",
-  "review_draft", "review_send_preview", "trust_prompt",
+  "review_draft", "review_send_preview", "trust_prompt", "attachment_state", "draft_attachments",
 ]);
 
 /** The panel keeps only the active tab's state, so an envelope for another tab is dropped. That
@@ -42,6 +42,17 @@ export function modePill(mode: PermissionModeChoice, cycleOffered: boolean, shor
   if (short) return mode === "bypass" ? "⏵⏵ bypass permissions on" : `⏵⏵ ${mode}`;
   // The key cycles manual -> auto -> bypass, Claude Code's order and word.
   return cycleOffered ? `⏵⏵ ${mode} on (shift+tab to cycle)` : `⏵⏵ ${mode} on`;
+}
+
+/** The band's mode pill while plan mode is involved (Claude Code's own word, `⏸ plan mode on`, with where it came
+ *  from): `plan · from <mode>` while planning, the move's own words while it is under way, and the mode asked of an
+ *  empty tab before its first message. `null` when plan mode has nothing to say, so the ordinary pill shows. */
+export function planPill(planning: PlanningState | null, mode: PermissionModeChoice, planOnStart = false): string | null {
+  const phase = planning?.phase ?? "executing";
+  if (phase === "planning") return `⏸ plan · from ${planning?.origin ?? mode}`;
+  if (phase === "entering") return "⏸ entering plan…";
+  if (phase === "leaving") return "⏸ leaving plan…";
+  return planOnStart ? `⏸ plan on start · from ${mode}` : null;
 }
 
 /** One glyph per marker. `working` has none: `TurnActivity`'s motion draws it. */

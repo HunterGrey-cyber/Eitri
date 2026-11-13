@@ -297,6 +297,7 @@ pre {
   font-size: var(--fs-xs);
 }
 /* The enrolled phone a prompt came from, as quiet as the delivered line. */
+.row-prompt .prompt-images,
 .row-prompt .phone-source {
   margin-top: 5px;
   color: var(--nv-tint-muted);
@@ -990,6 +991,79 @@ pre {
   font-size: var(--fs-sm);
   line-height: 1.5;
 }
+/* The draft's images, above the box: small cards that wrap, so a narrow panel stacks them instead of cutting them. */
+.attachment-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin: 0 0 8px;
+}
+.attachment-chip {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  max-width: 100%;
+  min-width: 0;
+  padding: 4px 4px 4px 6px;
+  border: 1px solid var(--rule-soft);
+  border-radius: 8px;
+  font-size: var(--fs-sm);
+  line-height: 1.35;
+  outline: none;
+}
+.attachment-chip:focus-visible {
+  border-color: var(--nv-focus-ring);
+  outline: 1px solid var(--nv-focus-ring);
+}
+.attachment-chip-failed {
+  border-color: var(--nv-error);
+}
+.attachment-thumb {
+  flex: none;
+  width: 36px;
+  height: 36px;
+  object-fit: cover;
+  border-radius: 4px;
+}
+.attachment-text {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+}
+.attachment-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.attachment-meta {
+  color: var(--nv-muted);
+  font-size: var(--fs-xs);
+  white-space: nowrap;
+}
+/* The host's sentence is read whole, wrapped at any width. */
+.attachment-reason {
+  color: var(--nv-fg);
+  font-size: var(--fs-xs);
+  overflow-wrap: anywhere;
+}
+.attachment-remove {
+  flex: none;
+  align-self: flex-start;
+  padding: 0 4px;
+  border: 0;
+  background: none;
+  color: var(--nv-muted);
+  font: inherit;
+  line-height: 1;
+  cursor: pointer;
+}
+.attachment-remove:hover {
+  color: var(--nv-fg);
+}
+.queue-images {
+  flex: none;
+  white-space: nowrap;
+}
 .activity-line {
   display: flex;
   align-items: baseline;
@@ -1392,7 +1466,7 @@ pre {
 }
 /* These take the keys whole by `.focus()`, and WebKit answers that with its own thick accent ring outside the frame.
    The cursor row or the frame already shows where the keys are; a field inside keeps its own ring. */
-.question-dock:focus, .chooser:focus, .slash-picker:focus, .tasks-overlay:focus {
+.question-dock:focus, .plan-dock:focus, .chooser:focus, .slash-picker:focus, .tasks-overlay:focus {
   outline: none;
 }
 .keymap-overlay h2, .trust-prompt h2 {
@@ -2466,6 +2540,55 @@ button.band-background {
 }
 .question-preview { font-family: var(--nv-font-mono); max-width: 100%; overflow: auto; }
 .question-footer { color: var(--nv-fg); }
+
+/* Claude's plan takes the composer's slot as a question does. The plan scrolls in its own region, by keys; the
+   actions wrap under it and the whole dock scrolls when even that does not fit, so at 320 px every action is still
+   reachable. */
+.plan-dock {
+  margin: 10px var(--page-pad) 14px;
+  padding: 12px;
+  border: 1px solid var(--rule-frame);
+  border-radius: 14px;
+  min-width: 0;
+  max-height: 70vh;
+  overflow: auto;
+  overflow-wrap: anywhere;
+  font-size: var(--fs-code);
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.plan-dock[data-active="true"] { border-color: var(--nv-focus-ring); }
+.plan-head { font-weight: 600; }
+.plan-body {
+  min-height: 3em;
+  max-height: 40vh;
+  overflow: auto;
+  font-size: var(--fs-prose);
+  border-left: 2px solid var(--rule-frame);
+  padding-left: 10px;
+}
+.plan-prompts { color: var(--nv-muted); }
+.plan-prompts ul { margin: 2px 0 0; padding-left: 1.5em; }
+.plan-text { unicode-bidi: isolate; white-space: pre-wrap; }
+.plan-actions { display: flex; flex-wrap: wrap; gap: 6px; }
+.plan-action { max-width: 100%; white-space: normal; overflow-wrap: anywhere; text-align: left; }
+.plan-dock [data-focused="true"] { background: var(--nv-cursor-band); }
+.plan-feedback { display: flex; flex-direction: column; gap: 4px; }
+.plan-feedback textarea {
+  display: block;
+  box-sizing: border-box;
+  width: 100%;
+  min-height: 3em;
+  resize: vertical;
+  font: inherit;
+  color: var(--nv-fg);
+  background: var(--nv-bg);
+  unicode-bidi: isolate;
+}
+.plan-send { align-self: flex-start; }
+.plan-hint { color: var(--nv-muted); white-space: normal; }
+.plan-footer { color: var(--nv-fg); }
 
 /* The device list sits in the panel's column above the band: its height is bounded, so a device's records scroll
    inside it and the window's y/n drawn under it stays on screen. */

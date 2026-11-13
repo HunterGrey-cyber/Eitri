@@ -8,11 +8,12 @@
 //!
 //! | verb | argument |
 //! |------|----------|
-//! | `send` | text, or `{text, typed}` |
+//! | `send` | text, or `{text, typed?, images?}`: `images` names files of `tests/fixtures/claude_scripted_images/`, sent with the text in that order (a host with the `turn_content_v1` capability) |
 //! | `steer` | text, or `{text, typed}` |
-//! | `queue`, `slash` | text |
+//! | `queue` | text, or `{text, images?}`: the message waits for the running turn and goes as a turn of its own |
+//! | `slash` | text |
 //! | `interrupt`, `approve_sweep`, `close`, `resume` | anything |
-//! | `answer_card` | `{tool, allow}` (allow defaults to true) |
+//! | `answer_card` | `{tool, allow, origin?}` (allow defaults to true; `origin` is `hook` or `cli_prompt`: only a card of that origin takes it) |
 //! | `open_gate` | gate name |
 //! | `release` | hold name |
 //! | `stop_task`, `task_output` | task id; `task_output` also `{task, refused?, min_bytes?, contains?}`: the host must refuse, with that text in the refusal, or the output it returns must be at least `min_bytes` long and hold `contains` |
@@ -21,14 +22,17 @@
 //! | `freeze`, `adopt`, `commit` | anything: the three steps of a window move of the tab, in the source and then the destination window (a host with the `chat_move` capability) |
 //! | `answer_question` | `{picks: [[option...]...], other?: [text\|null...], notes?: [text\|null...], refused?: text}` |
 //! | `decline_question` | `{kind: "cancel"\|"chat"}`, with `picks`, `other` and `notes` as the answers so far (chat only) and `refused?` |
+//! | `set_mode` | `manual`, `auto` or `bypass`: the person's Shift+Tab to that mode of the tab (not while plan mode holds it) |
+//! | `set_planning` | `{enter: bool}`: the person's own switch into plan mode, or out of it (a host with `plan_mode_v1`) |
+//! | `resolve_plan` | `{choice: "approve_manual"\|"approve_auto"\|"approve_bypass"\|"keep", feedback?, refused?}` |
 //! | `request`, `request_done` | step id or side kind, or `{id, count}` |
 //! | `held` | hold name |
 //! | `tap_line` | `{kind, fields?, count?}`; `kind` is a stdout line's `type` or `type/subtype` |
 //! | `cli_results` | how many `result` lines at least |
 //! | `session_state` | `idle`, `running` or `requires_action`: the newest state line since the last action |
 //! | `transcript_line` | `{type, fields?, count?, subagents?}` over the CLI's own session files; `subagents: true` includes nested agent transcripts |
-//! | `projection` | `{question: "waiting"\|"settled"}`, or an object the host judges |
-//! | `interaction` | an object the host judges |
+//! | `projection` | `{question: "waiting"\|"settled"}`, `{plan: "waiting"\|"settled"}`, `{planning: "executing"\|"planning"}`, or an object the host judges |
+//! | `interaction` | an object the host judges (`{plan_outcome, mode_after?, feedback?, count?}` for plans) |
 //! | `roster` | `{task, status}` |
 //! | `card` | `{tool}`: a request of that tool needed (or got) a driver answer |
 //! | `wall_floor` | `{after, seconds}`: `after` is a part's `name` or `<verb>:<target>` of an earlier wait |
@@ -55,11 +59,25 @@
 //! (a late answer to one that has gone). A host that does not declare `structured_questions_v1` gets the call
 //! unchecked, and fails it as missing.
 //!
+//! **Plans.** `resolve_plan` decides the plan the CLI's `can_use_tool` request for `ExitPlanMode` waits on, as
+//! `answer_question` does a question, and with the same checks before the host is called: that request has no
+//! answer yet, the permission gate never answered it (no card, no automatic answer for `ExitPlanMode`), and no
+//! request at the stand-in carries its `tool_result`. `refused` expects the host to refuse. `set_planning` moves
+//! the session into plan mode or out of it. A host that does not declare `plan_mode_v1` gets the call unchecked
+//! and fails it as missing. `projection{plan: waiting}` holds while the host shows the newest plan as waiting
+//! for the person, `settled` once it shows it ended any way; `projection{planning: planning}` once the CLI has
+//! reported plan mode (a move into it under way is not yet planning), `executing` once it has reported the way
+//! out of it, or when plan mode was never entered.
+//!
 //! `projection{question: waiting}` holds while the host shows the newest question as waiting for the person;
 //! `settled` once it shows it answered, declined, or ended by anything else. The host judges it, and an
 //! `interaction` object (`outcome`, `answers`, `notes`, `count`), in [`Host::interaction_holds`].
 
-use super::{gate_answer::Answered, script::Expander, RequestRecord, ScriptedModel};
+use super::{
+    gate_answer::{Answered, Origin},
+    script::Expander,
+    RequestRecord, ScriptedModel,
+};
 use serde_json::{json, Value};
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -120,6 +138,24 @@ pub struct QuestionAnswer {
 /// The tool whose calls are questions for the person, never permission requests.
 pub const QUESTION_TOOL: &str = "AskUserQuestion";
 
+/// The tool whose calls are plans for the person, never permission requests.
+pub const PLAN_TOOL: &str = "ExitPlanMode";
+
+/// The capability a host declares when it can decide plans and switch plan mode.
+pub const PLAN_MODE: &str = "plan_mode_v1";
+
+/// What the person does with a waiting plan.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PlanDecision {
+    ApproveManual,
+    ApproveAuto,
+    ApproveBypass,
+    /// "Keep planning", with feedback for the model, possibly empty.
+    Keep {
+        feedback: String,
+    },
+}
+
 /// A call of a tool this host declared, as the host was handed it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ClientCallSeen {
@@ -155,6 +191,18 @@ pub struct ClientState {
 pub trait Host {
     /// Sends a prompt. `typed` marks it as typed by the person; a host without `human_origin` fails it.
     fn send(&mut self, text: &str, typed: bool) -> Result<(), DriverError>;
+    /// Sends a prompt with images, named as files of the image fixtures directory, in that order. A host that
+    /// cannot carry them fails it as missing the capability.
+    fn send_images(&mut self, text: &str, images: &[String], typed: bool) -> Result<(), DriverError> {
+        let _ = (text, images, typed);
+        Err(DriverError::CapabilityMissing("turn_content_v1"))
+    }
+    /// Enter while a turn may run, for a message with images: it waits for the running turn and goes as a turn
+    /// of its own, never into it.
+    fn queue_images(&mut self, text: &str, images: &[String]) -> Result<(), DriverError> {
+        let _ = (text, images);
+        Err(DriverError::CapabilityMissing("turn_content_v1"))
+    }
     /// Puts a message into the running turn. `typed` marks it as typed by the person; a host without
     /// `human_origin` fails it.
     fn steer(&mut self, text: &str, typed: bool) -> Result<(), DriverError>;
@@ -163,6 +211,14 @@ pub trait Host {
     fn interrupt(&mut self) -> Result<(), DriverError>;
     /// Answers the oldest waiting card of `tool`, or the next one that comes.
     fn answer_card(&mut self, tool: &str, allow: bool) -> Result<(), DriverError>;
+    /// As [`answer_card`](Host::answer_card), for a card of one origin only: the hook's request or the CLI's own
+    /// prompt for the call. A host that cannot tell them apart fails the part.
+    fn answer_card_from(&mut self, tool: &str, allow: bool, origin: Origin) -> Result<(), DriverError> {
+        let _ = (tool, allow, origin);
+        Err(DriverError::Failed(
+            "this host cannot answer a card by its origin".into(),
+        ))
+    }
     /// Approves every pending card ("approve all pending").
     fn approve_sweep(&mut self) -> Result<(), DriverError>;
     fn slash(&mut self, command: &str) -> Result<(), DriverError>;
@@ -221,6 +277,28 @@ pub trait Host {
     fn decline_question(&mut self, kind: DeclineKind, so_far: &[QuestionAnswer]) -> Result<(), DriverError> {
         let _ = (kind, so_far);
         Err(DriverError::CapabilityMissing("structured_questions_v1"))
+    }
+    /// Puts the tab in `mode` as the person's Shift+Tab does.
+    fn set_mode(&mut self, mode: &str) -> Result<(), DriverError> {
+        let _ = mode;
+        Err(DriverError::CapabilityMissing(PLAN_MODE))
+    }
+    /// Moves the session into plan mode (`enter`) or out of it, as the person's own switch.
+    fn set_planning(&mut self, enter: bool) -> Result<(), DriverError> {
+        let _ = enter;
+        Err(DriverError::CapabilityMissing(PLAN_MODE))
+    }
+    /// Decides the plan the model is waiting on.
+    fn resolve_plan(&mut self, decision: &PlanDecision) -> Result<(), DriverError> {
+        let _ = decision;
+        Err(DriverError::CapabilityMissing(PLAN_MODE))
+    }
+    /// Whether the host's plan records hold what `want` describes: `{plan: "waiting"|"settled"}` for the newest
+    /// plan, `{planning: "executing"|"planning"}` for the session's phase, or `{plan_outcome, mode_after?,
+    /// feedback?, count?}` for the plans settled with that outcome.
+    fn plan_holds(&self, want: &Value) -> Result<bool, DriverError> {
+        let _ = want;
+        Err(DriverError::CapabilityMissing(PLAN_MODE))
     }
     /// Every call of a declared tool the host has been handed, settled or not, oldest first.
     fn client_calls_seen(&self) -> Result<Vec<ClientCallSeen>, DriverError> {
@@ -360,6 +438,9 @@ const ACTIONS: &[&str] = &[
     "set_per_task_stop",
     "answer_question",
     "decline_question",
+    "set_mode",
+    "set_planning",
+    "resolve_plan",
     "client_answer",
     "list_models",
     "set_model",
@@ -682,13 +763,25 @@ impl<'a> Driver<'a> {
         match verb {
             "send" => {
                 let typed = arg["typed"].as_bool().unwrap_or(false);
-                Ok(self.host.send(&need("text")?, typed)?)
+                let images = super::images::names_in(arg).map_err(Failure::text)?;
+                if images.is_empty() {
+                    Ok(self.host.send(&need("text")?, typed)?)
+                } else {
+                    Ok(self.host.send_images(&need("text")?, &images, typed)?)
+                }
             }
             "steer" => {
                 let typed = arg["typed"].as_bool().unwrap_or(false);
                 Ok(self.host.steer(&need("text")?, typed)?)
             }
-            "queue" => Ok(self.host.queue(&need("text")?)?),
+            "queue" => {
+                let images = super::images::names_in(arg).map_err(Failure::text)?;
+                if images.is_empty() {
+                    Ok(self.host.queue(&need("text")?)?)
+                } else {
+                    Ok(self.host.queue_images(&need("text")?, &images)?)
+                }
+            }
             "slash" => Ok(self.host.slash(&need("command")?)?),
             "interrupt" => Ok(self.host.interrupt()?),
             "approve_sweep" => Ok(self.host.approve_sweep()?),
@@ -696,7 +789,13 @@ impl<'a> Driver<'a> {
             "resume" => Ok(self.host.resume()?),
             "answer_card" => {
                 let tool = text_arg(arg, "tool").ok_or_else(|| Failure::text("`answer_card` needs a tool"))?;
-                Ok(self.host.answer_card(&tool, arg["allow"].as_bool().unwrap_or(true))?)
+                let allow = arg["allow"].as_bool().unwrap_or(true);
+                match arg["origin"].as_str() {
+                    None if arg.get("origin").is_none() => Ok(self.host.answer_card(&tool, allow)?),
+                    Some("hook") => Ok(self.host.answer_card_from(&tool, allow, Origin::Hook)?),
+                    Some("cli_prompt") => Ok(self.host.answer_card_from(&tool, allow, Origin::CliPrompt)?),
+                    _ => Err(Failure::text("`answer_card` origin is `hook` or `cli_prompt`")),
+                }
             }
             "open_gate" => {
                 let name = need("name")?;
@@ -734,6 +833,20 @@ impl<'a> Driver<'a> {
                 Ok(self.host.set_per_task_stop(on)?)
             }
             "answer_question" | "decline_question" => self.question_action(verb, arg),
+            "set_mode" => match arg.as_str() {
+                Some(mode @ ("manual" | "auto" | "bypass")) => Ok(self.host.set_mode(mode)?),
+                _ => Err(Failure::text("`set_mode` is `manual`, `auto` or `bypass`")),
+            },
+            "set_planning" => {
+                let enter = arg["enter"]
+                    .as_bool()
+                    .ok_or_else(|| Failure::text("`set_planning` needs `enter`: true or false"))?;
+                if arg.as_object().is_some_and(|o| o.len() != 1) {
+                    return Err(Failure::text("`set_planning` takes only `enter`"));
+                }
+                Ok(self.host.set_planning(enter)?)
+            }
+            "resolve_plan" => self.plan_action(arg),
             "client_answer" => {
                 let answer = client_answer_of(arg)?;
                 Ok(self.host.client_answer(&answer)?)
@@ -801,10 +914,10 @@ impl<'a> Driver<'a> {
         if !self.host.capabilities().contains("structured_questions_v1") {
             return Ok(call(&mut *self.host)?);
         }
-        let asked = self.question_to_answer(refused.is_some())?;
+        let asked = self.call_to_answer(QUESTION_TOOL, refused.is_some())?;
         check_against(verb, &answers, &asked)?;
         if refused.is_none() {
-            self.check_untouched(&asked)?;
+            self.check_untouched(QUESTION_TOOL, &asked)?;
         }
         match (call(&mut *self.host), refused) {
             (Ok(()), None) => Ok(()),
@@ -819,9 +932,32 @@ impl<'a> Driver<'a> {
         }
     }
 
-    /// The question an answer goes to: the oldest one still waiting, or for a late answer the newest one.
-    fn question_to_answer(&self, late: bool) -> Result<AskedQuestion, Failure> {
-        let asked = asked_questions(&self.settings.run.join("log"));
+    /// `resolve_plan`: the arguments read, the plan checked as untouched, then the host called.
+    fn plan_action(&mut self, arg: &Value) -> Result<(), Failure> {
+        let (decision, refused) = plan_action_of(arg)?;
+        if !self.host.capabilities().contains(PLAN_MODE) {
+            return Ok(self.host.resolve_plan(&decision)?);
+        }
+        let asked = self.call_to_answer(PLAN_TOOL, refused.is_some())?;
+        if refused.is_none() {
+            self.check_untouched(PLAN_TOOL, &asked)?;
+        }
+        match (self.host.resolve_plan(&decision), refused) {
+            (Ok(()), None) => Ok(()),
+            (Ok(()), Some(want)) => Err(Failure::text(format!(
+                "`resolve_plan` was taken, and the scenario expects a refusal holding `{want}`"
+            ))),
+            (Err(DriverError::Failed(why)), Some(want)) if why.contains(&want) => Ok(()),
+            (Err(DriverError::Failed(why)), Some(want)) => Err(Failure::text(format!(
+                "`resolve_plan` was refused with `{why}`, which does not hold `{want}`"
+            ))),
+            (Err(e), _) => Err(e.into()),
+        }
+    }
+
+    /// The call of `tool` an answer goes to: the oldest one still waiting, or for a late answer the newest one.
+    fn call_to_answer(&self, tool: &str, late: bool) -> Result<AskedQuestion, Failure> {
+        let asked = asked_calls(&self.settings.run.join("log"), tool);
         let found = if late {
             asked.into_iter().next_back()
         } else {
@@ -829,30 +965,27 @@ impl<'a> Driver<'a> {
         };
         found.ok_or_else(|| {
             Failure::text(if late {
-                "the CLI has asked no question to answer late".to_owned()
+                format!("the CLI has made no {tool} request to answer late")
             } else {
-                format!(
-                    "no {QUESTION_TOOL} request of the CLI waits for an answer{}",
-                    self.report_tail()
-                )
+                format!("no {tool} request of the CLI waits for an answer{}", self.report_tail())
             })
         })
     }
 
-    /// Nothing but the person answers a question: no card and no automatic answer for the question tool, and no
-    /// request at the stand-in carries the question's result yet.
-    fn check_untouched(&self, asked: &AskedQuestion) -> Result<(), Failure> {
+    /// Nothing but the person answers a question or a plan: no card and no automatic answer for its tool, and no
+    /// request at the stand-in carries the call's result yet.
+    fn check_untouched(&self, tool: &str, asked: &AskedQuestion) -> Result<(), Failure> {
         let (cards, automatic) = (self.host.cards_shown(), self.host.automatic_answers());
         let touched: Vec<Value> = cards
             .iter()
             .map(|a| ("card", a))
             .chain(automatic.iter().map(|a| ("automatic answer", a)))
-            .filter(|(_, a)| a.tool() == QUESTION_TOOL)
+            .filter(|(_, a)| a.tool() == tool)
             .map(|(what, a)| json!({"as": what, "answer": a.to_json()}))
             .collect();
         if !touched.is_empty() {
             return Err(Failure::text(format!(
-                "the question went through the permission gate: {}",
+                "the {tool} call went through the permission gate: {}",
                 Value::Array(touched)
             )));
         }
@@ -864,7 +997,7 @@ impl<'a> Driver<'a> {
             let Ok(body) = serde_json::from_str::<Value>(&text) else {
                 continue;
             };
-            let ids = question_results_in(&body);
+            let ids = tool_results_in(&body, tool);
             let hit = match &asked.tool_use_id {
                 Some(id) => ids.contains(id),
                 // Without the call's id, every result for a question has to belong to one the CLI got an answer
@@ -873,7 +1006,7 @@ impl<'a> Driver<'a> {
             };
             if hit {
                 return Err(Failure::text(format!(
-                    "request #{} reached the stand-in with the question's tool_result before the driver answered",
+                    "request #{} reached the stand-in with the {tool} call's tool_result before the driver answered",
                     record.arrival_index
                 )));
             }
@@ -973,10 +1106,35 @@ impl<'a> Driver<'a> {
                     d.host.interaction_holds(&want).map_err(Failure::from)
                 })
             }
+            "projection" if arg.get("plan").is_some() || arg.get("planning").is_some() => {
+                let (key, word) = match (arg["plan"].as_str(), arg["planning"].as_str()) {
+                    (Some(word @ ("waiting" | "settled")), None) => ("plan", word),
+                    (None, Some(word @ ("executing" | "planning"))) => ("planning", word),
+                    _ => {
+                        return Err(Failure::text(
+                            "`projection` on plans is exactly `{\"plan\": \"waiting\"|\"settled\"}` or \
+                             `{\"planning\": \"executing\"|\"planning\"}`",
+                        ));
+                    }
+                };
+                if arg.as_object().is_some_and(|o| o.len() != 1) {
+                    return Err(Failure::text("`projection` on plans takes one key"));
+                }
+                let want = json!({ key: word });
+                self.wait_for(&what, limit, false, move |d| {
+                    d.host.plan_holds(&want).map_err(Failure::from)
+                })
+            }
             "projection" => {
                 let want = arg.clone();
                 self.wait_for(&what, limit, false, move |d| {
                     d.host.projection_holds(&want).map_err(Failure::from)
+                })
+            }
+            "interaction" if arg.get("plan_outcome").is_some() => {
+                let want = arg.clone();
+                self.wait_for(&what, limit, false, move |d| {
+                    d.host.plan_holds(&want).map_err(Failure::from)
                 })
             }
             "interaction" => {
@@ -1205,12 +1363,12 @@ struct AskedQuestion {
     answered_before: usize,
 }
 
-/// Every `can_use_tool` request for the question tool on the tap's stdout, oldest first, each marked answered when
+/// Every `can_use_tool` request for `tool` on the tap's stdout, oldest first, each marked answered when
 /// a `control_response` with its request id went to the CLI's stdin, and settled when it was answered, the CLI
 /// withdrew it, or a later process started: the tap's index is one counter across both directions and every
 /// process of the run, so a question whose index is below a later `initialize` request on stdin was asked by a
 /// process that is gone.
-fn asked_questions(log: &Path) -> Vec<AskedQuestion> {
+fn asked_calls(log: &Path, tool: &str) -> Vec<AskedQuestion> {
     let stdin: Vec<(u64, Value)> = read_tap(&log.join("cli-stdin.jsonl"))
         .into_iter()
         .filter_map(|l| l.json.map(|j| (l.index, j)))
@@ -1237,10 +1395,7 @@ fn asked_questions(log: &Path) -> Vec<AskedQuestion> {
         let index = line.index;
         let Some(j) = line.json else { continue };
         let request = &j["request"];
-        if j["type"] != "control_request"
-            || request["subtype"] != "can_use_tool"
-            || request["tool_name"] != QUESTION_TOOL
-        {
+        if j["type"] != "control_request" || request["subtype"] != "can_use_tool" || request["tool_name"] != tool {
             continue;
         }
         let id = j["request_id"].as_str().unwrap_or_default();
@@ -1258,14 +1413,24 @@ fn asked_questions(log: &Path) -> Vec<AskedQuestion> {
     out
 }
 
+fn asked_questions(log: &Path) -> Vec<AskedQuestion> {
+    asked_calls(log, QUESTION_TOOL)
+}
+
+/// Whether a plan the CLI asked through its control channel (`ExitPlanMode`'s `can_use_tool`) still waits for
+/// its answer, by the tap logs in `log`.
+pub fn plan_waits(log: &Path) -> bool {
+    asked_calls(log, PLAN_TOOL).iter().any(|q| !q.settled)
+}
+
 /// Whether a question the CLI asked through its control channel still waits for its answer, by the tap logs in
 /// `log`: a `can_use_tool` request for the question tool of the live process, neither answered nor withdrawn.
 pub fn question_waits(log: &Path) -> bool {
     asked_questions(log).iter().any(|q| !q.settled)
 }
 
-/// The ids of the question tool's calls whose `tool_result` a request body carries.
-fn question_results_in(body: &Value) -> Vec<String> {
+/// The ids of `tool`'s calls whose `tool_result` a request body carries.
+fn tool_results_in(body: &Value, tool: &str) -> Vec<String> {
     let blocks = || {
         body["messages"]
             .as_array()
@@ -1274,7 +1439,7 @@ fn question_results_in(body: &Value) -> Vec<String> {
             .flat_map(|m| m["content"].as_array().into_iter().flatten())
     };
     let calls: BTreeSet<&str> = blocks()
-        .filter(|b| b["type"] == "tool_use" && b["name"] == QUESTION_TOOL)
+        .filter(|b| b["type"] == "tool_use" && b["name"] == tool)
         .filter_map(|b| b["id"].as_str())
         .collect();
     blocks()
@@ -1393,6 +1558,46 @@ fn question_action_of(verb: &str, arg: &Value) -> Result<QuestionAction, Failure
         refused,
         answers,
     })
+}
+
+/// A `resolve_plan` part's decision and the text a refusal must hold, read and checked for shape.
+fn plan_action_of(arg: &Value) -> Result<(PlanDecision, Option<String>), Failure> {
+    for key in arg.as_object().into_iter().flat_map(|o| o.keys()) {
+        if !["choice", "feedback", "refused"].contains(&key.as_str()) {
+            return Err(Failure::text(format!("`resolve_plan` has an unknown key `{key}`")));
+        }
+    }
+    let feedback = match &arg["feedback"] {
+        Value::Null => None,
+        Value::String(text) => Some(text.clone()),
+        _ => return Err(Failure::text("`resolve_plan` `feedback` is a text")),
+    };
+    let decision = match arg["choice"].as_str() {
+        Some("keep") => PlanDecision::Keep {
+            feedback: feedback.clone().unwrap_or_default(),
+        },
+        Some(approve @ ("approve_manual" | "approve_auto" | "approve_bypass")) => {
+            if feedback.is_some() {
+                return Err(Failure::text("`resolve_plan` takes `feedback` only with `keep`"));
+            }
+            match approve {
+                "approve_manual" => PlanDecision::ApproveManual,
+                "approve_auto" => PlanDecision::ApproveAuto,
+                _ => PlanDecision::ApproveBypass,
+            }
+        }
+        other => {
+            return Err(Failure::text(format!(
+                "`resolve_plan` choice is keep, approve_manual, approve_auto or approve_bypass, not {other:?}"
+            )));
+        }
+    };
+    let refused = match &arg["refused"] {
+        Value::Null => None,
+        Value::String(s) if !s.is_empty() => Some(s.clone()),
+        _ => return Err(Failure::text("`resolve_plan` `refused` is the text the refusal holds")),
+    };
+    Ok((decision, refused))
 }
 
 /// Every answer names a question of the set and options that question has.
@@ -1534,6 +1739,10 @@ mod tests {
         open: usize,
         /// The layer this host says it is.
         layer: &'static str,
+        /// Whether the host's plan records hold what a plan wait describes.
+        plan: bool,
+        /// The host cannot carry images: a send with them fails as missing the capability.
+        no_images: bool,
     }
 
     impl Fake {
@@ -1551,6 +1760,8 @@ mod tests {
                 client_calls: Vec::new(),
                 open: 0,
                 layer: "a",
+                plan: false,
+                no_images: false,
             }
         }
         fn note(&self, text: impl Into<String>) {
@@ -1564,6 +1775,17 @@ mod tests {
                 return Err(DriverError::CapabilityMissing("human_origin"));
             }
             self.note(format!("send {text}"));
+            Ok(())
+        }
+        fn send_images(&mut self, text: &str, images: &[String], _typed: bool) -> Result<(), DriverError> {
+            if self.no_images {
+                return Err(DriverError::CapabilityMissing("turn_content_v1"));
+            }
+            self.note(format!("send {text} with {}", images.join("+")));
+            Ok(())
+        }
+        fn queue_images(&mut self, text: &str, images: &[String]) -> Result<(), DriverError> {
+            self.note(format!("queue {text} with {}", images.join("+")));
             Ok(())
         }
         fn steer(&mut self, text: &str, typed: bool) -> Result<(), DriverError> {
@@ -1591,6 +1813,10 @@ mod tests {
             {
                 card.decision = Some(PermissionDecision::Allow);
             }
+            Ok(())
+        }
+        fn answer_card_from(&mut self, tool: &str, allow: bool, origin: Origin) -> Result<(), DriverError> {
+            self.note(format!("answer_card {tool} {allow} {}", origin.word()));
             Ok(())
         }
         fn approve_sweep(&mut self) -> Result<(), DriverError> {
@@ -1659,6 +1885,31 @@ mod tests {
                 Ok(self.interaction)
             } else {
                 Err(DriverError::CapabilityMissing("structured_questions_v1"))
+            }
+        }
+        fn set_mode(&mut self, mode: &str) -> Result<(), DriverError> {
+            self.note(format!("set_mode {mode}"));
+            Ok(())
+        }
+        fn set_planning(&mut self, enter: bool) -> Result<(), DriverError> {
+            if !self.caps.contains(PLAN_MODE) {
+                return Err(DriverError::CapabilityMissing(PLAN_MODE));
+            }
+            self.note(format!("set_planning {enter}"));
+            Ok(())
+        }
+        fn resolve_plan(&mut self, decision: &PlanDecision) -> Result<(), DriverError> {
+            if !self.caps.contains(PLAN_MODE) {
+                return Err(DriverError::CapabilityMissing(PLAN_MODE));
+            }
+            self.note(format!("resolve_plan {decision:?}"));
+            self.refuse.clone().map_or(Ok(()), |why| Err(DriverError::Failed(why)))
+        }
+        fn plan_holds(&self, _: &Value) -> Result<bool, DriverError> {
+            if self.caps.contains(PLAN_MODE) {
+                Ok(self.plan)
+            } else {
+                Err(DriverError::CapabilityMissing(PLAN_MODE))
             }
         }
         fn layer(&self) -> &'static str {
@@ -1797,6 +2048,75 @@ mod tests {
         );
         assert_eq!(endpoint.released.lock().unwrap().as_slice(), ["h1"]);
         assert!(run.join("gates/bg1.open").exists());
+    }
+
+    #[test]
+    fn a_card_answer_may_name_the_origin_it_is_for() {
+        let (run, endpoint, mut host) = (run_dir(), FakeEndpoint::default(), Fake::new());
+        drive(
+            &mut host,
+            &endpoint,
+            &run,
+            json!([
+                {"answer_card": {"tool": "Write", "allow": false, "origin": "cli_prompt"}},
+                {"answer_card": {"tool": "Write", "origin": "hook"}}
+            ]),
+        )
+        .unwrap();
+        assert_eq!(
+            host.calls.lock().unwrap().as_slice(),
+            ["answer_card Write false cli_prompt", "answer_card Write true hook"]
+        );
+        let err = drive(
+            &mut host,
+            &endpoint,
+            &run,
+            json!([{"answer_card": {"tool": "Write", "origin": "prompt"}}]),
+        )
+        .unwrap_err();
+        assert!(err.contains("origin is `hook` or `cli_prompt`"), "{err}");
+    }
+
+    #[test]
+    fn a_send_or_queue_with_images_reaches_the_host_with_their_names_in_order() {
+        let (run, endpoint, mut host) = (run_dir(), FakeEndpoint::default(), Fake::new());
+        drive(
+            &mut host,
+            &endpoint,
+            &run,
+            json!([
+                {"send": {"text": "look", "images": ["a.png", "b.jpg"]}},
+                {"queue": {"text": "later", "images": ["c.gif"]}},
+                {"send": {"text": "plain", "images": []}}
+            ]),
+        )
+        .unwrap();
+        assert_eq!(
+            host.calls.lock().unwrap().join("|"),
+            "send look with a.png+b.jpg|queue later with c.gif|send plain"
+        );
+        let err = drive(
+            &mut host,
+            &endpoint,
+            &run,
+            json!([{"send": {"text": "x", "images": "a.png"}}]),
+        )
+        .unwrap_err();
+        assert!(err.contains("images"), "{err}");
+    }
+
+    #[test]
+    fn a_host_that_carries_no_images_fails_a_send_with_them_as_missing_the_capability() {
+        let (run, endpoint, mut host) = (run_dir(), FakeEndpoint::default(), Fake::new());
+        host.no_images = true;
+        let err = drive(
+            &mut host,
+            &endpoint,
+            &run,
+            json!([{"send": {"text": "look", "images": ["a.png"]}}]),
+        )
+        .unwrap_err();
+        assert!(err.contains("turn_content_v1") && err.contains("requires"), "{err}");
     }
 
     #[test]
@@ -2429,6 +2749,202 @@ mod tests {
         host.refuse = None;
         let err = drive(&mut host, &endpoint, &run, late).unwrap_err();
         assert!(err.contains("expects a refusal"), "{err}");
+    }
+
+    /// A tap where the CLI asked for the approval of one plan (`ExitPlanMode`'s permission callback),
+    /// `answered` saying whether its control response went back.
+    fn plan_asked(run: &Path, answered: bool) {
+        tap(
+            run,
+            "cli-stdout.jsonl",
+            &[(
+                4,
+                json!({"type": "control_request", "request_id": "req-p1", "request": {
+                "subtype": "can_use_tool", "tool_name": "ExitPlanMode", "tool_use_id": "toolu_exit",
+                "input": {"plan": "# Plan"}}}),
+            )],
+        );
+        let mut stdin = vec![(0, json!({"type": "user", "message": {"role": "user", "content": "go"}}))];
+        if answered {
+            stdin.push((
+                6,
+                json!({"type": "control_response", "response": {"subtype": "success", "request_id": "req-p1", "response": {}}}),
+            ));
+        }
+        tap(run, "cli-stdin.jsonl", &stdin);
+    }
+
+    fn plans_host() -> Fake {
+        let mut host = Fake::new();
+        host.caps.insert(PLAN_MODE);
+        host
+    }
+
+    #[test]
+    fn a_plan_decision_reaches_the_host_as_the_choice_and_its_feedback() {
+        for (part, want) in [
+            (json!({"choice": "approve_manual"}), "resolve_plan ApproveManual"),
+            (json!({"choice": "approve_auto"}), "resolve_plan ApproveAuto"),
+            (json!({"choice": "approve_bypass"}), "resolve_plan ApproveBypass"),
+            (
+                json!({"choice": "keep", "feedback": "also the README"}),
+                "resolve_plan Keep { feedback: \"also the README\" }",
+            ),
+            (json!({"choice": "keep"}), "resolve_plan Keep { feedback: \"\" }"),
+        ] {
+            let (run, endpoint, mut host) = (run_dir(), FakeEndpoint::default(), plans_host());
+            plan_asked(&run, false);
+            drive(&mut host, &endpoint, &run, json!([{ "resolve_plan": part }])).unwrap();
+            assert_eq!(host.calls.lock().unwrap().as_slice(), [want], "{part}");
+        }
+    }
+
+    #[test]
+    fn a_plan_decision_that_is_malformed_fails_before_the_host() {
+        for (part, word) in [
+            (json!({}), "choice is keep, approve_manual"),
+            (json!({"choice": "approve"}), "choice is keep, approve_manual"),
+            (json!({"choice": "approve_auto", "feedback": "x"}), "only with `keep`"),
+            (json!({"choice": "keep", "feedback": 3}), "`feedback` is a text"),
+            (json!({"choice": "keep", "mode": "auto"}), "unknown key `mode`"),
+            (json!({"choice": "keep", "refused": ""}), "`refused` is the text"),
+        ] {
+            let (run, endpoint, mut host) = (run_dir(), FakeEndpoint::default(), plans_host());
+            plan_asked(&run, false);
+            let err = drive(&mut host, &endpoint, &run, json!([{ "resolve_plan": part }])).unwrap_err();
+            assert!(err.contains(word), "{part}: {err}");
+            assert!(host.calls.lock().unwrap().is_empty(), "{part}: the host was called");
+        }
+    }
+
+    #[test]
+    fn a_plan_decision_needs_a_plan_still_waiting() {
+        let (run, endpoint, mut host) = (run_dir(), FakeEndpoint::default(), plans_host());
+        let part = json!([{"resolve_plan": {"choice": "approve_manual"}}]);
+        let err = drive(&mut host, &endpoint, &run, part.clone()).unwrap_err();
+        assert!(err.contains("no ExitPlanMode request of the CLI waits"), "{err}");
+        plan_asked(&run, true);
+        let err = drive(&mut host, &endpoint, &run, part).unwrap_err();
+        assert!(err.contains("no ExitPlanMode request of the CLI waits"), "{err}");
+        assert!(host.calls.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_plan_the_gate_or_anything_else_answered_fails_the_decision() {
+        let part = json!([{"resolve_plan": {"choice": "approve_manual"}}]);
+        let (run, endpoint, mut host) = (run_dir(), FakeEndpoint::default(), plans_host());
+        plan_asked(&run, false);
+        host.cards.borrow_mut().push(Answered {
+            request: Request {
+                permission_id: "p1".into(),
+                tool_use_id: Some("toolu_exit".into()),
+                tool_name: "ExitPlanMode".into(),
+                input: json!({}),
+                origin: Origin::Hook,
+            },
+            decision: Some(PermissionDecision::Allow),
+        });
+        let err = drive(&mut host, &endpoint, &run, part.clone()).unwrap_err();
+        assert!(
+            err.contains("the ExitPlanMode call went through the permission gate"),
+            "{err}"
+        );
+
+        let (run, endpoint, mut host) = (run_dir(), FakeEndpoint::default(), plans_host());
+        plan_asked(&run, false);
+        std::fs::create_dir_all(run.join("standin")).unwrap();
+        let body = json!({"messages": [
+            {"role": "assistant", "content": [{"type": "tool_use", "id": "toolu_exit", "name": "ExitPlanMode", "input": {}}]},
+            {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "toolu_exit", "content": "approved"}]}
+        ]});
+        std::fs::write(run.join("standin/body_3.json"), body.to_string()).unwrap();
+        *endpoint.records.lock().unwrap() = vec![record(3, Some("m2"), None, None)];
+        let err = drive(&mut host, &endpoint, &run, part).unwrap_err();
+        assert!(
+            err.contains("request #3") && err.contains("ExitPlanMode call's tool_result before the driver answered"),
+            "{err}"
+        );
+        assert!(host.calls.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_late_plan_decision_passes_only_on_the_refusal_it_names() {
+        let late = json!([{"resolve_plan": {"choice": "keep", "refused": "INTERACTION_NOT_FOUND"}}]);
+        let (run, endpoint, mut host) = (run_dir(), FakeEndpoint::default(), plans_host());
+        plan_asked(&run, true);
+        host.refuse = Some("resolve_plan: INTERACTION_NOT_FOUND".into());
+        drive(&mut host, &endpoint, &run, late.clone()).unwrap();
+        host.refuse = Some("resolve_plan: INTERACTION_ANSWER_REFUSED".into());
+        let err = drive(&mut host, &endpoint, &run, late.clone()).unwrap_err();
+        assert!(err.contains("does not hold `INTERACTION_NOT_FOUND`"), "{err}");
+        host.refuse = None;
+        let err = drive(&mut host, &endpoint, &run, late).unwrap_err();
+        assert!(err.contains("expects a refusal"), "{err}");
+    }
+
+    #[test]
+    fn the_plan_verbs_need_the_capability_a_host_declares() {
+        let (run, endpoint, mut host) = (run_dir(), FakeEndpoint::default(), Fake::new());
+        for part in [
+            json!({"set_planning": {"enter": true}}),
+            json!({"resolve_plan": {"choice": "keep"}}),
+            json!({"projection": {"plan": "waiting"}}),
+            json!({"projection": {"planning": "planning"}}),
+            json!({"interaction": {"plan_outcome": "approved"}}),
+        ] {
+            let err = drive(&mut host, &endpoint, &run, json!([part.clone()])).unwrap_err();
+            assert!(err.contains(PLAN_MODE) && err.contains("requires"), "{part}: {err}");
+            let mut required = part.clone();
+            required["requires"] = json!(PLAN_MODE);
+            let report = drive(&mut host, &endpoint, &run, json!([required])).unwrap();
+            assert_eq!(report.pending.len(), 1, "{part}");
+        }
+        assert!(host.calls.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn set_planning_and_the_plan_waits_take_exactly_their_shapes() {
+        let (run, endpoint, mut host) = (run_dir(), FakeEndpoint::default(), plans_host());
+        host.plan = true;
+        drive(
+            &mut host,
+            &endpoint,
+            &run,
+            json!([
+                {"set_planning": {"enter": true}}, {"set_planning": {"enter": false}}, {"set_mode": "auto"},
+                {"projection": {"plan": "waiting"}}, {"projection": {"plan": "settled"}},
+                {"projection": {"planning": "planning"}}, {"projection": {"planning": "executing"}},
+                {"interaction": {"plan_outcome": "approved", "mode_after": "auto"}}
+            ]),
+        )
+        .unwrap();
+        assert_eq!(
+            host.calls.lock().unwrap().as_slice(),
+            ["set_planning true", "set_planning false", "set_mode auto"]
+        );
+        for (part, word) in [
+            (json!({"set_planning": true}), "needs `enter`"),
+            (
+                json!({"set_mode": "plan"}),
+                "`set_mode` is `manual`, `auto` or `bypass`",
+            ),
+            (json!({"set_planning": {"enter": true, "x": 1}}), "takes only `enter`"),
+            (
+                json!({"projection": {"plan": "answering"}}),
+                "projection` on plans is exactly",
+            ),
+            (
+                json!({"projection": {"planning": "entering"}}),
+                "projection` on plans is exactly",
+            ),
+            (
+                json!({"projection": {"plan": "waiting", "planning": "planning"}}),
+                "projection` on plans is exactly",
+            ),
+        ] {
+            let err = drive(&mut host, &endpoint, &run, json!([part.clone()])).unwrap_err();
+            assert!(err.contains(word), "{part}: {err}");
+        }
     }
 
     #[test]

@@ -53,6 +53,8 @@ pub struct Matcher {
     pub task_notification: Option<TaskNotification>,
     pub system_contains: Option<String>,
     pub has_tool: Option<String>,
+    /// How many image blocks the tail's user messages carry: the images of the turn the request answers.
+    pub tail_images: Option<usize>,
     pub not: Option<Box<Matcher>>,
 }
 
@@ -70,6 +72,7 @@ pub struct Ctx<'a> {
 enum Block {
     Text(String),
     ToolResult { id: String, text: String },
+    Image,
     Other,
 }
 
@@ -113,6 +116,7 @@ fn blocks_of(content: &Value) -> Vec<Block> {
                     id: b["tool_use_id"].as_str().unwrap_or("").to_owned(),
                     text: text_of(&b["content"]),
                 },
+                Some("image") => Block::Image,
                 _ => Block::Other,
             })
             .collect(),
@@ -227,10 +231,20 @@ impl View {
                 Block::Text(t) if t.contains(NOTIFICATION_TAG) => return Some(LastUser::TaskNotification),
                 Block::Text(t) if t.trim_start().starts_with("<system-reminder>") => continue,
                 Block::Text(_) => return Some(LastUser::Prompt),
-                Block::Other => continue,
+                Block::Image | Block::Other => continue,
             }
         }
         None
+    }
+
+    /// How many image blocks the tail's user messages carry.
+    pub fn tail_image_count(&self) -> usize {
+        self.tail()
+            .iter()
+            .filter(|m| m.role == "user")
+            .flat_map(|m| &m.blocks)
+            .filter(|b| matches!(b, Block::Image))
+            .count()
     }
 
     pub fn declared(&self) -> &BTreeMap<String, Availability> {
@@ -291,7 +305,7 @@ impl Msg {
             .filter_map(|b| match b {
                 Block::Text(t) => Some(t.as_str()),
                 Block::ToolResult { text, .. } => Some(text.as_str()),
-                Block::Other => None,
+                Block::Image | Block::Other => None,
             })
             .collect::<Vec<_>>()
             .join("\n")
@@ -380,6 +394,11 @@ impl Matcher {
         }
         if let Some(tool) = &self.has_tool {
             if !view.declared.contains_key(&sub(tool)) {
+                return false;
+            }
+        }
+        if let Some(count) = self.tail_images {
+            if view.tail_image_count() != count {
                 return false;
             }
         }
@@ -519,6 +538,35 @@ mod tests {
         );
         assert!(!matcher(json!({"has_tool": "Bash", "last_user": "prompt"})).matches(&v, &c));
         assert!(matcher(json!({})).matches(&v, &c));
+    }
+
+    #[test]
+    fn tail_images_counts_the_image_blocks_of_the_turn_the_request_answers() {
+        let mut b = body();
+        b["messages"] = json!([
+            {"role": "user", "content": [{"type": "text", "text": "first"}, {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "AAAA"}}]},
+            {"role": "assistant", "content": "SEEN"},
+            {"role": "user", "content": [
+                {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "AAAA"}},
+                {"type": "text", "text": "second"},
+                {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": "BBBB"}},
+            ]},
+        ]);
+        let v = View::new("/v1/messages", &b);
+        let vars = vars();
+        let c = ctx(&vars);
+        assert!(matcher(json!({"tail_images": 2})).matches(&v, &c));
+        assert!(!matcher(json!({"tail_images": 1})).matches(&v, &c));
+        assert!(matcher(json!({"tail_images": 2, "last_user": "prompt"})).matches(&v, &c));
+        assert!(matcher(json!({"tail_images": 0})).matches(&View::new("/v1/messages", &body()), &c));
+        // A turn of images alone has no words to match on, and its request is still told apart.
+        let mut only = body();
+        only["messages"] = json!([
+            {"role": "user", "content": [{"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "AAAA"}}]},
+        ]);
+        let v = View::new("/v1/messages", &only);
+        assert!(matcher(json!({"tail_images": 1})).matches(&v, &c));
+        assert_eq!(v.last_user_kind(), None);
     }
 
     #[test]

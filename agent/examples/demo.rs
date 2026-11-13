@@ -181,9 +181,16 @@ fn print_event(event: &AgentDomainEvent) {
         }
         AgentDomainEvent::QuestionAsked { questions, .. } => println!("[question] {} asked", questions.len()),
         AgentDomainEvent::QuestionSettled { outcome, .. } => println!("[question settled] {outcome:?}"),
+        AgentDomainEvent::PlanProposed { plan, .. } => println!("[plan] {} bytes proposed", plan.len()),
+        AgentDomainEvent::PlanSettled { outcome, .. } => println!("[plan settled] {outcome:?}"),
+        AgentDomainEvent::CliPlanMode { source } => println!("[cli] plan mode ({source})"),
+        // Folded by the host when it starts a plan-mode switch, which this demo never does.
+        AgentDomainEvent::PlanTransitionStarted { .. } | AgentDomainEvent::PlanTransitionUndone { .. } => {}
         AgentDomainEvent::CliWorkUnseen => println!("[Claude Code is working where this demo cannot show it]"),
         // Folded by the host when a send is refused, which this demo never does.
         AgentDomainEvent::UserPromptWithdrawn => {}
+        // Folded by the host for a turn with images, which this demo never sends.
+        AgentDomainEvent::UserPromptAttachments { .. } => {}
         AgentDomainEvent::TurnCauseUpdated { turn_id, cause } => {
             println!("[turn {turn_id} cause] {:?}", cause.as_ref().map(|c| c.kind))
         }

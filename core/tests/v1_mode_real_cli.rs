@@ -589,7 +589,7 @@ fn drive_turn(
         .unwrap()
         .live_mut()
         .unwrap()
-        .send_turn(prompt, label, agent::PromptOrigin::Composed)
+        .send_turn(prompt, label, agent::PromptOrigin::Composed, Vec::new())
         .map_err(|e| e.message)
         .unwrap();
 
@@ -838,6 +838,7 @@ fn host_answer_latency_in_bypass() {
              current directory, one call per file, then reply with exactly DONE and nothing else.",
             "latency-reads",
             agent::PromptOrigin::Composed,
+            Vec::new(),
         )
         .map_err(|e| e.message)
         .unwrap();
@@ -1825,6 +1826,7 @@ fn run_default_mode_probe(kind: BackendKind, default_mode: &str, label: &str) {
                      containing the word ok.",
                     label,
                     agent::PromptOrigin::Composed,
+                    Vec::new(),
                 )
                 .map_err(|e| e.message)
                 .unwrap();
@@ -2198,6 +2200,7 @@ fn bypass_approves_the_ask_rule_card(label: &str, ask_rule: &str) {
              the word ok.",
             "first-write",
             agent::PromptOrigin::Composed,
+            Vec::new(),
         )
         .map_err(|e| e.message)
         .unwrap();
@@ -2400,7 +2403,7 @@ fn bypass_approves_the_waiting_card(
         .unwrap()
         .live_mut()
         .unwrap()
-        .send_turn(first_prompt, "first-write", agent::PromptOrigin::Composed)
+        .send_turn(first_prompt, "first-write", agent::PromptOrigin::Composed, Vec::new())
         .map_err(|e| e.message)
         .unwrap();
     // The card for the first call itself: a card for any other call says nothing here.
@@ -2745,6 +2748,7 @@ fn a_manual_tab_cards_an_in_project_write_on_a_cli_auto_session() {
             ),
             "manual-write",
             agent::PromptOrigin::Composed,
+            Vec::new(),
         )
         .map_err(|e| e.message)
         .unwrap();

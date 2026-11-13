@@ -148,6 +148,10 @@ pub(super) fn panel_tab_handoff(state: &AgentPanelState, tab: TabId) -> Result<P
         // A chat whose answer's reply is unread refuses to move (the provider's freeze), and the
         // reply is told to the page that answered here.
         question_sends: _,
+        // The same for a plan decision or a switch into or out of plan mode: the provider refuses the freeze
+        // while a reply is unread, and an approval still waiting for calls finds the tab moving and waits.
+        plan_sends: _,
+        planning_switches: _,
         // A phone's call is answered where it was made, to the connection it came on.
         remote: _,
         // The tab itself moves through the tab set's own record.
@@ -599,6 +603,7 @@ mod tests {
             wire: text.into(),
             typed: text.into(),
             shell_line: false,
+            attachments: Vec::new(),
         };
         let composer = tabs.active();
         let (composer_provider, backend) = live_backend(&dir);

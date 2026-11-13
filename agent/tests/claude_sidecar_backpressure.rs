@@ -121,9 +121,17 @@ fn summarize(label: &str, events: &[AgentDomainEvent]) {
             AgentDomainEvent::SessionNotice { .. } => "SessionNotice",
             AgentDomainEvent::QuestionAsked { .. } => "QuestionAsked",
             AgentDomainEvent::QuestionSettled { .. } => "QuestionSettled",
+            AgentDomainEvent::PlanProposed { .. } => "PlanProposed",
+            AgentDomainEvent::PlanSettled { .. } => "PlanSettled",
+            AgentDomainEvent::CliPlanMode { .. } => "CliPlanMode",
+            // This side's own event, never read off the wire: matched for exhaustiveness.
+            AgentDomainEvent::PlanTransitionStarted { .. } => "PlanTransitionStarted",
+            AgentDomainEvent::PlanTransitionUndone { .. } => "PlanTransitionUndone",
             AgentDomainEvent::CliWorkUnseen => "CliWorkUnseen",
             // Folded by the host when a send is refused, never read off the wire: matched for exhaustiveness.
             AgentDomainEvent::UserPromptWithdrawn => "UserPromptWithdrawn",
+            // Folded by the host for a turn with images, never read off the wire.
+            AgentDomainEvent::UserPromptAttachments { .. } => "UserPromptAttachments",
             AgentDomainEvent::TurnCauseUpdated { .. } => "TurnCauseUpdated",
             AgentDomainEvent::CliCycleStarted { .. } => "CliCycleStarted",
             AgentDomainEvent::BackgroundTasksChanged { .. } => "BackgroundTasksChanged",
@@ -171,10 +179,7 @@ fn a_watch_stream_that_dies_mid_turn_reports_a_typed_loss_not_silence() {
     let session_id = open(&provider);
 
     provider
-        .send_turn(SendTurnRequest {
-            session_id: session_id.clone(),
-            text: LONG_PROMPT.to_string(),
-        })
+        .send_turn(SendTurnRequest::text(session_id.clone(), LONG_PROMPT.to_string()))
         .unwrap();
 
     // Wait for real streamed content, so the kill genuinely lands mid-reply.
@@ -248,10 +253,7 @@ fn a_consumer_that_stalls_until_a_backlog_accumulates_loses_nothing() {
     let session_id = open(&provider);
 
     provider
-        .send_turn(SendTurnRequest {
-            session_id: session_id.clone(),
-            text: LONG_PROMPT.to_string(),
-        })
+        .send_turn(SendTurnRequest::text(session_id.clone(), LONG_PROMPT.to_string()))
         .unwrap();
 
     // Do not pump until the queue has enough events to exercise backpressure.
@@ -314,10 +316,7 @@ fn interrupting_with_an_undrained_backlog_still_terminates_the_turn_correctly() 
     let session_id = open(&provider);
 
     provider
-        .send_turn(SendTurnRequest {
-            session_id: session_id.clone(),
-            text: INTERRUPT_PROMPT.to_string(),
-        })
+        .send_turn(SendTurnRequest::text(session_id.clone(), INTERRUPT_PROMPT.to_string()))
         .unwrap();
 
     // Drain until the reply's text is streaming, then stop draining for 8s so a real backlog builds, and
@@ -467,10 +466,7 @@ fn the_sidecar_write_queue_under_a_real_turn_and_a_pump_stall() {
     rss("before the turn");
 
     provider
-        .send_turn(SendTurnRequest {
-            session_id: session_id.clone(),
-            text: LONG_PROMPT.to_string(),
-        })
+        .send_turn(SendTurnRequest::text(session_id.clone(), LONG_PROMPT.to_string()))
         .unwrap();
 
     // Phase 1: drain attentively, the shape a healthy UI has. Highest sustained event rate.
@@ -491,10 +487,7 @@ fn the_sidecar_write_queue_under_a_real_turn_and_a_pump_stall() {
     // Phase 2: a second turn with NO pumping at all, for 30s. The client's own Vec absorbs it; the
     // point is to see whether anything moves on the sidecar's side while it does.
     provider
-        .send_turn(SendTurnRequest {
-            session_id: session_id.clone(),
-            text: LONG_PROMPT.to_string(),
-        })
+        .send_turn(SendTurnRequest::text(session_id.clone(), LONG_PROMPT.to_string()))
         .unwrap();
     for i in 0..6 {
         std::thread::sleep(Duration::from_secs(5));

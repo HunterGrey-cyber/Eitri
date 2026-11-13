@@ -9,9 +9,11 @@
 //! Never printed while redacting: the text of any message, tool input values, tool results, paths, model
 //! ids, host and user names, URLs, names and bodies of peers, workflow names and scripts, error strings,
 //! timestamps and the input files' paths; of Claude's questions, the question text, headers, option labels,
-//! descriptions and previews, the answers and the notes. A question set prints as its key only (how many
+//! descriptions and previews, the answers and the notes; of Claude's plans, the plan text, the feedback and the
+//! file path. A question set prints as its key only (how many
 //! questions, the indexes answered, an end from a closed list), in either form: its words never enter the
-//! oracle's normal form. Every value that is not one of the closed words below prints as
+//! oracle's normal form. A plan prints as an end from a closed list and a keyed digest of its text, in either
+//! form. Every value that is not one of the closed words below prints as
 //! `other`, a tool name not on the built-in list as `tool:<digest>`, and an input key that does not look
 //! like a schema key as `key:<digest>`.
 //!
@@ -87,6 +89,11 @@ pub const BUILT_IN_TOOLS: &[&str] = &[
 /// prompt sources, command modes, queue operations, task statuses, stop reasons, compaction triggers, and
 /// the reader's own words for what it skipped. A value outside this list prints as `other`.
 pub const ENUM_WORDS: &[&str] = &[
+    // the media types of an image the host sends
+    "image/png",
+    "image/jpeg",
+    "image/gif",
+    "image/webp",
     // line types
     "user",
     "assistant",

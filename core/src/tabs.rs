@@ -192,6 +192,8 @@ pub struct CloseFacts {
     pub unseen_work: bool,
     pub background: Option<String>,
     pub question_waiting: bool,
+    /// A plan of Claude's waits for a decision: closing ends it.
+    pub plan_waiting: bool,
     /// Messages held for the turn's end.
     pub queued: usize,
     /// Messages sent into the running turn that the agent has not been seen to read.
@@ -303,6 +305,9 @@ pub fn close_prompt(facts: &CloseFacts) -> Vec<String> {
     }
     if facts.question_waiting {
         lines.push("closing cancels Claude's question".to_string());
+    }
+    if facts.plan_waiting {
+        lines.push("closing ends Claude's plan without a decision".to_string());
     }
     match facts.queued {
         0 => {}
@@ -1013,6 +1018,7 @@ mod tests {
             unseen_work: false,
             background: None,
             question_waiting: false,
+            plan_waiting: false,
             queued,
             steered: 0,
             legacy,

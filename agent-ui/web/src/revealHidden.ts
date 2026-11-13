@@ -11,12 +11,14 @@
  *  soft hyphen and the tag characters), lone surrogates, line and paragraph separators, every space
  *  but the plain one, and the characters that render blank: the combining grapheme joiner, the
  *  Hangul and Braille fillers, the Khmer inherent vowels, the Mongolian variation selectors and the
- *  variation selectors. Right-to-left letters are ordinary text and are left alone.
+ *  variation selectors; and every default-ignorable code point, the unassigned ones included (U+2065,
+ *  U+FFF0-U+FFF8, most of U+E0000-U+E0FFF), since a renderer that does not know one draws it as nothing.
+ *  Right-to-left letters are ordinary text and are left alone.
  */
 export type RevealedPiece = { text: string } | { escape: string };
 
 const HIDDEN =
-  /[\p{Cc}\p{Cf}\p{Cs}\p{Zl}\p{Zp}\p{Zs}\u034F\u115F\u1160\u17B4\u17B5\u180B-\u180F\u2800\u3164\uFE00-\uFE0F\uFFA0\u{E0100}-\u{E01EF}]/u;
+  /[\p{Cc}\p{Cf}\p{Cs}\p{Zl}\p{Zp}\p{Zs}\p{Default_Ignorable_Code_Point}\u034F\u115F\u1160\u17B4\u17B5\u180B-\u180F\u2800\u3164\uFE00-\uFE0F\uFFA0\u{E0100}-\u{E01EF}]/u;
 
 /** Kept as text: the card shows the command as the shell reads it, newlines and all. */
 const KEPT = new Set(["\n", "\t", " "]);

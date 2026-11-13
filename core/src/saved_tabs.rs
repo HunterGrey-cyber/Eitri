@@ -83,6 +83,10 @@ pub struct SavedTab {
     /// another window or brought back after a restart. Absent from a file or a peer that predates keys, and read as
     /// absent when it is no key's shape: the tab that comes back then keeps the key it was made with.
     pub row_key: Option<String>,
+    /// The mode plan mode was entered from, when the tab was planning as this was written. `mode` stays the
+    /// execution mode underneath; a tab restored with this set asks for plan mode before its first message.
+    /// Absent from the file otherwise.
+    pub plan_origin: Option<SessionModeChoice>,
 }
 
 impl SavedTab {
@@ -118,6 +122,7 @@ impl SavedTab {
             turn_running: self.turn_running,
             draft: self.draft.clone(),
             row_key: self.row_key.clone(),
+            plan_origin: self.plan_origin,
         };
         serde_json::to_value(entry).expect("a saved tab always serializes")
     }
@@ -140,6 +145,7 @@ impl SavedTab {
             turn_running: entry.turn_running,
             draft: entry.draft,
             row_key: entry.row_key,
+            plan_origin: entry.plan_origin,
         })
     }
 }
@@ -407,6 +413,9 @@ struct ClaudeEntry {
         deserialize_with = "lenient_row_key"
     )]
     row_key: Option<String>,
+    /// Absent unless the tab was planning; an older build ignores it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    plan_origin: Option<SessionModeChoice>,
 }
 
 /// One entry of `external_tabs`: another agent's tab, the agent named as its records name it
@@ -436,6 +445,9 @@ struct OtherEntry {
         deserialize_with = "lenient_row_key"
     )]
     row_key: Option<String>,
+    /// Absent unless the tab was planning; an older build ignores it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    plan_origin: Option<SessionModeChoice>,
 }
 
 /// One entry of `external_tabs` as read: an agent this build does not know (a later build's) is kept
@@ -469,6 +481,7 @@ pub fn encode(saved: &SavedTabs, project_root: &Path) -> String {
                 turn_running: t.turn_running,
                 draft: t.draft.clone(),
                 row_key: t.row_key.clone(),
+                plan_origin: t.plan_origin,
             })
             .collect(),
         active: saved.rank(saved.claude_active, false).unwrap_or(0),
@@ -486,6 +499,7 @@ pub fn encode(saved: &SavedTabs, project_root: &Path) -> String {
                     turn_running: t.turn_running,
                     draft: t.draft.clone(),
                     row_key: t.row_key.clone(),
+                    plan_origin: t.plan_origin,
                 })
             })
             .collect(),
@@ -532,6 +546,7 @@ pub fn decode(text: &str, project_root: &Path) -> Result<SavedTabs, String> {
             turn_running: t.turn_running,
             draft: t.draft,
             row_key: t.row_key,
+            plan_origin: t.plan_origin,
         })
         .collect();
     // An agent this build does not know stays a hole, so the active index still finds its tab.
@@ -550,6 +565,7 @@ pub fn decode(text: &str, project_root: &Path) -> Result<SavedTabs, String> {
                 turn_running: t.turn_running,
                 draft: t.draft,
                 row_key: t.row_key,
+                plan_origin: t.plan_origin,
             }),
             ExternalEntry::Unknown(_) => None,
         })
@@ -1745,6 +1761,25 @@ mod tests {
         assert!(tabs_for(&merged, &two).tabs[0].turn_running);
     }
 
+    /// A tab saved while planning keeps where plan mode started, in the file and across the link; its `mode` is
+    /// still the execution mode. Absent from both when it was not planning, so an older build reads the same file.
+    #[test]
+    fn plan_origin_round_trips_and_is_absent_when_none() {
+        let root = Path::new("/work/project");
+        let mut planning = tab("s-1", None, SessionModeChoice::Bypass);
+        planning.plan_origin = Some(SessionModeChoice::Bypass);
+        let plain = tab("s-2", None, SessionModeChoice::Auto);
+        let saved = SavedTabs::from_parts(vec![planning.clone(), plain.clone()], 0, Vec::new(), None);
+        let text = encode(&saved, root);
+        assert_eq!(text.matches("plan_origin").count(), 1, "{text}");
+        let read = decode(&text, root).unwrap();
+        assert_eq!(read.tabs[0].plan_origin, Some(SessionModeChoice::Bypass));
+        assert_eq!(read.tabs[0].mode, SessionModeChoice::Bypass);
+        assert_eq!(read.tabs[1].plan_origin, None);
+        assert_eq!(SavedTab::from_wire(&planning.to_wire()).unwrap(), planning);
+        assert!(plain.to_wire().get("plan_origin").is_none());
+    }
+
     fn tab(session: &str, name: Option<&str>, mode: SessionModeChoice) -> SavedTab {
         SavedTab {
             agent: AgentId::Claude,
@@ -1757,6 +1792,7 @@ mod tests {
             turn_running: false,
             draft: None,
             row_key: None,
+            plan_origin: None,
         }
     }
 
@@ -1906,6 +1942,7 @@ mod tests {
                 turn_running: false,
                 draft: None,
                 row_key: None,
+                plan_origin: None,
             }],
             None,
         );
@@ -2372,6 +2409,7 @@ mod tests {
             turn_running: false,
             draft: None,
             row_key: None,
+            plan_origin: None,
         }
     }
 
@@ -3233,6 +3271,7 @@ mod measure {
             turn_running: false,
             draft: None,
             row_key: None,
+            plan_origin: None,
         };
         let mut memory = TabMemory::new(Some(dir.clone()), root.to_path_buf());
         let mut times = Vec::new();

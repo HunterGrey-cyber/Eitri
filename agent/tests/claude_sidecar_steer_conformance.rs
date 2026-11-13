@@ -173,10 +173,7 @@ fn start_a_gated_turn(
     release: &std::path::Path,
 ) -> String {
     let turn = provider
-        .send_turn(SendTurnRequest {
-            session_id: session_id.to_string(),
-            text: format!("Run exactly this Bash command: while [ ! -f '{}' ]; do sleep 0.01; done; echo released. Then reply with one short sentence.", release.display()),
-        })
+        .send_turn(SendTurnRequest::text(session_id.to_string(), format!("Run exactly this Bash command: while [ ! -f '{}' ]; do sleep 0.01; done; echo released. Then reply with one short sentence.", release.display())))
         .expect("send_turn should be accepted");
     pump_until(
         provider,

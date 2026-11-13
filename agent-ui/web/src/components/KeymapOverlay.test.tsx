@@ -3,7 +3,7 @@ import { StrictMode } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { cleanup, fireEvent, render } from "@testing-library/react";
 import { KeymapOverlay } from "./KeymapOverlay";
-import { BROWSE_KEYS, CARD_KEYS, CARET_KEYS, EMPTY_PANEL_TABLE, INPUT_KEYS, QUESTION_KEYS, REVIEW_KEYS, TASKS_KEYS, VISUAL_KEYS } from "../keymap";
+import { BROWSE_KEYS, CARD_KEYS, CARET_KEYS, EMPTY_PANEL_TABLE, INPUT_KEYS, PLAN_KEYS, QUESTION_KEYS, REVIEW_KEYS, TASKS_KEYS, VISUAL_KEYS } from "../keymap";
 import type { KeyHelp, PanelTable, PluginKeysHelp } from "../keymap";
 import { binding, TABLE } from "../testFixtures";
 import { listedSlashCommands } from "../slashCommands";
@@ -59,6 +59,7 @@ describe("KeymapOverlay", () => {
       "Slash commands",
       "Background tasks (/tasks)",
       "Claude's question",
+      "Claude's plan",
       "Anywhere in the window",
       "After Ctrl+b",
     ]);
@@ -101,7 +102,7 @@ describe("KeymapOverlay", () => {
   it("lists every row it was given and every local row, none dropped", () => {
     const { container } = overlay();
     const text = container.textContent!;
-    for (const row of [...BROWSE_KEYS, ...CARD_KEYS, ...CARET_KEYS, ...VISUAL_KEYS, ...REVIEW_KEYS, ...INPUT_KEYS, ...TASKS_KEYS, ...QUESTION_KEYS, ...WINDOW, ...PREFIX]) {
+    for (const row of [...BROWSE_KEYS, ...CARD_KEYS, ...CARET_KEYS, ...VISUAL_KEYS, ...REVIEW_KEYS, ...INPUT_KEYS, ...TASKS_KEYS, ...QUESTION_KEYS, ...PLAN_KEYS, ...WINDOW, ...PREFIX]) {
       expect(text).toContain(row.keys);
       expect(text).toContain(row.what);
     }
@@ -114,10 +115,10 @@ describe("KeymapOverlay", () => {
     // section adds none of its own; `EMPTY_PANEL_TABLE` has no bindings. "Selecting"
     // adds `CARET_KEYS.length + VISUAL_KEYS.length` rows of its own with no
     // GTK-decided extra, since the region never reaches `shell`. "Review (c)" adds `REVIEW_KEYS.length`, and the
-    // Claude tab's tasks list and question sections add theirs.
+    // Claude tab's tasks list, question and plan sections add theirs.
     expect(container.querySelectorAll("tr").length).toBe(
       BROWSE_KEYS.length + 1 + CARD_KEYS.length + CARET_KEYS.length + VISUAL_KEYS.length + REVIEW_KEYS.length + INPUT_KEYS.length + 4 +
-        TASKS_KEYS.length + QUESTION_KEYS.length + WINDOW.length + PREFIX.length,
+        TASKS_KEYS.length + QUESTION_KEYS.length + PLAN_KEYS.length + WINDOW.length + PREFIX.length,
     );
   });
 

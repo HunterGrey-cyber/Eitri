@@ -369,7 +369,7 @@ fn a_snapshot_mid_reply_carries_the_open_message_bit() {
             conversation_id: None,
             session_id: None,
             provider_session_id: None,
-            capabilities,
+            capabilities: capabilities.clone(),
             provider: None,
             projection: crate::agent_backend::ProjectionRef::Borrowed(&projection),
             hidden_pending: None,
@@ -1196,5 +1196,40 @@ fn eviction_keeps_notes_for_pending_permissions_before_the_call_starts() {
     assert_eq!(
         notes.creates_file.keys().map(String::as_str).collect::<Vec<_>>(),
         vec!["pending", "unjoined"]
+    );
+}
+
+/// A prompt sent with images carries what each was in the page's spelling (what its row draws), never the digest
+/// or the bytes; a prompt of text alone keeps the shape it always had.
+#[test]
+fn a_prompt_with_images_carries_their_metadata_in_the_pages_spelling() {
+    let mut projection = AgentSessionProjection::default();
+    projection.apply(&AgentDomainEvent::UserPromptSubmitted { text: "plain".into() });
+    projection.apply(&AgentDomainEvent::UserPromptSubmitted { text: "look".into() });
+    projection.apply(&AgentDomainEvent::UserPromptAttachments {
+        attachments: vec![agent::AttachmentMeta {
+            media_type: "image/png".into(),
+            bytes: 302,
+            width: 48,
+            height: 32,
+            sha256: "ab".repeat(32),
+        }],
+    });
+    let view = SnapshotView {
+        backend: "sidecar",
+        conversation_id: None,
+        session_id: None,
+        provider_session_id: None,
+        capabilities: agent::ProviderCapabilities::default(),
+        provider: None,
+        projection: crate::agent_backend::ProjectionRef::Borrowed(&projection),
+        hidden_pending: None,
+    };
+    let state =
+        serde_json::from_str::<Value>(&serialize_snapshot_for_js(TabId(1), &view, None)).unwrap()["state"].clone();
+    assert_eq!(state["userPrompts"][0], json!({"seq": 0, "text": "plain"}));
+    assert_eq!(
+        state["userPrompts"][1],
+        json!({"seq": 1, "text": "look", "attachments": [{"mediaType": "image/png", "width": 48, "height": 32, "bytes": 302}]})
     );
 }

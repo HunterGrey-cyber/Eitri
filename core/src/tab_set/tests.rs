@@ -330,6 +330,7 @@ fn planned(id: &str, mode: SessionModeChoice) -> PlannedTab {
         turn_running: false,
         draft: None,
         row_key: None,
+        plan_origin: None,
     }
 }
 
@@ -349,6 +350,7 @@ fn first_send(request_id: &str, typed: &str) -> DeferredStart {
             wire: format!("wire: {typed}"),
             typed: typed.to_string(),
             shell_line: false,
+            attachments: Vec::new(),
         },
     }
 }
@@ -385,6 +387,7 @@ fn saved_tab_named(session: &str) -> SavedTab {
         turn_running: false,
         draft: None,
         row_key: None,
+        plan_origin: None,
     }
 }
 

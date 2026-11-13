@@ -1,5 +1,5 @@
 import type { Cited } from "./gdTarget";
-import type { PageLine, AppliedSettings, EffortChoice, ModelOption, AgentDomainEvent, AgentUiSnapshot, ChooserEnvelope, ContextSummary, DetailRow, EditorCardWire, EditorLinkState, HandoffCommand, Hello, QueueItem, ReviewDiffEnvelope, ReviewDraftEnvelope, ReviewEnvelope, ReviewHintEnvelope, ReviewHintLevel, ReviewRecoveryEnvelope, ReviewScope, ReviewSendPreviewEnvelope, TabId, TabsEnvelope, ThinkingDisplay, TurnTimeWire } from "./types";
+import type { DraftImage, PageLine, PlanningState, AppliedSettings, EffortChoice, ModelOption, AgentDomainEvent, AgentUiSnapshot, ChooserEnvelope, ContextSummary, DetailRow, EditorCardWire, EditorLinkState, HandoffCommand, Hello, QueueItem, ReviewDiffEnvelope, ReviewDraftEnvelope, ReviewEnvelope, ReviewHintEnvelope, ReviewHintLevel, ReviewRecoveryEnvelope, ReviewScope, ReviewSendPreviewEnvelope, TabId, TabsEnvelope, ThinkingDisplay, TurnTimeWire } from "./types";
 import type { KeymapHelp, PaneDirection, PluginKeysHelp } from "./keymap";
 import { isEditorCardWire } from "./editorCardWire";
 import { isHex64, isTrustRemember } from "./trust";
@@ -8,6 +8,9 @@ import type { ProposedChange } from "./proposal";
 import type { TabViewState } from "./tabs";
 import { detectTransport } from "./transport";
 import type { Transport } from "./transport";
+
+/** A plan dock's decision, as the closed set the host parses (`PlanChoiceWire`). */
+export type PlanChoiceWire = "keep_planning" | "approve_manual" | "approve_auto" | "approve_bypass";
 
 export type QuestionAnswerWire = { question_index: number; option_indexes: number[]; other_text?: string | null; notes?: string | null };
 
@@ -19,13 +22,33 @@ export type OutboundMessage =
   | { type: "ready"; request_id: string }
   /** The mounted page has produced its first frame. The host reveals its view and answers nothing. */
   | { type: "painted" }
-  | { type: "send_message"; request_id: string; tab: TabId; text: string }
+  /** `attachments`: the draft's images that go with it, in order, by the tokens the host gave them. */
+  | { type: "send_message"; request_id: string; tab: TabId; text: string; attachments?: string[] }
+  /** A composer image to import into the draft of `generation`: `byte_length` bytes follow in `attach_chunk`s.
+   *  Answered by a `command_result` whose `attachmentId` names the image from then on. `name` is display text. */
+  | { type: "attach_begin"; request_id: string; tab: TabId; generation: number; byte_length: number; name: string }
+  /** The next bytes of an import, base64, at most 256 KiB decoded, one at a time: the next waits for this one's
+   *  `command_result`. */
+  | { type: "attach_chunk"; request_id: string; tab: TabId; attachment_id: string; offset: number; data_b64: string }
+  /** Every byte is sent; `sha256` is their digest, lowercase hex. The image's `attachment_state` follows. */
+  | { type: "attach_end"; request_id: string; tab: TabId; attachment_id: string; sha256: string }
+  /** Stops an import under way; its image leaves the draft. */
+  | { type: "attach_cancel"; request_id: string; tab: TabId; attachment_id: string }
+  /** Takes an image out of the draft. */
+  | { type: "attach_remove"; request_id: string; tab: TabId; attachment_id: string }
   /** A `!` line entered in the composer: the one message that runs a command. */
   | { type: "run_shell"; request_id: string; tab: TabId; text: string }
   | { type: "question_answer"; request_id: string; tab: TabId; interaction_id: string; answers: QuestionAnswerWire[] }
   | { type: "question_decline"; request_id: string; tab: TabId; interaction_id: string; kind: "cancel" | "chat"; so_far?: QuestionAnswerWire[] }
   | { type: "question_draft"; request_id: string; tab: TabId; interaction_id: string; draft: unknown }
   | { type: "edit_question_other"; request_id: string; tab: TabId; interaction_id: string; question_index: number; text: string }
+  /** The plan dock's decision: keep planning (with the person's feedback, possibly empty) or approve into one mode.
+   *  `plan_sha256` is the digest of the plan the person read; an approval carries no `feedback`. */
+  | { type: "plan_resolve"; request_id: string; tab: TabId; interaction_id: string; choice: PlanChoiceWire; plan_sha256: string; feedback?: string }
+  /** `<leader>p` or `/plan`: the person's own move into plan mode (`enter`) or out of it. */
+  | { type: "set_planning"; request_id: string; tab: TabId; enter: boolean }
+  /** The "keep planning" feedback as it is typed: a mirror only, empty drops it. */
+  | { type: "plan_feedback_draft"; request_id: string; tab: TabId; interaction_id: string; text: string }
   | { type: "interrupt"; request_id: string; tab: TabId }
   /** The confirmed `<leader>k`: stop what the tab's agent left running: a Claude tab stops each live task and keeps its
    *  session, another agent's tab ends its session. `running` is
@@ -86,7 +109,7 @@ export type OutboundMessage =
   /** `turn_id`: the turn the page showed running when Enter was pressed; the message goes only into that
    *  one, and is held for its end otherwise. `after_turn` (`Ctrl+x Enter`): it is held for the turn's end
    *  whatever, never put into it, and with no turn running it goes out as the next turn. */
-  | { type: "queue_message"; request_id: string; tab: TabId; text: string; turn_id: string | null; after_turn?: boolean }
+  | { type: "queue_message"; request_id: string; tab: TabId; text: string; turn_id: string | null; after_turn?: boolean; attachments?: string[] }
   /** `↑`: empty the tab's queue and hand its texts back as `queue_taken`. */
   | { type: "take_back_queue"; request_id: string; tab: TabId }
   /** `Ctrl+Enter`: queue this text (if non-empty), then interrupt if a turn is
@@ -305,6 +328,10 @@ type InboundHandler = (
     | { kind: "hello" } & Hello
     /** `message` is the shell's own one-line word on what it did (`sent`, `queued: ...`), where it has one. */
     | { kind: "command_result"; requestId: string; ok: true; message?: string }
+    /** One image of the tab's draft changed. */
+    | ({ kind: "attachment_state"; tab: TabId } & DraftImage)
+    /** The tab's whole draft of images, sent with its draft text: `note` is said once (images a move left behind). */
+    | { kind: "draft_attachments"; tab: TabId; generation: number; imageInput: boolean; why?: string; note?: string; attachments: DraftImage[] }
     /** An `open_path` with `expect` whose cited line no longer holds the name: a flash beside the open's own answer,
      *  which still settles the request. Plain text. */
     | { kind: "open_path_note"; requestId: string; note: string }
@@ -342,6 +369,9 @@ type InboundHandler = (
         autoCreatesFile?: string[];
         /** The turns that ended in this batch and how long each ran (`TurnTimeWire`); absent when none did. */
         turnTimes?: TurnTimeWire[];
+        /** Plan mode as the host reads it after this batch, when it changed since the page was last told; `null`
+         *  when the session no longer offers it. Not an event: it takes no `seq`. */
+        planningChanged?: PlanningState | null;
       }
     /** `turnStartedAtMs`: when the running turn started, `Date.now()`'s clock, kept per tab by
      *  Rust (`tab_set`'s `turn_clock`) so a switch or a reload shows its real elapsed time; `null`
@@ -456,7 +486,7 @@ type InboundHandler = (
     | { kind: "draft"; tab: TabId; text: string; refused?: string; late?: boolean }
     /** Reply to `take_back_queue`: the queue's texts, for the panel to merge into
      *  the box itself. */
-    | { kind: "queue_taken"; tab: TabId; texts: string[] }
+    | { kind: "queue_taken"; tab: TabId; texts: string[]; attachments?: string[][] }
     /** The shared prompt history, newest last. */
     | { kind: "history"; entries: string[] }
     /** Per pending card, the "always allow" rule it would install, keyed by
@@ -469,6 +499,9 @@ type InboundHandler = (
     | { kind: "editor_link"; state: EditorLinkState; text: string }
     /** A question's typed answer as it came back from nvim (Ctrl+G in the question dock). */
     | { kind: "question_other_edited"; tab: TabId; interaction_id: string; question_index: number; text: string }
+    /** An approval the plan dock sent waits for `calls` calls Claude Code is still deciding in plan mode; its
+     *  `command_result` follows once it went, or was refused. */
+    | { kind: "plan_waiting"; requestId: string; tab: TabId; calls: number }
     /** Whether the scratch-editor round trip currently has this tab's draft open in nvim. */
     | { kind: "scratch"; tab: TabId; editing: boolean }
     /** The footer's transient line, from Rust -- e.g. a `gf` refusal. */
@@ -683,6 +716,44 @@ function isWellFormedRemote(value: Record<string, unknown>): boolean {
   }
 }
 
+/** What a request awaited with `postForResult` was answered: a begin's names its image. */
+export type AwaitedResult =
+  | { kind: "command_result"; requestId: string; ok: true; attachmentId?: string }
+  | { kind: "command_result"; requestId: string; ok: false; error: string };
+
+const awaitedResults = new Map<string, (result: AwaitedResult) => void>();
+
+/** Posts `message` and resolves with its `command_result`, which then reaches no other handler. */
+export function postForResult(message: OutboundMessage & { request_id: string }): Promise<AwaitedResult> {
+  return new Promise((resolve) => {
+    awaitedResults.set(message.request_id, resolve);
+    postToRust(message);
+  });
+}
+
+const THUMBNAIL_PREFIX = "data:image/png;base64,";
+
+/** An image as the host draws it, with only the fields and kinds it sends: a thumbnail is a base64 PNG data URI. */
+export function isWellFormedDraftImage(value: unknown): value is DraftImage {
+  const v = value as Record<string, unknown> | null;
+  if (v === null || typeof v !== "object") return false;
+  const count = (x: unknown) => x === undefined || (Number.isSafeInteger(x) && (x as number) >= 0);
+  const text = (x: unknown) => x === undefined || typeof x === "string";
+  return typeof v.attachmentId === "string" && typeof v.name === "string" &&
+    (v.state === "importing" || v.state === "ready" || v.state === "failed") &&
+    text(v.mediaType) && count(v.width) && count(v.height) && count(v.bytes) && text(v.reason) &&
+    (v.thumbnail === undefined ||
+      (typeof v.thumbnail === "string" && v.thumbnail.startsWith(THUMBNAIL_PREFIX) &&
+        /^[A-Za-z0-9+/]*={0,2}$/.test(v.thumbnail.slice(THUMBNAIL_PREFIX.length))));
+}
+
+function isWellFormedDraftImages(value: unknown): boolean {
+  const v = value as Record<string, unknown>;
+  return Number.isSafeInteger(v.generation) && typeof v.imageInput === "boolean" &&
+    (v.why === undefined || typeof v.why === "string") && (v.note === undefined || typeof v.note === "string") &&
+    Array.isArray(v.attachments) && v.attachments.every(isWellFormedDraftImage);
+}
+
 export function installDispatch(handler: InboundHandler): void {
   activeTransport().listen((json: string) => {
     let parsed: unknown;
@@ -721,6 +792,19 @@ export function installDispatch(handler: InboundHandler): void {
           remoteDesk?.(parsed as RemoteDeskEnvelope);
           return;
         }
+        // An answer a caller awaits (`postForResult`) is that caller's alone.
+        const awaiting = typeof requestId === "string" ? awaitedResults.get(requestId) : undefined;
+        if (awaiting !== undefined) {
+          awaitedResults.delete(requestId as string);
+          awaiting(parsed as AwaitedResult);
+          return;
+        }
+      }
+      // A draft image's envelope draws a thumbnail: one whose fields are not what the host sends is dropped.
+      if ((obj.kind === "attachment_state" && !isWellFormedDraftImage(parsed)) ||
+          (obj.kind === "draft_attachments" && !isWellFormedDraftImages(parsed))) {
+        console.warn("agent-ui: __eitriDispatch received a malformed image envelope", parsed);
+        return;
       }
       // A `confirm_bypass` with no numeric `nonce` can never be answered correctly (there
       // would be nothing real to echo back on `y`), so it is rejected the same way an unrecognized
@@ -759,6 +843,14 @@ export function installDispatch(handler: InboundHandler): void {
               (value.error.server !== undefined && typeof value.error.server !== "string") ||
               (value.error.message !== undefined && typeof value.error.message !== "string")))) {
           console.warn("agent-ui: malformed editor_symbol_result envelope", parsed);
+          return;
+        }
+      }
+      if (obj.kind === "plan_waiting") {
+        const value = parsed as Record<string, unknown>;
+        if (typeof value.requestId !== "string" || !Number.isSafeInteger(value.tab) || !Number.isSafeInteger(value.calls) ||
+            (value.calls as number) < 0) {
+          console.warn("agent-ui: malformed plan_waiting envelope", parsed);
           return;
         }
       }
@@ -801,6 +893,7 @@ export function installDispatch(handler: InboundHandler): void {
         obj.kind === "models_result" ||
         obj.kind === "settings_result" ||
         obj.kind === "question_other_edited" ||
+        obj.kind === "plan_waiting" ||
         obj.kind === "events" ||
         obj.kind === "snapshot" ||
         obj.kind === "history_page" ||
@@ -854,7 +947,9 @@ export function installDispatch(handler: InboundHandler): void {
         obj.kind === "review_hint" ||
         obj.kind === "review_draft" ||
         obj.kind === "review_send_preview" ||
-        obj.kind === "review_recovery"
+        obj.kind === "review_recovery" ||
+        obj.kind === "attachment_state" ||
+        obj.kind === "draft_attachments"
       ) {
         handler(parsed as Parameters<InboundHandler>[0]);
         return;
