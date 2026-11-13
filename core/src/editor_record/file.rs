@@ -148,7 +148,7 @@ fn with_suffix(path: &Path, suffix: &str) -> PathBuf {
 }
 
 /// Writes `bytes` to `tmp` as a 0600 file and renames it over `path`; on a failure the temporary file goes.
-fn replace_private(tmp: &Path, path: &Path, bytes: &[u8]) -> io::Result<()> {
+pub(crate) fn replace_private(tmp: &Path, path: &Path, bytes: &[u8]) -> io::Result<()> {
     let written = agent::private_fs::write_private(tmp, bytes).and_then(|()| std::fs::rename(tmp, path));
     if written.is_err() {
         let _ = std::fs::remove_file(tmp);

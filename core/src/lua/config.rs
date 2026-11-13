@@ -176,6 +176,13 @@ pub fn parse_terminal_claude_ide(value: Option<&str>) -> Result<bool, String> {
     crate::config_switch::parse_switch(TERMINAL_CLAUDE_IDE_KEY, value, false)
 }
 
+/// Whether remote development may be opened from this machine.
+pub const REMOTE_DEV_ENABLED_KEY: &str = "remote_dev.enabled";
+
+pub fn parse_remote_dev_enabled(value: Option<&str>) -> Result<bool, String> {
+    crate::config_switch::parse_switch(REMOTE_DEV_ENABLED_KEY, value, false)
+}
+
 /// The `init.lua` key: `eitri.config.set("remote.enabled", true | false)`. Whether this window starts remote control
 /// (the `rv-` socket and `eitri remote serve`).
 pub const REMOTE_ENABLED_KEY: &str = "remote.enabled";
@@ -827,6 +834,35 @@ mod tests {
             let err = read().unwrap_err();
             assert!(err.contains("\"window.restore\""), "the refusal names its key: {err}");
             assert!(err.contains("must be true or \"on\" / false or \"off\""), "{err}");
+        }
+    }
+
+    #[test]
+    fn remote_dev_enabled_defaults_to_off() {
+        assert_eq!(REMOTE_DEV_ENABLED_KEY, "remote_dev.enabled");
+        assert_eq!(parse_remote_dev_enabled(None), Ok(false));
+    }
+
+    #[test]
+    fn remote_dev_enabled_reads_true_from_init_lua() {
+        let lua = Lua::new();
+        let eitri = lua.create_table().unwrap();
+        let store = Rc::new(RefCell::new(ConfigStore::default()));
+        install(&lua, &eitri, store.clone()).unwrap();
+        lua.globals().set("eitri", eitri).unwrap();
+        for (set, want) in [("true", true), ("false", false), ("'on'", true), ("'off'", false)] {
+            lua.load(format!("eitri.config.set('remote_dev.enabled', {set})"))
+                .exec()
+                .unwrap();
+            assert_eq!(
+                parse_remote_dev_enabled(store.borrow().get(REMOTE_DEV_ENABLED_KEY)),
+                Ok(want)
+            );
+        }
+        for bad in ["yes", "1", "", "TRUE"] {
+            assert!(parse_remote_dev_enabled(Some(bad))
+                .unwrap_err()
+                .contains(REMOTE_DEV_ENABLED_KEY));
         }
     }
 

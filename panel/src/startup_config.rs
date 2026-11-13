@@ -83,6 +83,7 @@ fn checks<'a>(agents: &'a [&'a str]) -> Vec<(&'static str, Check<'a>)> {
         ),
         (cfg::TERMINAL_FONT_KEY, check(cfg::parse_terminal_font)),
         (cfg::TERMINAL_CLAUDE_IDE_KEY, check(cfg::parse_terminal_claude_ide)),
+        (cfg::REMOTE_DEV_ENABLED_KEY, check(cfg::parse_remote_dev_enabled)),
         (cfg::WINDOW_RESTORE_KEY, check(cfg::parse_window_restore)),
         (cfg::EDITOR_RESTORE_KEY, check(cfg::parse_editor_restore)),
         (cfg::EDITOR_TAKEOVER_KEY, check(cfg::parse_editor_takeover)),
@@ -323,6 +324,25 @@ mod tests {
         settle(&kernel);
         let problems = kernel.startup_problems();
         (kernel, problems)
+    }
+
+    #[test]
+    fn remote_development_values_and_typos_are_checked_at_startup() {
+        use eitri_core::lua::config::{parse_remote_dev_enabled, REMOTE_DEV_ENABLED_KEY};
+        for value in ["true", "false", "'on'", "'off'"] {
+            let (kernel, problems) = settled(&format!("eitri.config.set('remote_dev.enabled', {value})"));
+            assert!(problems.is_empty(), "{value}: {problems:?}");
+            assert!(parse_remote_dev_enabled(kernel.config.borrow().get(REMOTE_DEV_ENABLED_KEY)).is_ok());
+        }
+        let (kernel, problems) = settled("eitri.config.set('remote_dev.enabled', 'maybe')");
+        assert_eq!(problems.len(), 1, "{problems:?}");
+        assert!(problems[0].contains("remote_dev.enabled"), "{problems:?}");
+        assert!(problems[0].contains("default is used"), "{problems:?}");
+        assert_eq!(kernel.config.borrow().get(REMOTE_DEV_ENABLED_KEY), None);
+        assert_eq!(parse_remote_dev_enabled(None), Ok(false));
+        let (_, problems) = settled("eitri.config.set('remote_dev.enable', true)");
+        assert_eq!(problems.len(), 1, "{problems:?}");
+        assert!(problems[0].contains("remote_dev.enabled"), "{problems:?}");
     }
 
     #[test]

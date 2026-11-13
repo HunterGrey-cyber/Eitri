@@ -14,7 +14,7 @@ use std::path::Path;
 
 use base64::Engine as _;
 
-mod file;
+pub(crate) mod file;
 mod parse;
 #[cfg(test)]
 mod tests;

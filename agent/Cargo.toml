@@ -5,6 +5,7 @@ edition = "2024"
 publish.workspace = true
 
 [dependencies]
+eitri-server-proto = { path = "../server-proto" }
 serde = { version = "1", features = ["derive"] }
 # `float_roundtrip`: a chat moved to the other window crosses as JSON and must read back value for
 # value, floats included; the default parser can land one bit off. No extra crate.

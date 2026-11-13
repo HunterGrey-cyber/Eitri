@@ -1,0 +1,14 @@
+[package]
+name = "eitri-server"
+version.workspace = true
+edition.workspace = true
+publish = false
+
+[dependencies]
+agent = { path = "../agent" }
+eitri-core = { path = "../core" }
+eitri-server-proto = { path = "../server-proto" }
+
+[[bin]]
+name = "eitri-server"
+path = "src/main.rs"

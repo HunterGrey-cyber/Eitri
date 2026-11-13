@@ -69,6 +69,7 @@ pub mod remote_audit;
 pub mod remote_devices;
 pub mod remote_greeting;
 pub mod remote_pairing;
+pub mod remote_project;
 pub mod remote_runtime;
 pub mod remote_rv;
 pub mod remote_wire;

@@ -43,6 +43,8 @@ const BANNED_SUBSTRINGS: &[&str] = &[
 const TARGET_CRATES: &[&str] = &[
     "eitri-core",
     "eitri-remote",
+    "eitri-server",
+    "eitri-server-proto",
     "eitri-panel",
     "eitri-mac",
     "agent",

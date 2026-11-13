@@ -1,0 +1,39 @@
+syntax = "proto3";
+package eitri.server.v1;
+
+// Verdandi's RuntimeService shares this connection. Calls name a sidecar in "eitri-sidecar"
+// metadata; WatchSessionEvents returns the decimal journal head in "eitri-journal-head".
+service Helper {
+  rpc Hello(HelloRequest) returns (HelloResponse);
+  rpc StartSidecar(StartSidecarRequest) returns (StartSidecarResponse);
+  rpc StopSidecar(StopSidecarRequest) returns (StopSidecarResponse);
+  rpc ListSidecars(ListSidecarsRequest) returns (ListSidecarsResponse);
+  rpc Pending(PendingRequest) returns (PendingResponse);
+  rpc TrustScan(TrustScanRequest) returns (TrustScanResponse);
+}
+message HelloRequest { uint32 protocol_major = 1; uint32 protocol_minor = 2; string client_version = 3; }
+message HelloResponse {
+  uint32 protocol_major = 1; uint32 protocol_minor = 2; repeated string capabilities = 3;
+  string helper_version = 4; string helper_build = 5; string sidecar_revision = 6;
+}
+message StartSidecarRequest {
+  string root = 1; string account = 2; map<string, string> env = 3; string command_id = 4;
+  // The client's expected revision and hash are checked before starting the sidecar.
+  string sidecar_revision = 5; string sidecar_sha256 = 6;
+}
+message StartSidecarResponse { string sidecar_id = 1; }
+message StopSidecarRequest { string sidecar_id = 1; string command_id = 2; }
+message StopSidecarResponse {}
+message ListSidecarsRequest {}
+message SessionInfo { string session_id = 1; uint64 journal_head = 2; bool closed = 3; uint64 pending = 4; }
+message SidecarInfo {
+  string sidecar_id = 1; string root = 2; string account = 3; uint32 pid = 4; uint64 started_unix_ms = 5;
+  bool alive = 6; repeated SessionInfo sessions = 7; string helper_version = 8;
+}
+message ListSidecarsResponse { repeated SidecarInfo sidecars = 1; }
+message PendingRequest { string sidecar_id = 1; string session_id = 2; }
+// SessionEvent bytes are retained as received.
+message PendingPermission { uint64 sequence = 1; bytes event = 2; }
+message PendingResponse { repeated PendingPermission requests = 1; }
+message TrustScanRequest { string root = 1; string profile_key = 2; }
+message TrustScanResponse { bytes discovery_json = 1; string refusal = 2; }

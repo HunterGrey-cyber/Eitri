@@ -50,6 +50,7 @@
 ---| "remote.notify"
 ---| "remote.origins"
 ---| "remote.port"
+---| "remote_dev.enabled"
 ---| "review.enabled"
 ---| "review.hint"
 ---| "review.live"

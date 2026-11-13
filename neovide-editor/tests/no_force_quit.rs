@@ -449,6 +449,8 @@ const SCANNED: &[&str] = &[
     "mac/src",
     "core/src",
     "remote/src",
+    "server/src",
+    "server-proto/src",
     "neovide-editor/src",
     "agent/src",
     "terminal/engine/src",

@@ -45,7 +45,7 @@ const RULE_CALLS: [&str; 3] = ["prefix_rule", "network_rule", "host_executable"]
 /// text: keys sorted, every value tagged with its type, so two definitions are equal exactly when
 /// their parsed tables are. A float is compared by its bits, so `0.0` and `-0.0` differ and a NaN
 /// equals the same NaN.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize)]
 pub struct ServerDefinition(String);
 
 impl ServerDefinition {

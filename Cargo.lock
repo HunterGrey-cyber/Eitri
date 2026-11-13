@@ -40,6 +40,7 @@ dependencies = [
  "agent",
  "base64",
  "claude-runtime-protocol",
+ "eitri-server-proto",
  "hyper-util",
  "libc",
  "prost",
@@ -1006,6 +1007,26 @@ dependencies = [
  "rustls-native-certs",
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "eitri-server"
+version = "0.3.0"
+dependencies = [
+ "agent",
+ "eitri-core",
+ "eitri-server-proto",
+]
+
+[[package]]
+name = "eitri-server-proto"
+version = "0.3.0"
+dependencies = [
+ "prost",
+ "serde",
+ "tonic",
+ "tonic-prost",
+ "tonic-prost-build",
 ]
 
 [[package]]

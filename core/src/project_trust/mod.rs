@@ -32,6 +32,7 @@ mod plan;
 mod store;
 mod text_diff;
 
+use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
@@ -76,7 +77,7 @@ impl Default for Limits {
 
 /// Whose configuration discovery looks for: each agent reads its own files from a project, and each
 /// keeps its own record, so trusting a project for one agent never trusts it for another.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum Profile {
     /// `.claude/`, `.mcp.json`, `CLAUDE.md`, `CLAUDE.local.md`. Keep its fingerprint and record name
     /// stable so existing records still match.
@@ -162,7 +163,7 @@ pub struct ProfileEnv {
 }
 
 /// The sha256 of a discovery's whole configuration.
-#[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Hash, Serialize, Deserialize)]
 pub struct Fingerprint(pub [u8; 32]);
 
 impl Fingerprint {
@@ -180,7 +181,7 @@ pub(crate) fn hex(bytes: &[u8]) -> String {
 }
 
 /// What was found for one root.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Discovery {
     /// Whose configuration this is; the record it is checked against is that profile's.
     pub profile: Profile,
@@ -255,13 +256,13 @@ impl Discovery {
 }
 
 /// One thing found, relative to `top`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Entry {
     pub path: PathBuf,
     pub kind: EntryKind,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum EntryKind {
     File {
         sha256: [u8; 32],
@@ -290,7 +291,7 @@ pub enum EntryKind {
 
 /// What the prompt shows about a discovery. Paths are relative to `top` (with leading `..` for a
 /// git directory a gitfile names somewhere else).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Finding {
     Hook {
         file: PathBuf,
@@ -408,4 +409,215 @@ pub enum Finding {
         reason: String,
         target: Option<PathBuf>,
     },
+}
+
+#[cfg(test)]
+mod serialization_tests {
+    use super::*;
+
+    #[test]
+    fn discovery_json_refuses_non_utf8_paths_in_every_path_field() {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+
+        let plain = Discovery {
+            profile: Profile::Claude,
+            root: "/srv/project".into(),
+            top: "/srv/project".into(),
+            walked: vec![],
+            entries: vec![],
+            findings: vec![],
+            fingerprint: Fingerprint([0; 32]),
+            over_budget: None,
+            user_mcp_servers: None,
+            user_mcp_names: None,
+            project_mcp_servers: vec![],
+            instructions: BTreeMap::new(),
+        };
+        assert!(serde_json::to_vec(&plain).is_ok());
+        let bad = PathBuf::from(OsStr::from_bytes(b"/srv/project/non-utf8-\xff"));
+        for field in [
+            "root",
+            "top",
+            "walked",
+            "entry",
+            "symlink",
+            "linked_file",
+            "finding",
+            "instructions",
+        ] {
+            let mut discovery = plain.clone();
+            match field {
+                "root" => discovery.root = bad.clone(),
+                "top" => discovery.top = bad.clone(),
+                "walked" => discovery.walked.push(bad.clone()),
+                "entry" => discovery.entries.push(Entry {
+                    path: bad.clone(),
+                    kind: EntryKind::Dir,
+                }),
+                "symlink" | "linked_file" => discovery.entries.push(Entry {
+                    path: "link".into(),
+                    kind: if field == "symlink" {
+                        EntryKind::Symlink {
+                            target: bad.clone(),
+                            outside: false,
+                        }
+                    } else {
+                        EntryKind::LinkedFile {
+                            target: bad.clone(),
+                            sha256: [0; 32],
+                            len: 0,
+                        }
+                    },
+                }),
+                "finding" => discovery.findings.push(Finding::Memory { path: bad.clone() }),
+                "instructions" => {
+                    discovery.instructions.insert(bad.clone(), Kept::NotText);
+                }
+                _ => unreachable!(),
+            }
+            assert!(
+                serde_json::to_vec(&discovery).is_err(),
+                "{field} must never be serialized lossily"
+            );
+        }
+    }
+
+    #[test]
+    fn discovery_round_trips_through_json() {
+        let home = agent::state_dirs::test_workspace_dir("discovery-json");
+        let root = home.join("project");
+        let write = |name: &str, bytes: &[u8]| {
+            let path = root.join(name);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, bytes).unwrap();
+        };
+        write(".git/HEAD", b"ref: refs/heads/main\n");
+        std::fs::create_dir_all(root.join(".git/objects")).unwrap();
+        std::fs::create_dir_all(root.join(".git/refs/heads")).unwrap();
+        write("CLAUDE.md", b"Project instructions\n");
+        write(
+            ".claude/settings.json",
+            br#"{
+            "hooks":{"PreToolUse":[{"matcher":"Bash","hooks":[{"type":"command","command":"echo hook"}]}]},
+            "env":{"EXAMPLE":"value"}, "apiKeyHelper":"echo key",
+            "permissions":{"allow":["Read(*)"],"additionalDirectories":["/srv/project"]},
+            "model":"example"
+        }"#,
+        );
+        write(".claude/settings.local.json", b"invalid JSON");
+        write(
+            ".mcp.json",
+            br#"{"mcpServers":{"example":{"command":"example-server","args":["--stdio"]}}}"#,
+        );
+        write(
+            ".claude/skills/example/SKILL.md",
+            b"---\nallowed-tools: Read\n---\nA skill\n",
+        );
+        write(
+            ".claude/commands/example.md",
+            b"---\npermissionMode: default\n---\nA command\n",
+        );
+        std::os::unix::fs::symlink("/missing-example", root.join(".claude/commands/link")).unwrap();
+        write("AGENTS.md", b"Codex instructions\n");
+        write(
+            ".codex/config.toml",
+            b"approval_policy = 'never'\n[mcp_servers.example]\ncommand = 'example-server'\n",
+        );
+        write(
+            ".codex/rules/example.rules",
+            b"prefix_rule(pattern = [\"echo\"], decision = \"allow\")\n",
+        );
+        write(".agents/plugins/marketplace.json", b"{}");
+        write(".agents/skills/example/SKILL.md", b"A shared skill\n");
+        let mut discoveries = vec![
+            discover(
+                &root,
+                Some(&home),
+                &Limits::default(),
+                &Profile::Claude,
+                &ProfileEnv::default(),
+            ),
+            discover(
+                &root,
+                Some(&home),
+                &Limits::default(),
+                &Profile::Codex,
+                &ProfileEnv::default(),
+            ),
+            discover(
+                &root,
+                Some(&home),
+                &Limits::default(),
+                &Profile::Codex,
+                &ProfileEnv {
+                    codex_home: Some(root.join(".codex")),
+                    ..ProfileEnv::default()
+                },
+            ),
+            discover(
+                &root,
+                Some(&home),
+                &Limits {
+                    max_entries: 1,
+                    ..Limits::default()
+                },
+                &Profile::Claude,
+                &ProfileEnv::default(),
+            ),
+        ];
+        std::fs::remove_dir_all(root.join(".git")).unwrap();
+        std::os::unix::fs::symlink("/missing-git-example", root.join(".git")).unwrap();
+        discoveries.push(discover(
+            &root,
+            Some(&home),
+            &Limits::default(),
+            &Profile::Claude,
+            &ProfileEnv::default(),
+        ));
+        discoveries.push(discover(
+            &root,
+            Some(&home),
+            &Limits::default(),
+            &Profile::Acp {
+                name: "example".into(),
+                files: vec!["AGENTS.md".into()],
+            },
+            &ProfileEnv::default(),
+        ));
+        let mut kinds = BTreeSet::new();
+        for discovery in discoveries {
+            let json = serde_json::to_vec(&discovery).unwrap();
+            assert_eq!(serde_json::from_slice::<Discovery>(&json).unwrap(), discovery);
+            for finding in discovery.findings {
+                let value = serde_json::to_value(finding).unwrap();
+                kinds.extend(value.as_object().unwrap().keys().cloned());
+            }
+        }
+        let expected: BTreeSet<String> = [
+            "Hook",
+            "McpServer",
+            "Env",
+            "ApiKeyHelper",
+            "Allow",
+            "AdditionalDirectory",
+            "OtherSetting",
+            "Unparsed",
+            "Memory",
+            "RuleFile",
+            "Skill",
+            "PluginListing",
+            "Overridden",
+            "Symlink",
+            "OtherFile",
+            "NotRead",
+            "Unreadable",
+            "OverBudget",
+            "GitUnverified",
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .collect();
+        assert_eq!(kinds, expected);
+    }
 }
