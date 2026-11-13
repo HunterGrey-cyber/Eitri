@@ -193,6 +193,36 @@ pub struct UserSettings {
     pub hooks: Option<Value>,
     #[serde(default)]
     pub env: BTreeMap<String, String>,
+    /// Permission rules for the user settings tier; only the scenarios `permission_rules_allowed` names may carry
+    /// them, since an allow rule changes what the CLI asks about.
+    #[serde(default)]
+    pub permissions: Option<Value>,
+}
+
+/// Whether a scenario may seed permission rules in its user settings: the plan-mode probes (`m40_*`) and the
+/// dangerous-rule scenario `c40d`, which measure how the CLI treats a seeded `Bash(*)`.
+pub fn permission_rules_allowed(id: &str) -> bool {
+    id.starts_with("m40_") || id == "c40d"
+}
+
+fn check_user_settings(id: &str, variant: Option<&str>, us: &UserSettings) -> Result<(), String> {
+    for name in us.env.keys() {
+        check_env_name(id, variant, name, EnvPlace::UserSettingsEnv)?;
+    }
+    if let Some(perms) = &us.permissions {
+        let variant = variant.map(|v| format!(" variant `{v}`")).unwrap_or_default();
+        if !permission_rules_allowed(id) {
+            return Err(format!(
+                "scenario `{id}`{variant}: user_settings.permissions is not allowed here"
+            ));
+        }
+        if !perms.is_object() {
+            return Err(format!(
+                "scenario `{id}`{variant}: user_settings.permissions is an object"
+            ));
+        }
+    }
+    Ok(())
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -386,9 +416,7 @@ impl Scenario {
             check_env_name(id, None, name, EnvPlace::Env)?;
         }
         if let Some(us) = &self.user_settings {
-            for name in us.env.keys() {
-                check_env_name(id, None, name, EnvPlace::UserSettingsEnv)?;
-            }
+            check_user_settings(id, None, us)?;
         }
         if let Some(name) = &self.client_tools {
             if !CLIENT_TOOL_SETS.contains(&name.as_str()) {
@@ -423,9 +451,7 @@ impl Scenario {
                 check_env_name(id, Some(name), env, EnvPlace::Env)?;
             }
             if let Some(us) = &v.user_settings {
-                for env in us.env.keys() {
-                    check_env_name(id, Some(name), env, EnvPlace::UserSettingsEnv)?;
-                }
+                check_user_settings(id, Some(name), us)?;
             }
             check_requires(&v.requires, &format!("scenario `{id}` variant `{name}`"))?;
             for part in v.driver.iter().flatten() {
@@ -1085,6 +1111,28 @@ mod tests {
         assert!(parse(scenario("c00", json!({}))).unwrap().expect.is_none());
         let err = parse(scenario("c08_manual", json!({"expect": ["not", "an", "object"]}))).unwrap_err();
         assert!(err.contains("`expect` is an object"), "{err}");
+    }
+
+    #[test]
+    fn only_the_plan_probes_and_c40d_seed_permission_rules() {
+        let rules = json!({"user_settings": {"permissions": {"allow": ["Bash(*)", "Bash(echo *)"]}}});
+        for id in ["m40_rules", "m40_host", "c40d"] {
+            let s = parse(scenario(id, rules.clone())).unwrap_or_else(|e| panic!("{id}: {e}"));
+            assert_eq!(s.user_settings.unwrap().permissions.unwrap()["allow"][0], "Bash(*)");
+        }
+        for id in ["c40", "c40dx", "c14"] {
+            let err = parse(scenario(id, rules.clone())).unwrap_err();
+            assert!(err.contains("user_settings.permissions is not allowed"), "{id}: {err}");
+        }
+        let variant = json!({"variants": {"v": {"user_settings": {"permissions": {"allow": []}}}}});
+        assert!(parse(scenario("c14", variant.clone())).is_err());
+        assert!(parse(scenario("m40_rules", variant)).is_ok());
+        let err = parse(scenario(
+            "m40_rules",
+            json!({"user_settings": {"permissions": ["Bash(*)"]}}),
+        ))
+        .unwrap_err();
+        assert!(err.contains("is an object"), "{err}");
     }
 
     #[test]
