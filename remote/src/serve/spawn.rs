@@ -345,11 +345,13 @@ mod tests {
             0o700,
         )
         .unwrap();
-        // A descriptor this process holds without close-on-exec, as a library might leave one.
+        // A descriptor this process holds without close-on-exec, as a library might leave one. Numbered from 100: the
+        // lowest free number is whatever other tests in this process just closed, often 3, which is also the number
+        // `ls` below takes for the directory it lists, so a low one would read as inherited when it was not.
         let file = std::fs::File::open(&exe).unwrap();
-        // SAFETY: `dup` takes a valid descriptor and returns a new one (or -1, checked), owned below.
-        let leaked = unsafe { libc::dup(file.as_raw_fd()) };
-        assert!(leaked > 2);
+        // SAFETY: `F_DUPFD` takes a valid descriptor and returns a new one (or -1, checked), owned below.
+        let leaked = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_DUPFD, 100) };
+        assert!(leaked >= 100);
         // SAFETY: `leaked` is a descriptor this test just made and owns alone.
         let leaked = unsafe { OwnedFd::from_raw_fd(leaked) };
         // Cargo gives every test process variables of its own: one of them stands for a secret the window holds.

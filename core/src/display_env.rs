@@ -165,11 +165,20 @@ pub fn socket_is_live(path: &Path, timeout: Duration) -> bool {
         for (slot, byte) in addr.sun_path.iter_mut().zip(bytes) {
             *slot = *byte as libc::c_char;
         }
-        // Not `SOCK_CLOEXEC | SOCK_NONBLOCK` in the call: macOS has neither. This runs before any thread exists.
+        // Close-on-exec from the start where the call can say so, so a child another thread is starting never keeps
+        // the probe's descriptor; macOS has neither flag, and there the probe runs before any thread exists.
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        let fd = libc::socket(
+            libc::AF_UNIX,
+            libc::SOCK_STREAM | libc::SOCK_CLOEXEC | libc::SOCK_NONBLOCK,
+            0,
+        );
+        #[cfg(not(any(target_os = "linux", target_os = "android")))]
         let fd = libc::socket(libc::AF_UNIX, libc::SOCK_STREAM, 0);
         if fd < 0 {
             return false;
         }
+        #[cfg(not(any(target_os = "linux", target_os = "android")))]
         if libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) < 0
             || libc::fcntl(fd, libc::F_SETFL, libc::fcntl(fd, libc::F_GETFL) | libc::O_NONBLOCK) < 0
         {
@@ -235,8 +244,22 @@ mod tests {
 
     /// A socket file nothing listens on, as a closed desktop session leaves behind.
     fn dead(dir: &Path, name: &str) {
-        drop(UnixListener::bind(dir.join(name)).unwrap());
+        close(UnixListener::bind(dir.join(name)).unwrap());
         assert!(dir.join(name).exists());
+    }
+
+    /// Stops `listener` listening, then drops it. A child another test thread is starting holds a copy of the
+    /// listener until it execs, and while that copy lives a connect still succeeds; a shut-down listener refuses
+    /// every connect, whatever copies remain.
+    fn close(listener: UnixListener) {
+        use std::os::fd::AsRawFd;
+        // SAFETY: `shutdown` on a descriptor `listener` owns for the call.
+        let rc = unsafe { libc::shutdown(listener.as_raw_fd(), libc::SHUT_RDWR) };
+        // macOS may refuse a listener's shutdown (`ENOTCONN`); there the drop alone stands, with the same race.
+        #[cfg(target_os = "linux")]
+        assert_eq!(rc, 0, "{}", std::io::Error::last_os_error());
+        let _ = rc;
+        drop(listener);
     }
 
     fn touch(dir: &Path, name: &str, seconds_since_epoch: i64) {
@@ -453,7 +476,53 @@ mod tests {
         for round in 0..600 {
             assert!(socket_is_live(&dir.join("wayland-1"), PROBE_TIMEOUT), "round {round}");
         }
-        drop(listener);
+        close(listener);
         assert!(!socket_is_live(&dir.join("wayland-1"), PROBE_TIMEOUT));
+    }
+
+    /// What a child another test thread is starting does until it execs: holds a copy of the listener.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn a_listener_another_process_still_holds_reads_dead_once_shut_down() {
+        use std::io::Read;
+        use std::os::fd::AsRawFd;
+        use std::os::unix::process::CommandExt;
+        let dir = scratch("held");
+        let listener = live(&dir, "wayland-1");
+        let fd = listener.as_raw_fd();
+        // Another number than the listener's own: `dup2` onto itself would keep close-on-exec, and the copy would go.
+        let copy = if fd == 50 { 51 } else { 50 };
+        let mut holder = std::process::Command::new("sh");
+        holder
+            .args([
+                "-c",
+                r#"if [ -e "/proc/self/fd/$1" ]; then echo held; else echo lost; fi; read _; exit 0"#,
+                "sh",
+                &copy.to_string(),
+            ])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped());
+        // SAFETY: `dup2` is async-signal-safe and touches only the child's descriptor table; the copy it makes is
+        // not close-on-exec, so the shell keeps the listener as `copy`.
+        unsafe {
+            holder.pre_exec(move || {
+                if libc::dup2(fd, copy) < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let mut holder = holder.spawn().unwrap();
+        let mut said = [0u8; 5];
+        holder.stdout.take().unwrap().read_exact(&mut said).unwrap();
+        assert_eq!(&said, b"held\n", "the shell holds a copy of the listener");
+        close(listener);
+        let dead = !socket_is_live(&dir.join("wayland-1"), PROBE_TIMEOUT);
+        drop(holder.stdin.take());
+        holder.wait().unwrap();
+        assert!(
+            dead,
+            "a listener another process holds a copy of still answered after its shutdown"
+        );
     }
 }

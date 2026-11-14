@@ -9,7 +9,8 @@
 //! - Tool results compare as their text: a string as is, text blocks joined by newlines, any other block as
 //!   `[<type>]`.
 //! - Adjacent assistant text in one turn is one entry, and so is adjacent thinking: Eitri coalesces deltas,
-//!   the CLI writes one line per block. A record may also keep two messages of one turn as two rows; the
+//!   the CLI writes one line per block. The reader has already put the paragraph separator in front of a
+//!   text block that follows a text block of the same message, as Eitri's records do. A record may also keep two messages of one turn as two rows; the
 //!   alignment joins those where the CLI holds the joined text.
 //! - A question set compares by its key alone ([`super::QuestionKey`]): how many questions, which carry an
 //!   answer, and how it ended. Eitri's own ends map onto the oracle's words in [`question_end`]: an interrupt,

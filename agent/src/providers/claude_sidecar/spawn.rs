@@ -2257,8 +2257,9 @@ impl Drop for SpawnedSidecar {
 }
 
 /// [`stop_child`] for a sidecar this process took over: its stdin is already closed by the caller;
-/// waits up to `grace` on the pidfd, then SIGKILLs the group through it even if the leader exited (a
-/// kernel without group signals through a pidfd reaches the group only while the leader lives). Nothing is
+/// waits up to `grace` on the pidfd, then SIGKILLs the group through it even if the leader exited
+/// (`PidFd::signal_group`, which on a kernel without group signals through a pidfd uses the group's
+/// number while the leader's pid names no other process). Nothing is
 /// reaped here: the status is the kernel parent's to read (the window that started the sidecar, or init
 /// once it is gone).
 #[cfg(target_os = "linux")]

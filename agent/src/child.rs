@@ -66,6 +66,7 @@ pub fn process_group(pid: u32) -> io::Result<u32> {
 pub struct PidFd {
     fd: OwnedFd,
     pid: u32,
+    start: u64,
 }
 
 impl PidFd {
@@ -85,7 +86,7 @@ impl PidFd {
                 format!("pid {pid} now names another process"),
             ));
         }
-        Ok(PidFd { fd, pid })
+        Ok(PidFd { fd, pid, start })
     }
 
     pub fn pid(&self) -> u32 {
@@ -97,21 +98,31 @@ impl PidFd {
     }
 
     /// The signal to the process group this process leads (a sidecar, an agent or a task started in a group of its
-    /// own). On a kernel without group signals through a pidfd, `kill(-pid)` while the pidfd says the leader lives.
+    /// own), also once the leader has exited and been reaped: the rest of the group still runs and goes too. Through
+    /// the pidfd where the kernel can (Linux 6.9 and later), else by the group's number ([`Self::signal_group_by_number`]).
     pub fn signal_group(&self, signal: i32) -> io::Result<()> {
         match self.send(signal, PIDFD_SIGNAL_PROCESS_GROUP) {
-            Err(err) if err.raw_os_error() == Some(libc::EINVAL) => {
-                if self.exited() {
-                    return Err(io::Error::from_raw_os_error(libc::ESRCH));
-                }
-                // SAFETY: `kill` reads no memory of ours.
-                if unsafe { libc::kill(-(self.pid as libc::pid_t), signal) } == 0 {
-                    Ok(())
-                } else {
-                    Err(io::Error::last_os_error())
-                }
-            }
+            Err(err) if err.raw_os_error() == Some(libc::EINVAL) => self.signal_group_by_number(signal),
             other => other,
+        }
+    }
+
+    /// `kill(-pid)`, refused (`ESRCH`) once the leader's pid names another process. The kernel hands a pid out again
+    /// only when no process uses it, as its pid or as its group's number, so while any member of the group lives the
+    /// group number names this group alone, whether the leader runs, is a zombie or has been reaped. The number can
+    /// name another group only after the whole group ended and the pid was handed to a new process that made a group
+    /// of its own: since the leader exited when that process has ended too or cannot be seen in this `/proc`
+    /// (`hidepid`, another pid namespace), or between the look at `/proc` and the `kill`. Each needs the cyclic pid
+    /// allocation to come round to this very pid in that time.
+    fn signal_group_by_number(&self, signal: i32) -> io::Result<()> {
+        if !group_number_is_ours(self.exited(), start_time(self.pid), self.start) {
+            return Err(io::Error::from_raw_os_error(libc::ESRCH));
+        }
+        // SAFETY: `kill` reads no memory of ours.
+        if unsafe { libc::kill(-(self.pid as libc::pid_t), signal) } == 0 {
+            Ok(())
+        } else {
+            Err(io::Error::last_os_error())
         }
     }
 
@@ -185,6 +196,20 @@ impl PidFd {
         } else {
             ExitCode::Signaled { signal: status }
         }))
+    }
+}
+
+/// Whether the leader's pid still names its group, from whether the leader has exited and what `/proc/<pid>/stat`
+/// says now: a leader that runs or is a zombie holds the number; a reaped one leaves it to the members that remain,
+/// unless the pid now names another process.
+fn group_number_is_ours(exited: bool, at_pid: io::Result<u64>, start: u64) -> bool {
+    if !exited {
+        return true;
+    }
+    match at_pid {
+        Ok(now) => now == start,
+        // `ESRCH`: the stat file was opened before the leader was released and read after.
+        Err(err) => err.kind() == io::ErrorKind::NotFound || err.raw_os_error() == Some(libc::ESRCH),
     }
 }
 
@@ -300,5 +325,80 @@ mod tests {
         assert!(member_fd.wait_exited(Duration::from_secs(2)));
         assert!(leader.wait_exited(Duration::from_secs(2)));
         sh.wait().unwrap();
+    }
+
+    /// A group whose leader has exited and been reaped by its parent (this test), with one member left: the
+    /// member's pidfd, and the leader's opened while it ran.
+    struct Orphaned {
+        member: PidFd,
+        leader: PidFd,
+    }
+
+    impl Drop for Orphaned {
+        fn drop(&mut self) {
+            let _ = self.member.signal(libc::SIGKILL);
+        }
+    }
+
+    fn orphaned_group() -> Orphaned {
+        let mut sh = Command::new("sh")
+            .args(["-c", "sleep 30 >/dev/null 2>&1 & echo $!; read _; exit 0"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let mut line = String::new();
+        BufReader::new(sh.stdout.take().unwrap()).read_line(&mut line).unwrap();
+        let member: u32 = line.trim().parse().unwrap();
+        let group = Orphaned {
+            member: PidFd::open(member, start_time(member).unwrap()).unwrap(),
+            leader: PidFd::open(sh.id(), start_time(sh.id()).unwrap()).unwrap(),
+        };
+        drop(sh.stdin.take());
+        assert!(sh.wait().unwrap().success());
+        assert_eq!(
+            start_time(sh.id()).unwrap_err().kind(),
+            io::ErrorKind::NotFound,
+            "the leader is reaped"
+        );
+        assert_eq!(process_group(member).unwrap(), sh.id());
+        assert!(!group.member.exited());
+        group
+    }
+
+    #[test]
+    fn a_group_signal_reaches_the_members_left_after_the_leader_is_reaped() {
+        let group = orphaned_group();
+        group.leader.signal_group(libc::SIGTERM).unwrap();
+        assert!(group.member.wait_exited(Duration::from_secs(5)));
+    }
+
+    #[test]
+    fn without_group_signals_through_a_pidfd_the_group_number_still_reaches_the_members_left() {
+        let group = orphaned_group();
+        group.leader.signal_group_by_number(libc::SIGTERM).unwrap();
+        assert!(group.member.wait_exited(Duration::from_secs(5)));
+    }
+
+    #[test]
+    fn the_group_number_is_used_only_while_the_leaders_pid_names_no_other_process() {
+        let gone = || Err(io::Error::from(io::ErrorKind::NotFound));
+        assert!(group_number_is_ours(false, gone(), 7), "the pidfd says the leader runs");
+        assert!(group_number_is_ours(true, Ok(7), 7), "a zombie leader");
+        assert!(
+            group_number_is_ours(true, gone(), 7),
+            "reaped: the members left hold the number"
+        );
+        assert!(
+            group_number_is_ours(true, Err(io::Error::from_raw_os_error(libc::ESRCH)), 7),
+            "released while its stat was read"
+        );
+        assert!(!group_number_is_ours(true, Ok(8), 7), "the pid names another process");
+        assert!(!group_number_is_ours(
+            true,
+            Err(io::Error::from(io::ErrorKind::PermissionDenied)),
+            7
+        ));
     }
 }

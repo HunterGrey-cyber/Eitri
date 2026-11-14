@@ -259,6 +259,10 @@ struct Reader {
     pending_turn_duration: Option<Pos>,
     /// Blocks already read per assistant `message.id`.
     seen_blocks: HashMap<String, HashSet<String>>,
+    /// The `message.id` of the last assistant text pushed, with the turn's index and entry count just after it (or
+    /// after thinking of the same message that followed it): a text block of that message read while they still hold
+    /// is the next paragraph of that reply. Thinking does not end the reply; a tool call or anything else does.
+    last_text: Option<(String, usize, usize)>,
     /// The input of each question call whose result has not been read, by tool-use id.
     asks: HashMap<String, Value>,
     /// The input of each plan call whose result has not been read, by tool-use id.
@@ -274,6 +278,7 @@ impl Reader {
             pending_compaction: None,
             pending_turn_duration: None,
             seen_blocks: HashMap::new(),
+            last_text: None,
             asks: HashMap::new(),
             plans: HashMap::new(),
         }
@@ -576,10 +581,21 @@ impl Reader {
                 bump(&mut form.unrecorded, "assistant:block-repeated");
                 continue;
             }
+            let kind = block.get("type").and_then(Value::as_str);
+            let is_text = kind == Some("text");
+            let is_thinking = matches!(kind, Some("thinking" | "redacted_thinking"));
+            let continues = self.follows_text_of(&message_id);
             let entry = match block.get("type").and_then(Value::as_str) {
-                Some("text") => Entry::Assistant {
-                    text: block.get("text").and_then(Value::as_str).unwrap_or_default().to_owned(),
-                },
+                Some("text") => {
+                    let mut text = block.get("text").and_then(Value::as_str).unwrap_or_default().to_owned();
+                    // The CLI draws each content block as its own row, so a text block straight after another
+                    // of the same message is its next paragraph; Eitri's records keep it so
+                    // (`TEXT_BLOCK_SEPARATOR`), and joined adjacent text then reads the same on both sides.
+                    if continues {
+                        text.insert_str(0, crate::projection::TEXT_BLOCK_SEPARATOR);
+                    }
+                    Entry::Assistant { text }
+                }
                 Some("tool_use") => {
                     let id = block.get("id").and_then(Value::as_str).unwrap_or_default().to_owned();
                     let name = block.get("name").and_then(Value::as_str).unwrap_or_default().to_owned();
@@ -610,6 +626,12 @@ impl Reader {
                 }
             };
             self.mid_turn(form, entry, pos);
+            self.last_text = match &self.current {
+                Some(turn) if !message_id.is_empty() && (is_text || (is_thinking && continues)) => {
+                    Some((message_id.clone(), turn.index, turn.entries.len()))
+                }
+                _ => None,
+            };
             produced = true;
         }
         if !produced && blocks.is_empty() {
@@ -737,6 +759,22 @@ impl Reader {
     }
 
     /// Adds an entry to the running turn.
+    /// Whether a text block of `message_id` read now comes straight after the last text of the same message:
+    /// nothing pushed since, and nothing waiting to be.
+    fn follows_text_of(&self, message_id: &str) -> bool {
+        let Some((id, index, len)) = &self.last_text else {
+            return false;
+        };
+        !message_id.is_empty()
+            && id == message_id
+            && self.pending_compaction.is_none()
+            && self.pending_turn_duration.is_none()
+            && self
+                .current
+                .as_ref()
+                .is_some_and(|turn| turn.index == *index && turn.entries.len() == *len)
+    }
+
     fn mid_turn(&mut self, form: &mut CliForm, entry: Entry, pos: Pos) {
         if let Some(at) = self.pending_turn_duration.take() {
             form.inconsistencies
@@ -1017,6 +1055,61 @@ mod tests {
                 pos: Pos { input: 0, line: 2 }
             }]
         );
+    }
+
+    #[test]
+    fn two_text_blocks_of_one_message_are_two_paragraphs_of_one_reply() {
+        let block = |id: &str, uuid: &str, text: &str| {
+            format!(
+                r#"{{"type":"assistant","isSidechain":false,"uuid":"{uuid}","message":{{"id":"{id}","content":[{{"type":"text","text":"{text}"}}]}}}}"#
+            )
+        };
+        let text = [
+            r#"{"type":"user","isSidechain":false,"promptSource":"sdk","message":{"role":"user","content":"go"}}"#
+                .to_owned(),
+            block("m1", "u1", "HELD"),
+            block("m1", "u2", "END"),
+            // Another message's text is more of the reply, as before: no paragraph is assumed between messages.
+            block("m2", "u3", "MORE"),
+        ]
+        .join("\n");
+        let mut form = read_texts(&[&text]);
+        super::super::normalise::join_adjacent(&mut form.turns);
+        assert_eq!(
+            form.turns[0].entries[1],
+            Entry::Assistant {
+                text: "HELD\n\nENDMORE".into()
+            }
+        );
+    }
+
+    #[test]
+    fn thinking_between_two_text_blocks_of_one_message_keeps_them_one_reply_and_a_tool_call_ends_it() {
+        let line = |uuid: &str, block: &str| {
+            format!(
+                r#"{{"type":"assistant","isSidechain":false,"uuid":"{uuid}","message":{{"id":"m1","content":[{block}]}}}}"#
+            )
+        };
+        let text = [
+            r#"{"type":"user","isSidechain":false,"promptSource":"sdk","message":{"role":"user","content":"go"}}"#
+                .to_owned(),
+            line("u1", r#"{"type":"text","text":"A"}"#),
+            line("u2", r#"{"type":"thinking","thinking":"hmm"}"#),
+            line("u3", r#"{"type":"text","text":"B"}"#),
+            line("u4", r#"{"type":"tool_use","id":"toolu_1","name":"Read","input":{}}"#),
+            line("u5", r#"{"type":"text","text":"C"}"#),
+        ]
+        .join("\n");
+        let form = read_texts(&[&text]);
+        let texts: Vec<&str> = form.turns[0]
+            .entries
+            .iter()
+            .filter_map(|e| match e {
+                Entry::Assistant { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(texts, ["A", "\n\nB", "C"]);
     }
 
     #[test]

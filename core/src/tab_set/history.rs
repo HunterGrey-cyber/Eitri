@@ -325,9 +325,13 @@ mod tests {
             std::thread::yield_now();
         }
     }
+    /// Queues `count` whole turns under one lock, so ingestion folds them in one batch: its next look at eviction
+    /// sees all of them, never a part. Taken a turn at a time, a loaded machine folds a part first, and eviction then
+    /// runs below the ceiling or is still due when the caller's wait for the last prompt ends.
     fn turns(provider: &RecordingProvider, from: usize, count: usize) {
+        let mut events = Vec::with_capacity(count * 4);
         for n in from..from + count {
-            provider.queue_all(vec![
+            events.extend([
                 AgentDomainEvent::UserPromptSubmitted {
                     text: format!("prompt {n}"),
                 },
@@ -349,6 +353,7 @@ mod tests {
                 },
             ]);
         }
+        provider.queue_all(events);
     }
     fn fixture() -> (TabSet, TabId, Arc<RecordingProvider>) {
         agent::state_dirs::redirect_state_to_a_test_root();
@@ -368,6 +373,11 @@ mod tests {
         let n = agent::history::history_turns();
         turns(&provider, 0, n + n / 10 + 1);
         until(|| tabs.get(id).unwrap().live().unwrap().projection().evicted.is_some());
+        assert_eq!(
+            tabs.get(id).unwrap().live().unwrap().projection().user_prompts.len(),
+            n,
+            "the cut leaves the turn budget"
+        );
         (tabs, id, provider)
     }
     fn loaded(tabs: &mut TabSet, id: TabId) -> serde_json::Value {
@@ -401,6 +411,12 @@ mod tests {
                 && p.evicted.as_ref().is_some_and(|e| e.turns > n as u64)
                 && p.active_turn_id.is_none()
         });
+        // A cut still due would run at the first request's ceiling and release its reservation.
+        assert_eq!(
+            tabs.get(id).unwrap().live().unwrap().projection().user_prompts.len(),
+            n,
+            "the cut leaves the turn budget"
+        );
         (tabs, id, provider)
     }
 

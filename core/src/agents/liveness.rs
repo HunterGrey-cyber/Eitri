@@ -105,8 +105,42 @@ pub(crate) fn lock_is_held(lock: &Path) -> bool {
         Ok(meta) if meta.is_file() && meta.uid() == euid() => {}
         _ => return false,
     }
-    // Taken here means nobody held it; closing `file` lets it go again at once.
-    !matches!(try_flock(&file), Ok(true))
+    // Taken here means nobody held it. It is let go before `file` closes: a child another thread is starting shares
+    // this open file, and with it the lock, until it execs, so a lock left to the close could still read as held to
+    // the next look, and `clean_dead` would leave the files of a writer that is gone.
+    if !matches!(try_flock(&file), Ok(true)) {
+        return true;
+    }
+    #[cfg(test)]
+    probe_hook::taken(&file);
+    // SAFETY: the descriptor is `file`'s own and open for the call; `flock` takes no pointers.
+    unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_UN) };
+    false
+}
+
+/// A test's look at the descriptor [`lock_is_held`] has just locked, before it lets the lock go.
+#[cfg(test)]
+mod probe_hook {
+    use std::cell::RefCell;
+    use std::fs::File;
+
+    type Hook = Box<dyn FnMut(&File)>;
+
+    thread_local! {
+        static TAKEN: RefCell<Option<Hook>> = const { RefCell::new(None) };
+    }
+
+    pub(super) fn set(hook: impl FnMut(&File) + 'static) {
+        TAKEN.with(|taken| *taken.borrow_mut() = Some(Box::new(hook)));
+    }
+
+    pub(super) fn taken(file: &File) {
+        TAKEN.with(|taken| {
+            if let Some(hook) = taken.borrow_mut().as_mut() {
+                hook(file);
+            }
+        });
+    }
 }
 
 /// One try at the exclusive lock: `Ok(true)` when taken, `Ok(false)` when another open holds it.
@@ -222,4 +256,65 @@ pub fn clean_dead(agents_dir: &File, control_dir: &File, instance: &str) -> io::
         unlink_at(agents_dir, &lock_name)?;
     }
     Ok(removed)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Read;
+    use std::os::unix::process::CommandExt;
+    use std::process::{Child, Command, Stdio};
+
+    /// A child that holds a copy of `fd` until its stdin closes, as a child another thread is starting holds every
+    /// descriptor until it execs. It says `held` once it has the copy.
+    fn holder_of(fd: libc::c_int) -> Child {
+        // Another number than `fd`: `dup2` onto itself would keep close-on-exec, and the copy would go.
+        let copy = if fd == 50 { 51 } else { 50 };
+        let mut command = Command::new("sh");
+        command
+            .args([
+                "-c",
+                r#"if [ -e "/proc/self/fd/$1" ]; then echo held; else echo lost; fi; read _; exit 0"#,
+                "sh",
+                &copy.to_string(),
+            ])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped());
+        // SAFETY: `dup2` is async-signal-safe and touches only the child's descriptor table.
+        unsafe {
+            command.pre_exec(move || {
+                if libc::dup2(fd, copy) < 0 {
+                    return Err(io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let mut child = command.spawn().unwrap();
+        let mut said = [0u8; 5];
+        child.stdout.take().unwrap().read_exact(&mut said).unwrap();
+        assert_eq!(&said, b"held\n", "the shell holds a copy of the look's descriptor");
+        child
+    }
+
+    #[test]
+    fn a_look_at_a_free_lock_leaves_it_free_whatever_copies_its_descriptor_has() {
+        let dir = agent::state_dirs::test_workspace_dir("liveness-probe");
+        let lock = dir.join("0123456789abcdef.lock");
+        agent::private_fs::write_private(&lock, b"").unwrap();
+        let holders = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let kept = holders.clone();
+        probe_hook::set(move |file| kept.borrow_mut().push(holder_of(file.as_raw_fd())));
+        assert!(!lock_is_held(&lock), "nobody holds it");
+        assert_eq!(holders.borrow().len(), 1, "the look took the lock");
+        let again = lock_is_held(&lock);
+        for mut holder in holders.borrow_mut().drain(..) {
+            drop(holder.stdin.take());
+            holder.wait().unwrap();
+        }
+        assert!(
+            !again,
+            "the first look's lock lived on in a child's copy of its descriptor"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 }
