@@ -12,7 +12,7 @@
 //! directions cannot be changed independently without one of them going red.
 //!
 //! **Why stripping at all.** Measured 2026-09-20: the prompt text on disk is the WIRE turn,
-//! not what the user typed -- 2 of the 6 SDK-driven sessions on this machine end with a block this
+//! not what the user typed -- 2 of the 6 SDK-driven sessions in the measured corpus end with a block this
 //! project's own `compose_turn_text` appended. `AgentDomainEvent::UserPromptSubmitted`'s own doc
 //! says `text` is "the text the user typed, deliberately NOT the text that went on the wire", so
 //! feeding the raw on-disk prompt into it would render a file path and a selection nobody wrote,

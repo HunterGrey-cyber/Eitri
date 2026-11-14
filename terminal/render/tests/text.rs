@@ -28,7 +28,7 @@ fn a_full_width_char_is_one_glyph_over_two_cells_with_no_glyph_on_the_spacer() {
     // character. Asserting only the text would miss it; asserting the COLUMNS
     // is what catches it.
     let mut s = Screen::new(20, 3);
-    s.feed("\u{6f22}\u{5b57}"); // Two full-width characters.
+    s.feed("\u{6f22}\u{5b57}"); // U+6F22 U+5B57, two wide characters
     let g = glyphs_on(&s.paint(), 0);
     assert_eq!(
         g,

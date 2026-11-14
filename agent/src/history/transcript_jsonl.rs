@@ -1,8 +1,8 @@
 //! Turning the real Claude CLI's own `<uuid>.jsonl` transcript into ordered `AgentDomainEvent`s.
 //!
-//! The corpus measurements quoted in this file were
-//! made on 2026-09-20 over the 822 real `.jsonl` files (570 MB, 117,826 lines) under this
-//! machine's own `$CLAUDE_CONFIG_DIR/projects`.
+//! The corpus measurements quoted in this file were made on 2026-09-20 over 822 real `.jsonl` files
+//! (570 MB, 117,826 lines) under a real `$CLAUDE_CONFIG_DIR/projects`; called "the measured corpus"
+//! below and elsewhere.
 //!
 //! Three properties this module exists to hold, none of which is convenience:
 //!
@@ -12,11 +12,11 @@
 //!    degrade to "less history was shown", never to a failed resume.
 //! 2. **`type:"user"` does not mean "the user typed this".** The decision is an ALLOW-list
 //!    ([`user_line_is_the_users_own_words`]), never a deny-list, because a deny-list's failure
-//!    direction is rendering someone else's text under the user's name -- and the corpus contains
+//!    direction is rendering someone else's text under the user's name -- and the measured corpus contains
 //!    exactly such a line: a compaction summary is a `type:"user"` line whose `message.content` is
 //!    a plain string, indistinguishable from a typed prompt by shape alone.
-//! 3. **Memory is bounded by the constants below, not by the file.** The largest real transcript on
-//!    this machine is 47,254,948 bytes.
+//! 3. **Memory is bounded by the constants below, not by the file.** The largest real transcript in
+//!    the measured corpus is 47,254,948 bytes.
 //!
 //! What this module does NOT do: fold anything into a projection, write anything anywhere, or read
 //! anything under `$CLAUDE_CONFIG_DIR` other than the one file it is handed. That directory belongs
@@ -40,7 +40,7 @@ use crate::provider::AttachmentMeta;
 
 /// The most conversational items a restored history may carry.
 ///
-/// 400, chosen on 2026-09-20 from these figures. Measured over this machine's 44 real session files by
+/// 400, chosen on 2026-09-20 from these figures. Measured over a corpus of 44 real session files by
 /// replaying the exact take-from-the-newest rule below: at 200, 14 of 44 sessions (32%) were
 /// truncated; at 400, 8 of 44 (18%). The cost of the larger number is the item ceiling and each
 /// item's fixed overhead, not text volume -- the most text any session loads is identical under
@@ -53,14 +53,14 @@ pub const HISTORY_MAX_ITEMS: usize = 400;
 /// The most characters a restored history may carry, counting each tool call's serialized `input`
 /// and `result`.
 ///
-/// Not decoration: at 400 items, 5 of this machine's 44 sessions are governed by this limit rather
+/// Not decoration: at 400 items, 5 of the measured corpus's 44 sessions are governed by this limit rather
 /// than by the item count (3 hit it outright, 2 more land within 5% of it). It is what stands
 /// between the panel and a single tool result of 483,545 bytes multiplied by the item ceiling.
 pub const HISTORY_MAX_CHARS: usize = 1_000_000;
 
 /// How far back from the end of the file the scan may reach.
 ///
-/// One of this machine's 44 sessions exceeds it (47,254,948 bytes) -- about 2%, which is the right
+/// One of the measured corpus's 44 sessions exceeds it (47,254,948 bytes) -- about 2%, which is the right
 /// trigger rate for a fallback: neither dead code nor the common case. Lowering it to 4 MiB would
 /// put 6 of 44 onto the "count unknown" notice. It is not a time budget: reading the largest file
 /// whole takes 0.143 s in Python. It is a memory and worst-case bound. A deliberate non-choice is
@@ -100,7 +100,7 @@ pub struct TranscriptHistory {
     /// In file order, ready to be handed to `apply` one at a time.
     ///
     /// Order is the order lines appear in the file, NOT a walk of the `parentUuid` chain. That
-    /// chain is not a chain: 20 of this machine's 44 session files contain 127 positions where one
+    /// chain is not a chain: 20 of the measured corpus's 44 session files contain 127 positions where one
     /// `parentUuid` is referenced by several lines, and which child is "the main line" is not
     /// expressed on disk. Reconstructing it would mean guessing at those 127 positions, and a wrong
     /// guess silently drops a whole stretch of conversation. Flattening is uglier and loses nothing.
@@ -1819,7 +1819,7 @@ fn read_bounded_line(reader: &mut impl BufRead) -> std::io::Result<Option<Line>>
     }
 }
 
-/// Every real top-level session transcript under this machine's `$CLAUDE_CONFIG_DIR/projects`.
+/// Every real top-level session transcript under the current `$CLAUDE_CONFIG_DIR/projects`.
 ///
 /// Shared by the `#[ignore]`d real-corpus tests in this module and in `history::load`, so the two
 /// walk the SAME set of files: a bucket holds directories as well as files, and `agent-<hex>.jsonl`
@@ -3447,7 +3447,7 @@ mod tests {
     // The editor-context block
     // ---------------------------------------------------------------------------------------
 
-    /// The prompt on disk is the WIRE turn. Two of the six Eitri-driven sessions on this machine
+    /// The prompt on disk is the WIRE turn. Two of the six Eitri-driven sessions in the measured corpus
     /// carry a block this project's own `compose_turn_text` appended, and
     /// `UserPromptSubmitted::text` is documented as what the user typed, not what went on the wire.
     #[test]
@@ -3474,7 +3474,7 @@ mod tests {
     // Order, truncation and bounds
     // ---------------------------------------------------------------------------------------
 
-    /// File order, not a walk of `parentUuid`: 20 of this machine's 44 session files hold 127
+    /// File order, not a walk of `parentUuid`: 20 of the measured corpus's 44 session files hold 127
     /// positions where one parent has several children, and which child continues the main line is
     /// not expressed on disk.
     #[test]
@@ -3550,7 +3550,7 @@ mod tests {
     #[test]
     fn the_character_budget_can_bind_before_the_item_count_does() {
         // Two items, each over half the budget: only the newer can fit, well short of the item
-        // ceiling. Measured, this is the binding limit for 5 of this machine's 44 sessions.
+        // ceiling. Measured, this is the binding limit for 5 of the measured corpus's 44 sessions.
         let older = "z".repeat(HISTORY_MAX_CHARS * 2 / 3);
         let newer = "y".repeat(HISTORY_MAX_CHARS * 2 / 3);
         let history = fold(&format!("{}\n{}", typed_prompt(&older), typed_prompt(&newer)));
@@ -3788,7 +3788,7 @@ mod tests {
     /// `len - HISTORY_SCAN_MAX_BYTES`, the partial line at that offset is dropped, and
     /// `omitted_items` becomes `None` -- because the number of records in the part that was never
     /// read is genuinely unknown, and reporting the part that was seen would be a precise-looking
-    /// count of the wrong thing. One of this machine's 44 sessions is past the limit.
+    /// count of the wrong thing. One of the measured corpus's 44 sessions is past the limit.
     #[test]
     fn a_file_past_the_scan_limit_is_read_from_its_tail_and_says_the_count_is_unknown() {
         let dir = temp_dir("tail");
@@ -3895,22 +3895,22 @@ mod tests {
         assert_eq!(history.writer_version.as_deref(), Some("2.1.272"));
     }
 
-    /// Runs the reader over every real top-level session file under `$CLAUDE_CONFIG_DIR/projects`
-    /// on this machine. `#[ignore]`d because it needs that corpus to exist; it reads files and
-    /// bills nothing.
+    /// Runs the reader over every real top-level session file under `$CLAUDE_CONFIG_DIR/projects`.
+    /// `#[ignore]`d because it needs that corpus to exist; it reads files and bills nothing.
     ///
     /// **What this proves that no synthetic or fixture line can.** The fixtures are twelve lines
-    /// somebody chose; this is every line the CLI has actually written here (44 sessions, ~46,000
-    /// lines, 130 MB as of 2026-09-20), including whatever shapes nobody thought to look for. Four
-    /// properties, none of which a hand-made input can establish:
+    /// somebody chose; this is every line the CLI has actually written to the measured corpus
+    /// (44 sessions, ~46,000 lines, 130 MB as of 2026-09-20), including whatever shapes nobody
+    /// thought to look for. Four properties, none of which a hand-made input can establish:
     ///
     /// 1. **No real file makes the reader fail.** Not one `Err`, on any of them.
     /// 2. **The bounds hold against real sizes**, including the one 47 MB session that is the only
-    ///    file on this machine past `HISTORY_SCAN_MAX_BYTES`.
+    ///    file in the measured corpus past `HISTORY_SCAN_MAX_BYTES`.
     /// 3. **The allow-list is not vacuous on real data.** Real prompts come back -- the failure
     ///    this asserts against is a parser that is merely *safe*, refusing everything, which every
     ///    negative test above would happily pass.
-    /// 4. **Nothing in the corpus produces an unmatched completion or a surviving context block.**
+    /// 4. **Nothing in the measured corpus produces an unmatched completion or a surviving context
+    ///    block.**
     ///
     /// It deliberately asserts only shapes and counts. Nothing here reads, prints or compares
     /// conversation content.

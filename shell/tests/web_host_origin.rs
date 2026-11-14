@@ -1,24 +1,43 @@
-//! Checks that a web module's WebView has allocation origin (0,0) inside WebHost.
-//! WebKitGTK 2.52.6 adds the WebView's parent-relative allocation offset to the caret rectangle
-//! it sends to the input method. GTK then translates from the WebView to the window again.
-//! WebHost makes that extra offset zero so the candidate window is not displaced.
+//! A web module's `WebView` sits at (0,0) of its `WebHost`, in real GTK (2026-09-29).
 //!
-//! A focusable DrawingArea stands in for WebView in a gtk4::Fixed container.
-//! The direct control is placed at x=761 and must report that allocation offset.
-//! Wrapped in WebHost at x=761, it must report (0,0) and fill the host despite prior margins
-//! and centred alignment. Its window-relative origin must still be x=761.
-//! The host must have one child and forward focus grabs to it without being focusable itself.
+//! **What this holds.** WebKitGTK 2.52.6 adds `gtk_widget_get_allocation(webView)`'s x and y -- the
+//! `WebView`'s position in its parent -- to the caret rectangle it gives the input method, and GTK4's
+//! input methods translate that rectangle from the `WebView` to the window again, so the candidate
+//! window lands off by that position (`shell/src/web_host.rs`'s module doc has the source lines).
+//! `WebHost` (compiled in from `src/` below) exists to make that addend (0,0) wherever the module is.
+//! This places a stand-in for the `WebView` where the module grid puts the agent panel in the default
+//! split, 761 logical px from the left, and reads the same `gtk_widget_get_allocation` WebKit reads:
 //!
-//! This checks GTK allocation and focus forwarding. It does not check the rectangle delivered
-//! to an input method or capture-phase key delivery from a WebView.
+//! - **direct** (the positive control): the stand-in placed at x=761 itself reports x=761, the error
+//!   the user saw. A run where it does not fails as "did not exercise the trigger";
+//! - **wrapped**: the stand-in in a `WebHost` placed at x=761 reports (0,0) and the host's whole size,
+//!   even though margins and a centred alignment were set on it beforehand, while its origin in the
+//!   window is still x=761 -- the input method's own translation, which is then the only one;
+//! - **one child**: the host's only child is the stand-in;
+//! - **focus**: the host is not focusable itself, and a grab on it lands on the stand-in, as a grab on
+//!   the stand-in does (code handed only the grid's hosts still gives the `WebView` the
+//!   keys, though `ModuleGrid::add` takes a focus target so module focus never needs this).
 //!
-//! The harness starts its own 1600x900 Xvfb through support/own_x_server.rs before GTK initialises.
-//! It ignores inherited displays and disconnects from the session bus. No xvfb-run is needed.
-//! Run with:
+//! A `gtk4::Fixed` stands in for the grid: both allocate a child with a translation, which is where
+//! `gtk_widget_get_allocation`'s x and y come from. The stand-in is a focusable `DrawingArea`, not a
+//! `WebView`: the allocation read here is GTK's, whatever the widget. Not held here: that the input
+//! method is then sent the right rectangle (the sandbox pass of 2026-09-29 read that off fcitx5's bus
+//! with the same change), and that capture-phase key controllers on the host see the `WebView`'s keys
+//! (GTK has no public way to synthesize a key event; `gtk_propagate_event_internal` is read, not run).
+//!
+//! Needs a display, and never the real desktop: **it starts its own** (since 2026-09-29, `support/own_x_server.rs`) -- an `Xvfb` with a 1600x900 screen, pointed to
+//! before GTK initialises, with any inherited `WAYLAND_DISPLAY`/`DISPLAY` and session bus dropped --
 //!
 //!     cargo test -p shell --test web_host_origin -- --ignored
 //!
-//! A plain main with `harness = false` keeps GTK on the main thread.
+//! Until then it refused only a missing `GDK_BACKEND=x11`, which XWayland's `DISPLAY=:0` on a desktop
+//! session satisfies -- run from an agent shell, its window would have opened on the user's screen --
+//! and its refusal printed an `xvfb-run -a` command, whose own `Xvfb` writes a socket file and a lock
+//! file in `/tmp` (this header warned against that one and started an `Xvfb` by hand inside `bwrap`).
+//! This test starts its own X server. Do not use `xvfb-run`: its server writes shared socket and lock files.
+//! rule on GUI tests says how to run these.
+//!
+//! A plain `main` (`harness = false`), because GTK must own the main thread. About 1s.
 
 use gtk4::prelude::*;
 

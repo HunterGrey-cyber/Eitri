@@ -214,7 +214,7 @@ fn wrapped_rows_place_the_continuation_on_the_next_row() {
 
 #[test]
 fn a_wide_glyph_occupies_both_of_its_cells() {
-    let s = scenario("mixed-ascii-cjk"); // a at c0 | wide glyph at c1+2 | wide glyph at c3+2 | b at c5
+    let s = scenario("mixed-ascii-cjk"); // a | "漢" (c1+2) | "字" (c3+2) | b (c5)
     let r = Rendered::of(&s);
     let bg = rgb(DEFAULT_BG);
 
@@ -238,7 +238,7 @@ fn a_wide_glyph_occupies_both_of_its_cells() {
 
 #[test]
 fn a_wide_glyph_at_a_wrap_boundary_starts_the_next_row() {
-    let s = scenario("wide-char-at-wrap-boundary"); // abcd fills r0 (5 cols), the wide glyph wraps to r1 c0+2
+    let s = scenario("wide-char-at-wrap-boundary"); // abcd fills r0 (5 cols), "漢" wraps to r1 c0+2
     let r = Rendered::of(&s);
     let bg = rgb(DEFAULT_BG);
     assert!(r.ink_in(1, 0, 1, bg) > 0, "the wide glyph begins row 1 column 0");
@@ -250,7 +250,7 @@ fn a_wide_glyph_at_a_wrap_boundary_starts_the_next_row() {
 
 #[test]
 fn a_decorated_wide_glyph_is_decorated_across_both_cells() {
-    let s = scenario("decorated-wide-char"); // Wide glyph at c0+2 with underline and strikeout.
+    let s = scenario("decorated-wide-char"); // "漢" at c0+2 with underline + strikeout
     let r = Rendered::of(&s);
     let bg = rgb(DEFAULT_BG);
     // The decoration spans the glyph's full two-column box, because `cols` is its width. A backend
@@ -297,8 +297,8 @@ fn a_combining_mark_on_a_wide_base_keeps_the_wide_box() {
     let s = scenario("combining-marks");
     let r = Rendered::of(&s);
     let bg = rgb(DEFAULT_BG);
-    // A wide CJK base plus U+0308 starts at column 2 and occupies two columns despite having two
-    // scalars. Use the terminal's `cols`; adding the combining scalar to the base width gives three.
+    // "漢"+U+0308 is at c2+2: two scalars, still two columns. `cols` is the terminal's accounting and
+    // counting scalars to decide width would make this three.
     assert!(r.ink_in(0, 2, 1, bg) > 0, "wide base, first column");
     assert!(r.ink_in(0, 3, 1, bg) > 0, "wide base, second column");
 }
@@ -399,7 +399,7 @@ fn an_unfocused_cursor_does_not_obscure_its_cell() {
 
 #[test]
 fn a_cursor_over_a_wide_glyph_covers_both_cells() {
-    let s = scenario("cursor-over-wide-glyph"); // cursor c0+2 over a wide glyph
+    let s = scenario("cursor-over-wide-glyph"); // cursor c0+2 over "漢"
     let r = Rendered::of(&s);
     let bg = rgb(DEFAULT_BG);
     // `cols: 2` on the cursor op. A backend that assumed a cursor is always one cell would leave

@@ -1880,7 +1880,7 @@ mod tests {
     /// web module's host is a `WebHost`, which is not focusable itself, and grabbing a `GtkBox` in its
     /// place left the keys where they were in the sandbox's first wrapped run. These are the grid's
     /// own records, with each module's host and focus target told apart, so an answer taken from
-    /// the host fails here.
+    /// the host fails here; a test that never saw a host at all could not tell the two apart.
     #[test]
     fn a_module_is_focused_through_its_focus_target_not_its_host() {
         let host = |id: ModuleId, widget: &'static str, focus: &'static str, kind| Host {

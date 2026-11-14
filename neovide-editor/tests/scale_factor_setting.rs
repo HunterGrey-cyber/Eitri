@@ -1,31 +1,52 @@
-//! Checks that `g:neovide_scale_factor` rescales the embedded editor using a real `nvim`.
+//! `g:neovide_scale_factor` really rescales an EMBEDDED editor -- against a real nvim.
 //!
-//! The embedding bypasses `window_wrapper.rs`, so `LiveHarness` must apply the variable to
-//! the renderer. The agent panel follows the same variable, so both panes need to rescale.
+//! This is the test that did not exist, for the reason it matters: in standalone Neovide the
+//! variable is applied by `window_wrapper.rs`, and an embedding never goes through that file. So
+//! until fork commit `LiveHarness::apply_scale_factor_setting` (2026-09-22) the variable was
+//! **stored and never applied** -- a `:let` inside Eitri changed nothing on screen, in either
+//! pane. `shell` makes the agent panel follow this variable (`Ctrl+=` zooms both panes); that is
+//! worthless if the editor itself does not move, and only `grid_scale()` can say whether it did.
 //!
-//! Six checks share one launch:
+//! Six checks, one launch:
 //!
-//! 1. A value set before `ui_attach` is applied on the first frame. The startup cell width
-//!    is compared directly with the baseline supplied by the runtime scale change.
-//! 2. A runtime `:let` changes cell width by the ratio of the two scales. This confirms
-//!    that the renderer applies the variable and makes the startup comparison meaningful.
-//! 3. `set_scale_factor_setting` assigns the variable in nvim and the renderer follows.
-//! 4. With no assignment, cell width and `LiveHarness::scale_factor_resyncs()` stay constant.
-//!    The counter checks the change gate directly, since stable cell width alone cannot
-//!    rule out redundant resyncs.
-//! 5. `g:neovide` is truthy in the embedded session. This enables zoom mappings guarded by
-//!    `if vim.g.neovide` in user configuration.
-//! 6. Rendered text changes size when the scale changes without a `resize_grid` call.
-//!    `sync_scale_factor()` updates `grid_renderer.grid_scale` even if cached line pictures
-//!    still use the old size. `prepare_lines(true)` must rebuild those pictures.
-//!    The check measures the first contiguous run of non-background pixels in the text row
-//!    to verify that `prepare_lines(scale_factor_changed)` updates the rendered pixels.
+//! 1. a value set before `ui_attach` (`--cmd`, the `init.lua` path) is applied on the first frame --
+//!    the harness's `None` sentinel -- not merely reported. Asserted directly once check 2 supplies
+//!    a baseline to divide by (an earlier revision only ever asserted this reading via check 2's own
+//!    `assert_ratio` call, never in check 1's own right);
+//! 2. a runtime `:let` rescales the renderer: the cell width shrinks by the ratio of the two
+//!    scales. This is the positive control that makes 1 meaningful, since 1 alone cannot tell
+//!    "applied" from "never scaled at all";
+//! 3. `set_scale_factor_setting` really assigns the variable in nvim and the renderer follows;
+//! 4. an unchanged variable leaves the cell size alone across many frames (no resync churn) --
+//!    and, directly, so does `LiveHarness::scale_factor_resyncs()`, the diagnostic counter the fork
+//!    added specifically so this property has a signal of its own rather than relying on the cell
+//!    width's silence to imply it;
+//! 5. `g:neovide` reads truthy inside this embedded session. This matters because a user's
+//!    `~/.config/nvim/init.lua` maps `<C-+>`/`<C-->`/`<C-0>` to change `g:neovide_scale_factor`
+//!    only `if vim.g.neovide` -- if this embedding left that variable unset or false, those
+//!    mappings would be dead code and the "both panes zoom together" design would never fire from
+//!    the user's config, no matter what this file's first four checks prove.
+//! 6. **the pixels themselves change, not just `grid_scale()`'s number.** Checks 1-5 all read
+//!    `grid_scale()`/`scale_factor_setting()` -- the renderer's own *idea* of the cell size --
+//!    which is exactly what would still move even if `LiveHarness::render_frame` kept calling
+//!    `prepare_lines(false)` on the frame the scale changes: `grid_renderer.grid_scale` is updated
+//!    by `sync_scale_factor()` regardless, it is *line pictures already recorded at the old size*
+//!    that only `prepare_lines(true)` re-records. So this check puts real text ('M's) on screen,
+//!    changes the scale with **no `resize_grid` call anywhere in this file** -- the same "integer
+//!    grid did not change" shape as every other check here -- and measures the ink: the height, in
+//!    pixels, of the first contiguous run of non-background pixels in the text's own row (see
+//!    `ink_row_height`'s own doc for why "contiguous run" rather than "bounding box over a fixed
+//!    band"). It is the one check in this file that the forced redraw
+//!    (`LiveHarness::render_frame`'s `prepare_lines(scale_factor_changed)`) can actually fail, and
+//!    was checked to fail by temporarily reverting that line to `prepare_lines(false)`.
 //!
-//! Ignored unless requested. Requires `nvim` >= 0.11 on `PATH` and starts its own `Xvfb`
-//! for the clipboard without opening a window. `shell/tests/support/own_x_server.rs` starts
-//! the display before winit connects and removes inherited `WAYLAND_DISPLAY` and `DISPLAY`.
-//! Uses a plain `main` (`harness = false`) because winit builds its event loop on the main
-//! thread. Run with:
+//! Ignored unless asked for: it spawns a real `nvim` (>= 0.11 on `PATH`) and connects to a display
+//! for the clipboard (no window) -- **its own `Xvfb`** since 2026-09-29
+//! (`shell/tests/support/own_x_server.rs`), started and pointed to before winit connects, with any
+//! inherited `WAYLAND_DISPLAY`/`DISPLAY` dropped. Before that it took the session's display, the
+//! desktop's from any agent shell. A plain `main` (`harness = false`) because winit builds its event
+//! loop on the main thread only, and libtest runs each test on a thread of its own. Run with, and no
+//! wrapper is needed:
 //!
 //!     cargo test -p neovide-editor --test scale_factor_setting -- --ignored
 use std::time::{Duration, Instant};
@@ -203,11 +224,14 @@ fn main() {
     assert_ratio(at_1_0, at_2_0, 2.0, "1.0 -> 2.0 via set_scale_factor_setting");
     println!("ok: set_scale_factor_setting assigns the variable and the editor follows ({at_1_0} -> {at_2_0})");
 
-    // 4. With no assignment, cell width and `scale_factor_resyncs()` must stay constant.
-    //    The counter checks `apply_scale_factor_setting`'s change gate directly; stable cell
-    //    width alone cannot rule out redundant resyncs. Construction and earlier checks may
-    //    have incremented the counter, so this loop checks only that its value stays equal
-    //    to the starting count throughout 30 idle frames.
+    // 4. Nothing moves while nothing changes -- and, since the fork added `scale_factor_resyncs()`,
+    //    the diagnostic counter this check is really about doesn't move either: `cell_width`
+    //    staying put is a symptom, the counter staying put is the direct proof that
+    //    `apply_scale_factor_setting`'s change gate, not just its absence of visible drift, is
+    //    still there. Construction and the five checks above may already have bumped the
+    //    counter some number of times before this loop starts (known limit: this test does not
+    //    assert what that starting count is, only that it stops moving here) -- what matters is
+    //    that it is IDENTICAL at the end of 30 idle frames to what it was at the start.
     let resyncs_before_idle = harness.scale_factor_resyncs();
     for _ in 0..30 {
         frames.step(&mut harness);

@@ -450,23 +450,41 @@ pub(crate) fn same_grid_scale(a: GridScale, b: GridScale) -> bool {
     (a.width().to_bits(), a.height().to_bits()) == (b.width().to_bits(), b.height().to_bits())
 }
 
-/// Moves the vertical sub-cell remainder of `region` from the bottom edge to the top edge.
+/// `region` with the vertical sub-cell remainder moved from the BOTTOM edge to the TOP edge.
 ///
-/// `grid_size_for_content_region` floors the row count, leaving `height mod cell_height` pixels.
-/// `draw_frame` clears those pixels to nvim's `Normal` background. Below a statusline with a
-/// different background, this looks like an extra stripe above the host's status bar. At the top,
-/// the remainder sits beside buffer text with the same background and looks like padding.
+/// A pane is almost never an exact multiple of the font's cell height, and
+/// `grid_size_for_content_region` floors, so `height mod cell_height` pixels are always left over.
+/// They are painted -- `draw_frame` clip-clears the whole region to nvim's own `Normal` background
+/// -- so this is not an undrawn band. It is a band of the *editor's* background in a place where
+/// that colour is not what sits above it.
 ///
-/// The horizontal remainder stays at the right edge, beside ordinary buffer background. Moving
-/// it left would put it beside the sign column and could make it visible.
+/// **Which edge it lands on is the entire difference, and it is not a matter of taste.** At the
+/// bottom, the row above the remainder is nvim's statusline (a global `laststatus=3` lualine, in
+/// the config this was reported against), whose background is deliberately a different colour; the
+/// leftover then reads as a stripe of a third colour between the statusline and the shell's own
+/// status bar. At the top, the row below it is ordinary buffer text on `Normal` -- the same colour
+/// as the remainder -- so it is indistinguishable from padding under the top bar. Reported
+/// 2026-09-19 as a gap still left at the bottom once the 44px dead-cmdline row (fixed in the fork) was gone and
+/// only this 14px remainder was left.
 ///
-/// Pixels outside the returned rect are no longer repainted by the renderer. The host must use a
-/// matching framebuffer clear colour through `NeovideEditorPane::set_clear_color`, driven by
-/// the theme pipeline's `tokens.bg`.
+/// **Vertical only, deliberately.** The horizontal remainder sits at the right edge, where its
+/// neighbour is ordinary buffer background of the same colour, so it is already invisible; moving
+/// it to the left would put it between the window edge and the sign column, which is where it
+/// would start being visible. The asymmetry is in what the leftover is adjacent to, not in the
+/// arithmetic.
 ///
-/// Returns `region` unchanged if the cell height is not positive and finite, there is no
-/// remainder, or the region is too short for one row. Removing the remainder in the last case
-/// would leave a zero-height rect.
+/// **The caller owes one thing for this to be an improvement rather than a swap:** once this
+/// returns anything but the full framebuffer, the pixels OUTSIDE the returned rect are no longer
+/// repainted by the renderer, so whatever the host clears the framebuffer to becomes visible for
+/// the first time. `lib.rs`'s `OUTSIDE_COLOR` doc predicted exactly this ("If `CONTENT_MARGIN`
+/// ever becomes non-zero again, this constant -- and a reason to bring back a host-settable
+/// override -- becomes reachable once more") and `NeovideEditorPane::set_clear_color` is that
+/// override, driven from the theme pipeline's `tokens.bg`.
+///
+/// Returns `region` unchanged when there is nothing to move or nothing to move it within: a cell
+/// height that is not yet a positive, finite number (nvim has not reported a font), no remainder,
+/// or a region too short for even one row -- in which case eating the remainder would leave a
+/// zero-height rect.
 pub(crate) fn snap_region_to_grid(region: &PixelRect<f32>, grid_scale: GridScale) -> PixelRect<f32> {
     let cell_height = grid_scale.height();
     if !cell_height.is_finite() || cell_height <= 0.0 {

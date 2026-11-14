@@ -1,20 +1,31 @@
-//! Checks that setting `NEOVIM_BIN` before building a `LiveHarness` makes the pinned fork's
-//! `CmdLineSettings` spawn that binary. Its clap argument uses `env = "NEOVIM_BIN"`.
-//! `shell::main` relies on this when it sets the variable. The pure `eitri_core::nvim_bin`
-//! tests inject `version_of` and do not exercise the fork.
+//! The pinned fork honours `NEOVIM_BIN`: with the variable set in
+//! this process before a `LiveHarness` is built, the pinned fork's `CmdLineSettings` (clap's own
+//! `#[arg(long = "neovim-bin", env = "NEOVIM_BIN")]`, in the pinned fork's `cmd_line.rs`)
+//! picks it up and spawns exactly that binary -- never plain `nvim` -- which is the one thing
+//! `shell::main`'s own `unsafe { std::env::set_var(..) }` (documented at that call site,
+//! `eitri_core::nvim_bin`'s module doc) depends on and nothing in this workspace's own tests
+//! otherwise exercises: `eitri_core::nvim_bin`'s tests are pure, over an injected `version_of`,
+//! and never touch the fork at all.
 //!
-//! A wrapper script appends its argv to a marker file, then execs the real `nvim` to provide a
-//! working session. The marker proves the fork ran the selected binary instead of resolving
-//! `nvim` on `PATH`.
+//! Proof, not inference: a wrapper script stands in for `nvim`, appends its own argv to a marker
+//! file, and `exec`s the real `nvim` so the harness still gets a working session. The marker being
+//! written at all is the proof the fork actually ran *this* binary rather than resolving `"nvim"` on
+//! `PATH` itself.
 //!
-//! This `harness = false` test checks `--ignored` in `main` because cargo does not skip it.
-//! It needs `nvim` (>= 0.11) on `PATH` and a display connection for winit's clipboard,
-//! even though it opens no window. `support/own_x_server.rs` starts an isolated `Xvfb` before
-//! winit connects and clears inherited `WAYLAND_DISPLAY` and `DISPLAY` values. Run with:
+//! `#[ignore]`d (mirrored here by hand, `harness = false` means cargo's own skip does not apply --
+//! see the check in `main` below): it needs `nvim` (>= 0.11) on `PATH`, and -- like every
+//! `LiveHarness`-driving test in this workspace, `neovide-editor`'s own ignored ones included -- a
+//! display connection, even though it never opens a window (winit's `EventLoop` needs one for the
+//! clipboard). **It starts its own** (2026-09-29, `support/own_x_server.rs`): an `Xvfb` pointed to
+//! before winit connects, with any inherited `WAYLAND_DISPLAY`/`DISPLAY` dropped. Until then it
+//! connected to whatever display it inherited, and this header's "never the real desktop" was only a
+//! sentence -- from an agent shell, the desktop's. So, with no wrapper:
 //!
 //!     cargo test -p shell --test nvim_bin_override -- --ignored
 //!
-//! A plain `main` keeps winit's event loop on the main thread.
+//! A plain `main` (`harness = false`), copied from `neovide-editor/tests/fullscreen_setting.rs`'s
+//! own pump/readiness plumbing almost verbatim (that file's own header explains why: winit builds
+//! its event loop on the main thread only).
 
 use std::os::unix::fs::PermissionsExt;
 use std::time::{Duration, Instant};

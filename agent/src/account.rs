@@ -7,7 +7,7 @@
 //! the terminal it was launched from, while the sidecar's `claude` had written the transcript into
 //! `$HOME/.claude-b`.
 //! [`crate::transcript::claude_projects_dir`] read the host's own variable, so it looked in the
-//! wrong one of this machine's six config directories and found nothing. `external_writer.rs` had
+//! wrong one of the host's several config directories and found nothing. `external_writer.rs` had
 //! been reading a path that never existed for the same reason.
 //!
 //! Verdandi's `packages/claude-runtime/src/account.ts` names the disease exactly: *"on a
@@ -255,9 +255,8 @@ impl std::error::Error for ConfiguredAccountError {}
 ///
 /// The caller passes the environment in rather than this reading it: `shell` is where an
 /// environment variable belongs, and a library that reads one makes its own tests depend on the
-/// machine they run on. This one caught that for real -- `VERDANDI_CLAUDE_ACCOUNT=work` is
-/// exported by this host's own shell configuration, so a test of "nothing is pinned" passed or
-/// failed by where it was run from.
+/// machine they run on. This one caught that for real: a shell that exports `VERDANDI_CLAUDE_ACCOUNT`
+/// made a test of "nothing is pinned" pass or fail by where it was run from.
 pub fn resolve_for(
     from_environment: Option<&str>,
     from_config: Option<&str>,
@@ -324,8 +323,8 @@ mod tests {
         assert_eq!(account.config_dir(), Path::new("/home/user/.claude-work"));
     }
 
-    /// The same four names this machine's launcher knows, so the convention is checked against
-    /// real directories rather than one invented example.
+    /// Four account names of the `.claude-<name>` shape, so the convention is checked against
+    /// several directories rather than one invented example.
     #[test]
     fn every_account_this_host_has_resolves_where_it_really_lives() {
         for (name, expected) in [

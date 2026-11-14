@@ -1,18 +1,21 @@
 //! Keeps the host process's stdin away from the embedded nvim.
 //!
-//! The fork's `NeovimInstance::forward_stdin` duplicates stdin when it is a regular file,
-//! FIFO or socket, and `ui_attach` passes it as `stdin_fd`. nvim reads it into a buffer.
-//! For a pipe or socket whose writer stays open, nvim blocks in `read()` until EOF. The
-//! editor stays blank with a default-size grid, and closing the window times out waiting
-//! for nvim. This editor does not read stdin into a buffer, but launchers, services and
-//! test harnesses can still start it with a pipe on stdin.
+//! **What the fork does.** The Neovide fork hands its own process's stdin to the `nvim --embed`
+//! child whenever that stdin is a regular file, a FIFO or a socket: `NeovimInstance::forward_stdin`
+//! (`src/bridge/session.rs` at the pinned rev, upstream Neovide's behaviour, so that
+//! `cmd | neovide` opens `cmd`'s output) dups it, and `ui_attach` passes it as `stdin_fd`. nvim reads
+//! it as a buffer and, for a pipe or a socket whose writer stays open, blocks in `read()` until EOF.
+//! The editor stays blank (no theme, a default-size grid) and the window's close then times out
+//! waiting for nvim. Eitri has no "read stdin into the editor" feature; being started with a pipe
+//! on stdin -- by a launcher, a service, a test harness -- is ordinary. The GUI pass of 2026-09-23
+//! lost 18 launches to it on both builds before it was found (its defect 2).
 //!
-//! The fork reads fd 0 when the harness starts. Before that, [`detach_stdin_from_nvim`]
-//! points fd 0 at `/dev/null` only when the fork would forward it. [`forwarded_kind`]
-//! matches the fork's forwarding conditions. Terminals and `/dev/null` are character
-//! devices and are left alone, so starting from a shell works as usual.
-//! Rust's runtime replaces a closed standard fd with `/dev/null` before `main` runs.
-//! If `fstat` fails for fd 0, the fork does not forward it either.
+//! **What this does instead.** The fork is not changed: it reads fd 0 when the harness starts, so
+//! [`detach_stdin_from_nvim`] points fd 0 at `/dev/null` before that, and only when the fork would
+//! have forwarded it ([`forwarded_kind`] restates the fork's rule). A terminal and `/dev/null` are
+//! character devices and are left alone, so running Eitri from a shell changes nothing. A closed
+//! fd 0 cannot reach `main`: Rust's runtime opens `/dev/null` over a closed standard fd before
+//! `main` runs, and an fd `fstat` refuses is one the fork forwards nothing from either.
 
 use std::io;
 use std::os::fd::{AsRawFd, RawFd};

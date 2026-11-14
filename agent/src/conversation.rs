@@ -818,11 +818,11 @@ impl AgentConversation {
         // already folded live events, and that is the one thing that would break the `seq` total
         // order.
         //
-        // **This comment used to end:** "Reading the largest real transcript on this machine whole
-        // takes 0.143s in Python." That was offered as the reason the cost is negligible, and it
+        // **This comment used to end** with the claim that reading the largest real transcript in the
+        // measured corpus whole takes 0.143s in Python. That was offered as the reason the cost is negligible, and it
         // was a Python measurement standing in for Rust. Kept above rather than deleted, because
         // what replaced it only moves the conclusion, not the direction: the real figures for the
-        // product path on this machine's largest
+        // product path on the measured corpus's largest
         // transcript (48,805,214 B, tail-scanned), 3 runs each, hot cache -- **70-84 ms in release
         // and 513-519 ms in debug**. So release is about twice as fast as the Python number and
         // debug about 3.6x slower than it, and debug is what every `cargo test` and every

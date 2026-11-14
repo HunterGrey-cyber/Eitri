@@ -1,5 +1,5 @@
 [English](README.md) | 简体中文
-<!-- translated-from: README.md sha256=ae45aa75858ba011b3b3688e38d9e0ac42d41d0d43cb7fd9b18d8cca08679985 -->
+<!-- translated-from: README.md sha256=394ef2e09d35187cac4562fe8a024395e34e68ea03f5e14831d73a8c7cde6faf -->
 
 <div align="center">
 
@@ -88,4 +88,8 @@ agent sidecar 打包了 Anthropic 的 Claude Agent SDK，它不是开源软件�
 
 Logo 的蓝绿两色取自 Jason Long 设计的 [Neovim logo](https://neovim.io)（CC BY 3.0）。
 
-Eitri 的开发有 Claude 协助。
+## Eitri 是怎么做出来的
+
+Eitri 的大部分代码由编程 agent（Claude Code 和 Codex）编写。Hunter Grey 定方向，在几种设计之间做选择，在出错代价最大的地方仔细看，发现不对就介入。改动带着测试一起写，分支合并之前跑完整的测试套件。
+
+Eitri 就是为这种工作方式做的。agent 在编辑器旁边的标签页里干活；你在要紧的地方看它改了什么，它跑偏了就把它拉回来。

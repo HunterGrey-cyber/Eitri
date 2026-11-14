@@ -562,8 +562,9 @@ mod tests {
         assert!(SessionLease::try_acquire("claude", "/tmp/project-b", "prov-1").is_ok());
     }
 
-    /// Two different sessions in one directory do not contend. The lease key includes the
-    /// session id, so acquiring one session does not claim the whole directory.
+    /// Two DIFFERENT sessions in one directory do not contend, and that is the design, not an
+    /// oversight: the lease claims a Claude session, never the directory. All it has to refuse is
+    /// a second window resuming the SAME session, which the test above pins.
     #[test]
     fn two_different_sessions_in_one_directory_do_not_contend() {
         let _isolated = IsolatedLeasesDir::new();

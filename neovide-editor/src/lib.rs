@@ -277,18 +277,52 @@ const LOG_EVERY_N_FRAMES: u64 = 60;
 /// How many service runs (tick callback or fd watch) between `[tick]` summary log lines (see `TickStats`).
 const TICK_LOG_EVERY_N_TICKS: u64 = 300;
 
-/// Initial framebuffer clear colour before the host supplies a theme colour.
+/// The clear colour painted across the whole framebuffer before each `LiveHarness::render_frame`
+/// call (`canvas.clear(OUTSIDE_COLOR)` in the render callback below) -- a cheap defensive clear,
+/// not a colour a host can override any more (see the removal note below).
 ///
-/// The render callback clears the whole framebuffer before `LiveHarness::render_frame`.
-/// Within `content_region`, `Ready` clips `Renderer::draw_frame` and clears to nvim's `Normal`
-/// background with an `SkBlendMode::kSrc` fill. The other states paint opaque `STARTING_COLOR`
-/// or `FAILED_COLOR` fills.
+/// **2026-09-07:** this used to be a loud, deliberately-wrong magenta (`(0.55, 0.15, 0.55)`) so a
+/// viewport-clear regression bleeding past `CONTENT_MARGIN` would be visible at a glance during
+/// validation. That validation is done (real screenshots at 6 scale factors, numeric
+/// geometry cross-checks) and this pane is now embedded in the real `shell` product, where a
+/// bright magenta strip around every real window reads as a bug rather than a debug aid -- a real
+/// user asked "what is that purple border, can it go away" the first time they saw it. Now a
+/// neutral near-black that blends with typical dark UI chrome.
 ///
-/// Even with `CONTENT_MARGIN` at 0, `snap_region_to_grid` leaves the vertical sub-cell remainder
-/// above the grid so its bottom is flush with the host's status bar. That band lies outside
-/// `content_region` and shows the framebuffer clear colour. The host uses
-/// [`NeovideEditorPane::set_clear_color`] to match `tokens.bg` at each colorscheme change.
-/// This near-black value shows until the host supplies its first colour.
+/// **2026-09-16, established with a positive control, not just argued:** `CONTENT_MARGIN` is 0.0,
+/// so there is no inset band left for this to paint, and **no pixel on screen shows it at all.**
+/// `compute_content_region` returns the whole framebuffer at margin 0, and every arm of the render
+/// callback repaints that entire rect on top of this clear:
+///
+/// - `Ready` hands `content_region` to the fork's `Renderer::draw_frame`, which `clip_rect`s to it
+///   and *then* does `root_canvas.clear(default_background)` -- an `SkBlendMode::kSrc` fill of the
+///   whole clip with nvim's own `Normal` background (`src/renderer/mod.rs:272-283` at the pinned
+///   rev, where the fork clears only the renderer's own clipped viewport).
+/// - `NotStarted`/`Starting`/`Failed` fill the same rect with `STARTING_COLOR`/`FAILED_COLOR`,
+///   both opaque.
+///
+/// A GUI pass proved this with a positive control rather than assuming it from the code alone: a
+/// magenta probe at margin 0 produced 0 pixels anywhere, including across 220 frames of a live
+/// divider drag, while the identical probe at `CONTENT_MARGIN = 40` produced exactly the 40px
+/// frame's own pixel count. A host-settable clear colour (`set_clear_color`) existed for one
+/// release so a host could track nvim's own background in case this ever became visible again; it
+/// was removed once that control confirmed the colour reaches no pixel today, and the sub-cell
+/// remainder a floored `grid_size_for_content_region` leaves at the right and bottom edge lies
+/// *inside* `content_region` and has always been painted by the renderer in nvim's own background,
+/// not this colour. Removing the margin is what fixed the near-black frame on its own, and the
+/// value also matches nothing any more: `#1a1b1f` was the background of the placeholder palette
+/// `shell`'s theme pipeline replaced. If `CONTENT_MARGIN` ever becomes non-zero again, this
+/// constant -- and a reason to bring back a host-settable override -- becomes reachable once more.
+///
+/// **2026-09-19: reachable again, exactly as the paragraph above predicted, and now only the
+/// STARTING value.** `snap_region_to_grid` moves the grid's sub-cell vertical remainder to the top
+/// edge so the bottom of the pane sits flush against the host's status bar, which means
+/// `content_region` no longer covers the whole framebuffer and these pixels are on screen -- a thin
+/// band under the top bar. A fixed near-black there would reinstate the near-black frame the margin
+/// removal fixed, so [`NeovideEditorPane::set_clear_color`] is back, and `shell` drives it from the
+/// same `tokens.bg` its theme pipeline already pushes at every colorscheme change. This value is
+/// what the band shows for the ~190ms before the first theme payload arrives, and until a host sets
+/// it at all.
 const OUTSIDE_COLOR: Color4f = Color4f::new(0.102, 0.106, 0.122, 1.0);
 /// Painted across the whole `content_region` while `LiveHarness` is being constructed (the one
 /// real, observed blocking call in this crate) -- distinct from both `OUTSIDE_COLOR` and anything
@@ -1158,16 +1192,22 @@ impl std::fmt::Debug for HangUp {
     }
 }
 
-/// The `--cmd` that hides the cursor while the pane does not have keyboard focus.
+/// The `--cmd` that makes the editor draw **no cursor** while it does not have the keys.
 ///
-/// `g:neovide_cursor_unfocused_outline_width` defaults to a hollow block of width 1/8 em.
-/// Here, a width `<= 0` suppresses every unfocused cursor shape. Drawing a zero-width outline can
-/// otherwise leave an anti-aliased sliver at fractional cell sizes: 33 pixels at scale 1.5.
+/// `g:neovide_cursor_unfocused_outline_width` is Neovide's own setting (default 1/8 em, a hollow
+/// block). The fork makes a width `<= 0` mean "draw nothing while unfocused, any
+/// shape" -- stock Neovide at width 0 still leaves an anti-aliased sliver at fractional cell sizes
+/// (measured: 33 pixels at scale 1.5). Drawing none means the only cursor on screen is the one in the
+/// pane that has the keys.
 ///
-/// `--cmd` runs before user configuration, so `init.lua` can restore the hollow block with
-/// `vim.g.neovide_cursor_unfocused_outline_width = 0.125`. The initial value is read by
-/// `settings.read_initial_values` before `ui_attach`. Configuration at `ui_attach` and later
-/// runtime changes reach the renderer through the `WatchGlobal` watcher and `setting_changed`.
+/// It is a `--cmd`, so it runs before the user's own config: a user who wants the hollow block
+/// back sets the variable in their `init.lua` (e.g. `vim.g.neovide_cursor_unfocused_outline_width
+/// = 0.125`) and wins. Neovide reads a `--cmd` value once, in `settings.read_initial_values`, BEFORE
+/// `ui_attach`; `init.lua` runs AT `ui_attach`, so its value, like a runtime `:let`, reaches the
+/// renderer by the other path -- the `WatchGlobal` dict watcher and `setting_changed`. Both paths are
+/// proved on real frames by `tests/unfocused_cursor.rs`: a later `--cmd`, and a `:let` typed after
+/// nvim is ready. A real `init.lua` itself was not loaded (the test runs `--clean`); the runtime
+/// `:let` stands in for it because it takes the same watcher path.
 pub const HIDE_UNFOCUSED_CURSOR_CMD: &str = "let g:neovide_cursor_unfocused_outline_width = 0";
 
 /// The whole argument list this pane hands to `LiveHarnessOptions::extra_nvim_args`: `--clean`
@@ -2516,11 +2556,14 @@ impl NeovideEditorPane {
                         // `render_frame` pumped every pane's batches outside the watch.
                         live_watch::after_outside_pump(Some(Rc::as_ptr(&session.live)));
                         if !same_grid_scale(snapped_scale, session.harness.grid_scale()) {
-                            // `render_frame` pumps nvim and applies `g:neovide_scale_factor` and `guifont` changes before
-                            // reading `grid_scale`. This frame was snapped for the old cell height, so the new rows
-                            // can leave a band at the bottom. Request another frame to snap with the new scale;
-                            // the tick's resync corrects the row count. An idle pane has no other render trigger.
-                            // The next frame sees the scale already applied, so this does not loop.
+                            // `render_frame` pumps nvim and applies `g:neovide_scale_factor` (and
+                            // any `guifont` change) BEFORE it reads `grid_scale` (the fork's
+                            // `live_harness.rs` `render_frame`), so this frame was snapped for the
+                            // old cell: its remainder sits at the top for the old height and the
+                            // new rows leave a band at the bottom. Nothing else asks for a frame
+                            // once the pane is idle, so ask for one here; it re-snaps, and the
+                            // tick's resync fixes the row count. The second frame sees the scale
+                            // already applied, so this does not loop. eitri-only.
                             session.wants_frame.set(true);
                         }
                         // The editor's own cell height is what `shell` puts into
@@ -3137,14 +3180,21 @@ impl NeovideEditorPane {
         self.hole_changed_callbacks.borrow_mut().push(Rc::new(callback));
     }
 
-    /// Tells the editor whether it has keyboard focus through `LiveHarness::set_focused`.
-    /// This updates the cursor and sends `nvim_ui_set_focus` so nvim can fire `FocusGained` and
-    /// `FocusLost`. `HIDE_UNFOCUSED_CURSOR_CMD` hides the unfocused cursor unless the user restores
-    /// the outline width.
+    /// Grabs keyboard focus for this pane's `GLArea` and tells the IME it's now the focused
+    /// widget -- call this once the host's window is actually shown (mirroring the reference
+    /// probe's own `window.present(); gl_area.grab_focus(); im_context.focus_in();` sequence,
+    /// minus the `.present()`, which is the host's own window's job).
+    /// Tells the editor whether it has the keyboard, so it can say so through its cursor: a solid
+    /// block when it has focus, **no cursor at all** when it does not (`HIDE_UNFOCUSED_CURSOR_CMD`;
+    /// a user who sets the width back gets upstream's hollow block). It forwards to
+    /// `LiveHarness::set_focused` (a fork method), which also tells nvim through
+    /// `nvim_ui_set_focus`. Before this, nvim never heard about focus at all, and nothing fired
+    /// `FocusGained` or `FocusLost`.
     ///
-    /// This is separate from [`grab_focus`](Self::grab_focus). The host defines focus; `shell`
-    /// requires both this pane to hold the window's focus widget and the window to be active.
-    /// Calls before nvim starts are saved, and the harness drops repeated focus notifications.
+    /// This is a separate call from [`grab_focus`](Self::grab_focus), and the host decides what
+    /// "focused" means. `shell` passes `true` only while this pane holds the window's focus widget
+    /// AND the window is active, so alt-tabbing away hides the cursor too. It may be called before nvim has started, and on every focus event:
+    /// repeats are dropped by the harness.
     pub fn set_focused(&self, focused: bool) {
         set_focused_and_request(&self.focused, &self.live_state, focused, |reason| {
             self.request_frame(reason)

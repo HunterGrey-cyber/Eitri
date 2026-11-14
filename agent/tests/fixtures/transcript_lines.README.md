@@ -1,6 +1,6 @@
 # `transcript_lines.jsonl`
 
-Twelve **real** lines, taken whole out of this machine's own `$CLAUDE_CONFIG_DIR/projects` on
+Twelve **real** lines, taken whole out of a real `$CLAUDE_CONFIG_DIR/projects` on
 2026-09-20 and redacted. Every line was written by CLI **2.1.272** (the four conversational line
 types carry that in their own `version` field; the three side records carry no version, which is
 itself one of the structural facts these fixtures pin).

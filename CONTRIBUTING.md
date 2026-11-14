@@ -191,6 +191,53 @@ Please don't open a public issue for a security vulnerability. Use GitHub's priv
 reporting on this repository instead — the **Security** tab → **Report a vulnerability** — so a
 report, and any proof of concept, doesn't sit in public before a fix ships.
 
+## History
+
+Eitri was called neovibe until September 2026. Some names keep the old one, such as the Neovide
+fork's branch `neovibe-integration`.
+
+Before 0.3.1, the history of `main` was rewritten into one commit per change. This was done once;
+later releases add commits on top of it. Commits from before late September 2026 carry a short
+placeholder README, written when the history was published, and the MIT licence file, which was
+added two days into development, is present from the first commit. In each snapshot commit the
+`neovide` submodule and the Verdandi dependency point at the nearest public commit, which for
+some early commits is a newer one.
+
+Releases 0.2.0 to 0.3.0 keep their original tags and commits, which are not on `main`. Each of
+their release pages names the commit on `main` that brings that release's changes in. The old
+history of `main` is still reachable through these tags: `git log v0.3.0`.
+
+| tag | where its changes are on `main` |
+|---|---|
+| `v0.2.0` | the commit named on the [0.2.0 release page](https://github.com/HunterGrey-cyber/eitri/releases/tag/v0.2.0) |
+| `v0.2.1` | the commit named on the [0.2.1 release page](https://github.com/HunterGrey-cyber/eitri/releases/tag/v0.2.1) |
+| `v0.2.2` | the commit named on the [0.2.2 release page](https://github.com/HunterGrey-cyber/eitri/releases/tag/v0.2.2) |
+| `v0.3.0` | the commit named on the [0.3.0 release page](https://github.com/HunterGrey-cyber/eitri/releases/tag/v0.3.0) |
+| `v0.3.1` and later | the tagged commit, which is on `main` |
+
+A tagged release commit builds with `cargo build --locked`: the four old tags, and `v0.3.1` and
+later on `main`. Every other commit on `main`, including the ones the old release pages name, is a
+snapshot: its `neovide` submodule points at the nearest commit of the public fork, and it may not
+build.
+
+A clone made before the rewrite cannot `git pull` the new `main` (git refuses with "refusing to
+merge unrelated histories"); reset its `main` instead. The reset throws away commits on your local
+`main` and any uncommitted changes, so move those first: commit them to another branch, or write
+them out with `git format-patch`. Other branches are left as they are. `origin` below is this
+repository; if your clone calls it `upstream`, use that name.
+
+```sh
+git fetch origin
+git switch main
+git reset --hard origin/main
+git submodule update --init
+```
+
+Then put your own commits back on top with `git cherry-pick` (or `git am` for patches). Do not
+rebase an old branch onto the new `main`: the two share no commits, so a rebase would bring the
+whole old history along. Your fork on GitHub keeps the old `main` until you run
+`git push --force <your fork> main`; a fresh clone of this repository works too.
+
 ## Licence
 
 Contributions are made under the licence that already covers the file you're editing: MIT for

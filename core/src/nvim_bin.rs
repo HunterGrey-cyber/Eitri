@@ -38,9 +38,11 @@ use std::time::Duration;
 /// not a file, is a hard startup failure naming this variable.
 pub const NVIM_OVERRIDE_ENV: &str = "EITRI_NVIM";
 
-/// The embedded editor's `NEOVIM_BIN` setting, read here so [`Choice`] can report what it will use.
-/// An inherited value is preserved. `main()` writes this variable only for choices that need it;
-/// the write must affect this process rather than only `child_env`, as explained above.
+/// The pinned fork's own setting (`CmdLineSettings`'s `#[arg(long = "neovim-bin", env =
+/// "NEOVIM_BIN")]`, in the pinned fork's `cmd_line.rs`) -- read here only so [`Choice`] can say what
+/// it will use; never Eitri's to set when it is already present.
+/// `main()` writes this same variable on the two branches that need it -- see this module's own doc
+/// above for why that write cannot go through `child_env` instead.
 pub const NEOVIM_BIN_ENV: &str = "NEOVIM_BIN";
 
 /// The oldest nvim Eitri runs. The editor pane hands the same floor to the fork

@@ -12,9 +12,9 @@
 //!
 //! Routing the lease fd through a terminal emulator instead was considered and not taken, on two
 //! grounds that are about what can be ESTABLISHED here rather than about what would happen.
-//! First, which emulator: `$TERMINAL` is unset on this machine, the GNOME default key names
-//! `xdg-terminal-exec`, which is not installed, and five emulators are (foot, alacritty, kitty,
-//! gnome-terminal, xterm) -- so the choice would be a guess. Second, and worse: nothing in a
+//! First, which emulator: `$TERMINAL` is commonly unset, GNOME's default key can name
+//! `xdg-terminal-exec` where it is not installed, and a desktop often has several emulators
+//! (foot, alacritty, kitty, gnome-terminal, xterm) -- so the choice would be a guess. Second, and worse: nothing in a
 //! terminal emulator's interface promises to preserve a file descriptor it knows nothing about
 //! across the fork/exec that starts the command, and whether any of these does has NOT been
 //! tested here. The failure that matters is not "the lock was silently dropped" but "fd number N

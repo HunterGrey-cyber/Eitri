@@ -1,15 +1,56 @@
-//! GTK4 probe embedding `LiveHarness` in a focusable `GtkGLArea` backed by a Skia surface.
-//! `LiveHarness` connects to a real `nvim --embed` child. `GtkEventControllerKey` forwards
-//! printable characters and Escape, Return, BackSpace, and Tab through `send_text_input`.
-//! Ctrl, Alt, and Super combinations are ignored to avoid sending bare characters for shortcuts.
-//! `LiveHarness::with_options` blocks while launching nvim and establishing the RPC session.
-//! A starting placeholder is painted and presented before construction on the next callback,
-//! so the user sees an explanation while the GTK main loop is blocked. The per-frame pump
-//! inside `render_frame` uses `Duration::ZERO` and does not need that mitigation.
-//! The close-request handler calls `LiveHarness::shutdown()` and logs the result to clean up
-//! the embedded child when the window closes.
-//! The tick callback also closes the window when `has_neovim_exited()` becomes true,
-//! so quitting nvim directly does not leave an unresponsive window displaying the last frame.
+//! Feasibility probe with a live editor:
+//!
+//!     GtkApplicationWindow
+//!     └── GtkGLArea (focusable, receives keyboard input)
+//!         └── Skia Surface
+//!             └── neovide::live_harness::LiveHarness
+//!                 (patched Neovide fork, neovibe-integration branch)
+//!                 └── real `nvim --embed` child process
+//!
+//! Direct sibling of `poc/neovide_embed` (the demo-harness probe): same GTK4 + `GtkGLArea` + Skia-wrapping-the-FBO
+//! plumbing (`SkiaState`, `resolve_gl_proc`, `make_gl_interface`, `current_bound_framebuffer`,
+//! `compute_content_region`'s resizable-viewport handling, the frame-pacing log) copied over
+//! essentially unchanged -- see that crate's own doc comments for the full rationale on the
+//! GL/Skia interop, which is not repeated here. The only architectural addition is real input:
+//! this crate wires `GtkEventControllerKey` into `LiveHarness::send_text_input`, so a real
+//! `nvim --embed` connection receives real keystrokes typed into the GTK window.
+//!
+//! ## What's new vs. `poc/neovide_embed`
+//!
+//! - `neovide::demo_harness::DemoHarness` (fabricated content, no nvim) is replaced by
+//!   `neovide::live_harness::LiveHarness` (real `nvim --embed` connection).
+//! - `GtkEventControllerKey` is attached to the `GLArea` (which is made focusable and grabs focus
+//!   on startup) and forwards basic printable-character input --
+//!   `gdk::Key::to_unicode()` plus a handful of named keys (Escape/Return/BackSpace/Tab) common
+//!   enough that a human can actually drive nvim (enter insert mode, type, get back out, correct
+//!   typos) -- through to `LiveHarness::send_text_input`. This is deliberately *not* full key-
+//!   code/modifier translation fidelity (that is a later, dedicated input-system phase): any
+//!   non-Shift modifier (Ctrl/Alt/Super) held down is treated as "not plain text" and ignored
+//!   rather than forwarded, to avoid silently sending e.g. bare `c` for Ctrl+C.
+//! - `LiveHarness::with_options` performs a real, synchronous, *blocking* call into
+//!   `NeovimRuntime::launch` (spawns the child process and waits for the msgpack-rpc session to
+//!   be established) -- unlike `DemoHarness::new`, which does no I/O at all. Per this phase's own
+//!   task background (citing `poc/pump_events_spike/FINDINGS.md`'s "nothing on the shared GLib
+//!   thread may block" constraint), that call is *not* hidden inside the same `render()` callback
+//!   that first needs it: a "starting nvim..." placeholder frame is painted and presented first,
+//!   and the actual (blocking) construction happens on the *next* callback, so the freeze -- which
+//!   is real and blocks the main loop -- at least happens
+//!   after the user sees an explanatory frame rather than a silently-frozen blank/garbage window.
+//!   `LiveHarness::render_frame`'s own internal per-frame pump is separately confirmed
+//!   non-blocking (`NON_BLOCKING = Duration::ZERO` in the harness's own source) and needs no such
+//!   mitigation.
+//! - On window close, `LiveHarness::shutdown()` is called and its return value logged, so a real
+//!   `nvim --embed` child is never left orphaned behind this probe (see the `connect_close_request`
+//!   handler below; a `pgrep` diff was used to confirm
+//!   it empirically).
+//! - **Fixed 2026-09-06**: the tick callback now also closes the window itself
+//!   (`window.close()`) when `LiveHarness::has_neovim_exited()` comes back true *without* that
+//!   having gone through `connect_close_request` first -- i.e. nvim quit on its own (`:qa!` typed
+//!   inside it), not via a user closing this window. Before the fix, that case left a dead-
+//!   looking-alive window on screen forever (last frame still rendering, all input silently
+//!   swallowed with nowhere to route it) instead of exiting like stock Neovide does when its own
+//!   nvim quits. See the tick callback's own comment for the mechanism and this crate's
+//!   `MANUAL_VERIFICATION.md` for the bug's original discovery and the fix's verification.
 
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;

@@ -60,7 +60,7 @@ describe("HistoryNotice", () => {
 
   /* The row appears whenever history was restored, not only when it was truncated. A user
      has to be able to tell "this is what we said last time" from "this is what we said just now",
-     and after the 400-item cap only 8 of this machine's 44 sessions truncate at all -- so a
+     and after the 400-item cap only 8 of the measured corpus's 44 sessions truncate at all -- so a
      truncation-only row would be absent almost every time it is needed. */
   it("is drawn for a complete history too, not only a truncated one", () => {
     const { el } = renderInPanel(notice({ omittedItems: 0 }));

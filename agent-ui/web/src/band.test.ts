@@ -376,9 +376,9 @@ describe("a y/n prompt is never truncated; a flash is one row", () => {
     expect(segs.map((s) => s.id)).toEqual(["mode", "pill", "message"]);
   });
 
-  /* At about 50 cells wide, BROWSE, `⏵⏵ auto`, `↓`, and a no-card flash must fit on one row.
-     A wrapping flash would push the unread indicator onto another row. */
-  it("the 'not a key here' flash at 50 cells wide: one row, its short form, the ↓ kept", () => {
+  /* Seen in use: a panel about 50 cells wide, BROWSE, `⏵⏵ auto`, the `↓` beside it, and `a` with no
+     card under the cursor. The flash wrapped onto two rows and pushed the `↓` onto a third. */
+  it("the 'not a key here' flash at about 50 cells: one row, its short form, the ↓ kept", () => {
     const facts: BandFacts = { ...idle, pill: "⏵⏵ auto", unread: "↓", message: A_ELSEWHERE_FLASH };
     const segs = bandLayout(facts, 50 * 7.2, 7.2);
     const message = segs.find((s) => s.id === "message")!;

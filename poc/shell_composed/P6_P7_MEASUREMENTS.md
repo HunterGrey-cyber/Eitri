@@ -120,8 +120,8 @@ never changes after startup) and confirmed via `poc/tools/screenshot.py` that th
 renders normally at rest, correctly visible, no stuck-hidden state. A real human drag (with natural
 pauses/reversals) would show intermittent reveal cycles between those, landing somewhere between
 this 0% best case and the original 107.7% baseline — not measured here (still blocked on
-`poc/docs/synthetic-input-findings.md`'s mouse-calibration gap for driving a *realistic*,
-pause-containing synthetic drag rather than a continuous sweep or a static launch).
+the mouse-calibration gap: synthetic input could not yet drive a *realistic*,
+pause-containing drag rather than a continuous sweep or a static launch).
 
 **Verdict inputs, not verdict**: no correctness failures (no bad dimensions, no stuck frames, no
 crashes), dt stays smooth outside the one already-explained-away periodic hitch, but WebKitGTK CPU
@@ -207,9 +207,9 @@ Compare to the resize-sweep run's 107.7% mean `WebKitWebProcess` CPU above — c
 WebKitGTK CPU cost in P7 is specifically a resize-driven reflow cost, not baseline busy-payload
 cost.
 
-### Answering the doc's specific question
+### Answering P6's question
 
-> Does WebView JS work stall the editor in lockstep when WebKitGTK blocks the GTK main loop?
+P6 asks: if WebKitGTK blocks the GTK main loop, does WebView JS work stall the editor in lockstep?
 
 Primary evidence (run A, the cleanest): **no** — editor dt stayed flat for the full run regardless
 of WebView fps. Secondary evidence (run A′, unreproduced): a sustained correlated slowdown was
@@ -267,8 +267,8 @@ either WebKitGTK coexistence or pane resize, since it demonstrably occurs withou
   first 0.5s of startup) — there is no "editor dt" to measure during genuine idle, by design, now.
   Reproducing the anomaly requires the editor to be genuinely *active* (typing/scrolling)
   throughout the measurement window, not idle. Tried driving that via synthetic scroll-wheel input
-  (`ydotool mousemove -w -- 0 1`, see `poc/docs/synthetic-input-findings.md` for the mechanism,
-  proven to work elsewhere in this session) at ~4.5 events/sec for ~45s — this did **not**
+  (`ydotool mousemove -w -- 0 1`, the mechanism proven
+  to work elsewhere in this session) at ~4.5 events/sec for ~45s — this did **not**
   meaningfully increase frame activity either (still only ~24 frames total), most likely because
   the synthetic scroll events need the pointer positioned precisely over the editor's `GtkGLArea`
   widget to route to nvim's mouse handling, and this session did not yet calibrate absolute pointer

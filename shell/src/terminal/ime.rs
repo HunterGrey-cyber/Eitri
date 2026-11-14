@@ -268,10 +268,10 @@ mod tests {
         );
     }
 
-    /// A sequence measured in a GUI pass: rime's preedit went `n`, `ni`, `ni h`, `ni ha`, `ni hao`, and
-    /// Space committed the word. The bytes at the PTY are the GUI checklist's oracle,
-    /// `e4 bd a0 e5 a5 bd`, checked with bracketed paste on, as zsh runs by default, because a commit
-    /// is typing and must not arrive bracketed.
+    /// A measured sequence from a GUI pass: rime's preedit went `n`, `ni`, `ni h`, `ni ha`, `ni hao`,
+    /// and Space committed the two characters U+4F60 U+597D. The bytes at the PTY are the GUI
+    /// checklist's oracle, `e4 bd a0 e5 a5 bd` -- checked with bracketed paste ON, zsh's default,
+    /// because a commit is typing and must not arrive bracketed.
     #[test]
     fn nihao_then_space_commits_the_bytes_the_gui_pass_reads_at_the_pty() {
         let mut gate = focused();

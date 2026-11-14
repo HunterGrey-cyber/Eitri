@@ -16,7 +16,7 @@
 //! covers sessions Eitri itself drove, and only from the day it was added.
 //!
 //! **What a real transcript looks like, measured 2026-09-20** over the 822 `.jsonl` files (570 MB,
-//! 117,826 lines) under this machine's own `$CLAUDE_CONFIG_DIR/projects` -- note
+//! 117,826 lines) under a real `$CLAUDE_CONFIG_DIR/projects` -- note
 //! [`claude_projects_dir`] below, which is why `~/.claude/projects` is the wrong place to look on a
 //! machine that sets that variable:
 //!
@@ -58,7 +58,7 @@
 //!    through the same [`crate::persistence::title_from_prompt`] every other title goes through. It
 //!    is **never written into a `ConversationRecord`**: `title` on disk stays what this project
 //!    recorded at write time, first-one-wins, and the CLI's title is layered *above* it at display
-//!    time only, falling back to it and then to the bare id when it is absent (37 of this machine's
+//!    time only, falling back to it and then to the bare id when it is absent (37 of the measured corpus's
 //!    44 sessions have one; 7 do not). Transcript content still never decides whether a resume is
 //!    safe, never reaches a permission decision, and is never composed into a turn sent to the
 //!    model.
@@ -111,7 +111,7 @@ fn projects_dir_for(
 
 /// Replaces every Unicode scalar in `cwd` outside `[A-Za-z0-9-]` with `-`, matching the real
 /// Claude CLI's own sanitization rule -- not just `/` and `.`. Verified against all 111 real
-/// buckets under this machine's own `~/.claude/projects/`, by reading each transcript's own
+/// buckets under a real `~/.claude/projects/`, by reading each transcript's own
 /// recorded `cwd` field and comparing it against the real directory name: 107 of 111 match this
 /// rule exactly. The 4 that don't fail for unrelated reasons -- worktree/`cd` cases where the
 /// recorded `cwd` is not the cwd the directory was actually created from -- not because they
@@ -174,10 +174,10 @@ pub const AI_TITLE_TAIL_BYTES: u64 = 64 * 1024;
 /// `None`.
 ///
 /// Since 2026-09-20. It reads the last [`AI_TITLE_TAIL_BYTES`] of `path` and
-/// takes the `aiTitle` of the **last** `type:"ai-title"` line in that window. Measured: this
-/// machine's 37 titled sessions each hold exactly one distinct value, rewritten a median of 24
+/// takes the `aiTitle` of the **last** `type:"ai-title"` line in that window. Measured: the
+/// corpus's 37 titled sessions each hold exactly one distinct value, rewritten a median of 24
 /// times, so "the newest wins" is a rule about a case that has not occurred yet rather than one
-/// this machine exercises -- which is why it is decided here instead of left to whichever line a
+/// the corpus exercises -- which is why it is decided here instead of left to whichever line a
 /// scan happens to meet first.
 ///
 /// **Never persisted.** The value is not written into a `ConversationRecord`, so this project's own
@@ -188,7 +188,7 @@ pub const AI_TITLE_TAIL_BYTES: u64 = 64 * 1024;
 /// `BackendGreeting::for_kind` already reads Eitri's own small records synchronously there, and
 /// `persistence`'s own retention cap already bounds how many rows a picker can have
 /// (`MAX_RECORDS_PER_CONVERSATION` + 1), so this adds one fixed-size read per row and nothing that
-/// grows -- measured at 1.74 ms hot and 5.92 ms cold over this machine's 16 largest sessions
+/// grows -- measured at 1.74 ms hot and 5.92 ms cold over the measured corpus's 16 largest sessions
 /// (116 MB in total). **Parsing the whole transcript here would not be acceptable at any speed**:
 /// it would trade a bounded read of Eitri's own files for one that grows with a file this project
 /// neither controls nor knows a bound for (the largest here is 47,254,948 bytes).
@@ -443,7 +443,7 @@ mod tests {
 
     /// The NEWEST title wins, not the first one the scan meets. Measured on real transcripts: a real
     /// session rewrites the same title a median of 24 times and up to 808, so "which one" is a
-    /// question every read answers, even though this machine has never seen the value change.
+    /// question every read answers, even though the measured corpus never shows the value change.
     #[test]
     fn the_last_ai_title_line_in_the_window_is_the_one_taken() {
         let (dir, path) = a_transcript(concat!(
@@ -539,8 +539,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
-    /// **The head-vs-tail choice, as a test rather than a comment.** Measured over this machine's
-    /// 37 titled sessions: reading the file's HEAD finds the title
+    /// **The head-vs-tail choice, as a test rather than a comment.** Measured over the 37 titled sessions of
+    /// the measured corpus: reading the file's HEAD finds the title
     /// 0 times out of 37, because a session opens with `attachment` lines and the first `ai-title`
     /// already sits past 117 KB; reading its TAIL finds it 37 times out of 37. This pins the
     /// direction with a file shaped like that: a title near the end, and a head window full of

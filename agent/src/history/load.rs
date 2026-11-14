@@ -102,7 +102,7 @@ pub(crate) fn seed_from(
 /// events, and `apply` coalesces consecutive assistant text into a single `TranscriptMessage`
 /// (`projection.rs`), so the number of events, slots or stored records that went in is not the
 /// number of rows that come out. Reporting the input count was a real defect, found on
-/// 2026-09-20: over all 45 real top-level transcripts on this machine, 13 disagreed with
+/// 2026-09-20: over all 45 real top-level transcripts in the measured corpus, 13 disagreed with
 /// what the projection actually held (worst case 400 against 384), and the two paths were reporting
 /// two different quantities under one field name -- B its pre-fold slot count, A its post-truncation
 /// stored-record count. Taking both from here means the number the panel prints is the number of
@@ -1199,7 +1199,7 @@ mod tests {
     ///
     /// `apply` coalesces consecutive assistant text into ONE `TranscriptMessage`, so a transcript
     /// of four adjacent assistant lines is four slots to the reader and one row to the panel. The
-    /// notice used to carry the reader's number, which on this machine's own corpus over-stated
+    /// notice used to carry the reader's number, which on the measured corpus over-stated
     /// the drawn count on 13 of 45 real files (worst case 400 against 384) -- and the panel's
     /// sentence prints this number, so an over-statement is a sentence a user can disprove by
     /// scrolling.
@@ -1312,7 +1312,7 @@ mod tests {
         );
     }
 
-    /// Fold every real top-level transcript on this machine and compare the notice with the
+    /// Fold every real top-level transcript in the corpus and compare the notice with the
     /// projection it produced. The hermetic case above pins one constructed input; this checks
     /// that the property survives a real corpus, including the 45 files that exposed a mismatch.
     /// Print how many files fold so an empty corpus cannot masquerade as meaningful equality.
