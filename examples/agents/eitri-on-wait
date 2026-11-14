@@ -1,0 +1,21 @@
+#!/bin/sh
+# One line each time an agent starts waiting for you: "<project> <window>·<tab> <state>".
+# Agents already waiting when it starts are not printed; an agent that stops waiting and waits again is.
+# A tab that moves to another window keeps its key and gets a new id, so a wait is kept by key with the id it has,
+# and a departure counts only for the id that left.
+eitri agents --watch | jq -n --unbuffered -r '
+  def slot: if (.key // "") == "" then .id else .key end;
+  def line: "\(.project.name) \(.window.name)·\(.number) \(.state)";
+  def waits($rows): [$rows[] | select(.class == "needs") | {key: slot, value: {id, line: line}}] | from_entries;
+  foreach inputs as $e ({waiting: {}, say: []};
+    if $e.type == null then {waiting: waits($e.rows), say: []}
+    elif $e.type == "reset" then .waiting as $old | waits($e.view.rows) as $now
+      | {waiting: $now, say: [$now | to_entries[] | select(.key as $k | $old | has($k) | not) | .value.line]}
+    elif $e.type == "row" then ($e.row | slot) as $k
+      | if $e.row.class != "needs" then {waiting: (.waiting | del(.[$k])), say: []}
+        elif .waiting[$k] then {waiting: (.waiting + {($k): {id: $e.row.id, line: ($e.row | line)}}), say: []}
+        else ($e.row | line) as $l | {waiting: (.waiting + {($k): {id: $e.row.id, line: $l}}), say: [$l]} end
+    elif $e.type == "gone" then ($e | slot) as $k
+      | if .waiting[$k].id == $e.id then {waiting: (.waiting | del(.[$k])), say: []} else .say = [] end
+    else .say = [] end;
+    .say[])'

@@ -1,0 +1,9 @@
+#!/bin/sh
+show() {
+  eitri agents --json | jq -c '[.rows[] | select(.class == "needs")] as $w | {
+    text: (if ($w | length) > 0 then "⚑ \($w | length)" else "" end),
+    class: (if ($w | length) > 0 then "waiting" else "quiet" end),
+    tooltip: ($w | map("\(.project.name) \(.window.name)·\(.number) \(.label)") | join("\n"))
+  }'
+}
+eitri agents --watch | while read -r _; do show; done

@@ -1,0 +1,5 @@
+#!/bin/sh
+# A desktop notification each time an agent starts waiting.
+eitri-on-wait | while IFS= read -r line; do
+  notify-send --app-name=Eitri "An agent waits for you" "$line"
+done

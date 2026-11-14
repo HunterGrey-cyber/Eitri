@@ -52,4 +52,6 @@ you register, and you supervise each of them yourself, in a window you control.
 - [Codex and other agents](agents.md): tabs that run Codex, or an agent you register that speaks ACP.
 - [Your editor, from an agent's tab](editor-tools.md): how an agent in any tab shows you a file, reads what your editor holds, asks your language servers and proposes changes for you to approve, and how to turn that off.
 - [Pages you build](pages.md): your own HTML page as a Lua panel, or a plugin page with a manifest (experimental).
+- [Write a plugin](write-a-plugin.md): the plugin author's reference: the manifest, every capability, the `agents` calls and events, and a complete example.
+- [Working environments](environments.md): whole `init.lua` files to start from, for a tmux person, an i3 person, a Markdown writer, someone running many agents, and Eitri beside a terminal Neovim.
 - [Known issues](../known-issues.md): what is unsupported or rough today.

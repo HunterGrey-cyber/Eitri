@@ -1,0 +1,5 @@
+body { margin: 0; padding: 8px; background: var(--nv-bg); color: var(--nv-fg); font-family: var(--nv-font-mono); }
+#head { margin: 0 0 6px; color: var(--nv-muted); }
+ol { margin: 0; padding-left: 2.5ch; }
+li { padding: 2px 4px; }
+li.picked { background: var(--nv-cursorline); outline: 1px solid var(--nv-focus-ring); }

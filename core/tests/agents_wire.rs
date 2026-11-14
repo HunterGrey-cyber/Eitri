@@ -226,3 +226,40 @@ fn a_file_past_the_row_limit_keeps_its_first_rows_and_says_truncated() {
     assert_eq!(parsed.rows.len(), MAX_ROWS_PER_FILE);
     assert!(parsed.truncated);
 }
+
+/// The recorded rows the `eitri agents` recipes in `examples/agents/` are tested against are what `eitri agents --json`
+/// and `--watch` print: each line read back as a view or a change and written again comes out byte for byte.
+#[test]
+fn the_recipe_fixtures_are_lines_eitri_agents_prints() {
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../examples/agents/fixtures");
+    let view_line = std::fs::read_to_string(dir.join("view.json")).unwrap();
+    let parsed: View = serde_json::from_str(view_line.trim_end()).unwrap();
+    assert_eq!(view_json(&parsed, SCHEMA_V), view_line.trim_end());
+
+    let watch = std::fs::read_to_string(dir.join("watch.jsonl")).unwrap();
+    let mut lines = watch.lines();
+    let first: View = serde_json::from_str(lines.next().unwrap()).unwrap();
+    assert_eq!(
+        view_json(&first, SCHEMA_V),
+        watch.lines().next().unwrap(),
+        "--watch starts with the whole view"
+    );
+    let mut kinds = Vec::new();
+    for line in lines {
+        let change: Change = serde_json::from_str(line).unwrap_or_else(|e| panic!("{line}: {e}"));
+        assert_eq!(change_json(&change, SCHEMA_V), line);
+        kinds.push(
+            serde_json::from_str::<serde_json::Value>(line).unwrap()["type"]
+                .as_str()
+                .unwrap()
+                .to_owned(),
+        );
+    }
+    kinds.sort();
+    kinds.dedup();
+    assert_eq!(
+        kinds,
+        ["gone", "reset", "round", "row", "selection"],
+        "every kind of change is recorded"
+    );
+}

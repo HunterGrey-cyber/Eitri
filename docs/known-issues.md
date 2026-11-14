@@ -64,20 +64,22 @@ These were measured on development builds shortly before 0.3.0, in an isolated, 
 desktop, unless a bullet names another machine. A physical display has still not been measured; the items below
 distinguish real refresh-period feedback from the fallback clock.
 
-- **On GTK 4.24, typing is one refresh slower than native Neovide.** In a headless session with the compositor
-  feeding GTK a real 165 Hz period through presentation feedback, GTK 4.24.1 added 5.97 ms at the median;
-  the same build with GTK 4.22.5 added 0.30 ms. With GTK's 60 Hz fallback clock, the addition was about
-  16.5 ms. A 156-line GTK-only reproduction also shows the delay on GTK's development branch (4.25.0,
-  commit c36202f6, 2026-10-25). Three workarounds using public GTK API were measured; none restored native
-  latency, so none ships. The one measured at the real 165 Hz period (`render`) still added about 5.8 ms;
-  the other two were measured only with the 60 Hz fallback clock. Settled idle was measured only with
-  that fallback clock and stayed quiet. The period was real, but the screen was the headless session's;
-  a physical display has still not been measured.
-- **On GTK 4.24, scrolling with a held `j` at a 165 Hz headless output drops frames.** Native Neovide drew
+- **Drawn the GTK way, the editor is one refresh slower on GTK 4.24.** By default it is not drawn that way there: on
+  Wayland with GTK 4.24 or newer, unless the graphics driver is NVIDIA's, the editor hands its frames to the
+  compositor on a surface of its own ([How the editor reaches the screen](guide/editor-presentation.md)), and a typed
+  letter reached the screen 0.02 to 0.46 ms after native Neovide's at the median, on sway and Mutter at 60 and
+  165 Hz. The GTK way is still used on X11, with NVIDIA's driver, with `editor.presentation = "gtk"`, and after a
+  fallback (the editor prints why). There, with the compositor feeding GTK a real 165 Hz period, GTK 4.24.1 added
+  5.97 ms at the median, where the same build with GTK 4.22.5 added 0.30 ms; with GTK's 60 Hz fallback clock the
+  addition was about 16.5 ms. A 156-line GTK-only reproduction also shows the delay on GTK's development branch
+  (4.25.0, commit c36202f6, 2026-10-25). The editor's own surface has not been tried on NVIDIA, KWin or a physical
+  display.
+- **Drawn the GTK way on GTK 4.24, scrolling with a held `j` at a 165 Hz headless output drops frames.** Native Neovide drew
   165.5 changed frames a second, Eitri on GTK 4.24.1 140.6, and the same build on GTK 4.22.5 165.4.
   The 99th-percentile frame intervals were 6.1, 12.1 and 6.1 ms respectively. This separate scrolling run
   used stock presentation feedback, so GTK 4.24 still used its 60 Hz fallback clock; scrolling has not been
-  repeated with real-period feedback or on a physical display.
+  repeated with real-period feedback or on a physical display. With the editor's own surface, a held-key test did no
+  worse than the GTK way.
 - **While an agent reply streams, typing in the editor is slower.** With WebKitGTK 2.54 a key's redraw took 11.2 ms
   at the median while a stand-in reply streamed at the default 5 updates a second, on GTK 4.22.5 as well; with
   WebKitGTK 2.52 it was about 2.3 ms. A real reply has not been measured. If you see lag while typing during a
@@ -142,7 +144,10 @@ page bridge may change during 0.x.
   network; it gets no bridge to Eitri, no colours and no keys kit. Give it only pages you trust.
 - **A page that handles a key itself** and moves the keys to the editor (`layout.focus`) lets the key reach the
   editor too, unless it calls `preventDefault()`. Keys handled through the keys kit are not affected.
-- Plugin pages and Lua panels are not shown in the companion window.
+- Plugin pages and Lua panels are not shown in the companion window. A plugin page can still open as a window of its
+  own beside your Neovim (`eitri page <id>`, `:EitriPage <id>`; [the guide](guide/companion.md#pages-beside-your-nvim))
+  when it uses only following the buffer, Neovim commands, opening files, keeping state and the network: the Markdown
+  preview can, the agent pages cannot. Lua panels have no such window.
 
 ## Reaching eitri.cc and GitHub from mainland China
 

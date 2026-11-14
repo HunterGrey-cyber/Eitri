@@ -187,6 +187,64 @@ eitri agents --watch | while read -r _; do show; done
 "custom/agents": { "exec": "~/.local/bin/eitri-waybar", "return-type": "json" }
 ```
 
+**A line for each new wait.** The next two need to know when an agent starts waiting, not how many wait. `eitri-on-wait`
+prints one line each time that happens, naming the agent's project, window, tab and state (`eitri 1·2 card`). Agents
+already waiting when it starts are not printed; one that stops waiting and waits again is. `~/.local/bin/eitri-on-wait`:
+
+```sh
+#!/bin/sh
+# One line each time an agent starts waiting for you: "<project> <window>·<tab> <state>".
+# Agents already waiting when it starts are not printed; an agent that stops waiting and waits again is.
+# A tab that moves to another window keeps its key and gets a new id, so a wait is kept by key with the id it has,
+# and a departure counts only for the id that left.
+eitri agents --watch | jq -n --unbuffered -r '
+  def slot: if (.key // "") == "" then .id else .key end;
+  def line: "\(.project.name) \(.window.name)·\(.number) \(.state)";
+  def waits($rows): [$rows[] | select(.class == "needs") | {key: slot, value: {id, line: line}}] | from_entries;
+  foreach inputs as $e ({waiting: {}, say: []};
+    if $e.type == null then {waiting: waits($e.rows), say: []}
+    elif $e.type == "reset" then .waiting as $old | waits($e.view.rows) as $now
+      | {waiting: $now, say: [$now | to_entries[] | select(.key as $k | $old | has($k) | not) | .value.line]}
+    elif $e.type == "row" then ($e.row | slot) as $k
+      | if $e.row.class != "needs" then {waiting: (.waiting | del(.[$k])), say: []}
+        elif .waiting[$k] then {waiting: (.waiting + {($k): {id: $e.row.id, line: ($e.row | line)}}), say: []}
+        else ($e.row | line) as $l | {waiting: (.waiting + {($k): {id: $e.row.id, line: $l}}), say: [$l]} end
+    elif $e.type == "gone" then ($e | slot) as $k
+      | if .waiting[$k].id == $e.id then {waiting: (.waiting | del(.[$k])), say: []} else .say = [] end
+    else .say = [] end;
+    .say[])'
+```
+
+**Desktop notifications.** `~/.local/bin/eitri-notify`, started from your desktop's autostart or a `systemd --user`
+service:
+
+```sh
+#!/bin/sh
+# A desktop notification each time an agent starts waiting.
+eitri-on-wait | while IFS= read -r line; do
+  notify-send --app-name=Eitri "An agent waits for you" "$line"
+done
+```
+
+**Your phone.** [ntfy](https://ntfy.sh) pushes a message posted to a topic on your server to the ntfy app on your
+phone. `~/.local/bin/eitri-ntfy`:
+
+```sh
+#!/bin/sh
+# A push to your phone through your own ntfy server each time an agent starts waiting.
+# NTFY_URL is the topic's address on your server, for example https://ntfy.example.com/my-agents.
+: "${NTFY_URL:?set NTFY_URL to your ntfy topic address}"
+eitri-on-wait | while IFS= read -r line; do
+  curl -fsS -H "Title: An agent waits for you" -d "$line" "$NTFY_URL" > /dev/null
+done
+```
+
+The line it posts holds the project's folder name, which then leaves this machine for your server; the label, which
+comes from your prompt, stays out of it. Run it as `NTFY_URL=https://ntfy.example.com/my-agents eitri-ntfy`, with
+your server's address and a topic name nobody else would guess.
+
+The five scripts on this page are in Eitri's source tree under `examples/agents/`, with the recorded rows they are tested against.
+
 ## Write your own page
 
 A page that shows how many agents wait, below the editor. It is three files in
@@ -266,107 +324,13 @@ could not hear), `agents.selection` and `agents.round`. A page that is not on sc
 A page that declares `agents` also gets `window.eitriAgents` before its own script runs: a row store keyed by row key
 that applies those events, a glyph and a word for every state (with a fallback by class for a state a newer Eitri
 added), and the keys of [the shared grammar](#the-shared-grammar) declared through the keys kit, so your page fits
-beside the bundled three. It also gets `window.eitriKeys`. [Pages you build](pages.md) covers the rest of the plugin
-format.
+beside the bundled three. It also gets `window.eitriKeys`. [Write a plugin](write-a-plugin.md) is the whole reference
+for plugin authors, and [Pages you build](pages.md) the short introduction.
 
 ### The rows
 
-The whole view and each line of `eitri agents --watch` carry `"v": 1`; a row itself does not (the example below has no
-`v`), and neither does the payload of a page event. A reader must ignore fields it does not know and map a state it
-does not know by its `class`. One row:
-
-```json
-{
-  "id": "a3f09c1d2e4b5f60.7",
-  "key": "k-5c1e0b9a7d3f2e18",
-  "agent": "claude",
-  "project": { "key": "9b2c4e7a10f3d856", "name": "eitri" },
-  "window": { "instance": "a3f09c1d2e4b5f60", "name": "1", "focused": true },
-  "number": 3,
-  "label": "close question",
-  "label_from": "title",
-  "shown": false,
-  "state": "card",
-  "class": "needs",
-  "since": 1793865600123,
-  "needs": { "cards": 1, "questions": 0, "trust": false },
-  "waiting_since": 1793865600123,
-  "unread": false,
-  "tool": "Bash",
-  "background": { "calls": 0, "shells": 0, "monitors": 0, "agents": 0, "other": 0 },
-  "queued": 0,
-  "mode": "manual",
-  "ended_how": null,
-  "moving": false
-}
-```
-
-| field | meaning |
-|---|---|
-| `id` | `<instance>.<tab>`; valid while the row exists; the argument of `focus` and `stop` |
-| `key` | `k-` and 16 hex digits, the tab's own, kept when the tab moves to another window or is resumed |
-| `agent` | `claude`, `codex` or `acp:<name>` |
-| `project` | `key` (16 hex digits, no path) and `name` (the folder's name, cut to 40 characters) |
-| `window` | `instance` (random per process start), `name` (`1`, `2`, `u` for an unpaired window, `c1`..`c9` for compositor chat windows, `companion`), `focused` |
-| `number` | the number on the tab strip of that window (not global) |
-| `label`, `label_from` | at most 40 characters; from `rename`, `title`, `session` or `new` |
-| `shown` | the tab is the active tab of a chat that is on screen |
-| `state`, `class` | below |
-| `since` | when the row entered its state, in milliseconds since the epoch of the writing process's clock |
-| `waiting_since` | when the oldest card, question or trust question was first seen, or `null`; the round orders by it |
-| `needs` | counts of cards and questions, and whether a trust question waits (a tab can hold a card and a question) |
-| `unread` | a turn finished while the chat was not on screen |
-| `tool` | the open tool call's name (or the oldest card's), never its input |
-| `background` | `calls` is the total; the four counts by kind can all be 0 while `calls` is not |
-| `queued` | messages typed and waiting for the turn to end |
-| `mode` | `manual`, `auto` or `bypass` |
-| `ended_how` | `closed`, `stopped`, `unavailable`, `start_failed` or `tripped`; never a reason text |
-| `moving` | the tab is in the middle of moving to another window |
-
-The states, in the order that decides which one a row has (the first that holds wins):
-
-| state | class | glyph | when |
-|---|---|---|---|
-| `card` | needs | `⚑` | a permission card or a tool card waits |
-| `question` | needs | `?` | a question set waits |
-| `trust` | needs | `?` | a start waits for the trust answer |
-| `failed` | ended | `✕` | the tab could not start, or its session died unasked |
-| `ended` | ended | `✕` | the session closed or you stopped it, and the tab is still open |
-| `running` | working | `●` | a turn runs |
-| `background` | working | `◌` | no turn runs, background work does |
-| `starting` | working | `…` | the session is being opened |
-| `done` | quiet | `•` | idle, and a turn finished while the chat was not on screen |
-| `idle` | quiet | `·` | a live session with nothing running and nothing unread |
-| `new` | quiet | (blank) | a tab with no session yet |
-
-The whole view, which is what `eitri agents --json` prints and `agents.watch` answers:
-
-```json
-{ "v": 1, "at": 1793865600200, "enabled": true, "projects": [ ... ], "rows": [ ... ],
-  "selection": { "key": "k-…", "by": "a3f09c1d2e4b5f60", "at": 1793865600100 } | null,
-  "round": { "from": { "instance": "a3f09c1d2e4b5f60", "module": "…", "tab": null }, "current": "k-…",
-             "visited": [ ... ], "started_at": 1793865500000, "at": 1793865600100 } | null }
-```
-
-`projects` lists every project that has a running window, `{key, name}`, including one whose windows hold no tab, so a
-page can offer `new` there. Rows come ordered by project name and key, window name and instance, and number. The lines
-of `--watch` wrap each change in an envelope with `v` and `type`:
-
-```json
-{ "v": 1, "type": "row",  "row": { ... } }
-{ "v": 1, "type": "gone", "id": "a3f09c1d2e4b5f60.7", "key": "k-5c1e0b9a7d3f2e18", "why": "closed" }
-{ "v": 1, "type": "reset", "view": { ... } }
-{ "v": 1, "type": "selection", "selection": { ... } | null }
-{ "v": 1, "type": "round", "round": { ... } | null }
-```
-
-A page does not get these envelopes. Its callback receives the payload alone, whose names are the ones inside the
-envelope: for `agents.row` the row itself (`event.id`, not `event.row.id`), for `agents.gone` `{id, key, why}`, for
-`agents.reset` the whole view (this one has `v`), for `agents.selection` the selection or `null`, for `agents.round`
-the round or `null`.
-
-`why` is `closed` (the tab), `moved` or `window` (its process ended, or turned the layer off). A process publishes at
-most 64 rows and 64 KiB; past that it publishes the first 64 by tab number.
+Every field of a row, the states and what decides them, the whole view and the lines of `--watch` are in
+[Write a plugin](write-a-plugin.md#the-rows), with each call's arguments, results and refusals.
 
 ## Limits
 

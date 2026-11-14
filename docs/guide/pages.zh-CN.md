@@ -1,5 +1,5 @@
 [English](pages.md) | 简体中文
-<!-- translated-from: pages.md sha256=70bb339083218008bf1d6a51036e56188fa3ffb7f0a8b1815f85fbc2f85e464d -->
+<!-- translated-from: pages.md sha256=c53bfc9d6e1ce02f57aaf30a7590243bffe69d0e22f4b2f44cc67c1abca57d41 -->
 
 # 你自己做的页面
 
@@ -8,7 +8,7 @@ Eitri 可以把你自己的网页作为窗口里的模块显示出来，和编�
 - **Lua 面板**是 `init.lua` 里的一条调用，显示一个 HTML 文件或一个地址，比如你的开发服务器。它是一个普通的网页视图，对 Eitri 一无所知。
 - **插件**是一个带 `eitri-plugin.toml` 的目录，加上一个小网站。它的页面拿到 Eitri 的配色、Eitri 的页面按键，以及一座通往一组封闭的宿主能力的桥，具体哪些由清单点名：保存它自己的数据、把按键交给编辑器、运行插件自己的程序、跟随你正在编辑的缓冲区。Eitri 随附的 [Markdown 预览](markdown-preview.zh-CN.md)就是一个插件。
 
-**两种都是实验性的。** 0.x 期间清单格式、桥接和按键工具包都可能改变，改变时发布说明会写出来。两种都不能在 companion 窗口里使用。
+**两种都是实验性的。** 0.x 期间清单格式、桥接和按键工具包都可能改变，改变时发布说明会写出来。两种都不会显示在 companion 窗口里。插件页面可以改为作为单独的窗口开在你的 Neovim 旁边（[开在你 nvim 旁边的页面](companion.zh-CN.md#pages-beside-your-nvim)），条件是它只声明 `editor.follow`、`editor.commands`、`editor.open`、`state` 和 `net`，并且没有 `[window]`：Markdown 预览可以，agent 页面不行。Lua 面板没有这样的窗口。
 
 <a id="trust"></a>
 ## 信任
@@ -57,6 +57,8 @@ eitri.panel.register{
 ```lua
 eitri.plugin.load("scratch", { key = "y" })
 ```
+
+[写一个插件](write-a-plugin.zh-CN.md)是参考：清单的每个键和每项能力、桥的调用和错误、完整的 `agents` 能力，以及发布之间保持稳定的是什么。
 
 `eitri.plugin.load` 只在 `init.lua` 运行期间被接受。它的选项是插件自己的设置、`key`（一个模块键，和 Lua 面板一样）以及 `position`。每次加载都会在你启动 Eitri 的那个终端里打印它用的是哪个目录。清单里有错误，这个页面就不加载，Eitri 在启动时把它列出来并点出出错的那个键。
 
@@ -199,7 +201,7 @@ start();
 <a id="a-brief-for-your-own-agent"></a>
 ## 给你自己的 agent 的说明
 
-想让一个 agent 替你写插件，把这一页和类似下面的说明交给它：
+想让一个 agent 替你写插件，把这一页、[写一个插件](write-a-plugin.zh-CN.md)和类似下面的说明交给它：
 
 ```text
 Write an Eitri plugin: a directory with eitri-plugin.toml (id, title, protocol = 1, site, entry,

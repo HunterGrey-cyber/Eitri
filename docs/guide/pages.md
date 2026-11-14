@@ -14,7 +14,10 @@ On Hyprland, sway and niri each page is a window of its own by default, which yo
   [Markdown preview](markdown-preview.md) that ships with Eitri is one.
 
 **Both are experimental.** The manifest, the bridge and the keys kit may change during 0.x, and a release note will
-say when they do. Neither is available in the companion window.
+say when they do. Neither is shown in the companion window. A plugin page can open as a window of its own beside
+your Neovim instead ([Pages beside your nvim](companion.md#pages-beside-your-nvim)), if it declares only `editor.follow`,
+`editor.commands`, `editor.open`, `state` and `net` and no `[window]`: the Markdown preview can, the agent pages
+cannot. A Lua panel has no such window.
 
 ## Trust
 
@@ -74,6 +77,9 @@ by path ([how a name is found](configuration.md#plugins)):
 ```lua
 eitri.plugin.load("scratch", { key = "y" })
 ```
+
+[Write a plugin](write-a-plugin.md) is the reference: every manifest key and capability, the bridge's calls and
+errors, the `agents` capability in full, and what stays stable between releases.
 
 `eitri.plugin.load` is taken only while `init.lua` runs. Its options are the plugin's own settings, `key` (a module
 key, as for a Lua panel) and `position`. Each load prints the directory it used in the terminal you started Eitri
@@ -242,7 +248,7 @@ The capabilities:
 
 ## A brief for your own agent
 
-To have an agent write a plugin for you, give it this page and a brief such as:
+To have an agent write a plugin for you, give it this page, [Write a plugin](write-a-plugin.md), and a brief such as:
 
 ```text
 Write an Eitri plugin: a directory with eitri-plugin.toml (id, title, protocol = 1, site, entry,

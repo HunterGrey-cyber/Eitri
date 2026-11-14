@@ -1,5 +1,5 @@
 [English](many-agents.md) | 简体中文
-<!-- translated-from: many-agents.md sha256=f47bf21c2efb6018ebca4b1eb3c867a5365976ee2d5385d3fde372d24e26fa19 -->
+<!-- translated-from: many-agents.md sha256=79a25f415bcd6a1f6b9cba7eaea5380a7a5920e8ce27fbfec449e49315bbf9e1 -->
 
 # 同时用很多 agent
 
@@ -143,6 +143,58 @@ eitri agents --watch | while read -r _; do show; done
 "custom/agents": { "exec": "~/.local/bin/eitri-waybar", "return-type": "json" }
 ```
 
+**每次有新的等待就一行。** 接下来的两个脚本要知道的是 agent 什么时候开始等，而不是有几个在等。`eitri-on-wait` 每发生一次就打印一行，写出 agent 所在的项目、窗口、标签页和状态（`eitri 1·2 card`）。它启动时已经在等的 agent 不会打印；停止等待后又重新等的会打印。`~/.local/bin/eitri-on-wait`：
+
+```sh
+#!/bin/sh
+# One line each time an agent starts waiting for you: "<project> <window>·<tab> <state>".
+# Agents already waiting when it starts are not printed; an agent that stops waiting and waits again is.
+# A tab that moves to another window keeps its key and gets a new id, so a wait is kept by key with the id it has,
+# and a departure counts only for the id that left.
+eitri agents --watch | jq -n --unbuffered -r '
+  def slot: if (.key // "") == "" then .id else .key end;
+  def line: "\(.project.name) \(.window.name)·\(.number) \(.state)";
+  def waits($rows): [$rows[] | select(.class == "needs") | {key: slot, value: {id, line: line}}] | from_entries;
+  foreach inputs as $e ({waiting: {}, say: []};
+    if $e.type == null then {waiting: waits($e.rows), say: []}
+    elif $e.type == "reset" then .waiting as $old | waits($e.view.rows) as $now
+      | {waiting: $now, say: [$now | to_entries[] | select(.key as $k | $old | has($k) | not) | .value.line]}
+    elif $e.type == "row" then ($e.row | slot) as $k
+      | if $e.row.class != "needs" then {waiting: (.waiting | del(.[$k])), say: []}
+        elif .waiting[$k] then {waiting: (.waiting + {($k): {id: $e.row.id, line: ($e.row | line)}}), say: []}
+        else ($e.row | line) as $l | {waiting: (.waiting + {($k): {id: $e.row.id, line: $l}}), say: [$l]} end
+    elif $e.type == "gone" then ($e | slot) as $k
+      | if .waiting[$k].id == $e.id then {waiting: (.waiting | del(.[$k])), say: []} else .say = [] end
+    else .say = [] end;
+    .say[])'
+```
+
+**桌面通知。** `~/.local/bin/eitri-notify`，从你桌面的自启动项或一个 `systemd --user` 服务启动：
+
+```sh
+#!/bin/sh
+# A desktop notification each time an agent starts waiting.
+eitri-on-wait | while IFS= read -r line; do
+  notify-send --app-name=Eitri "An agent waits for you" "$line"
+done
+```
+
+**你的手机。** [ntfy](https://ntfy.sh) 会把发到你服务器上某个主题的消息推送到你手机上的 ntfy 应用。`~/.local/bin/eitri-ntfy`：
+
+```sh
+#!/bin/sh
+# A push to your phone through your own ntfy server each time an agent starts waiting.
+# NTFY_URL is the topic's address on your server, for example https://ntfy.example.com/my-agents.
+: "${NTFY_URL:?set NTFY_URL to your ntfy topic address}"
+eitri-on-wait | while IFS= read -r line; do
+  curl -fsS -H "Title: An agent waits for you" -d "$line" "$NTFY_URL" > /dev/null
+done
+```
+
+它发出去的那一行里有项目的文件夹名，这个名字因此会离开这台机器，发到你的服务器；标签来自你的提示词，不在其中。运行方式是 `NTFY_URL=https://ntfy.example.com/my-agents eitri-ntfy`，换成你服务器的地址和一个别人猜不到的主题名。
+
+本页的五个脚本在 Eitri 源码树的 `examples/agents/` 下，附有测试用的录制好的行。
+
 <a id="write-your-own-page"></a>
 ## 写你自己的页面
 
@@ -214,99 +266,12 @@ eitriPlugin.call("host.hello", {})
 
 事件有 `agents.row`（一行变了）、`agents.gone`、`agents.reset`（页面没来得及听到变化之后给的完整视图）、`agents.selection` 和 `agents.round`。不在屏幕上的页面什么也听不到，回来时会收到一次 `agents.reset`。
 
-声明了 `agents` 的页面，在它自己的脚本运行之前，还会得到 `window.eitriAgents`：一个按行键存放行、并应用这些事件的行仓库；每个状态一个图标和一个词（遇到更新的 Eitri 新增的状态，按它的类别回退）；以及通过按键工具包声明的[共用操作](#the-shared-grammar)的各个键，所以你的页面可以和自带的三个并排放。它还会得到 `window.eitriKeys`。插件格式的其余部分见[你自己做的页面](pages.zh-CN.md)。
+声明了 `agents` 的页面，在它自己的脚本运行之前，还会得到 `window.eitriAgents`：一个按行键存放行、并应用这些事件的行仓库；每个状态一个图标和一个词（遇到更新的 Eitri 新增的状态，按它的类别回退）；以及通过按键工具包声明的[共用操作](#the-shared-grammar)的各个键，所以你的页面可以和自带的三个并排放。它还会得到 `window.eitriKeys`。[写一个插件](write-a-plugin.zh-CN.md)是给插件作者的完整参考，[你自己做的页面](pages.zh-CN.md)是简短的介绍。
 
 <a id="the-rows"></a>
 ### 行
 
-完整的视图和 `eitri agents --watch` 的每一行带有 `"v": 1`；单独的一行没有（下面的例子里没有 `v`），页面事件的内容也没有。读取方必须忽略它不认识的字段，并把不认识的状态按它的 `class` 来处理。一行如下：
-
-```json
-{
-  "id": "a3f09c1d2e4b5f60.7",
-  "key": "k-5c1e0b9a7d3f2e18",
-  "agent": "claude",
-  "project": { "key": "9b2c4e7a10f3d856", "name": "eitri" },
-  "window": { "instance": "a3f09c1d2e4b5f60", "name": "1", "focused": true },
-  "number": 3,
-  "label": "close question",
-  "label_from": "title",
-  "shown": false,
-  "state": "card",
-  "class": "needs",
-  "since": 1793865600123,
-  "needs": { "cards": 1, "questions": 0, "trust": false },
-  "waiting_since": 1793865600123,
-  "unread": false,
-  "tool": "Bash",
-  "background": { "calls": 0, "shells": 0, "monitors": 0, "agents": 0, "other": 0 },
-  "queued": 0,
-  "mode": "manual",
-  "ended_how": null,
-  "moving": false
-}
-```
-
-| 字段 | 含义 |
-|---|---|
-| `id` | `<instance>.<tab>`；这一行存在期间有效；是 `focus` 和 `stop` 的参数 |
-| `key` | `k-` 加 16 位十六进制数，标签页自己的，标签页移到另一个窗口或被恢复时保持不变 |
-| `agent` | `claude`、`codex` 或 `acp:<name>` |
-| `project` | `key`（16 位十六进制，不含路径）和 `name`（文件夹名，截到 40 个字符） |
-| `window` | `instance`（每次进程启动随机生成）、`name`（`1`、`2`，未配对的窗口是 `u`，合成器聊天窗口是 `c1`..`c9`，还有 `companion`）、`focused` |
-| `number` | 那个窗口标签栏上的编号（不是全局的） |
-| `label`、`label_from` | 最多 40 个字符；来自 `rename`、`title`、`session` 或 `new` |
-| `shown` | 这个标签页是屏幕上某个聊天的当前标签页 |
-| `state`、`class` | 见下 |
-| `since` | 这一行进入当前状态的时间，毫秒，自 epoch 起，用写入进程的时钟 |
-| `waiting_since` | 最早的卡片、提问或信任问题第一次被看到的时间，或 `null`；这一轮按它排序 |
-| `needs` | 卡片数和提问数，以及有没有信任问题在等（一个标签页可以同时有卡片和提问） |
-| `unread` | 一个回合在聊天不在屏幕上时结束了 |
-| `tool` | 打开着的工具调用的名字（或最早那张卡片的），绝不含它的输入 |
-| `background` | `calls` 是总数；按种类分的四个计数，在 `calls` 不为 0 时也可能全是 0 |
-| `queued` | 打好了、等回合结束再发送的消息数 |
-| `mode` | `manual`、`auto` 或 `bypass` |
-| `ended_how` | `closed`、`stopped`、`unavailable`、`start_failed` 或 `tripped`；绝不含原因文字 |
-| `moving` | 这个标签页正在移到另一个窗口的途中 |
-
-状态，按决定一行是哪个状态的顺序排列（第一个成立的生效）：
-
-| 状态 | 类别 | 图标 | 什么时候 |
-|---|---|---|---|
-| `card` | needs | `⚑` | 有权限卡片或工具卡片在等 |
-| `question` | needs | `?` | 有一组提问在等 |
-| `trust` | needs | `?` | 一次启动在等信任问题的回答 |
-| `failed` | ended | `✕` | 标签页没能启动，或者它的会话未经要求就死了 |
-| `ended` | ended | `✕` | 会话已关闭或被你停掉，而标签页仍然开着 |
-| `running` | working | `●` | 一个回合在运行 |
-| `background` | working | `◌` | 没有回合在运行，但有后台任务 |
-| `starting` | working | `…` | 会话正在打开 |
-| `done` | quiet | `•` | 空闲，并且有一个回合在聊天不在屏幕上时结束了 |
-| `idle` | quiet | `·` | 一个活着的会话，没有东西在运行，也没有未读 |
-| `new` | quiet | （空白） | 还没有会话的标签页 |
-
-完整的视图，也就是 `eitri agents --json` 打印的、`agents.watch` 回答的：
-
-```json
-{ "v": 1, "at": 1793865600200, "enabled": true, "projects": [ ... ], "rows": [ ... ],
-  "selection": { "key": "k-…", "by": "a3f09c1d2e4b5f60", "at": 1793865600100 } | null,
-  "round": { "from": { "instance": "a3f09c1d2e4b5f60", "module": "…", "tab": null }, "current": "k-…",
-             "visited": [ ... ], "started_at": 1793865500000, "at": 1793865600100 } | null }
-```
-
-`projects` 列出每个有窗口在运行的项目，`{key, name}`，包括窗口里没有任何标签页的项目，这样页面可以在那里提供 `new`。行按项目名和键、窗口名和实例、编号排序。`--watch` 的各行把每个变化包在一个带 `v` 和 `type` 的外壳里：
-
-```json
-{ "v": 1, "type": "row",  "row": { ... } }
-{ "v": 1, "type": "gone", "id": "a3f09c1d2e4b5f60.7", "key": "k-5c1e0b9a7d3f2e18", "why": "closed" }
-{ "v": 1, "type": "reset", "view": { ... } }
-{ "v": 1, "type": "selection", "selection": { ... } | null }
-{ "v": 1, "type": "round", "round": { ... } | null }
-```
-
-页面收不到这些外壳，它的回调只拿到里面的内容：`agents.row` 就是那一行本身（用 `event.id`，不是 `event.row.id`），`agents.gone` 是 `{id, key, why}`，`agents.reset` 是完整的视图（只有这个带 `v`），`agents.selection` 是选中项或 `null`，`agents.round` 是这一轮或 `null`。
-
-`why` 是 `closed`（标签页关了）、`moved` 或 `window`（它的进程结束了，或者关掉了这一层）。一个进程最多发布 64 行、64 KiB；超过的话，按标签页编号发布前 64 行。
+一行的每个字段、状态及其判定、完整的视图和 `--watch` 的各行，都在[写一个插件](write-a-plugin.zh-CN.md#the-rows)里，还有每个调用的参数、结果和拒绝的情况。
 
 <a id="limits"></a>
 ## 限制

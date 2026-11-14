@@ -1,0 +1,7 @@
+#!/bin/sh
+# A push to your phone through your own ntfy server each time an agent starts waiting.
+# NTFY_URL is the topic's address on your server, for example https://ntfy.example.com/my-agents.
+: "${NTFY_URL:?set NTFY_URL to your ntfy topic address}"
+eitri-on-wait | while IFS= read -r line; do
+  curl -fsS -H "Title: An agent waits for you" -d "$line" "$NTFY_URL" > /dev/null
+done

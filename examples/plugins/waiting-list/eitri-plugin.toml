@@ -1,0 +1,11 @@
+id = "waiting-list"
+title = "Who waits"
+protocol = 1
+site = "site"
+entry = "index.html"
+capabilities = ["agents", "layout.focus"]
+
+[module]
+start = "hidden"
+at = "right"
+size = 0.3

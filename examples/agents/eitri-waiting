@@ -1,0 +1,2 @@
+#!/bin/sh
+eitri agents --json | jq -r '[.rows[] | select(.class == "needs")] | length | if . > 0 then "⚑ \(.)" else "" end'

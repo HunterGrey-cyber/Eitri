@@ -481,7 +481,7 @@ _GUIDE_DIR = os.path.join(_PUBLISH_FILES, "docs", "guide")
 # The guide's pages, so a page may link a sibling written in another branch before both are merged; the
 # check that every one of them (and its twin) exists runs on the merged tree (GuideCompleteTests).
 _GUIDE_PAGE_NAMES = ("README", "getting-started", "keys", "configuration", "companion", "turn-review", "permissions", "markdown-preview",
-                     "agents", "editor-tools", "pages", "compositor-windows")
+                     "agents", "editor-tools", "pages", "compositor-windows", "write-a-plugin", "environments")
 _FENCE_RE = re.compile(r"^\s*(```|~~~)")
 _LINK_RE = re.compile(r"\]\(([^)\s]+)(?:\s+\"[^\"]*\")?\)")
 
@@ -613,6 +613,8 @@ class PublicTreeLayoutTests(unittest.TestCase):
         shutil.copytree(_PUBLISH_FILES, root, dirs_exist_ok=True)
         # The public tree also carries docs/keymap/, which guide pages link to.
         shutil.copytree(os.path.join(_REPO_ROOT, "docs", "keymap"), os.path.join(root, "docs", "keymap"))
+        # And examples/ (the recipes and the example plugin), which the environments page links to.
+        shutil.copytree(os.path.join(_REPO_ROOT, "examples"), os.path.join(root, "examples"))
         self.assertFalse(os.path.lexists(os.path.join(root, "publish")))
 
         result = subprocess.run(

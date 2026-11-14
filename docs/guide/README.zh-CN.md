@@ -1,5 +1,5 @@
 [English](README.md) | 简体中文
-<!-- translated-from: README.md sha256=e47e679b0f069e301f4da25496e0e783d2932d531291bd5d72821ac41ebb2f5a -->
+<!-- translated-from: README.md sha256=2592c942891dfacfcd0eae15909e6053218309592bb3ecd3e6e8612b2a162fb3 -->
 
 # Eitri 文档
 
@@ -43,4 +43,6 @@ Eitri 不取代 Neovim：缓冲区、动作、LSP 和补全仍然是 Neovim 自�
 - [Codex 与其他 agent](agents.zh-CN.md)：运行 Codex，或你注册的、说 ACP 的 agent 的标签页。
 - [从 agent 标签页使用你的编辑器](editor-tools.zh-CN.md)：任何标签页里的 agent 怎样给你看文件、读你的编辑器里有什么、询问你的语言服务器、提议改动等你批准，以及怎样关掉。
 - [你自己做的页面](pages.zh-CN.md)：把你自己的 HTML 页面作为 Lua 面板，或者带清单的插件页面（实验性）。
+- [写一个插件](write-a-plugin.zh-CN.md)：插件作者的参考：清单、每项能力、`agents` 的调用和事件，以及一个完整的例子。
+- [工作环境](environments.zh-CN.md)：可以直接拿来改的完整 `init.lua`，分别给 tmux 用户、i3 用户、用 Markdown 写作的人、同时跑很多 agent 的人，以及把 Eitri 放在终端 Neovim 旁边的人。
 - [已知问题](../known-issues.zh-CN.md)：今天不支持的和还比较粗糙的地方。

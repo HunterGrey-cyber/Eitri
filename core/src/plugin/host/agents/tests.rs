@@ -1138,6 +1138,103 @@ fn the_guide_example_plugin_loads_and_counts_waiting() {
     );
 }
 
+/// The plugin-author guide's example (`examples/plugins/waiting-list`, each file printed in `write-a-plugin.md` word for
+/// word) loads through the real loader, names only verbs and events the host serves, declares a key table the host
+/// accepts, and its `Enter` reaches the agent that has waited longest with the card first.
+#[test]
+fn the_write_a_plugin_example_loads_and_opens_the_oldest_wait() {
+    use crate::plugin::manifest::Capability;
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../examples/plugins/waiting-list");
+    let plugin = Rc::new(load_plugin(dir.to_str().unwrap(), &BTreeMap::new(), None).expect("the example loads"));
+    assert_eq!(
+        plugin.manifest.capabilities,
+        vec![Capability::Agents, Capability::LayoutFocus]
+    );
+    let guide = std::fs::read_to_string(crate::guide_files::this_trees_guide().join("write-a-plugin.md")).unwrap();
+    for file in ["eitri-plugin.toml", "site/index.html", "site/style.css", "site/page.js"] {
+        let text = std::fs::read_to_string(dir.join(file)).unwrap();
+        assert!(
+            guide.contains(text.trim_end()),
+            "the guide's {file} and the example's differ"
+        );
+    }
+    let script = std::fs::read_to_string(dir.join("site/page.js")).unwrap();
+    let named = |prefix: &str| -> Vec<String> {
+        script
+            .match_indices(prefix)
+            .map(|(at, p)| {
+                let rest = &script[at + p.len()..];
+                rest[..rest.find('"').unwrap()].to_owned()
+            })
+            .collect()
+    };
+    assert_eq!(
+        named("host.call(\""),
+        ["agents.focus", "host.hello", "layout.focus", "agents.watch"]
+    );
+    assert_eq!(
+        named("host.on(\""),
+        [EVENT_AGENTS_ROW, EVENT_AGENTS_GONE, EVENT_AGENTS_RESET]
+    );
+
+    let page = Rc::new(Page::default());
+    let host = PluginHost::new(plugin, page.clone(), Arc::new(|| {}), None, vec![]);
+    let (feed, log) = feed();
+    let port = Rc::new(FakePort::default());
+    let clock = Rc::new(GestureClock::default());
+    host.set_agents(Some(AgentsServices {
+        feed,
+        port: port.clone(),
+        gesture: clock.clone(),
+    }));
+    host.set_on_screen(true, Instant::now());
+    let r = Rig {
+        _s: Scratch::new("host-agents-guide-example"),
+        host,
+        page,
+        port,
+        clock,
+    };
+    r.watching(&log, two_waiting());
+    // The key table the page hands the keys kit, which declares it to the host as written.
+    let rows = [
+        ("waiting.down", "j", "next agent"),
+        ("waiting.up", "k", "previous agent"),
+        ("waiting.open", "<CR>", "go to its chat, card first"),
+        ("waiting.back", "q", "back to the editor"),
+    ];
+    for (action, key, desc) in rows {
+        let written =
+            format!("{{ action: \"{action}\", keys: [\"{key}\"], context: \"Who waits\", desc: \"{desc}\" }}");
+        assert!(script.contains(&written), "page.js lost its row {written}");
+    }
+    let declared: Vec<Value> = rows
+        .iter()
+        .map(|(action, key, desc)| json!({"action": action, "keys": [key], "context": "Who waits", "desc": desc}))
+        .collect();
+    let reply = r.answer_at(Instant::now(), 3, "keys.declare", json!({ "rows": declared }));
+    assert_eq!(reply["ok"], true, "{reply}");
+    // What `open()` does with the watch's view: the waiting rows, oldest first, and the first of them.
+    let watch = r.answer_at(Instant::now(), 4, "agents.watch", json!({}));
+    let mut waiting: Vec<&Value> = watch["result"]["rows"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|row| row["class"] == "needs")
+        .collect();
+    waiting.sort_by_key(|row| row["waiting_since"].as_u64().unwrap_or(0));
+    let at = Instant::now();
+    r.clock.record(at);
+    let reply = r.answer_at(
+        at,
+        5,
+        "agents.focus",
+        json!({"id": waiting[0]["id"], "card_first": true}),
+    );
+    assert_eq!(reply["ok"], true, "{reply}");
+    assert_eq!(r.port.take(), [format!("focus {B} Some(3) card_first=true Show")]);
+}
+
 #[test]
 fn a_plugin_pages_view_never_satisfies_may_answer() {
     use crate::layout::ModuleId;
