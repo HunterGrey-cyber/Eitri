@@ -40,8 +40,9 @@ pub use moving::{ClaudeProviderHandoff, MoveRefusedWhy};
 #[cfg(target_os = "linux")]
 pub use spawn::SidecarFds;
 pub use spawn::{
-    apply_sidecar_env, sidecar_availability, sidecar_env_policy, sidecar_missing_message, sidecar_origin,
-    user_sidecar_path, SidecarAvailability, SidecarEnv, BUNDLED_SIDECAR_REVISION, NO_SIDECAR_HINT, SIDECAR_EXIT_GRACE,
+    apply_sidecar_env, sidecar_availability, sidecar_env_policy, sidecar_for_upload, sidecar_missing_message,
+    sidecar_origin, user_sidecar_path, SidecarAvailability, SidecarEnv, UploadSidecar, UploadSidecarOrigin,
+    BUNDLED_SIDECAR_REVISION, NO_SIDECAR_HINT, SIDECAR_EXIT_GRACE,
 };
 
 use crate::provider::{

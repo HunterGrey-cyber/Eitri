@@ -81,6 +81,7 @@ pub mod setting_sources;
 pub mod settings;
 #[doc(hidden)]
 pub mod socket_path;
+pub mod ssh;
 pub mod state_dirs;
 #[cfg(feature = "test-support")]
 pub mod testkit;
@@ -157,9 +158,10 @@ pub use provider::{
 pub use providers::claude_sidecar::turn_content;
 pub use providers::claude_sidecar::{
     apply_sidecar_env, claude_cli_missing_here, claude_problem_here, failure_names_missing_cli, locate_claude_here,
-    locate_claude_in, sidecar_availability, sidecar_env_policy, sidecar_missing_message, sidecar_origin,
-    user_sidecar_path, BackpressureStats, ClaudeCli, ClaudeProblem, ClaudeSidecarProvider, SidecarAvailability,
-    SidecarEnv, BUNDLED_SIDECAR_REVISION, BUNDLED_SIDECAR_VERSION, CLAUDE_INSTALL_URL, CLAUDE_LOOKED_IN,
-    CLAUDE_REFUSED_NOTE, CLIENT_IMPLEMENTS_RESUME, CLIENT_PROTOCOL_MAJOR, CLI_MISSING_FAILURE_MARKER, NO_SIDECAR_HINT,
-    REFUSED_CLAUDE_NOTE, REQUIRED_CAPABILITIES, SIDECAR_EXIT_GRACE, UNARY_RPC_TIMEOUT, UNTESTED_CLAUDE_NOTE,
+    locate_claude_in, sidecar_availability, sidecar_env_policy, sidecar_for_upload, sidecar_missing_message,
+    sidecar_origin, user_sidecar_path, BackpressureStats, ClaudeCli, ClaudeProblem, ClaudeSidecarProvider,
+    SidecarAvailability, SidecarEnv, UploadSidecar, UploadSidecarOrigin, BUNDLED_SIDECAR_REVISION,
+    BUNDLED_SIDECAR_VERSION, CLAUDE_INSTALL_URL, CLAUDE_LOOKED_IN, CLAUDE_REFUSED_NOTE, CLIENT_IMPLEMENTS_RESUME,
+    CLIENT_PROTOCOL_MAJOR, CLI_MISSING_FAILURE_MARKER, NO_SIDECAR_HINT, REFUSED_CLAUDE_NOTE, REQUIRED_CAPABILITIES,
+    SIDECAR_EXIT_GRACE, UNARY_RPC_TIMEOUT, UNTESTED_CLAUDE_NOTE,
 };

@@ -274,6 +274,13 @@ fn main() -> glib::ExitCode {
     if early_args.first().is_some_and(|a| a == "--sidecar-probe") {
         return sidecar_probe::run(&early_args[1..]);
     }
+    if early_args.first().is_some_and(|a| a == "--server-helper-hash") {
+        println!(
+            "{}",
+            eitri_core::remote_host::provenance::RELEASE_HELPER_SHA256.unwrap_or("none")
+        );
+        return glib::ExitCode::SUCCESS;
+    }
     // After the panel branch, which reads `$NVIM` as its default address; before anything that starts a
     // thread or a child. An Eitri started from an nvim `:terminal` would otherwise hand that editor's
     // RPC address -- and, if it is another window's nvim, that window's socket variables -- to the
@@ -5223,3 +5230,27 @@ fn build_ui(
 #[cfg(test)]
 #[path = "main_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+mod server_helper_hash_tests {
+    #[test]
+    fn helper_hash_exits_before_root_parsing_or_gtk_startup() {
+        let source = eitri_core::source_scan::read_required("shell/src/main.rs");
+        let (_, body) = eitri_core::source_scan::function_in_raw(&[source], "main");
+        let probe = body.find("--sidecar-probe").expect("sidecar probe arm");
+        let arm = body.find("--server-helper-hash").expect("helper hash arm");
+        assert!(probe < arm);
+        let remainder = &body[arm..];
+        let end = remainder
+            .find("return glib::ExitCode::SUCCESS;")
+            .expect("early successful exit");
+        assert!(remainder[..end].contains("RELEASE_HELPER_SHA256.unwrap_or(\"none\")"));
+        for later in [
+            "drop_inherited_editor_env()",
+            "resolve_launch()",
+            "build_application(kind)",
+        ] {
+            assert!(arm + end < body.find(later).unwrap(), "hash probe must precede {later}");
+        }
+    }
+}

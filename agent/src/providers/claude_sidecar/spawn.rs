@@ -970,6 +970,122 @@ enum SidecarProgram {
     Checkout(VerdandiCheckout),
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UploadSidecarOrigin {
+    Packaged,
+    PerUserBuild,
+    Checkout,
+    BinaryOverride,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UploadSidecar {
+    pub path: PathBuf,
+    pub revision: String,
+    pub origin: UploadSidecarOrigin,
+    pub warnings: Vec<String>,
+}
+
+/// Resolve the same self-contained artifact a local tab would use, without starting or building it.
+pub fn sidecar_for_upload() -> Result<UploadSidecar, String> {
+    upload_choice(
+        std::env::var("EITRI_SIDECAR_BINARY").ok().as_deref(),
+        std::env::var("EITRI_VERDANDI_CHECKOUT").ok().as_deref(),
+        running_exe_dir().as_deref(),
+        std::env::var_os("XDG_DATA_HOME").as_deref(),
+        std::env::var_os("HOME").as_deref(),
+        &failed_updates(),
+    )
+}
+
+fn upload_choice(
+    explicit_binary: Option<&str>,
+    explicit_checkout: Option<&str>,
+    exe_dir: Option<&Path>,
+    data_home: Option<&OsStr>,
+    home: Option<&OsStr>,
+    failed: &HashSet<String>,
+) -> Result<UploadSidecar, String> {
+    if explicit_binary.is_some_and(|value| !value.trim().is_empty()) {
+        return Err(
+            "cannot upload an EITRI_SIDECAR_BINARY override; select a packaged or per-user sidecar build".into(),
+        );
+    }
+    if explicit_checkout.is_some_and(|value| !value.trim().is_empty()) {
+        return Err("cannot upload a checkout sidecar; select a packaged or per-user sidecar build".into());
+    }
+    let mut warnings = Vec::new();
+    let (path, origin, updated) =
+        match update_choice(explicit_binary, explicit_checkout, exe_dir, data_home, home, failed) {
+            UpdateChoice::Use { path, .. } => (path, UploadSidecarOrigin::PerUserBuild, true),
+            fallback => {
+                match fallback {
+                    UpdateChoice::Unusable(why) => warnings.push(UpdateTrouble::Unusable(why).fallback_line()),
+                    UpdateChoice::FailedHere(version) => {
+                        warnings.push(UpdateTrouble::FailedHere(version).fallback_line())
+                    }
+                    _ => {}
+                }
+                match resolve_sidecar_program(explicit_binary, explicit_checkout, exe_dir, data_home, home)
+                    .map_err(|error| error.to_string())?
+                {
+                    SidecarProgram::Named(_) => return Err(
+                        "cannot upload an EITRI_SIDECAR_BINARY override; select a packaged or per-user sidecar build"
+                            .into(),
+                    ),
+                    SidecarProgram::Checkout(_) => {
+                        return Err(
+                            "cannot upload a checkout sidecar; select a packaged or per-user sidecar build".into(),
+                        )
+                    }
+                    SidecarProgram::Packaged(path) => {
+                        let packaged = exe_dir.is_some_and(|dir| path == dir.join(PACKAGED_SIDECAR_BINARY));
+                        (
+                            path,
+                            if packaged {
+                                UploadSidecarOrigin::Packaged
+                            } else {
+                                UploadSidecarOrigin::PerUserBuild
+                            },
+                            false,
+                        )
+                    }
+                }
+            }
+        };
+    let revision = if origin == UploadSidecarOrigin::Packaged {
+        BUNDLED_SIDECAR_REVISION.to_string()
+    } else {
+        let build = path.parent().expect("resolved sidecar has a parent").join("BUILD");
+        let text = crate::private_fs::read_sidecar_selection_capped(&build, 16 * 1024)
+            .map_err(|error| format!("cannot read sidecar build identity: {error}"))?;
+        let revisions: Vec<_> = text
+            .lines()
+            .filter_map(|line| line.strip_prefix("VERDANDI_REV="))
+            .collect();
+        let [revision] = revisions.as_slice() else {
+            return Err("sidecar BUILD must name exactly one VERDANDI_REV".into());
+        };
+        if !matches!(revision.len(), 7 | 40)
+            || !revision
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        {
+            return Err("sidecar BUILD revision must be 7 or 40 lowercase hex characters".into());
+        }
+        if !updated && !revision.starts_with(BUNDLED_SIDECAR_REVISION) {
+            return Err("per-user sidecar build does not match the bundled revision".into());
+        }
+        (*revision).to_string()
+    };
+    Ok(UploadSidecar {
+        path,
+        revision,
+        origin,
+        warnings,
+    })
+}
+
 const PACKAGED_DESCRIPTION: &str = "packaged sidecar artifact: ";
 
 fn packaged_description(path: &Path) -> String {
@@ -4235,5 +4351,79 @@ mod tests {
         child.kill().unwrap();
         child.wait().unwrap();
         assert_eq!(group, pid);
+    }
+}
+
+#[cfg(test)]
+mod upload_tests {
+    use super::*;
+
+    fn artifact(path: &Path, revision: Option<&str>) {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, b"self-contained sidecar fixture").unwrap();
+        if let Some(revision) = revision {
+            std::fs::write(
+                path.parent().unwrap().join("BUILD"),
+                format!("VERDANDI_REV={revision}\n"),
+            )
+            .unwrap();
+        }
+    }
+
+    #[test]
+    fn upload_follows_packaged_per_user_and_selected_update_resolution() {
+        let root = crate::state_dirs::test_workspace_dir("sidecar-upload");
+        let exe = root.join("bin");
+        std::fs::create_dir(&exe).unwrap();
+        let data = root.join("data");
+        let user = user_sidecar_path(Some(data.as_os_str()), None, BUNDLED_SIDECAR_REVISION).unwrap();
+        artifact(&user, Some(BUNDLED_SIDECAR_REVISION));
+        let resolve = || upload_choice(None, None, Some(&exe), Some(data.as_os_str()), None, &HashSet::new()).unwrap();
+        let found = resolve();
+        assert_eq!(found.path, user);
+        assert_eq!(found.revision, BUNDLED_SIDECAR_REVISION);
+        assert_eq!(found.origin, UploadSidecarOrigin::PerUserBuild);
+        let packaged = exe.join(PACKAGED_SIDECAR_BINARY);
+        artifact(&packaged, None);
+        assert_eq!(resolve().origin, UploadSidecarOrigin::Packaged);
+        std::fs::write(exe.join(SETUP_PROGRAM), b"setup fixture").unwrap();
+        let update_root = sidecar_data_root(Some(data.as_os_str()), None).unwrap();
+        let update = update_root.join("updates/99.0.0").join(PACKAGED_SIDECAR_BINARY);
+        artifact(&update, Some("abcdef0123456789abcdef0123456789abcdef01"));
+        crate::private_fs::write_private(&update_root.join("selected"), b"version=99.0.0\n").unwrap();
+        let found = resolve();
+        assert_eq!(found.path, update);
+        assert_eq!(found.revision, "abcdef0123456789abcdef0123456789abcdef01");
+        assert_eq!(found.origin, UploadSidecarOrigin::PerUserBuild);
+        std::fs::write(
+            found.path.parent().unwrap().join("BUILD"),
+            b"VERDANDI_REV=../../escape\n",
+        )
+        .unwrap();
+        assert!(upload_choice(None, None, Some(&exe), Some(data.as_os_str()), None, &HashSet::new()).is_err());
+    }
+
+    #[test]
+    fn unusable_selected_update_falls_back_to_the_bundled_artifact() {
+        let root = crate::state_dirs::test_workspace_dir("upload-fallback");
+        let exe = root.join("bin");
+        let data = root.join("data");
+        artifact(&exe.join(PACKAGED_SIDECAR_BINARY), None);
+        std::fs::write(exe.join(SETUP_PROGRAM), b"setup fixture").unwrap();
+        let update_root = sidecar_data_root(Some(data.as_os_str()), None).unwrap();
+        std::fs::create_dir_all(&update_root).unwrap();
+        crate::private_fs::write_private(&update_root.join("selected"), b"version=99.0.0\n").unwrap();
+        let found = upload_choice(None, None, Some(&exe), Some(data.as_os_str()), None, &HashSet::new()).unwrap();
+        assert_eq!(found.path, exe.join(PACKAGED_SIDECAR_BINARY));
+        assert_eq!(found.origin, UploadSidecarOrigin::Packaged);
+        assert!(found.warnings[0].contains("Sidecar update: 99.0.0 is incomplete"));
+    }
+
+    #[test]
+    fn overrides_and_checkouts_are_refused_for_upload_with_reasons() {
+        let named = upload_choice(Some("/srv/project/sidecar"), None, None, None, None, &HashSet::new()).unwrap_err();
+        assert!(named.contains("EITRI_SIDECAR_BINARY override"));
+        let checkout = upload_choice(None, Some("/srv/project"), None, None, None, &HashSet::new()).unwrap_err();
+        assert!(checkout.contains("checkout sidecar"));
     }
 }
