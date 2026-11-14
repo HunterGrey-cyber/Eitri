@@ -35,7 +35,6 @@
 //! and its refusal printed an `xvfb-run -a` command, whose own `Xvfb` writes a socket file and a lock
 //! file in `/tmp` (this header warned against that one and started an `Xvfb` by hand inside `bwrap`).
 //! This test starts its own X server. Do not use `xvfb-run`: its server writes shared socket and lock files.
-//! rule on GUI tests says how to run these.
 //!
 //! A plain `main` (`harness = false`), because GTK must own the main thread. About 1s.
 

@@ -511,6 +511,8 @@ pub(crate) fn translate_wire_event(
 /// `projection::tool_use_link` rejects an empty id, while `permission_id` remains the routing
 /// key used by `respond_permission`. The hook relay uses the tool-use id as its routing key,
 /// but the fields stay separate so changing either role does not silently change the other.
+/// That the relay's id is the `tool_use` block's id rests on one captured run, whose `tool_result` names it;
+/// the ignored real-CLI test `real_pretooluse_hook_allow_end_to_end` asserts the equality directly.
 fn permission_requested_event(
     request_id: String,
     tool_use_id: Option<String>,

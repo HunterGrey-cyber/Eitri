@@ -6641,8 +6641,8 @@ describe("App keyboard: scrolling through the conversation", () => {
     vi.unstubAllGlobals();
   });
   /* `[`/`]` arm with Alt or Meta held, so the second key accepts the same modifiers and
-     `[[`/`]]` still jump. Layouts that type brackets with Option need the modifier on both
-     keys. */
+     `[[`/`]]` still jump. On layouts that type brackets with Option, both keys arrive with
+     that modifier. */
   it("[[ and ]] typed with Alt or Meta held on both keys still jump", () => {
     const { container } = started();
     prompts("r0", "r1", "r2", "r3");
