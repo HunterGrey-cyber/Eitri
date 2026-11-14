@@ -40,12 +40,15 @@
       "cwd": null,
       "history": null,
       "lastTurnEnding": null,
+      "linkState": null,
       "model": null,
       "pendingPermissions": [],
       "provider": {
+        "accountName": null,
         "buildDescription": null,
         "claudeAgentSdkVersion": "",
         "claudeCodeVersion": "",
+        "host": null,
         "protocol": "0.0",
         "sidecarVersion": "",
         "startupDiagnostics": []
@@ -103,12 +106,15 @@
       "cwd": null,
       "history": null,
       "lastTurnEnding": null,
+      "linkState": null,
       "model": null,
       "pendingPermissions": [],
       "provider": {
+        "accountName": null,
         "buildDescription": null,
         "claudeAgentSdkVersion": "",
         "claudeCodeVersion": "",
+        "host": null,
         "protocol": "0.0",
         "sidecarVersion": "",
         "startupDiagnostics": []

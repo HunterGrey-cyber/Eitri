@@ -60,6 +60,12 @@ version = "0.3.0"
 edition = "2021"
 publish = false
 
+# Verdandi's protocol crate, pinned once for every crate that speaks it (agent, server: `workspace = true`), so the
+# window, the helper and the sidecar never build against two revisions of it. The pin moves together with
+# `agent::EXPECTED_VERDANDI_REVISION`, and publish/export.sh rewrites this line for the public tree.
+[workspace.dependencies]
+claude-runtime-protocol = { git = "https://github.com/HunterGrey-cyber/verdandi.git", rev = "842d54e6c4cccf4aa71e8ded54c020c0253ad78e" }
+
 # The Neovide fork builds against Neovide's own nvim-rs branch (its `[patch.crates-io]`), which a
 # dependency's patch section cannot give this workspace: nvim-rs master plus "drain queued
 # notifications before reporting RPC EOF". Pinned by commit, never the branch. LGPL-3.0 like the

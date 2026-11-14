@@ -97,7 +97,31 @@
 //! - `EITRI_STANDIN_STDERR_FLOOD=<bytes>`: after binding, write this many bytes in 64 KiB chunks a few
 //!   milliseconds apart on a separate thread; write errors do not stop the process;
 //! - `EITRI_STANDIN_RING=<n>`: retain only the newest `n` events per session (unset is unbounded),
-//!   refusing evicted cursors with `EVENT_GAP`.
+//!   refusing evicted cursors with `EVENT_GAP`;
+//! - `EITRI_STANDIN_BIND_AFTER_MS=<ms>`: the process waits this long before it binds;
+//! - `EITRI_STANDIN_REFUSE_CREATE`: every `CreateSession` is refused with `FAILED_PRECONDITION`;
+//! - `EITRI_STANDIN_ACCOUNTS=<directory>`: an account named by `VERDANDI_CLAUDE_ACCOUNT` exists when
+//!   `<directory>/.claude-<name>` is a directory; otherwise the process refuses before it binds, with
+//!   the sidecar's own words. Unset, every account exists, under `$HOME`.
+//!
+//! An account named by `VERDANDI_CLAUDE_ACCOUNT` is reported in the handshake (`account_name`, and its
+//! directory as `account_config_dir` and `effective_claude_config_dir`), as the sidecar reports it.
+//!
+//! A started process that cannot be given arguments or environment (the server helper starts its
+//! sidecars with neither) reads them from `standin.conf` beside its executable when there is one: each
+//! line is either `NAME=value`, set before anything else reads the environment, or an argument with
+//! its value after one space (`--record-create /abs/file`), taken after the command line's.
+//!
+//! One more step drives a long replay: `flood <count> <bytes> <message id>` emits `count` text deltas of
+//! `bytes` characters each. `touch <file>` creates an empty file, so a test can wait for the script to have got
+//! there (a flood past a short ring, for one).
+//!
+//! `ask-expire <permission id> <seconds>` plays what the CLI does with a request nobody answers: the request,
+//! then, stamped `<seconds>` later on the events' own clock (every later event follows that clock), its
+//! resolution as expired; the script goes on. A late answer to it is refused as the sidecar refuses one, with
+//! `PERMISSION_NOT_FOUND`.
+//!
+//! `--record-permissions <file>` appends a line per `ResolvePermission` request: `<permission id> allow|deny`.
 
 use claude_runtime_protocol::v1::client_tool_content::Kind as ContentKind;
 use claude_runtime_protocol::v1::resolve_interaction_request::Result as Decision;
@@ -274,10 +298,17 @@ struct Shared {
     /// The handshake's limit, and what `AnswerClientToolCall` holds a request to. Unset, [`MAX_MESSAGE_BYTES`].
     max_message_bytes: Option<u64>,
     record_answers: Mutex<Option<std::fs::File>>,
+    record_permissions: Mutex<Option<std::fs::File>>,
+    /// Added to every event's `occurred_at`: how far `ask-expire` moved the events' clock.
+    clock_offset_ms: std::sync::atomic::AtomicI64,
+    /// Requests that expired: an answer to one is refused as not found.
+    expired: Mutex<HashSet<String>>,
     /// While true, `AnswerClientToolCall` replies wait.
     holding_answers: tokio::sync::watch::Sender<bool>,
     scripted: Scripted,
     ring_capacity: Option<usize>,
+    /// The account the process resolved, with its directory.
+    account: Option<(String, String)>,
     plan_mode: bool,
     /// The handshake's `turn_content_limits` and `turn_content_v1`, when offered.
     turn_content: Option<TurnContentLimits>,
@@ -347,7 +378,8 @@ impl Shared {
         let occurred_at = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_millis() as i64)
-            .unwrap_or(0);
+            .unwrap_or(0)
+            + self.clock_offset_ms.load(Ordering::SeqCst);
         let event = SessionEvent {
             session_id: session_id.to_string(),
             sequence: session.latest_sequence + 1,
@@ -546,6 +578,27 @@ fn run(shared: Arc<Shared>, session_id: String, mut turn_id: String, mut steps: 
                 Some("gate") => {
                     wait_for_gate(words.next().expect("gate directory")).await;
                 }
+                Some("touch") => {
+                    std::fs::write(words.next().expect("a file"), b"").expect("the file is created");
+                }
+                Some("flood") => {
+                    let count: usize = words.next().and_then(|n| n.parse().ok()).expect("a count");
+                    let bytes: usize = words.next().and_then(|n| n.parse().ok()).expect("a size");
+                    let message_id = words.next().unwrap_or("m").to_string();
+                    let text = "x".repeat(bytes);
+                    for _ in 0..count {
+                        shared.emit(
+                            &session_id,
+                            Some(&turn_id),
+                            Event::TextDelta(TextDelta {
+                                turn_id: turn_id.clone(),
+                                text: text.clone(),
+                                message_id: Some(message_id.clone()),
+                                ..Default::default()
+                            }),
+                        );
+                    }
+                }
                 Some("sleep") => {
                     let ms = words.next().and_then(|ms| ms.parse().ok()).unwrap_or(0);
                     tokio::time::sleep(Duration::from_millis(ms)).await;
@@ -606,6 +659,31 @@ fn run(shared: Arc<Shared>, session_id: String, mut turn_id: String, mut steps: 
                     } else {
                         return;
                     }
+                }
+                Some("ask-expire") => {
+                    let permission_id = words.next().unwrap_or("p").to_string();
+                    let seconds: i64 = words.next().and_then(|n| n.parse().ok()).expect("seconds");
+                    shared.emit(
+                        &session_id,
+                        Some(&turn_id),
+                        Event::PermissionRequested(PermissionRequested {
+                            permission_id: permission_id.clone(),
+                            tool_use_id: format!("tool-{permission_id}"),
+                            tool_name: "Bash".to_string(),
+                            input_json: r#"{"command":"true"}"#.to_string(),
+                            ..Default::default()
+                        }),
+                    );
+                    shared.clock_offset_ms.fetch_add(seconds * 1000, Ordering::SeqCst);
+                    shared.expired.lock().unwrap().insert(permission_id.clone());
+                    shared.emit(
+                        &session_id,
+                        Some(&turn_id),
+                        Event::PermissionResolved(PermissionResolved {
+                            permission_id,
+                            outcome: PermissionOutcome::Expired as i32,
+                        }),
+                    );
                 }
                 Some("client-call") => {
                     let call_id = words.next().unwrap_or("c").to_string();
@@ -884,6 +962,11 @@ fn handshake(shared: &Shared) -> HandshakeResponse {
         max_message_bytes: shared.max_message_bytes(),
         ..Default::default()
     };
+    if let Some((name, directory)) = &shared.account {
+        response.account_name = name.clone();
+        response.account_config_dir = directory.clone();
+        response.effective_claude_config_dir = directory.clone();
+    }
     if shared.without_system_prompt_preset {
         response.capabilities.retain(|c| c != "system_prompt_preset");
     }
@@ -994,6 +1077,9 @@ impl Service<http::Request<Body>> for StandIn {
                             file.write_all(&(bytes.len() as u32).to_le_bytes()).unwrap();
                             file.write_all(&bytes).unwrap();
                             file.flush().unwrap();
+                        }
+                        if std::env::var_os("EITRI_STANDIN_REFUSE_CREATE").is_some() {
+                            return Err(Status::failed_precondition("sessions refused by the test"));
                         }
                         let plan_offered = request
                             .client_interactions
@@ -1130,6 +1216,14 @@ impl Service<http::Request<Body>> for StandIn {
                 }
                 "ResolvePermission" => {
                     unary(req, move |request: ResolvePermissionRequest| async move {
+                        if let Some(file) = shared.record_permissions.lock().unwrap().as_mut() {
+                            let decision = if request.allow { "allow" } else { "deny" };
+                            writeln!(file, "{} {decision}", request.permission_id).unwrap();
+                            file.flush().unwrap();
+                        }
+                        if shared.expired.lock().unwrap().contains(&request.permission_id) {
+                            return Err(refusal(tonic::Code::NotFound, ErrorCode::PermissionNotFound, ""));
+                        }
                         let rest = shared
                             .sessions
                             .lock()
@@ -1395,7 +1489,62 @@ impl Service<http::Request<Body>> for StandIn {
     }
 }
 
+/// `standin.conf` beside the executable: environment to set, and arguments after the command line's.
+fn configuration_beside_the_executable() -> (Vec<(String, String)>, Vec<std::ffi::OsString>) {
+    let Some(file) = std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(|dir| dir.join("standin.conf")))
+    else {
+        return Default::default();
+    };
+    let Ok(text) = std::fs::read_to_string(file) else {
+        return Default::default();
+    };
+    let mut env = Vec::new();
+    let mut args = Vec::new();
+    for line in text.lines().filter(|line| !line.trim().is_empty()) {
+        if line.starts_with("--") {
+            match line.split_once(' ') {
+                Some((flag, value)) => args.extend([flag.into(), value.into()]),
+                None => args.push(line.into()),
+            }
+        } else if let Some((name, value)) = line.split_once('=') {
+            env.push((name.to_string(), value.to_string()));
+        } else {
+            panic!("standin.conf: unreadable line {line:?}");
+        }
+    }
+    (env, args)
+}
+
+/// The account `VERDANDI_CLAUDE_ACCOUNT` names and its directory; exits as the sidecar does when the
+/// directory is not there.
+fn resolve_account() -> Option<(String, String)> {
+    let name = std::env::var("VERDANDI_CLAUDE_ACCOUNT")
+        .ok()
+        .filter(|name| !name.is_empty())?;
+    let home = std::env::var("EITRI_STANDIN_ACCOUNTS")
+        .ok()
+        .or_else(|| std::env::var("HOME").ok())
+        .unwrap_or_default();
+    let directory = std::path::Path::new(&home).join(format!(".claude-{name}"));
+    if std::env::var_os("EITRI_STANDIN_ACCOUNTS").is_some() && !directory.is_dir() {
+        eprintln!(
+            "claude account {} is pinned but its config directory {} does not exist (or is not a directory)",
+            serde_json::to_string(&name).unwrap(),
+            directory.display()
+        );
+        std::process::exit(1);
+    }
+    Some((name, directory.display().to_string()))
+}
+
 fn main() {
+    let (configured_env, configured_args) = configuration_beside_the_executable();
+    for (name, value) in configured_env {
+        // SAFETY: nothing else runs in this process yet, so nothing reads the environment meanwhile.
+        unsafe { std::env::set_var(name, value) };
+    }
     let parent_watch = std::env::var_os("VERDANDI_CLAUDE_SIDECAR_PARENT_WATCH").unwrap_or_default();
     let parent_watch = parent_watch.to_string_lossy();
     // JavaScript's trim includes the byte-order mark and excludes the Unicode next-line character.
@@ -1429,6 +1578,7 @@ fn main() {
         ring_capacity: std::env::var("EITRI_STANDIN_RING")
             .ok()
             .map(|n| n.parse().expect("a ring capacity")),
+        account: resolve_account(),
         ..Shared::default()
     };
     if let Some(words) = std::env::var_os("EITRI_STANDIN_REFUSE_BIND") {
@@ -1436,7 +1586,7 @@ fn main() {
         std::process::exit(1);
     }
     let mut record_create = std::env::var_os("EITRI_STANDIN_RECORD_CREATE");
-    let mut args = std::env::args_os().skip(1);
+    let mut args = std::env::args_os().skip(1).chain(configured_args);
     while let Some(arg) = args.next() {
         match arg.to_str() {
             Some("--without-system-prompt-preset") => shared.without_system_prompt_preset = true,
@@ -1451,6 +1601,11 @@ fn main() {
                 let path = std::path::PathBuf::from(args.next().expect("record file"));
                 assert!(path.is_absolute(), "record file must be absolute");
                 *shared.record_answers.get_mut().unwrap() = Some(agent::private_fs::open_private(&path).unwrap());
+            }
+            Some("--record-permissions") => {
+                let path = std::path::PathBuf::from(args.next().expect("record file"));
+                assert!(path.is_absolute(), "record file must be absolute");
+                *shared.record_permissions.get_mut().unwrap() = Some(agent::private_fs::open_private(&path).unwrap());
             }
             Some("--record-sends") => {
                 let path = std::path::PathBuf::from(args.next().expect("record file"));
@@ -1501,6 +1656,12 @@ fn main() {
                 std::thread::sleep(Duration::from_millis(50));
             }
         });
+    }
+    if let Some(ms) = std::env::var("EITRI_STANDIN_BIND_AFTER_MS")
+        .ok()
+        .and_then(|ms| ms.parse().ok())
+    {
+        std::thread::sleep(Duration::from_millis(ms));
     }
     if std::env::var_os("EITRI_STANDIN_NEVER_BIND").is_some() {
         loop {

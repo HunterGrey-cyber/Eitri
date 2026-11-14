@@ -52,6 +52,25 @@ impl<F: Fn(&Path) -> io::Result<u64>> FreeSpace for F {
     }
 }
 
+/// Space available to an unprivileged writer, including for a directory not created yet.
+pub fn available_bytes(dir: &Path) -> io::Result<u64> {
+    use std::os::unix::ffi::OsStrExt;
+
+    let existing = dir
+        .ancestors()
+        .find(|ancestor| ancestor.exists())
+        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no existing ancestor for free-space check"))?;
+    let path = std::ffi::CString::new(existing.as_os_str().as_bytes())?;
+    // SAFETY: `path` is NUL-terminated and `stat` is filled by the call before it is read.
+    let mut stat: libc::statvfs = unsafe { std::mem::zeroed() };
+    if unsafe { libc::statvfs(path.as_ptr(), &mut stat) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    (stat.f_bavail as u64)
+        .checked_mul(stat.f_frsize as u64)
+        .ok_or_else(|| io::Error::other("available filesystem space overflows u64"))
+}
+
 pub fn enforce_budget(
     state_dir: &Path,
     sessions: &[SessionUsage],
@@ -145,6 +164,16 @@ fn unlink_closed(
     errors: &mut Vec<io::Error>,
     evicted: &mut Vec<Evicted>,
 ) -> io::Result<()> {
+    // Publish terminal state before deleting any history. A restart must never adopt the retained ring
+    // as fresh history, including when deletion is interrupted part way through.
+    match fs.read(&dir.join("identity")) {
+        Ok(identity) => fs.replace(
+            &dir.parent().unwrap().parent().unwrap().join("expired").join(session),
+            &identity,
+        )?,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
     let lengths: BTreeMap<_, _> = fs
         .entries(dir)?
         .into_iter()
@@ -182,6 +211,24 @@ fn unlink_closed(
         }
     }
     fs.sync_dir(dir)?;
+    for name in ["identity", "closed-at"] {
+        let path = dir.join(name);
+        if lengths.contains_key(&path) {
+            fs.remove_file(&path)?;
+        }
+    }
+    let pending = dir
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .join("pending")
+        .join(format!("{session}.bin"));
+    match fs.remove_file(&pending) {
+        Ok(()) => fs.sync_dir(pending.parent().unwrap())?,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
     fs.remove_dir(dir)?;
     fs.sync_dir(dir.parent().unwrap())
 }

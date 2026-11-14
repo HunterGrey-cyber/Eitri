@@ -1,4 +1,4 @@
-use agent::ssh::{ChannelLauncher, ControlMaster, DaemonInfo, SshLauncher};
+use agent::ssh::{ChannelLauncher, DaemonInfo};
 use std::cmp::Ordering;
 use std::ffi::OsStr;
 
@@ -46,7 +46,7 @@ pub fn decide_attach(
                 Some(Ordering::Greater) | None => Attach::Newer { daemon: daemon.clone() },
                 Some(Ordering::Equal)
                     if daemon.version == current_version
-                        && daemon.rev == current_revision
+                        && revision_matches(&daemon.rev, current_revision)
                         && daemon.protocol_major == this_major =>
                 {
                     Attach::Same
@@ -62,6 +62,17 @@ pub fn decide_attach(
             (daemon.clone(), attach)
         })
         .collect()
+}
+
+fn revision_matches(a: &str, b: &str) -> bool {
+    if !super::install::valid_revision(a) || !super::install::valid_revision(b) {
+        return false;
+    }
+    if a.len() == b.len() {
+        a == b
+    } else {
+        a[..7] == b[..7]
+    }
 }
 
 // Semver precedence ignores build metadata; a revision is an identity, not an ordered version.
@@ -129,37 +140,40 @@ fn version_order(left: &str, right: &str) -> Option<Ordering> {
     Some(a_pre.len().cmp(&b_pre.len()))
 }
 
-pub fn stop_older(master: &ControlMaster, host: &RemoteHost, daemon: &DaemonInfo) -> Result<(), InstallError> {
-    check_stop_candidate(daemon)?;
-    let prefix = super::install::current_helper_prefix()?;
-    let launcher = SshLauncher {
-        master: master.clone(),
-        helper: host.data_dir.join("bin/eitri-server"),
-    };
-    stop_recorded_with(&launcher, host, &prefix, daemon)
-}
-
-fn check_stop_candidate(daemon: &DaemonInfo) -> Result<(), InstallError> {
-    if version_order(&daemon.version, env!("CARGO_PKG_VERSION")) != Some(Ordering::Less)
-        || daemon.protocol_major == agent::ssh::PROTOCOL_MAJOR
-    {
-        return Err(InstallError::Invalid(
-            "only a strictly older incompatible daemon may be stopped".into(),
-        ));
+/// Whether `daemon` is newer than this build, or cannot be ordered against it: one this client must never stop. A
+/// daemon of this build's version speaking another protocol major is a newer one too, as [`decide_attach`] reads it
+/// (a development build whose protocol moved before its version did).
+pub fn is_newer_than_this_build(daemon: &DaemonInfo) -> bool {
+    match version_order(&daemon.version, env!("CARGO_PKG_VERSION")) {
+        Some(Ordering::Less) => false,
+        Some(Ordering::Equal) => daemon.protocol_major != agent::ssh::PROTOCOL_MAJOR,
+        Some(Ordering::Greater) | None => true,
     }
-    Ok(())
 }
 
-fn stop_recorded_with(
+/// Stops `daemon`, whatever its protocol, with the `stop-daemon` of an installation `host` records (`preferred`
+/// first), that installation's recorded hash checked before it runs. `run` is the daemon's key as `list-daemons`
+/// names it (its installation's name; a helper that keyed daemons by version alone gives none, and the version is the
+/// key). Only for what the person asked for by name (`eitri host stop` and `uninstall`): a newer daemon is refused, as
+/// everywhere.
+pub fn stop_daemon_with(
     launcher: &dyn ChannelLauncher,
     host: &RemoteHost,
-    prefix: &str,
+    preferred: Option<&str>,
     daemon: &DaemonInfo,
+    run: &str,
 ) -> Result<(), InstallError> {
-    check_stop_candidate(daemon)?;
-    let mut error = InstallError::Invalid("no recorded current helper hash; reinstall the helper".into());
-    for (current, hash) in host.helpers.iter().filter(|(name, _)| name.starts_with(prefix)) {
-        match stop_with(launcher, host, current, hash, &daemon.version) {
+    let daemon_version = daemon.version.as_str();
+    if is_newer_than_this_build(daemon) {
+        return Err(InstallError::Invalid(format!(
+            "Eitri server {daemon_version} is newer than this Eitri; stop it with that Eitri"
+        )));
+    }
+    let mut installations: Vec<(&String, &String)> = host.helpers.iter().collect();
+    installations.sort_by_key(|(name, _)| Some(name.as_str()) != preferred);
+    let mut error = InstallError::Invalid("no installation of Eitri server is recorded for this host".into());
+    for (installation, hash) in installations {
+        match stop_with(launcher, host, installation, hash, run) {
             Ok(()) => return Ok(()),
             Err(failure) => error = failure,
         }
@@ -182,17 +196,29 @@ fn stop_with(
     };
     let hex = agent::ssh::encode_args(&[OsStr::new(version)]);
     let args = [super::install::checked_path(&host.data_dir)?, current, &hex];
-    super::install::communicate(
-        launcher.spawn_step(super::steps::STOP, &args)?,
-        &manifest.render()?,
-        &|_, _| {},
-    )?;
+    let child = {
+        let _key = launcher.hold_host_key(&host.host_key_sha256)?;
+        super::install::attached(launcher.spawn_step(super::steps::STOP, &args)?)?
+    };
+    super::install::communicate(child, &manifest.render()?, &|_, _| {})?;
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn revision_identity_compares_full_commits_and_the_installed_rev7() {
+        let mut same = daemon("0.3.0", 1);
+        same.rev = format!("abcdef0{}", "1".repeat(33));
+        assert_eq!(decide(&[same])[0].1, Attach::Same);
+        assert!(!revision_matches(
+            &format!("abcdef0{}", "1".repeat(33)),
+            &format!("abcdef0{}", "2".repeat(33))
+        ));
+        assert!(!revision_matches("unknown", "unknown"));
+    }
+
     fn daemon(version: &str, major: u32) -> DaemonInfo {
         DaemonInfo {
             version: version.into(),
@@ -206,6 +232,19 @@ mod tests {
     fn decide(running: &[DaemonInfo]) -> Vec<(DaemonInfo, Attach)> {
         decide_attach(1, "0.3.0", "abcdef0", running)
     }
+    /// `eitri host stop` leaves alone what this build must not stop: a newer or unorderable version, and this
+    /// version speaking another protocol major; an older one of any protocol, and this build's own, it stops.
+    #[test]
+    fn host_stop_never_takes_a_newer_daemon() {
+        let this = env!("CARGO_PKG_VERSION");
+        let major = agent::ssh::PROTOCOL_MAJOR;
+        assert!(is_newer_than_this_build(&daemon("99.0.0", major)));
+        assert!(is_newer_than_this_build(&daemon("junk", major)));
+        assert!(is_newer_than_this_build(&daemon(this, major + 1)));
+        assert!(!is_newer_than_this_build(&daemon(this, major)));
+        assert!(!is_newer_than_this_build(&daemon("0.0.1", major + 1)));
+    }
+
     #[test]
     fn newer_daemons_never_become_stop_candidates() {
         for major in [1, 2] {
@@ -260,7 +299,7 @@ mod tests {
         let dir = crate::test_scratch_dir::ScratchDir::new("remote", "skew");
         let helper = dir.join("current-present/bin/eitri-server");
         std::fs::create_dir_all(helper.parent().unwrap()).unwrap();
-        std::fs::write(&helper, "#!/bin/sh\ntest \"$1\" = stop-daemon && test \"$2\" = --args-hex && test \"$3\" = 00000005302e322e30 || exit 1\nif flock -n -x ../.install.lock true; then exit 2; fi\nprintf stopped > stopped\n").unwrap();
+        std::fs::write(&helper, "#!/bin/sh\ntest \"$1\" = stop-daemon && test \"$2\" = --args-hex && test \"$3\" = 0000000b696e7374616c6c2d72756e || exit 1\nif flock -n -x ../.install.lock true; then exit 2; fi\nprintf stopped > stopped\n").unwrap();
         std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o700)).unwrap();
         let hash = super::super::manifest::hash_file(&helper).unwrap();
         let host = RemoteHost {
@@ -279,21 +318,29 @@ mod tests {
         let launcher = agent::ssh::LocalExec {
             helper: dir.join("fixture"),
         };
-        for candidate in [
-            daemon("0.2.0", 1),
-            daemon("0.3.0", 0),
-            daemon("0.4.0", 0),
-            daemon("junk", 0),
-        ] {
-            assert!(check_stop_candidate(&candidate).is_err());
-            assert!(stop_recorded_with(&launcher, &host, "current-", &candidate).is_err());
+        for candidate in [daemon("0.3.0", 0), daemon("0.4.0", 0), daemon("junk", 0)] {
+            assert!(stop_daemon_with(&launcher, &host, Some("current-absent"), &candidate, "install-run").is_err());
             assert!(!dir.join("current-present/stopped").exists());
         }
-        stop_recorded_with(&launcher, &host, "current-", &daemon("0.2.0", 0)).unwrap();
+        stop_daemon_with(
+            &launcher,
+            &host,
+            Some("current-absent"),
+            &daemon("0.2.0", 0),
+            "install-run",
+        )
+        .unwrap();
         assert!(dir.join("current-present/stopped").exists());
         std::fs::remove_file(dir.join("current-present/stopped")).unwrap();
         std::fs::write(helper, b"tampered").unwrap();
-        assert!(stop_recorded_with(&launcher, &host, "current-", &daemon("0.2.0", 0)).is_err());
+        assert!(stop_daemon_with(
+            &launcher,
+            &host,
+            Some("current-absent"),
+            &daemon("0.2.0", 0),
+            "install-run"
+        )
+        .is_err());
         assert!(!dir.join("current-present/stopped").exists());
     }
 }

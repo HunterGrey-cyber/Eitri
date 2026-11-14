@@ -254,6 +254,13 @@ pub(super) fn panel_tab_handoff(state: &AgentPanelState, tab: TabId) -> Result<P
         chooser_titles_stale: _,
         conversation_id: _,
         restore_source: _,
+        // The window's connection and its saved remote tabs stay with the window; a remote question open for
+        // the tab is not carried, and the taking window asks again what it needs to.
+        server: _,
+        remote_prompts: _,
+        // The stops this window keeps are its server's, sent by its own sender.
+        remote_stops: _,
+        unclaimed_remote: _,
         restore_policy: _,
         tab_files: _,
         group_tabs: _,

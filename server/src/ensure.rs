@@ -46,11 +46,12 @@ pub async fn hello(paths: &Paths) -> io::Result<HelloResponse> {
         .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "daemon Hello timed out"))?
 }
 
+/// Starts this installation's own daemon unless it answers already: a daemon of another installation of the same
+/// version is another daemon, with a run directory of its own.
 pub async fn ensure() -> io::Result<()> {
-    let paths = Paths::from_env(crate::VERSION)?;
+    let paths = Paths::own_from_env()?;
     paths.prepare()?;
-    crate::gc::touch_install(&paths)?;
-    crate::gc::collect(&paths, std::time::SystemTime::now())?;
+    refresh_install(&paths);
     let deadline = Instant::now() + START_TIMEOUT;
     if hello(&paths).await.is_ok() {
         return Ok(());
@@ -91,6 +92,18 @@ pub async fn ensure() -> io::Result<()> {
             let _ = child.try_wait()?;
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+fn refresh_install(paths: &Paths) {
+    for (kind, result) in [
+        ("install-touch", crate::gc::touch_install(paths)),
+        ("install-gc", crate::gc::collect(paths, std::time::SystemTime::now())),
+    ] {
+        if let Err(error) = result {
+            eprintln!("eitri-server: {kind}: {error}");
+            let _ = crate::audit::record(&paths.state, kind, &error.to_string());
+        }
     }
 }
 
@@ -183,22 +196,24 @@ pub async fn list_daemons() -> io::Result<()> {
         for entry in std::fs::read_dir(root)? {
             let entry = entry?;
             if private_fs::is_private_dir(&entry.path()) {
-                if let Some(version) = entry.file_name().to_str() {
-                    if let Ok(paths) = Paths::new(version, &data_home, &state_home, &std::env::temp_dir()) {
+                if let Some(key) = entry.file_name().to_str() {
+                    if let Ok(paths) = Paths::new(key, &data_home, &state_home, &std::env::temp_dir()) {
                         candidates.push(paths);
                     }
                 }
             }
         }
     }
-    candidates.sort_by(|left, right| (&left.version, &left.run).cmp(&(&right.version, &right.run)));
+    candidates.sort_by(|left, right| (&left.key, &left.run).cmp(&(&right.key, &right.run)));
     for paths in candidates {
-        let Ok(info) = paths.info() else { continue };
-        if !crate::run_dir::pid_alive(info.pid) {
+        let Ok(published) = paths.published() else { continue };
+        if !crate::run_dir::pid_alive(published.info.pid) {
             continue;
         }
         let response = hello(&paths).await;
-        if let Some(value) = listed_info(&info, response) {
+        if let Some(mut value) = listed_info(&published.info, response) {
+            // What `stop-daemon` and `connect --daemon` take to reach this daemon.
+            value["run"] = paths.key.clone().into();
             println!("{}", value);
         }
     }
@@ -228,7 +243,8 @@ fn listed_info(
 #[cfg(target_os = "linux")]
 pub fn stop_daemon(paths: &Paths) -> io::Result<()> {
     use std::os::fd::FromRawFd;
-    let info = paths.info()?;
+    let published = paths.published()?;
+    let info = &published.info;
     // Pin the process identity before resolving /proc: a recycled pid must never get the signal.
     // SAFETY: pidfd_open takes a validated positive pid and zero flags.
     let raw = unsafe { libc::syscall(libc::SYS_pidfd_open, info.pid, 0) };
@@ -238,11 +254,20 @@ pub fn stop_daemon(paths: &Paths) -> io::Result<()> {
     // SAFETY: a successful pidfd_open returns a new descriptor owned here.
     let pidfd = unsafe { std::os::fd::OwnedFd::from_raw_fd(raw as i32) };
     let exe = std::fs::read_link(format!("/proc/{}/exe", info.pid))?;
-    let bin = paths.install(&info.rev).join("bin").canonicalize()?;
-    if !exe.is_absolute() || !exe.starts_with(&bin) {
+    // The installation the daemon recorded as its own, under the data directory, of its own version and revision:
+    // the helper running this stop may be another installation's.
+    let installed = crate::run_dir::installation_of(&exe, &paths.data).is_some_and(|(install, version, revision)| {
+        published
+            .installation
+            .as_deref()
+            .is_none_or(|name| install.file_name() == Some(std::ffi::OsStr::new(name)))
+            && version == info.version
+            && revision == crate::run_dir::rev7(&info.rev)
+    });
+    if !installed {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
-            "daemon executable is outside that version's installed bin directory; refusing to signal",
+            "daemon executable does not match its recorded installation identity; refusing to signal",
         ));
     }
     // SAFETY: the pidfd pins the checked process; null siginfo and zero flags request plain SIGTERM.
@@ -271,6 +296,30 @@ pub fn stop_daemon(_: &Paths) -> io::Result<()> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn installation_maintenance_survives_audit_and_collection_errors() {
+        let root = std::env::temp_dir().join(format!("maintenance-{}", std::process::id()));
+        let install = root.join("data/0.3.0-abcdef0");
+        agent::private_fs::create_private_dir_all(&install, &root).unwrap();
+        let paths = crate::run_dir::Paths {
+            version: "0.3.0".into(),
+            key: "test".into(),
+            data: root.join("data"),
+            state: root.join("state"),
+            run: root.join("run"),
+            install: Some(install.clone()),
+            installed: true,
+        };
+        paths.prepare().unwrap();
+        agent::private_fs::create_private_dir_all(&paths.state.join("audit.log"), &paths.state).unwrap();
+        crate::gc::touch_install(&paths).unwrap();
+        assert!(install.join("last-used").is_file());
+        std::fs::remove_file(paths.data.join("gc.lock")).unwrap();
+        std::fs::create_dir(paths.data.join("gc.lock")).unwrap();
+        super::refresh_install(&paths);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
     #[test]
     fn systemd_scope_requires_the_user_manager_socket() {
         assert!(!super::use_systemd_scope(None));
@@ -303,4 +352,96 @@ mod tests {
         assert_eq!(value["incompatible_protocol"], true);
         assert!(super::listed_info(&info, Err(std::io::Error::from(std::io::ErrorKind::ConnectionRefused))).is_none());
     }
+}
+
+/// Removal must preserve every surviving agent's adoption records, even without a live daemon.
+pub(crate) fn check_sidecars_stopped(run: &Path) -> io::Result<()> {
+    let runs = sidecar_runs(run, false)?;
+    if runs.is_empty() {
+        Ok(())
+    } else {
+        Err(io::Error::other("recorded sidecars may still run"))
+    }
+}
+
+/// Read-only inventory; no ensure, installation touch or garbage collection is performed here.
+pub(crate) fn live_sidecar_runs(run: &Path) -> io::Result<()> {
+    for value in sidecar_runs(run, true)? {
+        println!("{value}");
+    }
+    Ok(())
+}
+
+fn sidecar_runs(run: &Path, recovery: bool) -> io::Result<Vec<serde_json::Value>> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let entries = match std::fs::read_dir(run) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error),
+    };
+    let mut refusing = Vec::new();
+    for entry in entries {
+        let entry = entry?;
+        if !entry.file_type()?.is_dir() {
+            continue;
+        }
+        let key = entry.file_name().to_string_lossy().into_owned();
+        let records = crate::daemon::sidecars::refusing_records_in(&entry.path())?;
+        if records.is_empty() {
+            continue;
+        }
+        for record in &records {
+            eprintln!(
+                "run {key} sidecar {} pid {} {}{}",
+                record.id,
+                record
+                    .pid
+                    .map(|pid| pid.to_string())
+                    .unwrap_or_else(|| "unknown".into()),
+                record.status,
+                record
+                    .error
+                    .as_ref()
+                    .map(|error| format!(": {}", error.replace(['\r', '\n'], " ")))
+                    .unwrap_or_default()
+            );
+        }
+        if recovery {
+            if !records.iter().any(|record| record.status == "alive") {
+                continue;
+            }
+            // A non-answering daemon can still hold its lifetime lock while starting or stopping.
+            match std::fs::OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+                .open(entry.path().join("live.lock"))
+            {
+                Ok(lock) => {
+                    // SAFETY: flock operates on the live descriptor and never waits with LOCK_NB.
+                    if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_SH | libc::LOCK_NB) } != 0 {
+                        let error = io::Error::last_os_error();
+                        if error.kind() == io::ErrorKind::WouldBlock {
+                            continue;
+                        }
+                        return Err(error);
+                    }
+                }
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error),
+            }
+        }
+        let published = private_fs::read_private_nofollow_capped(&entry.path().join("info"), 16 * 1024)
+            .ok()
+            .and_then(|text| serde_json::from_str::<crate::run_dir::Published>(&text).ok())
+            .filter(|published| match &published.installation {
+                Some(installation) => crate::run_dir::run_key_of(installation) == key,
+                None => published.info.version == key,
+            });
+        refusing.push(serde_json::json!({
+            "run": key,
+            "daemon": published.as_ref().map(|published| &published.info),
+            "installation": published.as_ref().and_then(|published| published.installation.as_ref()),
+        }));
+    }
+    Ok(refusing)
 }

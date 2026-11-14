@@ -3,6 +3,10 @@ use std::path::Path;
 
 use super::ControlMaster;
 
+/// A lifecycle shell has attached before it starts consuming input or running its command.
+pub const LIFECYCLE_ATTACHED: &[u8] = b"eitri-lifecycle-attached-v1\n";
+pub(crate) const LIFECYCLE_COMMAND: &str = r#"printf "eitri-lifecycle-attached-v1\n"; exec "$@""#;
+
 pub const CHANNEL_OPTIONS: &[&str] = &[
     "-T",
     "-o",
@@ -46,7 +50,11 @@ pub fn channel_argv(
     }
     let hex = eitri_server_proto::args_hex::encode_args(args);
     let hex = if hex.is_empty() { "''" } else { &hex };
-    let command = format!("exec {helper} {subcommand} --args-hex {hex}");
+    let command = if subcommand == "list-daemons" {
+        format!("sh -c '{LIFECYCLE_COMMAND}' sh {helper} {subcommand} --args-hex {hex}")
+    } else {
+        format!("exec {helper} {subcommand} --args-hex {hex}")
+    };
     if command.len() >= 120 * 1024 {
         return Err("encoded SSH command must be smaller than 120 KiB".to_owned());
     }

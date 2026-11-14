@@ -1,4 +1,5 @@
-//! `agent/Cargo.toml`'s `claude-runtime-protocol` revision and
+//! The workspace's one `claude-runtime-protocol` pin (the root `Cargo.toml`'s `[workspace.dependencies]`, which
+//! agent and server take with `workspace = true`) and
 //! `agent::BUNDLED_SIDECAR_REVISION` must name the same commit. Either can be a full hash
 //! or a short prefix, so compare prefixes in either direction, as Cargo accepts both forms.
 //! `providers::claude_sidecar::spawn::describe_checkout` uses the same comparison for runtime drift.
@@ -150,19 +151,76 @@ fn the_lock_names_the_manifest_revision() {
         .unwrap_or_else(|| panic!("claude-runtime-protocol has no source line: {package}"));
     assert!(
         source.contains(&format!("?rev={manifest_rev}#{manifest_rev}\"")),
-        "Cargo.lock's {source} must name agent/Cargo.toml's rev {manifest_rev} in full"
+        "Cargo.lock's {source} must name the workspace pin's rev {manifest_rev} in full"
     );
     assert_eq!(manifest_rev.len(), 40, "the manifest names the full revision");
 }
 
-/// Pulls the `rev = "..."` value off `agent/Cargo.toml`'s `claude-runtime-protocol` dependency line,
+/// Pulls the `rev = "..."` value off the root `Cargo.toml`'s `claude-runtime-protocol` dependency line,
 /// by text, deliberately not by parsing TOML -- this test wants to fail loudly if that one line's
 /// shape ever stops looking like a `git` dependency with a `rev`, not silently accept some other
 /// shape a TOML parser would happily normalize.
 fn cargo_toml_rev() -> String {
-    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml");
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../Cargo.toml");
     let text = fs::read_to_string(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
-    rev_from_manifest_text(&text, &path.display().to_string())
+    let section = text
+        .split("\n[")
+        .find(|section| section.starts_with("workspace.dependencies]"))
+        .unwrap_or_else(|| panic!("{}: no [workspace.dependencies] section", path.display()));
+    rev_from_manifest_text(section, &path.display().to_string())
+}
+
+/// Every `Cargo.toml` of the checkout, build outputs and installed packages left out.
+fn manifests(dir: &std::path::Path, found: &mut Vec<PathBuf>) {
+    for entry in fs::read_dir(dir).unwrap_or_else(|e| panic!("{}: {e}", dir.display())) {
+        let entry = entry.unwrap();
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        let kind = entry.file_type().unwrap();
+        if kind.is_dir() {
+            if !name.starts_with('.') && !matches!(name.as_ref(), "target" | "node_modules" | "docs") {
+                manifests(&entry.path(), found);
+            }
+        } else if kind.is_file() && name == "Cargo.toml" {
+            found.push(entry.path());
+        }
+    }
+}
+
+/// The protocol crate is pinned in one place, so no crate can build against another revision of it than the
+/// sidecar and the agent: the root manifest names its source, and every crate that uses it takes it from there.
+#[test]
+fn the_protocol_crate_is_pinned_once_for_the_workspace() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..");
+    let mut found = Vec::new();
+    manifests(&root, &mut found);
+    let mut pins = Vec::new();
+    let mut users = Vec::new();
+    for path in &found {
+        let text = fs::read_to_string(path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+        for line in text.lines().filter(|l| !l.trim_start().starts_with('#')) {
+            if line.contains("verdandi.git") || (line.contains("claude-runtime-protocol") && line.contains("rev")) {
+                pins.push(path.clone());
+            } else if line.trim_start().starts_with("claude-runtime-protocol") {
+                assert!(
+                    line.replace(' ', "").contains("workspace=true"),
+                    "{}: {line:?} must take the workspace's pin",
+                    path.display()
+                );
+                users.push(path.clone());
+            }
+        }
+    }
+    let root_manifest = root.join("Cargo.toml");
+    assert_eq!(pins, [root_manifest], "one pin, in the root manifest");
+    for crate_dir in ["agent", "server"] {
+        let manifest = root.join(crate_dir).join("Cargo.toml");
+        assert!(
+            users.contains(&manifest),
+            "{} takes the workspace's pin",
+            manifest.display()
+        );
+    }
 }
 
 /// The parsing logic `cargo_toml_rev` runs, pulled out so it can be exercised on a synthetic
@@ -209,7 +267,7 @@ fn manifest_pin_and_expected_revision_name_the_same_commit() {
 
     assert!(
         is_hex(&manifest_rev) && manifest_rev.len() >= 7,
-        "agent/Cargo.toml's claude-runtime-protocol rev {manifest_rev:?} must be at least 7 hex characters"
+        "Cargo.toml's workspace claude-runtime-protocol rev {manifest_rev:?} must be at least 7 hex characters"
     );
     assert!(
         is_hex(expected) && expected.len() >= 7,
@@ -217,7 +275,7 @@ fn manifest_pin_and_expected_revision_name_the_same_commit() {
     );
     assert!(
         manifest_rev.starts_with(expected) || expected.starts_with(manifest_rev.as_str()),
-        "agent/Cargo.toml pins claude-runtime-protocol at {manifest_rev:?}, but \
+        "Cargo.toml pins the workspace claude-runtime-protocol at {manifest_rev:?}, but \
          agent::BUNDLED_SIDECAR_REVISION is {expected:?} -- these must name the same commit. \
          Bump both together and re-verify against the real proto diff \
          (the drill: `git diff <old>..<new> -- proto crates` \

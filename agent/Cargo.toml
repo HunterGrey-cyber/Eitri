@@ -11,7 +11,7 @@ serde = { version = "1", features = ["derive"] }
 # value, floats included; the default parser can land one bit off. No extra crate.
 serde_json = { version = "1", features = ["float_roundtrip"] }
 uuid = { version = "1", features = ["v4"] }
-claude-runtime-protocol = { git = "https://github.com/HunterGrey-cyber/verdandi.git", rev = "842d54e6c4cccf4aa71e8ded54c020c0253ad78e" }
+claude-runtime-protocol = { workspace = true }
 tonic = "0.14"
 tonic-prost = "0.14"
 prost = "0.14"
@@ -46,8 +46,8 @@ agent = { path = ".", features = ["test-support"] }
 
 # The legacy gate's relay, located only by `settings::locate_agent_hook_binary` on the legacy spawn
 # path: without the feature there is nothing for it to relay to, so it is not built. A release then
-# has five binaries: shell, eitri-tmux-shim, eitri-claude-handoff, eitri-run-guard,
-# eitri-editor-bridge.
+# has six binaries: shell, eitri-tmux-shim, eitri-claude-handoff, eitri-run-guard,
+# eitri-editor-bridge, eitri-server.
 [[bin]]
 name = "agent-hook"
 path = "src/bin/agent-hook.rs"

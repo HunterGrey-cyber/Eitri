@@ -196,6 +196,14 @@ pub struct PlanningState {
     /// A call's mark is dropped once the call has completed with no request pending for it: nothing reads it then.
     #[serde(skip)]
     pub call_marks: BTreeMap<String, CallPlanMark>,
+    /// The events being folded are a remote tab's history read back from its server (set by the ingestion for a
+    /// batch that begins within it, `IngestState::replay_through`). A move into or out of plan mode the person
+    /// made in the window that saved the tab is folded there only (`PlanTransitionStarted`), so the history holds
+    /// the CLI's `plan` or creation-mode report without the move that explains it: while this is set, such a
+    /// report is folded as that move, which the history did not record, rather than tripping. A mode no session
+    /// asks for still trips, and nothing here answers a request or a plan. Host state, never saved.
+    #[serde(skip)]
+    pub replaying_history: bool,
 }
 
 impl PlanningState {
@@ -709,6 +717,12 @@ pub(super) fn fold(state: &mut AgentSessionProjection, event: &AgentDomainEvent,
                     }
                     state.planning.cli_reports_plan = true;
                 }
+                // A move into plan mode the person made in the window that saved a reattached tab: its history
+                // holds the CLI's report and not the move.
+                PlanPhase::Executing if state.planning.replaying_history => {
+                    state.planning.phase = PlanPhase::Planning;
+                    state.planning.cli_reports_plan = true;
+                }
                 PlanPhase::Executing => trip(state, "plan", "plan mode the host did not expect"),
             }
         }
@@ -774,6 +788,15 @@ fn on_cli_mode(state: &mut AgentSessionProjection, reported: &str) {
                 }
                 state.planning.cli_reports_plan = false;
             }
+        }
+        // A move out of plan mode the person made in the window that saved a reattached tab: its history holds the
+        // CLI's report of its creation mode (or of `default`, its fallback from `auto`) and not the move.
+        PlanPhase::Planning
+            if state.planning.replaying_history
+                && (reported == creation || (auto_session && reported == "default")) =>
+        {
+            state.planning.phase = PlanPhase::Executing;
+            state.planning.cli_reports_plan = false;
         }
         PlanPhase::Planning => trip(state, reported, "left plan mode without an approval"),
         // Reported before the CLI took the move in.

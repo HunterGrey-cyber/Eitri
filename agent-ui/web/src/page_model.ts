@@ -1,7 +1,7 @@
 import { EMPTY_PANEL_TABLE } from "./keymap";
 import type { KeymapHelp } from "./keymap";
 import type { TrustPromptEnvelope } from "./trust";
-import type { NavKeyDirection } from "./bridge";
+import type { NavKeyDirection, RemotePromptChoice, RemotePromptEnvelope } from "./bridge";
 import type { InboundPayload } from "./bridge";
 import { isMirrorRequest } from "./bridge";
 
@@ -97,6 +97,10 @@ export type Confirmation =
   /** A restore found a tab saved in bypass and asks before giving it back: `y` as saved, `n` in auto. A `y` here
    *  also enters bypass, so it gets the same wait and lone-key guard. */
   | { kind: "restore"; nonce: number; lines: string[]; openedAt: number }
+  /** A remote tab's question, drawn while its tab is shown: a key among `choices`, on its own and after the same
+   *  wait as a bypass `y`, answers it with that choice. Escape puts it away until the tab is shown again; any other
+   *  key leaves it up and chooses nothing. */
+  | { kind: "remote"; tab: TabId; nonce: number; lines: string[]; choices: RemotePromptChoice[]; openedAt: number }
   /** The question before this tab's session loads the project's own configuration for its agent. `view` is the
    *  envelope as shown, and an answer echoes its `fingerprint` and `findingsDigest` and nothing recomputed here;
    *  a `y` loads a repository's hooks. `flashAfter` is the flash counter when it opened: only a flash made since
@@ -145,6 +149,10 @@ export type PageModel = {
    *  close prompt, a rename field or the chooser took the keys. Drawing it at once could take the `y` meant for
    *  that prompt or typed into that field. */
   heldTrust: TrustPromptEnvelope | null;
+  /** Each remote tab's open question, by tab, until it is answered or Rust drops it: drawn only while its tab is
+   *  shown and nothing else holds the keys, so its arrival never replaces another prompt and a background tab's
+   *  question waits for its tab. */
+  heldRemote: ReadonlyMap<TabId, RemotePromptEnvelope>;
   confirm: Confirmation;
   /** The inline rename field's tab and prefilled text (`prefix ,`), or `null`. The tab bar is shown even with
    *  one tab while this is set. */
@@ -189,6 +197,10 @@ export type PageModel = {
    *  and a refused command's notice never touch it, only its Dismiss (or a reloaded document, which is told
    *  again) does. */
   rootNote: string | null;
+  /** Each tab's own note (a remote tab's, naming its host), from a `root_note` envelope that names the tab, and
+   *  whether its Dismiss was pressed. Drawn only while its tab is shown, in place of `rootNote`. The same text
+   *  told again keeps a dismissed note dismissed; another text shows it again. */
+  tabRootNotes: ReadonlyMap<TabId, { text: string; dismissed: boolean }>;
   /** See `CommandRecord`. Bookkeeping that nothing draws: the page records an outgoing request without a render
    *  and reads this only when the answer is reduced. */
   inFlight: ReadonlyMap<string, CommandRecord>;
@@ -257,14 +269,37 @@ export function initialPageModel(): PageModel {
     answerEpoch: 0, inputRequest: 0, arriveRequest: 0, permissionRequest: 0, navKey: null,
     pages: [],
     keymapHelp: { prefix: "Ctrl+b", window: [], prefixKeys: [], panel: EMPTY_PANEL_TABLE, newTabChord: "" },
-    heldTrust: null, confirm: null, renaming: null, queueTaken: null, queueTakenSequence: 0, draftImages: NO_DRAFT_IMAGES,
+    heldTrust: null, heldRemote: new Map(), confirm: null, renaming: null, queueTaken: null, queueTakenSequence: 0,
+    draftImages: NO_DRAFT_IMAGES,
     state: initialState(), hello: null, tabs: null, keptStates: new Map(), fatalError: null,
-    handoff: null, handoffRequests: new Map(), commandNotice: null, rootNote: null, inFlight: new Map(),
+    handoff: null, handoffRequests: new Map(), commandNotice: null, rootNote: null, tabRootNotes: new Map(),
+    inFlight: new Map(),
     turnClock: null, turnDurations: NO_TURN_DURATIONS, thinkingDisplay: "collapsed", paneFocused: false,
     queue: [], queueError: null, queueNote: null, queueSteers: null, shellRunning: false, history: [], ruleOffers: {},
     editorContext: null, editorLink: null, scratchEditing: false, review: null, reviewHints: {},
     reviewRecovery: [], reviewSettings: REVIEW_SETTINGS_OFF, chooser: null,
   };
+}
+
+/** The note banner the page draws: the shown tab's own note while it has one (nothing once that is dismissed),
+ *  otherwise the window's. */
+export function shownRootNote(model: Pick<PageModel, "rootNote" | "tabRootNotes" | "tabs">): string | null {
+  const own = model.tabs === null ? undefined : model.tabRootNotes.get(model.tabs.active);
+  if (own !== undefined) return own.dismissed ? null : own.text;
+  return model.rootNote;
+}
+
+/** The two note fields after the drawn banner's Dismiss: a tab's own note is dismissed for that tab only, and
+ *  the window's note for every tab that has none. */
+export function dismissShownRootNote(
+  model: Pick<PageModel, "rootNote" | "tabRootNotes" | "tabs">,
+): Pick<PageModel, "rootNote" | "tabRootNotes"> {
+  const tab = model.tabs?.active;
+  const own = tab === undefined ? undefined : model.tabRootNotes.get(tab);
+  if (tab === undefined || own === undefined) return { rootNote: null, tabRootNotes: model.tabRootNotes };
+  const tabRootNotes = new Map(model.tabRootNotes);
+  tabRootNotes.set(tab, { ...own, dismissed: true });
+  return { rootNote: model.rootNote, tabRootNotes };
 }
 
 /** `hints` without `tab`'s entry -- the same object when it has none, so a clear that changes nothing renders
@@ -359,6 +394,21 @@ function reduceEnvelope(model: PageModel, envelope: Envelope): PageModel {
           openedAt: envelope.monotonicAt ?? envelope.receivedAt,
         }
       };
+    case "remote_prompt": {
+      // Held for its tab; a newer one for the tab replaces it, on screen too.
+      const heldRemote = new Map(model.heldRemote);
+      heldRemote.set(envelope.tab, envelope);
+      const shown = model.confirm?.kind === "remote" && model.confirm.tab === envelope.tab;
+      return { ...model, heldRemote, confirm: shown ? null : model.confirm };
+    }
+    case "remote_prompt_clear": {
+      const held = model.heldRemote.get(envelope.tab);
+      if (held === undefined || held.nonce !== envelope.nonce) return model;
+      const heldRemote = new Map(model.heldRemote);
+      heldRemote.delete(envelope.tab);
+      const shown = model.confirm?.kind === "remote" && model.confirm.nonce === envelope.nonce;
+      return { ...model, heldRemote, confirm: shown ? null : model.confirm };
+    }
     case "trust_prompt":
       return { ...model, heldTrust: envelope };
     case "draft_attachments":
@@ -388,8 +438,19 @@ function reduceEnvelope(model: PageModel, envelope: Envelope): PageModel {
       // asked for.
       return (THINKING_DISPLAYS as readonly string[]).includes(envelope.thinking)
         ? { ...model, thinkingDisplay: envelope.thinking } : model;
-    case "root_note":
-      return typeof envelope.text === "string" && envelope.text !== "" ? { ...model, rootNote: envelope.text } : model;
+    case "link_state":
+      return { ...model, state: { ...model.state, linkState: envelope.linkState } };
+    case "root_note": {
+      if (typeof envelope.text !== "string" || envelope.text === "") return model;
+      if (typeof envelope.tab !== "number") return { ...model, rootNote: envelope.text };
+      // The window says whether this text was dismissed in some page: a tab moved here keeps its dismissal.
+      const dismissed = envelope.dismissed === true;
+      const known = model.tabRootNotes.get(envelope.tab);
+      if (known?.text === envelope.text && (known.dismissed || !dismissed)) return model;
+      const tabRootNotes = new Map(model.tabRootNotes);
+      tabRootNotes.set(envelope.tab, { text: envelope.text, dismissed });
+      return { ...model, tabRootNotes };
+    }
     case "review_settings":
       // Older hosts send a boolean; unknown levels leave the hint off.
       return { ...model, reviewSettings: {
@@ -419,6 +480,9 @@ function reduceEnvelope(model: PageModel, envelope: Envelope): PageModel {
       }
       // A switch to a failed tab brings its kept conversation back, since no snapshot follows for it.
       if (switched) state = keptStates.get(envelope.active) ?? state;
+      // A closed tab's remote question goes with it; one on screen goes down when its tab is no longer shown.
+      const heldRemote = new Map([...model.heldRemote].filter(([id]) => envelope.tabs.some((entry) => entry.id === id)));
+      const remoteGone = model.confirm?.kind === "remote" && (switched || !heldRemote.has(model.confirm.tab));
       // The banner belongs to the session that ended. Once the active tab is starting a new one or running it,
       // that reason is not about this tab any more; a start that fails again sends its own `error`.
       // `awaiting_trust` keeps it: nothing has started under it, and a waiting tab draws no ended-session notice
@@ -432,7 +496,8 @@ function reduceEnvelope(model: PageModel, envelope: Envelope): PageModel {
           commandNotice: null, queue: [], queueError: null, queueNote: null, queueSteers: null, shellRunning: false,
           ruleOffers: {}, scratchEditing: false, chooser: null,
         } : {}),
-        state, keptStates,
+        state, keptStates, heldRemote,
+        ...(remoteGone ? { confirm: null } : {}),
         fatalError: switched || activeState === "starting" || activeState === "live" ? null : model.fatalError,
         tabs: { active: envelope.active, tabs: envelope.tabs, defaultMode: envelope.defaultMode },
       };

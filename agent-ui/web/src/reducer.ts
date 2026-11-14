@@ -45,6 +45,7 @@ export function initialState(): AgentUiState {
     editorCards: [],
     capabilities: { resume: false, fork: false, interrupt: false, bypassPermissionMode: false },
     provider: null,
+    linkState: null,
     usage: null,
     accountLimits: null,
     backgroundCalls: 0,
@@ -166,6 +167,7 @@ export function resetToStartScreen(state: AgentUiState): AgentUiState {
     backend: state.backend,
     capabilities: state.capabilities,
     provider: state.provider,
+    linkState: state.linkState,
     // Never counted down: a stop question still up from the ended session must not match the next one's work.
     cliUnseenEpisode: state.cliUnseenEpisode,
   };
@@ -1039,6 +1041,7 @@ export function applySnapshot(previous: AgentUiState, snapshot: AgentUiSnapshot,
   let state: AgentUiState = {
     ...initialState(),
     ...snapshot,
+    linkState: snapshot.linkState ?? null,
     evicted: snapshot.evicted ?? null,
     usage: snapshot.usage ?? null,
     accountLimits: snapshot.accountLimits ?? null,

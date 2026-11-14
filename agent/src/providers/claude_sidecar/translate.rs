@@ -538,6 +538,15 @@ fn translate_resume_status(status: ProtoResumeStatus) -> ResumeStatus {
     }
 }
 
+/// Whether `event` is a permission resolution whose outcome the sidecar sent as EXPIRED: not one it left
+/// unspecified, which `translate` also reads as expired.
+pub(crate) fn expired_on_the_wire(event: &ProtoSessionEvent) -> bool {
+    matches!(
+        &event.event,
+        Some(ProtoEvent::PermissionResolved(resolved)) if resolved.outcome() == ProtoPermissionOutcome::Expired
+    )
+}
+
 fn translate_permission_outcome(outcome: ProtoPermissionOutcome) -> PermissionOutcome {
     match outcome {
         ProtoPermissionOutcome::Allowed => PermissionOutcome::Allowed,

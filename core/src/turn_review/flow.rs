@@ -592,6 +592,13 @@ impl ReviewFlow {
                 return out;
             }
         };
+        if tabs
+            .get(tab.unwrap_or_else(|| tabs.active()))
+            .is_some_and(|tab| tab.is_remote())
+        {
+            out.push(failed(&request_id, super::REMOTE_UNAVAILABLE));
+            return out;
+        }
         let named = |tab: Option<TabId>| tab.ok_or_else(|| "protocol: this command names no tab".to_string());
         let result = match message {
             InboundMessage::ReviewRevert {

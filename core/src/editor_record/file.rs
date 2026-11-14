@@ -156,6 +156,42 @@ pub(crate) fn replace_private(tmp: &Path, path: &Path, bytes: &[u8]) -> io::Resu
     written
 }
 
+/// [`replace_private`] for a record that has to survive a crash or a power loss: the temporary file's bytes reach
+/// the disk before the rename, and the directory's new entry after it, so the name holds the previous record or
+/// the new one whole, never an empty file. On a failure before the rename the temporary file goes.
+pub(crate) fn replace_private_durable(tmp: &Path, path: &Path, bytes: &[u8]) -> io::Result<()> {
+    let filled = agent::private_fs::open_private(tmp).and_then(|mut file| {
+        use std::io::Write;
+        file.write_all(bytes)?;
+        sync(&file)
+    });
+    if let Err(error) = filled.and_then(|()| std::fs::rename(tmp, path)) {
+        let _ = std::fs::remove_file(tmp);
+        return Err(error);
+    }
+    let dir = path
+        .parent()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "a record path names no directory"))?;
+    sync(&std::fs::File::open(dir)?)
+}
+
+#[cfg(test)]
+thread_local! {
+    static SYNCS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// How many files and directories [`replace_private_durable`] has flushed to disk on this thread.
+#[cfg(test)]
+pub(crate) fn syncs() -> usize {
+    SYNCS.with(std::cell::Cell::get)
+}
+
+fn sync(file: &std::fs::File) -> io::Result<()> {
+    #[cfg(test)]
+    SYNCS.with(|syncs| syncs.set(syncs.get() + 1));
+    file.sync_all()
+}
+
 /// Whether `token` is 16 lowercase hex digits, the only form that goes into names nvim makes.
 fn is_token(token: &str) -> bool {
     token.len() == 16 && token.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))

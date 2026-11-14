@@ -24,6 +24,7 @@ mod grid_probe;
 mod gtk_host;
 mod hint;
 mod host_clipboard;
+mod host_command;
 #[cfg(target_os = "linux")]
 mod ide_wiring;
 mod keymap_alt_mod;
@@ -53,8 +54,10 @@ mod project_stamp;
 mod project_start;
 #[cfg(target_os = "linux")]
 mod remote_presence;
+mod remote_resume;
 #[cfg(target_os = "linux")]
 mod remote_switch;
+mod remote_window;
 mod root_conflicts;
 mod sidecar_probe;
 mod takeover;
@@ -153,6 +156,11 @@ fn main() -> glib::ExitCode {
         .is_some_and(|a| a == eitri_core::attachments::SUBCOMMAND)
     {
         eitri_core::attachments::decoder_child_main();
+    }
+    // `eitri host`, before anything else here: ssh runs `eitri host known-hosts-probe` on every connection it makes for
+    // a remote project, which must record the key and print nothing, and the other `host` commands are a terminal's.
+    if let Some(code) = host_command::run(std::env::args_os().skip(1)) {
+        return code;
     }
     // What the launcher says about this start, first: a start from the desktop takes its `PATH` from the login shell
     // here, before any thread or child, and the lines about it (and the launcher's note) wait for the log below.
@@ -371,19 +379,31 @@ fn main() -> glib::ExitCode {
     //
     // What the command line names to open comes out of the same resolution as nvim's own arguments; window 2 and a
     // module window have no editor and carry none.
-    let (project_root, open) = match &start {
+    let (project_root, open, origin) = match &start {
         linked_window::WindowStart::Second { root, .. }
         | linked_window::WindowStart::Module { root, .. }
-        | linked_window::WindowStart::Beside { root, .. } => (root.clone(), Vec::new()),
+        | linked_window::WindowStart::Beside { root, .. } => {
+            (root.clone(), Vec::new(), remote_window::origin_for_root(root))
+        }
         linked_window::WindowStart::Full => match eitri_core::project_root::resolve_launch() {
-            Ok(launch) => {
+            Ok(mut launch) => {
                 for note in &launch.notes {
                     eprintln!("eitri: {note}");
                 }
+                // A remote project's window and a window of its copy share a root: which one this is decides which
+                // running window a file or a raise goes to.
+                let origin = match remote_window::origin_for_launch(&mut launch) {
+                    Ok(origin) => origin,
+                    Err(message) => {
+                        eprintln!("eitri: {message}");
+                        return glib::ExitCode::FAILURE;
+                    }
+                };
                 // Ahead of everything a window needs: a launch a running window takes ends here, with no GTK, no
                 // display and no nvim. The one thread this may start only connects, and never reads the environment.
                 if let Some(code) = open_requests::hand_over(
                     &launch,
+                    &origin,
                     want_clean,
                     backend_kind,
                     open_hint.as_deref(),
@@ -392,10 +412,16 @@ fn main() -> glib::ExitCode {
                     return code;
                 }
                 // The same, for a window asked only to come forward.
-                if let Some(code) = open_requests::raise(&launch, want_clean, backend_kind, open_token.as_deref()) {
+                if let Some(code) =
+                    open_requests::raise(&launch, &origin, want_clean, backend_kind, open_token.as_deref())
+                {
                     return code;
                 }
-                (launch.root, eitri_core::project_root::nvim_open_args(&launch.open))
+                (
+                    launch.root,
+                    eitri_core::project_root::nvim_open_args(&launch.open),
+                    origin,
+                )
             }
             Err(message) => {
                 eprintln!("eitri: {message}");
@@ -403,6 +429,20 @@ fn main() -> glib::ExitCode {
             }
         },
     };
+    // The launch's origin, for what finds this project's windows by it: a window 2 waiting for its window 1 is found
+    // only by a window 1 of the same origin.
+    linked_window::relink::set_origin(&origin);
+    // What this window starts opens this root as the same copy; every other origin clears inherited copy state.
+    let copy = std::env::var_os(remote_window::LOCAL_COPY_ENV);
+    match remote_window::copy_root_for_children(&origin, &project_root) {
+        // SAFETY: as for `NEOVIM_BIN` below: no thread this process started reads the environment.
+        Some(root) => unsafe { std::env::set_var(remote_window::LOCAL_COPY_ENV, root) },
+        None if copy.is_some() => unsafe { std::env::remove_var(remote_window::LOCAL_COPY_ENV) },
+        None => {}
+    }
+    if origin.remote().is_some() {
+        remote_resume::prepare_network_monitor();
+    }
     if matches!(start, linked_window::WindowStart::Full) {
         window_log::start_main(&project_root);
     }
@@ -591,6 +631,7 @@ fn main() -> glib::ExitCode {
             app,
             want_clean,
             &project_root,
+            &origin,
             backend_kind,
             panel_notice.as_deref(),
             root_note.clone(),
@@ -628,6 +669,7 @@ fn build_ui(
     app: &Application,
     want_clean: bool,
     project_root: &Path,
+    origin: &eitri_core::remote_project::WindowOrigin,
     backend_kind: eitri_core::agent_backend::BackendKind,
     panel_notice: Option<&str>,
     root_note: Option<String>,
@@ -834,7 +876,7 @@ fn build_ui(
     let incoming_opens = matches!(editor_presence, eitri_core::wm::EditorPresence::Owned)
         .then(|| {
             let sink: Rc<dyn eitri_core::wm::HostSink> = driver.clone();
-            open_requests::OpenRequests::claim(project_root, Rc::downgrade(&sink))
+            open_requests::OpenRequests::claim(project_root, origin, Rc::downgrade(&sink))
         })
         .flatten();
     driver.start(
@@ -995,6 +1037,8 @@ fn build_ui(
             tokens
         },
     );
+    // Before any tab can start: a remote project's tabs start on its server, and its copy's start nowhere.
+    let remote_prepared = remote_window::prepare(&agent_panel_handle, origin);
     let base_page = gtk_host_surfaces::BasePage::new(agent_panel_handle.clone(), panel_notice);
     wm_host.set_base_page_maker(base_page.clone());
     // Filled once `init.lua` has said whether the terminal's `claude` may attach, which is after this hook is set.
@@ -1380,7 +1424,7 @@ fn build_ui(
     let terminal_zoom = Rc::new(std::cell::Cell::new(1.0_f32));
     let make_terminal_pane: Rc<dyn Fn() -> terminal::TerminalPane> = {
         let root = project_root.to_path_buf();
-        let shell_env = open_requests::shell_env(incoming_opens.as_deref(), project_root);
+        let shell_env = open_requests::shell_env(incoming_opens.as_deref(), project_root, origin);
         #[cfg(target_os = "linux")]
         let env_with_port = (claude_ide || !owns_editor).then(|| shell_port.over(shell_env.clone()));
         let colors = terminal_colors.clone();
@@ -1803,9 +1847,10 @@ fn build_ui(
     // at the start beside the layout's.
     let tab_windows = if hub && agent_panel_handle.remembers_tabs() {
         let group_tabs = linked_window::group_tabs::GroupTabs::read(
-            eitri_core::saved_tabs::state_dir(
+            eitri_core::saved_tabs::state_dir_for(
                 std::env::var_os("XDG_STATE_HOME").as_deref(),
                 std::env::var_os("HOME").as_deref(),
+                &origin.tab_origin(),
             )
             .as_deref(),
             project_root,
@@ -1825,6 +1870,9 @@ fn build_ui(
     } else {
         Vec::new()
     };
+    if remote_prepared {
+        remote_window::start(&agent_panel_handle, origin, incoming_opens.clone(), pair.clone());
+    }
     if window2_restored {
         agent_panel_handle.hold_launch_restore();
     }
@@ -2144,9 +2192,10 @@ fn build_ui(
         && pair.pair_role() == eitri_core::window_link::pair::Role::Main
         && agent_panel_handle.remembers_tabs())
     .then(|| {
-        eitri_core::saved_tabs::state_dir(
+        eitri_core::saved_tabs::state_dir_for(
             std::env::var_os("XDG_STATE_HOME").as_deref(),
             std::env::var_os("HOME").as_deref(),
+            &origin.tab_origin(),
         )
     })
     .flatten()

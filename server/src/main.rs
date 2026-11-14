@@ -3,6 +3,7 @@ mod daemon;
 mod ensure;
 mod gc;
 mod peer;
+mod probe;
 mod run_dir;
 
 use std::ffi::OsString;
@@ -34,13 +35,21 @@ fn invalid(message: impl Into<String>) -> io::Error {
 }
 
 fn dispatch() -> io::Result<()> {
-    let mut args: Vec<OsString> = std::env::args_os().skip(1).collect();
+    dispatch_with_probe(std::env::args_os().skip(1).collect(), |args| async move {
+        probe::run(&args).await
+    })
+}
+
+fn dispatch_with_probe<F: std::future::Future<Output = io::Result<()>>>(
+    mut args: Vec<OsString>,
+    probe: impl FnOnce(Vec<OsString>) -> F,
+) -> io::Result<()> {
     if args.len() == 1 && args[0] == "--version" {
         println!("eitri-server {VERSION} {}", run_dir::rev7(REVISION));
         return Ok(());
     }
     if args.is_empty() {
-        return Err(invalid("expected ensure, connect, list-daemons or stop-daemon"));
+        return Err(invalid("expected ensure, connect, list-daemons, stop-daemon or probe"));
     }
     let command = args.remove(0);
     if args.first().is_some_and(|arg| arg == "--args-hex") {
@@ -72,28 +81,115 @@ fn dispatch() -> io::Result<()> {
                 ),
                 _ => return Err(invalid("unexpected daemon arguments")),
             };
-            runtime.block_on(daemon::run(run_dir::Paths::from_env(VERSION)?, idle))
+            finish_runtime(runtime, daemon::run(run_dir::Paths::own_from_env()?, idle))
         }
         Some("connect") => {
-            let version = match args.as_slice() {
-                [] => VERSION,
-                [flag, version] if flag == "--daemon" => version
-                    .to_str()
-                    .ok_or_else(|| invalid("daemon version must be UTF-8"))?,
-                _ => return Err(invalid("expected connect [--daemon <version>]")),
+            // This installation's own daemon, or the one keyed `--daemon <key>` (as `list-daemons` names it in `run`).
+            let paths = match args.as_slice() {
+                [] => run_dir::Paths::own_from_env()?,
+                [flag, key] if flag == "--daemon" => {
+                    let name = key.to_str().ok_or_else(|| invalid("daemon key must be UTF-8"))?;
+                    let key = daemon_key(name);
+                    run_dir::Paths::from_env(&key)?
+                }
+                _ => return Err(invalid("expected connect [--daemon <key>]")),
             };
-            let result = runtime.block_on(ensure::connect(&run_dir::Paths::from_env(version)?));
-            // Tokio's stdin may have an outstanding blocking read after the socket closes.
-            runtime.shutdown_background();
-            result
+            finish_runtime(runtime, ensure::connect(&paths))
+        }
+        Some("check-sidecars") if args.len() == 2 && args[1] == "--live-runs" => {
+            ensure::live_sidecar_runs(&std::path::Path::new(&args[0]).join("run"))
+        }
+        Some("check-sidecars") if args.len() == 1 => {
+            let run = std::path::Path::new(&args[0]).join("run");
+            ensure::check_sidecars_stopped(&run)
         }
         Some("list-daemons") if args.is_empty() => runtime.block_on(ensure::list_daemons()),
+        // The daemon keyed as `list-daemons` names it in `run`: its installation's name, or its version.
         Some("stop-daemon") if args.len() == 1 => {
-            let version = args[0]
-                .to_str()
-                .ok_or_else(|| invalid("daemon version must be UTF-8"))?;
-            ensure::stop_daemon(&run_dir::Paths::from_env(version)?)
+            let key = args[0].to_str().ok_or_else(|| invalid("daemon key must be UTF-8"))?;
+            ensure::stop_daemon(&run_dir::Paths::from_env(key)?)
         }
+        Some("probe") => finish_runtime(runtime, probe(args)),
         _ => Err(invalid("unknown command or unexpected arguments")),
+    }
+}
+
+fn daemon_key(name: &str) -> String {
+    let run_key = name.strip_prefix("i-").is_some_and(|hex| {
+        hex.len() == 16
+            && hex
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    });
+    if !run_key && run_dir::installation_identity(name).is_some() {
+        run_dir::run_key_of(name)
+    } else {
+        name.to_owned()
+    }
+}
+
+fn finish_runtime(
+    runtime: tokio::runtime::Runtime,
+    operation: impl std::future::Future<Output = io::Result<()>>,
+) -> io::Result<()> {
+    let result = runtime.block_on(operation);
+    // A timed-out NSS lookup or an outstanding stdin read may still own a blocking worker.
+    runtime.shutdown_background();
+    result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn connect_accepts_listed_run_keys_without_hashing_them_again() {
+        let installation = "0.3.0-abcdef0";
+        let key = run_dir::run_key_of(installation);
+        assert_eq!(daemon_key(&key), key);
+        assert_eq!(daemon_key(installation), key);
+        assert_eq!(daemon_key("0.3.0"), "0.3.0");
+    }
+
+    #[test]
+    fn probe_shutdown_does_not_join_a_stalled_lookup() {
+        const CHILD: &str = "EITRI_TEST_STALLED_PROBE";
+        if std::env::var_os(CHILD).is_some() {
+            let error = dispatch_with_probe(vec!["probe".into()], |_| async {
+                let (entered, ready) = tokio::sync::oneshot::channel();
+                tokio::task::spawn_blocking(move || {
+                    let _ = entered.send(());
+                    std::thread::park();
+                });
+                ready.await.unwrap();
+                Err(io::Error::new(io::ErrorKind::TimedOut, "passwd lookup timed out"))
+            })
+            .unwrap_err();
+            eprintln!("eitri-server: {error}");
+            return;
+        }
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "tests::probe_shutdown_does_not_join_a_stalled_lookup",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        while child.try_wait().unwrap().is_none() {
+            if std::time::Instant::now() >= deadline {
+                child.kill().unwrap();
+                panic!("probe runtime waited for the stalled lookup");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let output = child.wait_with_output().unwrap();
+        assert!(output.status.success());
+        assert!(String::from_utf8_lossy(&output.stderr).contains("passwd lookup timed out"));
+        assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
     }
 }

@@ -17,6 +17,7 @@
 //! Selected by `EITRI_AGENT_BACKEND=legacy|sidecar`, defaulting to `sidecar`.
 
 use agent::setting_sources::ProjectTrust;
+use agent::GateRoot;
 use agent::{
     AgentConversation, AgentDomainEvent, AgentSession, AgentSessionProjection, ClaudeSidecarProvider,
     ConversationError, PermissionDecision, PermissionMode, ProjectionGuard, ProviderCapabilities, ProviderInfo,
@@ -880,6 +881,156 @@ impl AgentBackend {
         }
     }
 
+    /// Starts a remote Claude tab (`agent::remote_client::open_remote_session`): the root is checked
+    /// here first, the sidecar runs on the server, started and held by the helper behind `client`, and
+    /// its session runs in `start.root` exactly as the remote project records it; a sidecar whose
+    /// session could not be created is stopped again. The tab's link state is the provider's from here
+    /// on. **Blocking**: ssh and the helper's start, so callers run it off the GTK main loop.
+    pub fn start_remote(
+        client: agent::remote_client::HelperClient,
+        host_key_sha256: &str,
+        start: &agent::remote_client::SidecarStart,
+        project: ProjectTrust,
+        client_tools: Option<agent::ClientToolSet>,
+    ) -> Result<Self, BackendError> {
+        agent::remote_client::open_remote_session(client, host_key_sha256, start, project, client_tools)
+            .map(|conversation| AgentBackend::Conversation {
+                agent: AgentId::Claude,
+                conversation: Box::new(conversation),
+            })
+            .map_err(|failure| {
+                BackendError::fatal(match &failure.info {
+                    Some(info) => with_provider_notes(failure.message, info),
+                    None => failure.message,
+                })
+            })
+    }
+
+    /// Takes a remote Claude tab up again from its saved state (`handoff`, over `client`, opened for its
+    /// host key): its history is folded afresh from the journal's start and nothing is resumed. When the
+    /// server no longer runs the sidecar the journal is still shown and the tab then ends with the agent
+    /// gone. **Blocking**: ssh and the helper.
+    pub fn reattach_remote(
+        client: agent::remote_client::HelperClient,
+        handoff: &agent::HelperHandoff,
+        root: &Path,
+    ) -> Result<Self, BackendError> {
+        let host = handoff.host.clone();
+        let provider = ClaudeSidecarProvider::reattach_through_helper(client, handoff)
+            .map_err(|e| BackendError::fatal(format!("the agent on {host} could not be reached: {e}")))?;
+        AgentConversation::reattach_remote(std::sync::Arc::new(provider), root, &handoff.session_id)
+            .map(|conversation| Self::reattached(conversation, handoff.last_folded_sequence))
+            .map_err(|e| BackendError::fatal(format!("the agent on {host} could not be taken up: {e}")))
+    }
+
+    /// The backend of a remote tab taken up again (`conversation`, from `AgentConversation::reattach_remote`), whose
+    /// saving window had folded its session through `attached_through`: what is folded up to there is old history
+    /// read back ([`Self::replaying_history`]).
+    pub fn reattached(mut conversation: AgentConversation, attached_through: u64) -> Self {
+        conversation.replays_history_through(attached_through);
+        AgentBackend::Conversation {
+            agent: AgentId::Claude,
+            conversation: Box::new(conversation),
+        }
+    }
+
+    /// Whether this backend is still folding history read back from its server (`AgentConversation::
+    /// replaying_history`): only a remote tab taken up again does, until it has caught up.
+    pub fn replaying_history(&self) -> bool {
+        match self {
+            AgentBackend::Legacy(_) => false,
+            AgentBackend::Conversation { conversation, .. } => conversation.replaying_history(),
+        }
+    }
+
+    /// Continues the CLI's own session `provider_session_id` on the server through a new sidecar started
+    /// for `start`, with the resume request a local tab sends: a remote tab whose agent the server no longer
+    /// runs. The new sidecar is stopped again when the resume fails. **Blocking.**
+    pub fn resume_remote(
+        client: agent::remote_client::HelperClient,
+        host_key_sha256: &str,
+        start: &agent::remote_client::SidecarStart,
+        provider_session_id: &str,
+        project: ProjectTrust,
+        client_tools: Option<agent::ClientToolSet>,
+    ) -> Result<Self, BackendError> {
+        let provider = std::sync::Arc::new(
+            ClaudeSidecarProvider::connect_through_helper(client, host_key_sha256, start)
+                .map_err(|e| BackendError::fatal(e.to_string()))?,
+        );
+        let info = agent::AgentProvider::info(provider.as_ref());
+        AgentConversation::resume_remote_with_tools(
+            provider.clone(),
+            &start.root,
+            provider_session_id,
+            project,
+            client_tools,
+        )
+        .map(|conversation| AgentBackend::Conversation {
+            agent: AgentId::Claude,
+            conversation: Box::new(conversation),
+        })
+        .map_err(|e| {
+            if let Err(stop) = provider.stop_remote_sidecar() {
+                eprintln!("[agent_backend] the sidecar of a resume that failed was not stopped: {stop}");
+            }
+            BackendError::fatal(with_provider_notes(
+                format!("could not continue the previous session: {e}"),
+                &info,
+            ))
+        })
+    }
+
+    /// How this remote tab's session ended, once the helper said; `None` while it runs and for a local tab.
+    pub fn remote_ending(&self) -> Option<agent::RemoteEnding> {
+        match self {
+            AgentBackend::Conversation { conversation, .. } => conversation.remote_ending(),
+            AgentBackend::Legacy(_) => None,
+        }
+    }
+
+    /// What reaches this remote tab's agent again from a later window; `None` for a local tab.
+    pub fn helper_handoff(&self) -> Option<agent::HelperHandoff> {
+        match self {
+            AgentBackend::Conversation { conversation, .. } => conversation.helper_handoff(),
+            AgentBackend::Legacy(_) => None,
+        }
+    }
+
+    /// After a gap: denies each listed waiting request through the provider's ordinary answer and stops
+    /// the agent, on a thread of its own (`AgentConversation::deny_waiting_and_stop`).
+    pub fn deny_waiting_and_stop(
+        &self,
+        permission_ids: Vec<String>,
+    ) -> std::sync::mpsc::Receiver<Result<agent::DenyAndStopOutcome, String>> {
+        match self {
+            AgentBackend::Conversation { conversation, .. } => conversation.deny_waiting_and_stop(permission_ids),
+            AgentBackend::Legacy(_) => {
+                let (tx, rx) = std::sync::mpsc::channel();
+                let _ = tx.send(Err("this tab's agent does not run on a server".to_string()));
+                rx
+            }
+        }
+    }
+
+    /// Why the last [`Self::shutdown`] did not stop this remote tab's agent on its server
+    /// (`AgentConversation::remote_stop_failure`); `None` when it did, or for a local tab.
+    pub fn remote_stop_failure(&self) -> Option<String> {
+        match self {
+            AgentBackend::Conversation { conversation, .. } => conversation.remote_stop_failure().map(str::to_string),
+            AgentBackend::Legacy(_) => None,
+        }
+    }
+
+    /// Lets go of a remote tab without ending its agent on the server (a window closing, "leave it
+    /// running"); a local tab is shut down. Blocking like [`Self::shutdown`]: a worker's.
+    pub fn detach(&mut self) {
+        match self {
+            AgentBackend::Legacy(session) => session.shutdown(),
+            AgentBackend::Conversation { conversation, .. } => conversation.detach(),
+        }
+    }
+
     /// Starts, or resumes, a session of an external agent. **Blocking** like [`start`](Self::start):
     /// it runs the agent's own child, and for Codex the per-binary check first, so callers run it off
     /// the GTK main loop.
@@ -1098,6 +1249,13 @@ impl AgentBackend {
         match self {
             AgentBackend::Legacy(session) => session.projection.provider_session_id.clone(),
             AgentBackend::Conversation { conversation, .. } => conversation.provider_session_id(),
+        }
+    }
+
+    pub fn link_state(&self) -> Option<agent::RemoteLinkState> {
+        match self {
+            AgentBackend::Legacy(_) => None,
+            AgentBackend::Conversation { conversation, .. } => conversation.link_state(),
         }
     }
 
@@ -2076,9 +2234,9 @@ impl AgentBackend {
     /// an event with the projection's `last_revision` right after its own fold, so the tags compare
     /// directly with a snapshot's. An event answered here without a card, and one only the host reads,
     /// is dropped with its tag; the others keep theirs, in order.
-    pub fn take_revised_ui_delivery(
+    pub fn take_revised_ui_delivery<'a>(
         &mut self,
-        project_root: &Path,
+        project_root: GateRoot<'a>,
         rules: &agent::PrefixRules,
         mode: impl Into<GateMode>,
         host_answered: &mut BTreeSet<String>,
@@ -2101,9 +2259,9 @@ impl AgentBackend {
     /// the ids answered there, sends in flight included. Such a request is never held for another
     /// approval and never reconsidered here, so nothing answers it a second time.
     #[allow(clippy::too_many_arguments)]
-    pub fn take_revised_ui_delivery_after_answers(
+    pub fn take_revised_ui_delivery_after_answers<'a>(
         &mut self,
-        project_root: &Path,
+        project_root: GateRoot<'a>,
         rules: &agent::PrefixRules,
         mode: impl Into<GateMode>,
         host_answered: &mut BTreeSet<String>,
@@ -2146,6 +2304,23 @@ impl AgentBackend {
         if resync {
             approvals.forget_recorded();
         }
+        let lost_before: BTreeSet<String> = approvals.lost.ids().cloned().collect();
+        Self::note_resolutions_of_answers_out(approvals, &delivery);
+        let refused: BTreeSet<String> = Self::settle_host_sends(approvals, host_answered, answered_for_you)
+            .into_iter()
+            .collect();
+        Self::record_lost_answers_taken(approvals, host_answered, answered_for_you);
+        // An answer lost on the way (the link broke, or no reply came in time) is its request's card,
+        // delivered once with the drain that read the loss, and is sent once more by a later drain that
+        // reads the link live, if it still stands then.
+        let newly_lost: BTreeSet<String> = approvals
+            .lost
+            .ids()
+            .filter(|id| !lost_before.contains(*id))
+            .cloned()
+            .collect();
+        self.resend_lost_when_back(approvals, user_answered, mode, &newly_lost, plan, plan_followed);
+        let cards_only: BTreeSet<String> = refused.iter().chain(newly_lost.iter()).cloned().collect();
         let (mut retry, waiting) = if !approvals.in_flight.is_empty() || !approvals.held.is_empty() {
             let projection = self.projection();
             approvals.held.retain(|id| !user_answered.contains(id));
@@ -2179,6 +2354,48 @@ impl AgentBackend {
         } else {
             (Vec::new(), BTreeSet::new())
         };
+        // Pruned on every drain to what the projection still lists, so an id stays only while its request
+        // waits.
+        if !approvals.resolved_out.0.is_empty() {
+            let HumanApprovals {
+                host_sends,
+                lost,
+                resolved_out,
+                ..
+            } = &mut *approvals;
+            resolved_out
+                .0
+                .retain(|id, _| host_sends.contains(id) || lost.ids().any(|lost| lost == id));
+        }
+        if !approvals.fell_back.is_empty() || !approvals.lost.0.is_empty() {
+            let projection = self.projection();
+            approvals
+                .fell_back
+                .retain(|id| projection.pending_permissions.contains_key(id));
+            approvals
+                .lost
+                .0
+                .retain(|lost| projection.pending_permissions.contains_key(&lost.planned.permission_id));
+        }
+        if !cards_only.is_empty() {
+            let projection = self.projection();
+            approvals.fell_back.extend(refused.iter().cloned());
+            for id in &cards_only {
+                let Some(p) = projection.pending_permissions.get(id) else {
+                    continue;
+                };
+                retry.push((
+                    projection.last_revision,
+                    AgentDomainEvent::PermissionRequested {
+                        permission_id: id.clone(),
+                        tool_use_id: p.tool_use_id.clone(),
+                        tool_name: p.tool_name.clone(),
+                        input: p.input.clone(),
+                        provider_prompt: p.provider_prompt.clone(),
+                    },
+                ));
+            }
+        }
         // Requests held while the session left plan mode are judged once more as soon as nothing holds them
         // any more, under the mode the tab took up; one that is a card then is drawn by a snapshot, since its
         // event was kept from the page.
@@ -2274,6 +2491,7 @@ impl AgentBackend {
                 host_answered,
                 approvals,
                 answered_for_you,
+                cards_only: &cards_only,
                 plan,
             },
         );
@@ -2457,7 +2675,8 @@ impl AgentBackend {
     fn answer_what_needs_no_human(
         &mut self,
         events: Vec<(u64, AgentDomainEvent)>,
-        project_root: &Path,
+        // GateRoot enters the answer path here; a remote tab supplies no laptop root.
+        project_root: GateRoot<'_>,
         cx: AnswerContext<'_>,
     ) -> Vec<(u64, AgentDomainEvent)> {
         let AnswerContext {
@@ -2468,8 +2687,12 @@ impl AgentBackend {
             host_answered,
             approvals,
             answered_for_you,
+            cards_only,
             plan,
         } = cx;
+        // The tab's own mode, what a remote answer is sent under: a lost one is sent again only while the tab is
+        // still in it.
+        let tab_mode = mode;
         // What the batch's own events have shown so far; the projection is read again for every
         // request below, because ingestion keeps folding while earlier answers of this batch are
         // sent, and a trip or a fallback to `default` it folds there must reach the next request.
@@ -2536,15 +2759,22 @@ impl AgentBackend {
             let defers_to_the_cli = mode == PermissionMode::Auto
                 && self.capabilities().cli_auto_mode
                 && cli_reports_auto
-                && root_is_a_boundary(project_root);
+                && gate_root_is_a_boundary(project_root);
             if tripped {
                 eprintln!("[permission] not answering {tool_name}: the agent reported a policy it was not asked for");
                 kept.push((revision, event));
                 continue;
             }
             // One check for every way of answering, before any is chosen: an id the host already
-            // answered (a duplicate delivery, e.g. after a resync) is dropped without a second answer.
-            if host_answered.contains(permission_id) {
+            // answered (a duplicate delivery, e.g. after a resync) is dropped without a second answer,
+            // and so is one whose answer is still on its way.
+            if host_answered.contains(permission_id) || approvals.host_sends.contains(permission_id) {
+                continue;
+            }
+            // A host answer that failed to reach a remote agent is shown as the card it fell back to.
+            if cards_only.contains(permission_id) {
+                plan.unsequenced.remove(permission_id);
+                kept.push((revision, event));
                 continue;
             }
             // A card raised while the CLI ran plan mode is a person's to answer, whatever the tab's mode now. It waits
@@ -2636,7 +2866,16 @@ impl AgentBackend {
             let deferred_call = (phase != RequestPhase::Executing && planned.decision.defers())
                 .then(|| planned.call.clone())
                 .flatten();
-            if self.answer_and_record(planned, host_answered, approvals, answered_for_you) {
+            // As `approve_pending` decides it: a backend that reports a link answers over the network, whatever
+            // root its tab named.
+            let remote = matches!(project_root, GateRoot::RemoteWithoutFacts) || self.link_state().is_some();
+            if self.answer_and_record(
+                planned,
+                host_answered,
+                approvals,
+                answered_for_you,
+                remote.then_some(tab_mode),
+            ) {
                 plan.deferred_in_flight.extend(deferred_call);
             } else {
                 kept.push((revision, event));
@@ -2648,61 +2887,255 @@ impl AgentBackend {
     /// Sends the answer `decide` chose and, once the provider took it, records it: the gate answer,
     /// the id in `host_answered`, the approval it used up and each row note it carries. Every way of
     /// answering without a card ends here, so none can send an answer it does not record or record
-    /// one it did not send. `false` when the answer could not be sent: the caller delivers the
-    /// request as a card, since a request left pending with nothing on screen is a session the user
-    /// cannot unstick.
+    /// one it did not send. For a local tab the reply is waited for here. For a remote tab the answer
+    /// goes out without waiting and `true` means only that it went: the recording happens when a later
+    /// delivery reads its reply (`settle_host_sends`), and a refused or lost one is delivered then as
+    /// its card. `false` when the answer could not be sent: the caller delivers the request as a card,
+    /// since a request left pending with nothing on screen is a session the user cannot unstick.
     fn answer_and_record(
         &mut self,
         planned: PlannedAnswer,
         host_answered: &mut BTreeSet<String>,
         approvals: &mut HumanApprovals,
         answered_for_you: &mut AnsweredForYou,
+        remote: Option<PermissionMode>,
     ) -> bool {
-        let PlannedAnswer {
-            permission_id,
-            decision,
-            origin,
-            call,
-            tool_name,
-            consumes_approval,
-            prompt,
-            fast_path,
-            by_rule,
-            creates_file,
-            sent,
-            could_not,
-        } = planned;
-        let deferred = decision.defers();
-        match self.respond_permission(&permission_id, decision) {
-            Ok(_resolution) => {
-                answered_for_you.gate_answers.push(GateAnswer {
-                    origin,
-                    permission_id: permission_id.clone(),
-                    tool_use_id: call,
-                    tool_name,
-                    deferred,
-                });
-                host_answered.insert(permission_id);
-                // Used up once it answered one prompt: a later prompt under this id is a card.
-                if let Some(id) = consumes_approval {
-                    approvals.consume(&id);
+        if let Some(mode) = remote {
+            // A remote tab's answer crosses the network: it goes out without this thread waiting, and is
+            // recorded when its reply is read; a refused or lost one becomes the card then.
+            return match self.respond_permission_async(&planned.permission_id, planned.decision.clone()) {
+                Ok(send) => {
+                    // Used up as the answer goes, not when its reply is read: a later prompt in this batch, or one
+                    // before the reply, under another permission id is a card. A refused or lost answer falls back
+                    // to the person's card, never to the approval.
+                    if let Some(id) = &planned.consumes_approval {
+                        approvals.consume(id);
+                    }
+                    approvals.host_sends.0.push(HostSend {
+                        planned,
+                        send,
+                        mode,
+                        resent: false,
+                    });
+                    true
                 }
-                answered_for_you.prompts.extend(prompt);
-                answered_for_you.by_the_fast_path.extend(fast_path);
-                answered_for_you.creates_file.extend(creates_file);
-                answered_for_you.by_rule.extend(by_rule);
-                // Said on stderr rather than silently: this is the only record anywhere of a tool
-                // call that ran without the user being asked. One short line, whose reason is a
-                // fixed label rather than anything the model wrote.
-                eprintln!("[permission] {sent}");
+                Err(error) => {
+                    eprintln!(
+                        "[permission] could not {}, showing a card instead: {}",
+                        planned.could_not, error.message
+                    );
+                    false
+                }
+            };
+        }
+        match self.respond_permission(&planned.permission_id, planned.decision.clone()) {
+            Ok(_resolution) => {
+                record_host_answer(planned, host_answered, approvals, answered_for_you);
                 true
             }
             Err(error) => {
                 eprintln!(
-                    "[permission] could not {could_not}, showing a card instead: {}",
-                    error.message
+                    "[permission] could not {}, showing a card instead: {}",
+                    planned.could_not, error.message
                 );
                 false
+            }
+        }
+    }
+
+    /// Reads the replies of a remote tab's host answers that came: a taken one is recorded as the
+    /// synchronous path records it; the ids of refused ones are returned, for a card the person answers
+    /// from then on. A lost one (the connection broke, or no reply came in time: the agent may never
+    /// have had it) is kept in `approvals.lost` with the mode it was sent under, a card until it is sent
+    /// again ([`Self::resend_lost_when_back`]); one lost a second time stays a card, with its planned answer
+    /// kept for a later resolution to identify, so no answer goes round again. A retry refused as already
+    /// resolved keeps that evidence too: the first answer may have arrived before its resolution did.
+    fn settle_host_sends(
+        approvals: &mut HumanApprovals,
+        host_answered: &mut BTreeSet<String>,
+        answered_for_you: &mut AnsweredForYou,
+    ) -> Vec<String> {
+        let mut refused = Vec::new();
+        let mut waiting = Vec::new();
+        for sent in std::mem::take(&mut approvals.host_sends.0) {
+            match sent.send.try_reply() {
+                None => waiting.push(sent),
+                Some(Ok(_)) => record_host_answer(sent.planned, host_answered, approvals, answered_for_you),
+                Some(Err(error @ (agent::ProviderError::Transport(_) | agent::ProviderError::Timeout))) => {
+                    eprintln!(
+                        "[permission] could not {}, showing a card until the link is back: {error}",
+                        sent.planned.could_not
+                    );
+                    approvals.lost.0.push(LostAnswer {
+                        planned: sent.planned,
+                        mode: sent.mode,
+                        retry: !sent.resent,
+                        person: None,
+                    });
+                }
+                Some(Err(error)) => {
+                    eprintln!(
+                        "[permission] could not {}, showing a card instead: {error}",
+                        sent.planned.could_not
+                    );
+                    refused.push(sent.planned.permission_id.clone());
+                    // A retry can find the first answer already taken before its resolution arrives.
+                    // Keep that answer's evidence for the resolution, without ever retrying it again.
+                    if sent.resent
+                        && matches!(
+                            error,
+                            agent::ProviderError::Provider {
+                                code: agent::ProviderErrorCode::PermissionAlreadyResolved,
+                                ..
+                            }
+                        )
+                    {
+                        approvals.lost.0.push(LostAnswer {
+                            planned: sent.planned,
+                            mode: sent.mode,
+                            retry: false,
+                            person: None,
+                        });
+                    }
+                }
+            }
+        }
+        approvals.host_sends.0.extend(waiting);
+        refused
+    }
+
+    /// Keeps what this drain's folded resolutions say about requests whose host answer is on its way or lost. A
+    /// resync delivers no events, so it says nothing here: such an answer is then left as it was.
+    fn note_resolutions_of_answers_out(approvals: &mut HumanApprovals, delivery: &RevisedDelivery) {
+        let RevisedDelivery::Events(events) = delivery else {
+            return;
+        };
+        if approvals.host_sends.0.is_empty() && approvals.lost.0.is_empty() {
+            return;
+        }
+        for (_, event) in events {
+            if let AgentDomainEvent::PermissionResolved { permission_id, outcome } = event {
+                let tracked = approvals.host_sends.contains(permission_id)
+                    || approvals.lost.ids().any(|lost| lost == permission_id);
+                if tracked {
+                    approvals.resolved_out.0.insert(permission_id.clone(), *outcome);
+                }
+            }
+        }
+    }
+
+    /// A lost host answer the agent took after all: its reply never came back, but the agent resolved the request
+    /// as the answer said. It is recorded as a taken answer is (the gate's answer, the id in `host_answered`, the
+    /// approval it used up, its row notes and its `[permission]` line, which says the reply was lost), and is sent
+    /// no more. A resolution matching the person's later answer is ambiguous and records nothing for the host;
+    /// one matching only the host's answer records it. Another outcome leaves with its request.
+    fn record_lost_answers_taken(
+        approvals: &mut HumanApprovals,
+        host_answered: &mut BTreeSet<String>,
+        answered_for_you: &mut AnsweredForYou,
+    ) {
+        if approvals.lost.0.is_empty() || approvals.resolved_out.0.is_empty() {
+            return;
+        }
+        for lost in std::mem::take(&mut approvals.lost.0) {
+            let id = lost.planned.permission_id.clone();
+            let Some(outcome) = approvals.resolved_out.0.get(&id).copied() else {
+                approvals.lost.0.push(lost);
+                continue;
+            };
+            if lost
+                .person
+                .as_ref()
+                .is_some_and(|decision| taken_as_planned(decision, outcome))
+                || !taken_as_planned(&lost.planned.decision, outcome)
+            {
+                approvals.lost.0.push(lost);
+                continue;
+            }
+            approvals.resolved_out.0.remove(&id);
+            let mut planned = lost.planned;
+            planned.sent = format!(
+                "{} (its reply was lost; the agent's resolution shows it was taken)",
+                planned.sent
+            );
+            record_host_answer(planned, host_answered, approvals, answered_for_you);
+        }
+    }
+
+    /// Sends each lost host answer once more, tracked like the first, at a drain that reads this tab's link live:
+    /// never the drain that read the loss (that one delivers its card), and never while the link is down, where
+    /// every send would fail at once. Each lost answer goes again on its own, whenever it was lost and whatever
+    /// the link did meanwhile; an answer lost when no outage was seen (no reply in time) goes at the next drain.
+    /// It goes only if it still stands: the request still waits, the person has not answered its card (any
+    /// answer moves it to `fell_back` for good, see [`HumanApprovals::person_answers`]) and the tab is still in
+    /// the mode it was planned under. Nor does it go while anything would keep the gate from answering automatically
+    /// now: the session reported a policy it was not asked for, plans or changes mode (`plan_holds`, `plan_followed`
+    /// as the drain's), the request is a plan card, its call began outside executing, or it cannot be placed. One
+    /// that no longer stands stays the person's card.
+    fn resend_lost_when_back(
+        &mut self,
+        approvals: &mut HumanApprovals,
+        user_answered: &BTreeSet<String>,
+        mode: PermissionMode,
+        read_now: &BTreeSet<String>,
+        plan: &PlanBook,
+        plan_followed: bool,
+    ) {
+        if approvals.lost.0.is_empty() || self.link_state() != Some(agent::RemoteLinkState::Live) {
+            return;
+        }
+        for lost in std::mem::take(&mut approvals.lost.0) {
+            let LostAnswer {
+                planned,
+                mode: planned_under,
+                mut retry,
+                person,
+            } = lost;
+            // Its own statement, guard dropped before any answer below.
+            let barred = {
+                let projection = self.projection();
+                session_tripped(&projection)
+                    || projection.is_planning()
+                    || plan_holds(&projection, plan_followed)
+                    || plan.cards.contains(&planned.permission_id)
+                    || projection.began_outside_executing(planned.call.as_deref())
+                    || !projection.request_placed(&planned.permission_id)
+            };
+            if user_answered.contains(&planned.permission_id) || planned_under != mode || person.is_some() || barred {
+                retry = false;
+                approvals.fell_back.insert(planned.permission_id.clone());
+            }
+            if !retry || read_now.contains(&planned.permission_id) {
+                approvals.lost.0.push(LostAnswer {
+                    planned,
+                    mode: planned_under,
+                    retry,
+                    person,
+                });
+                continue;
+            }
+            if approvals.host_sends.contains(&planned.permission_id) {
+                continue;
+            }
+            // Its own statement, guard dropped before the answer locks the projection again.
+            let pending = self
+                .projection()
+                .pending_permissions
+                .contains_key(&planned.permission_id);
+            if !pending {
+                continue;
+            }
+            match self.respond_permission_async(&planned.permission_id, planned.decision.clone()) {
+                Ok(send) => approvals.host_sends.0.push(HostSend {
+                    planned,
+                    send,
+                    mode: planned_under,
+                    resent: true,
+                }),
+                Err(error) => {
+                    eprintln!("[permission] could not {}: {}", planned.could_not, error.message);
+                    approvals.fell_back.insert(planned.permission_id);
+                }
             }
         }
     }
@@ -2743,7 +3176,17 @@ impl AgentBackend {
     /// not know, one that gives no reason): both callers are bypass, which lets everything through.
     /// Each one that names its call comes back in `Approved::prompts` with the row note a bypass
     /// tab's own answer gives it, for the caller to put on that call's row.
-    pub fn approve_pending(&mut self, ids: &[String], why: &str) -> Approved {
+    ///
+    /// **A remote tab's answers are tracked, not waited for** (`remote`, or any provider reporting a
+    /// link): each joins `approvals`' host answers on their way, as an answer the gate chose does, and
+    /// none is reported here; see [`Self::approve_pending_remote`].
+    pub fn approve_pending(
+        &mut self,
+        ids: &[String],
+        why: &str,
+        remote: bool,
+        approvals: &mut HumanApprovals,
+    ) -> Approved {
         // Its own statement, guard dropped before any answer -- the same lock-order rule the
         // collection below follows.
         if self.tripped() {
@@ -2755,6 +3198,10 @@ impl AgentBackend {
         // under a mode the CLI is not in.
         if self.projection().is_planning() {
             eprintln!("[permission] not answering {why}: the session is in plan mode");
+            return Approved::default();
+        }
+        if remote || self.link_state().is_some() {
+            self.approve_pending_remote(ids, why, approvals);
             return Approved::default();
         }
         let external = self.agent().is_external();
@@ -2804,6 +3251,76 @@ impl AgentBackend {
             }
             self.respond_permission(id, PermissionDecision::Allow)
         })
+    }
+
+    /// [`Self::approve_pending`] for a remote tab, whose answers cross the network: each `allow` goes out
+    /// without this thread waiting and joins the host answers on their way in `approvals`, with the row
+    /// note a bypass answer gives a CLI prompt. While one is on its way no page draws its request, no
+    /// card answer is taken for it and no later sweep answers it again. A later delivery reads its reply
+    /// (`settle_host_sends`): a taken one is recorded as every host answer is, its note included, and a
+    /// refused or lost one comes back as its card. One that could not be sent at all stays a card.
+    fn approve_pending_remote(&mut self, ids: &[String], why: &str, approvals: &mut HumanApprovals) {
+        let external = self.agent().is_external();
+        let planned: Vec<PlannedAnswer> = {
+            let projection = self.projection();
+            ids.iter()
+                .filter(|id| !approvals.host_sends.contains(id))
+                .filter_map(|id| {
+                    let p = projection.pending_permissions.get(id)?;
+                    let call = named_call(&p.tool_use_id);
+                    // As on a local tab: a request for a call that began while the session planned or changed
+                    // mode is a person's alone, and one that cannot be placed yet is the gate's to judge later.
+                    if projection.began_outside_executing(call.as_deref()) || !projection.request_placed(id) {
+                        return None;
+                    }
+                    let note = if external {
+                        Some(EXTERNAL_BYPASS_NOTE.to_string())
+                    } else {
+                        p.provider_prompt
+                            .as_ref()
+                            .map(|prompt| format!("{} — allowed in bypass", prompt.label()))
+                    };
+                    let prompt = call
+                        .clone()
+                        .zip(note)
+                        .map(|(tool_use_id, note)| PromptAnsweredForYou { tool_use_id, note });
+                    Some(PlannedAnswer {
+                        permission_id: id.clone(),
+                        decision: PermissionDecision::Allow,
+                        origin: if p.provider_prompt.is_some() {
+                            GateOrigin::ProviderPrompt
+                        } else {
+                            GateOrigin::GateRequest
+                        },
+                        call,
+                        tool_name: p.tool_name.clone(),
+                        consumes_approval: None,
+                        prompt,
+                        fast_path: None,
+                        by_rule: None,
+                        creates_file: None,
+                        sent: format!("allowed {why}: {}", p.tool_name),
+                        could_not: format!("allow {} {why}", p.tool_name),
+                    })
+                })
+                .collect()
+        };
+        for planned in planned {
+            // Its own statement, guard dropped before the answer locks the projection again.
+            if self.tripped() {
+                eprintln!("[permission] not answering {why}: the agent reported a policy it was not asked for");
+                break;
+            }
+            match self.respond_permission_async(&planned.permission_id, PermissionDecision::Allow) {
+                Ok(send) => approvals.host_sends.0.push(HostSend {
+                    planned,
+                    send,
+                    mode: PermissionMode::Bypass,
+                    resent: false,
+                }),
+                Err(error) => eprintln!("[permission] could not {}: {}", planned.could_not, error.message),
+            }
+        }
     }
 
     pub fn shutdown(&mut self) {
@@ -2897,6 +3414,60 @@ struct PendingAnswer {
     prompt: Option<(String, String)>,
 }
 
+/// Whether the agent resolving a request with `outcome` is it taking the host's `decision`.
+fn taken_as_planned(decision: &PermissionDecision, outcome: agent::PermissionOutcome) -> bool {
+    matches!(
+        (decision, outcome),
+        (PermissionDecision::Allow, agent::PermissionOutcome::Allowed)
+            | (PermissionDecision::Deny { .. }, agent::PermissionOutcome::Denied)
+            | (PermissionDecision::Defer, agent::PermissionOutcome::Deferred)
+    )
+}
+
+/// Records an answer the provider took: the gate answer, the id in `host_answered`, the approval it
+/// used up and each row note it carries.
+fn record_host_answer(
+    planned: PlannedAnswer,
+    host_answered: &mut BTreeSet<String>,
+    approvals: &mut HumanApprovals,
+    answered_for_you: &mut AnsweredForYou,
+) {
+    let PlannedAnswer {
+        permission_id,
+        decision,
+        origin,
+        call,
+        tool_name,
+        consumes_approval,
+        prompt,
+        fast_path,
+        by_rule,
+        creates_file,
+        sent,
+        could_not: _,
+    } = planned;
+    answered_for_you.gate_answers.push(GateAnswer {
+        origin,
+        permission_id: permission_id.clone(),
+        tool_use_id: call,
+        tool_name,
+        deferred: decision.defers(),
+    });
+    host_answered.insert(permission_id);
+    // Used up once it answered one prompt: a later prompt under this id is a card.
+    if let Some(id) = consumes_approval {
+        approvals.consume(&id);
+    }
+    answered_for_you.prompts.extend(prompt);
+    answered_for_you.by_the_fast_path.extend(fast_path);
+    answered_for_you.creates_file.extend(creates_file);
+    answered_for_you.by_rule.extend(by_rule);
+    // Said on stderr rather than silently: this is the only record anywhere of a tool call that ran
+    // without the user being asked. One short line, whose reason is a fixed label rather than anything
+    // the model wrote.
+    eprintln!("[permission] {sent}");
+}
+
 /// Answers the still-pending ids in order. Keeping the answer injectable lets tests check
 /// partial success without involving a CLI transport.
 fn approve_each(
@@ -2962,6 +3533,8 @@ struct AnswerContext<'a> {
     host_answered: &'a mut BTreeSet<String>,
     approvals: &'a mut HumanApprovals,
     answered_for_you: &'a mut AnsweredForYou,
+    /// Requests whose host answer failed to reach the agent: delivered as cards, never answered again.
+    cards_only: &'a BTreeSet<String>,
     plan: &'a mut PlanBook,
 }
 
@@ -3090,6 +3663,14 @@ pub fn root_is_a_boundary(project_root: &Path) -> bool {
     .is_none()
 }
 
+/// Remote roots have no local boundary facts; only the local arm may inspect this machine.
+pub fn gate_root_is_a_boundary(root: GateRoot<'_>) -> bool {
+    match root {
+        GateRoot::Local(path) => root_is_a_boundary(path),
+        GateRoot::RemoteWithoutFacts => false,
+    }
+}
+
 /// What `decide` judges a request by besides the request itself.
 struct Judge<'a> {
     mode: PermissionMode,
@@ -3102,7 +3683,8 @@ struct Judge<'a> {
     /// tool server's name and that one is in process; otherwise nothing here is the session's own.
     own_tools: Option<&'a BTreeSet<String>>,
     rules: &'a agent::PrefixRules,
-    project_root: &'a Path,
+    /// Carries the same root facts as the batch; the judge never substitutes a laptop path.
+    project_root: GateRoot<'a>,
     approvals: &'a HumanApprovals,
     /// Set when the request is judged as one the CLI made in plan mode (`RequestPhase::Planning`, and the plan
     /// half of an uncertain one): the plan table answers first, and every prompt of the CLI's own is a card.
@@ -3287,8 +3869,9 @@ fn plan_holds(projection: &agent::AgentSessionProjection, plan_followed: bool) -
         || (!projection.is_planning() && !plan_followed)
 }
 
-/// The answer `decide` chose for one request, with everything its row says once it is sent; only
-/// `AgentBackend::answer_and_record` sends it.
+/// One host answer to one request, with everything its row says once it is sent: one `decide` chose,
+/// which only `AgentBackend::answer_and_record` sends, or a remote tab's bypass approval, which
+/// `approve_pending_remote` sends.
 struct PlannedAnswer {
     permission_id: String,
     decision: PermissionDecision,
@@ -3371,9 +3954,10 @@ fn decide(request: GateRequest<'_>, judge: Judge<'_>) -> Option<PlannedAnswer> {
         ..
     } = request;
     let call = named_call(tool_use_id);
-    let creates_file = || {
-        call.clone()
-            .filter(|_| write_over_no_file(tool_name, input, project_root))
+    // GateRoot enters the decision here too: even bypass row notes must not inspect a laptop copy.
+    let creates_file = || match project_root {
+        GateRoot::Local(path) => call.clone().filter(|_| write_over_no_file(tool_name, input, path)),
+        GateRoot::RemoteWithoutFacts => None,
     };
     if external {
         // An external agent's requests are judged by nobody here. In Auto its own reviewer has
@@ -3458,7 +4042,7 @@ fn decide(request: GateRequest<'_>, judge: Judge<'_>) -> Option<PlannedAnswer> {
             format!("leave {tool_name} to the editor broker"),
         ));
     }
-    let mode = match planning.map(|gate| plan_verdict(tool_name, false, gate, root_is_a_boundary(project_root))) {
+    let mode = match planning.map(|gate| plan_verdict(tool_name, false, gate, gate_root_is_a_boundary(project_root))) {
         None => mode,
         Some(PlanVerdict::AsMode(mode)) => mode,
         Some(PlanVerdict::Card) => {
@@ -3487,11 +4071,11 @@ fn decide(request: GateRequest<'_>, judge: Judge<'_>) -> Option<PlannedAnswer> {
             )
         });
     }
-    if defers_to_the_cli {
+    if let (true, GateRoot::Local(path)) = (defers_to_the_cli, project_root) {
         // A saved rule still answers what it answers today, and says so on the row; it is the only
         // allow this host gives an Auto call on such a session. Asked here rather than through
         // `classify_with_rules`, whose classifier half is exactly what is not consulted.
-        let planned = match agent::rule_that_allows(tool_name, input, project_root, rules) {
+        let planned = match agent::rule_that_allows(tool_name, input, path, rules) {
             Some(rule) => PlannedAnswer {
                 by_rule: call.clone().map(|id| RuleAnsweredForYou {
                     tool_use_id: id,
@@ -3524,10 +4108,14 @@ fn decide(request: GateRequest<'_>, judge: Judge<'_>) -> Option<PlannedAnswer> {
             ..planned
         });
     }
-    let classification = if mode == PermissionMode::Manual {
-        agent::classify_in_manual(tool_name, input, project_root, rules)
-    } else {
-        agent::classify_with_rules(tool_name, input, project_root, rules)
+    let classification = match project_root {
+        GateRoot::RemoteWithoutFacts => {
+            agent::classify_without_a_boundary(tool_name, input, rules, mode == PermissionMode::Manual)
+        }
+        GateRoot::Local(path) if mode == PermissionMode::Manual => {
+            agent::classify_in_manual(tool_name, input, path, rules)
+        }
+        GateRoot::Local(path) => agent::classify_with_rules(tool_name, input, path, rules),
     };
     if classification.needs_a_human() {
         // One line per card, with the policy's own fixed reason, never anything the model wrote:
@@ -3552,7 +4140,10 @@ fn decide(request: GateRequest<'_>, judge: Judge<'_>) -> Option<PlannedAnswer> {
     // request with no tool-use id is answered as ever and noted nowhere, the same as the fast path
     // leaves it.
     let rule = (classification.reason == agent::permission_policy::REASON_ALLOWED_BY_A_PROJECT_RULE)
-        .then(|| agent::rule_that_allows(tool_name, input, project_root, rules))
+        .then(|| match project_root {
+            GateRoot::Local(path) => agent::rule_that_allows(tool_name, input, path, rules),
+            GateRoot::RemoteWithoutFacts => None,
+        })
         .flatten();
     let by_rule = call.clone().zip(rule).map(|(id, rule)| RuleAnsweredForYou {
         tool_use_id: id,
@@ -3592,6 +4183,156 @@ pub struct HumanApprovals {
     in_flight: std::collections::BTreeMap<String, InFlightApproval>,
     #[serde(skip)]
     held: BTreeSet<String>,
+    /// Answers this host chose for a remote tab, sent without waiting and recorded once the agent
+    /// took them ([`AgentBackend::take_revised_ui_delivery_after_answers`]).
+    #[serde(skip)]
+    host_sends: HostSends,
+    /// Requests whose host answer was refused, pruned on every drain to what the projection still lists:
+    /// each is the person's card from then on. No bypass sweep answers one again, or the resync that
+    /// shows it would send the same answer, meet the same refusal and show it again, as often as the
+    /// tick runs.
+    #[serde(skip)]
+    fell_back: BTreeSet<String>,
+    /// Host answers lost on their way to a remote agent (the connection broke, or no reply came in time),
+    /// pruned to pending requests. Each may be retried once; a person's card answer or another loss stops
+    /// retries while retaining the plan to identify a later resolution.
+    #[serde(skip)]
+    lost: HostSendsLost,
+    /// How the agent resolved requests whose host answer is on its way or lost, as its folded resolutions said:
+    /// a resolution can be folded before its answer's reply is read. Pruned to the answers still tracked.
+    #[serde(skip)]
+    resolved_out: ResolvedWhileOut,
+}
+
+/// The agent's resolutions of requests whose host answer is still tracked. A copy carries none, as with
+/// [`HostSends`].
+#[derive(Default)]
+pub(crate) struct ResolvedWhileOut(std::collections::BTreeMap<String, agent::PermissionOutcome>);
+
+impl Clone for ResolvedWhileOut {
+    fn clone(&self) -> Self {
+        Self::default()
+    }
+}
+
+impl PartialEq for ResolvedWhileOut {
+    fn eq(&self, _: &Self) -> bool {
+        true
+    }
+}
+
+impl std::fmt::Debug for ResolvedWhileOut {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "ResolvedWhileOut({})", self.0.len())
+    }
+}
+
+/// Host answers lost on their way, with what each was. A copy carries none, as with [`HostSends`].
+#[derive(Default)]
+pub(crate) struct HostSendsLost(Vec<LostAnswer>);
+
+/// A host answer lost on its way, and the tab's mode it was planned under: it is sent again only in that mode.
+struct LostAnswer {
+    planned: PlannedAnswer,
+    mode: PermissionMode,
+    /// A second loss and a person's card answer stop retries, but retain evidence for a later resolution.
+    retry: bool,
+    person: Option<PermissionDecision>,
+}
+
+impl HostSendsLost {
+    fn ids(&self) -> impl Iterator<Item = &String> {
+        self.0.iter().map(|lost| &lost.planned.permission_id)
+    }
+}
+
+impl Clone for HostSendsLost {
+    fn clone(&self) -> Self {
+        Self::default()
+    }
+}
+
+impl PartialEq for HostSendsLost {
+    fn eq(&self, _: &Self) -> bool {
+        true
+    }
+}
+
+impl std::fmt::Debug for HostSendsLost {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "HostSendsLost({})", self.0.len())
+    }
+}
+
+/// Host answers on their way to a remote tab's agent. A copy carries none: a send belongs to the
+/// window that sent it, which reads its reply.
+#[derive(Default)]
+pub(crate) struct HostSends(Vec<HostSend>);
+
+struct HostSend {
+    planned: PlannedAnswer,
+    send: agent::InteractionSend,
+    /// The tab's mode the answer was planned under.
+    mode: PermissionMode,
+    /// Whether this is a lost answer's second send: lost again, it is not sent a third time.
+    resent: bool,
+}
+
+impl HostSends {
+    fn contains(&self, permission_id: &str) -> bool {
+        self.0.iter().any(|sent| sent.planned.permission_id == permission_id)
+    }
+}
+
+impl HumanApprovals {
+    /// The requests this host answered for a remote tab whose replies have not been read: being
+    /// answered, so no page draws them, the bypass sweep skips them and no card answer is taken.
+    pub(crate) fn host_send_ids(&self) -> impl Iterator<Item = &String> {
+        self.host_sends.0.iter().map(|sent| &sent.planned.permission_id)
+    }
+
+    /// Whether a host answer is still on its way; the panel's tick then keeps reading until its reply
+    /// is read.
+    pub(crate) fn has_host_sends(&self) -> bool {
+        !self.host_sends.0.is_empty()
+    }
+
+    /// Whether the host's answer to `permission_id` was refused, or lost and not sent again yet, leaving
+    /// its card to the person.
+    pub(crate) fn fell_back(&self, permission_id: &str) -> bool {
+        self.fell_back.contains(permission_id) || self.lost.ids().any(|id| id == permission_id)
+    }
+
+    /// The person answers `permission_id`'s card: a lost host answer to it is never sent again, whatever
+    /// becomes of the person's answer (one that fails leaves the card the person's, not the host's).
+    pub(crate) fn person_answers(&mut self, permission_id: &str, decision: PermissionDecision) {
+        for lost in &mut self.lost.0 {
+            if lost.planned.permission_id == permission_id {
+                lost.retry = false;
+                lost.person = Some(decision.clone());
+                self.fell_back.insert(permission_id.to_string());
+            }
+        }
+    }
+}
+
+impl Clone for HostSends {
+    fn clone(&self) -> Self {
+        Self::default()
+    }
+}
+
+impl PartialEq for HostSends {
+    /// In-flight sends are no part of what the approvals say.
+    fn eq(&self, _: &Self) -> bool {
+        true
+    }
+}
+
+impl std::fmt::Debug for HostSends {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "HostSends({} in flight)", self.0.len())
+    }
 }
 
 /// An approval whose acknowledgement is pending, by its card's permission id: the turn it was sent
@@ -4065,6 +4806,20 @@ impl BackendGreeting {
         }
         let resumable = Self::claude_sessions_titled(kind, &project_dir, titles);
         Self::with_resumable(kind, project_dir, resumable)
+    }
+
+    /// A remote tab never offers this machine's session records and reads none of them.
+    pub fn for_agent_at_root(
+        kind: BackendKind,
+        agent: &AgentId,
+        project_dir: PathBuf,
+        titles: Titles<'_>,
+        root: GateRoot<'_>,
+    ) -> Self {
+        match root {
+            GateRoot::Local(_) => Self::for_agent_titled(kind, agent, project_dir, titles),
+            GateRoot::RemoteWithoutFacts => Self::with_resumable(kind, project_dir, Vec::new()),
+        }
     }
 
     /// The Claude sessions of the project at `project_dir` a `kind` backend can continue, titled,
@@ -4912,7 +5667,7 @@ mod tests {
             provider.wait_until_folded();
             match backend
                 .take_revised_ui_delivery(
-                    project_root,
+                    GateRoot::Local(project_root),
                     &agent::PrefixRules::default(),
                     mode,
                     &mut BTreeSet::new(),
@@ -5074,7 +5829,7 @@ mod tests {
         let delivered = loop {
             match backend
                 .take_revised_ui_delivery(
-                    &dir,
+                    GateRoot::Local(&dir),
                     &rules,
                     PermissionMode::Auto,
                     &mut host_answered,
@@ -5202,7 +5957,7 @@ mod tests {
             assert!(std::time::Instant::now() < deadline, "timed out: {delivered:?}");
             if let UiDelivery::Events(events) = backend
                 .take_revised_ui_delivery(
-                    &dir,
+                    GateRoot::Local(&dir),
                     &agent::PrefixRules::default(),
                     PermissionMode::Auto,
                     &mut BTreeSet::new(),
@@ -5275,7 +6030,7 @@ mod tests {
             assert!(std::time::Instant::now() < deadline, "timed out: {delivered:?}");
             if let UiDelivery::Events(events) = backend
                 .take_revised_ui_delivery(
-                    &dir,
+                    GateRoot::Local(&dir),
                     &agent::PrefixRules::default(),
                     PermissionMode::Bypass,
                     &mut BTreeSet::new(),
@@ -5340,7 +6095,7 @@ mod tests {
             assert!(std::time::Instant::now() < deadline, "timed out: {delivered:?}");
             if let UiDelivery::Events(events) = backend
                 .take_revised_ui_delivery(
-                    &dir,
+                    GateRoot::Local(&dir),
                     &agent::PrefixRules::default(),
                     PermissionMode::Bypass,
                     &mut BTreeSet::new(),
@@ -5366,7 +6121,12 @@ mod tests {
         ));
         assert!(provider.resolutions().is_empty(), "nor one in a later batch");
 
-        let answered = backend.approve_pending(&["behind-it".to_string()], "on entering bypass");
+        let answered = backend.approve_pending(
+            &["behind-it".to_string()],
+            "on entering bypass",
+            false,
+            &mut HumanApprovals::default(),
+        );
         assert_eq!(answered, Approved::default());
         assert!(provider.resolutions().is_empty(), "nor a direct approval");
         backend.shutdown();
@@ -5443,7 +6203,7 @@ mod tests {
         let delivered = loop {
             match backend
                 .take_revised_ui_delivery(
-                    &dir,
+                    GateRoot::Local(&dir),
                     &rules,
                     PermissionMode::Bypass,
                     &mut host_answered,
@@ -5519,7 +6279,7 @@ mod tests {
             provider.wait_until_folded();
             match backend
                 .take_revised_ui_delivery(
-                    &dir,
+                    GateRoot::Local(&dir),
                     &rules,
                     PermissionMode::Auto,
                     &mut host_answered,
@@ -5571,7 +6331,7 @@ mod tests {
             provider.wait_until_folded();
             match backend
                 .take_revised_ui_delivery(
-                    &dir,
+                    GateRoot::Local(&dir),
                     &rules,
                     PermissionMode::Auto,
                     &mut host_answered,
@@ -5635,7 +6395,7 @@ mod tests {
             assert!(std::time::Instant::now() < deadline, "b never resolved");
             backend
                 .take_revised_ui_delivery(
-                    &dir,
+                    GateRoot::Local(&dir),
                     &agent::PrefixRules::default(),
                     PermissionMode::Auto,
                     &mut BTreeSet::new(),
@@ -5651,7 +6411,7 @@ mod tests {
         );
 
         let ids = vec!["a".to_string(), "b".to_string(), "zzz".to_string()];
-        let answered = backend.approve_pending(&ids, "test");
+        let answered = backend.approve_pending(&ids, "test", false, &mut HumanApprovals::default());
         assert_eq!(answered.ids, vec!["a".to_string()]);
         assert_eq!(provider.resolutions(), vec![("a".to_string(), true)]);
         backend.shutdown();
@@ -5729,7 +6489,12 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
 
-        let answered = backend.approve_pending(&["still-pending".to_string()], "on entering bypass");
+        let answered = backend.approve_pending(
+            &["still-pending".to_string()],
+            "on entering bypass",
+            false,
+            &mut HumanApprovals::default(),
+        );
         assert_eq!(answered, Approved::default());
         assert!(
             provider.resolutions().is_empty(),
@@ -5820,7 +6585,14 @@ mod tests {
         for _ in 0..20 {
             provider.wait_until_folded();
             match backend
-                .take_revised_ui_delivery(dir, rules, mode, host_answered, approvals, &mut answered)
+                .take_revised_ui_delivery(
+                    GateRoot::Local(dir),
+                    rules,
+                    mode,
+                    host_answered,
+                    approvals,
+                    &mut answered,
+                )
                 .without_revisions()
             {
                 UiDelivery::Events(events) if !events.is_empty() => {
@@ -6469,7 +7241,7 @@ mod tests {
         let ids: Vec<String> = ["perm-ask", "perm-unknown", "perm-silent", "perm-plain"]
             .map(str::to_string)
             .to_vec();
-        let answered = backend.approve_pending(&ids, "test");
+        let answered = backend.approve_pending(&ids, "test", false, &mut HumanApprovals::default());
         assert_eq!(answered.ids, ids);
         assert_eq!(
             provider.resolutions(),
@@ -6511,7 +7283,7 @@ mod tests {
         let ids: Vec<String> = ["perm-ask", "perm-silent", "perm-noid", "perm-gate"]
             .map(str::to_string)
             .to_vec();
-        let answered = backend.approve_pending(&ids, "on entering bypass");
+        let answered = backend.approve_pending(&ids, "on entering bypass", false, &mut HumanApprovals::default());
         assert_eq!(answered.ids, ids);
         assert_eq!(
             answered.prompts,
@@ -6550,7 +7322,12 @@ mod tests {
             reported: "acceptEdits".into(),
             detail: "SessionReady".into(),
         }]);
-        let answered = backend.approve_pending(&["perm-1".to_string(), "perm-2".to_string()], "on entering bypass");
+        let answered = backend.approve_pending(
+            &["perm-1".to_string(), "perm-2".to_string()],
+            "on entering bypass",
+            false,
+            &mut HumanApprovals::default(),
+        );
         assert_eq!(answered.ids, vec!["perm-1".to_string()]);
         assert_eq!(provider.resolutions(), vec![("perm-1".to_string(), true)]);
         backend.shutdown();
@@ -6625,7 +7402,14 @@ mod tests {
         for _ in 0..20 {
             provider.wait_until_folded();
             match backend
-                .take_revised_ui_delivery(dir, rules, mode, host_answered, approvals, &mut answered)
+                .take_revised_ui_delivery(
+                    GateRoot::Local(dir),
+                    rules,
+                    mode,
+                    host_answered,
+                    approvals,
+                    &mut answered,
+                )
                 .without_revisions()
             {
                 UiDelivery::Events(events) if !events.is_empty() => {
@@ -7612,7 +8396,7 @@ mod external_tests {
             provider.wait_until_folded();
             match backend
                 .take_revised_ui_delivery(
-                    dir,
+                    GateRoot::Local(dir),
                     rules,
                     mode,
                     host_answered,
@@ -7743,7 +8527,7 @@ mod external_tests {
         while answered.gate_answers.is_empty() && std::time::Instant::now() < deadline {
             backend
                 .take_revised_ui_delivery(
-                    &dir,
+                    GateRoot::Local(&dir),
                     &rules,
                     PermissionMode::Bypass,
                     &mut host_answered,
@@ -7776,7 +8560,12 @@ mod external_tests {
             &mut host_answered,
         );
         assert!(carded(&delivered, "a1"), "{delivered:?}");
-        let approved = backend.approve_pending(&["a1".to_string()], "on entering bypass");
+        let approved = backend.approve_pending(
+            &["a1".to_string()],
+            "on entering bypass",
+            false,
+            &mut HumanApprovals::default(),
+        );
         assert_eq!(approved.ids, vec!["a1".to_string()]);
         assert_eq!(
             approved.prompts,
@@ -8430,7 +9219,7 @@ mod question_tests {
             assert!(Instant::now() < deadline, "timed out waiting for {what}");
             if let UiDelivery::Events(events) = backend
                 .take_revised_ui_delivery(
-                    dir,
+                    GateRoot::Local(dir),
                     &agent::PrefixRules::default(),
                     mode,
                     host_answered,
@@ -8559,6 +9348,75 @@ mod question_tests {
         }
     }
 
+    /// A remote tab's host answer goes out without the pump waiting for its reply. It is recorded once
+    /// the agent took it, and a refused or lost one comes back as its card, never answered again.
+    #[test]
+    fn a_remote_tabs_host_answer_does_not_wait_for_its_reply() {
+        let dir = workspace("remote-host-answer");
+        let (provider, mut backend) = backend_on(RecordingProvider::default(), &dir);
+        provider.hold_permission_replies();
+        let mut host_answered = BTreeSet::new();
+        let mut approvals = HumanApprovals::default();
+        let mut take = |backend: &mut AgentBackend, host_answered: &mut BTreeSet<String>| {
+            backend.take_revised_ui_delivery(
+                GateRoot::RemoteWithoutFacts,
+                &agent::PrefixRules::default(),
+                PermissionMode::Bypass,
+                host_answered,
+                &mut approvals,
+                &mut AnsweredForYou::default(),
+            )
+        };
+        let holds_card = |delivery: &agent::RevisedDelivery, id: &str| {
+            match delivery {
+            agent::RevisedDelivery::Events(events) => events.iter().any(|(_, event)| {
+                matches!(event, AgentDomainEvent::PermissionRequested { permission_id, .. } if permission_id == id)
+            }),
+            _ => false,
+        }
+        };
+        let replies: [(&str, agent::InteractionReply); 2] = [
+            ("p1", Ok(None)),
+            ("p2", Err(agent::ProviderError::Transport("the link went away".into()))),
+        ];
+        for (id, reply) in replies {
+            let refused = reply.is_err();
+            provider.queue(card(id));
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while provider.held_permissions() == 0 {
+                assert!(Instant::now() < deadline, "{id}: the answer never went out");
+                let delivery = take(&mut backend, &mut host_answered);
+                assert!(!holds_card(&delivery, id), "{id}: no card while the answer is out");
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            assert!(!host_answered.contains(id), "{id}: not recorded before its reply");
+            let delivery = take(&mut backend, &mut host_answered);
+            assert!(
+                !holds_card(&delivery, id),
+                "{id}: nor answered twice nor carded meanwhile"
+            );
+            assert_eq!(provider.held_permissions(), 1, "{id}: sent once");
+            provider.reply_to_held_permissions(reply);
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                assert!(Instant::now() < deadline, "{id}: the reply was never read");
+                let delivery = take(&mut backend, &mut host_answered);
+                if refused {
+                    if holds_card(&delivery, id) || matches!(delivery, agent::RevisedDelivery::Resync { .. }) {
+                        assert!(!host_answered.contains(id), "{id}: a refused answer is not recorded");
+                        assert!(backend.projection().pending_permissions.contains_key(id));
+                        break;
+                    }
+                } else if host_answered.contains(id) {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            assert_eq!(provider.held_permissions(), 0, "{id}: not sent again");
+        }
+        backend.shutdown();
+    }
+
     /// Entering Bypass and the bypass resync answer through `approve_pending`; handed a question's id
     /// among the cards', it answers the cards only.
     #[test]
@@ -8576,7 +9434,12 @@ mod question_tests {
                 holds_question(delivered, "q1") && backend.projection().pending_permissions.contains_key("c1")
             },
         );
-        let answered = backend.approve_pending(&["q1".to_string(), "c1".to_string()], "on entering bypass");
+        let answered = backend.approve_pending(
+            &["q1".to_string(), "c1".to_string()],
+            "on entering bypass",
+            false,
+            &mut HumanApprovals::default(),
+        );
         assert_eq!(answered.ids, vec!["c1".to_string()]);
         assert_eq!(provider.resolutions(), vec![("c1".to_string(), true)]);
         assert!(provider.interactions().is_empty());
@@ -8763,6 +9626,303 @@ mod eitri_gate_tests {
     const OURS: &str = "mcp__eitri__open_file";
     const LINE: &str = "a server named eitri that is not Eitri's is loaded; its tools get no special treatment";
 
+    #[test]
+    fn remote_tab_gate_path_reads_no_file() {
+        use crate::source_scan::{self, function_in};
+        let policy = vec![source_scan::read_required("agent/src/permission_policy.rs")];
+        for name in ["classify_without_a_boundary", "classify_by_name", "ask", "allow"] {
+            let (_, body) = function_in(&policy, name);
+            for forbidden in ["std::fs", "Identity::current", "resolve_in_root", "write_over_no_file"] {
+                assert!(
+                    !body.contains(forbidden),
+                    "{name} reads local facts through {forbidden}"
+                );
+            }
+            assert_eq!(
+                source_scan::calls(&body, "boundary"),
+                0,
+                "{name} calls the local boundary check"
+            );
+            // Every callee is listed, so a new helper cannot hide a disk read outside the scanned body.
+            let allowed = [
+                "is_object",
+                "Some",
+                "ask",
+                "allow",
+                "contains",
+                "matches",
+                "classify_by_name",
+                "unwrap_or_else",
+                "reason",
+            ];
+            let bytes = body.as_bytes();
+            for (at, _) in body.char_indices().filter(|(_, ch)| *ch == '(') {
+                let mut end = at;
+                while end > 0 && bytes[end - 1].is_ascii_whitespace() {
+                    end -= 1;
+                }
+                let mut start = end;
+                while start > 0 && (bytes[start - 1].is_ascii_alphanumeric() || bytes[start - 1] == b'_') {
+                    start -= 1;
+                }
+                if start != end {
+                    let callee = &body[start..end];
+                    assert!(allowed.contains(&callee), "{name} calls unscanned {callee}");
+                }
+            }
+        }
+        let backend = vec![source_scan::read_required("core/src/agent_backend.rs")];
+        let compact = |text: &str| {
+            text.chars()
+                .filter(|ch| !ch.is_whitespace() && ![',', '{', '}'].contains(ch))
+                .collect::<String>()
+        };
+        for (name, remote_arm) in [
+            ("gate_root_is_a_boundary", "GateRoot::RemoteWithoutFacts=>false,"),
+            ("decide", "GateRoot::RemoteWithoutFacts=>None,"),
+            ("decide", "GateRoot::RemoteWithoutFacts=>agent::classify_without_a_boundary(tool_name,input,rules,mode==PermissionMode::Manual),"),
+        ] {
+            let (_, body) = function_in(&backend, name);
+            assert!(compact(&body).contains(&compact(remote_arm)), "{name}: remote branch must remain free of local facts");
+        }
+        // Blank local match arms, then inspect everything a remote request can reach in the common body.
+        fn without_local_arms(body: &str) -> (String, usize) {
+            let mut spans = Vec::new();
+            for (at, _) in body.match_indices("GateRoot::Local(") {
+                let after_pattern = at + body[at..].find(')').unwrap() + 1;
+                let tail = body[after_pattern..].trim_start();
+                if !tail.starts_with("=>") && !tail.starts_with("if ") {
+                    continue;
+                }
+                let expression = after_pattern + body[after_pattern..].find("=>").unwrap() + 2;
+                let expression = expression + body[expression..].len() - body[expression..].trim_start().len();
+                if body[expression..].starts_with('{') {
+                    spans.push(at..expression + source_scan::braced(body, expression).len());
+                    continue;
+                }
+                let mut depth = 0;
+                let end = body[expression..]
+                    .char_indices()
+                    .find_map(|(offset, ch)| {
+                        match ch {
+                            '(' | '[' | '{' => depth += 1,
+                            ')' | ']' | '}' => depth -= 1,
+                            ',' if depth == 0 => return Some(expression + offset),
+                            _ => {}
+                        }
+                        None
+                    })
+                    .unwrap_or(body.len());
+                spans.push(at..end);
+            }
+            let count = spans.len();
+            let mut common = body.to_string();
+            for span in spans.into_iter().rev() {
+                common.replace_range(span.clone(), &" ".repeat(span.len()));
+            }
+            (common, count)
+        }
+        for (name, expected_local_arms) in [("decide", 4), ("gate_root_is_a_boundary", 1)] {
+            let (_, body) = function_in(&backend, name);
+            let (common, removed) = without_local_arms(&body);
+            assert_eq!(removed, expected_local_arms, "{name}: local arms must remain explicit");
+            for forbidden in ["std::fs", "Identity::current"] {
+                assert!(
+                    !common.contains(forbidden),
+                    "{name} reads {forbidden} outside a local arm"
+                );
+            }
+            for forbidden in [
+                "boundary",
+                "resolve_in_root",
+                "write_over_no_file",
+                "root_is_a_boundary",
+            ] {
+                assert_eq!(
+                    source_scan::calls(&common, forbidden),
+                    0,
+                    "{name} calls {forbidden} outside a local arm"
+                );
+            }
+        }
+        let (_, decide) = function_in(&backend, "decide");
+        assert_eq!(source_scan::calls(&decide, "write_over_no_file"), 1);
+        assert!(compact(&decide).contains(&compact(
+            "GateRoot::Local(path)=>call.clone().filter(|_|write_over_no_file(tool_name,input,path))"
+        )));
+        let tabs = vec![source_scan::read_required("core/src/tab_set.rs")];
+        let (_, events) = function_in(&tabs, "pump_arm_events");
+        assert!(compact(&events).contains(&compact("if !live.remote { live_edits::collect(live, &events); }")));
+        assert!(compact(&events).contains(&compact(
+            "creates_file: if live.remote { Default::default() } else { note_new_files(&mut live.notes.creates_file, &events, project_root) }"
+        )));
+        assert_eq!(source_scan::calls(&events, "note_new_files"), 1);
+        assert_eq!(source_scan::calls(&events, "collect"), 1);
+        let (_, offers) = function_in(&tabs, "refresh_offers");
+        let guard = offers
+            .find("if tab.is_remote()")
+            .expect("remote tabs must skip rule offers");
+        let open = guard + offers[guard..].find('{').unwrap();
+        let guarded = source_scan::braced(&offers, open);
+        assert!(guarded.contains("return had;"));
+        assert!(guard + guarded.len() < offers.find("permission_rules::offer").unwrap());
+        let (_, answer) = function_in(&backend, "answer_what_needs_no_human");
+        assert!(answer.contains("gate_root_is_a_boundary(project_root)"));
+        for forbidden in ["std::fs", "Identity::current", "resolve_in_root", "write_over_no_file"] {
+            assert!(
+                !answer.contains(forbidden),
+                "answer path reads local facts through {forbidden}"
+            );
+        }
+    }
+
+    fn remote_calls() -> Vec<(&'static str, serde_json::Value)> {
+        use serde_json::json;
+        vec![
+            ("Read", json!({"file_path":"main.rs"})),
+            ("Read", json!({"file_path":"/srv/project/main.rs"})),
+            (
+                "Edit",
+                json!({"file_path":"main.rs", "old_string":"a", "new_string":"b"}),
+            ),
+            ("Write", json!({"file_path":"/srv/project/new.rs", "content":"x"})),
+            ("Write", json!({"file_path":"new.rs", "content":"x"})),
+            (
+                "Edit",
+                json!({"file_path":"/srv/project/main.rs", "old_string":"a", "new_string":"b"}),
+            ),
+            ("NotebookEdit", json!({"notebook_path":"main.ipynb"})),
+            ("Grep", json!({"path":".", "pattern":"x"})),
+            ("Grep", json!({"path":"/srv/project", "pattern":"x"})),
+            ("Glob", json!({"pattern":"**/*.rs"})),
+            ("Glob", json!({"path":"/srv/project", "pattern":"*.rs"})),
+            ("Bash", json!({"command":"cat main.rs"})),
+            ("Bash", json!({"command":"cat /srv/project/main.rs"})),
+            ("Bash", json!({"command":"git -C . log"})),
+            ("Bash", json!({"command":"git -C /srv/project log"})),
+        ]
+    }
+
+    fn at_root(
+        root: GateRoot<'_>,
+        mode: PermissionMode,
+        tool: &str,
+        input: &serde_json::Value,
+    ) -> Option<PlannedAnswer> {
+        let rules = agent::PrefixRules::default()
+            .with(agent::PrefixRule::parse("Bash(cat *)").unwrap())
+            .with(agent::PrefixRule::parse("Bash(git *)").unwrap());
+        decide(
+            GateRequest {
+                permission_id: "p1",
+                tool_use_id: &Some("tu-1".into()),
+                tool_name: tool,
+                input,
+                provider_prompt: None,
+            },
+            Judge {
+                mode,
+                external: false,
+                defers_to_the_cli: false,
+                own_tools: None,
+                rules: &rules,
+                project_root: root,
+                approvals: &HumanApprovals::default(),
+                planning: None,
+            },
+        )
+    }
+
+    #[test]
+    fn remote_tab_cards_every_path_judged_call_in_manual_and_auto() {
+        for mode in [PermissionMode::Manual, PermissionMode::Auto] {
+            for (tool, input) in remote_calls() {
+                assert!(
+                    at_root(GateRoot::RemoteWithoutFacts, mode, tool, &input).is_none(),
+                    "{mode:?} {tool} {input}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn remote_tab_bypass_allows_as_at_a_local_no_boundary_root() {
+        for (tool, input) in remote_calls() {
+            let remote = at_root(GateRoot::RemoteWithoutFacts, PermissionMode::Bypass, tool, &input).unwrap();
+            let local = at_root(GateRoot::Local(Path::new("/")), PermissionMode::Bypass, tool, &input).unwrap();
+            assert_eq!(remote.decision, local.decision);
+            assert!(remote.creates_file.is_none(), "no laptop existence note even in bypass");
+        }
+    }
+
+    #[test]
+    fn remote_tab_name_allowed_tools_as_at_a_local_no_boundary_root() {
+        for tool in agent::permission_policy::NEVER_ASK_TOOLS {
+            for mode in [PermissionMode::Manual, PermissionMode::Auto, PermissionMode::Bypass] {
+                let input = serde_json::json!({});
+                let remote = at_root(GateRoot::RemoteWithoutFacts, mode, tool, &input).unwrap();
+                let local = at_root(GateRoot::Local(Path::new("/")), mode, tool, &input).unwrap();
+                assert_eq!(remote.decision, local.decision);
+            }
+        }
+    }
+
+    #[test]
+    fn remote_tab_never_defers_to_the_cli_classifier() {
+        use crate::agent_bridge::SessionModeChoice;
+        use crate::remote_project::TabOrigin;
+        let dir = workspace("remote-tab-gate");
+        assert!(root_is_a_boundary(&dir));
+        let mut set = TabSet::new(BackendKind::Sidecar, SessionModeChoice::Auto);
+        set.set_project_origin(TabOrigin::Remote {
+            host: "example-host".into(),
+            host_key_sha256: "SHA256:example".into(),
+            root: "/srv/project".into(),
+        })
+        .unwrap();
+        let tab = set.active();
+        let (provider, backend) = session(RecordingProvider::client_tooling_cli_auto(), &dir, false);
+        set.get_mut(tab).unwrap().set_backend(TabBackend::Live(backend));
+        provider.queue(cli_runs_auto());
+        provider.queue(AgentDomainEvent::PermissionRequested {
+            permission_id: "remote-read".into(),
+            tool_use_id: Some("tu-read".into()),
+            tool_name: "Read".into(),
+            input: serde_json::json!({"file_path": dir.join("main.rs")}),
+            provider_prompt: None,
+        });
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            set.pump(&dir, true);
+            if set
+                .get(tab)
+                .unwrap()
+                .live()
+                .unwrap()
+                .projection()
+                .pending_permissions
+                .contains_key("remote-read")
+            {
+                break;
+            }
+            assert!(Instant::now() < deadline);
+            std::thread::yield_now();
+        }
+        set.pump(&dir, true);
+        assert!(provider.decisions().is_empty());
+        assert!(set.get(tab).unwrap().gate_answers().is_empty());
+        assert!(!gate_root_is_a_boundary(set.get(tab).unwrap().gate_root(&dir)));
+        close(&mut set, tab);
+    }
+
+    #[test]
+    fn remote_tab_gate_ignores_the_laptop_disk() {
+        let dir = workspace("remote-tab-laptop");
+        let input = serde_json::json!({"file_path":dir.join("main.rs")});
+        assert!(at_root(GateRoot::Local(&dir), PermissionMode::Auto, "Read", &input).is_some());
+        assert!(at_root(GateRoot::RemoteWithoutFacts, PermissionMode::Auto, "Read", &input).is_none());
+    }
+
     fn workspace(label: &str) -> PathBuf {
         agent::state_dirs::redirect_state_to_a_test_root();
         let dir = agent::state_dirs::test_workspace_dir(label);
@@ -8859,7 +10019,7 @@ mod eitri_gate_tests {
         loop {
             let delivery = backend
                 .take_revised_ui_delivery(
-                    dir,
+                    GateRoot::Local(dir),
                     &rules,
                     mode,
                     &mut BTreeSet::new(),
@@ -8952,7 +10112,7 @@ mod eitri_gate_tests {
                 defers_to_the_cli: false,
                 own_tools: own.then_some(&declared),
                 rules: &agent::PrefixRules::default(),
-                project_root: Path::new("/nonexistent"),
+                project_root: GateRoot::Local(Path::new("/nonexistent")),
                 approvals: &HumanApprovals::default(),
                 planning: None,
             },
@@ -9278,7 +10438,7 @@ mod eitri_gate_tests {
         while !backend.cli_left_auto() {
             assert!(Instant::now() < deadline, "the report was never folded");
             let _ = backend.take_revised_ui_delivery(
-                &dir,
+                GateRoot::Local(&dir),
                 &agent::PrefixRules::default(),
                 PermissionMode::Auto,
                 &mut BTreeSet::new(),

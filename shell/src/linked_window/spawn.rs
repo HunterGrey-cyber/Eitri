@@ -583,6 +583,10 @@ impl Pair {
         self.modules.borrow_mut().keep_tabs(tabs);
     }
 
+    pub fn rekey_group_tabs(&self, dir: PathBuf, old: &str, new: &str) -> Result<(), &'static str> {
+        self.modules.borrow_mut().rekey_tabs(dir, old, new)
+    }
+
     /// Window 1 is closing: the receiver reports once the group's tabs file holds what it was last handed, which comes
     /// after the last tabs the chat windows were asked for.
     pub fn finish_group_tabs(&self) -> Option<std::sync::mpsc::Receiver<()>> {

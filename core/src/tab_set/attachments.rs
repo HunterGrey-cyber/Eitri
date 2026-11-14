@@ -445,7 +445,8 @@ impl TabSet {
         self.attach.why_not = Some(why);
     }
 
-    /// Whether `id`'s composer may take images now: `Err` says why not, in the composer's words. A live session
+    /// Whether `id`'s composer may take images now: `Err` says why not, in the composer's words. A remote tab
+    /// takes none. A live session
     /// takes them when its provider does (`AgentBackend::why_no_images`); a Claude tab that has not started may
     /// import them for its first message, which its session refuses with the same words if it cannot carry them.
     pub fn image_input(&self, id: TabId) -> Result<(), String> {
@@ -457,6 +458,11 @@ impl TabSet {
                 .unwrap_or_else(|| "this window cannot take images".to_string()));
         }
         let tab = self.get(id).ok_or_else(|| format!("no tab {}", id.0))?;
+        // A remote tab's turns leave this thread as text alone (`TabSet::spawn_desk_send`): its composer takes no
+        // images rather than sending a message without them.
+        if self.sends_off_thread(id) {
+            return Err(super::desk_sends::REMOTE_TAB_TAKES_NO_IMAGES.to_string());
+        }
         match &tab.backend {
             TabBackend::Live(backend) => backend.why_no_images().map_or(Ok(()), Err),
             _ if tab.agent.is_external() => Err(format!(

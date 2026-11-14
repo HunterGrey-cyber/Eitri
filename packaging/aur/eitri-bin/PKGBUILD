@@ -1,7 +1,7 @@
 # Maintainer: Hunter Grey <71165939+HunterGrey-cyber@users.noreply.github.com>
 #
-# eitri-bin -- the prebuilt release tarball's five binaries (shell,
-# eitri-tmux-shim, eitri-claude-handoff, eitri-run-guard, eitri-editor-bridge), plus a Claude Agent SDK sidecar built here, on the
+# eitri-bin -- the prebuilt release tarball's six binaries (shell,
+# eitri-tmux-shim, eitri-claude-handoff, eitri-run-guard, eitri-editor-bridge, eitri-server), plus a Claude Agent SDK sidecar built here, on the
 # user's own machine, at install time.
 # Building it is not redistribution by this project; see the licence note below.
 #
@@ -42,8 +42,10 @@ depends=('gtk4' 'webkitgtk-6.0' 'glibc' 'gcc-libs')
 # pass corrupts the sidecar (a Node SEA executable, whose fuse/injection mechanism does not
 # survive its ELF sections being restructured: "Loadable section \"\" outside of ELF segments",
 # "Can't find string offset for section name '.note.100'" from binutils, then the packaged binary
-# fails with "Exec format error"). Every other binary here is prebuilt and already stripped by
-# release.sh, so disabling makepkg's own pass costs nothing on them either.
+# fails with "Exec format error"). The prebuilt eitri-server needs it too: the window carries the
+# helper's SHA-256, so a stripped helper no longer matches it and is refused before it is installed on
+# a server. Every other binary here is prebuilt and already stripped by release.sh, so disabling
+# makepkg's own pass costs nothing on them either.
 options=('!strip')
 optdepends=(
 	'neovim: the editor (any nvim >= 0.11 on PATH)'
@@ -107,6 +109,7 @@ package() {
 	install -m0755 "$top/lib/eitri/eitri-tmux-shim" "$pkgdir/usr/lib/eitri/eitri-tmux-shim"
 	install -m0755 "$top/lib/eitri/eitri-run-guard" "$pkgdir/usr/lib/eitri/eitri-run-guard"
 	install -m0755 "$top/lib/eitri/eitri-editor-bridge" "$pkgdir/usr/lib/eitri/eitri-editor-bridge"
+	install -m0755 "$top/lib/eitri/eitri-server" "$pkgdir/usr/lib/eitri/eitri-server"
 	install -m0755 "$top/lib/eitri/eitri-claude-handoff" "$pkgdir/usr/lib/eitri/eitri-claude-handoff"
 	install -m0755 "$top/lib/eitri/eitri-setup" "$pkgdir/usr/lib/eitri/eitri-setup"
 	install -m0755 "$srcdir/sidecar/verdandi-claude-sidecar" "$pkgdir/usr/lib/eitri/verdandi-claude-sidecar"

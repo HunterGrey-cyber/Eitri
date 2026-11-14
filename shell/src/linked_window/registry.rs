@@ -164,6 +164,13 @@ impl ModuleWindows {
         self.tabs = Some(tabs);
     }
 
+    pub fn rekey_tabs(&mut self, dir: std::path::PathBuf, old: &str, new: &str) -> Result<(), &'static str> {
+        if let Some(tabs) = &mut self.tabs {
+            tabs.rekey_remote(dir, old, new)?;
+        }
+        Ok(())
+    }
+
     /// The window `name` reported its tabs.
     pub fn tabs_reported(&mut self, name: &WindowName, tabs: &serde_json::Value) {
         if let Some(group) = &mut self.tabs {

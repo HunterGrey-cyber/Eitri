@@ -75,6 +75,7 @@ pub mod project_boundary;
 pub mod provider_move;
 pub mod providers;
 pub mod read_deny;
+pub mod remote_client;
 pub mod save_health;
 pub mod setting_sources;
 #[cfg(feature = "legacy-backend")]
@@ -88,7 +89,9 @@ pub mod testkit;
 pub mod transcript;
 
 pub use account::{AccountError, ClaudeAccount};
-pub use conversation::{conversation_id_for_cwd, AgentConversation, ConversationError, PromptOrigin};
+pub use conversation::{
+    conversation_id_for_cwd, AgentConversation, ConversationError, DenyAndStopOutcome, PromptOrigin,
+};
 #[cfg(feature = "legacy-backend")]
 pub use event::{AgentEvent, PermissionSource};
 pub use external::{
@@ -100,8 +103,8 @@ pub use move_seed::{
     ChatMoveCore, ConversationHandoff, HandoffRefused, MoveSeed, MovedProvider, PendingName, SeedRefused,
 };
 pub use permission_policy::{
-    classify_in_manual, classify_permission_request, classify_with_rules, judge_edit_path, judge_project_path,
-    rule_that_allows, Classification, OutsideReason, PathJudgement, PermissionVerdict,
+    classify_in_manual, classify_permission_request, classify_with_rules, classify_without_a_boundary, judge_edit_path,
+    judge_project_path, rule_that_allows, Classification, GateRoot, OutsideReason, PathJudgement, PermissionVerdict,
 };
 pub use permission_rules::{PrefixRule, PrefixRules, RuleRefusal};
 pub use persistence::{
@@ -150,9 +153,10 @@ pub use provider::{
     ClientToolDecl, ClientToolSet, CloseSessionRequest, CreateSessionRequest, EffortChoice, EventSignal,
     InteractionReply, InteractionResolution, InteractionSend, InteractionState, InterruptTurnRequest, ModelList,
     ModelOption, PermissionDecision, PlanningReply, PlanningSend, ProviderCapabilities, ProviderError,
-    ProviderErrorCode, ProviderInfo, QuestionAnswer, QuestionDeclineKind, RemoteLinkState, ReplySend,
+    ProviderErrorCode, ProviderInfo, QuestionAnswer, QuestionDeclineKind, RemoteEnding, RemoteLinkState, ReplySend,
     ResolveInteractionRequest, ResolvePermissionRequest, ResumeSessionRequest, SendTurnRequest, SetPlanningRequest,
     SteerTurnRequest, StreamingPreference, TaskOutput, TaskReply, TurnContentLimits, TurnImage, TurnStamp,
+    WaitingRequest,
 };
 /// Images on a Claude turn: the sidecar's reason words for a refusal and the composer's words for them.
 pub use providers::claude_sidecar::turn_content;
@@ -160,7 +164,7 @@ pub use providers::claude_sidecar::{
     apply_sidecar_env, claude_cli_missing_here, claude_problem_here, failure_names_missing_cli, locate_claude_here,
     locate_claude_in, sidecar_availability, sidecar_env_policy, sidecar_for_upload, sidecar_missing_message,
     sidecar_origin, user_sidecar_path, BackpressureStats, ClaudeCli, ClaudeProblem, ClaudeSidecarProvider,
-    SidecarAvailability, SidecarEnv, UploadSidecar, UploadSidecarOrigin, BUNDLED_SIDECAR_REVISION,
+    HelperHandoff, SidecarAvailability, SidecarEnv, UploadSidecar, UploadSidecarOrigin, BUNDLED_SIDECAR_REVISION,
     BUNDLED_SIDECAR_VERSION, CLAUDE_INSTALL_URL, CLAUDE_LOOKED_IN, CLAUDE_REFUSED_NOTE, CLIENT_IMPLEMENTS_RESUME,
     CLIENT_PROTOCOL_MAJOR, CLI_MISSING_FAILURE_MARKER, NO_SIDECAR_HINT, REFUSED_CLAUDE_NOTE, REQUIRED_CAPABILITIES,
     SIDECAR_EXIT_GRACE, UNARY_RPC_TIMEOUT, UNTESTED_CLAUDE_NOTE,

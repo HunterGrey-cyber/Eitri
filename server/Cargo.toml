@@ -9,7 +9,7 @@ agent = { path = "../agent" }
 eitri-core = { path = "../core" }
 eitri-server-proto = { path = "../server-proto" }
 # Every crate below is already in the workspace lock through `agent` or `tonic`; the helper adds no registry package.
-claude-runtime-protocol = { git = "https://github.com/HunterGrey-cyber/verdandi.git", rev = "842d54e6c4cccf4aa71e8ded54c020c0253ad78e" }
+claude-runtime-protocol = { workspace = true }
 tonic = "0.14"
 tonic-prost = "0.14"
 prost = "0.14"

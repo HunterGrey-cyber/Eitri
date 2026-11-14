@@ -109,9 +109,10 @@ looks unrelated, run `cargo fmt --all` again rather than hand-editing around it.
 ## The Verdandi dependency
 
 Eitri's agent talks to Claude Code through a sidecar, a Node service from the sibling project
-[Verdandi](https://github.com/HunterGrey-cyber/verdandi). `agent` depends on Verdandi's
-`claude-runtime-protocol` crate, pinned by revision in `agent/Cargo.toml` and fetched from GitHub by
-Cargo — *building* Eitri never needs a Verdandi checkout. *Running* the sidecar backend is a
+[Verdandi](https://github.com/HunterGrey-cyber/verdandi). `agent` and `server` depend on Verdandi's
+`claude-runtime-protocol` crate, pinned once by revision in the root `Cargo.toml`'s
+`[workspace.dependencies]` and fetched from GitHub by Cargo — *building* Eitri never needs a Verdandi
+checkout. *Running* the sidecar backend is a
 separate question with its own search order:
 
 To *run* the sidecar backend, Eitri needs the sidecar itself, found in this order: first

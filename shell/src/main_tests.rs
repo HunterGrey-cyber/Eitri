@@ -884,3 +884,48 @@ fn build_ui_refuses_nothing_itself() {
     let drawn = code.matches(concat!("show_flash", "(")).count();
     assert_eq!(flashes, drawn, "the only flash in build_ui is the chrome model's own");
 }
+
+/// ssh runs `eitri host known-hosts-probe` on every connection it makes for a remote project: `main` dispatches it
+/// first, before the launcher's environment, the display, any subcommand, any thread or GTK, and it records the key
+/// it is given and prints nothing. Any other command line is not `host`'s.
+#[test]
+fn known_hosts_probe_is_dispatched_before_gtk() {
+    // Split literals, so this test's own text is not counted.
+    let src = include_str!("main.rs");
+    let start = src.find(concat!("fn main() -> glib", "::ExitCode {")).expect("main");
+    let end = start
+        + src[start..]
+            .find(concat!("fn build_", "application"))
+            .expect("build_application");
+    let body = &src[start..end];
+    let at = |needle: &str| body.find(needle).unwrap_or_else(|| panic!("{needle} in main"));
+    let order = [
+        at(concat!("host_command::", "run(")),
+        at(concat!("launch_env::", "take(")),
+        at(concat!("display_env::", "resolve_wayland_display(")),
+        at(concat!("start::", "SUBCOMMAND")),
+        at(concat!("build_", "application(kind)")),
+    ];
+    assert!(order.windows(2).all(|w| w[0] < w[1]), "{order:?}");
+
+    let scratch = eitri_core::plugin::test_support::Scratch::new("kh-probe");
+    let record = scratch.0.join("kh-0123456789abcdef");
+    let args = [
+        "host",
+        "known-hosts-probe",
+        record.to_str().unwrap(),
+        "example-host",
+        "ssh-ed25519",
+        "SHA256:abc",
+    ]
+    .map(OsString::from);
+    assert_eq!(host_command::run(args), Some(glib::ExitCode::SUCCESS));
+    let recorded: Vec<String> = serde_json::from_str(&std::fs::read_to_string(&record).unwrap()).unwrap();
+    assert_eq!(recorded, ["example-host", "ssh-ed25519", "SHA256:abc"]);
+    assert_eq!(
+        host_command::run(["host", "known-hosts-probe"].map(OsString::from)),
+        Some(glib::ExitCode::from(1))
+    );
+    assert_eq!(host_command::run(["open"].map(OsString::from)), None);
+    assert_eq!(host_command::run(Vec::<OsString>::new()), None);
+}

@@ -80,6 +80,7 @@
           "cwd": null,
           "history": null,
           "lastTurnEnding": null,
+          "linkState": null,
           "model": null,
           "pendingPermissions": [],
           "provider": null,
@@ -170,6 +171,7 @@
           "cwd": null,
           "history": null,
           "lastTurnEnding": null,
+          "linkState": null,
           "model": null,
           "pendingPermissions": [],
           "provider": null,
@@ -267,6 +269,7 @@
           "cwd": null,
           "history": null,
           "lastTurnEnding": null,
+          "linkState": null,
           "model": null,
           "pendingPermissions": [],
           "provider": null,
@@ -384,6 +387,7 @@
           "cwd": null,
           "history": null,
           "lastTurnEnding": null,
+          "linkState": null,
           "model": null,
           "pendingPermissions": [],
           "provider": null,
@@ -459,6 +463,7 @@
           "cwd": null,
           "history": null,
           "lastTurnEnding": null,
+          "linkState": null,
           "model": null,
           "pendingPermissions": [],
           "provider": null,
@@ -561,6 +566,7 @@
           "cwd": null,
           "history": null,
           "lastTurnEnding": null,
+          "linkState": null,
           "model": null,
           "notices": [
             {
@@ -658,6 +664,7 @@
           "fallbackModel": "small",
           "history": null,
           "lastTurnEnding": null,
+          "linkState": null,
           "model": null,
           "notices": [
             {
@@ -747,6 +754,7 @@
           "cwd": null,
           "history": null,
           "lastTurnEnding": null,
+          "linkState": null,
           "model": null,
           "notices": [
             {
@@ -833,6 +841,7 @@
           "cwd": null,
           "history": null,
           "lastTurnEnding": null,
+          "linkState": null,
           "model": null,
           "pendingPermissions": [],
           "provider": null,
@@ -907,6 +916,7 @@
           "cwd": null,
           "history": null,
           "lastTurnEnding": null,
+          "linkState": null,
           "model": null,
           "notices": [
             {
@@ -993,6 +1003,7 @@
           "cwd": null,
           "history": null,
           "lastTurnEnding": null,
+          "linkState": null,
           "model": null,
           "notices": [
             {
@@ -1079,6 +1090,7 @@
           "cwd": null,
           "history": null,
           "lastTurnEnding": null,
+          "linkState": null,
           "model": null,
           "notices": [
             {
@@ -1171,6 +1183,7 @@
           "cwd": null,
           "history": null,
           "lastTurnEnding": null,
+          "linkState": null,
           "model": null,
           "notices": [
             {
@@ -1266,6 +1279,7 @@
           "cwd": null,
           "history": null,
           "lastTurnEnding": null,
+          "linkState": null,
           "model": null,
           "pendingPermissions": [],
           "provider": null,
@@ -1346,6 +1360,7 @@
           "cwd": null,
           "history": null,
           "lastTurnEnding": null,
+          "linkState": null,
           "model": null,
           "notices": [
             {
@@ -1441,6 +1456,7 @@
           "cwd": null,
           "history": null,
           "lastTurnEnding": null,
+          "linkState": null,
           "model": null,
           "pendingPermissions": [],
           "provider": null,
@@ -1521,6 +1537,7 @@
           "cwd": null,
           "history": null,
           "lastTurnEnding": null,
+          "linkState": null,
           "model": null,
           "pendingPermissions": [],
           "provider": null,
@@ -1608,6 +1625,7 @@
           "cwd": null,
           "history": null,
           "lastTurnEnding": null,
+          "linkState": null,
           "model": null,
           "notices": [
             {
@@ -1722,6 +1740,7 @@
           "cwd": null,
           "history": null,
           "lastTurnEnding": null,
+          "linkState": null,
           "model": null,
           "pendingPermissions": [],
           "provider": null,
@@ -1827,6 +1846,7 @@
           "cwd": null,
           "history": null,
           "lastTurnEnding": "limit_reached",
+          "linkState": null,
           "model": null,
           "pendingPermissions": [],
           "provider": null,
@@ -1911,6 +1931,7 @@
           "cwd": null,
           "history": null,
           "lastTurnEnding": null,
+          "linkState": null,
           "model": null,
           "notification": {
             "content": "Background update",
@@ -2097,6 +2118,7 @@
           "cwd": null,
           "history": null,
           "lastTurnEnding": null,
+          "linkState": null,
           "model": null,
           "pendingPermissions": [],
           "provider": null,

@@ -13,6 +13,7 @@ build. Scratch lives under ~/.cache, never /tmp.
 import errno
 import hashlib
 import importlib.util
+import json
 import os
 import re
 import select
@@ -1092,6 +1093,98 @@ def _bash(script, env, cwd):
     """Run `script` in bash with release.sh's functions loaded (sourcing it runs no release)."""
     return subprocess.run(["bash", "-c", f'set -euo pipefail; source "{_RELEASE_SH}"; {script}'],
                           capture_output=True, text=True, env=env, cwd=cwd, timeout=60)
+
+
+class ServerHelperBuild(unittest.TestCase):
+    def setUp(self):
+        self.scratch = _scratch_dir()
+        self.addCleanup(shutil.rmtree, self.scratch, ignore_errors=True)
+        self.logs = os.path.join(self.scratch, "logs")
+        os.makedirs(self.logs)
+        self.record = os.path.join(self.scratch, "cargo.log")
+        # The fake cargo uses its own output tree; the shared build cache stays untouched.
+        self.output = os.path.join(self.scratch, "built")
+        _write(os.path.join(self.scratch, "cargo"), textwrap.dedent('''\
+            #!/usr/bin/env python3
+            import json, os, pathlib, sys
+            args = sys.argv[1:]
+            with open(os.environ["BUILD_RECORD"], "a") as f:
+                f.write(json.dumps([args, os.environ.get("EITRI_SERVER_SHA256")]) + "\\n")
+            if args[0] == "clean":
+                sys.exit(0)
+            root = pathlib.Path(os.environ["FAKE_OUTPUT"]) / "release"
+            root.mkdir(parents=True, exist_ok=True)
+            if "eitri-server" in args:
+                names = ["eitri-server"]
+            else:
+                names = ["shell", "eitri-tmux-shim", "eitri-claude-handoff", "eitri-run-guard", "eitri-editor-bridge"]
+            for name in names:
+                path = root / name
+                if name == "shell":
+                    proof = os.environ.get("FAKE_PROOF", os.environ.get("EITRI_SERVER_SHA256", "none"))
+                    path.write_text("#!/bin/sh\\n[ \\"$1\\" = --server-helper-hash ] || exit 9\\nprintf '%s\\\\n' '" + proof + "'\\n")
+                else:
+                    path.write_text("built " + name + "\\n")
+                path.chmod(0o755)
+                print(json.dumps({"reason": "compiler-artifact", "executable": str(path)}))
+        '''), 0o755)
+
+    def run_build(self, proof=None):
+        env = dict(os.environ, PATH=self.scratch + ":" + os.environ["PATH"],
+                   BUILD_RECORD=self.record, FAKE_OUTPUT=self.output)
+        env.pop("EITRI_SERVER_SHA256", None)
+        if proof is not None:
+            env["FAKE_PROOF"] = proof
+        # Substitute the output expression in the sourced function, so no real build cache is modified.
+        script = ('eval "$(declare -f ctr_build_release_binaries | '
+                  'sed \'s|$CARGO_TARGET_DIR/release|$FAKE_OUTPUT/release|g\')"; '
+                  f'ctr_build_release_binaries {shlex.quote(self.logs)}; '
+                  'touch packaged')
+        return _bash(script, env, self.scratch)
+
+    def test_phase_b_builds_the_helper_first_and_bakes_its_hash(self):
+        proc = self.run_build()
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        with open(self.record) as f:
+            calls = [json.loads(line) for line in f]
+        builds = [call for call in calls if call[0][0] == "build"]
+        self.assertEqual(len(builds), 2)
+        self.assertIn("eitri-server", builds[0][0])
+        self.assertNotIn("shell", builds[0][0])
+        with open(os.path.join(self.output, "release", "eitri-server"), "rb") as f:
+            digest = hashlib.sha256(f.read()).hexdigest()
+        self.assertIn("shell", builds[1][0])
+        self.assertEqual(builds[1][1], digest)
+        with open(os.path.join(self.logs, "build.json")) as f:
+            self.assertEqual(len(rc.release_executables(f)), 6)
+        self.assertTrue(os.path.exists(os.path.join(self.scratch, "packaged")))
+        body = StagesThePluginDirectories.function_text("ctr_phase_b")
+        self.assertLess(body.index('ctr_build_release_binaries "$logs"'), body.index('nfpm pkg'))
+
+    def test_release_build_without_proof_refuses(self):
+        for proof in ("none", "0" * 64, "extra\n" + "0" * 64):
+            with self.subTest(proof=proof):
+                proc = self.run_build(proof)
+                self.assertNotEqual(proc.returncode, 0)
+                self.assertIn("release.sh (container): server helper hash proof", proc.stderr)
+                self.assertFalse(os.path.exists(os.path.join(self.scratch, "packaged")))
+
+    def test_packaged_helper_is_the_built_one(self):
+        proc = self.run_build()
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        body = StagesThePluginDirectories.function_text("ctr_phase_b")
+        loops = re.findall(r'\tfor b in "\$\{RS_BINARIES\[@\]\}"; do install [^\n]+; done', body)
+        self.assertEqual(len(loops), 2)
+        script = ('st="$PWD/stage"; tb="$PWD/tarball"; tt=top; '
+                  'mkdir -p "$st/target/release"; ' + "\n".join(loops))
+        script = script.replace('$CARGO_TARGET_DIR/release', shlex.quote(self.output) + '/release')
+        proc = _bash(script, dict(os.environ), self.scratch)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        shell = os.path.join(self.output, "release", "shell")
+        baked = subprocess.check_output([shell, "--server-helper-hash"], text=True).strip()
+        for rel in ("stage/target/release/eitri-server", "tarball/top/lib/eitri/eitri-server"):
+            with open(os.path.join(self.scratch, rel), "rb") as f:
+                self.assertEqual(hashlib.sha256(f.read()).hexdigest(), baked, rel)
 
 
 class PerformanceWindowAdmission(unittest.TestCase):

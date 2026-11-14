@@ -346,6 +346,8 @@ fn run_window(root: PathBuf, start: TakeoverStart) {
     if let Some(note) = &root_note {
         println!("[agent] project root note: {note}");
     }
+    // Reads the project's remote record, so here rather than on the GTK thread.
+    let origin = crate::remote_window::origin_for_root(&root);
     let app = crate::build_application(crate::launch::AppKind::of(&crate::linked_window::WindowStart::Full));
     let pieces = RefCell::new(Some(start));
     app.connect_activate(move |app| {
@@ -366,6 +368,7 @@ fn run_window(root: PathBuf, start: TakeoverStart) {
             app,
             false,
             &root,
+            &origin,
             backend_kind,
             panel_notice.as_deref(),
             root_note.clone(),

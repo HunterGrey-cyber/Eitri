@@ -28,7 +28,7 @@ Deterministic by construction: every list is sorted, nothing reads the clock, an
 are printed once and referred to afterwards. Running it twice gives byte-identical output.
 
 Inputs it expects to exist (publish.sh / release.sh produce all of them before calling it):
-  <repo>/target/release/{shell,eitri-tmux-shim,eitri-claude-handoff,eitri-run-guard,eitri-editor-bridge}
+  <repo>/target/release/{shell,eitri-tmux-shim,eitri-claude-handoff,eitri-run-guard,eitri-editor-bridge,eitri-server}
     (or --binaries-dir DIR; no agent-hook -- it is not in any release)
   dist/verdandi-claude-sidecar                    (sidecar profile only; not read with --no-sidecar)
   agent-ui/web/node_modules                       (shell/build.rs runs npm ci there)
@@ -98,11 +98,11 @@ REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 TEXTS = os.path.join(REPO, "packaging", "license-texts")
 TARGET = "x86_64-unknown-linux-gnu"
 
-# The five binaries every release installs from target/release, built with
-# `-p shell -p agent --bins`. No `agent-hook`: it relays permissions for the legacy
+# The six binaries every release installs from target/release, built with
+# `-p shell -p agent -p eitri-server --bins`. No `agent-hook`: it relays permissions for the legacy
 # backend, which no release build compiles in either profile.
-SHIPPED_BINARIES = ["shell", "eitri-tmux-shim", "eitri-claude-handoff", "eitri-run-guard", "eitri-editor-bridge"]
-SHIPPED_CARGO_PACKAGES = ["shell", "agent"]
+SHIPPED_BINARIES = ["shell", "eitri-tmux-shim", "eitri-claude-handoff", "eitri-run-guard", "eitri-editor-bridge", "eitri-server"]
+SHIPPED_CARGO_PACKAGES = ["shell", "agent", "eitri-server"]
 
 # Spell small binary counts as words from the actual list, so prose cannot retain a stale count.
 # Counts beyond this table fall back to digits rather than failing.

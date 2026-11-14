@@ -717,3 +717,103 @@ def test_failed_takeover_removes_its_sublock(failure):
         assert "another Eitri installer" not in proc.stderr, report(proc)
     elif failure == "remove-main":
         assert "cannot remove the stale lock" in proc.stderr, report(proc)
+
+
+@pytest.mark.parametrize("shell", ["bash", "dash"])
+@pytest.mark.parametrize("version,bridge,server", [
+    ("0.2.2", 0, 0), ("0.3.0-rc.1", 0, 0), ("0.3.0", 0, 0),
+    ("0.3.1-rc.0", 1, 0), ("0.3.1-rc.1", 1, 0), ("0.3.1", 1, 0),
+    ("0.3.2-rc.0", 1, 1), ("0.3.2-rc.1", 1, 1), ("0.3.2", 1, 1),
+    ("0.10.0", 1, 1),
+])
+def test_companion_boundaries(shell, version, bridge, server):
+    if shutil.which(shell) is None:
+        pytest.skip(f"{shell} is not installed")
+    script = INSTALLER.read_text().replace('main "$@" </dev/null', r'''
+NV_VERSION=$1
+for binary in eitri-editor-bridge eitri-server shell; do
+    companion_required "$binary"
+    printf '%s=%s\n' "$binary" "$NV_COMPANION_REQUIRED"
+done
+''')
+    proc = subprocess.run([shell, "-s", "--", version], input=script,
+                          capture_output=True, text=True, timeout=10)
+    assert proc.returncode == 0, report(proc)
+    assert proc.stdout.splitlines() == [f"eitri-editor-bridge={bridge}", f"eitri-server={server}", "shell=1"]
+
+
+@pytest.mark.parametrize("version", [
+    "0.2.2", "0.3.0-rc.1", "0.3.0", "0.3.1-rc.1", "0.3.1",
+    "0.3.2-rc.0", "0.3.2-rc.1", "0.3.2", "0.10.0",
+])
+@pytest.mark.parametrize("companion", ["eitri-server", "eitri-editor-bridge"])
+@pytest.mark.parametrize("mode", ["absent", "executable", "not-executable"])
+def test_archive_companion_compatibility(version, companion, mode):
+    """Exercise unpack_new's real layout checks without the HTTP fixture server."""
+    with tempfile.TemporaryDirectory(prefix=UNIT_SCRATCH_PREFIX, dir=scratch_root()) as scratch:
+        script = INSTALLER.read_text().replace('main "$@" </dev/null', r'''
+NV_VERSION=$1
+missing=$2
+NV_HOME=$3
+mode=$4
+NV_STAGE=$NV_HOME/stage
+NV_LIBROOT=$NV_HOME/lib
+NV_LIB=$NV_LIBROOT/eitri
+NV_TARBALL_NAME=eitri-$NV_VERSION-x86_64-linux.tar.gz
+NV_TARBALL=$NV_HOME/$NV_TARBALL_NAME
+fixture=$NV_HOME/fixture/eitri-$NV_VERSION-x86_64-linux
+mkdir -p "$fixture/lib/eitri/plugins"
+for plugin in $NV_SHIPPED_PLUGINS; do
+    mkdir -p "$fixture/lib/eitri/plugins/$plugin"
+    touch "$fixture/lib/eitri/plugins/$plugin/eitri-plugin.toml"
+done
+for path in bin/eitri lib/eitri/RELEASE; do
+    mkdir -p "$fixture/${path%/*}"
+    printf 'fixture\n' >"$fixture/$path"
+done
+for path in $NV_DESKTOP; do
+    mkdir -p "$fixture/share/applications"
+    touch "$fixture/share/applications/$path"
+done
+for path in $NV_PLUGIN_FILES; do
+    mkdir -p "$fixture/share/eitri/eitri.nvim/${path%/*}"
+    touch "$fixture/share/eitri/eitri.nvim/$path"
+done
+for path in $NV_EXT_FILES; do
+    mkdir -p "$fixture/share/gnome-shell/extensions/$NV_EXT_ID"
+    touch "$fixture/share/gnome-shell/extensions/$NV_EXT_ID/$path"
+done
+for path in $NV_ICON_FILES; do
+    mkdir -p "$fixture/share/icons/${path%/*}"
+    touch "$fixture/share/icons/$path"
+done
+for path in $NV_LICENCE_FILES; do
+    mkdir -p "$fixture/share/licenses/eitri"
+    touch "$fixture/share/licenses/eitri/$path"
+done
+# Later layouts also require NOTICE, independently of the companion under test.
+case $NV_VERSION in 0.3.1* | 0.3.2* | 0.10.0) touch "$fixture/share/licenses/eitri/NOTICE" ;; esac
+for path in $NV_BINARIES eitri-setup; do
+    if [ "$path" = "$missing" ] && [ "$mode" = absent ]; then continue; fi
+    printf '#!/bin/sh\nexit 0\n' >"$fixture/lib/eitri/$path"
+    chmod 0755 "$fixture/lib/eitri/$path"
+    if [ "$path" = "$missing" ] && [ "$mode" = not-executable ]; then
+        chmod 0644 "$fixture/lib/eitri/$path"
+    fi
+done
+# Only metadata parsing is outside this layout test; archive and path checks run unchanged.
+parse_release() { REL_VERSION=$NV_VERSION; REL_REV7=aaaaaaa; }
+tar -C "$NV_HOME/fixture" -czf "$NV_TARBALL" "eitri-$NV_VERSION-x86_64-linux"
+unpack_new
+if [ "$mode" = absent ]; then [ ! -e "$NV_LIB.new/$missing" ];
+else [ -x "$NV_LIB.new/$missing" ]; fi
+''')
+        proc = subprocess.run(["bash", "-s", "--", version, companion, scratch, mode], input=script,
+                              capture_output=True, text=True, timeout=30)
+        legacy = version in ("0.2.2", "0.3.0-rc.1", "0.3.0") or (
+            companion == "eitri-server" and version in ("0.3.1-rc.1", "0.3.1"))
+        if mode == "executable" or (legacy and mode == "absent"):
+            assert proc.returncode == 0, report(proc)
+        else:
+            assert proc.returncode != 0, report(proc)
+            assert f"has no executable lib/eitri/{companion}" in proc.stderr, report(proc)

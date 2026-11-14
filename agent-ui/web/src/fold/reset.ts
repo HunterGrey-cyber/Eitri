@@ -35,7 +35,7 @@ const EMPTIED = {
 /** The fields the process still holds, which a reset leaves as they are. */
 const KEPT = [
   "backend", "conversationId", "sessionId", "model", "cwd", "status", "activeTurnId", "pendingPermissions", "editorCards",
-  "capabilities", "provider", "accountLimits", "backgroundCalls", "backgroundTasks", "availableCommands", "apiRetry",
+  "capabilities", "provider", "linkState", "accountLimits", "backgroundCalls", "backgroundTasks", "availableCommands", "apiRetry",
   "compacting", "rateLimitWarning", "fallbackModel", "effort", "notification", "cliUnseenBusy", "cliUnseenEpisode", "nextSeq", "turnThinking",
   "denialsBeforeTheirCall", "changedInputsBeforeTheirCall", "runningTurnCli", "planning",
 ] as const satisfies readonly (keyof AgentUiState)[];

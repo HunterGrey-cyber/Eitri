@@ -406,6 +406,14 @@ pub enum InboundMessage {
         #[serde(default)]
         tab: Option<u64>,
     },
+    /// The page's Dismiss of a tab's own note (`root_note`) reading `text`: the tab keeps it dismissed in every
+    /// page it is shown in, until its note says something else.
+    RootNoteDismissed {
+        request_id: String,
+        #[serde(default)]
+        tab: Option<u64>,
+        text: String,
+    },
     /// `Ctrl+Enter` (Claude Code's `chat:sendNow`): interrupt if running, then the queue plus `text`.
     SendNow {
         request_id: String,
@@ -730,6 +738,16 @@ pub enum InboundMessage {
         #[serde(default)]
         tab: Option<u64>,
     },
+    /// The person's choice on a remote tab's question (`remote_prompt`): what to do about requests left
+    /// waiting after a gap, how to close a tab whose server cannot be reached, whether to continue a
+    /// session whose agent the server no longer runs. Names its tab and the nonce the question was shown
+    /// with; no field has a default, so only the exact question shown is answered.
+    RemotePromptAnswer {
+        request_id: String,
+        tab: u64,
+        nonce: u64,
+        action: RemotePromptAction,
+    },
     /// `y` (`keep_bypass`) or `n` to the question a restore asked because a saved tab was in bypass.
     /// Window-level, like `ConfirmBypass`; the nonce is the one the question was shown with, and has
     /// no default for the same reason: only the exact prompt shown may be answered.
@@ -901,6 +919,7 @@ impl InboundMessage {
             // These name their tab as a plain number: a message without one does not parse.
             InboundMessage::TrustAnswer { tab, .. }
             | InboundMessage::TrustCancel { tab, .. }
+            | InboundMessage::RemotePromptAnswer { tab, .. }
             | InboundMessage::EditorSymbol { tab, .. }
             | InboundMessage::AttachBegin { tab, .. }
             | InboundMessage::AttachChunk { tab, .. }
@@ -937,6 +956,7 @@ impl InboundMessage {
             | InboundMessage::OpenDetail { tab, .. }
             | InboundMessage::QueueMessage { tab, .. }
             | InboundMessage::TakeBackQueue { tab, .. }
+            | InboundMessage::RootNoteDismissed { tab, .. }
             | InboundMessage::SendNow { tab, .. }
             | InboundMessage::Draft { tab, .. }
             | InboundMessage::EditDraft { tab, .. }
@@ -1198,6 +1218,7 @@ impl InboundMessage {
             | InboundMessage::HintTargets { request_id, .. }
             | InboundMessage::QueueMessage { request_id, .. }
             | InboundMessage::TakeBackQueue { request_id, .. }
+            | InboundMessage::RootNoteDismissed { request_id, .. }
             | InboundMessage::AttachBegin { request_id, .. }
             | InboundMessage::AttachChunk { request_id, .. }
             | InboundMessage::AttachEnd { request_id, .. }
@@ -1237,6 +1258,7 @@ impl InboundMessage {
             | InboundMessage::ViewExported { request_id, .. }
             | InboundMessage::TrustAnswer { request_id, .. }
             | InboundMessage::TrustCancel { request_id, .. }
+            | InboundMessage::RemotePromptAnswer { request_id, .. }
             | InboundMessage::TrustCommand { request_id, .. }
             | InboundMessage::RemoteEnrollAnswer { request_id, .. }
             | InboundMessage::RemoteListenAnswer { request_id, .. }
@@ -1557,12 +1579,43 @@ pub fn serialize_pane_focus_for_js(focused: bool) -> String {
     json!({ "kind": "pane_focus", "focused": focused }).to_string()
 }
 
+/// A provider's current connection state, independent of conversation revisions.
+pub fn link_state_for_js(state: Option<&agent::RemoteLinkState>) -> Value {
+    use agent::RemoteLinkState;
+    match state {
+        None => Value::Null,
+        Some(RemoteLinkState::Live) => json!({ "kind": "live" }),
+        Some(RemoteLinkState::Disconnected { since_unix_ms }) => {
+            json!({ "kind": "disconnected", "sinceUnixMs": since_unix_ms })
+        }
+        Some(RemoteLinkState::Reconnecting { attempt, next_in_ms }) => {
+            json!({ "kind": "reconnecting", "attempt": attempt, "nextInMs": next_in_ms })
+        }
+        Some(RemoteLinkState::CatchingUp { done, total }) => {
+            json!({ "kind": "catching_up", "done": done, "total": total })
+        }
+    }
+}
+
+pub fn serialize_link_state_for_js(tab: crate::tabs::TabId, state: Option<&agent::RemoteLinkState>) -> String {
+    json!({ "kind": "link_state", "tab": tab.0, "linkState": link_state_for_js(state) }).to_string()
+}
+
 /// `{"kind":"root_note","text":...}`: why this window's project folder is no boundary
 /// (`agent::project_boundary::note`). Window-level, no tab; the page shows it as a banner of its own
 /// that only its Dismiss clears, so a send or a command notice never takes it away. Sent right after
 /// `hello` on every `ready`, so a reloaded document says it again.
 pub fn serialize_root_note_for_js(text: &str) -> String {
     json!({ "kind": "root_note", "text": text }).to_string()
+}
+
+/// `{"kind":"root_note","tab":n,"text":...,"dismissed":bool}`: one tab's own note (a remote tab names its host and
+/// the absence of server path checks), sent when the tab is shown or arrives in a page. The page draws it only
+/// while that tab is shown, in place of the window's note, and keeps a Dismiss of it for that tab until the text
+/// changes, so the same note told again stays dismissed. `dismissed` says the person dismissed this text in some
+/// page (`root_note_dismissed`), so a page the tab moves into draws it dismissed too.
+pub fn serialize_tab_root_note_for_js(tab: crate::tabs::TabId, text: &str, dismissed: bool) -> String {
+    json!({ "kind": "root_note", "tab": tab.0, "text": text, "dismissed": dismissed }).to_string()
 }
 
 /// `{"kind":"editor_typing","typing":bool,"periodMs":n}`: whether the user is typing in the editor
@@ -2573,6 +2626,18 @@ pub fn serialize_snapshot_with_notes_for_js(
     notes: &CallNotes,
     cards: &[crate::editor_tools::cards::EditorCardWire],
 ) -> String {
+    serialize_snapshot_with_link_for_js(tab, view, turn_started_at_ms, notes, cards, None)
+}
+
+/// A snapshot with the connection value read alongside it; connection changes need no projection event.
+pub fn serialize_snapshot_with_link_for_js(
+    tab: crate::tabs::TabId,
+    view: &SnapshotView<'_>,
+    turn_started_at_ms: Option<u64>,
+    notes: &CallNotes,
+    cards: &[crate::editor_tools::cards::EditorCardWire],
+    link_state: Option<&agent::RemoteLinkState>,
+) -> String {
     let projection = &*view.projection;
     // Written out for the same stated reason as `transcript` just below: both field names happen
     // to be single lowercase words today, so the derive would produce the same JSON, but this
@@ -2728,6 +2793,8 @@ pub fn serialize_snapshot_with_notes_for_js(
     let capabilities = view.capabilities.clone();
     let provider = view.provider.map(|info| {
         json!({
+            "host": info.host,
+            "accountName": info.account_name,
             "sidecarVersion": info.sidecar_version,
             "claudeAgentSdkVersion": info.claude_agent_sdk_version,
             "claudeCodeVersion": info.actual_claude_code_version,
@@ -2858,6 +2925,7 @@ pub fn serialize_snapshot_with_notes_for_js(
             // more; the tab's own mode is local to the host.
         },
         "provider": provider,
+        "linkState": link_state_for_js(link_state),
     });
     // Absence is an unavailable control, including snapshots from peers predating task reporting.
     for (name, offered) in [
@@ -3657,6 +3725,61 @@ pub fn serialize_confirm_restore_for_js(prompt: &crate::tab_set::RestorePrompt) 
     json!({ "kind": "confirm_restore", "nonce": prompt.nonce, "lines": prompt.lines }).to_string()
 }
 
+/// What the person may choose on a remote tab's question. A closed set: the page sends one of these words
+/// and nothing else, and each is offered only by the question it belongs to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RemotePromptAction {
+    /// After a gap: deny every request the server listed as waiting, then stop the agent.
+    DenyAndStop,
+    /// After a gap: leave the agent and its requests waiting on the server.
+    LeaveWaiting,
+    /// Closing a tab whose server cannot be reached: stop its agent once the server is back.
+    StopWhenBack,
+    /// Closing a tab whose server cannot be reached: leave its agent running there.
+    LeaveRunning,
+    /// The server no longer runs the tab's agent: continue the CLI's session through a new one.
+    Resume,
+}
+
+/// One choice of a remote tab's question: the key that picks it on the page, and its words.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct RemotePromptChoice {
+    pub key: char,
+    pub label: String,
+    pub action: RemotePromptAction,
+}
+
+/// A remote tab's question for its page: `lines` to read (the first names the tab and says what happened, the
+/// rest list what it is about), `choices` to pick by key. The page keeps it for its tab and draws it only while
+/// that tab is shown; a key that is not a choice leaves it up. `nonce` is echoed back with the choice. A second
+/// one for the tab replaces the first.
+pub fn serialize_remote_prompt_for_js(
+    tab: u64,
+    nonce: u64,
+    lines: &[String],
+    choices: &[RemotePromptChoice],
+) -> String {
+    json!({
+        "kind": "remote_prompt",
+        "tab": tab,
+        "nonce": nonce,
+        "lines": lines,
+        "choices": choices,
+    })
+    .to_string()
+}
+
+/// The remote question `nonce` of tab `tab` is no longer open: the page drops it, from the screen too.
+pub fn serialize_remote_prompt_clear_for_js(tab: u64, nonce: u64) -> String {
+    json!({
+        "kind": "remote_prompt_clear",
+        "tab": tab,
+        "nonce": nonce,
+    })
+    .to_string()
+}
+
 #[cfg(test)]
 mod attachment_message_tests;
 #[cfg(test)]
@@ -3741,5 +3864,299 @@ mod gd_tests {
             "request_id": "gd2", "tab": 1, "name": "M.call"}))
         .unwrap();
         assert!(matches!(message, InboundMessage::EditorSymbol { cited: None, .. }));
+    }
+}
+
+#[cfg(test)]
+mod remote_link_tests {
+    use super::*;
+    use agent::{AgentProvider, RemoteLinkState};
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Default)]
+    struct RemoteRecordingProvider {
+        inner: crate::test_providers::RecordingProvider,
+        link: Mutex<Option<RemoteLinkState>>,
+        after_read: Mutex<Option<Option<RemoteLinkState>>>,
+    }
+
+    impl AgentProvider for RemoteRecordingProvider {
+        fn link_state(&self) -> Option<RemoteLinkState> {
+            let mut link = self.link.lock().unwrap();
+            let value = link.clone();
+            if let Some(next) = self.after_read.lock().unwrap().take() {
+                *link = next;
+            }
+            value
+        }
+        fn capabilities(&self) -> agent::ProviderCapabilities {
+            self.inner.capabilities()
+        }
+        fn info(&self) -> agent::ProviderInfo {
+            agent::ProviderInfo {
+                host: Some("example-host".into()),
+                account_name: Some("work".into()),
+                ..self.inner.info()
+            }
+        }
+        fn create_session(&self, request: agent::CreateSessionRequest) -> Result<String, agent::ProviderError> {
+            self.inner.create_session(request)
+        }
+        fn resume_session(&self, request: agent::ResumeSessionRequest) -> Result<String, agent::ProviderError> {
+            self.inner.resume_session(request)
+        }
+        fn send_turn(&self, request: agent::SendTurnRequest) -> Result<String, agent::ProviderError> {
+            self.inner.send_turn(request)
+        }
+        fn interrupt_turn(&self, request: agent::InterruptTurnRequest) -> Result<(), agent::ProviderError> {
+            self.inner.interrupt_turn(request)
+        }
+        fn resolve_permission(&self, request: agent::ResolvePermissionRequest) -> Result<(), agent::ProviderError> {
+            self.inner.resolve_permission(request)
+        }
+        fn close_session(&self, request: agent::CloseSessionRequest) -> Result<(), agent::ProviderError> {
+            self.inner.close_session(request)
+        }
+        fn pump(&self) -> Vec<agent::AgentDomainEvent> {
+            self.inner.pump()
+        }
+    }
+
+    fn fixture() -> (std::path::PathBuf, Arc<RemoteRecordingProvider>, crate::tab_set::TabSet) {
+        use crate::agent_backend::{AgentBackend, AgentId, BackendKind};
+        use crate::tab_set::{TabBackend, TabSet};
+        agent::state_dirs::redirect_state_to_a_test_root();
+        let dir = agent::state_dirs::test_workspace_dir("remote-link-flips");
+        let provider = Arc::new(RemoteRecordingProvider::default());
+        let conversation =
+            agent::AgentConversation::create(provider.clone(), &dir, agent::setting_sources::ProjectTrust::Untrusted)
+                .unwrap();
+        let mut tabs = TabSet::new(BackendKind::Sidecar, SessionModeChoice::Manual);
+        tabs.active_tab_mut()
+            .set_backend(TabBackend::Live(AgentBackend::Conversation {
+                agent: AgentId::Claude,
+                conversation: Box::new(conversation),
+            }));
+        (dir, provider, tabs)
+    }
+
+    #[test]
+    fn switch_snapshots_update_the_link_change_cache() {
+        snapshot_link_flip(false);
+    }
+
+    #[test]
+    fn resync_snapshots_update_the_link_change_cache() {
+        snapshot_link_flip(true);
+    }
+
+    fn snapshot_link_flip(resync: bool) {
+        {
+            let (dir, provider, mut tabs) = fixture();
+            *provider.link.lock().unwrap() = Some(RemoteLinkState::Live);
+            tabs.pump(&dir, true);
+            if resync {
+                for _ in 0..agent::UI_EVENT_QUEUE_CAPACITY + 10 {
+                    provider
+                        .inner
+                        .queue(agent::AgentDomainEvent::TurnStarted { turn_id: "turn".into() });
+                }
+                let limit = std::time::Instant::now() + std::time::Duration::from_secs(10);
+                while tabs.active_tab().live().unwrap().projection().last_revision
+                    < (agent::UI_EVENT_QUEUE_CAPACITY + 10) as u64
+                {
+                    assert!(std::time::Instant::now() < limit);
+                    std::thread::yield_now();
+                }
+            }
+            *provider.link.lock().unwrap() = Some(RemoteLinkState::Disconnected { since_unix_ms: 200 });
+            let snapshot = if resync {
+                *provider.after_read.lock().unwrap() = Some(Some(RemoteLinkState::Live));
+                let out = tabs.pump(&dir, true);
+                let snapshot: Value = serde_json::from_str(out.active_payload.as_ref().unwrap()).unwrap();
+                assert!(
+                    out.view_payloads
+                        .iter()
+                        .any(|p| serde_json::from_str::<Value>(&p.payload).unwrap()["linkState"]
+                            == json!({"kind":"live"})),
+                    "the poll corrects the resync snapshot in the same pump"
+                );
+                snapshot
+            } else {
+                let snapshot = tabs
+                    .active_state_payloads()
+                    .iter()
+                    .map(|p| serde_json::from_str::<Value>(p).unwrap())
+                    .find(|p| p["kind"] == "snapshot")
+                    .unwrap();
+                *provider.link.lock().unwrap() = Some(RemoteLinkState::Live);
+                assert!(
+                    tabs.pump(&dir, true)
+                        .view_payloads
+                        .iter()
+                        .any(|p| serde_json::from_str::<Value>(&p.payload).unwrap()["linkState"]
+                            == json!({"kind":"live"})),
+                    "the poll corrects the switch snapshot"
+                );
+                snapshot
+            };
+            assert_eq!(snapshot["kind"], "snapshot");
+            assert_eq!(
+                snapshot["state"]["linkState"],
+                json!({"kind":"disconnected", "sinceUnixMs":200})
+            );
+            tabs.active_tab_mut().live_mut().unwrap().shutdown();
+        }
+    }
+
+    #[test]
+    fn a_hidden_tabs_link_change_waits_for_its_snapshot() {
+        use crate::agent_backend::AgentId;
+        let (dir, provider, mut tabs) = fixture();
+        let background = tabs.active();
+        tabs.open(AgentId::Claude);
+        *provider.link.lock().unwrap() = Some(RemoteLinkState::Disconnected { since_unix_ms: 100 });
+        assert!(tabs.pump(&dir, true).view_payloads.is_empty());
+        assert!(tabs.state_payloads(background).is_empty());
+        tabs.select(background);
+        let snapshot = tabs
+            .active_state_payloads()
+            .iter()
+            .map(|p| serde_json::from_str::<Value>(p).unwrap())
+            .find(|p| p["kind"] == "snapshot")
+            .unwrap();
+        assert_eq!(snapshot["tab"], background.0);
+        assert_eq!(
+            snapshot["state"]["linkState"],
+            json!({"kind":"disconnected", "sinceUnixMs":100})
+        );
+        tabs.get_mut(background).unwrap().live_mut().unwrap().shutdown();
+    }
+
+    #[test]
+    fn a_background_views_link_change_is_addressed_only_to_its_tab() {
+        use crate::agent_backend::AgentId;
+        let (dir, provider, mut tabs) = fixture();
+        let background = tabs.active();
+        tabs.open(AgentId::Claude);
+        tabs.select(background);
+        let view = crate::tabs::ViewId::new(2).unwrap();
+        tabs.break_out(view).unwrap();
+        *provider.link.lock().unwrap() = Some(RemoteLinkState::Disconnected { since_unix_ms: 100 });
+        let out = tabs.pump(&dir, true);
+        let links: Vec<_> = out
+            .view_payloads
+            .iter()
+            .filter(|p| serde_json::from_str::<Value>(&p.payload).unwrap()["kind"] == "link_state")
+            .collect();
+        assert_eq!(links.len(), 1);
+        assert_eq!(links[0].view, view);
+        assert_eq!(links[0].tab, background);
+        assert_eq!(
+            serde_json::from_str::<Value>(&links[0].payload).unwrap(),
+            json!({"kind":"link_state", "tab":background.0, "linkState":{"kind":"disconnected", "sinceUnixMs":100}})
+        );
+        tabs.get_mut(background).unwrap().live_mut().unwrap().shutdown();
+    }
+
+    #[test]
+    fn recording_provider_link_changes_reach_the_page_without_events() {
+        use crate::agent_backend::{AgentBackend, AgentId, BackendKind};
+        use crate::tab_set::{TabBackend, TabSet};
+        agent::state_dirs::redirect_state_to_a_test_root();
+        let dir = agent::state_dirs::test_workspace_dir("remote-panel-link");
+        let provider = Arc::new(RemoteRecordingProvider::default());
+        let conversation =
+            agent::AgentConversation::create(provider.clone(), &dir, agent::setting_sources::ProjectTrust::Untrusted)
+                .unwrap();
+        assert_eq!(conversation.link_state(), None);
+        let backend = AgentBackend::Conversation {
+            agent: AgentId::Claude,
+            conversation: Box::new(conversation),
+        };
+        let mut tabs = TabSet::new(BackendKind::Sidecar, SessionModeChoice::Manual);
+        tabs.active_tab_mut().set_backend(TabBackend::Live(backend));
+        let snapshot = |tabs: &mut TabSet| -> Value {
+            tabs.active_state_payloads()
+                .iter()
+                .map(|s| serde_json::from_str::<Value>(s).unwrap())
+                .find(|v| v["kind"] == "snapshot")
+                .unwrap()
+        };
+        let initial = snapshot(&mut tabs);
+        assert_eq!(initial["state"]["provider"]["host"], "example-host");
+        assert_eq!(initial["state"]["provider"]["accountName"], "work");
+        assert!(initial["state"]["linkState"].is_null());
+        let mut was_disconnected = false;
+        for (state, expected) in [
+            (
+                RemoteLinkState::Disconnected { since_unix_ms: 100 },
+                json!({"kind":"disconnected", "sinceUnixMs":100}),
+            ),
+            (
+                RemoteLinkState::Disconnected { since_unix_ms: 101 },
+                json!({"kind":"disconnected", "sinceUnixMs":101}),
+            ),
+            (
+                RemoteLinkState::Reconnecting {
+                    attempt: 3,
+                    next_in_ms: 20,
+                },
+                json!({"kind":"reconnecting", "attempt":3, "nextInMs":20}),
+            ),
+            (
+                RemoteLinkState::CatchingUp { done: 12, total: 30 },
+                json!({"kind":"catching_up", "done":12, "total":30}),
+            ),
+            (
+                RemoteLinkState::CatchingUp { done: 20, total: 30 },
+                json!({"kind":"catching_up", "done":20, "total":30}),
+            ),
+            (RemoteLinkState::Live, json!({"kind":"live"})),
+        ] {
+            *provider.link.lock().unwrap() = Some(state.clone());
+            let output = tabs.pump(&dir, true);
+            let payload = output
+                .view_payloads
+                .iter()
+                .map(|p| serde_json::from_str::<Value>(&p.payload).unwrap())
+                .find(|v| v["kind"] == "link_state")
+                .expect("an idle tab reports its connection change");
+            assert_eq!(payload["tab"], tabs.active().0);
+            assert_eq!(
+                payload,
+                json!({"kind":"link_state", "tab":tabs.active().0, "linkState":expected})
+            );
+            let class = output
+                .view_payloads
+                .iter()
+                .find(|p| p.payload.contains("\"kind\":\"link_state\""))
+                .unwrap()
+                .class;
+            assert_eq!(
+                class,
+                if matches!(state, RemoteLinkState::Disconnected { .. }) && !was_disconnected {
+                    crate::panel_cadence::EnvelopeClass::Immediate
+                } else {
+                    crate::panel_cadence::EnvelopeClass::Stream
+                }
+            );
+            was_disconnected = matches!(state, RemoteLinkState::Disconnected { .. });
+            assert_eq!(snapshot(&mut tabs)["state"]["linkState"], expected);
+            assert!(tabs
+                .pump(&dir, true)
+                .view_payloads
+                .iter()
+                .all(|p| !p.payload.contains("\"kind\":\"link_state\"")));
+        }
+        *provider.link.lock().unwrap() = None;
+        let output = tabs.pump(&dir, true);
+        assert!(output.view_payloads.iter().any(|p| {
+            let v: Value = serde_json::from_str(&p.payload).unwrap();
+            v == json!({"kind":"link_state", "tab":tabs.active().0, "linkState":null})
+        }));
+        if let TabBackend::Live(mut backend) = tabs.active_tab_mut().set_backend(TabBackend::NotStarted) {
+            backend.shutdown();
+        }
     }
 }

@@ -205,6 +205,12 @@ pub(super) fn admission(
         InboundMessage::CycleMode { .. } | InboundMessage::CycleDefaultMode { .. } => Admission::Ungated,
         // Escape on a trust question starts and loads nothing.
         InboundMessage::TrustCancel { .. } => Admission::Ungated,
+        // A remote tab's question is answered only from the page that shows the tab. Its choices deny, stop or
+        // leave an agent, or continue its session, which goes through the trust question as any start does.
+        InboundMessage::RemotePromptAnswer { .. } => match target {
+            Some(tab) => from_its_page(tab),
+            None => Admission::Ungated,
+        },
         // Remote control's questions are the window's, asked in its base page: a `y` adds a device that may follow
         // the tabs, or lets phones reach the listener from a network, so it meets the window's gate; an `n` changes
         // nothing.
@@ -254,6 +260,7 @@ pub(super) fn admission(
         | InboundMessage::OpenDetail { .. }
         | InboundMessage::QueueMessage { .. }
         | InboundMessage::TakeBackQueue { .. }
+        | InboundMessage::RootNoteDismissed { .. }
         | InboundMessage::SendNow { .. }
         | InboundMessage::Draft { .. }
         | InboundMessage::EditDraft { .. }

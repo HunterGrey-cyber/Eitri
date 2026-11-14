@@ -47,7 +47,11 @@ NV_GLIBC_FLOOR='2.39'
 NV_NVIM_FLOOR='0.11.0'
 # Retired companions are removed from staged archives before the install is swapped in.
 NV_OLD_BINARIES='eitri-supervisor'
-NV_BINARIES='shell eitri-tmux-shim eitri-claude-handoff eitri-run-guard eitri-editor-bridge'
+NV_BINARIES='shell eitri-tmux-shim eitri-claude-handoff eitri-run-guard eitri-editor-bridge eitri-server'
+# First release line requiring the server helper, including that line's candidates.
+NV_SERVER_SINCE=0.3.2
+# First release line requiring the editor bridge, including that line's candidates.
+NV_BRIDGE_SINCE=0.3.1
 NV_LICENCE_FILES='LICENSE THIRD-PARTY-LICENSES SOURCE'
 # The desktop entry is named by the application id (the compositor matches a window to <id>.desktop;
 # the icon theme's icon name and the window's class, shell/src/main.rs's APP_ID, are the same string).
@@ -242,8 +246,9 @@ usage: sh install.sh [options]
                                release. Without --checkout: clone the public repo at the chosen
                                version's tag and refuse unless its HEAD matches the verified
                                release's EITRI_COMMIT. With --checkout DIR: build DIR as it is,
-                               synthesizing a RELEASE from its own version, HEAD, agent/Cargo.toml's
-                               Verdandi rev and packaging/pins.env (a local development build).
+                               synthesizing a RELEASE from its own version, HEAD, the root
+                               Cargo.toml's workspace Verdandi rev and packaging/pins.env
+                               (a local development build).
                                --verdandi-checkout DIR builds the sidecar's source from a local
                                Verdandi checkout instead of the pinned public source; refused unless
                                it is at the pinned revision and clean, unless
@@ -3418,14 +3423,22 @@ checkout_fork_rev() {
 	fi
 }
 
-# agent_toml_verdandi DIR: sets AT_GIT_URL and AT_REV from DIR/agent/Cargo.toml's own
-# claude-runtime-protocol dependency line. Asserts AT_REV is 40 hex (a 7-char rev in
-# agent/Cargo.toml refuses) -- a synthesized RELEASE has nothing else to check VERDANDI_REV
-# against, so a short prefix here is not enough to trust. A plain statement (rule 2: this can die).
+# agent_toml_verdandi DIR: sets AT_GIT_URL and AT_REV from DIR's Verdandi pin: the root Cargo.toml's
+# claude-runtime-protocol line (its [workspace.dependencies], which every crate takes the pin from), or
+# agent/Cargo.toml's in a checkout from before the pin moved there. Asserts AT_REV is 40 hex (a 7-char
+# rev refuses) -- a synthesized RELEASE has nothing else to check VERDANDI_REV against, so a short
+# prefix here is not enough to trust. A plain statement (rule 2: this can die).
 agent_toml_verdandi() {
-	_atv_file=$1/agent/Cargo.toml
-	if [ ! -f "$_atv_file" ]; then die "$1 has no agent/Cargo.toml: not an Eitri checkout"; fi
-	_atv_line=$(grep -E '^claude-runtime-protocol[[:space:]]*=' "$_atv_file" | head -n 1) || _atv_line=
+	_atv_file=$1/Cargo.toml
+	_atv_line=
+	if [ -f "$_atv_file" ]; then
+		_atv_line=$(grep -E '^claude-runtime-protocol[[:space:]]*=' "$_atv_file" | head -n 1) || _atv_line=
+	fi
+	if [ -z "$_atv_line" ]; then
+		_atv_file=$1/agent/Cargo.toml
+		if [ ! -f "$_atv_file" ]; then die "$1 has no agent/Cargo.toml: not an Eitri checkout"; fi
+		_atv_line=$(grep -E '^claude-runtime-protocol[[:space:]]*=' "$_atv_file" | head -n 1) || _atv_line=
+	fi
 	if [ -z "$_atv_line" ]; then
 		die "$_atv_file names no claude-runtime-protocol dependency: not an Eitri checkout, or it no longer pins Verdandi the way this installer expects"
 	fi
@@ -3435,7 +3448,7 @@ agent_toml_verdandi() {
 		die "could not parse a git URL and rev out of $_atv_file's claude-runtime-protocol dependency: $_atv_line"
 	fi
 	if ! printf '%s\n' "$AT_REV" | grep -Eqx '[0-9a-f]{40}'; then
-		die "$_atv_file pins claude-runtime-protocol at rev \"$AT_REV\", which is not a full 40-hex commit: --from-source --checkout needs the full commit, not a short prefix, to synthesize a trustworthy RELEASE. Pin the full commit in agent/Cargo.toml and re-run"
+		die "$_atv_file pins claude-runtime-protocol at rev \"$AT_REV\", which is not a full 40-hex commit: --from-source --checkout needs the full commit, not a short prefix, to synthesize a trustworthy RELEASE. Pin the full commit in $_atv_file and re-run"
 	fi
 }
 
@@ -3542,7 +3555,7 @@ synthesize_release_from_checkout() {
 	*) NV_VERDANDI_REV_IS_PUBLIC=0 ;;
 	esac
 	if [ "$NV_VERDANDI_REV_IS_PUBLIC" != 1 ] && [ -z "$OPT_VERDANDI_CHECKOUT" ]; then
-		die "agent/Cargo.toml in $_src_dir pins Verdandi from a private source ($AT_GIT_URL), so its source cannot be fetched publicly: pass --verdandi-checkout DIR (a local checkout of it), or set EITRI_VERDANDI_CHECKOUT"
+		die "$_atv_file pins Verdandi from a private source ($AT_GIT_URL), so its source cannot be fetched publicly: pass --verdandi-checkout DIR (a local checkout of it), or set EITRI_VERDANDI_CHECKOUT"
 	fi
 	_src_pins=$_src_dir/packaging/pins.env
 	if [ ! -f "$_src_pins" ]; then die "$_src_dir has no packaging/pins.env: not an Eitri checkout"; fi
@@ -3643,8 +3656,21 @@ fetch_verified_release() {
 	NV_RELEASE_PATH=$NV_DL/RELEASE
 }
 
+# companion_required NAME: older release lines may omit a companion. Compare with rc.0 so
+# every candidate of the first required release line requires it too.
+companion_required() {
+	NV_COMPANION_REQUIRED=1
+	case $1 in
+	eitri-server) _cr_since=$NV_SERVER_SINCE ;;
+	eitri-editor-bridge) _cr_since=$NV_BRIDGE_SINCE ;;
+	*) return 0 ;;
+	esac
+	_cr_cmp=$(semver_cmp "$NV_VERSION" "$_cr_since-rc.0")
+	if [ "$_cr_cmp" -lt 0 ]; then NV_COMPANION_REQUIRED=0; fi
+}
+
 # from_source_stage SRC RELEASE_PATH: SRC is the tree that was just built (target/release/ holds the
-# six binaries); RELEASE_PATH is the RELEASE this build matches. Builds the same on-disk shape
+# binaries required by that release); RELEASE_PATH is the RELEASE this build matches. Builds the same on-disk shape
 # unpack_new produces from a downloaded tarball (NV_STAGE_TOP, NV_LIB.new), so ensure_sidecar,
 # maybe_offer_nvim, stage_files, swap_in, commit_files and prune_sidecars -- finish_install's own
 # body -- are the one path both a prebuilt install and a from-source one share from here on. There
@@ -3661,6 +3687,9 @@ from_source_stage() {
 	cp -- "$_fss_src/packaging/eitri.launcher.sh" "$_fss_top/bin/eitri" || die "cannot stage the launcher"
 	chmod 0755 "$_fss_top/bin/eitri" || die "cannot chmod the staged launcher"
 	for _fss_b in $NV_BINARIES; do
+		companion_required "$_fss_b"
+		if [ "$NV_COMPANION_REQUIRED" = 0 ] && [ ! -e "$_fss_src/target/release/$_fss_b" ] &&
+			[ ! -L "$_fss_src/target/release/$_fss_b" ]; then continue; fi
 		if [ ! -x "$_fss_src/target/release/$_fss_b" ]; then
 			die "the build did not produce target/release/$_fss_b: report it at $NV_ISSUES"
 		fi
@@ -4025,6 +4054,15 @@ do_from_source() {
 		if [ -n "$OPT_VERDANDI_CHECKOUT" ]; then resolve_verdandi_source; fi
 	fi
 
+	companion_required eitri-server
+	if [ "$NV_COMPANION_REQUIRED" = 1 ] && [ ! -f "$NV_FROM_SOURCE_DIR/server/Cargo.toml" ]; then
+		die "source tree for $NV_VERSION has no server/Cargo.toml: eitri-server is required from $NV_SERVER_SINCE, including candidates"
+	fi
+	companion_required eitri-editor-bridge
+	if [ "$NV_COMPANION_REQUIRED" = 1 ] && [ ! -f "$NV_FROM_SOURCE_DIR/shell/src/bin/eitri-editor-bridge.rs" ]; then
+		die "source tree for $NV_VERSION has no shell/src/bin/eitri-editor-bridge.rs: eitri-editor-bridge is required from $NV_BRIDGE_SINCE, including candidates"
+	fi
+
 	_dfs_node_workdir=$NV_CACHE_NV/from-source-node
 	rm -rf -- "$_dfs_node_workdir" || die "cannot remove the stale $_dfs_node_workdir"
 	mkdir -p -- "$_dfs_node_workdir" || die "cannot create $_dfs_node_workdir"
@@ -4053,8 +4091,10 @@ do_from_source() {
 	for _dfs_b in $NV_BINARIES; do
 		rm -f -- "$NV_FROM_SOURCE_DIR/target/release/$_dfs_b" || die "cannot remove the stale $NV_FROM_SOURCE_DIR/target/release/$_dfs_b"
 	done
-	run_in "$NV_FROM_SOURCE_DIR" env "PATH=$_dfs_node_top/bin:$PATH" "SKIA_BINARIES_URL=file://$NV_SKIA_ARCHIVE" \
-		cargo build --release --locked --target-dir "$NV_FROM_SOURCE_DIR/target" -p shell -p agent --bins
+	set -- -p shell -p agent
+	if [ -f "$NV_FROM_SOURCE_DIR/server/Cargo.toml" ]; then set -- "$@" -p eitri-server; fi
+	run_in "$NV_FROM_SOURCE_DIR" env -u EITRI_SERVER_SHA256 "PATH=$_dfs_node_top/bin:$PATH" "SKIA_BINARIES_URL=file://$NV_SKIA_ARCHIVE" \
+		cargo build --release --locked --target-dir "$NV_FROM_SOURCE_DIR/target" "$@" --bins
 
 	from_source_stage "$NV_FROM_SOURCE_DIR" "$NV_RELEASE_PATH"
 	finish_install
@@ -4108,20 +4148,19 @@ dry_run_new_rev() {
 	say "the new release's RELEASE ($_dr_from) names verdandi $NV_NEW_REV7"
 }
 
-# licence_files: what this install writes under share/licenses/eitri. The acknowledgement in NOTICE sat
-# inside LICENSE through 0.3.0, so those releases, which --version still installs, have no NOTICE file; a
-# source tree from after the split can still call itself 0.3.0, and then the staged file decides.
+# Through 0.3.0 the acknowledgement sits inside LICENSE, so those releases have no NOTICE.
+# A later source tree can still call itself 0.3.0; install its NOTICE when staged.
 licence_files() {
-	case $NV_VERSION in
-	0.[0-2].* | 0.3.0 | 0.3.0-*)
+	_lf_cmp=$(semver_cmp "$NV_VERSION" 0.3.0)
+	if [ "$_lf_cmp" -le 0 ]; then
 		if [ -n "${NV_STAGE_TOP:-}" ] && [ -f "$NV_STAGE_TOP/share/licenses/eitri/NOTICE" ]; then
 			printf '%s NOTICE\n' "$NV_LICENCE_FILES"
 		else
 			printf '%s\n' "$NV_LICENCE_FILES"
 		fi
-		;;
-	*) printf '%s NOTICE\n' "$NV_LICENCE_FILES" ;;
-	esac
+	else
+		printf '%s NOTICE\n' "$NV_LICENCE_FILES"
+	fi
 }
 
 # unpack_new: the verified tarball, unpacked in the cache and checked, becomes $NV_LIB.new.
@@ -4154,6 +4193,10 @@ unpack_new() {
 		if [ ! -f "$_un_top/share/icons/$_un_f" ]; then die "$NV_TARBALL_NAME has no share/icons/$_un_f: it is not a valid Eitri release. Nothing was changed; report it at $NV_ISSUES"; fi
 	done
 	for _un_f in $NV_BINARIES eitri-setup; do
+		# Check supplied companions even when the release line permits their absence.
+		companion_required "$_un_f"
+		if [ "$NV_COMPANION_REQUIRED" = 0 ] && [ ! -e "$_un_top/lib/eitri/$_un_f" ] &&
+			[ ! -L "$_un_top/lib/eitri/$_un_f" ]; then continue; fi
 		if [ -f "$_un_top/lib/eitri/$_un_f" ] && [ ! -x "$_un_top/lib/eitri/$_un_f" ] &&
 			[ -n "$(find "$_un_top/lib/eitri/$_un_f" -maxdepth 0 -perm -u+x 2>/dev/null)" ]; then
 			# Its mode says executable and the system will not run it: the file system under the cache is mounted noexec.

@@ -573,11 +573,14 @@ def check_no_legacy_symbols(nm_c_text: str) -> None:
         raise ReleaseCheckError(f"no {SIDECAR_SYMBOL_MARKER} symbol found -- the sidecar backend is not linked")
 
 
-# Read release executables from Cargo's build JSON rather than listing the target directory.
-# A reused target directory may contain binaries left by a development build, such as
+# --- 10. What the release build produced -----------------------------------------------------
+#
+# Read release executables from Cargo's build JSON rather than listing the target directory. release.sh builds
+# `eitri-server`, then `shell` and `agent` with `--bins`, each with `--message-format=json-render-diagnostics`, and
+# reads the concatenated logs. A reused target directory may contain binaries left by a development build, such as
 # `agent-hook`, that were not produced by this release build.
 
-RELEASE_BINARIES = ("shell", "eitri-tmux-shim", "eitri-claude-handoff", "eitri-run-guard", "eitri-editor-bridge")
+RELEASE_BINARIES = ("shell", "eitri-tmux-shim", "eitri-claude-handoff", "eitri-run-guard", "eitri-editor-bridge", "eitri-server")
 
 
 def _json_messages(lines: Iterable[str]) -> list[dict]:

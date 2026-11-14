@@ -17,6 +17,8 @@ pub struct RecordingProvider {
     /// Every ranged read of a task's output that reached the provider.
     output_ranges: std::sync::Mutex<Vec<(u64, u32)>>,
     queued: std::sync::Mutex<Vec<AgentDomainEvent>>,
+    /// The wire position of what is queued (`queue_through`), and of what the last pump took (`pumped_through`).
+    positions: std::sync::Mutex<(Option<u64>, Option<u64>)>,
     resolved: std::sync::Mutex<Vec<(String, bool)>>,
     /// Every turn text a send reached the provider with, accepted or refused.
     turns: std::sync::Mutex<Vec<String>>,
@@ -73,6 +75,17 @@ pub struct RecordingProvider {
     held_calls: std::sync::Mutex<Option<std::sync::mpsc::Receiver<()>>>,
     /// How many calls have begun to wait on the hold.
     calls_waiting: AtomicUsize,
+    /// What `link_state` reports: `None` for a provider on this machine (the default), `Some` to stand
+    /// for a remote tab's link ([`Self::set_link`]).
+    link: std::sync::Mutex<Option<agent::RemoteLinkState>>,
+    /// What a remote tab's provider says of how its session ended and where its agent is ([`Self::set_remote`]).
+    remote: std::sync::Mutex<(Option<agent::RemoteEnding>, Option<agent::HelperHandoff>)>,
+    /// How many times its agent on a server was stopped.
+    remote_stops: AtomicUsize,
+    /// While set, a stop of its agent on a server fails as an unreachable server's does.
+    failing_remote_stops: AtomicBool,
+    /// How many answers it had taken when each stop of its agent on a server came.
+    answers_at_stops: std::sync::Mutex<Vec<usize>>,
     /// Offers plan mode (`plan_mode_v1`), and its sessions are created with it.
     plan_mode: bool,
     /// Every `SetPlanning` that reached it, as its `enter`.
@@ -93,6 +106,31 @@ pub struct RecordingProvider {
 type ClientReadReply = std::sync::mpsc::Sender<Result<agent::ClientToolCallState, agent::ProviderError>>;
 
 impl RecordingProvider {
+    /// What `link_state` reports from now on: a remote tab's link as it stands, or `None`.
+    pub fn set_link(&self, link: Option<agent::RemoteLinkState>) {
+        *self.link.lock().unwrap() = link;
+    }
+
+    /// What a remote tab's provider says from now on of how its session ended, and where its agent is.
+    pub fn set_remote(&self, ending: Option<agent::RemoteEnding>, handoff: Option<agent::HelperHandoff>) {
+        *self.remote.lock().unwrap() = (ending, handoff);
+    }
+
+    /// How many times its agent on a server was stopped.
+    pub fn remote_stops(&self) -> usize {
+        self.remote_stops.load(Ordering::SeqCst)
+    }
+
+    /// How many answers it had taken when each stop of its agent on a server came, in order.
+    pub fn answers_at_stops(&self) -> Vec<usize> {
+        self.answers_at_stops.lock().unwrap().clone()
+    }
+
+    /// From now on a stop of its agent on a server fails (and is not counted), until set back.
+    pub fn fail_remote_stops(&self, failing: bool) {
+        self.failing_remote_stops.store(failing, Ordering::SeqCst);
+    }
+
     pub fn hold_permission_replies(&self) {
         self.holding_permission_replies.store(true, Ordering::SeqCst);
     }
@@ -208,6 +246,14 @@ impl RecordingProvider {
     /// effect until the overflow later in the same batch has already happened too.
     pub fn queue_all(&self, events: Vec<AgentDomainEvent>) {
         self.queued.lock().unwrap().extend(events);
+    }
+
+    /// [`Self::queue_all`], with `through` the provider's own sequence of the last of them: the next pump reports
+    /// it as `pumped_through`, as a sidecar's watch numbers what it delivers.
+    pub fn queue_through(&self, events: Vec<AgentDomainEvent>, through: u64) {
+        let mut queued = self.queued.lock().unwrap();
+        queued.extend(events);
+        self.positions.lock().unwrap().0 = Some(through);
     }
 
     /// Holds the next ingestion batch until the returned sender sends or is dropped; the receiver
@@ -390,6 +436,29 @@ impl RecordingProvider {
 }
 
 impl agent::AgentProvider for RecordingProvider {
+    fn link_state(&self) -> Option<agent::RemoteLinkState> {
+        self.link.lock().unwrap().clone()
+    }
+
+    fn remote_ending(&self) -> Option<agent::RemoteEnding> {
+        self.remote.lock().unwrap().0.clone()
+    }
+
+    fn helper_handoff(&self) -> Option<agent::HelperHandoff> {
+        self.remote.lock().unwrap().1.clone()
+    }
+
+    fn stop_remote_agent(&self) -> Option<std::io::Result<()>> {
+        self.link.lock().unwrap().as_ref()?;
+        if self.failing_remote_stops.load(Ordering::SeqCst) {
+            return Some(Err(std::io::Error::other("the server cannot be reached")));
+        }
+        let answers = self.decisions.lock().unwrap().len();
+        self.answers_at_stops.lock().unwrap().push(answers);
+        self.remote_stops.fetch_add(1, Ordering::SeqCst);
+        Some(Ok(()))
+    }
+
     fn capabilities(&self) -> ProviderCapabilities {
         ProviderCapabilities {
             interrupt: self.interrupt_capable,
@@ -721,7 +790,14 @@ impl agent::AgentProvider for RecordingProvider {
             let _ = inside.send(());
             let _ = release.recv_timeout(std::time::Duration::from_secs(10));
         }
-        std::mem::take(&mut *self.queued.lock().unwrap())
+        let mut queued = self.queued.lock().unwrap();
+        let mut positions = self.positions.lock().unwrap();
+        positions.1 = positions.0;
+        std::mem::take(&mut *queued)
+    }
+
+    fn pumped_through(&self) -> Option<u64> {
+        self.positions.lock().unwrap().1
     }
 }
 
@@ -1042,6 +1118,7 @@ pub fn adopt_moving(
     kind: agent::chat_mover::MovedKind,
     record: &serde_json::Value,
     fds: Vec<std::os::fd::OwnedFd>,
+    _helpers: &dyn agent::remote_client::HelperConnections,
 ) -> Result<agent::chat_mover::Adopted, String> {
     if kind != agent::chat_mover::MovedKind::Claude || fds.len() != 3 {
         return Err(format!(

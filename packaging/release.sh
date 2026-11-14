@@ -39,7 +39,7 @@ RS_SIGN_NAMESPACE=eitri-release
 RS_SIGN_IDENTITY=release@eitri
 RS_PUBLIC_REPO=https://github.com/HunterGrey-cyber/eitri
 RS_IMAGE_REPO=eitri-release-build
-RS_BINARIES=(shell eitri-tmux-shim eitri-claude-handoff eitri-run-guard eitri-editor-bridge)
+RS_BINARIES=(shell eitri-tmux-shim eitri-claude-handoff eitri-run-guard eitri-editor-bridge eitri-server)
 RS_VERSION_ERE='^[0-9]+\.[0-9]+\.[0-9]+(-rc\.[0-9]+)?$'
 RS_LEGACY_MESSAGE='the legacy backend is not in this build'
 # Public identity required by public_commits_check for the released commit.
@@ -72,13 +72,25 @@ workspace_version() {
 		}' "$1"
 }
 
-# verdandi_dep AGENT_CARGO_TOML: sets RS_VERDANDI_URL and RS_VERDANDI_REV from the
-# claude-runtime-protocol dependency line.
+# verdandi_dep CARGO_TOML: sets RS_VERDANDI_URL and RS_VERDANDI_REV from its claude-runtime-protocol
+# dependency line (both empty when it has none).
 verdandi_dep() {
 	local line
-	line="$(grep -E '^claude-runtime-protocol = \{ git = "[^"]+", rev = "[^"]+" \}' "$1" || true)"
+	line="$(grep -E '^claude-runtime-protocol = \{ git = "[^"]+", rev = "[^"]+" \}' "$1" 2>/dev/null || true)"
 	RS_VERDANDI_URL="$(printf '%s\n' "$line" | sed -nE 's/.*git = "([^"]+)".*/\1/p')"
 	RS_VERDANDI_REV="$(printf '%s\n' "$line" | sed -nE 's/.*rev = "([^"]+)".*/\1/p')"
+}
+
+# pinned_verdandi SOURCE: verdandi_dep of SOURCE's Verdandi pin, with RS_PIN_TOML the manifest it is in: the root
+# Cargo.toml, whose [workspace.dependencies] every crate takes the pin from, or agent/Cargo.toml in a source from
+# before the pin moved there.
+pinned_verdandi() {
+	RS_PIN_TOML=Cargo.toml
+	verdandi_dep "$1/Cargo.toml"
+	if [ -z "$RS_VERDANDI_REV" ]; then
+		RS_PIN_TOML=agent/Cargo.toml
+		verdandi_dep "$1/agent/Cargo.toml"
+	fi
 }
 
 # legacy_default_offenders DIR: find tracked Cargo.toml files whose default features enable
@@ -486,10 +498,10 @@ preflight() {
 		die "pins.env has no nvim pin (NVIM_VERSION, NVIM_SHA256_linux_x86_64); only a --rehearsal may run without it"
 	fi
 
-	verdandi_dep "$RS_SOURCE/agent/Cargo.toml"
+	pinned_verdandi "$RS_SOURCE"
 	[[ "$RS_VERDANDI_REV" =~ ^[0-9a-f]{40}$ ]] \
-		|| die "agent/Cargo.toml's claude-runtime-protocol rev '$RS_VERDANDI_REV' is not a full 40-hex public Verdandi commit"
-	[[ "$RS_VERDANDI_URL" == https://* ]] || die "agent/Cargo.toml's claude-runtime-protocol source is not an https URL: $RS_VERDANDI_URL"
+		|| die "$RS_PIN_TOML's claude-runtime-protocol rev '$RS_VERDANDI_REV' is not a full 40-hex public Verdandi commit"
+	[[ "$RS_VERDANDI_URL" == https://* ]] || die "$RS_PIN_TOML's claude-runtime-protocol source is not an https URL: $RS_VERDANDI_URL"
 	grep -qE "^pub const (EXPECTED_VERDANDI_REVISION|BUNDLED_SIDECAR_REVISION): &str = \"${RS_VERDANDI_REV:0:7}\";" \
 		"$RS_SOURCE/agent/src/providers/claude_sidecar/spawn.rs" \
 		|| die "BUNDLED_SIDECAR_REVISION (EXPECTED_VERDANDI_REVISION in an older tree) is not ${RS_VERDANDI_REV:0:7}, the 7-char prefix of the pinned Verdandi rev"
@@ -1158,6 +1170,29 @@ ctr_tarball_art() {
 	done < <(cd "$st/packaging/icons" && find hicolor -type f | LC_ALL=C sort)
 }
 
+ctr_build_release_binaries() {
+	local logs="$1" helper_hash reported_hash
+	step "cargo build --release --locked -p eitri-server --bin eitri-server"
+	cargo build --release --locked --offline -p eitri-server --bin eitri-server \
+		--message-format=json-render-diagnostics > "$logs/build-helper.json"
+	helper_hash="$(sha256sum "$CARGO_TARGET_DIR/release/eitri-server" | awk '{ print $1 }')"
+	export EITRI_SERVER_SHA256="$helper_hash"
+	# shell/build.rs writes web bundles into the source copy, while target is reused. Unchanged
+	# inputs can leave the build script fresh with no bundles in this copy; cleaning shell forces
+	# it to write them again before include_str! reads them.
+	step "cargo clean --release -p shell (its build script writes the web bundle into this fresh copy)"
+	cargo clean --release --locked --offline -p shell
+	step "cargo build --release --locked -p shell -p agent --bins (no --features)"
+	cargo build --release --locked --offline -p shell -p agent --bins \
+		--message-format=json-render-diagnostics > "$logs/build-window.json"
+	cat "$logs/build-helper.json" "$logs/build-window.json" > "$logs/build.json"
+	step "server helper hash proof: shell --server-helper-hash"
+	reported_hash="$("$CARGO_TARGET_DIR/release/shell" --server-helper-hash)" \
+		|| ctr_die "server helper hash proof: shell --server-helper-hash failed"
+	[ "$reported_hash" = "$helper_hash" ] \
+		|| ctr_die "server helper hash proof: shell --server-helper-hash prints '$reported_hash', expected '$helper_hash'"
+}
+
 ctr_phase_b() {
 	ctr_env
 	export CARGO_NET_OFFLINE=true npm_config_offline=true
@@ -1176,20 +1211,10 @@ ctr_phase_b() {
 	export SOURCE_DATE_EPOCH="$sde"
 
 	step "legacy stays out: the resolved feature graph (M15)"
-	cargo tree --locked --offline -e features -p shell -p agent -i agent > "$logs/feature-tree.txt"
+	cargo tree --locked --offline -e features -p shell -p agent -p eitri-server -i agent > "$logs/feature-tree.txt"
 	if grep -n 'legacy-backend' "$logs/feature-tree.txt" >&2; then ctr_die "the resolved graph enables legacy-backend"; fi
 
-	# shell/build.rs writes agent-ui/web/dist/index.html (and plugin-kit/keys/dist/keys.js and the Markdown
-	# preview plugin's site under plugins/markdown/web/dist) into the source tree, which this run copied
-	# afresh, while /build/target is kept. A rerun of the same commit (a retry after a failure, or a
-	# rehearsal then the real build) leaves every input shell/build.rs watches unchanged, so cargo
-	# would not run it, the fresh copy would have no bundle, and include_str! would fail.
-	# Cleaning shell alone makes its build script run against this copy every time.
-	step "cargo clean --release -p shell (its build script writes the web bundle into this fresh copy)"
-	cargo clean --release --locked --offline -p shell
-	step "cargo build --release --locked -p shell -p agent --bins (no --features)"
-	cargo build --release --locked --offline -p shell -p agent --bins \
-		--message-format=json-render-diagnostics > "$logs/build.json"
+	ctr_build_release_binaries "$logs"
 	local exes=()
 	mapfile -t exes < <(python3 packaging/release_check.py build-executables "$logs/build.json")
 	[ "${#exes[@]}" = "${#RS_BINARIES[@]}" ] || ctr_die "the build did not report exactly the ${#RS_BINARIES[@]} executables a release ships"
@@ -1197,7 +1222,7 @@ ctr_phase_b() {
 	skia_out="$(python3 packaging/release_check.py build-script-out-dir "$logs/build.json" skia-bindings)"
 	python3 packaging/release_check.py check-skia-output "$(dirname "$skia_out")/output" "$skia_url"
 
-	step "check-abi-floor.py over the five (GTK $RS_GTK_FLOOR, glibc $RS_GLIBC_FLOOR)"
+	step "check-abi-floor.py over the six (GTK $RS_GTK_FLOOR, glibc $RS_GLIBC_FLOOR)"
 	python3 packaging/check-abi-floor.py "${exes[@]}" --gtk "$RS_GTK_FLOOR" --glibc "$RS_GLIBC_FLOOR" \
 		| tee "$logs/abi.txt"
 	nm -C "$CARGO_TARGET_DIR/release/shell" > "$logs/shell.nm"
@@ -1345,9 +1370,11 @@ ctr_proof() {
 		|| ctr_die "SOURCE's EITRI_BUILD_COMMIT is '${EITRI_BUILD_COMMIT:-}', not $RS_COMMIT"
 	[ -n "${EITRI_BUILD_FORK_COMMIT:-}" ] || ctr_die "SOURCE gives no EITRI_BUILD_FORK_COMMIT"
 
-	step "proof (a): the full release command, offline and --locked, from the source asset"
+	# One build of every binary, without the helper's hash the release bakes into the window: a rebuild from SOURCE
+	# is an unsigned-helper build, so this proves the source builds, not that its window equals the shipped one.
+	step "proof (a): every binary rebuilt in one command, offline and --locked, from the source asset"
 	SKIA_BINARIES_URL="file://$PWD/skia/$archive" \
-		cargo build --release --offline --locked -p shell -p agent --bins
+		cargo build --release --offline --locked -p shell -p agent -p eitri-server --bins
 	[ ! -e "$marker" ] || ctr_die "proof (a) reached npm: $(cat "$marker")"
 	env -i PATH=/usr/bin:/bin HOME=/home/builder "$CARGO_TARGET_DIR/release/shell" --version > "$logs/proof-a-version.txt"
 	cmp -s "$logs/proof-a-version.txt" "$logs/version.txt" \

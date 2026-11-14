@@ -12,7 +12,9 @@ set -u
 # Everything below but the detach cases runs as a start from the desktop: no controlling terminal and no terminal on
 # a standard descriptor, so the launcher execs the stub as it always did. The detach cases give the launcher a
 # terminal of their own (`script`). Run with a controlling terminal, this file runs itself again without one.
-if [[ -z "${LAUNCHER_TEST_NO_TTY:-}" ]] && { { : </dev/tty; } 2>/dev/null || [[ -t 0 ]]; }; then
+# `true`, not `:`: run as `sh`, bash is in POSIX mode, where a failed redirection on a special builtin such as `:` ends
+# the whole script.
+if [[ -z "${LAUNCHER_TEST_NO_TTY:-}" ]] && { { true </dev/tty; } 2>/dev/null || [[ -t 0 ]]; }; then
 	LAUNCHER_TEST_NO_TTY=1 exec setsid -w "$BASH" "${BASH_SOURCE[0]}" "$@" </dev/null
 fi
 
@@ -766,6 +768,9 @@ echo "== -h lists the panel and split subcommands =="
 out="$(run_launcher -h)"
 assert_contains "$out" "eitri agents" "the help text names eitri agents"
 assert_contains "$out" "eitri remote" "the help text names eitri remote"
+assert_contains "$out" "eitri host open HOST:/srv/p" "the help text names eitri host"
+assert_contains "$out" "eitri --ssh HOST /srv/p" "the help text names --ssh"
+assert_contains "$out" "eitri --local /srv/p" "the help text names --local"
 assert_contains "$out" "eitri panel" "the help text names eitri panel"
 assert_contains "$out" "eitri split" "the help text names eitri split"
 assert_contains "$out" "eitri setup [args]" "and still ends with the setup line"
@@ -801,7 +806,7 @@ out="$(run_in_filedir --quiet --account x a.rs)"
 assert_eq "$(args_of "$out")" "--new-window|a.rs" "--account as a flag asks for a new window"
 assert_contains "$out" "STUB_ARG:--new-window" "and the stub saw it"
 mkdir -p "$FILEDIR/choose-project"
-for sub in panel split page run-guard linked-window choose-project agents remote attachment-decoder; do
+for sub in panel split page run-guard linked-window choose-project agents remote host attachment-decoder; do
 	out="$(run_in_filedir --quiet "$sub")"
 	assert_eq "$(args_of "$out")" "./$sub" "a path named $sub is not read as the $sub subcommand"
 	out="$(run_in_filedir --quiet "$sub" b.rs)"
@@ -847,6 +852,44 @@ out="$(run_launcher remote add-device --help)"
 assert_eq "$(args_of "$out")" "remote|add-device|--help" "a command's --help reaches it"
 out="$(run_launcher remote)"
 assert_eq "$(args_of "$out")" "remote" "plain eitri remote reaches the binary, which prints its usage"
+echo "== eitri host: handed to shell as typed, with no banner and no project =="
+reset_state
+EXTRA_ENV=()
+out="$(run_launcher host open example-host:/srv/project)"
+assert_eq "$?" "0" "eitri host open runs"
+assert_eq "$(args_of "$out")" "host|open|example-host:/srv/project" "eitri host open execs shell host open as typed"
+assert_not_contains "$out" "eitri    " "eitri host prints no startup banner"
+assert_not_contains "$out" "no sidecar built yet" "eitri host prints no sidecar hint"
+out="$(run_launcher host stop example-host)"
+assert_eq "$(args_of "$out")" "host|stop|example-host" "eitri host stop reaches shell host"
+out="$(run_launcher host)"
+assert_eq "$(args_of "$out")" "host" "plain eitri host reaches the binary, which prints its usage"
+echo "== eitri --ssh HOST PATH and --local: the window's, forwarded ahead of the path =="
+out="$(run_in_filedir --quiet --ssh example-host /srv/project)"
+assert_eq "$(args_of "$out")" "--ssh|example-host|/srv/project" "--ssh and its host reach shell ahead of the path"
+out="$(run_in_filedir --quiet /srv/project --ssh example-host)"
+assert_eq "$(args_of "$out")" "--ssh|example-host|/srv/project" "--ssh after the path is forwarded too"
+out="$(run_in_filedir --quiet --ssh example-host -- /srv/project)"
+assert_eq "$(args_of "$out")" "--ssh|example-host|--|/srv/project" "the user's -- stays in front of the path"
+out="$(run_in_filedir --quiet --ssh example-host)"
+assert_eq "$(args_of "$out")" "--ssh|example-host" "with no path, --ssh is not given this machine's current directory"
+out="$(run_in_filedir --quiet --ssh)"
+assert_contains "$out" "eitri: --ssh needs a host" "--ssh with no host is refused"
+assert_not_contains "$out" "STUB_ARG" "and shell is not started"
+(cd "$FILEDIR" && env -i HOME="$FAKE_HOME" PATH="$PATH" "$ROOT/bin/eitri" --ssh --local /srv/project >/dev/null 2>&1)
+assert_eq "$?" "64" "an option where the host goes is no host"
+out="$(run_in_filedir --quiet --local a.rs)"
+assert_eq "$(args_of "$out")" "--local|a.rs" "--local reaches shell"
+out="$(run_in_filedir --quiet --local)"
+assert_eq "$(args_of "$out")" "--local|$(realpath -e -- "$FILEDIR")" "--local with no path opens the current directory's copy"
+for sub in panel split page open; do
+	for flag in --local "--ssh example-host"; do
+		# shellcheck disable=SC2086 # the flag and its value are two words on purpose
+		out="$(run_in_filedir "$sub" $flag)"
+		assert_contains "$out" "eitri $sub: ${flag%% *} opens a remote project" "eitri $sub refuses ${flag%% *} by name"
+		assert_not_contains "$out" "STUB_ARG" "and eitri $sub starts nothing with ${flag%% *}"
+	done
+done
 out="$(run_in_filedir --quiet a.rs --clean)"
 assert_eq "$(args_of "$out")" "--clean|a.rs" "an option after a file is still honoured"
 out="$(run_in_filedir --quiet a.rs --bogus)"
@@ -1383,6 +1426,25 @@ assert_eq "$(grep -c 'from=terminal readyfd=3 ctty=no ' <<<"$starts")" "3" "thre
 assert_contains "$starts" "$D_PROJECT/a" "one for the first folder"
 assert_contains "$starts" "$D_PROJECT/b" "one for the second"
 assert_contains "$starts" "$D_PROJECT/f.txt" "and one for the file"
+end_stub
+
+# `eitri host` asks its questions on the terminal it was typed in: never detached, its input the terminal.
+rm -f "$D_STATE/record"
+out="$(STUB_MODE=handover in_terminal "$D_ROOT/bin/eitri" host open example-host:/srv/project)"
+record="$(cat "$D_STATE/record" 2>/dev/null)"
+assert_contains "$record" "readyfd=<unset>" "eitri host is not detached"
+assert_contains "$record" "stdin=tty" "its input is the terminal, where it asks"
+assert_contains "$record" "ctty=yes" "and it keeps the terminal as its own"
+assert_contains "$out" "handed to the running window" "what it prints reaches the terminal"
+end_stub
+
+# A window of a remote project started from a terminal leaves it like any window.
+rm -f "$D_STATE/record"
+out="$(STUB_MODE=ready in_terminal "$D_ROOT/bin/eitri" --ssh example-host /srv/project)"
+record="$(cat "$D_STATE/record" 2>/dev/null)"
+assert_contains "$record" "readyfd=3" "a --ssh window is detached like any other"
+assert_contains "$record" "arg=--ssh" "with --ssh"
+assert_contains "$record" "arg=/srv/project" "and the server's path"
 end_stub
 
 # From the desktop: no terminal, so no detach, and the window is told so.

@@ -207,3 +207,196 @@ fn the_configured_default_mode_is_the_one_way_a_window_starts_in_bypass() {
     );
     assert_eq!(set.default_mode(), SessionModeChoice::Manual);
 }
+
+/// A remote tab is never saved among the Claude tabs (a restore would resume it on this machine): it is saved in
+/// its own list with where its agent is and the CLI's session, and not once its session has ended.
+#[test]
+fn a_remote_tab_is_saved_apart_with_where_its_agent_is() {
+    let dir = workspace("remote-saved-apart");
+    let mut set = set();
+    set.set_project_origin(crate::remote_project::TabOrigin::Remote {
+        host: "example-host".into(),
+        host_key_sha256: "SHA256:example".into(),
+        root: "/srv/project".into(),
+    })
+    .unwrap();
+    let tab = set.active();
+    let (provider, backend) = live(&dir);
+    provider.set_link(Some(agent::RemoteLinkState::Live));
+    let helper = agent::HelperHandoff {
+        daemon: "".into(),
+        declared_client_tools: Default::default(),
+        host: "example-host".into(),
+        host_key_sha256: "SHA256:example".into(),
+        sidecar_id: "sc-1".into(),
+        session_id: "verdandi-1".into(),
+        last_folded_sequence: 3,
+    };
+    provider.set_remote(None, Some(helper.clone()));
+    set.get_mut(tab).unwrap().backend = TabBackend::Live(backend);
+    provider.queue(AgentDomainEvent::SessionOpened {
+        session_id: "verdandi-1".into(),
+        provider_session_id: "claude-1".into(),
+        model: "m".into(),
+        cwd: "/srv/project".into(),
+    });
+    until("the session", || {
+        set.pump(&dir, true);
+        set.saved_snapshot(PROJECT).is_some_and(|saved| {
+            saved
+                .remote
+                .first()
+                .is_some_and(|tab| tab.provider_session_id.is_some())
+        })
+    });
+    let saved = set.saved_snapshot(PROJECT).unwrap();
+    assert!(saved.tabs.is_empty(), "not among the tabs a restore resumes");
+    assert_eq!(saved.remote.len(), 1);
+    assert_eq!(saved.remote[0].helper, helper);
+    assert_eq!(saved.remote[0].provider_session_id.as_deref(), Some("claude-1"));
+    provider.set_remote(Some(agent::RemoteEnding::AgentGone), Some(helper));
+    assert!(
+        set.saved_snapshot(PROJECT).unwrap().remote.is_empty(),
+        "an ended one is not kept"
+    );
+    shut_down_all(&mut set);
+}
+
+fn saved_remote(sidecar: &str, mode: SessionModeChoice) -> crate::saved_tabs::SavedRemoteTab {
+    crate::saved_tabs::SavedRemoteTab {
+        window: None,
+        helper: agent::HelperHandoff {
+            daemon: "".into(),
+            declared_client_tools: Default::default(),
+            host: "example-host".into(),
+            host_key_sha256: "SHA256:example".into(),
+            sidecar_id: sidecar.into(),
+            session_id: format!("verdandi-{sidecar}"),
+            last_folded_sequence: 7,
+        },
+        provider_session_id: Some(format!("claude-{sidecar}")),
+        name: Some(format!("tab {sidecar}")),
+        mode,
+    }
+}
+
+/// A saved remote tab taken up again keeps its entry while its reattach runs and after one that failed: its agent
+/// still runs on the server. It comes back in its saved mode, except bypass, which comes back as manual; the first
+/// one takes the window's untouched first tab, the next a tab of its own, and the tab on screen stays the same.
+#[test]
+fn a_remote_tab_being_taken_up_stays_saved_in_its_mode_but_never_bypass() {
+    let mut set = set();
+    set.set_project_origin(crate::remote_project::TabOrigin::Remote {
+        host: "example-host".into(),
+        host_key_sha256: "SHA256:example".into(),
+        root: "/srv/project".into(),
+    })
+    .unwrap();
+    let first = set.active();
+    let manual = saved_remote("sc-1", SessionModeChoice::Manual);
+    let bypass = saved_remote("sc-2", SessionModeChoice::Bypass);
+    assert_eq!(set.open_reattaching(&manual), first, "the untouched first tab is taken");
+    let second = set.open_reattaching(&bypass);
+    assert_ne!(second, first);
+    assert_eq!(set.active(), first, "the tab on screen stays");
+    assert_eq!(set.get(first).unwrap().mode, SessionModeChoice::Manual);
+    assert_eq!(
+        set.get(second).unwrap().mode,
+        SessionModeChoice::Manual,
+        "bypass is never given back unasked"
+    );
+    assert_eq!(set.get(second).unwrap().name.as_deref(), Some("tab sc-2"));
+    let saved = set.saved_snapshot(PROJECT).unwrap();
+    assert_eq!(
+        saved
+            .remote
+            .iter()
+            .map(|t| t.helper.sidecar_id.as_str())
+            .collect::<Vec<_>>(),
+        ["sc-1", "sc-2"],
+        "kept while they are being taken up"
+    );
+    set.get_mut(second).unwrap().backend = TabBackend::Failed {
+        reason: "the master dropped".into(),
+    };
+    let saved = set.saved_snapshot(PROJECT).unwrap();
+    assert_eq!(saved.remote.len(), 2, "a failed reattach keeps its agent in the file");
+    assert_eq!(saved.remote[1].provider_session_id.as_deref(), Some("claude-sc-2"));
+    set.remote_agent_stopped(second);
+    assert_eq!(
+        set.saved_snapshot(PROJECT).unwrap().remote.len(),
+        1,
+        "a stopped agent is not kept"
+    );
+    assert!(set.reset(second).is_ok());
+    assert!(
+        !set.get(second).unwrap().remote_agent_stopped,
+        "a reset tab starts afresh"
+    );
+}
+
+/// A remote tab whose session ended with a gap may still have its agent running on the server: it stays saved, so a
+/// later window can reach it, until the person stops it.
+#[test]
+fn a_remote_tab_ended_by_a_gap_stays_saved_until_its_agent_is_stopped() {
+    let dir = workspace("remote-gap-saved");
+    let mut set = set();
+    set.set_project_origin(crate::remote_project::TabOrigin::Remote {
+        host: "example-host".into(),
+        host_key_sha256: "SHA256:example".into(),
+        root: "/srv/project".into(),
+    })
+    .unwrap();
+    let tab = set.active();
+    let (provider, backend) = live(&dir);
+    provider.set_link(Some(agent::RemoteLinkState::Live));
+    let helper = saved_remote("sc-1", SessionModeChoice::Auto).helper;
+    provider.set_remote(
+        Some(agent::RemoteEnding::Gap { waiting: Vec::new() }),
+        Some(helper.clone()),
+    );
+    set.get_mut(tab).unwrap().backend = TabBackend::Live(backend);
+    let saved = set.saved_snapshot(PROJECT).unwrap();
+    assert_eq!(saved.remote.len(), 1);
+    assert_eq!(saved.remote[0].helper, helper);
+    set.remote_agent_stopped(tab);
+    assert!(set.saved_snapshot(PROJECT).unwrap().remote.is_empty());
+    shut_down_all(&mut set);
+}
+
+/// A tab taken up from the saved tabs replays its journal from the start: until its fold passes what the saving
+/// window had folded, the saved floor stays the higher one, so a window closed partway through never lowers it.
+#[test]
+fn a_reattach_partway_through_its_replay_keeps_the_saved_floor() {
+    let dir = workspace("remote-reattach-floor");
+    let mut set = set();
+    set.set_project_origin(crate::remote_project::TabOrigin::Remote {
+        host: "example-host".into(),
+        host_key_sha256: "SHA256:example".into(),
+        root: "/srv/project".into(),
+    })
+    .unwrap();
+    let saved = saved_remote("sc-1", SessionModeChoice::Auto);
+    let tab = set.open_reattaching(&saved);
+    let (provider, backend) = live(&dir);
+    provider.set_link(Some(agent::RemoteLinkState::Live));
+    let mut partway = saved.helper.clone();
+    partway.last_folded_sequence = 3;
+    provider.set_remote(None, Some(partway.clone()));
+    set.get_mut(tab).unwrap().backend = TabBackend::Live(backend);
+    assert_eq!(
+        set.saved_snapshot(PROJECT).unwrap().remote[0]
+            .helper
+            .last_folded_sequence,
+        7
+    );
+    partway.last_folded_sequence = 12;
+    provider.set_remote(None, Some(partway.clone()));
+    assert_eq!(
+        set.saved_snapshot(PROJECT).unwrap().remote[0]
+            .helper
+            .last_folded_sequence,
+        12
+    );
+    shut_down_all(&mut set);
+}

@@ -7,11 +7,11 @@ pub mod master;
 pub mod version;
 
 pub use channel::{channel_argv, step_argv, CHANNEL_OPTIONS};
-pub use eitri_server_proto::args_hex::encode_args;
+pub use eitri_server_proto::args_hex::{decode_args, encode_args};
 pub use eitri_server_proto::probe::{DaemonInfo, ProbeReport, RootState};
 pub use eitri_server_proto::PROTOCOL_MAJOR;
 pub use known_hosts::HostKey;
-pub use launcher::{ChannelLauncher, LocalExec, SshLauncher};
+pub use launcher::{ChannelLauncher, LinkCheck, LocalExec, SshLauncher};
 pub use master::ControlMaster;
 pub use version::check_openssh;
 
@@ -164,6 +164,22 @@ pub(crate) fn private_dir(dir: &Path) -> io::Result<()> {
         ));
     }
     Ok(())
+}
+
+/// [`lock`] waiting at most `wait`; `TimedOut` when another holder keeps it longer.
+pub(crate) fn lock_within(path: &Path, wait: Duration) -> io::Result<crate::private_fs::PrivateLock> {
+    let lock = crate::private_fs::PrivateLock::open(path)?;
+    let deadline = Instant::now() + wait;
+    while !lock.try_lock()? {
+        if Instant::now() >= deadline {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "another restart of this connection is still running",
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    Ok(lock)
 }
 
 pub(crate) fn lock(path: &Path) -> io::Result<crate::private_fs::PrivateLock> {

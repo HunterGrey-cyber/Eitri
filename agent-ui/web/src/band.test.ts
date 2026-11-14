@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { phoneTitle, backgroundSegment, bandLayout, closingPath, cutFlash, bandLayoutSteady, liveTasks, taskWords, tasksLine, textWidth, usageSegment, RETURN_COOLDOWN_MS, RETURN_MARGIN, type BandFacts, type LayoutHold } from "./band";
+import { remoteLinkLine, phoneTitle, backgroundSegment, bandLayout, closingPath, cutFlash, bandLayoutSteady, liveTasks, taskWords, tasksLine, textWidth, usageSegment, RETURN_COOLDOWN_MS, RETURN_MARGIN, type BandFacts, type LayoutHold } from "./band";
 import { applyEvent, initialState } from "./reducer";
 import { revealedPathText } from "./revealHidden";
 import {
@@ -879,5 +879,38 @@ it.each([
 ])("keeps the closing word and its trailing whitespace: %j", (text, start) => {
   expect(closingPath(text)).toEqual(start === null ? null : {
     text: text.slice(0, start) + revealedPathText(text.slice(start)), start,
+  });
+});
+
+
+describe("remote tab location", () => {
+  it("band shows the host and account", () => {
+    expect(bandLayout({ ...idle, host: "example-host", accountName: "work" }, 3000, 7.2)
+      .find(s => s.id === "location")?.text).toBe("example-host · account work");
+  });
+  it("local tab shows no host", () => {
+    expect(bandLayout({ ...idle, host: null, accountName: "work" }, 3000, 7.2)
+      .find(s => s.id === "location")?.text).toBe("account work");
+    expect(bandLayout(idle, 3000, 7.2).some(s => s.id === "location")).toBe(false);
+  });
+  it("drops location before other segments", () => {
+    const facts = { ...idle, host: "example-host", accountName: "work", usage: { text: "10 tok", title: "usage" } };
+    const wide = bandLayout(facts, 3000, 7.2);
+    const width = wide.reduce((n, s) => n + s.text.length + 2, 0) * 7.2;
+    const narrow = bandLayout(facts, width - 30, 7.2);
+    expect(narrow.some(s => s.id === "location")).toBe(false);
+    expect(narrow.some(s => s.id === "usage")).toBe(true);
+  });
+  it("link states render their lines", () => {
+    expect(remoteLinkLine("example-host", { kind: "disconnected", sinceUnixMs: 42 }))
+      .toBe("disconnected from example-host; the agent may still be working");
+    expect(remoteLinkLine("example-host", { kind: "reconnecting", attempt: 3, nextInMs: 50 }))
+      .toBe("reconnecting to example-host… (attempt 3)");
+    expect(remoteLinkLine("example-host", { kind: "live" })).toBeNull();
+    expect(remoteLinkLine(null, null)).toBeNull();
+  });
+  it("catching up shows done and total", () => {
+    expect(remoteLinkLine("example-host", { kind: "catching_up", done: 12, total: 30 }))
+      .toBe("catching up 12 / 30");
   });
 });

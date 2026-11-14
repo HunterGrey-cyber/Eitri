@@ -26,6 +26,7 @@ EXPECTED_TREE='./.local d
 ./.local/lib/eitri/eitri-claude-handoff f
 ./.local/lib/eitri/eitri-editor-bridge f
 ./.local/lib/eitri/eitri-run-guard f
+./.local/lib/eitri/eitri-server f
 ./.local/lib/eitri/eitri-setup f
 ./.local/lib/eitri/eitri-tmux-shim f
 ./.local/lib/eitri/plugins d
@@ -120,7 +121,7 @@ t_fresh_layout() {
 	expect_rc 0
 	expect_eq "$(tree "$TH")" "$EXPECTED_TREE" "the installed tree"
 	expect_eq "$(installed_version)" 1.0.0 "the installed version"
-	for b in shell eitri-tmux-shim eitri-claude-handoff eitri-run-guard eitri-editor-bridge eitri-setup; do
+	for b in shell eitri-tmux-shim eitri-claude-handoff eitri-run-guard eitri-editor-bridge eitri-server eitri-setup; do
 		expect_exec "$TH/.local/lib/eitri/$b"
 	done
 	expect_exec "$TH/.local/bin/eitri"
@@ -328,10 +329,39 @@ t_release_before_notice_still_installs() {
 	expect_eq "$(installed_version)" 0.3.0 "the version installed"
 	expect_file "$(data_of)/licenses/eitri/LICENSE"
 	expect_absent "$(data_of)/licenses/eitri/NOTICE"
+	expect_absent "$TH/.local/lib/eitri/eitri-server"
+	expect_absent "$TH/.local/lib/eitri/eitri-editor-bridge"
 	plant_sidecar aaaaaaa
 	inst_net --version 0.3.0
 	expect_rc 0
 	expect_out 'is up to date'
+	# Uninstall removes companions even when this installed release predates them.
+	for b in eitri-server eitri-editor-bridge; do
+		printf '#!/bin/sh\nexit 0\n' >"$TH/.local/lib/eitri/$b"
+		chmod 0755 "$TH/.local/lib/eitri/$b"
+	done
+	inst -- --uninstall
+	expect_rc 0
+	expect_absent "$TH/.local/lib/eitri"
+}
+
+TESTS="$TESTS t_new_release_requires_new_companions"
+t_new_release_requires_new_companions() {
+	for b in eitri-server eitri-editor-bridge; do
+		serve 1.0.0
+		d=$(served 1.0.0)
+		rm -rf "$T/bad"
+		mkdir -p "$T/bad"
+		tar -C "$T/bad" -xzf "$d/eitri-1.0.0-x86_64-linux.tar.gz"
+		rm "$T/bad/eitri-1.0.0-x86_64-linux/lib/eitri/$b"
+		tar -C "$T/bad" -czf "$d/eitri-1.0.0-x86_64-linux.tar.gz" eitri-1.0.0-x86_64-linux
+		resign "$d"
+		relatest 1.0.0
+		inst_net
+		expect_fail "a new release without $b"
+		expect_out "has no executable lib/eitri/$b"
+		expect_absent "$TH/.local/lib/eitri"
+	done
 }
 
 TESTS="$TESTS t_release_without_notice_refused"

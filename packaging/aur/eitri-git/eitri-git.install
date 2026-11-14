@@ -1,0 +1,11 @@
+post_install() {
+	echo "eitri-server, the remote-development helper, is an unsigned build compiled locally."
+	echo "Eitri takes its hash from the locally built file rather than from a signed release."
+	echo "Eitri asks before the first helper install on a server and identifies it as unsigned."
+	echo "Once accepted on that server, newer helper builds install there without asking."
+	echo "Remote development is off unless remote_dev.enabled is set."
+}
+
+post_upgrade() {
+	post_install
+}

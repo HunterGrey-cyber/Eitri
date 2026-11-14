@@ -1,5 +1,14 @@
 //! Saved remote projects and host installation identities. All disk work belongs on a worker.
 
+mod connection;
+mod origin;
+
+pub use connection::{verified_host_key, RemoteConnection};
+pub use origin::{
+    carried_text, carry_tabs_to_key, check_remote_dev, decide_origin, host_key_changed, host_open_hint, origin_key,
+    reconcile_host_key, remote_dev_off, tab_origin_key, WindowOrigin,
+};
+
 use std::collections::BTreeMap;
 use std::ffi::OsStr;
 use std::io;
@@ -11,8 +20,10 @@ use sha2::{Digest, Sha256};
 
 use crate::state_paths::{create_state_dir, lock_store, temporary, ON_A_WRITER_THREAD};
 
+/// A remote project's record. A field this build does not know (a later build's) is read past, so the project still
+/// opens here and its stops can still be kept; a field this build needs is required, and a record missing one is
+/// refused.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct RemoteProject {
     pub version: u32,
     pub host: String,
@@ -21,6 +32,17 @@ pub struct RemoteProject {
     pub helper_version: String,
     pub sync: Option<serde_json::Value>,
     pub created_at: u64,
+    /// `<installation>/<sidecar id>` for tabs closed while the server could not be reached. Each leaves
+    /// the list after its owner accepts the stop or every candidate confirms absence. Legacy ids are
+    /// looked up across recorded installations and stay queued while any candidate cannot be asked.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub queued_stops: Vec<String>,
+}
+
+impl RemoteProject {
+    pub fn same_identity(&self, other: &Self) -> bool {
+        self.root == other.root && self.host == other.host && self.host_key_sha256 == other.host_key_sha256
+    }
 }
 
 pub fn project_key(root: &Path) -> String {
@@ -30,8 +52,9 @@ pub fn project_key(root: &Path) -> String {
     format!("{:x}", hash.finalize())[..16].to_owned()
 }
 
+/// A server's installation record, read as [`RemoteProject`] is: past a later build's field, never without one this
+/// build needs.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct RemoteHost {
     pub version: u32,
     pub host_key_sha256: String,
@@ -43,8 +66,9 @@ pub struct RemoteHost {
 }
 
 /// A tab's origin is fixed when it starts.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum TabOrigin {
+    #[default]
     Local,
     Remote {
         host: String,
@@ -62,6 +86,11 @@ impl RemoteProjects {
         Self {
             dir: crate::state_paths::state_subdir(xdg_state_home, home, "hosts"),
         }
+    }
+
+    /// Where the windows of these projects keep their saved tabs: `<state home>/eitri/tabs`, beside the records.
+    pub fn saved_tabs_dir(&self) -> Option<PathBuf> {
+        Some(self.dir.as_deref()?.parent()?.join("tabs"))
     }
 
     fn dir(&self) -> io::Result<&Path> {
@@ -113,8 +142,177 @@ impl RemoteProjects {
         self.write(&path, record)
     }
 
+    /// Commits an open without replacing stop updates made while it connected, uploaded or asked for consent.
+    pub fn save_opened(&self, opened: &RemoteProject) -> io::Result<RemoteProject> {
+        let path = self.project_path(&opened.root)?;
+        let _lock = self.lock(&path)?;
+        let mut record = opened.clone();
+        if let Some(latest) = self.find(&opened.root)?.filter(|latest| latest.host == opened.host) {
+            record.queued_stops = latest.queued_stops;
+            record.created_at = latest.created_at;
+            record.sync = latest.sync;
+        }
+        version(&path, record.version)?;
+        self.write(&path, &record)?;
+        Ok(record)
+    }
+
+    /// Reads, changes and replaces a project record under its store lock: the same rules as
+    /// [`Self::update_host`]. `NotFound` when there is no record for `root`. Disk work belongs on a worker.
+    pub fn update(&self, root: &Path, update: impl FnOnce(&mut RemoteProject)) -> io::Result<RemoteProject> {
+        self.update_checked(root, |record| {
+            update(record);
+            Ok(())
+        })
+    }
+
+    /// A window may update its launch host's record, never a replacement host's record at the same root.
+    pub(crate) fn update_for_host(
+        &self,
+        root: &Path,
+        host: &str,
+        update: impl FnOnce(&mut RemoteProject),
+    ) -> io::Result<RemoteProject> {
+        self.update_checked(root, |record| {
+            if record.host != host {
+                return Err(io::Error::other(
+                    "the project now points at another server; reopen the window",
+                ));
+            }
+            update(record);
+            Ok(())
+        })
+    }
+
+    fn update_checked(
+        &self,
+        root: &Path,
+        update: impl FnOnce(&mut RemoteProject) -> io::Result<()>,
+    ) -> io::Result<RemoteProject> {
+        let path = self.project_path(root)?;
+        let _lock = self.lock(&path)?;
+        let mut record = self.find(root)?.ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("no remote project at {}", root.display()),
+            )
+        })?;
+        update(&mut record)?;
+        version(&path, record.version)?;
+        if record.root != root {
+            return Err(invalid(&path, "record root does not match the requested root"));
+        }
+        self.write(&path, &record)?;
+        Ok(record)
+    }
+
+    /// Keeps `sidecar_id` to be stopped once the project's server can be reached.
+    pub fn queue_stop(&self, root: &Path, sidecar_id: &str) -> io::Result<()> {
+        self.update(root, |record| {
+            if !record.queued_stops.iter().any(|queued| queued == sidecar_id) {
+                record.queued_stops.push(sidecar_id.to_string());
+            }
+        })
+        .map(|_| ())
+    }
+
+    /// `sidecar_id`'s stop was sent: it leaves the queue.
+    pub fn stop_sent(&self, root: &Path, sidecar_id: &str) -> io::Result<()> {
+        self.update(root, |record| record.queued_stops.retain(|queued| queued != sidecar_id))
+            .map(|_| ())
+    }
+
+    /// Reads stops only for the server identity that queued them. Host includes the SSH user and port as typed.
+    pub fn queued_stops_for(&self, project: &RemoteProject) -> io::Result<Vec<String>> {
+        match self.find(&project.root)? {
+            Some(record) if record.same_identity(project) => Ok(record.queued_stops),
+            Some(_) => Err(io::Error::other(
+                "the project now points at another server; reopen the window",
+            )),
+            None => Ok(Vec::new()),
+        }
+    }
+
+    /// Writes or acknowledges a stop only while its owning project identity still holds the root's record.
+    pub fn write_stop_for(&self, root: &Path, host: &str, key: &str, id: &str, keep: bool) -> io::Result<()> {
+        let path = self.project_path(root)?;
+        let _lock = self.lock(&path)?;
+        let mut record = self
+            .find(root)?
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no remote project record"))?;
+        if record.host != host || record.host_key_sha256 != key {
+            return Err(io::Error::other(
+                "the project now points at another server; reopen the window",
+            ));
+        }
+        if keep {
+            if !record.queued_stops.iter().any(|queued| queued == id) {
+                record.queued_stops.push(id.to_owned());
+            }
+        } else {
+            record.queued_stops.retain(|queued| queued != id);
+        }
+        self.write(&path, &record)
+    }
+
+    /// Removes `root`'s record, under its store lock: an [`Self::update`] that read the record first finishes its
+    /// write before the record goes, rather than writing it back after.
     pub fn forget(&self, root: &Path) -> io::Result<bool> {
-        match std::fs::remove_file(self.project_path(root)?) {
+        let path = self.project_path(root)?;
+        let _lock = self.lock(&path)?;
+        match std::fs::remove_file(&path) {
+            Ok(()) => Ok(true),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(false),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Every project record, oldest first, and a line for each file that could not be read. No state home is no
+    /// records. Disk work belongs on a worker.
+    pub fn list(&self) -> io::Result<(Vec<RemoteProject>, Vec<String>)> {
+        let Ok(dir) = self.dir() else {
+            return Ok((Vec::new(), Vec::new()));
+        };
+        let entries = match std::fs::read_dir(dir) {
+            Ok(entries) => entries,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok((Vec::new(), Vec::new())),
+            Err(e) => return Err(e),
+        };
+        let mut projects = Vec::new();
+        let mut unreadable = Vec::new();
+        for entry in entries {
+            let path = entry?.path();
+            let Some(name) = path.file_name().and_then(OsStr::to_str) else {
+                continue;
+            };
+            let is_project = name.len() == 21
+                && name.ends_with(".json")
+                && name[..16]
+                    .bytes()
+                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b));
+            if !is_project {
+                continue;
+            }
+            match read::<RemoteProject>(&path).and_then(|record| {
+                let record = record.ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "removed meanwhile"))?;
+                version(&path, record.version)?;
+                if self.project_path(&record.root)? != path {
+                    return Err(invalid(&path, "record root does not match its file name"));
+                }
+                Ok(record)
+            }) {
+                Ok(record) => projects.push(record),
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                Err(e) => unreadable.push(format!("{}: {e}", path.display())),
+            }
+        }
+        projects.sort_by(|a, b| (a.created_at, &a.root).cmp(&(b.created_at, &b.root)));
+        Ok((projects, unreadable))
+    }
+
+    /// Removes the host record kept under `host_key_sha256`; `false` when there was none.
+    pub fn forget_host(&self, host_key_sha256: &str) -> io::Result<bool> {
+        match std::fs::remove_file(self.host_path(host_key_sha256)?) {
             Ok(()) => Ok(true),
             Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(false),
             Err(e) => Err(e),
@@ -162,7 +360,7 @@ impl RemoteProjects {
 
     fn write(&self, path: &Path, record: &impl Serialize) -> io::Result<()> {
         let bytes = serde_json::to_vec(record).map_err(|e| invalid(path, e))?;
-        crate::editor_record::file::replace_private(&temporary(path), path, &bytes)
+        crate::editor_record::file::replace_private_durable(&temporary(path), path, &bytes)
     }
 }
 
@@ -197,6 +395,73 @@ mod tests {
         RemoteProjects::new(Some(state.as_os_str()), None)
     }
 
+    /// A forget waits for the store lock an update holds, so it cannot slip between that update's read and its write.
+    #[test]
+    fn forget_waits_for_the_store_lock() {
+        let store = store();
+        let record = record();
+        store.save(&record).unwrap();
+        let path = store.project_path(&record.root).unwrap();
+        let held = store.lock(&path).unwrap();
+        assert!(
+            store.forget(&record.root).is_err(),
+            "it gives up while another writer holds the record"
+        );
+        assert_eq!(store.find(&record.root).unwrap(), Some(record.clone()));
+        drop(held);
+        assert!(store.forget(&record.root).unwrap());
+        assert_eq!(store.find(&record.root).unwrap(), None);
+    }
+
+    /// A record replaced in place survives a crash: its bytes are flushed before the rename and the directory's
+    /// entry after it.
+    #[test]
+    fn every_record_write_is_flushed_before_and_after_its_rename() {
+        let store = store();
+        let record = record();
+        let before = crate::editor_record::file::syncs();
+        store.save(&record).unwrap();
+        assert_eq!(
+            crate::editor_record::file::syncs() - before,
+            2,
+            "the file, then its directory"
+        );
+        let before = crate::editor_record::file::syncs();
+        store
+            .update_host(&host_record().host_key_sha256, |_| host_record())
+            .unwrap();
+        assert_eq!(crate::editor_record::file::syncs() - before, 2);
+        assert_eq!(store.find(&record.root).unwrap(), Some(record));
+    }
+
+    /// A stop queued while the server was out of reach stays in the record until it is sent, and an
+    /// older record without the list reads as having none.
+    #[test]
+    fn a_queued_stop_is_kept_until_sent() {
+        let store = store();
+        let record = record();
+        store.save(&record).unwrap();
+        store.queue_stop(&record.root, "sc-1").unwrap();
+        store.queue_stop(&record.root, "sc-1").unwrap();
+        store.queue_stop(&record.root, "sc-2").unwrap();
+        assert_eq!(
+            store.find(&record.root).unwrap().unwrap().queued_stops,
+            ["sc-1", "sc-2"]
+        );
+        store.stop_sent(&record.root, "sc-1").unwrap();
+        assert_eq!(store.find(&record.root).unwrap().unwrap().queued_stops, ["sc-2"]);
+        let older = serde_json::to_value(&record).unwrap();
+        assert!(older.get("queued_stops").is_none(), "an empty list is not written");
+        assert_eq!(
+            serde_json::from_value::<RemoteProject>(older).unwrap().queued_stops,
+            Vec::<String>::new()
+        );
+        assert_eq!(
+            store.queue_stop(Path::new("/srv/other"), "sc-3").unwrap_err().kind(),
+            io::ErrorKind::NotFound
+        );
+    }
+
     fn record() -> RemoteProject {
         RemoteProject {
             version: 1,
@@ -206,6 +471,7 @@ mod tests {
             helper_version: "0.3.0".into(),
             sync: None,
             created_at: 42,
+            queued_stops: Vec::new(),
         }
     }
 
@@ -219,6 +485,35 @@ mod tests {
             sidecars: BTreeMap::from([("1234567".into(), "b".repeat(64))]),
             consented: true,
         }
+    }
+
+    /// The records are listed oldest first; a host record is not a project, and a damaged file is said, not fatal.
+    #[test]
+    fn every_project_record_is_listed() {
+        let store = store();
+        assert_eq!(store.list().unwrap(), (Vec::new(), Vec::new()));
+        let first = record();
+        let mut second = record();
+        second.root = "/srv/other".into();
+        second.created_at = 50;
+        store.save(&second).unwrap();
+        store.save(&first).unwrap();
+        store.save_host(&host_record()).unwrap();
+        let damaged = store
+            .dir()
+            .unwrap()
+            .join(format!("{}.json", project_key(Path::new("/srv/third"))));
+        agent::private_fs::write_private(&damaged, b"{").unwrap();
+        let (projects, unreadable) = store.list().unwrap();
+        assert_eq!(projects, [first, second]);
+        assert_eq!(unreadable.len(), 1);
+        assert!(unreadable[0].contains(&damaged.display().to_string()));
+        assert!(store.forget_host("SHA256:example").unwrap());
+        assert!(!store.forget_host("SHA256:example").unwrap());
+        assert_eq!(
+            RemoteProjects::new(None, None).list().unwrap(),
+            (Vec::new(), Vec::new())
+        );
     }
 
     #[test]
@@ -289,14 +584,12 @@ mod tests {
         );
         assert_eq!(store.find(&record.root).unwrap(), Some(record.clone()));
         assert_eq!(store.find(Path::new("/srv/other")).unwrap(), None);
-        for change in ["version", "unknown"] {
-            let mut value = serde_json::to_value(&record).unwrap();
-            value[change] = serde_json::json!(2);
-            agent::private_fs::write_private(&path, &serde_json::to_vec(&value).unwrap()).unwrap();
-            let err = store.find(&record.root).unwrap_err();
-            assert_eq!(err.kind(), io::ErrorKind::InvalidData);
-            assert!(err.to_string().contains(&path.display().to_string()));
-        }
+        let mut value = serde_json::to_value(&record).unwrap();
+        value["version"] = serde_json::json!(2);
+        agent::private_fs::write_private(&path, &serde_json::to_vec(&value).unwrap()).unwrap();
+        let err = store.find(&record.root).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains(&path.display().to_string()));
         let mut bad = record.clone();
         bad.version = 2;
         assert!(store.save(&bad).is_err());
@@ -343,15 +636,46 @@ mod tests {
         assert_eq!(store.host(&host.host_key_sha256).unwrap(), Some(host.clone()));
         let path = store.host_path(&host.host_key_sha256).unwrap();
         assert_eq!(path.metadata().unwrap().permissions().mode() & 0o777, 0o600);
-        for change in ["version", "unknown"] {
-            let mut value = serde_json::to_value(&host).unwrap();
-            value[change] = serde_json::json!(2);
-            agent::private_fs::write_private(&path, &serde_json::to_vec(&value).unwrap()).unwrap();
-            assert_eq!(
-                store.host(&host.host_key_sha256).unwrap_err().kind(),
-                io::ErrorKind::InvalidData
-            );
-        }
+        let mut value = serde_json::to_value(&host).unwrap();
+        value["version"] = serde_json::json!(2);
+        agent::private_fs::write_private(&path, &serde_json::to_vec(&value).unwrap()).unwrap();
+        assert_eq!(
+            store.host(&host.host_key_sha256).unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
+    }
+
+    /// A later build may add a field to either record: this build reads past it, so the project still opens and its
+    /// stops can still be kept. A field this build needs stays required.
+    #[test]
+    fn records_with_a_later_builds_field_still_read_and_a_missing_field_is_refused() {
+        let store = store();
+        let record = record();
+        store.save(&record).unwrap();
+        let path = store.project_path(&record.root).unwrap();
+        let mut value = serde_json::to_value(&record).unwrap();
+        value["added_later"] = serde_json::json!({ "any": "shape" });
+        agent::private_fs::write_private(&path, &serde_json::to_vec(&value).unwrap()).unwrap();
+        assert_eq!(store.find(&record.root).unwrap(), Some(record.clone()));
+        store.queue_stop(&record.root, "sc-1").unwrap();
+        assert_eq!(store.find(&record.root).unwrap().unwrap().queued_stops, ["sc-1"]);
+        value.as_object_mut().unwrap().remove("helper_version");
+        agent::private_fs::write_private(&path, &serde_json::to_vec(&value).unwrap()).unwrap();
+        assert_eq!(store.find(&record.root).unwrap_err().kind(), io::ErrorKind::InvalidData);
+
+        let host = host_record();
+        store.save_host(&host).unwrap();
+        let path = store.host_path(&host.host_key_sha256).unwrap();
+        let mut value = serde_json::to_value(&host).unwrap();
+        value["added_later"] = serde_json::json!(2);
+        agent::private_fs::write_private(&path, &serde_json::to_vec(&value).unwrap()).unwrap();
+        assert_eq!(store.host(&host.host_key_sha256).unwrap(), Some(host.clone()));
+        value.as_object_mut().unwrap().remove("consented");
+        agent::private_fs::write_private(&path, &serde_json::to_vec(&value).unwrap()).unwrap();
+        assert_eq!(
+            store.host(&host.host_key_sha256).unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
     }
 
     #[test]

@@ -20,6 +20,12 @@
 #                          the agents every open window shares: a table, one JSON view, or a stream
 #   eitri remote COMMAND   remote control from a phone: serve, stop, status, add-device, devices,
 #                            revoke, grant, ssh-key (eitri remote --help lists them)
+#   eitri host open HOST:/srv/p
+#                          record a project on a server (asks before it trusts a host key or installs
+#                            anything there); also host status, list, stop HOST and uninstall HOST
+#   eitri --ssh HOST /srv/p
+#                          open that recorded project on the server in a window
+#   eitri --local /srv/p   open a recorded remote project's copy on this machine instead
 #   eitri --version        print the version and exit
 #   eitri sidecar status   what new tabs run, what is bundled, what is kept; no network
 #   eitri sidecar check    ask for the newest sidecar release; changes nothing
@@ -120,6 +126,14 @@ if [[ "${1:-}" == remote ]]; then
 	exec "$LIBDIR/shell" remote "$@"
 fi
 
+# `eitri host` opens no window and asks yes-or-no questions on this terminal (a host key ssh does not know, the
+# install on a server): it goes to the binary as typed, in the foreground with this terminal as its input, before the
+# banner and the option loop. Detached, every question would read end of input, which is a no.
+if [[ "${1:-}" == host ]]; then
+	shift
+	exec "$LIBDIR/shell" host "$@"
+fi
+
 # Handle setup before flag parsing: it opens no project or window. Invoke the POSIX installer
 # through sh so setup also works when the installed copy lacks its execute bit.
 # Explicit modes and help pass through once, unchanged: adding --sidecar-only would conflict with
@@ -178,6 +192,7 @@ FROM_DESKTOP=""
 NO_FORK=""
 CHOOSE=""
 FIRST=""
+SSH_GIVEN=""
 # Window mode keeps what was typed, in order: BEFORE is everything ahead of the user's `--` (a `+N`
 # stays a line spec there), AFTER everything behind it (all paths). shell resolves them.
 BEFORE=()
@@ -204,6 +219,13 @@ while [[ $# -gt 0 ]]; do
 		# Forwarded too: shell starts its nvim with --clean, the same as running it directly.
 		--clean)   [[ $MODE == window ]] || { echo "$CMD_NAME: unknown option --clean" >&2; exit 64; }
 		           SHELL_ARGS+=(--clean); shift ;;
+		# A project on a server opens in a window of its own; shell checks the host and that the project is recorded
+		# there. The other modes refuse both by name.
+		--ssh)     [[ $MODE == window ]] || { echo "$CMD_NAME: --ssh opens a remote project in a window of its own (eitri --ssh <host> <path>)" >&2; exit 64; }
+		           [[ -n "${2:-}" && "${2:-}" != -* ]] || { echo "$CMD_NAME: --ssh needs a host" >&2; exit 64; }
+		           SHELL_ARGS+=(--ssh "$2"); SSH_GIVEN=1; shift 2 ;;
+		--local)   [[ $MODE == window ]] || { echo "$CMD_NAME: --local opens a remote project's copy in a window of its own (eitri --local <path>)" >&2; exit 64; }
+		           SHELL_ARGS+=(--local); shift ;;
 		# The panel attaches to an nvim that is already running; there is nothing to attach to in the
 		# one-window mode, which starts its own.
 		--nvim)    [[ $MODE == panel || $MODE == page || $MODE == open ]] || { echo "$CMD_NAME: unknown option --nvim" >&2; exit 64; }
@@ -273,6 +295,9 @@ if [[ -n "$FROM_DESKTOP" && ${#BEFORE[@]} -eq 0 && ${#AFTER[@]} -eq 0 ]]; then
 	# The chooser needs no project yet, and must also start when the current directory is gone.
 	CHOOSE=1
 elif [[ $MODE == open ]]; then
+	:
+elif [[ $MODE == window && -n "$SSH_GIVEN" && ${#BEFORE[@]} -eq 0 && ${#AFTER[@]} -eq 0 ]]; then
+	# A project on a server is named by its path there; this machine's current directory is not one.
 	:
 elif [[ $MODE != window || (${#BEFORE[@]} -eq 0 && ${#AFTER[@]} -eq 0) ]]; then
 	# No positional (or panel/split, which take a directory only): the one directory, resolved here.
@@ -651,7 +676,7 @@ fi
 # same directory.
 if [[ ${#SHELL_ARGS[@]} -eq 0 && ${#BEFORE[@]} -gt 0 ]]; then
 	case "${BEFORE[0]}" in
-		open | panel | split | page | agents | remote | run-guard | linked-window | choose-project | attachment-decoder) BEFORE[0]="./${BEFORE[0]}" ;;
+		open | panel | split | page | agents | remote | host | run-guard | linked-window | choose-project | attachment-decoder) BEFORE[0]="./${BEFORE[0]}" ;;
 	esac
 fi
 if [[ -n "$SAW_DASHES" ]]; then

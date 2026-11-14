@@ -3,6 +3,110 @@
 
 use super::*;
 
+#[test]
+fn remote_tab_takes_no_review_snapshot() {
+    use crate::agent_bridge::SessionModeChoice;
+    use crate::remote_project::TabOrigin;
+    for remote in [true, false] {
+        let scratch = target_scratch("remote-tab-review");
+        let dir = scratch.join("project");
+        let review_dir = scratch.join("state/review");
+        let mut set = TabSet::new(BackendKind::Sidecar, SessionModeChoice::Manual);
+        if remote {
+            set.set_project_origin(TabOrigin::Remote {
+                host: "example-host".into(),
+                host_key_sha256: "SHA256:example".into(),
+                root: "/srv/project".into(),
+            })
+            .unwrap();
+        }
+        set.install_turn_review(crate::turn_review::TurnReview::with_options(
+            Some(review_dir.clone()),
+            &dir,
+            crate::turn_review::ReviewOptions {
+                excludes: Some(None),
+                trim_every: Duration::MAX,
+                ..Default::default()
+            },
+        ))
+        .unwrap();
+        let tab = set.active();
+        let provider = Arc::new(RecordingProvider::client_tooling());
+        let conversation =
+            AgentConversation::create(provider.clone(), &dir, agent::setting_sources::ProjectTrust::Untrusted).unwrap();
+        let backend = AgentBackend::Conversation {
+            agent: AgentId::Claude,
+            conversation: Box::new(conversation),
+        };
+        let session_id = "remote-review-session";
+        set.get_mut(tab).unwrap().set_backend(TabBackend::Live(backend));
+        provider.queue_all(vec![
+            AgentDomainEvent::SessionOpened {
+                session_id: "fake-session".into(),
+                provider_session_id: session_id.into(),
+                model: "m".into(),
+                cwd: dir.to_string_lossy().into_owned(),
+            },
+            AgentDomainEvent::TurnStarted {
+                turn_id: "remote-turn".into(),
+            },
+            AgentDomainEvent::PermissionRequested {
+                permission_id: "review-barrier".into(),
+                tool_use_id: Some("tu-review-barrier".into()),
+                tool_name: "Write".into(),
+                input: serde_json::json!({ "file_path": "new.rs", "content": "new" }),
+                provider_prompt: None,
+            },
+        ]);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            set.pump(&dir, true);
+            if set
+                .get(tab)
+                .unwrap()
+                .live()
+                .unwrap()
+                .projection()
+                .pending_permissions
+                .contains_key("review-barrier")
+            {
+                break;
+            }
+            assert!(Instant::now() < deadline);
+            std::thread::yield_now();
+        }
+        set.pump(&dir, true);
+        let review = set.turn_review().unwrap();
+        if remote {
+            assert!(review.turns(&session_id).is_empty());
+            assert!(!review.has_work_in_flight());
+            assert!(!review_dir.exists());
+            assert_eq!(
+                set.review_session(tab).err().as_deref(),
+                Some(crate::turn_review::REMOTE_UNAVAILABLE)
+            );
+        } else {
+            until("the local base snapshot", || {
+                set.pump(&dir, true);
+                set.turn_review()
+                    .unwrap()
+                    .turns(session_id)
+                    .first()
+                    .is_some_and(|turn| turn.base != crate::turn_review::Snap::Pending)
+            });
+            let turns = set.turn_review().unwrap().turns(session_id);
+            assert!(
+                matches!(turns[0].base, crate::turn_review::Snap::Taken { .. }),
+                "{turns:?}"
+            );
+            assert!(review_dir.exists());
+        }
+        if let TabBackend::Live(mut backend) = set.get_mut(tab).unwrap().set_backend(TabBackend::NotStarted) {
+            backend.shutdown();
+        }
+    }
+}
+
 /// A directory of a test's own inside the target dir (beside the test binary), never under the
 /// user's state directory.
 fn target_scratch(label: &str) -> PathBuf {

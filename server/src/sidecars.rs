@@ -84,11 +84,11 @@ impl Sidecars {
         for record in read_records(&paths) {
             let pidfd = pin_record(&record).ok().map(Arc::new);
             if pidfd.is_some() {
-                crate::audit::record(
+                let _ = crate::audit::record(
                     &paths.state,
                     "sidecar-adopt",
                     &format!("id={} pid={}", record.sidecar_id, record.pid),
-                )?;
+                );
             }
             entries.insert(
                 record.sidecar_id.clone(),
@@ -109,6 +109,33 @@ impl Sidecars {
             starts: Mutex::new(BTreeMap::new()),
             shutting_down: AtomicBool::new(false),
         })
+    }
+
+    #[cfg(test)]
+    pub(super) fn test_adopted_self(&self, id: &str, handshake: bool) {
+        let pid = std::process::id();
+        let record = Record {
+            pid,
+            start_time: start_time(pid).unwrap(),
+            socket: PathBuf::new(),
+            sidecar_id: id.into(),
+            root: "/srv/project".into(),
+            account: String::new(),
+            command_id: "adopted".into(),
+            started_unix_ms: 0,
+            ready: true,
+            failure: None,
+            exited_unix_ms: None,
+        };
+        self.entries.lock().unwrap().insert(
+            id.into(),
+            Arc::new(Mutex::new(Entry {
+                record,
+                pidfd: Some(Arc::new(pin(pid).unwrap())),
+                child: None,
+                handshake,
+            })),
+        );
     }
 
     pub fn set_environment(&self, captured: io::Result<Captured>) {
@@ -210,13 +237,13 @@ impl Sidecars {
     }
 
     pub async fn start(&self, request: StartSidecarRequest) -> Result<String, Status> {
+        self.start_with(request, |_| {}).await
+    }
+
+    async fn start_with(&self, request: StartSidecarRequest, after_spawn: impl FnOnce(u32)) -> Result<String, Status> {
         validate_request(&request)?;
         let root = open_root(&request.root)?;
-        let canonical_root = std::fs::read_link(format!("/proc/self/fd/{}", root.as_raw_fd()))
-            .map_err(internal)?
-            .into_os_string()
-            .into_string()
-            .map_err(|_| Status::invalid_argument("canonical root must be UTF-8"))?;
+        let canonical_root = canonical_root(&root)?;
         let serial = self.start_lock(&request.command_id);
         let _serial = serial.lock().await;
         if self.shutting_down.load(Ordering::SeqCst) {
@@ -231,7 +258,9 @@ impl Sidecars {
         }
         let binary = self
             .paths
-            .install(crate::REVISION)
+            .install
+            .as_ref()
+            .ok_or_else(|| Status::failed_precondition("the helper does not run from an installation"))?
             .join("sidecar")
             .join(&request.sidecar_revision)
             .join("verdandi-claude-sidecar");
@@ -288,9 +317,12 @@ impl Sidecars {
             let mut starting = Starting(Some(tokio::process::Command::from(command).spawn().map_err(internal)?));
             let pid = starting.0.as_ref().and_then(Child::id).expect("new child pid");
             let pidfd = pin(pid).map_err(internal)?;
+            after_spawn(pid);
             let record = Record {
                 pid,
-                start_time: start_time(pid).map_err(internal)?,
+                // This owned child has not been reaped, so even an exited leader still reserves its identity.
+                // Readiness reports an early exit with the same refusal regardless of when it happened.
+                start_time: identity_start_time(pid).map_err(internal)?,
                 socket: socket.clone(),
                 sidecar_id: id.clone(),
                 root: canonical_root,
@@ -658,11 +690,20 @@ fn validate_request(request: &StartSidecarRequest) -> Result<(), Status> {
     Ok(())
 }
 
-fn open_root(root: &str) -> Result<File, Status> {
+/// Whether an absolute `root` is in normal form: no empty, `.` or `..` component, so no doubled or trailing slash.
+pub(crate) fn in_normal_form(root: &[u8]) -> bool {
+    root == b"/"
+        || root
+            .split(|byte| *byte == b'/')
+            .skip(1)
+            .all(|part| !part.is_empty() && part != b"." && part != b"..")
+}
+
+pub(crate) fn open_root(root: &str) -> Result<File, Status> {
     if !root.starts_with('/') {
         return Err(Status::invalid_argument("root must be absolute"));
     }
-    if root != "/" && root.split('/').skip(1).any(|s| s.is_empty() || s == "." || s == "..") {
+    if !in_normal_form(root.as_bytes()) {
         return Err(Status::invalid_argument("root must be in normal form"));
     }
     let mut dir = private_fs::open_dir(Path::new("/")).map_err(internal)?;
@@ -684,6 +725,16 @@ fn open_root(root: &str) -> Result<File, Status> {
         return Err(Status::invalid_argument("root must be owned by the daemon's uid"));
     }
     Ok(dir)
+}
+
+/// The path the kernel gives the directory `root` holds, resolved through every link: what a sidecar started in
+/// it records as its root.
+pub(crate) fn canonical_root(root: &File) -> Result<String, Status> {
+    std::fs::read_link(format!("/proc/self/fd/{}", root.as_raw_fd()))
+        .map_err(internal)?
+        .into_os_string()
+        .into_string()
+        .map_err(|_| Status::invalid_argument("canonical root must be UTF-8"))
 }
 
 unsafe fn child_setup(root_fd: i32, umask: libc::mode_t) -> io::Result<()> {
@@ -1051,6 +1102,104 @@ pub async fn handshake(socket: &Path, pid: u32) -> io::Result<()> {
         .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "sidecar handshake timed out"))?
 }
 
+/// A refusing record remains available to explain why removal cannot safely proceed.
+pub(crate) struct RefusingRecord {
+    pub id: String,
+    pub pid: Option<u32>,
+    pub status: &'static str,
+    pub error: Option<String>,
+}
+
+/// Collection keeps artifacts needed to adopt a surviving sidecar even while its daemon is gone.
+pub(crate) fn recorded_alive_in(run: &Path) -> io::Result<bool> {
+    recorded_alive_with(run, identity_start_time)
+}
+
+fn recorded_alive_with(run: &Path, stat: impl Fn(u32) -> io::Result<u64>) -> io::Result<bool> {
+    let records = refusing_records_with(run, stat)?;
+    if let Some(record) = records.iter().find(|record| record.status == "unreadable") {
+        return Err(io::Error::other(
+            record.error.clone().unwrap_or_else(|| "unreadable sidecar".into()),
+        ));
+    }
+    Ok(!records.is_empty())
+}
+
+pub(crate) fn refusing_records_in(run: &Path) -> io::Result<Vec<RefusingRecord>> {
+    refusing_records_with(run, identity_start_time)
+}
+
+fn refusing_records_with(run: &Path, stat: impl Fn(u32) -> io::Result<u64>) -> io::Result<Vec<RefusingRecord>> {
+    let entries = match std::fs::read_dir(run) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error),
+    };
+    let mut refusing = Vec::new();
+    for entry in entries {
+        let entry = entry?;
+        let name = entry.file_name();
+        let Some(id) = name
+            .to_str()
+            .and_then(|name| name.strip_prefix("sc-"))
+            .and_then(|name| name.strip_suffix(".pid"))
+        else {
+            continue;
+        };
+        if id.len() != 16 || !id.bytes().all(|b| b.is_ascii_hexdigit()) {
+            continue;
+        }
+        let mut pid = None;
+        let alive = (|| {
+            let bytes = private_fs::read_private_nofollow_bytes_capped(&entry.path(), 64 * 1024)?;
+            let record: Record = serde_json::from_slice(&bytes)?;
+            pid = Some(record.pid);
+            record_alive_with(&record, &stat)
+        })();
+        match alive {
+            Ok(false) => {}
+            result => refusing.push(RefusingRecord {
+                id: id.into(),
+                pid,
+                status: if result.is_ok() { "alive" } else { "unreadable" },
+                error: result.err().map(|error| error.to_string()),
+            }),
+        }
+    }
+    Ok(refusing)
+}
+
+fn record_alive_with(record: &Record, stat: &impl Fn(u32) -> io::Result<u64>) -> io::Result<bool> {
+    record_alive_readers(record, stat, &|fd| signal(fd, 0))
+}
+
+fn record_alive_readers(
+    record: &Record,
+    stat: &impl Fn(u32) -> io::Result<u64>,
+    ownership: &impl Fn(&OwnedFd) -> io::Result<()>,
+) -> io::Result<bool> {
+    let fd = match pin(record.pid) {
+        Ok(fd) => fd,
+        Err(error) if error.raw_os_error() == Some(libc::ESRCH) => return Ok(false),
+        Err(error) => return Err(error),
+    };
+    if exited(&fd)? {
+        return Ok(false);
+    }
+    match stat(record.pid) {
+        Ok(start) => Ok(start == record.start_time),
+        // A same-uid process can hide its stat by becoming non-dumpable. Check signal permission
+        // independently while the pidfd pins it; uncertainty must preserve adoption records.
+        Err(error) if matches!(error.raw_os_error(), Some(libc::ENOENT | libc::EACCES)) => match ownership(&fd) {
+            Ok(()) => Ok(true),
+            Err(error) if error.raw_os_error() == Some(libc::EPERM) => Ok(false),
+            Err(error) => Err(error),
+        },
+        Err(_) if exited(&fd)? => Ok(false),
+        Err(error) => Err(error),
+    }
+}
+
 fn read_records(paths: &Paths) -> Vec<Record> {
     let metadata_run = paths.metadata_run();
     let run_dir = &paths.run;
@@ -1159,6 +1308,48 @@ mod tests {
     }
 
     #[test]
+    fn hidden_same_uid_pids_preserve_their_adoption_records() {
+        let scratch = Scratch::new();
+        let pid = std::process::id();
+        let record = serde_json::json!({"pid": pid, "start_time": identity_start_time(pid).unwrap(), "socket": ""});
+        private_fs::write_private(
+            &scratch.0.join("sc-0123456789abcdef.pid"),
+            &serde_json::to_vec(&record).unwrap(),
+        )
+        .unwrap();
+        for errno in [libc::ENOENT, libc::EACCES] {
+            assert!(recorded_alive_with(&scratch.0, |_| Err(io::Error::from_raw_os_error(errno))).unwrap());
+        }
+        assert!(recorded_alive_with(&scratch.0, |_| Err(io::Error::from_raw_os_error(libc::EIO))).is_err());
+        assert!(recorded_alive_with(&scratch.0, identity_start_time).unwrap());
+        assert!(!recorded_alive_with(&scratch.0, |_| Ok(0)).unwrap());
+    }
+
+    #[test]
+    fn hidden_identity_checks_ownership_independently() {
+        let pid = std::process::id();
+        let record: Record = serde_json::from_value(serde_json::json!({
+            "pid": pid, "start_time": identity_start_time(pid).unwrap(), "socket": ""
+        }))
+        .unwrap();
+        for errno in [libc::ENOENT, libc::EACCES] {
+            let stat = |_| Err(io::Error::from_raw_os_error(errno));
+            assert!(record_alive_readers(&record, &stat, &|_| Ok(())).unwrap());
+            assert!(
+                !record_alive_readers(&record, &stat, &|_| Err(io::Error::from_raw_os_error(libc::EPERM))).unwrap()
+            );
+            for failure in [libc::EIO, libc::ESRCH, libc::EACCES] {
+                assert_eq!(
+                    record_alive_readers(&record, &stat, &|_| Err(io::Error::from_raw_os_error(failure)))
+                        .unwrap_err()
+                        .raw_os_error(),
+                    Some(failure)
+                );
+            }
+        }
+    }
+
+    #[test]
     fn process_start_time_ignores_arbitrary_bytes_in_the_name() {
         let mut stat = b"42 (name ) with \xff\n) S".to_vec();
         for n in 4..=21 {
@@ -1199,17 +1390,19 @@ mod tests {
     fn checked_executable_stays_the_same_after_an_install_replacement() {
         let scratch = Scratch::new();
         let path = scratch.0.join("sidecar");
-        std::fs::copy("/bin/true", &path).unwrap();
+        crate::daemon::test_exec::install_executable(Path::new("/bin/true"), &path);
         let hash = format!("{:x}", Sha256::digest(std::fs::read(&path).unwrap()));
         let executable = checked_binary(&path, &hash).unwrap();
         std::fs::rename(&path, scratch.0.join("old")).unwrap();
-        std::fs::copy("/bin/false", &path).unwrap();
+        crate::daemon::test_exec::install_executable(Path::new("/bin/false"), &path);
         assert!(checked_binary(&path, &hash).is_err());
         assert!(
-            std::process::Command::new(format!("/proc/self/fd/{}", executable.as_raw_fd()))
-                .status()
-                .unwrap()
-                .success()
+            crate::daemon::test_exec::status(&mut std::process::Command::new(format!(
+                "/proc/self/fd/{}",
+                executable.as_raw_fd()
+            )))
+            .unwrap()
+            .success()
         );
     }
 
@@ -1258,7 +1451,7 @@ mod tests {
     }
 
     fn manager(scratch: &Scratch) -> Sidecars {
-        let paths = Paths::new(
+        let mut paths = Paths::new(
             "test",
             &scratch.0.join("d"),
             &scratch.0.join("s"),
@@ -1266,12 +1459,52 @@ mod tests {
         )
         .unwrap();
         paths.prepare().unwrap();
+        paths.install = Some(scratch.0.join("d/eitri-server/test-0123456"));
         let manager = Sidecars::new(paths).unwrap();
         manager.set_environment(Ok(Captured {
             env: login_env::Environment::new(),
             fallback: None,
         }));
         manager
+    }
+
+    #[tokio::test]
+    async fn an_owned_child_exiting_before_publication_keeps_the_startup_refusal() {
+        let scratch = short_scratch();
+        let manager = manager(&scratch);
+        let installed = manager.paths.install.as_ref().unwrap().join("sidecar/test-rev");
+        private_fs::create_private_dir_all(&installed, &manager.paths.data).unwrap();
+        let executable = installed.join("verdandi-claude-sidecar");
+        crate::daemon::test_exec::install_executable(Path::new("/bin/false"), &executable);
+        let error = manager
+            .start_with(
+                StartSidecarRequest {
+                    root: scratch.0.to_str().unwrap().into(),
+                    command_id: "early-exit".into(),
+                    sidecar_revision: "test-rev".into(),
+                    sidecar_sha256: format!("{:x}", Sha256::digest(std::fs::read(executable).unwrap())),
+                    ..Default::default()
+                },
+                |pid| {
+                    let fd = pin(pid).unwrap();
+                    let mut poll = libc::pollfd {
+                        fd: fd.as_raw_fd(),
+                        events: libc::POLLIN,
+                        revents: 0,
+                    };
+                    // SAFETY: poll gets one initialized descriptor; the timeout only guards a hung child.
+                    assert_eq!(unsafe { libc::poll(&mut poll, 1, 15_000) }, 1);
+                },
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), tonic::Code::Unavailable, "{error:?}");
+        assert_eq!(error.message(), "sidecar exited before binding");
+        let records = read_records(&manager.paths);
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].failure.as_deref(), Some(error.message()));
+        assert!(!manager.any_alive());
+        assert!(manager.snapshot()[0].lock().unwrap().child.is_none());
     }
 
     fn record(id: &str) -> Record {

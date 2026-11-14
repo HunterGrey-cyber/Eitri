@@ -13,6 +13,7 @@ fn files() -> Vec<String> {
         "core/src/tab_set.rs",
         "core/src/tab_set/moving.rs",
         "core/src/tab_set/remote_turns.rs",
+        "core/src/tab_set/desk_sends.rs",
         "core/src/agent_backend.rs",
     ]
     .map(String::from)
@@ -31,10 +32,10 @@ const SEND_METHODS: &[&str] = &[
     "send_turn_as_spawned",
 ];
 
-/// The eight places a turn leaves for an agent, each of which this scan must find: the tab set's three (its
+/// The nine places a turn leaves for an agent, each of which this scan must find: the tab set's four (its
 /// queue, which carries a typed prompt, a queue flush at a turn's end, a review message and a resumed
-/// session's prompt; a new session's first message; and a phone's message, whose provider call runs off the
-/// tick), the legacy session's and the sidecar conversation's turn (sent in place, or with the provider's
+/// session's prompt; a new session's first message; a phone's message, whose provider call runs off the
+/// tick; and the desk's turn of a remote tab, whose provider call runs off the tick too), the legacy session's and the sidecar conversation's turn (sent in place, or with the provider's
 /// call on a thread of its own), a Claude turn sent through the mode-carrying door, and an external agent's
 /// (a Codex `turn/start`, an ACP `session/prompt`).
 const SENDS: &[(&str, &str)] = &[
@@ -61,6 +62,10 @@ const SENDS: &[(&str, &str)] = &[
     ),
     (
         "core/src/tab_set/remote_turns.rs",
+        "backend.send_turn_spawned(request, answered)",
+    ),
+    (
+        "core/src/tab_set/desk_sends.rs",
         "backend.send_turn_spawned(request, answered)",
     ),
     (

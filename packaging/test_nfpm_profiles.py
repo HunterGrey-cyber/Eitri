@@ -16,6 +16,7 @@ These tests read the two YAML files as data; they never invoke `nfpm` (no binary
 `./dist/*` -- that do not exist until `release.sh`/`publish.sh` run).
 """
 
+import hashlib
 import os
 import re
 import unittest
@@ -182,13 +183,14 @@ def _contents_by_dst(doc):
     return {entry["dst"]: entry for entry in doc.get("contents", [])}
 
 
-# The five binaries every release ships; no legacy agent-hook.
+# The six binaries every release ships; no legacy agent-hook.
 
 RELEASE_BINARY_DSTS = {
     "/usr/lib/eitri/shell",
     "/usr/lib/eitri/eitri-tmux-shim",
     "/usr/lib/eitri/eitri-run-guard",
     "/usr/lib/eitri/eitri-editor-bridge",
+    "/usr/lib/eitri/eitri-server",
     "/usr/lib/eitri/eitri-claude-handoff",
 }
 
@@ -268,7 +270,7 @@ class NeitherProfileNamesAgentHook(unittest.TestCase):
                 self.assertNotIn("agent-hook", entry["src"], (path, entry))
                 self.assertNotIn("agent-hook", entry["dst"], (path, entry))
 
-    def test_the_five_binaries_are_at_the_same_dsts_in_both_profiles(self):
+    def test_the_six_binaries_are_at_the_same_dsts_in_both_profiles(self):
         public_dsts = set(_contents_by_dst(_load_yaml(PUBLIC_PATH)))
         private_dsts = set(_contents_by_dst(_load_yaml(PRIVATE_PATH)))
         self.assertTrue(RELEASE_BINARY_DSTS <= public_dsts, public_dsts)
@@ -623,6 +625,14 @@ class RealPackagesCarryTheProfileWhereTheySay(unittest.TestCase):
                 else:
                     with open(src, "w") as f:
                         f.write(f"stand-in for {entry['src']}\n")
+            helper = os.path.join(stage, "target/release/eitri-server")
+            with open(helper, "rb") as f:
+                baked_hash = hashlib.sha256(f.read()).hexdigest()
+            # This stand-in tests package byte preservation; release.sh checks the real build hash.
+            shell = os.path.join(stage, "target/release/shell")
+            with open(shell, "w") as f:
+                f.write(f"#!/bin/sh\n[ \"$1\" = --server-helper-hash ] || exit 9\nprintf '%s\\n' '{baked_hash}'\n")
+            os.chmod(shell, 0o755)
             env = {**os.environ, "VERSION": "1.0.0-rc.1", "EITRI_SOURCE_URL": "https://example.com/source"}
             for packager in packagers:
                 out = os.path.join(cls.work, f"{label}.{packager}")
@@ -637,6 +647,20 @@ class RealPackagesCarryTheProfileWhereTheySay(unittest.TestCase):
         control = out + ".control"
         self.sh(["dpkg-deb", "-e", out, control])
         return x, control
+
+    def test_packaged_helper_is_the_built_one(self):
+        for (label, packager), out in self.built.items():
+            with self.subTest(profile=label, format=packager):
+                if packager == "deb":
+                    root, _ = self._deb(label)
+                else:
+                    root = out + ".helper-x"
+                    os.makedirs(root)
+                    self.sh(["bsdtar", "-xf", out, "-C", root])
+                lib = os.path.join(root, "usr/lib/eitri")
+                baked = self.sh([os.path.join(lib, "shell"), "--server-helper-hash"], text=True).stdout.strip()
+                with open(os.path.join(lib, "eitri-server"), "rb") as f:
+                    self.assertEqual(hashlib.sha256(f.read()).hexdigest(), baked)
 
     def test_the_debs_carry_the_profile_as_a_conffile_and_no_maintainer_script(self):
         with open(os.path.join(_HERE, "apparmor", "eitri"), "rb") as f:

@@ -493,8 +493,11 @@ pub(super) fn reset_tab(state: &mut AgentPanelState, tab: TabId, view: ViewId, r
     // A session its agent stopped with the conversation whole is continued in the same tab, not
     // left for a second `r` on the start screen.
     let continued = state.tabs.resumes_on_r(tab);
+    // A saved remote agent the tab never reached (its reattach failed) has nothing that ends it: its stop is kept.
+    let unreached = super::remote_tabs::unreached_agent(state, tab);
     match state.tabs.reset(tab) {
         Ok(old) => {
+            super::remote_tabs::keep_unreached(state, unreached);
             // A wait an earlier `r` left for this tab is over: its start did not happen.
             state.resume_after.remove(&tab);
             if let Some(old) = old {
@@ -738,12 +741,7 @@ pub(super) fn handle_inbound_message(
                 // closes.
                 reset_nav_mode_for_ready(state, view);
                 let agent = hello_agent(state, view);
-                let greeting = BackendGreeting::for_agent_titled(
-                    state.backend_kind,
-                    &agent,
-                    state.project_dir.clone(),
-                    eitri_core::agent_backend::Titles::Cached(&state.titles),
-                );
+                let greeting = super::detail::greeting_for_view(state, view);
                 let open = state.tabs.open_sessions();
                 let theme = eitri_core::agent_bridge::serialize_theme_for_js(&state.theme);
                 let context =
@@ -804,10 +802,20 @@ pub(super) fn handle_inbound_message(
                     state.choose_project_hook.is_some(),
                 );
                 // Why the folder is no boundary: a fact about the window, said again to every document,
-                // right after the greeting it belongs with.
-                if let Some(note) = &state.root_note {
-                    payloads.insert(1, eitri_core::agent_bridge::serialize_root_note_for_js(note));
-                }
+                // right after the greeting it belongs with; then the shown tab's own note, if it has one, which
+                // the page draws over the window's while that tab is shown.
+                let notes: Vec<String> = state
+                    .root_note
+                    .as_deref()
+                    .map(eitri_core::agent_bridge::serialize_root_note_for_js)
+                    .into_iter()
+                    .chain(
+                        state
+                            .tab_of_page(view)
+                            .and_then(|tab| super::routing::tab_root_note(state, tab)),
+                    )
+                    .collect();
+                payloads.splice(1..1, notes);
                 // The status-band hints the replaced document was showing, of this view's tabs.
                 for hint in hints_for_new_document(state, view) {
                     payloads.push(eitri_core::agent_bridge::serialize_review_hint_for_js(&hint));
@@ -841,6 +849,8 @@ pub(super) fn handle_inbound_message(
             // tab) is held back by `send_mode_note`; this is the first moment it can be said, after
             // the `tabs` that shows the tab. Taking it clears it, so a later `tabs` does not repeat it.
             send_mode_note(state, &mut out);
+            // The remote questions open for this page's tabs: the document that was here took them with it.
+            super::remote_tabs::resend_open_questions(state, view, &mut out);
             ok(&mut out);
             // The interrupted reverts, offered once the base page can show them (and again after a
             // reload). They are the window's, so only the base page offers them.
@@ -857,8 +867,7 @@ pub(super) fn handle_inbound_message(
             let asked = match state.tab_of_page(view) {
                 Some(tab) => {
                     state.trust.hide(tab);
-                    let profile = waiting_profile(state, tab);
-                    state.trust.begin_check(&profile);
+                    refresh_trust(state, tab);
                     reroute_or_ask(state, tab)
                 }
                 None => Outbox::default(),
@@ -1009,6 +1018,10 @@ pub(super) fn handle_inbound_message(
                 refuse(&mut out, "the previous session is still being handed off to a terminal");
                 return out;
             }
+            if state.tabs.get(tab).is_some_and(|tab| tab.is_remote()) {
+                refuse(&mut out, super::detail::REMOTE_RESUME_UNAVAILABLE);
+                return out;
+            }
             let canonical = state.canonical_project_dir.clone();
             // The session is the tab's agent's: its lease is under that agent's name.
             let agent = state.tabs.get(tab).map_or(AgentId::Claude, |t| t.agent().clone());
@@ -1052,9 +1065,18 @@ pub(super) fn handle_inbound_message(
         }
         InboundMessage::Interrupt { .. } => {
             let tab = tab_of(target);
-            // The desk's `!` line is the desk's to stop first; only then the agent's work.
+            // The desk's `!` line is the desk's to stop first; only then the agent's work. A remote tab's interrupt
+            // crosses the network, so it is asked off this thread and its command answered once the provider has.
             let outcome = if state.tabs.interrupt_shell_line(tab) {
                 Ok(())
+            } else if state.tabs.sends_off_thread(tab) {
+                match state.tabs.interrupt_spawned(tab) {
+                    Ok(number) => {
+                        state.owed.owe(view, &request_id, Owed::Interrupt(number));
+                        return out;
+                    }
+                    Err(error) => Err(error),
+                }
             } else {
                 interrupt_agent(state, tab)
             };
@@ -1262,6 +1284,10 @@ pub(super) fn handle_inbound_message(
         }
         InboundMessage::HandoffToTerminal { .. } => {
             let tab = tab_of(target);
+            if state.tabs.get(tab).is_some_and(|tab| tab.is_remote()) {
+                refuse(&mut out, "terminal handoff is not available on remote tabs yet");
+                return out;
+            }
             // Its session is the move's: handed to a terminal, the window it lands in would hold a
             // closed one.
             if state.tabs.is_moving(tab) {
@@ -1364,7 +1390,7 @@ pub(super) fn handle_inbound_message(
             // shutdown has returned, and a panic inside `shutdown()` reads as a failed close
             // (`collect_pending_handoffs`). The drop that ends the child comes later; the command is
             // deliberately NOT made to wait for it, but a window closing at this moment is.
-            let Teardown { closed, dropped } = spawn_teardown(retired);
+            let Teardown { closed, dropped, .. } = spawn_teardown(retired);
             if let Some(t) = state.tabs.get_mut(tab) {
                 // The page that asked holds the request, wherever the tab is when the close ends.
                 state.owed.owe(view, &request_id, Owed::Handoff(tab));
@@ -1470,6 +1496,11 @@ pub(super) fn handle_inbound_message(
         }
         InboundMessage::RunShell { text, .. } => {
             let tab = tab_of(target);
+            // Eitri runs a line on this machine; a remote tab's agent works on the server's copy of the project.
+            if state.tabs.get(tab).is_some_and(|t| t.is_remote()) {
+                refuse(&mut out, eitri_core::tab_set::SHELL_LINES_REMOTE_UNAVAILABLE);
+                return out;
+            }
             remember_prompts(state, std::slice::from_ref(&text), &mut out);
             if state.mention_sections.is_none() {
                 state.tabs.note_sent(tab);
@@ -1573,6 +1604,13 @@ pub(super) fn handle_inbound_message(
                 Err(why) => refuse(&mut out, &why),
             }
         }
+        InboundMessage::RootNoteDismissed { text, .. } => {
+            let tab = tab_of(target);
+            if let Some(t) = state.tabs.get_mut(tab) {
+                t.dismiss_root_note(&text);
+            }
+            ok(&mut out);
+        }
         InboundMessage::TakeBackQueue { .. } => {
             let tab = tab_of(target);
             let drafts = state.tabs.take_back_queue(tab);
@@ -1652,6 +1690,10 @@ pub(super) fn handle_inbound_message(
                 Ok(eitri_core::tab_set::SendNow::Interrupting(outcome)) => {
                     send_queue(state, tab, &mut out);
                     apply_command_outcome(state, screen, view, tab, &request_id, outcome, &mut out);
+                }
+                Ok(eitri_core::tab_set::SendNow::InterruptOut(number)) => {
+                    send_queue(state, tab, &mut out);
+                    state.owed.owe(view, &request_id, Owed::Interrupt(number));
                 }
                 Ok(eitri_core::tab_set::SendNow::Flushed(flush)) => {
                     if let Some(flush) = flush {
@@ -2001,7 +2043,7 @@ pub(super) fn handle_inbound_message(
             let ids = state.tabs.close_others_plan().map_or_else(Vec::new, |(ids, _)| ids);
             let mut first_err = None;
             for id in ids {
-                if let Err(why) = close_tab(state, id, &mut out) {
+                if let Err(why) = super::remote_tabs::close_tab_unasked(state, id, &mut out) {
                     first_err.get_or_insert(why);
                 }
             }
@@ -2091,6 +2133,13 @@ pub(super) fn handle_inbound_message(
             );
             let answered = answered.settled(state, screen);
             out.extend(answered);
+        }
+        InboundMessage::RemotePromptAnswer { nonce, action, .. } => {
+            let tab = tab_of(target);
+            if let Err(why) = super::remote_tabs::answer_prompt(state, tab, nonce, action, &request_id, view, &mut out)
+            {
+                refuse(&mut out, &why);
+            }
         }
         InboundMessage::TrustCancel { nonce, .. } => {
             let tab = tab_of(target);
@@ -2760,6 +2809,117 @@ mod tests {
         handle.page_message(ViewId::BASE, &message("run_shell", "r1", tab, "!"));
         assert!(matches!(result_for(&page.sent.borrow(), "r1"), Some(Err(_))));
         assert!(!handle.state.borrow().tabs.shell_line_runs(tab));
+        shut_down_every_tab(&handle);
+    }
+
+    fn remote_origin() -> eitri_core::remote_project::TabOrigin {
+        eitri_core::remote_project::TabOrigin::Remote {
+            host: "example-host".into(),
+            host_key_sha256: "SHA256:example".into(),
+            root: "/srv/project".into(),
+        }
+    }
+
+    /// A tab of a remote window over `provider`, standing for an agent on a server whose link is up.
+    fn remote_live_tab(
+        handle: &AgentPanelHandle,
+        dir: &std::path::Path,
+        provider: RecordingProvider,
+    ) -> (TabId, std::sync::Arc<RecordingProvider>) {
+        let provider = std::sync::Arc::new(provider);
+        let conversation =
+            agent::AgentConversation::create(provider.clone(), dir, agent::setting_sources::ProjectTrust::Untrusted)
+                .unwrap();
+        provider.set_link(Some(agent::RemoteLinkState::Live));
+        let mut state = handle.state.borrow_mut();
+        state.tabs.set_project_origin(remote_origin()).unwrap();
+        let tab = state.tabs.open(AgentId::Claude);
+        state
+            .tabs
+            .get_mut(tab)
+            .unwrap()
+            .set_backend(TabBackend::Live(AgentBackend::Conversation {
+                agent: AgentId::Claude,
+                conversation: Box::new(conversation),
+            }));
+        (tab, provider)
+    }
+
+    /// A `!` line would run in this machine's copy of the project, not on the server: a remote tab refuses it, live or
+    /// not started yet, and nothing runs or starts.
+    #[test]
+    fn a_bang_line_in_a_remote_tab_is_refused() {
+        agent::state_dirs::redirect_state_to_a_test_root();
+        let dir = agent::state_dirs::test_workspace_dir("panel-shell-remote");
+        let (handle, page, _second) = handle_with_two_pages();
+        handle.state.borrow_mut().project_dir = dir.clone();
+        let (tab, provider) = remote_live_tab(&handle, &dir, RecordingProvider::default());
+        handle.tick();
+        handle.page_message(ViewId::BASE, &message("run_shell", "r1", tab, "!true"));
+        assert_eq!(
+            result_for(&page.sent.borrow(), "r1"),
+            Some(Err(eitri_core::tab_set::SHELL_LINES_REMOTE_UNAVAILABLE.to_string()))
+        );
+        assert!(!handle.state.borrow().tabs.shell_line_runs(tab));
+        let fresh = handle.state.borrow_mut().tabs.open(AgentId::Claude);
+        handle.page_message(ViewId::BASE, &message("run_shell", "r2", fresh, "!true"));
+        assert_eq!(
+            result_for(&page.sent.borrow(), "r2"),
+            Some(Err(eitri_core::tab_set::SHELL_LINES_REMOTE_UNAVAILABLE.to_string()))
+        );
+        assert!(
+            matches!(
+                handle.state.borrow().tabs.get(fresh).unwrap().backend(),
+                TabBackend::NotStarted
+            ),
+            "no session was started for it"
+        );
+        assert!(provider.turns().is_empty());
+        shut_down_every_tab(&handle);
+    }
+
+    /// Esc on a remote tab's running turn asks the provider off this thread: the page's command comes back once the
+    /// provider has answered, and nothing waits for it here.
+    #[test]
+    fn an_interrupt_of_a_remote_tab_never_waits_on_the_provider() {
+        agent::state_dirs::redirect_state_to_a_test_root();
+        let dir = agent::state_dirs::test_workspace_dir("panel-remote-interrupt");
+        let (handle, page, _second) = handle_with_two_pages();
+        handle.state.borrow_mut().project_dir = dir.clone();
+        let (tab, provider) = remote_live_tab(&handle, &dir, RecordingProvider::interruptible());
+        provider.queue(agent::AgentDomainEvent::TurnStarted { turn_id: "t1".into() });
+        tick_handle_until(&handle, "the turn", || handle.tab_has_work(tab));
+        let release = provider.hold_calls();
+        let (let_go, asked) = std::sync::mpsc::channel::<()>();
+        let released = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = released.clone();
+        std::thread::spawn(move || {
+            if asked.recv_timeout(std::time::Duration::from_secs(3)).is_err() {
+                flag.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+            drop(release);
+        });
+        handle.page_message(
+            ViewId::BASE,
+            &serde_json::json!({ "type": "interrupt", "request_id": "i1", "tab": tab.0 }).to_string(),
+        );
+        assert!(
+            !released.load(std::sync::atomic::Ordering::SeqCst),
+            "the interrupt came back while the provider waited"
+        );
+        handle.tick();
+        assert_eq!(
+            result_for(&page.sent.borrow(), "i1"),
+            None,
+            "answered once the provider has"
+        );
+        assert_eq!(provider.interrupts(), 0);
+        let _ = let_go.send(());
+        tick_handle_until(&handle, "the interrupt answered", || {
+            result_for(&page.sent.borrow(), "i1").is_some()
+        });
+        assert_eq!(result_for(&page.sent.borrow(), "i1"), Some(Ok(())));
+        assert_eq!(provider.interrupts(), 1);
         shut_down_every_tab(&handle);
     }
 

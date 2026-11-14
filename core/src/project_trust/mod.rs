@@ -45,7 +45,7 @@ pub use findings::{mcp_findings, settings_findings};
 pub use git_top::{git_top_level, GitWalk};
 pub use last_trusted::{ChangedText, Kept, NoDiff, MAX_KEPT_BYTES, MAX_KEPT_FILE_BYTES};
 pub use plan::{eitri_server_name, eitri_server_taken, trust_plan, EditorServerName, NonUtf8};
-pub use store::{civil_date, for_root, Diff, Remember, TrustState, TrustStore, DISCLOSURE};
+pub use store::{civil_date, for_root, Diff, Remember, RemoteRoot, TrustPlace, TrustState, TrustStore, DISCLOSURE};
 pub use text_diff::{question_diffs, FileDiff, Hunk, LineKind, TextDiff, MAX_QUESTION_ROWS};
 
 /// How much discovery may look at before it stops and says so.
@@ -255,6 +255,21 @@ impl Discovery {
     }
 }
 
+/// The discovery a server's helper made for `profile` and sent as JSON (`TrustScan`). One about
+/// another profile is refused: the record it would be checked against is that profile's.
+pub fn discovery_from_server(json: &[u8], profile: &Profile) -> Result<Discovery, String> {
+    let discovery: Discovery =
+        serde_json::from_slice(json).map_err(|error| format!("the server's trust scan could not be read: {error}"))?;
+    if discovery.profile != *profile {
+        return Err(format!(
+            "the server's trust scan was about {}, not {}",
+            discovery.profile.label(),
+            profile.label()
+        ));
+    }
+    Ok(discovery)
+}
+
 /// One thing found, relative to `top`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Entry {
@@ -414,6 +429,34 @@ pub enum Finding {
 #[cfg(test)]
 mod serialization_tests {
     use super::*;
+
+    /// A server's discovery reads back as it was made, and only for the profile it was asked for.
+    #[test]
+    fn a_servers_discovery_reads_back_for_its_profile_only() {
+        let scratch = crate::plugin::test_support::Scratch::new("trust-server-json");
+        let root = scratch.0.join("project");
+        std::fs::create_dir_all(root.join(".claude")).unwrap();
+        std::fs::write(
+            root.join(".claude/settings.json"),
+            r#"{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"echo hi"}]}]},"env":{"A":"1"}}"#,
+        )
+        .unwrap();
+        std::fs::write(root.join("CLAUDE.md"), "instructions\n").unwrap();
+        let found = discover(
+            &root,
+            Some(&scratch.0),
+            &Limits::default(),
+            &Profile::Claude,
+            &ProfileEnv::default(),
+        );
+        let json = serde_json::to_vec(&found).unwrap();
+        assert_eq!(discovery_from_server(&json, &Profile::Claude), Ok(found));
+        let other = discovery_from_server(&json, &Profile::Codex).unwrap_err();
+        assert_eq!(other, "the server's trust scan was about Claude, not Codex");
+        assert!(discovery_from_server(b"{", &Profile::Claude)
+            .unwrap_err()
+            .starts_with("the server's trust scan could not be read: "));
+    }
 
     #[test]
     fn discovery_json_refuses_non_utf8_paths_in_every_path_field() {

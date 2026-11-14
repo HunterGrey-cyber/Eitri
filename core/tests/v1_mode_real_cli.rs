@@ -883,7 +883,7 @@ fn host_answer_latency_in_bypass() {
         note_requests(&backend, &mut requests, &mut requested_at, before_ms);
         let delivery = backend
             .take_revised_ui_delivery(
-                &dir,
+                agent::GateRoot::Local(&dir),
                 &rules,
                 PermissionMode::Bypass,
                 &mut host_answered,

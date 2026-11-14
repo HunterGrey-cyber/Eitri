@@ -142,6 +142,7 @@
       "cwd": "/project",
       "history": null,
       "lastTurnEnding": null,
+      "linkState": null,
       "model": "gpt-test",
       "pendingPermissions": [],
       "provider": null,

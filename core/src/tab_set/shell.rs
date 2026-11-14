@@ -5,7 +5,7 @@
 //! does. A queue item is a line only if [`TabSet::queue_shell_line`] made it, which only the composer's Enter
 //! reaches. Everything else that starts with `!`, from anywhere, is text.
 
-use super::{wall_clock_ms, BackendError, Flush, Queued, TabId, TabSet};
+use super::{wall_clock_ms, BackendError, Flush, Queued, Tab, TabId, TabSet, SHELL_LINES_REMOTE_UNAVAILABLE};
 use crate::shell_line::{self, wire, Ending};
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -34,13 +34,18 @@ pub struct ShellEnded {
 
 impl TabSet {
     /// A person's Enter on a `!` line in `id`'s composer: it joins the queue, and [`TabSet::flush_queue`]
-    /// starts it when nothing runs before it. Refused in another agent's tab, where `!` means nothing.
+    /// starts it when nothing runs before it. Refused in another agent's tab, where `!` means nothing, and in a
+    /// remote tab: the line would run here, in this machine's copy of the project, while the agent works on the
+    /// server's.
     pub fn queue_shell_line(&mut self, id: TabId, text: &str, now_ms: u64) -> Result<(), String> {
         if shell_command(text).is_none() {
             return Err("nothing to run".to_string());
         }
         if self.get(id).is_some_and(|tab| tab.agent.is_external()) {
             return Err("this agent has no shell lines".to_string());
+        }
+        if self.get(id).is_some_and(Tab::is_remote) {
+            return Err(SHELL_LINES_REMOTE_UNAVAILABLE.to_string());
         }
         // What is kept under the words goes to the agent as words: a line that outlives the mark, restored from
         // a saved queue, is never run.
@@ -66,12 +71,16 @@ impl TabSet {
         }
     }
 
-    /// Shows the line and starts it. The queue's own path to a line, so it runs only in a live, idle tab.
+    /// Shows the line and starts it. The queue's own path to a line, so it runs only in a live, idle tab, and never
+    /// in a remote one ([`TabSet::queue_shell_line`]).
     pub(super) fn start_shell_line(&mut self, id: TabId, text: &str) -> Result<(), BackendError> {
         let refused = |message: &str| BackendError {
             message: message.to_string(),
             benign: true,
         };
+        if self.get(id).is_some_and(Tab::is_remote) {
+            return Err(refused(SHELL_LINES_REMOTE_UNAVAILABLE));
+        }
         let command = shell_command(text)
             .ok_or_else(|| refused("nothing to run"))?
             .to_string();

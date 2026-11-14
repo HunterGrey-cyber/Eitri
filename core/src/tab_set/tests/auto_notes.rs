@@ -3,6 +3,55 @@
 
 use super::*;
 
+#[test]
+fn remote_tab_write_cards_have_no_local_file_notes_or_rule_offers() {
+    for remote in [true, false] {
+        let dir = workspace("remote-card-notes");
+        let mut set = TabSet::new(BackendKind::Sidecar, SessionModeChoice::Manual);
+        if remote {
+            set.set_project_origin(crate::remote_project::TabOrigin::Remote {
+                host: "example-host".into(),
+                host_key_sha256: "SHA256:example".into(),
+                root: "/srv/project".into(),
+            })
+            .unwrap();
+        }
+        let tab = set.active();
+        let (provider, backend) = live(&dir);
+        set.get_mut(tab).unwrap().set_backend(TabBackend::Live(backend));
+        assert!(!dir.join("missing.rs").exists());
+        provider.queue_all(vec![
+            AgentDomainEvent::PermissionRequested {
+                permission_id: "write-missing".into(),
+                tool_use_id: Some("tu-write".into()),
+                tool_name: "Write".into(),
+                input: serde_json::json!({"file_path": "missing.rs", "content": "new"}),
+                provider_prompt: None,
+            },
+            AgentDomainEvent::PermissionRequested {
+                permission_id: "bash-rule".into(),
+                tool_use_id: Some("tu-bash".into()),
+                tool_name: "Bash".into(),
+                input: serde_json::json!({"command": "cargo test --lib"}),
+                provider_prompt: None,
+            },
+        ]);
+        until("both cards delivered", || {
+            set.pump(&dir, true);
+            set.get(tab).unwrap().attention.attention().pending == 2
+        });
+        set.pump(&dir, true);
+        let tab = set.get(tab).unwrap();
+        assert_eq!(tab.notes.creates_file.contains_key("write-missing"), !remote);
+        assert_eq!(tab.session.rule_offers.contains_key("bash-rule"), !remote);
+        if remote {
+            assert!(tab.notes.creates_file.is_empty());
+            assert!(tab.session.rule_offers.is_empty());
+        }
+        shut_down_all(&mut set);
+    }
+}
+
 /// Saved rules answer background tabs too, and a card eligible for a rule offers one.
 #[test]
 fn rules_answer_a_background_call_and_a_card_is_offered_the_rule_that_would() {

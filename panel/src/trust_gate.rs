@@ -2,9 +2,11 @@
 //! configuration for its agent (Claude's project and local setting tiers, Codex's project layers, a
 //! registered agent's own files), and the question that decides it.
 //!
-//! One gate per window, over the window's one project root, with each agent's configuration kept
-//! apart: every check, answer, record and memory of an answer belongs to one discovery profile, so a
-//! `y` for one agent never lets another load anything, and two tabs of two agents get two questions.
+//! One gate per window, over the window's project root and the roots of its remote tabs' projects,
+//! with each agent's configuration at each place kept apart: every check, answer, record and memory of
+//! an answer belongs to one subject, an agent's profile at one place ([`Subject::key`]), so a `y` for
+//! one agent, or for one place, never lets another load anything, and two tabs of two agents get two
+//! questions.
 //!
 //! Every disk operation of the trust check -- discovering and fingerprinting the configuration,
 //! reading Eitri's record of it, writing that record and removing it -- runs on the gate's own worker
@@ -33,11 +35,21 @@
 //! where the CLI reads a file, a walk over its budget) can change while its fingerprint stays the
 //! same, so an answer about it covers one start: it is never recorded and the window does not
 //! remember it.
+//!
+//! A remote tab's project is read on its server, never on this machine ([`Place::Remote`]): its checks,
+//! and the second look before a `y`, are the helper's trust scan through the window's connection opened
+//! for the host key the project records, and each scan is taken only while that connection still shows
+//! that key. Those jobs run on a second worker of the gate's own, so a slow server never holds up this
+//! machine's checks. Everything the gate keeps about a remote project (its checks, answers, epochs and
+//! prompts) is keyed by its agent, host key and root ([`Subject::key`]), apart from this machine's for
+//! any path, and its record is that host key's and root's. A scan that is refused or cannot be made
+//! starts nothing: the start is put off, saying why ([`GateEvent::Unavailable`]).
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{mpsc, Arc};
 
+use agent::remote_client::HelperClient;
 use agent::setting_sources::ProjectTrust;
 use eitri_core::agent_bridge::{
     TrustAction, TrustDiffView, TrustHunkView, TrustItemView, TrustLineView, TrustPromptState, TrustPromptView,
@@ -45,7 +57,7 @@ use eitri_core::agent_bridge::{
 };
 use eitri_core::project_trust::{
     civil_date, question_diffs, ChangedText, Discovery, FileDiff, Finding, Fingerprint, Hunk, LineKind, Profile,
-    ProfileEnv, Remember, TextDiff, TrustState, TrustStore, UserCodexConfig,
+    ProfileEnv, Remember, RemoteRoot, TextDiff, TrustPlace, TrustState, TrustStore, UserCodexConfig,
 };
 use eitri_core::tabs::TabId;
 
@@ -186,6 +198,104 @@ fn uncheckable_names(discovery: &Discovery) -> String {
     }
 }
 
+/// What one check is about: an agent's configuration ([`Profile`]) at the window's root on this machine,
+/// or at a remote project's root, read on its server.
+#[derive(Clone)]
+pub(crate) struct Subject {
+    pub(crate) profile: Profile,
+    pub(crate) place: Place,
+}
+
+/// Where a subject's configuration is read.
+#[derive(Clone)]
+pub(crate) enum Place {
+    /// This machine's disk, at the window's root.
+    Local,
+    /// A server's, through its helper.
+    Remote(Box<RemotePlace>),
+}
+
+/// A remote tab's project, as its trust is checked and kept.
+#[derive(Clone)]
+pub(crate) struct RemotePlace {
+    /// The host as the person typed it, for what a person reads.
+    pub(crate) host: String,
+    /// The host key the project records and its root as recorded: the key its answers and its record are
+    /// kept under, and the key the connection must show for a scan to be taken.
+    pub(crate) root: RemoteRoot,
+    /// The server account's configuration that loads without asking, as the question names it
+    /// ([`user_tier_words`]).
+    pub(crate) user_tier: String,
+    /// What the scan goes through; `None` when the window has no connection for the project's host key.
+    pub(crate) server: Option<Server>,
+}
+
+/// What a remote scan goes through.
+#[derive(Clone)]
+pub(crate) enum Server {
+    /// The window's connection to the helper, opened for the project's host key.
+    Helper(HelperClient),
+    /// A test's stand-in for the helper.
+    #[cfg(test)]
+    Fake(Arc<tests::FakeServer>),
+}
+
+impl Subject {
+    pub(crate) fn local(profile: Profile) -> Subject {
+        Subject {
+            profile,
+            place: Place::Local,
+        }
+    }
+
+    pub(crate) fn remote(profile: Profile, place: RemotePlace) -> Subject {
+        Subject {
+            profile,
+            place: Place::Remote(Box::new(place)),
+        }
+    }
+
+    /// The name the gate keeps everything about this subject under: the profile's key on this machine,
+    /// and `<profile key>@<record id>` for a remote project, whose record id stands for its host key and
+    /// root. No profile key holds an `@` ([`Profile::key`]), so the two never meet.
+    pub(crate) fn key(&self) -> SubjectKey {
+        match &self.place {
+            Place::Local => self.profile.key(),
+            Place::Remote(remote) => format!("{}@{}", self.profile.key(), remote.root.record_id()),
+        }
+    }
+
+    pub(crate) fn is_remote(&self) -> bool {
+        matches!(self.place, Place::Remote(_))
+    }
+
+    /// Where the store keeps this subject's record.
+    fn store_place(&self) -> TrustPlace {
+        match &self.place {
+            Place::Local => TrustPlace::Local,
+            Place::Remote(remote) => TrustPlace::Remote(remote.root.clone()),
+        }
+    }
+}
+
+impl From<&Profile> for Subject {
+    fn from(profile: &Profile) -> Subject {
+        Subject::local(profile.clone())
+    }
+}
+
+impl From<Profile> for Subject {
+    fn from(profile: Profile) -> Subject {
+        Subject::local(profile)
+    }
+}
+
+impl From<&Subject> for Subject {
+    fn from(subject: &Subject) -> Subject {
+        subject.clone()
+    }
+}
+
 /// Where a check sent a waiting tab.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Route {
@@ -219,6 +329,9 @@ pub(crate) enum GateEvent {
         ok: bool,
         notice: Option<String>,
     },
+    /// The project this tab's start waits on could not be checked (a remote project's scan was refused or
+    /// could not be made): nothing is started or recorded, and the start is put off, saying `why`.
+    Unavailable { tab: TabId, why: String },
 }
 
 /// What [`TrustGate::answer`] decided.
@@ -278,6 +391,8 @@ pub(crate) const UNAVAILABLE_COMMAND: &str =
 
 /// What a tab's prompt showed: an answer must name exactly this.
 struct Shown {
+    /// The subject the prompt is about ([`Subject::key`]).
+    key: SubjectKey,
     nonce: u64,
     fingerprint: Fingerprint,
     findings_digest: String,
@@ -351,9 +466,9 @@ enum Shape {
 }
 
 /// The prompt for one check's result, made on the worker. The worker alone knows whether the
-/// profile's last record failed, so the one prompt it builds already carries the right remember line.
+/// subject's last record failed, so the one prompt it builds already carries the right remember line.
 struct Prompts {
-    key: ProfileKey,
+    key: SubjectKey,
     /// The worker's number of the message whose state this describes.
     for_seq: u64,
     prepared: Prepared,
@@ -363,6 +478,8 @@ struct Prompts {
 /// failed record, for the state that record was asked for, rebuilt with the failure's words).
 struct Msg {
     seq: u64,
+    /// The subject the job was about ([`Subject::key`]).
+    key: SubjectKey,
     done: Done,
     prompts: Option<Prompts>,
 }
@@ -371,9 +488,19 @@ struct Msg {
 #[derive(Debug, Clone)]
 struct Answered {
     fingerprint: Fingerprint,
+    /// The directory the configuration was found in (the discovery's root): an answer holds only there,
+    /// so a remote root that leads elsewhere, even to the same configuration, is asked about again.
+    root: PathBuf,
     trust: ProjectTrust,
     /// Why a `y` could not be recorded, for a window-only trust.
     window_only: Option<String>,
+}
+
+impl Answered {
+    /// Whether this answer is about `discovery`: the same configuration, found in the same directory.
+    fn answers(&self, discovery: &Discovery) -> bool {
+        self.fingerprint == discovery.fingerprint && self.root == discovery.root
+    }
 }
 
 /// `:trust`'s prompt, on screen in `tab`.
@@ -394,7 +521,7 @@ enum Job {
     Check {
         epoch: u64,
         generation: u64,
-        profile: Profile,
+        subject: Subject,
     },
     Record {
         purpose: Purpose,
@@ -403,6 +530,7 @@ enum Job {
         seq: u64,
         epoch: u64,
         now: u64,
+        subject: Subject,
     },
     /// A `y` that writes nothing: the disk is read again and must still be what was shown.
     Confirm {
@@ -410,18 +538,31 @@ enum Job {
         shown: Arc<TrustState>,
         epoch: u64,
         kept: Kept,
+        subject: Subject,
     },
     CommandCheck {
         epoch: u64,
         request_id: String,
         tab: TabId,
-        profile: Profile,
+        subject: Subject,
     },
     Forget {
         request_id: String,
         had_window_trust: bool,
-        profile: Profile,
+        subject: Subject,
     },
+}
+
+impl Job {
+    fn subject(&self) -> &Subject {
+        match self {
+            Job::Check { subject, .. }
+            | Job::Record { subject, .. }
+            | Job::Confirm { subject, .. }
+            | Job::CommandCheck { subject, .. }
+            | Job::Forget { subject, .. } => subject,
+        }
+    }
 }
 
 enum Done {
@@ -448,7 +589,8 @@ enum Done {
     },
     RecordFailed {
         purpose: Purpose,
-        profile: ProfileKey,
+        /// The subject's key ([`Subject::key`]).
+        key: SubjectKey,
         reason: String,
     },
     CommandChecked {
@@ -457,11 +599,29 @@ enum Done {
         tab: TabId,
         state: TrustState,
     },
+    /// `state` is the check after the record went; `None` when a remote project could not be read again.
     Forgot {
         request_id: String,
         ok: bool,
         notice: String,
-        state: TrustState,
+        state: Option<TrustState>,
+    },
+    /// A remote project could not be read for `job`: `why` says so, in a person's words.
+    Unavailable { job: Unanswered, why: String },
+    /// A `y` whose subject was untrusted after it was queued: nothing was written.
+    Withdrawn { purpose: Purpose },
+}
+
+/// The job a remote project could not be read for.
+enum Unanswered {
+    Check {
+        epoch: u64,
+        generation: u64,
+    },
+    /// A `y`'s second look, before a record or a confirmation.
+    Answer(Purpose),
+    CommandCheck {
+        request_id: String,
     },
 }
 
@@ -478,41 +638,98 @@ struct Kept {
 /// mistaken for each other.
 const COMMAND_NONCE_BASE: u64 = 1 << 48;
 
-/// A profile's name as the gate's maps key it ([`Profile::key`]).
-type ProfileKey = String;
+/// A subject's name as the gate's maps key it ([`Subject::key`]).
+type SubjectKey = String;
 
 pub(crate) struct TrustGate {
     #[cfg_attr(not(test), allow(dead_code))]
     root: PathBuf,
     jobs: Option<mpsc::Sender<Job>>,
     done: mpsc::Receiver<Msg>,
-    /// The last check queued, of any profile.
+    /// The last check queued, of any subject.
     generation: u64,
-    /// Moved by `:untrust` of a profile: a check or record queued before it cannot authorize a start.
-    epochs: HashMap<ProfileKey, u64>,
-    /// Per profile, the newest result of any check of it, in the order they were queued.
-    latest: HashMap<ProfileKey, Arc<TrustState>>,
+    /// Moved by `:untrust` of a subject: a check or record queued before it cannot authorize a start.
+    epochs: HashMap<SubjectKey, u64>,
+    /// Per subject, the newest result of any check of it, in the order they were queued.
+    latest: HashMap<SubjectKey, Arc<TrustState>>,
     /// The worker's number of the message each `latest` came in.
-    latest_seq: HashMap<ProfileKey, u64>,
+    latest_seq: HashMap<SubjectKey, u64>,
     /// The prompt the worker built for each `latest` that asks something.
-    prompts: HashMap<ProfileKey, Prompts>,
-    /// What each tab's question showed; the discovery it holds names the question's profile.
+    prompts: HashMap<SubjectKey, Prompts>,
+    /// What each tab's question showed, under the key of the subject it is about.
     shown: HashMap<TabId, Shown>,
-    /// This window's own answer per profile.
-    answered: HashMap<ProfileKey, Answered>,
-    /// The profiles whose "not loaded" notice has been said.
-    said_not_loaded: std::collections::HashSet<ProfileKey>,
-    /// Tabs waiting for a check, each with the profile and the generation of the check that answers
+    /// This window's own answer per subject.
+    answered: HashMap<SubjectKey, Answered>,
+    /// The subjects whose "not loaded" notice has been said.
+    said_not_loaded: std::collections::HashSet<SubjectKey>,
+    /// Tabs waiting for a check, each with the subject and the generation of the check that answers
     /// it.
-    waiting: Vec<(TabId, ProfileKey, u64)>,
-    /// `:trust` asked for a question: its request, the tab whose `:` line asked, and the profile.
-    command_pending: Option<(String, TabId, ProfileKey)>,
+    waiting: Vec<(TabId, SubjectKey, u64)>,
+    /// `:trust` asked for a question: its request, the tab whose `:` line asked, and the subject.
+    command_pending: Option<(String, TabId, SubjectKey)>,
     command_shown: Option<CommandShown>,
     next_command_nonce: u64,
     /// Results made here rather than by the worker, delivered by the next `poll`.
     owed: Vec<GateEvent>,
     /// Jobs handed to the worker whose answer `poll` has not taken yet: the worker answers each job once.
     in_flight: usize,
+    /// The subject of every key a job was queued for, as last queued: what a `y` to its question, or a
+    /// check queued again, reads.
+    subjects: HashMap<SubjectKey, Subject>,
+    /// The worker remote projects are read on.
+    remote: SecondWorker,
+    /// Per remote subject, its checks the remote worker has not answered yet: a check nothing waits on
+    /// ([`TrustGate::refresh`]) is not queued while one is.
+    server_checks: HashMap<SubjectKey, usize>,
+    /// The `epochs` the workers read before writing a record: a `y` queued before an `:untrust` of its
+    /// subject is not written.
+    withdrawals: Withdrawals,
+}
+
+/// The most jobs the remote worker holds at once, queued and running. Each is a scan of a server's tree
+/// that may take two minutes; one more is refused (its start is put off), never queued behind them.
+pub(crate) const MAX_SERVER_JOBS: usize = 8;
+
+/// How often a gate whose remote worker owes answers is polled: a scan takes seconds, so the window's
+/// steady tick is not held for it.
+pub(crate) const SERVER_POLL: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// Why a remote job was refused when the remote worker already holds [`MAX_SERVER_JOBS`].
+const SERVER_BUSY: &str = "too many checks of remote projects are waiting; try again shortly";
+
+/// What starts the worker remote projects are read on: its job and result channels, or `None` when its
+/// thread could not start.
+type StartWorker = Box<dyn FnOnce() -> Option<(mpsc::Sender<Job>, mpsc::Receiver<Msg>)>>;
+
+/// The gate's worker for remote projects, started with the first remote job. A scan waits on a server
+/// for as long as it takes (two minutes at most), so it has a thread of its own and this machine's
+/// checks never wait behind it.
+#[derive(Default)]
+struct SecondWorker {
+    /// `None` once it started, and for a gate that starts none: its remote jobs fail closed.
+    start: Option<StartWorker>,
+    jobs: Option<mpsc::Sender<Job>>,
+    done: Option<mpsc::Receiver<Msg>>,
+    /// Its jobs whose answer `poll` has not taken yet.
+    in_flight: usize,
+}
+
+impl SecondWorker {
+    /// Where its jobs go, starting it first if it has not started.
+    fn jobs(&mut self) -> Option<&mpsc::Sender<Job>> {
+        if let Some(start) = self.start.take() {
+            match start() {
+                Some((jobs, done)) => {
+                    self.jobs = Some(jobs);
+                    self.done = Some(done);
+                }
+                None => {
+                    eprintln!("[trust] the trust check of remote projects could not start; remote tabs start nothing")
+                }
+            }
+        }
+        self.jobs.as_ref()
+    }
 }
 
 impl TrustGate {
@@ -524,13 +741,13 @@ impl TrustGate {
     /// The gate for `root` (canonical), starting the window's worker, which alone owns `store`.
     /// Touches no disk here.
     pub(crate) fn new(store: TrustStore, root: PathBuf, home: Option<PathBuf>) -> TrustGate {
-        TrustGate::with_wait(store, root, home, Box::new(|| {}))
+        TrustGate::with_wait(store, root, home, Arc::new(|| {}))
     }
 
     /// A gate whose worker waits on `hold` before each job, so a test decides how slow the disk is.
     #[cfg(test)]
     pub(crate) fn new_held(store: TrustStore, root: PathBuf, home: Option<PathBuf>, hold: WorkerHold) -> TrustGate {
-        TrustGate::with_wait(store, root, home, Box::new(move || hold.wait()))
+        TrustGate::with_wait(store, root, home, Arc::new(move || hold.wait()))
     }
 
     /// The worker is gone from here on, as when its thread has died: what it would answer is made by
@@ -538,6 +755,7 @@ impl TrustGate {
     #[cfg(test)]
     pub(crate) fn drop_worker(&mut self) {
         self.jobs = None;
+        self.remote = SecondWorker::default();
     }
 
     /// Every prompt the gate holds is forgotten, as if each check had come without one: asking then
@@ -570,6 +788,10 @@ impl TrustGate {
             next_command_nonce: COMMAND_NONCE_BASE,
             owed: Vec::new(),
             in_flight: 0,
+            subjects: HashMap::new(),
+            remote: SecondWorker::default(),
+            server_checks: HashMap::new(),
+            withdrawals: Withdrawals::default(),
         };
         (gate, jobs_rx, DoneSender::new(done_tx))
     }
@@ -587,16 +809,34 @@ impl TrustGate {
         store: TrustStore,
         root: PathBuf,
         home: Option<PathBuf>,
-        before_each: Box<dyn Fn() + Send>,
+        before_each: Arc<dyn Fn() + Send + Sync>,
     ) -> TrustGate {
         let (jobs_tx, jobs_rx) = mpsc::channel();
         let (done_tx, done_rx) = mpsc::channel();
         let worker_root = root.clone();
         // Read here, where no disk is touched: the worker resolves it.
         let codex_home = codex_home_of_this_process();
+        let withdrawals = Withdrawals::default();
+        let start_remote: StartWorker = {
+            let (store, root, home, codex_home) = (store.clone(), root.clone(), home.clone(), codex_home.clone());
+            let withdrawn = Arc::clone(&withdrawals);
+            let each = Arc::clone(&before_each);
+            Box::new(move || {
+                let (jobs_tx, jobs_rx) = mpsc::channel();
+                let (done_tx, done_rx) = mpsc::channel();
+                let each: Box<dyn Fn() + Send> = Box::new(move || each());
+                std::thread::Builder::new()
+                    .name("eitri-trust-remote".into())
+                    .spawn(move || run_worker(store, root, home, codex_home, jobs_rx, done_tx, withdrawn, each))
+                    .ok()?;
+                Some((jobs_tx, done_rx))
+            })
+        };
+        let each: Box<dyn Fn() + Send> = Box::new(move || before_each());
+        let withdrawn = Arc::clone(&withdrawals);
         let started = std::thread::Builder::new()
             .name("eitri-trust".into())
-            .spawn(move || run_worker(store, worker_root, home, codex_home, jobs_rx, done_tx, before_each));
+            .spawn(move || run_worker(store, worker_root, home, codex_home, jobs_rx, done_tx, withdrawn, each));
         let jobs = match started {
             Ok(_) => Some(jobs_tx),
             Err(e) => {
@@ -622,6 +862,13 @@ impl TrustGate {
             next_command_nonce: COMMAND_NONCE_BASE,
             owed: Vec::new(),
             in_flight: 0,
+            subjects: HashMap::new(),
+            remote: SecondWorker {
+                start: Some(start_remote),
+                ..SecondWorker::default()
+            },
+            server_checks: HashMap::new(),
+            withdrawals,
         }
     }
 
@@ -634,31 +881,73 @@ impl TrustGate {
     /// Hands `job` to the worker. With no worker, what it would have answered is made here, failing
     /// closed: a check routes its tabs to start without the project's tiers, and a record or a
     /// command fails.
+    /// A remote project's job fails closed instead: nothing is started for it, saying why.
     fn queue(&mut self, job: Job) {
-        let job = match self.jobs.as_ref() {
-            Some(jobs) => match jobs.send(job) {
-                Ok(()) => {
-                    self.in_flight += 1;
-                    return;
+        let subject = job.subject().clone();
+        self.subjects.insert(subject.key(), subject.clone());
+        let is_check = matches!(job, Job::Check { .. });
+        // `:untrust` is never refused for a full queue: typed by hand, it is bounded, and its place behind a
+        // queued `y` is what lets the later command win.
+        let full =
+            subject.is_remote() && !matches!(job, Job::Forget { .. }) && self.remote.in_flight >= MAX_SERVER_JOBS;
+        let sender = match subject.is_remote() {
+            _ if full => None,
+            true => self.remote.jobs(),
+            false => self.jobs.as_ref(),
+        };
+        let sent = match sender {
+            Some(jobs) => jobs.send(job).map_err(|mpsc::SendError(job)| job),
+            None => Err(job),
+        };
+        let job = match sent {
+            Ok(()) => {
+                match subject.is_remote() {
+                    true => {
+                        self.remote.in_flight += 1;
+                        if is_check {
+                            *self.server_checks.entry(subject.key()).or_insert(0) += 1;
+                        }
+                    }
+                    false => self.in_flight += 1,
                 }
-                Err(mpsc::SendError(job)) => job,
-            },
-            None => job,
+                return;
+            }
+            Err(job) => job,
         };
         const NO_WORKER: &str = "the trust check is not running";
+        if let Place::Remote(remote) = &subject.place {
+            let why = cannot_check(&remote.host, if full { SERVER_BUSY } else { NO_WORKER });
+            match job {
+                Job::Check { generation, .. } => {
+                    // Refused for a full queue, only this check's own waiter is answered: the earlier
+                    // ones' checks are still queued and answer them.
+                    let tabs = match full {
+                        true => self.resolve_exactly(&subject.key(), generation),
+                        false => self.resolve(&subject.key(), generation),
+                    };
+                    for tab in tabs {
+                        self.owed.push(GateEvent::Unavailable {
+                            tab,
+                            why: not_started(&why),
+                        });
+                    }
+                }
+                Job::Record { purpose, .. } | Job::Confirm { purpose, .. } => self.owed.push(unavailable(purpose, why)),
+                Job::CommandCheck { request_id, .. } | Job::Forget { request_id, .. } => {
+                    self.owed.push(GateEvent::CommandDone {
+                        request_id,
+                        ok: false,
+                        notice: Some(why),
+                    })
+                }
+            }
+            return;
+        }
         match job {
-            Job::Check {
-                generation, profile, ..
-            } => {
-                let key = profile.key();
-                let (resolved, kept): (Vec<_>, Vec<_>) = self
-                    .waiting
-                    .drain(..)
-                    .partition(|(_, p, g)| *p == key && *g <= generation);
-                self.waiting = kept;
+            Job::Check { generation, .. } => {
                 // Started untrusted. An agent that needs a `y` is refused where external starts begin,
                 // which takes no untrusted start of one, whatever discovery an earlier check left.
-                for (tab, _, _) in resolved {
+                for tab in self.resolve(&subject.key(), generation) {
                     self.owed
                         .push(GateEvent::Route(tab, Route::Start(ProjectTrust::Untrusted)));
                 }
@@ -684,30 +973,87 @@ impl TrustGate {
         }
     }
 
-    /// Whether `poll` has something coming: a job the worker has not answered yet, or a result made
-    /// here. The worker tells nobody when it answers, so the window keeps polling until this is false.
+    /// The tabs waiting for a check of `key` that the check numbered `generation` answers, taken off the
+    /// waiting list.
+    fn resolve(&mut self, key: &str, generation: u64) -> Vec<TabId> {
+        let (resolved, kept): (Vec<_>, Vec<_>) = self
+            .waiting
+            .drain(..)
+            .partition(|(_, p, g)| p == key && *g <= generation);
+        self.waiting = kept;
+        resolved.into_iter().map(|(tab, _, _)| tab).collect()
+    }
+
+    /// The tabs waiting for exactly the check of `key` numbered `generation`, taken off the waiting list.
+    fn resolve_exactly(&mut self, key: &str, generation: u64) -> Vec<TabId> {
+        let (resolved, kept): (Vec<_>, Vec<_>) = self
+            .waiting
+            .drain(..)
+            .partition(|(_, p, g)| p == key && *g == generation);
+        self.waiting = kept;
+        resolved.into_iter().map(|(tab, _, _)| tab).collect()
+    }
+
+    /// The subject a result of `key` is about: as it was queued, or, for a result of this machine's that
+    /// came with no job here (a test playing the worker), its profile's.
+    fn subject_of(&self, key: &str, state: &TrustState) -> Option<Subject> {
+        self.subjects.get(key).cloned().or_else(|| {
+            let profile = state_profile(state);
+            (profile.key() == key).then(|| Subject::local(profile.clone()))
+        })
+    }
+
+    /// Whether `poll` has something coming soon: a job this machine's worker has not answered yet, or a
+    /// result made here. The worker tells nobody when it answers, so the window keeps polling on its
+    /// steady cadence until this is false. The remote worker's backlog is polled more slowly
+    /// ([`TrustGate::server_poll_deadline`]).
     pub(crate) fn is_busy(&self) -> bool {
         self.in_flight > 0 || !self.owed.is_empty()
     }
 
-    /// Queues a fresh check of the root for `profile`; returns its generation.
-    pub(crate) fn begin_check(&mut self, profile: &Profile) -> u64 {
+    /// When the window next polls for the remote worker's answers, while it owes any: a scan takes
+    /// seconds, so [`SERVER_POLL`] from `now` rather than the steady tick.
+    pub(crate) fn server_poll_deadline(&self, now: std::time::Instant) -> Option<std::time::Instant> {
+        (self.remote.in_flight > 0).then_some(now + SERVER_POLL)
+    }
+
+    /// Jobs the remote worker holds, queued and running.
+    #[cfg(test)]
+    pub(crate) fn server_jobs(&self) -> usize {
+        self.remote.in_flight
+    }
+
+    /// A check of `subject` that nothing waits on (a page that loaded refreshes `prefix i`'s row and
+    /// its question). A remote subject's is a scan of the server's tree, so none is queued while one of
+    /// its checks is queued or running: that one answers the row too.
+    pub(crate) fn refresh(&mut self, subject: impl Into<Subject>) {
+        let subject = subject.into();
+        if subject.is_remote() && self.server_checks.get(&subject.key()).is_some_and(|n| *n > 0) {
+            return;
+        }
+        self.begin_check(subject);
+    }
+
+    /// Queues a fresh check of `subject` (a profile alone is that agent at the window's root); returns its
+    /// generation.
+    pub(crate) fn begin_check(&mut self, subject: impl Into<Subject>) -> u64 {
+        let subject = subject.into();
         self.generation += 1;
         let generation = self.generation;
         self.queue(Job::Check {
-            epoch: self.epoch_of(&profile.key()),
+            epoch: self.epoch_of(&subject.key()),
             generation,
-            profile: profile.clone(),
+            subject,
         });
         generation
     }
 
-    /// `tab` waits for the check of `profile` that [`TrustGate::begin_check`] queues next (callers
-    /// always call it right after); an older result, or one of another profile, does not resolve it.
-    pub(crate) fn wait_for(&mut self, tab: TabId, profile: &Profile) {
+    /// `tab` waits for the check of `subject` that [`TrustGate::begin_check`] queues next (callers
+    /// always call it right after); an older result, or one of another subject, does not resolve it.
+    pub(crate) fn wait_for(&mut self, tab: TabId, subject: impl Into<Subject>) {
         let generation = self.generation + 1;
         self.waiting.retain(|(t, _, _)| *t != tab);
-        self.waiting.push((tab, profile.key(), generation));
+        self.waiting.push((tab, subject.into().key(), generation));
     }
 
     pub(crate) fn is_waiting(&self, tab: TabId) -> bool {
@@ -728,25 +1074,55 @@ impl TrustGate {
     /// no longer has is refused and asked again.
     pub(crate) fn poll(&mut self) -> Vec<GateEvent> {
         let mut events = std::mem::take(&mut self.owed);
-        // Positions in `events` settled only once the batch is drained, each with its profile.
-        let mut routes: Vec<(usize, ProfileKey)> = Vec::new();
-        let mut taken: Vec<(usize, ProfileKey, Fingerprint)> = Vec::new();
-        loop {
-            let Msg { seq, done, prompts } = match self.done.try_recv() {
-                Ok(msg) => msg,
-                Err(mpsc::TryRecvError::Empty) => break,
-                // The worker is gone (it panicked): what it owed never comes, so nothing is counted as
-                // coming, and every later job is answered here as with no worker.
-                Err(mpsc::TryRecvError::Disconnected) => {
-                    if self.jobs.take().is_some() {
-                        eprintln!("[trust] the trust check stopped; this window starts sessions without the project's settings");
+        // Positions in `events` settled only once the batch is drained, each with its subject.
+        let mut routes: Vec<(usize, SubjectKey)> = Vec::new();
+        let mut taken: Vec<(usize, SubjectKey, Fingerprint)> = Vec::new();
+        // Each worker answers its own subjects, in the order they were queued, so taking one worker's
+        // results before the other's reorders nothing about any one subject.
+        let mut batch = Vec::new();
+        drain_worker(
+            &self.done,
+            &mut self.jobs,
+            &mut self.in_flight,
+            &mut batch,
+            "the trust check stopped; this window starts sessions without the project's settings",
+        );
+        if let Some(done) = &self.remote.done {
+            drain_worker(
+                done,
+                &mut self.remote.jobs,
+                &mut self.remote.in_flight,
+                &mut batch,
+                "the trust check of remote projects stopped; remote tabs start nothing",
+            );
+            if self.remote.jobs.is_none() {
+                self.server_checks.clear();
+            }
+        }
+        for msg in &batch {
+            if matches!(
+                msg.done,
+                Done::Checked { .. }
+                    | Done::Unavailable {
+                        job: Unanswered::Check { .. },
+                        ..
                     }
-                    self.in_flight = 0;
-                    break;
+            ) {
+                if let Some(count) = self.server_checks.get_mut(&msg.key) {
+                    *count = count.saturating_sub(1);
+                    if *count == 0 {
+                        self.server_checks.remove(&msg.key);
+                    }
                 }
-            };
-            // The worker answers each job with exactly one message.
-            self.in_flight = self.in_flight.saturating_sub(1);
+            }
+        }
+        for Msg {
+            seq,
+            key,
+            done,
+            prompts,
+        } in batch
+        {
             // Each result's prompts go in with its state; nothing else of this message uses them.
             let mut prompts = prompts;
             match done {
@@ -755,41 +1131,43 @@ impl TrustGate {
                     epoch,
                     state,
                 } => {
-                    let profile = state_profile(&state);
-                    let key = profile.key();
                     if epoch != self.epoch_of(&key) {
-                        if self.waiting.iter().any(|(_, p, g)| *p == key && *g <= generation) {
-                            self.begin_check(profile);
+                        // Its waiters wait for the check queued again in its place, under that check's number:
+                        // answered by its result, or by its refusal when the queue is full.
+                        let waits = self.waiting.iter().any(|(_, p, g)| *p == key && *g <= generation);
+                        if let Some(subject) = waits.then(|| self.subject_of(&key, &state)).flatten() {
+                            let retry = self.generation + 1;
+                            for (_, p, g) in self.waiting.iter_mut() {
+                                if *p == key && *g <= generation {
+                                    *g = retry;
+                                }
+                            }
+                            self.begin_check(subject);
                         }
                         continue;
                     }
-                    self.take_latest(state, seq, prompts.take(), &mut events);
-                    let (resolved, kept): (Vec<_>, Vec<_>) = self
-                        .waiting
-                        .drain(..)
-                        .partition(|(_, p, g)| *p == key && *g <= generation);
-                    self.waiting = kept;
-                    for (tab, _, _) in resolved {
+                    self.take_latest(key.clone(), state, seq, prompts.take(), &mut events);
+                    for tab in self.resolve(&key, generation) {
                         routes.push((events.len(), key.clone()));
                         events.push(GateEvent::Route(tab, Route::Ask));
                     }
                 }
                 Done::Recorded { purpose, epoch, state } => {
                     let profile = state_profile(&state).clone();
-                    let key = profile.key();
                     if epoch == self.epoch_of(&key) {
                         let fingerprint = discovery_of(&state).map(|d| d.fingerprint);
-                        if let Some(fingerprint) = fingerprint {
+                        if let Some(found) = discovery_of(&state) {
                             self.answered.insert(
                                 key.clone(),
                                 Answered {
-                                    fingerprint,
+                                    fingerprint: found.fingerprint,
+                                    root: found.root.clone(),
                                     trust: ProjectTrust::Trusted,
                                     window_only: None,
                                 },
                             );
                         }
-                        self.take_latest(state, seq, prompts.take(), &mut events);
+                        self.take_latest(key.clone(), state, seq, prompts.take(), &mut events);
                         if let (Purpose::ForTab(_), Some(fingerprint)) = (&purpose, fingerprint) {
                             taken.push((events.len(), key, fingerprint));
                         }
@@ -813,23 +1191,23 @@ impl TrustGate {
                     kept,
                     state,
                 } => {
-                    let key = state_profile(&state).key();
                     if epoch != self.epoch_of(&key) {
                         events.push(refused_withdrawn(purpose));
                         continue;
                     }
                     let fingerprint = discovery_of(&state).map(|d| d.fingerprint);
-                    if let (Some(why), Some(fingerprint)) = (kept.window_only.clone(), fingerprint) {
+                    if let (Some(why), Some(found)) = (kept.window_only.clone(), discovery_of(&state)) {
                         self.answered.insert(
                             key.clone(),
                             Answered {
-                                fingerprint,
+                                fingerprint: found.fingerprint,
+                                root: found.root.clone(),
                                 trust: ProjectTrust::Trusted,
                                 window_only: Some(why),
                             },
                         );
                     }
-                    self.take_latest(state, seq, prompts.take(), &mut events);
+                    self.take_latest(key.clone(), state, seq, prompts.take(), &mut events);
                     if let (Purpose::ForTab(_), Some(fingerprint)) = (&purpose, fingerprint) {
                         taken.push((events.len(), key, fingerprint));
                     }
@@ -846,14 +1224,14 @@ impl TrustGate {
                     });
                 }
                 Done::Moved { purpose, epoch, state } => {
-                    if epoch == self.epoch_of(&state_profile(&state).key()) {
-                        self.take_latest(state, seq, prompts.take(), &mut events);
+                    if epoch == self.epoch_of(&key) {
+                        self.take_latest(key, state, seq, prompts.take(), &mut events);
                     }
                     events.push(refused(purpose, CHANGED_WHILE_READING.to_string()));
                 }
                 Done::RecordFailed {
                     purpose,
-                    profile,
+                    key: failed,
                     reason,
                 } => {
                     let notice = match &purpose {
@@ -863,7 +1241,7 @@ impl TrustGate {
                     // The worker built the refused prompt's state again with the failure's words;
                     // it replaces that state's prompt only while that is still the newest result.
                     if let Some(prompts) = prompts.take() {
-                        if prompts.key == profile && self.latest_seq.get(&prompts.key) == Some(&prompts.for_seq) {
+                        if prompts.key == failed && self.latest_seq.get(&prompts.key) == Some(&prompts.for_seq) {
                             self.prompts.insert(prompts.key.clone(), prompts);
                         }
                     }
@@ -875,12 +1253,11 @@ impl TrustGate {
                     epoch,
                     state,
                 } => {
-                    let key = state_profile(&state).key();
                     if epoch != self.epoch_of(&key) {
                         events.push(refused_withdrawn(Purpose::Command(request_id)));
                         continue;
                     }
-                    self.take_latest(state, seq, prompts.take(), &mut events);
+                    self.take_latest(key.clone(), state, seq, prompts.take(), &mut events);
                     self.drop_command_prompt_into(&mut events);
                     events.push(self.command_check_result(request_id, tab, key));
                 }
@@ -890,17 +1267,48 @@ impl TrustGate {
                     notice,
                     state,
                 } => {
-                    self.take_latest(state, seq, prompts.take(), &mut events);
+                    if let Some(state) = state {
+                        self.take_latest(key, state, seq, prompts.take(), &mut events);
+                    }
                     events.push(GateEvent::CommandDone {
                         request_id,
                         ok,
                         notice: Some(notice),
                     });
                 }
+                Done::Withdrawn { purpose } => events.push(refused_withdrawn(purpose)),
+                // Nothing is decided by an earlier result here: the check that was asked for could not
+                // be made, so what waited on it starts nothing.
+                Done::Unavailable { job, why } => match job {
+                    Unanswered::Check { epoch, generation } => {
+                        if epoch != self.epoch_of(&key) {
+                            if self.waiting.iter().any(|(_, p, g)| *p == key && *g <= generation) {
+                                if let Some(subject) = self.subjects.get(&key).cloned() {
+                                    self.begin_check(subject);
+                                }
+                            }
+                            continue;
+                        }
+                        for tab in self.resolve(&key, generation) {
+                            events.push(GateEvent::Unavailable {
+                                tab,
+                                why: not_started(&why),
+                            });
+                        }
+                    }
+                    Unanswered::Answer(purpose) => events.push(unavailable(purpose, why)),
+                    Unanswered::CommandCheck { request_id } => events.push(GateEvent::CommandDone {
+                        request_id,
+                        ok: false,
+                        notice: Some(why),
+                    }),
+                },
             }
         }
         for (at, key) in routes {
-            let route = self.latest_state(&key).map_or(Route::Ask, |state| self.route(state));
+            let route = self
+                .latest_state(&key)
+                .map_or(Route::Ask, |state| self.route(&key, state));
             if let GateEvent::Route(_, r) = &mut events[at] {
                 *r = route;
             }
@@ -919,25 +1327,31 @@ impl TrustGate {
         events
     }
 
-    /// The newest result of a profile's checks.
+    /// The newest result of a subject's checks.
     fn latest_state(&self, key: &str) -> Option<&TrustState> {
         self.latest.get(key).map(|state| &**state)
     }
 
-    /// The `:untrust` count of a profile.
+    /// The `:untrust` count of a subject.
     fn epoch_of(&self, key: &str) -> u64 {
         self.epochs.get(key).copied().unwrap_or(0)
     }
 
-    /// A newer result for its profile: every prompt of that profile that no longer shows its
-    /// fingerprint goes, and is asked again. Other profiles' prompts are about other files.
-    fn take_latest(&mut self, state: TrustState, seq: u64, prompts: Option<Prompts>, events: &mut Vec<GateEvent>) {
-        let key = state_profile(&state).key();
+    /// A newer result for its subject: every prompt of that subject that no longer shows its
+    /// fingerprint goes, and is asked again. Other subjects' prompts are about other files.
+    fn take_latest(
+        &mut self,
+        key: SubjectKey,
+        state: TrustState,
+        seq: u64,
+        prompts: Option<Prompts>,
+        events: &mut Vec<GateEvent>,
+    ) {
         let fingerprint = discovery_of(&state).map(|d| d.fingerprint);
         let mut stale: Vec<TabId> = self
             .shown
             .iter()
-            .filter(|(_, shown)| shown.discovery().profile.key() == key && Some(shown.fingerprint) != fingerprint)
+            .filter(|(_, shown)| shown.key == key && Some(shown.fingerprint) != fingerprint)
             .map(|(tab, _)| *tab)
             .collect();
         stale.sort_by_key(|tab| tab.0);
@@ -948,7 +1362,7 @@ impl TrustGate {
         if self
             .command_shown
             .as_ref()
-            .is_some_and(|c| c.shown.discovery().profile.key() == key && Some(c.shown.fingerprint) != fingerprint)
+            .is_some_and(|c| c.shown.key == key && Some(c.shown.fingerprint) != fingerprint)
         {
             let command = self.command_shown.take().expect("checked above");
             events.push(GateEvent::CommandDone {
@@ -965,7 +1379,7 @@ impl TrustGate {
         self.latest.insert(key, Arc::new(state));
     }
 
-    fn command_check_result(&mut self, request_id: String, tab: TabId, key: ProfileKey) -> GateEvent {
+    fn command_check_result(&mut self, request_id: String, tab: TabId, key: SubjectKey) -> GateEvent {
         let done = |ok: bool, notice: String| GateEvent::CommandDone {
             request_id: request_id.clone(),
             ok,
@@ -988,8 +1402,8 @@ impl TrustGate {
         }
     }
 
-    /// Where a start goes, given a check's result and this window's answers for its profile. Pure.
-    pub(crate) fn route(&self, state: &TrustState) -> Route {
+    /// Where a start goes, given a check's result for `key` and this window's answers for it. Pure.
+    pub(crate) fn route(&self, key: &str, state: &TrustState) -> Route {
         let profile = state_profile(state);
         match state {
             // Nothing exists to load, so leaving the project tiers out loses nothing, and it keeps out a
@@ -1002,9 +1416,9 @@ impl TrustGate {
             TrustState::NothingToTrust(_) => Route::Ask,
             TrustState::Trusted { .. } => Route::Start(ProjectTrust::Trusted),
             TrustState::Untrusted { discovery, .. } | TrustState::Changed { discovery, .. } => {
-                match self.answered.get(&profile.key()) {
+                match self.answered.get(key) {
                     Some(answered)
-                        if answered.fingerprint == discovery.fingerprint
+                        if answered.answers(discovery)
                             && discovery.fully_hashed()
                             && (answered.trust == ProjectTrust::Trusted || !profile.requires_explicit_yes()) =>
                     {
@@ -1016,18 +1430,19 @@ impl TrustGate {
         }
     }
 
-    /// The route for a start of `profile` right now, from its latest check; `None` before any check
+    /// The route for a start of `subject` right now, from its latest check; `None` before any check
     /// of it came back.
-    pub(crate) fn current_route(&self, profile: &Profile) -> Option<Route> {
-        self.latest_state(&profile.key()).map(|state| self.route(state))
+    pub(crate) fn current_route(&self, subject: impl Into<Subject>) -> Option<Route> {
+        let key = subject.into().key();
+        self.latest_state(&key).map(|state| self.route(&key, state))
     }
 
     /// The newest discovery of `profile`: what a start routed by [`TrustGate::current_route`], or let
     /// through by an answer, is bound to. A `y` is taken only while the newest check still has the
     /// fingerprint its prompt showed, and an `n` only while the page echoes it, so this is the
     /// configuration the answer was about.
-    pub(crate) fn bound_discovery(&self, profile: &Profile) -> Option<&Discovery> {
-        self.latest_state(&profile.key()).and_then(discovery_of)
+    pub(crate) fn bound_discovery(&self, subject: impl Into<Subject>) -> Option<&Discovery> {
+        self.latest_state(&subject.into().key()).and_then(discovery_of)
     }
 
     /// The prompt for `tab` under `nonce`, from the latest check of `profile` (the tab's agent's),
@@ -1035,8 +1450,8 @@ impl TrustGate {
     ///
     /// Builds nothing: the worker made the message with the check, and this only puts the tab and
     /// nonce on it.
-    pub(crate) fn ask(&mut self, tab: TabId, nonce: u64, profile: &Profile) -> Option<Asked> {
-        let key = profile.key();
+    pub(crate) fn ask(&mut self, tab: TabId, nonce: u64, subject: impl Into<Subject>) -> Option<Asked> {
+        let key = subject.into().key();
         let (asked, shown) = self.pick(tab, nonce, &key, false)?;
         match shown {
             Some(shown) => {
@@ -1052,9 +1467,10 @@ impl TrustGate {
     /// [`TrustGate::ask`] as the view the page would draw, for the tests, which read its fields.
     /// `None` also for a prompt that cannot be shown.
     #[cfg(test)]
-    pub(crate) fn show(&mut self, tab: TabId, nonce: u64, profile: &Profile) -> Option<TrustPromptView> {
-        match self.ask(tab, nonce, profile)? {
-            Asked::Prompt(_) => self.shown_view(tab, nonce, &profile.key()),
+    pub(crate) fn show(&mut self, tab: TabId, nonce: u64, subject: impl Into<Subject>) -> Option<TrustPromptView> {
+        let subject = subject.into();
+        match self.ask(tab, nonce, &subject)? {
+            Asked::Prompt(_) => self.shown_view(tab, nonce, &subject.key()),
             Asked::TooLarge { .. } | Asked::Unavailable => None,
         }
     }
@@ -1103,6 +1519,7 @@ impl TrustGate {
         };
         let message = format!("{{\"tab\":{},\"nonce\":{nonce},{}", tab.0, &body[1..]);
         let shown = Shown {
+            key: key.to_string(),
             nonce,
             fingerprint: discovery_of(state)?.fingerprint,
             findings_digest: prepared.findings_digest.clone(),
@@ -1148,7 +1565,7 @@ impl TrustGate {
         trust: bool,
         now_unix: u64,
     ) -> AnswerOutcome {
-        let shown_key = self.shown.get(&tab).map(|s| s.discovery().profile.key());
+        let shown_key = self.shown.get(&tab).map(|s| s.key.clone());
         if let Err(why) = Self::check_echo(
             self.shown.get(&tab),
             nonce,
@@ -1171,7 +1588,10 @@ impl TrustGate {
         }
         let shown = self.shown.remove(&tab).expect("checked above");
         let profile = shown.discovery().profile.clone();
-        let key = profile.key();
+        let key = shown.key.clone();
+        let Some(subject) = self.subject_of(&key, &shown.state) else {
+            return AnswerOutcome::Refused(OUT_OF_DATE.to_string());
+        };
         let remember = shown.remember();
         if !trust {
             // An `n` for an agent that cannot leave the project's configuration out starts nothing,
@@ -1184,6 +1604,7 @@ impl TrustGate {
                     key.clone(),
                     Answered {
                         fingerprint: shown.fingerprint,
+                        root: shown.discovery().root.clone(),
                         trust: ProjectTrust::Untrusted,
                         window_only: None,
                     },
@@ -1207,6 +1628,7 @@ impl TrustGate {
                         window_only: None,
                         notice,
                     },
+                    subject,
                 });
                 AnswerOutcome::Recording
             }
@@ -1219,6 +1641,7 @@ impl TrustGate {
                         notice: window_only_notice(&why),
                         window_only: Some(why),
                     },
+                    subject,
                 });
                 AnswerOutcome::Recording
             }
@@ -1229,41 +1652,49 @@ impl TrustGate {
                     shown: shown.state,
                     epoch,
                     now: now_unix,
+                    subject,
                 });
                 AnswerOutcome::Recording
             }
         }
     }
 
-    /// `:trust` (`tab` is the tab whose `:` line asked) or `:untrust`, about `profile` (that tab's
-    /// agent's). Only queues: the worker runs a fresh check and the record's removal, and the answer
-    /// is a [`GateEvent::CommandDone`].
-    pub(crate) fn command(&mut self, request_id: String, action: TrustAction, tab: TabId, profile: &Profile) {
+    /// `:trust` (`tab` is the tab whose `:` line asked) or `:untrust`, about `subject` (that tab's
+    /// agent's, where that tab runs). Only queues: the worker runs a fresh check and the record's
+    /// removal, and the answer is a [`GateEvent::CommandDone`].
+    pub(crate) fn command(&mut self, request_id: String, action: TrustAction, tab: TabId, subject: impl Into<Subject>) {
+        let subject = subject.into();
         match action {
             TrustAction::Trust => self.queue(Job::CommandCheck {
-                epoch: self.epoch_of(&profile.key()),
+                epoch: self.epoch_of(&subject.key()),
                 request_id,
                 tab,
-                profile: profile.clone(),
+                subject,
             }),
             TrustAction::Untrust => {
                 // Before the forget is queued: from here on no start reuses this window's answer, and
                 // a record still queued for an earlier `y` is not trust when it lands.
-                let key = profile.key();
+                let key = subject.key();
                 let had_window_trust = self
                     .answered
                     .remove(&key)
                     .is_some_and(|answered| answered.trust == ProjectTrust::Trusted);
                 self.latest.remove(&key);
                 self.prompts.remove(&key);
-                *self.epochs.entry(key).or_insert(0) += 1;
+                let epoch = self.epochs.entry(key.clone()).or_insert(0);
+                *epoch += 1;
+                let epoch = *epoch;
+                self.withdrawals
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .insert(key, epoch);
                 let mut dropped = Vec::new();
                 self.drop_command_prompt_into(&mut dropped);
                 self.owed.extend(dropped);
                 self.queue(Job::Forget {
                     request_id,
                     had_window_trust,
-                    profile: profile.clone(),
+                    subject,
                 });
             }
         }
@@ -1336,7 +1767,7 @@ impl TrustGate {
         let command = self.command_shown.take_if(|c| c.tab == tab && c.shown.nonce == nonce)?;
         let request_id = command.request_id;
         let profile = command.shown.discovery().profile.clone();
-        let key = profile.key();
+        let key = command.shown.key.clone();
         let done = |ok: bool, notice: Option<String>| CommandAnswer::Done {
             request_id: request_id.clone(),
             ok,
@@ -1356,6 +1787,9 @@ impl TrustGate {
         if !trust {
             return Some(done(false, None));
         }
+        let Some(subject) = self.subject_of(&key, &command.shown.state) else {
+            return Some(done(false, Some(COMMAND_OUT_OF_DATE.to_string())));
+        };
         Some(match command.shown.remember() {
             Remember::SessionOnly(_) => done(false, Some(cannot_remember_notice(command.shown.discovery()))),
             Remember::WindowOnly(why) => {
@@ -1369,6 +1803,7 @@ impl TrustGate {
                         notice: format!("{} (this window only: {why})", trusted_from_now(&profile)),
                         window_only: Some(why),
                     },
+                    subject,
                 });
                 CommandAnswer::Recording
             }
@@ -1380,6 +1815,7 @@ impl TrustGate {
                     shown: command.shown.state,
                     epoch,
                     now: now_unix,
+                    subject,
                 });
                 CommandAnswer::Recording
             }
@@ -1433,9 +1869,10 @@ impl TrustGate {
         }
     }
 
-    /// The `trust` row of `prefix i`, for the latest check of `profile` (the tab's agent's).
-    pub(crate) fn row(&self, profile: &Profile) -> String {
-        let key = profile.key();
+    /// The `trust` row of `prefix i`, for the latest check of `subject` (the tab's agent's, where the
+    /// tab runs).
+    pub(crate) fn row(&self, subject: impl Into<Subject>) -> String {
+        let key = subject.into().key();
         let Some(state) = self.latest_state(&key) else {
             return "not checked yet".to_string();
         };
@@ -1446,7 +1883,7 @@ impl TrustGate {
                 let answered = self
                     .answered
                     .get(&key)
-                    .filter(|a| a.fingerprint == discovery.fingerprint && discovery.fully_hashed());
+                    .filter(|a| a.answers(discovery) && discovery.fully_hashed());
                 match (answered, state) {
                     (
                         Some(Answered {
@@ -1467,10 +1904,10 @@ impl TrustGate {
         }
     }
 
-    /// What a session of `profile` started now would be given without asking; untrusted when it
+    /// What a session of `subject` started now would be given without asking; untrusted when it
     /// would ask.
-    pub(crate) fn next_session_trust(&self, profile: &Profile) -> ProjectTrust {
-        match self.current_route(profile) {
+    pub(crate) fn next_session_trust(&self, subject: impl Into<Subject>) -> ProjectTrust {
+        match self.current_route(subject) {
             Some(Route::Start(trust)) => trust,
             Some(Route::Ask) | None => ProjectTrust::Untrusted,
         }
@@ -1710,7 +2147,13 @@ fn too_large_prepared(view: &TrustPromptView, basis: Basis, bytes: usize) -> Pre
             too_large(&view.agent, bytes)
         )),
         changed: None,
-        items: Vec::new(),
+        // Where the settings are read stays said: it is part of what the question is about.
+        items: view
+            .items
+            .iter()
+            .filter(|item| item.what == SERVER_ITEM)
+            .cloned()
+            .collect(),
     };
     let (findings_digest, body) = finish(&short);
     Prepared {
@@ -1729,9 +2172,11 @@ fn too_large_prepared(view: &TrustPromptView, basis: Basis, bytes: usize) -> Pre
 /// large it is when it cannot be shown (see [`too_large_prepared`]). Whether the question can be asked
 /// at all is decided on what it would hold with no instruction text: a diff is for reading and never
 /// turns a `y`/`n` question into an `n`-only one, so the largest give way to a line first and then all
-/// of it to nothing. Worker only.
-fn prepare_one(state: &TrustState, basis: Basis) -> Option<Prepared> {
+/// of it to nothing. A remote project's question first says where its settings are read and which of the
+/// server account's own load without asking ([`server_items`]). Worker only.
+fn prepare_one(state: &TrustState, basis: Basis, place: &Place) -> Option<Prepared> {
     let mut view = view_of(state, &basis)?;
+    view.items.splice(0..0, server_items(place));
     let texts = view
         .changed
         .as_mut()
@@ -1771,15 +2216,52 @@ fn prepare_one(state: &TrustState, basis: Basis) -> Option<Prepared> {
     })
 }
 
-/// The prompt for a check's result, sent with it in message `seq`, with the remember line `failure`
-/// (the profile's last failed record, if any) gives it. `None` when the result asks nothing. Worker
-/// only.
-fn prepare(state: &TrustState, failure: Option<&str>, seq: u64) -> Option<Prompts> {
-    let (discovery, remember) = match state {
-        TrustState::Untrusted { discovery, remember }
-        | TrustState::Changed {
-            discovery, remember, ..
-        } => (discovery, remember),
+/// The rows that say a remote project's settings are read on its server: the host, and the server
+/// account's directory whose user tier loads without asking. None for this machine's.
+fn server_items(place: &Place) -> Vec<TrustItemView> {
+    match place {
+        Place::Local => Vec::new(),
+        Place::Remote(remote) => vec![TrustItemView {
+            what: SERVER_ITEM,
+            file: format!("settings on {} (server)", remote.host),
+            label: "loads without asking".to_string(),
+            value: remote.user_tier.clone(),
+            outside: false,
+        }],
+    }
+}
+
+/// What the question says loads without asking on `host` for `profile`: the server account's own
+/// configuration, which the laptop does not read. Claude's directory is the one an agent on that host
+/// reported (`reported`, from an earlier handshake) when there is one; otherwise the account's default
+/// (`~/.claude-<account>`, `~/.claude` with no account pinned), said to hold only unless the server's
+/// login environment names another (`VERDANDI_CLAUDE_CONFIG_DIR`, `CLAUDE_CONFIG_DIR`). Codex's is its
+/// home, `~/.codex` unless the login sets `CODEX_HOME`.
+pub(crate) fn user_tier_words(host: &str, profile: &Profile, account: Option<&str>, reported: Option<&Path>) -> String {
+    match (profile, reported) {
+        (Profile::Codex, _) => {
+            format!("the account's Codex home on {host} (~/.codex unless the server's login sets CODEX_HOME)")
+        }
+        (_, Some(dir)) => format!(
+            "{} on {host}, the Claude config directory an agent there reported",
+            dir.display()
+        ),
+        (_, None) => {
+            let dir = account.map_or_else(|| "~/.claude".to_string(), |name| format!("~/.claude-{name}"));
+            format!("the account's Claude config directory on {host} ({dir} unless the server's login sets another)")
+        }
+    }
+}
+
+/// The kind of the row [`server_items`] makes.
+const SERVER_ITEM: &str = "server";
+
+/// The prompt for a check's result about `key` at `place`, sent with it in message `seq`, with the
+/// remember line `failure` (the subject's last failed record, if any) gives it. `None` when the result
+/// asks nothing. Worker only.
+fn prepare(key: &str, place: &Place, state: &TrustState, failure: Option<&str>, seq: u64) -> Option<Prompts> {
+    let remember = match state {
+        TrustState::Untrusted { remember, .. } | TrustState::Changed { remember, .. } => remember,
         _ => return None,
     };
     let basis = match (remember, failure) {
@@ -1787,9 +2269,9 @@ fn prepare(state: &TrustState, failure: Option<&str>, seq: u64) -> Option<Prompt
         _ => Basis::Own,
     };
     Some(Prompts {
-        key: discovery.profile.key(),
+        key: key.to_string(),
         for_seq: seq,
-        prepared: prepare_one(state, basis)?,
+        prepared: prepare_one(state, basis, place)?,
     })
 }
 
@@ -1801,41 +2283,51 @@ fn state_of(done: &Done) -> Option<&TrustState> {
         | Done::Confirmed { state, .. }
         | Done::Moved { state, .. }
         | Done::CommandChecked { state, .. }
-        | Done::Forgot { state, .. } => Some(state),
-        Done::RecordFailed { .. } => None,
+        | Done::Forgot { state: Some(state), .. } => Some(state),
+        Done::RecordFailed { .. }
+        | Done::Forgot { state: None, .. }
+        | Done::Unavailable { .. }
+        | Done::Withdrawn { .. } => None,
     }
 }
 
 /// Numbers the worker's results and builds their prompts. It is the one place that knows why each
-/// profile's last record failed: the gate keeps no copy, and takes the remember line from the prompt
+/// subject's last record failed: the gate keeps no copy, and takes the remember line from the prompt
 /// it showed, so the two can never disagree about it.
 #[derive(Default)]
 struct Preparer {
     seq: u64,
-    failures: HashMap<ProfileKey, String>,
+    failures: HashMap<SubjectKey, String>,
 }
 
 impl Preparer {
-    /// `asked`, for a failed record, is the state that record was asked for and the gate's number of
-    /// it: its prompt is built again with the failure's words, keeping no copy of any state here.
-    fn wrap(&mut self, done: Done, asked: Option<(u64, &TrustState)>) -> Msg {
+    /// `done` is about the subject `key` at `place`. `asked`, for a failed record, is the state that
+    /// record was asked for and the gate's number of it: its prompt is built again with the failure's
+    /// words, keeping no copy of any state here.
+    fn wrap(&mut self, key: SubjectKey, place: &Place, done: Done, asked: Option<(u64, &TrustState)>) -> Msg {
         self.seq += 1;
         let seq = self.seq;
         let prompts = match &done {
-            Done::RecordFailed { profile, reason, .. } => {
-                self.failures.insert(profile.clone(), reason.clone());
-                asked.and_then(|(at, state)| prepare(state, Some(reason), at))
+            Done::RecordFailed { reason, .. } => {
+                self.failures.insert(key.clone(), reason.clone());
+                asked.and_then(|(at, state)| prepare(&key, place, state, Some(reason), at))
             }
-            other => {
-                let state = state_of(other).expect("every other result carries a state");
-                let key = state_profile(state).key();
-                if matches!(other, Done::Recorded { .. }) {
-                    self.failures.remove(&key);
+            other => match state_of(other) {
+                Some(state) => {
+                    if matches!(other, Done::Recorded { .. }) {
+                        self.failures.remove(&key);
+                    }
+                    prepare(&key, place, state, self.failures.get(&key).map(String::as_str), seq)
                 }
-                prepare(state, self.failures.get(&key).map(String::as_str), seq)
-            }
+                None => None,
+            },
         };
-        Msg { seq, done, prompts }
+        Msg {
+            seq,
+            key,
+            done,
+            prompts,
+        }
     }
 }
 
@@ -1857,10 +2349,70 @@ impl DoneSender {
         }
     }
 
+    /// `done` about a profile at the window's root, as the worker sends it.
     #[cfg(test)]
     fn send(&self, done: Done) -> Result<(), mpsc::SendError<Msg>> {
-        let msg = self.preparer.borrow_mut().wrap(done, None);
+        let key = match (&done, state_of(&done)) {
+            (Done::RecordFailed { key, .. }, _) => key.clone(),
+            (_, Some(state)) => state_profile(state).key(),
+            (_, None) => String::new(),
+        };
+        let msg = self.preparer.borrow_mut().wrap(key, &Place::Local, done, None);
         self.tx.send(msg)
+    }
+}
+
+/// Takes what one worker has finished, without waiting. A worker that is gone (it panicked) owes nothing
+/// more: what it owed never comes, so nothing is counted as coming, every later job of its own is
+/// answered by [`TrustGate::queue`] as with no worker, and `gone` says what that means for its tabs.
+fn drain_worker(
+    done: &mpsc::Receiver<Msg>,
+    jobs: &mut Option<mpsc::Sender<Job>>,
+    in_flight: &mut usize,
+    into: &mut Vec<Msg>,
+    gone: &str,
+) {
+    loop {
+        match done.try_recv() {
+            Ok(msg) => {
+                // The worker answers each job with exactly one message.
+                *in_flight = in_flight.saturating_sub(1);
+                into.push(msg);
+            }
+            Err(mpsc::TryRecvError::Empty) => return,
+            Err(mpsc::TryRecvError::Disconnected) => {
+                if jobs.take().is_some() {
+                    eprintln!("[trust] {gone}");
+                }
+                *in_flight = 0;
+                return;
+            }
+        }
+    }
+}
+
+/// Why a remote project's job could not be done, in a person's words.
+fn cannot_check(host: &str, why: &str) -> String {
+    format!("the project on {host} could not be checked ({why})")
+}
+
+/// A start that waited on a check that could not be made.
+fn not_started(why: &str) -> String {
+    format!("not started: {why}; nothing was loaded or recorded")
+}
+
+/// A `y` whose second look could not be made: the tab's start is put off, `:trust` ends untrusted.
+fn unavailable(purpose: Purpose, why: String) -> GateEvent {
+    match purpose {
+        Purpose::ForTab(tab) => GateEvent::Unavailable {
+            tab,
+            why: not_started(&why),
+        },
+        Purpose::Command(request_id) => GateEvent::CommandDone {
+            request_id,
+            ok: false,
+            notice: Some(why),
+        },
     }
 }
 
@@ -2115,9 +2667,10 @@ fn read_codex_user_config(dir: &Path) -> UserCodexConfig {
     eitri_core::project_trust::read_user_codex_config(&resolved)
 }
 
-/// The worker: the only code here that touches the disk, and the only one that builds a prompt. It
-/// owns the store, runs each job in the order queued, and ends when the gate (and so the sender) is
-/// dropped.
+/// The worker: the only code here that touches the disk or asks a server, and the only one that builds
+/// a prompt. It owns the store, runs each job in the order queued, and ends when the gate (and so the
+/// sender) is dropped. A gate runs two: one for this machine's root and one for remote projects, whose
+/// configuration is read on their server ([`scan_on_server`]), never here.
 fn run_worker(
     store: TrustStore,
     root: PathBuf,
@@ -2125,6 +2678,7 @@ fn run_worker(
     codex_home: Option<PathBuf>,
     jobs: mpsc::Receiver<Job>,
     done: mpsc::Sender<Msg>,
+    withdrawn: Withdrawals,
     before_each: Box<dyn Fn() + Send>,
 ) {
     // Every result goes out with its prompt already built, here rather than on the GTK thread.
@@ -2155,26 +2709,47 @@ fn run_worker(
         }
         Profile::Claude | Profile::Acp { .. } => ProfileEnv::default(),
     };
-    let check = |store: &TrustStore, profile: &Profile| {
-        eitri_core::project_trust::for_root(store, &root, home, profile, &env_for(profile))
+    // A remote project is read on its server alone: nothing of this machine's disk stands in for it.
+    let check = |store: &TrustStore, subject: &Subject| match &subject.place {
+        Place::Local => Ok(eitri_core::project_trust::for_root(
+            store,
+            &root,
+            home,
+            &subject.profile,
+            &env_for(&subject.profile),
+        )),
+        Place::Remote(remote) => {
+            scan_on_server(remote, &subject.profile).map(|found| store.state_at(&subject.store_place(), found))
+        }
     };
-    let rediscover = |profile: &Profile| {
-        eitri_core::project_trust::discover(&root, home, &Default::default(), profile, &env_for(profile))
+    let rediscover = |subject: &Subject| match &subject.place {
+        Place::Local => Ok(eitri_core::project_trust::discover(
+            &root,
+            home,
+            &Default::default(),
+            &subject.profile,
+            &env_for(&subject.profile),
+        )),
+        Place::Remote(remote) => scan_on_server(remote, &subject.profile),
     };
     while let Ok(job) = jobs.recv() {
         before_each();
+        let subject = job.subject().clone();
+        let place = subject.store_place();
         // The state a record was asked for, kept until its result is sent: a failed record's prompt
         // is rebuilt from it.
         let mut asked: Option<(u64, Arc<TrustState>)> = None;
         let result = match job {
-            Job::Check {
-                generation,
-                epoch,
-                profile,
-            } => Done::Checked {
-                epoch,
-                generation,
-                state: check(&store, &profile),
+            Job::Check { generation, epoch, .. } => match check(&store, &subject) {
+                Ok(state) => Done::Checked {
+                    epoch,
+                    generation,
+                    state,
+                },
+                Err(why) => Done::Unavailable {
+                    job: Unanswered::Check { epoch, generation },
+                    why,
+                },
             },
             Job::Record {
                 purpose,
@@ -2182,34 +2757,41 @@ fn run_worker(
                 seq,
                 epoch,
                 now,
+                ..
             } => {
                 let shown = discovery_of(&shown_state).expect("every state carries its discovery");
                 // What was shown is what is written, and only if the disk still says the same: a
                 // change since the prompt is asked about again rather than trusted unseen.
-                let fresh = rediscover(&shown.profile);
-                if fresh.fingerprint != shown.fingerprint {
-                    Done::Moved {
+                match rediscover(&subject) {
+                    Err(why) => Done::Unavailable {
+                        job: Unanswered::Answer(purpose),
+                        why,
+                    },
+                    Ok(fresh) if moved(shown, &fresh) => Done::Moved {
                         epoch,
                         purpose,
-                        state: store.state(fresh),
-                    }
-                } else {
-                    let recorded = store.record(shown, now);
-                    asked = Some((seq, Arc::clone(&shown_state)));
-                    match recorded {
-                        Ok(()) => Done::Recorded {
-                            purpose,
-                            epoch,
-                            state: TrustState::Trusted {
-                                since_unix: now,
-                                discovery: fresh,
+                        state: store.state_at(&place, fresh),
+                    },
+                    // A `:untrust` queued after this `y` has already withdrawn it: nothing is written.
+                    Ok(_) if withdrawn_since(&withdrawn, &subject.key(), epoch) => Done::Withdrawn { purpose },
+                    Ok(fresh) => {
+                        let recorded = store.record_at(&place, shown, now);
+                        asked = Some((seq, Arc::clone(&shown_state)));
+                        match recorded {
+                            Ok(()) => Done::Recorded {
+                                purpose,
+                                epoch,
+                                state: TrustState::Trusted {
+                                    since_unix: now,
+                                    discovery: fresh,
+                                },
                             },
-                        },
-                        Err(e) => Done::RecordFailed {
-                            purpose,
-                            profile: shown.profile.key(),
-                            reason: e.to_string(),
-                        },
+                            Err(e) => Done::RecordFailed {
+                                purpose,
+                                key: subject.key(),
+                                reason: e.to_string(),
+                            },
+                        }
                     }
                 }
             }
@@ -2218,42 +2800,49 @@ fn run_worker(
                 shown,
                 epoch,
                 kept,
+                ..
             } => {
                 let shown = discovery_of(&shown).expect("every state carries its discovery");
-                let fresh = rediscover(&shown.profile);
-                if fresh.fingerprint != shown.fingerprint {
-                    Done::Moved {
+                match rediscover(&subject) {
+                    Err(why) => Done::Unavailable {
+                        job: Unanswered::Answer(purpose),
+                        why,
+                    },
+                    Ok(fresh) if moved(shown, &fresh) => Done::Moved {
                         epoch,
                         purpose,
-                        state: store.state(fresh),
-                    }
-                } else {
-                    Done::Confirmed {
+                        state: store.state_at(&place, fresh),
+                    },
+                    Ok(fresh) => Done::Confirmed {
                         purpose,
                         epoch,
                         kept,
-                        state: store.state(fresh),
-                    }
+                        state: store.state_at(&place, fresh),
+                    },
                 }
             }
             Job::CommandCheck {
-                epoch,
-                request_id,
-                tab,
-                profile,
-            } => Done::CommandChecked {
-                epoch,
-                request_id,
-                tab,
-                state: check(&store, &profile),
+                epoch, request_id, tab, ..
+            } => match check(&store, &subject) {
+                Ok(state) => Done::CommandChecked {
+                    epoch,
+                    request_id,
+                    tab,
+                    state,
+                },
+                Err(why) => Done::Unavailable {
+                    job: Unanswered::CommandCheck { request_id },
+                    why,
+                },
             },
             Job::Forget {
                 request_id,
                 had_window_trust,
-                profile,
+                ..
             } => {
-                let (ok, notice) = match store.forget(&root, &profile) {
-                    Ok(existed) if existed || had_window_trust => (true, untrusted_from_now(&profile)),
+                let profile = &subject.profile;
+                let (ok, notice) = match store.forget_at(&place, &root, profile) {
+                    Ok(existed) if existed || had_window_trust => (true, untrusted_from_now(profile)),
                     Ok(_) => (true, WAS_NOT_TRUSTED.to_string()),
                     Err(e) => (false, e.to_string()),
                 };
@@ -2261,15 +2850,81 @@ fn run_worker(
                     request_id,
                     ok,
                     notice,
-                    state: check(&store, &profile),
+                    state: check(&store, &subject).ok(),
                 }
             }
         };
         let asked = asked.as_ref().map(|(seq, state)| (*seq, &**state));
-        if done.send(preparer.wrap(result, asked)).is_err() {
+        if done
+            .send(preparer.wrap(subject.key(), &subject.place, result, asked))
+            .is_err()
+        {
             return;
         }
     }
+}
+
+/// Whether the disk read again before a `y` is not what the question showed: another configuration, or the
+/// same one in another directory (a remote root that now leads elsewhere).
+fn moved(shown: &Discovery, fresh: &Discovery) -> bool {
+    fresh.fingerprint != shown.fingerprint || fresh.root != shown.root
+}
+
+/// The newest `:untrust` epoch of each subject, as the gate moved it, shared with its workers.
+type Withdrawals = Arc<std::sync::Mutex<HashMap<SubjectKey, u64>>>;
+
+/// Whether `:untrust` of `key` came after a job queued at `epoch`.
+fn withdrawn_since(withdrawn: &Withdrawals, key: &str, epoch: u64) -> bool {
+    withdrawn
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(key)
+        .is_some_and(|latest| *latest > epoch)
+}
+
+/// A remote project's configuration as its server's helper found it for `profile` (`TrustScan`), taken
+/// only while the connection it came through shows the host key the project records, so a key that
+/// rotated is never read as the project's. Claude and Codex only: the helper scans for no other agent.
+/// `Err` says why nothing could be read, in a person's words; nothing here falls back to this machine's
+/// disk. Worker only: it waits on the server for as long as the scan takes.
+fn scan_on_server(remote: &RemotePlace, profile: &Profile) -> Result<Discovery, String> {
+    let cannot = |why: String| cannot_check(&remote.host, &why);
+    if !matches!(profile, Profile::Claude | Profile::Codex) {
+        return Err(cannot(format!(
+            "{} is not checked on a server; only Claude and Codex run there",
+            profile.label()
+        )));
+    }
+    let Some(server) = &remote.server else {
+        return Err(cannot(format!("this window has no connection to {}", remote.host)));
+    };
+    let (json, refusal) = match server {
+        Server::Helper(client) => {
+            let answer = client
+                .trust_scan(&remote.root.root, &profile.key())
+                .map_err(|status| cannot(status.message().to_string()))?;
+            (answer.discovery_json, answer.refusal)
+        }
+        #[cfg(test)]
+        Server::Fake(fake) => fake.scan(&remote.root.root, profile).map_err(cannot)?,
+    };
+    if !refusal.is_empty() {
+        return Err(cannot(refusal));
+    }
+    let found = eitri_core::project_trust::discovery_from_server(&json, profile).map_err(cannot)?;
+    let shown = match server {
+        Server::Helper(client) => client.verified_host_key(),
+        #[cfg(test)]
+        Server::Fake(fake) => fake.host_key(),
+    }
+    .map_err(cannot)?;
+    if shown != remote.root.host_key_sha256 {
+        return Err(cannot(format!(
+            "the connection shows host key {shown}, not the {} this project records",
+            remote.root.host_key_sha256
+        )));
+    }
+    Ok(found)
 }
 
 /// A gate on the worker, for tests: closed, every job waits until it is opened (or sixty seconds
@@ -2956,8 +3611,8 @@ mod tests {
         fx.write(SETTINGS, &hook("touch /tmp/a"));
         let (mut gate, jobs, done) = TrustGate::detached(fx.root.clone());
         let state = checked(&fx);
-        let prompts = prepare(&state, None, 1);
-        gate.take_latest(state, 1, prompts, &mut Vec::new());
+        let prompts = prepare(&CLAUDE.key(), &Place::Local, &state, None, 1);
+        gate.take_latest(CLAUDE.key(), state, 1, prompts, &mut Vec::new());
         let view = gate.show(A, 1, &CLAUDE).unwrap();
         assert_eq!(answer(&mut gate, &view, true), AnswerOutcome::Recording);
         let Ok(Job::Record { purpose, .. }) = jobs.try_recv() else {
@@ -2995,7 +3650,7 @@ mod tests {
         fx.trust_now(1_790_000_000);
         let trusted = checked(&fx);
         let (mut gate, jobs, done) = TrustGate::detached(fx.root.clone());
-        gate.take_latest(trusted.clone(), 0, None, &mut Vec::new());
+        gate.take_latest(CLAUDE.key(), trusted.clone(), 0, None, &mut Vec::new());
         assert_eq!(gate.current_route(&CLAUDE), Some(Route::Start(ProjectTrust::Trusted)));
         gate.wait_for(A, &CLAUDE);
         let generation = gate.begin_check(&CLAUDE);
@@ -3929,15 +4584,26 @@ mod tests {
         for anchor in [
             "for_root",
             "discover",
-            ".state(",
-            ".record(",
-            ".forget(",
+            ".state_at(",
+            ".record_at(",
+            ".forget_at(",
             "std::fs",
             "canonicalize",
+            "scan_on_server",
         ] {
             assert!(
                 worker[0].contains(anchor),
                 "the scan would not see `{anchor}` in run_worker"
+            );
+        }
+        // A remote project is read through the one function that asks its server, called from the
+        // worker only, and only it names the helper's scan or the key the connection shows.
+        let server = scan::functions(&code, "scan_on_server");
+        assert_eq!(server.len(), 1, "scan_on_server not found");
+        for anchor in ["trust_scan(", "verified_host_key(", "discovery_from_server("] {
+            assert!(
+                server[0].contains(anchor),
+                "the scan would not see `{anchor}` in scan_on_server"
             );
         }
         // The one helper the worker reads the user's Codex configuration with; called from nowhere
@@ -3952,17 +4618,36 @@ mod tests {
         assert_eq!(tests.len(), 1, "the tests module not found");
         let mut cut: Vec<&str> = worker;
         cut.extend(helper);
+        cut.extend(server);
         cut.extend(tests);
         let rest = scan::without(&code, &cut);
-        assert_eq!(
-            scan::word_ends(&rest, "read_codex_user_config").len(),
-            1,
-            "read_codex_user_config is named outside the worker (beyond its own definition)"
-        );
-        for word in ["for_root", "discover", "canonicalize"] {
+        for name in ["read_codex_user_config", "scan_on_server"] {
+            assert_eq!(
+                scan::word_ends(&rest, name).len(),
+                1,
+                "{name} is named outside the worker (beyond its own definition)"
+            );
+        }
+        for word in [
+            "for_root",
+            "discover",
+            "canonicalize",
+            "trust_scan",
+            "verified_host_key",
+            "discovery_from_server",
+        ] {
             assert!(scan::word_ends(&rest, word).is_empty(), "`{word}` outside the worker");
         }
-        for needle in [".state(", ".record(", ".forget(", "std::fs", "fs::"] {
+        for needle in [
+            ".state(",
+            ".record(",
+            ".forget(",
+            ".state_at(",
+            ".record_at(",
+            ".forget_at(",
+            "std::fs",
+            "fs::",
+        ] {
             assert!(!rest.contains(needle), "`{needle}` outside the worker");
         }
     }
@@ -4484,7 +5169,7 @@ mod tests {
         const BASE: usize = 1 << 10;
         let prepared_with = |hook_len: usize| {
             fx.write(SETTINGS, &hook(&"y".repeat(hook_len)));
-            match prepare_one(&checked(&fx), Basis::Own).unwrap().shape {
+            match prepare_one(&checked(&fx), Basis::Own, &Place::Local).unwrap().shape {
                 Shape::Fits { body, view } => (body.len(), view.changed.clone().unwrap().texts),
                 _ => panic!("a y/n question"),
             }
@@ -4517,13 +5202,13 @@ mod tests {
             if !copy {
                 std::fs::remove_file(copy_file(&fx)).unwrap();
             }
-            let prepared = prepare_one(&checked(&fx), Basis::Own).unwrap();
+            let prepared = prepare_one(&checked(&fx), Basis::Own, &Place::Local).unwrap();
             assert!(matches!(prepared.shape, Shape::OnlyN { .. }), "copy {copy}");
         }
     }
 
     fn texts_of(fx: &Fx) -> Vec<TrustTextView> {
-        match prepare_one(&checked(fx), Basis::Own).unwrap().shape {
+        match prepare_one(&checked(fx), Basis::Own, &Place::Local).unwrap().shape {
             Shape::Fits { view, .. } => view.changed.clone().unwrap().texts,
             _ => panic!("a y/n question"),
         }
@@ -4888,6 +5573,7 @@ mod tests {
         done.tx
             .send(Msg {
                 seq: 1,
+                key: gem().key(),
                 done: Done::Checked {
                     epoch: 0,
                     generation: 1,
@@ -5195,6 +5881,7 @@ mod tests {
         done.tx
             .send(Msg {
                 seq: 1,
+                key: CLAUDE.key(),
                 done: Done::Checked {
                     epoch: 0,
                     generation: 1,
@@ -5221,6 +5908,7 @@ mod tests {
         done.tx
             .send(Msg {
                 seq: 2,
+                key: CLAUDE.key(),
                 done: Done::CommandChecked {
                     epoch: 0,
                     request_id: "c".into(),
@@ -5362,9 +6050,11 @@ mod tests {
         // The record fails; the worker rebuilds result 1's prompt with the failure's words.
         let fail = |reason: &str, asked: (u64, &TrustState)| {
             let msg = done.preparer.borrow_mut().wrap(
+                CLAUDE.key(),
+                &Place::Local,
                 Done::RecordFailed {
                     purpose: Purpose::ForTab(A),
-                    profile: CLAUDE.key(),
+                    key: CLAUDE.key(),
                     reason: reason.to_string(),
                 },
                 Some(asked),
@@ -5401,5 +6091,723 @@ mod tests {
         assert!(last.remember_note.as_ref().unwrap().contains("disk full"));
         assert_eq!(answer(&mut gate, &last, true), AnswerOutcome::Recording);
         assert!(matches!(jobs.try_recv(), Ok(Job::Confirm { .. })));
+    }
+
+    /// A server's helper as a test plays it: each scan takes the next of the queued answers (the last
+    /// one repeats), each the discovery's JSON and a refusal, or a broken connection; the connection
+    /// shows `host_key`. Every root it was asked to scan is kept.
+    pub(crate) struct FakeServer {
+        answers: std::sync::Mutex<std::collections::VecDeque<Result<(Vec<u8>, String), String>>>,
+        host_key: std::sync::Mutex<Result<String, String>>,
+        scanned: std::sync::Mutex<Vec<PathBuf>>,
+    }
+
+    impl FakeServer {
+        pub(crate) fn new(host_key: &str) -> Arc<FakeServer> {
+            Arc::new(FakeServer {
+                answers: Default::default(),
+                host_key: std::sync::Mutex::new(Ok(host_key.to_string())),
+                scanned: Default::default(),
+            })
+        }
+
+        /// The helper finds `found` (sent as the JSON it sends).
+        pub(crate) fn finds(&self, found: &Discovery) {
+            let json = serde_json::to_vec(found).unwrap();
+            self.answers.lock().unwrap().push_back(Ok((json, String::new())));
+        }
+
+        /// The helper finds `found` from now on, whatever was queued before.
+        pub(crate) fn now_finds(&self, found: &Discovery) {
+            self.answers.lock().unwrap().clear();
+            self.finds(found);
+        }
+
+        /// The helper refuses the scan, saying `why`.
+        pub(crate) fn refuses(&self, why: &str) {
+            self.answers
+                .lock()
+                .unwrap()
+                .push_back(Ok((Vec::new(), why.to_string())));
+        }
+
+        /// The connection breaks under the scan, saying `why`.
+        pub(crate) fn breaks(&self, why: &str) {
+            self.answers.lock().unwrap().push_back(Err(why.to_string()));
+        }
+
+        /// The connection shows another key from now on.
+        pub(crate) fn shows_key(&self, key: &str) {
+            *self.host_key.lock().unwrap() = Ok(key.to_string());
+        }
+
+        pub(crate) fn scanned(&self) -> Vec<PathBuf> {
+            self.scanned.lock().unwrap().clone()
+        }
+
+        pub(crate) fn scan(&self, root: &Path, _profile: &Profile) -> Result<(Vec<u8>, String), String> {
+            self.scanned.lock().unwrap().push(root.to_path_buf());
+            let mut answers = self.answers.lock().unwrap();
+            let answer = if answers.len() > 1 {
+                answers.pop_front()
+            } else {
+                answers.front().cloned()
+            };
+            answer.unwrap_or_else(|| Err("no answer was set for this scan".to_string()))
+        }
+
+        pub(crate) fn host_key(&self) -> Result<String, String> {
+            self.host_key.lock().unwrap().clone()
+        }
+    }
+
+    /// The root a remote project records: a path this machine does not have.
+    fn server_root(fx: &Fx) -> PathBuf {
+        let root = fx.outer.join("not-on-this-machine/srv/project");
+        assert!(!root.exists());
+        root
+    }
+
+    /// Claude's configuration of `fx`'s tree as the server's helper finds it there.
+    fn found_on_server(fx: &Fx) -> Discovery {
+        eitri_core::project_trust::discover(
+            &fx.root,
+            Some(&fx.home),
+            &Default::default(),
+            &CLAUDE,
+            &ProfileEnv::default(),
+        )
+    }
+
+    fn remote_subject(profile: Profile, root: &Path, key: &str, server: Option<&Arc<FakeServer>>) -> Subject {
+        Subject::remote(
+            profile,
+            RemotePlace {
+                host: "example-host".into(),
+                root: RemoteRoot {
+                    host_key_sha256: key.into(),
+                    root: root.to_path_buf(),
+                },
+                user_tier: user_tier_words("example-host", &CLAUDE, None, None),
+                server: server.map(|server| Server::Fake(Arc::clone(server))),
+            },
+        )
+    }
+
+    /// A start of `subject` for `tab`: what the check sent it to, a route or why it could not be made.
+    fn start_at(gate: &mut TrustGate, tab: TabId, subject: &Subject) -> Result<Route, String> {
+        gate.wait_for(tab, subject);
+        gate.begin_check(subject);
+        let seen = drain(gate, |seen| {
+            seen.iter().any(|e| {
+                matches!(e, GateEvent::Route(t, _) if *t == tab)
+                    || matches!(e, GateEvent::Unavailable { tab: t, .. } if *t == tab)
+            })
+        });
+        seen.into_iter()
+            .find_map(|e| match e {
+                GateEvent::Route(t, route) if t == tab => Some(Ok(route)),
+                GateEvent::Unavailable { tab: t, why } if t == tab => Some(Err(why)),
+                _ => None,
+            })
+            .unwrap()
+    }
+
+    /// A remote tab's question is about what the server found: a hook only the server's scan holds is
+    /// shown, with where the settings are read and which of the server account's own load unasked, and
+    /// the root as the project records it is what the server was asked to scan. This machine has no such
+    /// root, so nothing here could have been read.
+    #[test]
+    fn remote_trust_uses_the_servers_settings() {
+        let fx = Fx::new("remote-settings");
+        fx.write(SETTINGS, &hook("echo only-on-the-server"));
+        let server = FakeServer::new("SHA256:host-a");
+        server.finds(&found_on_server(&fx));
+        let root = server_root(&fx);
+        let mut gate = TrustGate::new(fx.store(), root.clone(), Some(fx.home.clone()));
+        let subject = remote_subject(CLAUDE, &root, "SHA256:host-a", Some(&server));
+        assert_eq!(start_at(&mut gate, A, &subject), Ok(Route::Ask));
+        let view = gate
+            .show(A, 1, &subject)
+            .expect("the server's configuration is asked about");
+        assert_eq!(view.items[0].what, "server");
+        assert_eq!(view.items[0].file, "settings on example-host (server)");
+        assert_eq!(
+            view.items[0].value,
+            "the account's Claude config directory on example-host (~/.claude unless the server's login sets \
+             another)"
+        );
+        assert!(
+            view.items
+                .iter()
+                .any(|item| item.value.contains("echo only-on-the-server")),
+            "{:?}",
+            view.items
+        );
+        assert_eq!(server.scanned(), [root.clone()]);
+        assert!(!root.exists());
+        // The same profile at this machine's root is another subject, with no answer of its own yet.
+        assert_eq!(gate.current_route(&CLAUDE), None);
+    }
+
+    /// A local and a remote project at the same path are kept apart: a `y` for the server writes the
+    /// server's record and trusts nothing here, and this machine's question is about its own files.
+    #[test]
+    fn a_local_and_a_remote_project_at_the_same_path_are_kept_apart() {
+        let laptop = Fx::new("same-path-laptop");
+        laptop.write(SETTINGS, &hook("echo on-the-laptop"));
+        let tree = Fx::new("same-path-server");
+        tree.write(SETTINGS, &hook("echo on-the-server"));
+        let found = found_on_server(&tree);
+        let server = FakeServer::new("SHA256:host-a");
+        server.finds(&found);
+        let mut gate = laptop.gate();
+        let subject = remote_subject(CLAUDE, &laptop.root, "SHA256:host-a", Some(&server));
+        assert_eq!(start_at(&mut gate, A, &subject), Ok(Route::Ask));
+        let view = gate.show(A, 1, &subject).unwrap();
+        assert!(view.items.iter().any(|item| item.value.contains("on-the-server")));
+        assert_eq!(answer(&mut gate, &view, true), AnswerOutcome::Recording);
+        drain(&mut gate, |seen| {
+            seen.iter()
+                .any(|e| matches!(e, GateEvent::Recorded { tab, .. } if *tab == A))
+        });
+        let place = TrustPlace::Remote(RemoteRoot {
+            host_key_sha256: "SHA256:host-a".into(),
+            root: laptop.root.clone(),
+        });
+        assert!(matches!(
+            laptop.store().state_at(&place, found),
+            TrustState::Trusted { .. }
+        ));
+        assert!(
+            !laptop.record_file().exists(),
+            "nothing recorded for this machine's root"
+        );
+        assert_eq!(start(&mut gate, B), Route::Ask);
+        let view = gate.show(B, 2, &CLAUDE).unwrap();
+        assert!(view.items.iter().any(|item| item.value.contains("on-the-laptop")));
+        assert!(view.items.iter().all(|item| item.what != "server"));
+        // The remote project's `y` stands for it alone.
+        assert_eq!(
+            start_at(&mut gate, A, &subject),
+            Ok(Route::Start(ProjectTrust::Trusted))
+        );
+    }
+
+    /// Before a `y` is taken the server is asked again; a configuration that moved since the question
+    /// is refused, recorded nowhere, and asked about again.
+    #[test]
+    fn a_moved_fingerprint_before_yes_refuses() {
+        let fx = Fx::new("remote-moved");
+        fx.write(SETTINGS, &hook("echo first"));
+        let first = found_on_server(&fx);
+        fx.write(SETTINGS, &hook("echo second"));
+        let second = found_on_server(&fx);
+        let server = FakeServer::new("SHA256:host-a");
+        server.finds(&first);
+        server.finds(&second);
+        let root = server_root(&fx);
+        let mut gate = TrustGate::new(fx.store(), root.clone(), Some(fx.home.clone()));
+        let subject = remote_subject(CLAUDE, &root, "SHA256:host-a", Some(&server));
+        assert_eq!(start_at(&mut gate, A, &subject), Ok(Route::Ask));
+        let view = gate.show(A, 1, &subject).unwrap();
+        assert_eq!(view.fingerprint, first.fingerprint.hex());
+        assert_eq!(answer(&mut gate, &view, true), AnswerOutcome::Recording);
+        let seen = drain(&mut gate, |seen| {
+            seen.iter().any(
+                |e| matches!(e, GateEvent::RecordRefused { tab, .. } | GateEvent::Recorded { tab, .. } if *tab == A),
+            )
+        });
+        assert!(
+            seen.iter().any(|e| matches!(e, GateEvent::RecordRefused { tab, notice }
+                if *tab == A && notice == CHANGED_WHILE_READING)),
+            "{seen:?}"
+        );
+        assert_eq!(server.scanned().len(), 2, "asked again before the y");
+        let place = TrustPlace::Remote(RemoteRoot {
+            host_key_sha256: "SHA256:host-a".into(),
+            root,
+        });
+        for found in [first, second.clone()] {
+            assert!(matches!(
+                fx.store().state_at(&place, found),
+                TrustState::Untrusted { .. }
+            ));
+        }
+        // What is on the server now is what is asked next.
+        assert_eq!(gate.show(A, 2, &subject).unwrap().fingerprint, second.fingerprint.hex());
+    }
+
+    /// The host key ssh verified is part of what is trusted: the same root under a key that rotated is
+    /// asked about again, and a connection showing a key other than the project's is read for nothing.
+    #[test]
+    fn rotated_host_key_is_a_new_identity() {
+        let fx = Fx::new("remote-rotated");
+        fx.write(SETTINGS, &hook("echo hello"));
+        let server = FakeServer::new("SHA256:old");
+        server.finds(&found_on_server(&fx));
+        let root = server_root(&fx);
+        let mut gate = TrustGate::new(fx.store(), root.clone(), Some(fx.home.clone()));
+        let old = remote_subject(CLAUDE, &root, "SHA256:old", Some(&server));
+        assert_eq!(start_at(&mut gate, A, &old), Ok(Route::Ask));
+        let view = gate.show(A, 1, &old).unwrap();
+        assert_eq!(answer(&mut gate, &view, true), AnswerOutcome::Recording);
+        drain(&mut gate, |seen| {
+            seen.iter()
+                .any(|e| matches!(e, GateEvent::Recorded { tab, .. } if *tab == A))
+        });
+        assert_eq!(start_at(&mut gate, A, &old), Ok(Route::Start(ProjectTrust::Trusted)));
+
+        // The project's key rotated and the connection shows the new one: the same root is a new
+        // identity, asked about from the start, in a window that answered for the old one.
+        server.shows_key("SHA256:new");
+        let new = remote_subject(CLAUDE, &root, "SHA256:new", Some(&server));
+        assert_eq!(start_at(&mut gate, B, &new), Ok(Route::Ask));
+        // A connection showing a key other than the one the project records is read for nothing.
+        let why = start_at(&mut gate, A, &old).unwrap_err();
+        assert!(why.contains("SHA256:new") && why.contains("SHA256:old"), "{why}");
+    }
+
+    /// A scan the helper refuses is a refusal, never a start: the tab's start is put off with the
+    /// helper's own words, and nothing is routed or recorded.
+    #[test]
+    fn trust_scan_refusal_is_a_card_not_a_start() {
+        let fx = Fx::new("remote-refused");
+        let server = FakeServer::new("SHA256:host-a");
+        server.refuses("the project folder changed during the scan");
+        let root = server_root(&fx);
+        let mut gate = TrustGate::new(fx.store(), root.clone(), Some(fx.home.clone()));
+        let subject = remote_subject(CLAUDE, &root, "SHA256:host-a", Some(&server));
+        let why = start_at(&mut gate, A, &subject).unwrap_err();
+        assert_eq!(
+            why,
+            "not started: the project on example-host could not be checked (the project folder changed during \
+             the scan); nothing was loaded or recorded"
+        );
+        assert_eq!(gate.current_route(&subject), None);
+        assert!(!gate.is_waiting(A));
+    }
+
+    /// A connection that breaks, a window with no connection, or a scan about another agent, are
+    /// refusals too; so is a broken connection at the second look before a `y`.
+    #[test]
+    fn a_transport_error_is_a_card_not_a_start() {
+        let fx = Fx::new("remote-transport");
+        fx.write(SETTINGS, &hook("echo hello"));
+        let root = server_root(&fx);
+        let mut gate = TrustGate::new(fx.store(), root.clone(), Some(fx.home.clone()));
+
+        let broken = FakeServer::new("SHA256:host-a");
+        broken.breaks("the helper on example-host did not answer within 120 s");
+        let subject = remote_subject(CLAUDE, &root, "SHA256:host-a", Some(&broken));
+        let why = start_at(&mut gate, A, &subject).unwrap_err();
+        assert!(why.contains("did not answer within 120 s"), "{why}");
+
+        let unconnected = remote_subject(CLAUDE, &root, "SHA256:host-a", None);
+        let why = start_at(&mut gate, A, &unconnected).unwrap_err();
+        assert!(why.contains("this window has no connection to example-host"), "{why}");
+
+        let server = FakeServer::new("SHA256:host-a");
+        server.finds(&found_on_server(&fx));
+        server.breaks("broken pipe");
+        let subject = remote_subject(CLAUDE, &root, "SHA256:host-a", Some(&server));
+        assert_eq!(start_at(&mut gate, A, &subject), Ok(Route::Ask));
+        let view = gate.show(A, 1, &subject).unwrap();
+        assert_eq!(answer(&mut gate, &view, true), AnswerOutcome::Recording);
+        let seen = drain(&mut gate, |seen| {
+            seen.iter()
+                .any(|e| matches!(e, GateEvent::Unavailable { tab, .. } | GateEvent::Recorded { tab, .. } if *tab == A))
+        });
+        assert!(
+            seen.iter()
+                .any(|e| matches!(e, GateEvent::Unavailable { tab, why } if *tab == A && why.contains("broken pipe"))),
+            "{seen:?}"
+        );
+        let place = TrustPlace::Remote(RemoteRoot {
+            host_key_sha256: "SHA256:host-a".into(),
+            root,
+        });
+        assert!(matches!(
+            fx.store().state_at(&place, found_on_server(&fx)),
+            TrustState::Untrusted { .. }
+        ));
+    }
+
+    /// The server scans for Claude and Codex only: a registered agent's question about a remote project is
+    /// refused here, and the server is not asked.
+    #[test]
+    fn an_acp_profile_on_a_remote_project_is_refused() {
+        let fx = Fx::new("remote-acp");
+        let server = FakeServer::new("SHA256:host-a");
+        server.finds(&found_on_server(&fx));
+        let root = server_root(&fx);
+        let mut gate = TrustGate::new(fx.store(), root.clone(), Some(fx.home.clone()));
+        let acp = Profile::Acp {
+            name: "example-agent".into(),
+            files: vec!["AGENTS.md".into()],
+        };
+        let subject = remote_subject(acp, &root, "SHA256:host-a", Some(&server));
+        let why = start_at(&mut gate, A, &subject).unwrap_err();
+        assert!(why.contains("example-agent is not checked on a server"), "{why}");
+        assert!(server.scanned().is_empty());
+    }
+
+    /// A gate with no worker refuses a remote project's start rather than starting it untrusted.
+    #[test]
+    fn a_remote_check_with_no_worker_starts_nothing() {
+        let fx = Fx::new("remote-no-worker");
+        let root = server_root(&fx);
+        let mut gate = TrustGate::without_worker(root.clone());
+        let subject = remote_subject(CLAUDE, &root, "SHA256:host-a", None);
+        gate.wait_for(A, &subject);
+        gate.begin_check(&subject);
+        let events = gate.poll();
+        assert!(
+            matches!(&events[..], [GateEvent::Unavailable { tab, .. }] if *tab == A),
+            "{events:?}"
+        );
+    }
+    /// The row names the user tier the laptop can know of: the directory an agent on that host reported, or
+    /// the account's default there with the caveat that the server's login may set another.
+    #[test]
+    fn the_user_tier_row_never_claims_a_directory_it_cannot_know() {
+        assert_eq!(
+            user_tier_words("example-host", &CLAUDE, Some("work"), None),
+            "the account's Claude config directory on example-host (~/.claude-work unless the server's login sets \
+             another)"
+        );
+        assert_eq!(
+            user_tier_words(
+                "example-host",
+                &CLAUDE,
+                Some("work"),
+                Some(Path::new("/data/claude-cfg"))
+            ),
+            "/data/claude-cfg on example-host, the Claude config directory an agent there reported"
+        );
+        assert_eq!(
+            user_tier_words(
+                "example-host",
+                &Profile::Codex,
+                None,
+                Some(Path::new("/data/claude-cfg"))
+            ),
+            "the account's Codex home on example-host (~/.codex unless the server's login sets CODEX_HOME)"
+        );
+    }
+
+    /// A page that loads asks for a check that nothing waits on; for a remote project that is a scan of the
+    /// server's tree, so while one is queued or running another is not queued, and a start's own check waits
+    /// behind at most that one.
+    #[test]
+    fn page_readies_queue_at_most_one_scan_and_a_start_is_not_stuck_behind_them() {
+        let fx = Fx::new("remote-coalesced");
+        fx.write(SETTINGS, &hook("echo hello"));
+        let server = FakeServer::new("SHA256:host-a");
+        server.finds(&found_on_server(&fx));
+        let root = server_root(&fx);
+        let hold = WorkerHold::closed();
+        let mut gate = TrustGate::new_held(fx.store(), root.clone(), Some(fx.home.clone()), hold.clone());
+        let subject = remote_subject(CLAUDE, &root, "SHA256:host-a", Some(&server));
+        for _ in 0..5 {
+            gate.refresh(&subject);
+        }
+        assert_eq!(gate.server_jobs(), 1, "one scan queued for five loads");
+        gate.wait_for(A, &subject);
+        gate.begin_check(&subject);
+        assert_eq!(gate.server_jobs(), 2, "the start's check is next in line");
+        hold.open();
+        let seen = drain(&mut gate, |seen| {
+            seen.iter().any(|e| matches!(e, GateEvent::Route(t, _) if *t == A))
+        });
+        assert!(seen.contains(&GateEvent::Route(A, Route::Ask)), "{seen:?}");
+        assert_eq!(server.scanned().len(), 2);
+        // Once that scan was answered, a later load checks again.
+        gate.refresh(&subject);
+        drain(&mut gate, |_| server.scanned().len() == 3);
+        assert!(!hold.timed_out());
+    }
+
+    /// The remote worker takes at most [`MAX_SERVER_JOBS`] jobs at once; one more is refused, never started.
+    #[test]
+    fn the_remote_queue_is_capped_and_overflow_is_refused() {
+        let fx = Fx::new("remote-capped");
+        fx.write(SETTINGS, &hook("echo hello"));
+        let server = FakeServer::new("SHA256:host-a");
+        server.finds(&found_on_server(&fx));
+        let root = server_root(&fx);
+        let hold = WorkerHold::closed();
+        let mut gate = TrustGate::new_held(fx.store(), root.clone(), Some(fx.home.clone()), hold.clone());
+        let subject = remote_subject(CLAUDE, &root, "SHA256:host-a", Some(&server));
+        let tabs: Vec<TabId> = (1..=MAX_SERVER_JOBS as u64 + 1).map(TabId).collect();
+        for &tab in &tabs {
+            gate.wait_for(tab, &subject);
+            gate.begin_check(&subject);
+        }
+        assert_eq!(gate.server_jobs(), MAX_SERVER_JOBS);
+        let over = *tabs.last().unwrap();
+        let refused = gate.poll();
+        assert!(
+            matches!(&refused[..], [GateEvent::Unavailable { tab, why }] if *tab == over && why.contains("too many")),
+            "{refused:?}"
+        );
+        hold.open();
+        let seen = drain(&mut gate, |seen| {
+            seen.iter().filter(|e| matches!(e, GateEvent::Route(..))).count() == MAX_SERVER_JOBS
+        });
+        assert!(
+            seen.iter().all(|e| matches!(e, GateEvent::Route(_, Route::Ask))),
+            "{seen:?}"
+        );
+        assert!(!hold.timed_out());
+    }
+
+    /// A backlog on the remote worker is polled on a slow deadline, not the steady tick.
+    #[test]
+    fn a_remote_backlog_does_not_hold_the_steady_tick() {
+        let fx = Fx::new("remote-slow-poll");
+        let server = FakeServer::new("SHA256:host-a");
+        server.finds(&found_on_server(&fx));
+        let root = server_root(&fx);
+        let hold = WorkerHold::closed();
+        let mut gate = TrustGate::new_held(fx.store(), root.clone(), Some(fx.home.clone()), hold.clone());
+        let now = Instant::now();
+        assert_eq!(gate.server_poll_deadline(now), None);
+        gate.begin_check(remote_subject(CLAUDE, &root, "SHA256:host-a", Some(&server)));
+        assert!(!gate.is_busy(), "the steady tick is not held for a server's answer");
+        assert_eq!(gate.server_poll_deadline(now), Some(now + SERVER_POLL));
+        hold.open();
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while gate.server_poll_deadline(Instant::now()).is_some() {
+            let _ = gate.poll();
+            assert!(Instant::now() < deadline, "the scan never came back");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(server.scanned().len(), 1);
+    }
+
+    /// Nothing in the panel but the gate's worker asks a server or writes a remote record: every file of
+    /// `panel/src` is read, so a call moved to the GTK thread's side (`subject_for` holds a live connection)
+    /// is caught.
+    #[test]
+    fn only_the_worker_asks_a_server_anywhere_in_the_panel() {
+        let sources = scan::rust_sources(&["panel/src"]);
+        scan::require_anchors(&sources, &["fn scan_on_server(", "fn subject_for("]);
+        let test_only = scan::test_only_files(&sources);
+        for source in &sources {
+            if test_only.contains(&source.path) || source.path.ends_with("panel/src/trust_gate.rs") {
+                continue;
+            }
+            let code = scan::code_only(&source.text);
+            let tests = scan::modules(&code, "tests");
+            let rest = scan::without(&code, &tests);
+            for word in [
+                "trust_scan",
+                "verified_host_key",
+                "discovery_from_server",
+                "scan_on_server",
+                "state_at",
+                "record_at",
+                "forget_at",
+            ] {
+                assert!(
+                    scan::word_ends(&rest, word).is_empty(),
+                    "{} names `{word}` outside the trust worker",
+                    source.path
+                );
+            }
+        }
+    }
+    /// A worker that runs one job per permit it was given, so a test decides how many results there are when it
+    /// polls.
+    #[derive(Clone, Default)]
+    struct Permits(std::sync::Arc<(std::sync::Mutex<usize>, std::sync::Condvar)>);
+
+    impl Permits {
+        fn give(&self, n: usize) {
+            *self.0 .0.lock().unwrap() += n;
+            self.0 .1.notify_all();
+        }
+
+        fn take(&self) {
+            let (left, given) = &*self.0;
+            let guard = left.lock().unwrap();
+            let (mut left, _) = given
+                .wait_timeout_while(guard, Duration::from_secs(60), |left| *left == 0)
+                .unwrap();
+            *left = left.saturating_sub(1);
+        }
+    }
+
+    /// A remote start's check whose result comes back stale (an `:untrust` came after it) is checked again; when
+    /// the queue is full then (seven `:trust` checks and the forget still in it), the retry is refused, and the
+    /// start's waiter is told so rather than left waiting for a check nobody queued.
+    #[test]
+    fn a_stale_checks_retry_refused_for_a_full_queue_still_answers_its_waiter() {
+        let fx = Fx::new("remote-stale-full");
+        fx.write(SETTINGS, &hook("echo hello"));
+        let server = FakeServer::new("SHA256:host-a");
+        server.finds(&found_on_server(&fx));
+        let root = server_root(&fx);
+        let permits = Permits::default();
+        let each = permits.clone();
+        let mut gate = TrustGate::with_wait(
+            fx.store(),
+            root.clone(),
+            Some(fx.home.clone()),
+            Arc::new(move || each.take()),
+        );
+        let subject = remote_subject(CLAUDE, &root, "SHA256:host-a", Some(&server));
+        gate.wait_for(A, &subject);
+        gate.begin_check(&subject);
+        for n in 0..MAX_SERVER_JOBS - 1 {
+            gate.command(format!("t{n}"), TrustAction::Trust, A, &subject);
+        }
+        assert_eq!(gate.server_jobs(), MAX_SERVER_JOBS);
+        gate.command("u".into(), TrustAction::Untrust, A, &subject);
+        assert_eq!(
+            gate.server_jobs(),
+            MAX_SERVER_JOBS + 1,
+            "the forget is queued, not refused"
+        );
+        permits.give(1);
+        let mut seen = Vec::new();
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while gate.server_jobs() > MAX_SERVER_JOBS {
+            seen.extend(gate.poll());
+            assert!(Instant::now() < deadline, "the start's check never came back");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        permits.give(MAX_SERVER_JOBS * 2);
+        let answered = |seen: &[GateEvent]| {
+            seen.iter().any(|e| {
+                matches!(e, GateEvent::Route(t, _) if *t == A)
+                    || matches!(e, GateEvent::Unavailable { tab, .. } if *tab == A)
+            })
+        };
+        let rest = drain(&mut gate, |more| command_done(more, "u").is_some());
+        seen.extend(rest);
+        seen.extend(gate.poll());
+        assert!(answered(&seen), "the start is answered: {seen:?}");
+        assert!(!gate.is_waiting(A));
+    }
+
+    /// `:untrust` of a remote project is never refused for a full queue, and a `y` queued before it is not
+    /// written: the later command wins, so no record is left and no tab starts trusted.
+    #[test]
+    fn untrust_with_a_full_remote_queue_still_withdraws_a_queued_yes() {
+        let fx = Fx::new("remote-untrust-full");
+        fx.write(SETTINGS, &hook("echo hello"));
+        let found = found_on_server(&fx);
+        let server = FakeServer::new("SHA256:host-a");
+        server.finds(&found);
+        let root = server_root(&fx);
+        let hold = WorkerHold::default();
+        let mut gate = TrustGate::new_held(fx.store(), root.clone(), Some(fx.home.clone()), hold.clone());
+        let subject = remote_subject(CLAUDE, &root, "SHA256:host-a", Some(&server));
+        assert_eq!(start_at(&mut gate, A, &subject), Ok(Route::Ask));
+        let view = gate.show(A, 1, &subject).unwrap();
+        hold.close();
+        assert_eq!(answer(&mut gate, &view, true), AnswerOutcome::Recording);
+        let others: Vec<TabId> = (10..10 + MAX_SERVER_JOBS as u64 - 1).map(TabId).collect();
+        for &tab in &others {
+            gate.wait_for(tab, &subject);
+            gate.begin_check(&subject);
+        }
+        assert_eq!(gate.server_jobs(), MAX_SERVER_JOBS);
+        gate.command("u".into(), TrustAction::Untrust, A, &subject);
+        assert_eq!(
+            gate.server_jobs(),
+            MAX_SERVER_JOBS + 1,
+            "the forget is queued, not refused"
+        );
+        hold.open();
+        let seen = drain(&mut gate, |seen| {
+            command_done(seen, "u").is_some()
+                && others
+                    .iter()
+                    .all(|tab| seen.iter().any(|e| matches!(e, GateEvent::Route(t, _) if t == tab)))
+        });
+        assert_eq!(
+            command_done(&seen, "u"),
+            Some((true, Some(WAS_NOT_TRUSTED.to_string()))),
+            "the queued y was never written, so nothing was there to forget: {seen:?}"
+        );
+        assert!(
+            seen.iter()
+                .all(|e| !matches!(e, GateEvent::Route(_, Route::Start(_)) | GateEvent::Recorded { .. })),
+            "{seen:?}"
+        );
+        let place = TrustPlace::Remote(RemoteRoot {
+            host_key_sha256: "SHA256:host-a".into(),
+            root,
+        });
+        assert!(matches!(
+            fx.store().state_at(&place, found),
+            TrustState::Untrusted { .. }
+        ));
+        assert_eq!(start_at(&mut gate, B, &subject), Ok(Route::Ask));
+        assert!(!hold.timed_out());
+    }
+
+    /// Two server trees with the same configuration, as a recorded root pointed at another checkout leads
+    /// to: `fx`'s and a twin of it.
+    fn twin_trees(label: &str) -> (Fx, Fx, Discovery, Discovery) {
+        let first = Fx::new(&format!("{label}-a"));
+        let second = Fx::new(&format!("{label}-b"));
+        for fx in [&first, &second] {
+            fx.write(SETTINGS, &hook("echo hello"));
+        }
+        let (a, b) = (found_on_server(&first), found_on_server(&second));
+        assert_eq!(a.fingerprint, b.fingerprint);
+        assert_ne!(a.root, b.root);
+        (first, second, a, b)
+    }
+
+    /// A `y` is taken only while the recorded root still leads where the question showed: the same
+    /// configuration in another directory is asked about again, not recorded.
+    #[test]
+    fn a_retargeted_root_before_yes_is_asked_again() {
+        let (fx, _twin, a, b) = twin_trees("remote-retarget-yes");
+        let server = FakeServer::new("SHA256:host-a");
+        server.finds(&a);
+        server.finds(&b);
+        let root = server_root(&fx);
+        let mut gate = TrustGate::new(fx.store(), root.clone(), Some(fx.home.clone()));
+        let subject = remote_subject(CLAUDE, &root, "SHA256:host-a", Some(&server));
+        assert_eq!(start_at(&mut gate, A, &subject), Ok(Route::Ask));
+        let view = gate.show(A, 1, &subject).unwrap();
+        assert_eq!(answer(&mut gate, &view, true), AnswerOutcome::Recording);
+        let seen = drain(&mut gate, |seen| {
+            seen.iter().any(
+                |e| matches!(e, GateEvent::RecordRefused { tab, .. } | GateEvent::Recorded { tab, .. } if *tab == A),
+            )
+        });
+        assert!(
+            seen.iter().any(|e| matches!(e, GateEvent::RecordRefused { tab, notice }
+                if *tab == A && notice == CHANGED_WHILE_READING)),
+            "{seen:?}"
+        );
+    }
+
+    /// The window's own answer is for the directory it was given in: after a `y`, the recorded root leading
+    /// to another directory with the same configuration is asked about again.
+    #[test]
+    fn a_window_answer_does_not_follow_a_retargeted_root() {
+        let (fx, _twin, a, b) = twin_trees("remote-retarget-window");
+        let server = FakeServer::new("SHA256:host-a");
+        server.finds(&a);
+        let root = server_root(&fx);
+        let mut gate = TrustGate::new(fx.store(), root.clone(), Some(fx.home.clone()));
+        let subject = remote_subject(CLAUDE, &root, "SHA256:host-a", Some(&server));
+        assert_eq!(start_at(&mut gate, A, &subject), Ok(Route::Ask));
+        let view = gate.show(A, 1, &subject).unwrap();
+        assert_eq!(answer(&mut gate, &view, true), AnswerOutcome::Recording);
+        drain(&mut gate, |seen| {
+            seen.iter()
+                .any(|e| matches!(e, GateEvent::Recorded { tab, .. } if *tab == A))
+        });
+        server.now_finds(&b);
+        assert_eq!(start_at(&mut gate, B, &subject), Ok(Route::Ask));
     }
 }

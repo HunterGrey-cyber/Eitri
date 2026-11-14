@@ -1,3 +1,4 @@
+import { remoteLinkLine } from "./band";
 import { classify as classifyGd, expectedName, validName, wordAt } from "./gdTarget";
 import type { Cited, GdTarget } from "./gdTarget";
 import type { ColumnUnit, EditorSymbolResult } from "./bridge";
@@ -69,8 +70,8 @@ import { landingInset } from "./promptHeader";
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
 import type { KeyboardEvent, SetStateAction } from "react";
 import { ProjectDirContext } from "./projectPath";
-import { initialPageModel, pageModel, withoutHint } from "./page_model";
-import type { CommandRecord, PageModel } from "./page_model";
+import { dismissShownRootNote, initialPageModel, pageModel, shownRootNote, withoutHint } from "./page_model";
+import type { CommandRecord, Confirmation, PageModel } from "./page_model";
 import { pruneCardViews, pruneTabEntries } from "./pageLookups";
 import type { CardView } from "./pageLookups";
 import { installDispatch, installRemoteDesk, postForResult, postToRust, nextMirrorId, nextRequestId } from "./bridge";
@@ -276,15 +277,15 @@ export default function App() {
     setPage(next);
   }, []);
   const {
-    state, hello, tabs, fatalError, handoff, handoffRequests, commandNotice, rootNote, turnClock, turnDurations, thinkingDisplay, paneFocused,
+    state, hello, tabs, fatalError, handoff, handoffRequests, commandNotice, rootNote, tabRootNotes, turnClock, turnDurations, thinkingDisplay, paneFocused,
     queue, queueError, queueNote, queueSteers, shellRunning, history, ruleOffers, editorContext, editorLink, scratchEditing,
     review, reviewHints, reviewRecovery, reviewSettings, chooser,
-    inputRequest, arriveRequest, permissionRequest, navKey, keymapHelp, pages, heldTrust, confirm, renaming, queueTaken,
-    draftImages,
+    inputRequest, arriveRequest, permissionRequest, navKey, keymapHelp, pages, heldTrust, heldRemote, confirm, renaming,
+    queueTaken, draftImages,
   } = page;
   const {
     setFatalError, setHandoffRequests, setCommandNotice, setRootNote, setReview, setReviewHints, setChooser,
-    setInputRequest, setArriveRequest, setPermissionRequest, setHeldTrust, setConfirm, setRenaming,
+    setInputRequest, setArriveRequest, setPermissionRequest, setHeldTrust, setHeldRemote, setConfirm, setRenaming,
   } = useMemo(() => ({
     setFatalError: (value: SetStateAction<PageModel["fatalError"]>) => setPageField("fatalError", value),
     setHandoffRequests: (value: SetStateAction<PageModel["handoffRequests"]>) => setPageField("handoffRequests", value),
@@ -297,6 +298,7 @@ export default function App() {
     setArriveRequest: (value: SetStateAction<PageModel["arriveRequest"]>) => setPageField("arriveRequest", value),
     setPermissionRequest: (value: SetStateAction<PageModel["permissionRequest"]>) => setPageField("permissionRequest", value),
     setHeldTrust: (value: SetStateAction<PageModel["heldTrust"]>) => setPageField("heldTrust", value),
+    setHeldRemote: (value: SetStateAction<PageModel["heldRemote"]>) => setPageField("heldRemote", value),
     setConfirm: (value: SetStateAction<PageModel["confirm"]>) => setPageField("confirm", value),
     setRenaming: (value: SetStateAction<PageModel["renaming"]>) => setPageField("renaming", value),
   }), [setPageField]);
@@ -1562,6 +1564,10 @@ export default function App() {
    *  this request id (or told why not by the refusal). Recorded as `"review"`, so a refusal is the
    *  overlay's own header and not the conversation's banner. */
   function openReviewOverlay(tab: TabId) {
+    if (state.provider?.host) {
+      showFlash("turn review is not available on remote tabs yet");
+      return;
+    }
     const requestId = nextRequestId();
     trackRequest(requestId, { kind: "review", tab });
     setReview(openReview(tab, requestId, reviewRecovery));
@@ -1874,6 +1880,38 @@ export default function App() {
       flashAfter: flashSeq.current,
     });
   }, [heldTrust, keysTakenElsewhere]);
+  /* A remote tab's question is drawn while its tab is shown and nothing else holds the keys: it never replaces a
+     prompt, field or picker that is up, and a background tab's question waits for its tab. Escape puts it away
+     until the tab is shown again (`remoteAwayRef`). Opening it ends a pending sequence and VISUAL, as every prompt
+     in the band does; the keys stay where they were, and a key typed into a text field stays the field's. */
+  const remoteAwayRef = useRef<{ tab: TabId; nonce: number } | null>(null);
+  const shownTab = activeTab?.id ?? null;
+  useEffect(() => {
+    if (remoteAwayRef.current !== null && remoteAwayRef.current.tab !== shownTab) remoteAwayRef.current = null;
+  }, [shownTab]);
+  const heldRemoteShown = shownTab === null ? undefined : heldRemote.get(shownTab);
+  useLayoutEffect(() => {
+    if (heldRemoteShown === undefined || confirm !== null || heldTrust !== null || keysTakenElsewhere) return;
+    const away = remoteAwayRef.current;
+    if (away !== null && away.tab === heldRemoteShown.tab && away.nonce === heldRemoteShown.nonce) return;
+    dropPendingKeys();
+    exitRegion();
+    closeTransientOverlays();
+    // The prompt band shows the words, then each choice as `key label`. The lines carry the agent's own words (a
+    // waiting request's tool name and input) and the host as typed: hidden and bidi characters are drawn as escapes.
+    const lines = [
+      ...heldRemoteShown.lines.map(revealedText),
+      heldRemoteShown.choices.map((c) => `${c.key} ${revealedText(c.label)}`).join(" · "),
+    ];
+    setConfirm({
+      kind: "remote",
+      tab: heldRemoteShown.tab,
+      nonce: heldRemoteShown.nonce,
+      lines,
+      choices: heldRemoteShown.choices,
+      openedAt: performance.now(),
+    });
+  }, [heldRemoteShown, confirm, heldTrust, keysTakenElsewhere]);
   /* The question took the keys to the layout's root (a field must not hold them while it is up). On the start
      screen that root is not what handles keys -- `.empty-tab` inside it is -- so whichever way the question
      ended, the keys are asked for back, through the one path every other overlay's close uses. Reads this
@@ -4845,7 +4883,7 @@ export default function App() {
    *  that hands the keys to something else calls `endKeyPrompts` (below) instead, which ends all three kinds of
    *  prompt, because a `y` typed into what such a route opens answered a close prompt too. */
   function cancelBypassConfirm() {
-    setConfirm((c) => (c?.kind === "bypass" || c?.kind === "restore" || c?.kind === "trust" || c?.kind === "stop_background" || c?.kind === "stop_turn" ? null : c));
+    setConfirm((c) => (c?.kind === "bypass" || c?.kind === "restore" || c?.kind === "trust" || c?.kind === "stop_background" || c?.kind === "stop_turn" || c?.kind === "remote" ? null : c));
     setHeldTrust(null);
   }
 
@@ -4960,6 +4998,50 @@ export default function App() {
    *  that owns it) -- checked here, ahead of the `confirm === null` return, so it still applies once
    *  `confirm` is gone. A confirm that is NOT null (a fresh reprompt arrived in between) skips
    *  this and reaches the branch below unchanged, which already treats a repeat as never counting. */
+  /** A key while a remote tab's question is up. A key typed into a text field is the field's and leaves the question
+   *  up. A choice's key answers only when pressed on its own, not held, after the question has been on screen and the
+   *  typing has paused for the same time a bypass `y` needs; one too soon says why and leaves the question up.
+   *  Escape puts the question away until its tab is shown again. Any other key leaves it up and does what it does. */
+  function answerRemote(
+    event: KeyboardEvent<HTMLElement>,
+    asked: Extract<Confirmation, { kind: "remote" }>,
+  ): boolean {
+    if (isEditableElement(event.target) || isModifierKey(event.key)) return false;
+    if (event.key === "Escape") {
+      event.preventDefault();
+      event.stopPropagation();
+      remoteAwayRef.current = { tab: asked.tab, nonce: asked.nonce };
+      setConfirm(null);
+      return true;
+    }
+    const choice = asked.choices.find((c) => c.key === event.key);
+    if (choice === undefined) return false;
+    event.preventDefault();
+    event.stopPropagation();
+    promptSwallowKeyRef.current = event.key;
+    typingGuard.onKey(event.key, typingGuard.timeOf(event));
+    const plain = isPlainAnswerKey(event.nativeEvent as unknown as KeyLike);
+    if (!plain || event.repeat || !bypassYesCounts(answerClock())) {
+      showFlash(`${choice.key} must be pressed on its own, after a pause, to ${revealedText(choice.label)}`);
+      return true;
+    }
+    postToRust({
+      type: "remote_prompt_answer",
+      request_id: nextRequestId(),
+      tab: asked.tab,
+      nonce: asked.nonce,
+      action: choice.action,
+    });
+    setHeldRemote((held) => {
+      if (held.get(asked.tab)?.nonce !== asked.nonce) return held;
+      const next = new Map(held);
+      next.delete(asked.tab);
+      return next;
+    });
+    setConfirm(null);
+    return true;
+  }
+
   function answerConfirm(event: KeyboardEvent<HTMLElement>): boolean {
     // The keys have moved into a text field (a click on the composer, say) while the restore question
     // was up: what is typed there is text, never an answer -- the `y` of "you should" must not give a
@@ -4968,6 +5050,7 @@ export default function App() {
       setConfirm(null);
       return false;
     }
+    if (confirm?.kind === "remote") return answerRemote(event, confirm);
     if (confirm === null) {
       if (promptSwallowKeyRef.current !== null && event.key === promptSwallowKeyRef.current && event.repeat) {
         event.preventDefault();
@@ -5165,13 +5248,29 @@ export default function App() {
       </div>
     );
 
-  /* A fact about the window, not the last command: it has its own field and its own Dismiss, so neither a send
-     nor a refused command's notice takes it away. */
+  /* A fact about the window (or, for a remote tab, about that tab), not the last command: it has its own fields
+     and its own Dismiss, so neither a send nor a refused command's notice takes it away. */
+  const shownNote = shownRootNote({ rootNote, tabRootNotes, tabs });
   const rootNoteBanner =
-    rootNote === null ? null : (
+    shownNote === null ? null : (
       <div className="command-notice root-note" role="status" data-nav-stop="root-note">
-        <span>{rootNote}</span>
-        <button onClick={() => setRootNote(null)}>Dismiss</button>
+        <span>{shownNote}</span>
+        <button
+          onClick={() => {
+            const page = pageRef.current;
+            const tab = page.tabs?.active;
+            const own = tab === undefined ? undefined : page.tabRootNotes.get(tab);
+            const next = dismissShownRootNote(page);
+            setPageField("tabRootNotes", next.tabRootNotes);
+            setRootNote(next.rootNote);
+            // A tab's own note stays dismissed in any page the tab is shown in: the window keeps it.
+            if (tab !== undefined && own !== undefined) {
+              postToRust({ type: "root_note_dismissed", request_id: nextRequestId(), tab, text: own.text });
+            }
+          }}
+        >
+          Dismiss
+        </button>
       </div>
     );
 
@@ -7738,6 +7837,9 @@ export default function App() {
       </div>
       {sessionEndedBanner}
       {rootNoteBanner}
+      {remoteLinkLine(state.provider?.host, state.linkState) && (
+        <div className="command-notice remote-link-state" role="status">{remoteLinkLine(state.provider?.host, state.linkState)}</div>
+      )}
       {commandNoticeBanner}
       <QueueLines items={queue} error={queueError} note={queueNote} />
       <ActivityLine
@@ -7967,6 +8069,8 @@ export default function App() {
           messageLook: bandFlash?.look,
           messagePath: bandFlash?.path,
           prompt: confirmBandPrompt,
+          host: state.provider?.host,
+          accountName: state.provider?.accountName,
           warn: statusWarning(state.provider, activeTab?.failure ?? null)
             ?? (state.apiRetry ? revealedText(cliPhaseText(state) ?? "API retry") : null)
             ?? (state.rateLimitWarning ? `Usage limit warning${typeof state.rateLimitWarning.scalars.resets_at_ms === "number" ? ` · limit resets ${new Date(state.rateLimitWarning.scalars.resets_at_ms).toLocaleTimeString("en-GB", { hour: "2-digit", minute: "2-digit", hour12: false })}` : ""}` : null),

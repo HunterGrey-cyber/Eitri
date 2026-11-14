@@ -2,12 +2,56 @@ use std::ffi::OsString;
 use std::io;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
+use std::time::Duration;
 
-use super::ControlMaster;
+use super::{ConnectError, ControlMaster};
+
+/// What checking the network path under a launcher's channels found.
+#[derive(Debug)]
+pub enum LinkCheck {
+    /// Channels start without a shared connection (a local fixture), so there is nothing to check.
+    NoMaster,
+    /// The connection answered its check.
+    Alive,
+    /// The connection had gone and a new one started.
+    Restarted,
+    /// The connection had gone and starting a new one failed.
+    Failed(ConnectError),
+}
 
 /// `tail` is the helper argv after its executable: subcommand, --args-hex, encoded bytes.
 pub trait ChannelLauncher: Send + Sync {
     fn spawn(&self, tail: &[OsString]) -> io::Result<Child>;
+    fn spawn_at(&self, _helper: &std::path::Path, tail: &[OsString]) -> io::Result<Child> {
+        self.spawn(tail)
+    }
+
+    /// Records the capabilities learned through this installation's own default connection.
+    fn helper_hello(&self, _installation: &str, _capabilities: &[String]) {}
+
+    /// Runs the recorded installation's checked START when its connection needs recovery.
+    fn ensure_helper(&self, _installation: &str) -> io::Result<()> {
+        Ok(())
+    }
+
+    /// Checks the consented key while excluding master replacement. Callers keep this guard until the channel
+    /// confirms attachment, then release it before transfers or command waits. A direct fallback uses strict SSH checks.
+    fn hold_host_key(&self, expected: &str) -> io::Result<Box<dyn Send>> {
+        check_host_key(self.host_key(), expected)?;
+        Ok(Box::new(()))
+    }
+
+    /// Checks the connection new channels go through and restarts it when it is gone. Blocking: it
+    /// runs on a worker, never on a runtime or the GTK thread.
+    fn check_link(&self) -> LinkCheck {
+        LinkCheck::NoMaster
+    }
+
+    /// The SHA-256 fingerprint of the host key the connection's master verified, when it has one.
+    /// Read before every channel of a pinned connection, so it must be cheap.
+    fn host_key(&self) -> Option<io::Result<String>> {
+        None
+    }
 
     fn spawn_step(&self, _literal: &'static str, _args: &[&str]) -> io::Result<Child> {
         Err(io::Error::new(
@@ -23,6 +67,19 @@ pub struct SshLauncher {
 }
 
 impl ChannelLauncher for SshLauncher {
+    fn spawn_at(&self, helper: &std::path::Path, tail: &[OsString]) -> io::Result<Child> {
+        Self {
+            master: self.master.clone(),
+            helper: helper.to_owned(),
+        }
+        .spawn(tail)
+    }
+
+    fn hold_host_key(&self, expected: &str) -> io::Result<Box<dyn Send>> {
+        let held = super::lock_within(&self.master.control_path.with_extension("lock"), MASTER_LOCK_WAIT)?;
+        check_host_key(self.host_key(), expected)?;
+        Ok(Box::new(held))
+    }
     fn spawn_step(&self, literal: &'static str, args: &[&str]) -> io::Result<Child> {
         let argv = super::step_argv(&self.master, literal, args)
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
@@ -36,7 +93,42 @@ impl ChannelLauncher for SshLauncher {
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
         pipes(Command::new("ssh").args(argv)).spawn()
     }
+
+    fn check_link(&self) -> LinkCheck {
+        if self.master.check(MASTER_CHECK) {
+            return LinkCheck::Alive;
+        }
+        match self.master.restart_if_dead(MASTER_LOCK_WAIT) {
+            Ok(true) => LinkCheck::Restarted,
+            Ok(false) => LinkCheck::Alive,
+            Err(error) => LinkCheck::Failed(error),
+        }
+    }
+
+    /// ssh's own record of the key the master verified; rewritten by every master start.
+    fn host_key(&self) -> Option<io::Result<String>> {
+        Some(super::known_hosts::read_key(&self.master.host_key_record).map(|key| key.sha256))
+    }
 }
+
+fn check_host_key(observed: Option<io::Result<String>>, expected: &str) -> io::Result<()> {
+    if let Some(observed) = observed {
+        let observed = observed?;
+        if observed != expected {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!("SSH host key changed from {expected} to {observed}; refusing lifecycle command"),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// How long a master gets to answer `-O check` before it counts as gone.
+pub const MASTER_CHECK: Duration = Duration::from_secs(2);
+
+/// How long a check waits for another caller's restart of the same master before it reports failure.
+pub const MASTER_LOCK_WAIT: Duration = Duration::from_secs(5);
 
 /// A helper fixture launched directly, without SSH or a network connection.
 pub struct LocalExec {
@@ -62,7 +154,16 @@ impl ChannelLauncher for LocalExec {
     }
 
     fn spawn(&self, tail: &[OsString]) -> io::Result<Child> {
-        decode_tail(tail)?;
+        let (subcommand, _) = decode_tail(tail)?;
+        if subcommand == "list-daemons" {
+            return pipes(
+                Command::new("sh")
+                    .args(["-c", super::channel::LIFECYCLE_COMMAND, "sh"])
+                    .arg(&self.helper)
+                    .args(tail),
+            )
+            .spawn();
+        }
         pipes(Command::new(&self.helper).args(tail)).spawn()
     }
 }
@@ -108,29 +209,113 @@ mod tests {
                     master: super::super::tests::master_fixture(),
                     helper,
                 };
-                for args in [
-                    vec![],
-                    vec![std::ffi::OsStr::new("/srv/a b/$(x)/*"), std::ffi::OsStr::new("")],
-                ] {
-                    let tail = [
-                        "probe".into(),
-                        "--args-hex".into(),
-                        eitri_server_proto::args_hex::encode_args(&args).into(),
-                    ];
-                    let outputs: Vec<_> = [&local as &dyn ChannelLauncher, &ssh as &dyn ChannelLauncher]
-                        .iter()
-                        .map(|launcher| {
-                            let mut child = launcher.spawn(&tail).unwrap();
-                            child.stdin.take().unwrap().write_all(b"stdin data").unwrap();
-                            let output = child.wait_with_output().unwrap();
-                            assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
-                            output.stdout
-                        })
-                        .collect();
-                    assert_eq!(outputs[0], outputs[1]);
+                for subcommand in ["probe", "list-daemons"] {
+                    for args in [
+                        vec![],
+                        vec![std::ffi::OsStr::new("/srv/a b/$(x)/*"), std::ffi::OsStr::new("")],
+                    ] {
+                        let tail = [
+                            subcommand.into(),
+                            "--args-hex".into(),
+                            eitri_server_proto::args_hex::encode_args(&args).into(),
+                        ];
+                        let outputs: Vec<_> = [&local as &dyn ChannelLauncher, &ssh as &dyn ChannelLauncher]
+                            .iter()
+                            .map(|launcher| {
+                                let mut child = launcher.spawn(&tail).unwrap();
+                                child.stdin.take().unwrap().write_all(b"stdin data").unwrap();
+                                let output = child.wait_with_output().unwrap();
+                                assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+                                output.stdout
+                            })
+                            .collect();
+                        assert_eq!(outputs[0], outputs[1]);
+                        assert_eq!(
+                            outputs[0].starts_with(super::super::channel::LIFECYCLE_ATTACHED),
+                            subcommand == "list-daemons"
+                        );
+                    }
                 }
             },
         );
+    }
+
+    /// A master that no longer answers its check is closed and started again before a channel is
+    /// tried, and one that answers is left alone.
+    #[test]
+    fn dead_master_is_checked_and_restarted_before_retrying() {
+        super::super::tests::isolated(
+            "ssh::launcher::tests::dead_master_is_checked_and_restarted_before_retrying",
+            |dir| {
+                let master = ControlMaster::ensure("example-host", dir, std::path::Path::new("/eitri")).unwrap();
+                let launcher = SshLauncher {
+                    master,
+                    helper: "/srv/eitri-server".into(),
+                };
+                assert!(matches!(launcher.check_link(), LinkCheck::Alive));
+                assert_eq!(std::fs::read_to_string(dir.join("starts")).unwrap(), "start\n");
+                std::fs::remove_file(dir.join("live")).unwrap();
+                let before = std::fs::read_to_string(dir.join("argv")).unwrap().len();
+                assert!(matches!(launcher.check_link(), LinkCheck::Restarted));
+                assert_eq!(std::fs::read_to_string(dir.join("starts")).unwrap(), "start\nstart\n");
+                assert_eq!(std::fs::read_to_string(dir.join("exits")).unwrap(), "exit\n");
+                let argv = std::fs::read_to_string(dir.join("argv")).unwrap();
+                let since = &argv[before..];
+                let check = since.find("\ncheck\n").expect("a check");
+                let exit = since.find("\nexit\n").expect("an exit");
+                let start = since.find("ControlMaster=yes").expect("a start");
+                assert!(check < exit && exit < start, "{since}");
+                assert!(dir.join("live").exists());
+            },
+        );
+    }
+
+    /// Two checks that both find the master dead start one new master between them, and neither
+    /// closes the one the other started.
+    #[test]
+    fn concurrent_checks_of_a_dead_master_start_it_once() {
+        super::super::tests::isolated(
+            "ssh::launcher::tests::concurrent_checks_of_a_dead_master_start_it_once",
+            |dir| {
+                let master = ControlMaster::ensure("example-host", dir, std::path::Path::new("/eitri")).unwrap();
+                let launcher = std::sync::Arc::new(SshLauncher {
+                    master,
+                    helper: "/srv/eitri-server".into(),
+                });
+                std::fs::remove_file(dir.join("live")).unwrap();
+                let checks: Vec<_> = (0..2)
+                    .map(|_| {
+                        let launcher = std::sync::Arc::clone(&launcher);
+                        std::thread::spawn(move || launcher.check_link())
+                    })
+                    .collect();
+                for check in checks {
+                    assert!(matches!(check.join().unwrap(), LinkCheck::Alive | LinkCheck::Restarted));
+                }
+                assert_eq!(std::fs::read_to_string(dir.join("starts")).unwrap(), "start\nstart\n");
+                assert_eq!(std::fs::read_to_string(dir.join("exits")).unwrap(), "exit\n");
+                // A live master is checked and left alone.
+                assert!(matches!(launcher.check_link(), LinkCheck::Alive));
+                assert_eq!(std::fs::read_to_string(dir.join("exits")).unwrap(), "exit\n");
+            },
+        );
+    }
+
+    /// A check does not wait without end behind another restart of the same master.
+    #[test]
+    fn a_check_behind_a_stuck_restart_gives_up() {
+        super::super::tests::isolated("ssh::launcher::tests::a_check_behind_a_stuck_restart_gives_up", |dir| {
+            let master = ControlMaster::ensure("example-host", dir, std::path::Path::new("/eitri")).unwrap();
+            let held = crate::private_fs::PrivateLock::open(&master.control_path.with_extension("lock")).unwrap();
+            assert!(held.try_lock().unwrap());
+            let launcher = SshLauncher {
+                master,
+                helper: "/srv/eitri-server".into(),
+            };
+            std::fs::remove_file(dir.join("live")).unwrap();
+            assert!(matches!(launcher.check_link(), LinkCheck::Failed(_)));
+            assert_eq!(std::fs::read_to_string(dir.join("starts")).unwrap(), "start\n");
+        });
     }
 
     #[test]
@@ -154,6 +339,36 @@ mod tests {
                     String::from_utf8(output.stdout).unwrap(),
                     format!("exec\n--args-hex\n{}\nstdin data\n", tail[2].to_str().unwrap())
                 );
+            },
+        );
+    }
+    #[test]
+    fn lifecycle_key_guard_excludes_master_replacement_and_refuses_another_key() {
+        super::super::tests::isolated(
+            "ssh::launcher::tests::lifecycle_key_guard_excludes_master_replacement_and_refuses_another_key",
+            |dir| {
+                let master = ControlMaster::ensure("example-host", dir, std::path::Path::new("/eitri")).unwrap();
+                assert_eq!(
+                    super::super::known_hosts::probe_main(&[
+                        master.host_key_record.clone().into_os_string(),
+                        "example-host".into(),
+                        "ssh-ed25519".into(),
+                        "SHA256:example".into()
+                    ]),
+                    0
+                );
+                let launcher = SshLauncher {
+                    master: master.clone(),
+                    helper: "/srv/helper".into(),
+                };
+                let key = launcher.host_key().unwrap().unwrap();
+                let guard = launcher.hold_host_key(&key).unwrap();
+                let other = crate::private_fs::PrivateLock::open(&master.control_path.with_extension("lock")).unwrap();
+                assert!(!other.try_lock().unwrap());
+                drop(guard);
+                assert!(other.try_lock().unwrap());
+                drop(other);
+                assert!(launcher.hold_host_key("SHA256:another").is_err());
             },
         );
     }

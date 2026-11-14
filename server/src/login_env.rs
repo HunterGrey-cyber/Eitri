@@ -55,19 +55,32 @@ struct PasswdLookup {
 }
 
 pub async fn capture() -> io::Result<Captured> {
+    Ok(capture_account().await?.1)
+}
+
+pub async fn capture_account() -> io::Result<(Environment, Captured)> {
     static LOOKUP: OnceLock<PasswdLookup> = OnceLock::new();
     LOOKUP
         .get_or_init(PasswdLookup::default)
-        .capture_lookup(minimal_environment, CAPTURE_BUDGET)
+        .capture_pair(minimal_environment, CAPTURE_BUDGET)
         .await
 }
 
 impl PasswdLookup {
+    #[cfg(test)]
     async fn capture_lookup(
         &self,
         lookup: impl FnOnce() -> io::Result<Environment> + Send + 'static,
         budget: Duration,
     ) -> io::Result<Captured> {
+        Ok(self.capture_pair(lookup, budget).await?.1)
+    }
+
+    async fn capture_pair(
+        &self,
+        lookup: impl FnOnce() -> io::Result<Environment> + Send + 'static,
+        budget: Duration,
+    ) -> io::Result<(Environment, Captured)> {
         let deadline = tokio::time::Instant::now() + budget;
         // NSS can outlive the deadline. Retain its handle so retries wait for the same worker.
         let baseline = tokio::time::timeout_at(deadline, async {
@@ -79,11 +92,14 @@ impl PasswdLookup {
         })
         .await
         .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "passwd lookup timed out"))??;
-        Ok(capture_with_budget(
-            baseline,
-            deadline.saturating_duration_since(tokio::time::Instant::now()),
-        )
-        .await)
+        Ok((
+            baseline.clone(),
+            capture_with_budget(
+                baseline,
+                deadline.saturating_duration_since(tokio::time::Instant::now()),
+            )
+            .await,
+        ))
     }
 }
 
@@ -312,6 +328,17 @@ mod tests {
             .err()
             .unwrap();
         assert!(error.to_string().contains("passwd unavailable"));
+    }
+
+    #[tokio::test]
+    async fn bounded_capture_returns_the_same_passwd_baseline_used_for_the_shell() {
+        let lookup = PasswdLookup::default();
+        let baseline = Environment::from([("HOME".into(), "/srv/project".into()), ("SHELL".into(), "".into())]);
+        let expected = baseline.clone();
+        let (account, captured) = lookup.capture_pair(move || Ok(baseline), CAPTURE_BUDGET).await.unwrap();
+        assert_eq!(account, expected);
+        assert_eq!(captured.env, account);
+        assert!(captured.fallback.is_some());
     }
 
     #[test]

@@ -1134,3 +1134,747 @@ fn close_others_plan_leaves_out_a_tab_shown_in_an_extra_view() {
         "the active tab is the base view's only one"
     );
 }
+
+fn remote_origin() -> crate::remote_project::TabOrigin {
+    crate::remote_project::TabOrigin::Remote {
+        host: "example-host".into(),
+        host_key_sha256: "SHA256:example".into(),
+        root: "/srv/project".into(),
+    }
+}
+
+/// Whether any `pendingPermissions` a payload carries names `id`.
+fn draws(payloads: &[String], id: &str) -> bool {
+    payloads.iter().any(|payload| {
+        serde_json::from_str::<serde_json::Value>(payload).is_ok_and(|value| {
+            value["state"]["pendingPermissions"]
+                .as_array()
+                .is_some_and(|pending| pending.iter().any(|p| p.to_string().contains(id)))
+        })
+    })
+}
+
+/// A remote tab's host answer on its way is being answered: no snapshot draws it as a card, no card
+/// answer is taken for it, the bypass resync sweep does not answer it a second time, and the tick keeps
+/// polling until its reply is read.
+#[test]
+fn a_remote_host_answer_in_flight_is_drawn_nowhere_and_not_swept() {
+    let dir = workspace("remote-host-answer-in-flight");
+    let mut set = set();
+    set.set_project_origin(remote_origin()).unwrap();
+    let tab = set.active();
+    let (provider, backend) = live(&dir);
+    set.get_mut(tab).unwrap().backend = TabBackend::Live(backend);
+    let plan = plan(set.cycle_mode(tab, ViewId::BASE));
+    set.confirm_bypass(plan.scope, plan.nonce, ViewId::BASE).unwrap();
+
+    provider.hold_permission_replies();
+    provider.queue(write("inflight-1"));
+    until("the host answer on its way", || {
+        set.pump(&dir, true);
+        provider.held_permissions() == 1
+    });
+    assert!(set.needs_polling(), "the reply is read without a wake");
+    assert!(
+        !draws(&set.active_state_payloads(), "inflight-1"),
+        "no card drawn for it"
+    );
+    assert!(!set.get(tab).unwrap().card_is_waiting("inflight-1"));
+    assert!(set
+        .answer_card_async(
+            tab,
+            ViewId::BASE,
+            "inflight-1",
+            agent::PermissionDecision::Deny { reason: None }
+        )
+        .is_err());
+
+    // A resync in bypass: the sweep answers what is pending and not being answered.
+    provider.resume_permission_replies();
+    provider.queue(AgentDomainEvent::TurnStarted { turn_id: "t1".into() });
+    for i in 0..300 {
+        provider.queue(AgentDomainEvent::ContentDelta {
+            turn_id: "t1".into(),
+            kind: agent::ContentKind::Text,
+            text: format!("chunk {i}"),
+        });
+    }
+    provider.queue(write("swept"));
+    until("both pending in the projection", || {
+        set.get(tab)
+            .unwrap()
+            .live()
+            .unwrap()
+            .projection()
+            .pending_permissions
+            .len()
+            == 2
+    });
+    let out = set.pump(&dir, true);
+    let payload = out.active_payload.expect("the resync's snapshot");
+    assert!(!draws(&[payload], "inflight-1"));
+    let decided: Vec<String> = provider.decisions().into_iter().map(|(id, _)| id).collect();
+    assert!(
+        !decided.contains(&"inflight-1".to_string()),
+        "the sweep did not answer it again: {decided:?}"
+    );
+
+    provider.reply_to_held_permissions(Ok(None));
+    until("the reply read", || {
+        set.pump(&dir, true);
+        set.get(tab).unwrap().session.host_answered.contains("inflight-1")
+    });
+    assert!(!set.get(tab).unwrap().session.human_allowed.has_host_sends());
+    shut_down_all(&mut set);
+}
+
+/// A remote tab records a host answer when its reply is read. When the call finished before that, its
+/// row note still goes out, with the next batch.
+#[test]
+fn a_remote_answers_row_note_reaches_a_call_that_finished_first() {
+    let dir = workspace("remote-late-row-note");
+    let mut set = set();
+    set.set_project_origin(remote_origin()).unwrap();
+    let tab = set.active();
+    let (provider, backend) = live(&dir);
+    set.get_mut(tab).unwrap().backend = TabBackend::Live(backend);
+    let plan = plan(set.cycle_mode(tab, ViewId::BASE));
+    set.confirm_bypass(plan.scope, plan.nonce, ViewId::BASE).unwrap();
+
+    provider.hold_permission_replies();
+    provider.queue(AgentDomainEvent::TurnStarted { turn_id: "t1".into() });
+    provider.queue(cli_prompt(
+        "prompt-1",
+        "toolu_late",
+        "Bash",
+        serde_json::json!({ "command": "cat notes.txt" }),
+        Some("cat:*"),
+    ));
+    until("the host answer on its way", || {
+        set.pump(&dir, true);
+        provider.held_permissions() == 1
+    });
+    provider.queue(AgentDomainEvent::ToolCallStarted {
+        turn_id: "t1".into(),
+        tool_use_id: "toolu_late".into(),
+        name: "Bash".into(),
+        input: serde_json::json!({ "command": "cat notes.txt" }),
+    });
+    provider.queue(AgentDomainEvent::ToolCallCompleted {
+        turn_id: "t1".into(),
+        tool_use_id: "toolu_late".into(),
+        content: serde_json::json!("ok"),
+        is_error: false,
+    });
+    until("the call finished in the projection", || {
+        set.pump(&dir, true);
+        set.get(tab)
+            .unwrap()
+            .live()
+            .unwrap()
+            .projection()
+            .tool_calls
+            .iter()
+            .any(|call| call.tool_use_id == "toolu_late" && call.result.is_some())
+    });
+    provider.reply_to_held_permissions(Ok(None));
+    provider.queue(AgentDomainEvent::ContentDelta {
+        turn_id: "t1".into(),
+        kind: agent::ContentKind::Text,
+        text: "after".into(),
+    });
+    until("the note on the finished call", || {
+        set.pump(&dir, true);
+        set.get(tab).unwrap().notes.prompt_notes.contains_key("toolu_late")
+    });
+    shut_down_all(&mut set);
+}
+
+/// Queues a batch long enough to overflow the page's queue, so the next pump is a resync, ending with
+/// `last`.
+fn overflow_then(provider: &RecordingProvider, turn: &str, last: AgentDomainEvent) {
+    for i in 0..300 {
+        provider.queue(AgentDomainEvent::ContentDelta {
+            turn_id: turn.into(),
+            kind: agent::ContentKind::Text,
+            text: format!("chunk {i}"),
+        });
+    }
+    provider.queue(last);
+}
+
+/// A remote tab's bypass resync sweep answers through the host answers on their way: what it sent is
+/// drawn nowhere and taken from no card while its reply is out, a second resync does not send it again,
+/// and once taken it is recorded with the row note the CLI's own prompt gets in bypass.
+#[test]
+fn a_remote_bypass_sweep_is_tracked_until_its_reply() {
+    let dir = workspace("remote-sweep-tracked");
+    let mut set = set();
+    set.set_project_origin(remote_origin()).unwrap();
+    let tab = set.active();
+    let (provider, backend) = live(&dir);
+    set.get_mut(tab).unwrap().backend = TabBackend::Live(backend);
+    let plan = plan(set.cycle_mode(tab, ViewId::BASE));
+    set.confirm_bypass(plan.scope, plan.nonce, ViewId::BASE).unwrap();
+
+    provider.hold_permission_replies();
+    provider.queue(AgentDomainEvent::TurnStarted { turn_id: "t1".into() });
+    overflow_then(
+        &provider,
+        "t1",
+        cli_prompt(
+            "swept",
+            "toolu_swept",
+            "Bash",
+            serde_json::json!({ "command": "cat notes.txt" }),
+            Some("cat:*"),
+        ),
+    );
+    until("the request in the projection", || {
+        set.get(tab)
+            .unwrap()
+            .live()
+            .unwrap()
+            .projection()
+            .pending_permissions
+            .len()
+            == 1
+    });
+    let out = set.pump(&dir, true);
+    let payload = out.active_payload.expect("the resync's snapshot");
+    assert_eq!(provider.held_permissions(), 1, "the sweep sent its answer");
+    assert!(!draws(&[payload], "swept"), "the resync's snapshot does not draw it");
+    assert!(!draws(&set.active_state_payloads(), "swept"));
+    assert!(!set.get(tab).unwrap().card_is_waiting("swept"));
+    assert!(set.needs_polling(), "the reply is read without a wake");
+    assert!(set
+        .answer_card_async(
+            tab,
+            ViewId::BASE,
+            "swept",
+            agent::PermissionDecision::Deny { reason: None }
+        )
+        .is_err());
+
+    // A second resync while the reply is still out sweeps only what is new.
+    overflow_then(&provider, "t1", write("later"));
+    until("both pending in the projection", || {
+        set.get(tab)
+            .unwrap()
+            .live()
+            .unwrap()
+            .projection()
+            .pending_permissions
+            .len()
+            == 2
+    });
+    let out = set.pump(&dir, true);
+    assert!(out.active_payload.is_some(), "a second resync");
+    assert_eq!(provider.held_permissions(), 2, "only the new request was sent");
+
+    provider.reply_to_held_permission(0, Ok(None));
+    provider.reply_to_held_permission(0, Ok(None));
+    until("both replies read", || {
+        set.pump(&dir, true);
+        let session = &set.get(tab).unwrap().session;
+        session.host_answered.contains("swept") && session.host_answered.contains("later")
+    });
+    assert!(!set.get(tab).unwrap().session.human_allowed.has_host_sends());
+    provider.queue(AgentDomainEvent::ToolCallStarted {
+        turn_id: "t1".into(),
+        tool_use_id: "toolu_swept".into(),
+        name: "Bash".into(),
+        input: serde_json::json!({ "command": "cat notes.txt" }),
+    });
+    provider.queue(AgentDomainEvent::ToolCallCompleted {
+        turn_id: "t1".into(),
+        tool_use_id: "toolu_swept".into(),
+        content: serde_json::json!("ok"),
+        is_error: false,
+    });
+    until("the bypass note on the swept prompt's call", || {
+        set.pump(&dir, true);
+        set.get(tab).unwrap().notes.prompt_notes.contains_key("toolu_swept")
+    });
+    shut_down_all(&mut set);
+}
+
+/// Entering bypass on a remote tab answers its waiting cards the same tracked way: the card is drawn
+/// nowhere and taken by no card answer while the reply is out, and a refused answer brings it back as
+/// the person's card, which no bypass sweep answers again.
+#[test]
+fn a_remote_bypass_confirmation_is_tracked_until_its_reply() {
+    let dir = workspace("remote-confirm-tracked");
+    let mut set = set();
+    set.set_project_origin(remote_origin()).unwrap();
+    let tab = set.active();
+    let (provider, backend) = live(&dir);
+    set.get_mut(tab).unwrap().backend = TabBackend::Live(backend);
+    provider.queue(write("waiting"));
+    until("the card", || {
+        set.pump(&dir, true);
+        set.get(tab).unwrap().attention.attention().pending == 1
+    });
+
+    provider.hold_permission_replies();
+    let plan = plan(set.cycle_mode(tab, ViewId::BASE));
+    assert_eq!(plan.approve, vec!["waiting".to_string()]);
+    assert_eq!(
+        set.confirm_bypass(plan.scope, plan.nonce, ViewId::BASE),
+        Ok(ConfirmOutcome::Entered { approved: 1 })
+    );
+    assert_eq!(
+        set.get(tab).unwrap().attention.attention().pending,
+        0,
+        "the tray counts it no more"
+    );
+    assert_eq!(provider.held_permissions(), 1, "the confirmation sent its answer");
+    assert!(!draws(&set.active_state_payloads(), "waiting"));
+    assert!(!set.get(tab).unwrap().card_is_waiting("waiting"));
+    assert!(set.needs_polling());
+    assert!(set
+        .answer_card_async(
+            tab,
+            ViewId::BASE,
+            "waiting",
+            agent::PermissionDecision::Deny { reason: None }
+        )
+        .is_err());
+
+    provider.reply_to_held_permissions(Err(agent::ProviderError::Provider {
+        code: agent::ProviderErrorCode::PermissionAlreadyResolved,
+        message: "refused by the test".into(),
+    }));
+    until("the card back", || {
+        set.pump(&dir, true);
+        set.get(tab).unwrap().card_is_waiting("waiting")
+    });
+    assert!(!set.get(tab).unwrap().session.host_answered.contains("waiting"));
+    // It is the person's now: the resync that showed it, and the ones after, do not answer it again.
+    for _ in 0..3 {
+        set.pump(&dir, true);
+    }
+    assert_eq!(provider.held_permissions(), 0, "nothing sent again");
+    assert!(set.get(tab).unwrap().card_is_waiting("waiting"));
+    assert_eq!(set.get(tab).unwrap().attention.attention().pending, 1);
+    shut_down_all(&mut set);
+}
+
+/// A remote Bypass tab whose host answer is lost in an outage (the link broke before the reply) shows its
+/// card and sends nothing again while the link is down; once the link reads live again the answer goes once
+/// more, tracked, and is recorded when taken.
+#[test]
+fn a_remote_bypass_answer_lost_in_an_outage_is_sent_once_after_the_reconnect() {
+    let dir = workspace("remote-lost-answer");
+    let mut set = set();
+    set.set_project_origin(remote_origin()).unwrap();
+    let tab = set.active();
+    let (provider, backend) = live(&dir);
+    provider.set_link(Some(agent::RemoteLinkState::Live));
+    set.get_mut(tab).unwrap().backend = TabBackend::Live(backend);
+    let plan = plan(set.cycle_mode(tab, ViewId::BASE));
+    set.confirm_bypass(plan.scope, plan.nonce, ViewId::BASE).unwrap();
+
+    provider.hold_permission_replies();
+    provider.queue(write("lost-1"));
+    until("the host answer on its way", || {
+        set.pump(&dir, true);
+        provider.held_permissions() == 1
+    });
+    provider.set_link(Some(agent::RemoteLinkState::Disconnected { since_unix_ms: 1 }));
+    provider.reply_to_held_permissions(Err(agent::ProviderError::Transport("the link broke".into())));
+    until("the card shown while the link is down", || {
+        set.pump(&dir, true);
+        set.get(tab).unwrap().card_is_waiting("lost-1")
+    });
+    for _ in 0..3 {
+        set.pump(&dir, true);
+    }
+    assert_eq!(provider.held_permissions(), 0, "nothing sent while the link is down");
+
+    provider.set_link(Some(agent::RemoteLinkState::Reconnecting {
+        attempt: 2,
+        next_in_ms: 1000,
+    }));
+    set.pump(&dir, true);
+    assert_eq!(provider.held_permissions(), 0);
+    provider.set_link(Some(agent::RemoteLinkState::Live));
+    until("the answer sent again", || {
+        set.pump(&dir, true);
+        provider.held_permissions() == 1
+    });
+    for _ in 0..3 {
+        set.pump(&dir, true);
+    }
+    assert_eq!(provider.held_permissions(), 1, "sent once");
+    provider.reply_to_held_permissions(Ok(None));
+    until("the reply read", || {
+        set.pump(&dir, true);
+        set.get(tab).unwrap().session.host_answered.contains("lost-1")
+    });
+    assert!(!set.get(tab).unwrap().session.human_allowed.fell_back("lost-1"));
+    shut_down_all(&mut set);
+}
+
+/// A remote Bypass tab whose host answer to `id` is lost while the link reads disconnected: the card is shown and
+/// the answer kept to be sent again. The provider still holds replies.
+fn lose_a_bypass_answer(label: &str, id: &str) -> (std::path::PathBuf, TabSet, TabId, Arc<RecordingProvider>) {
+    let dir = workspace(label);
+    let mut set = set();
+    set.set_project_origin(remote_origin()).unwrap();
+    let tab = set.active();
+    let (provider, backend) = live(&dir);
+    provider.set_link(Some(agent::RemoteLinkState::Live));
+    set.get_mut(tab).unwrap().backend = TabBackend::Live(backend);
+    let plan = plan(set.cycle_mode(tab, ViewId::BASE));
+    set.confirm_bypass(plan.scope, plan.nonce, ViewId::BASE).unwrap();
+    provider.hold_permission_replies();
+    provider.queue(write(id));
+    until("the host answer on its way", || {
+        set.pump(&dir, true);
+        provider.held_permissions() == 1
+    });
+    provider.set_link(Some(agent::RemoteLinkState::Disconnected { since_unix_ms: 1 }));
+    provider.reply_to_held_permissions(Err(agent::ProviderError::Transport("the link broke".into())));
+    until("the card shown while the link is down", || {
+        set.pump(&dir, true);
+        set.get(tab).unwrap().card_is_waiting(id)
+    });
+    (dir, set, tab, provider)
+}
+
+/// A lost bypass answer the agent took after all (its resolution comes once the link is back) is recorded as the
+/// host's answer, as one whose reply came is: in the gate's log, and never sent again. One the agent resolved another
+/// way is not.
+#[test]
+fn a_lost_answer_the_agent_took_is_recorded() {
+    let (dir, mut set, tab, provider) = lose_a_bypass_answer("remote-lost-taken", "lost-t");
+    provider.queue(AgentDomainEvent::PermissionResolved {
+        permission_id: "lost-t".into(),
+        outcome: agent::PermissionOutcome::Allowed,
+    });
+    // The resolution in the same batch forgets the id from `host_answered` at once; the gate's log keeps it.
+    until("the answer recorded", || {
+        set.pump(&dir, true);
+        set.get(tab)
+            .unwrap()
+            .gate_answers()
+            .iter()
+            .any(|answer| answer.permission_id == "lost-t")
+    });
+    assert!(!set.get(tab).unwrap().card_is_waiting("lost-t"));
+    provider.set_link(Some(agent::RemoteLinkState::Live));
+    for _ in 0..3 {
+        set.pump(&dir, true);
+    }
+    assert_eq!(provider.held_permissions(), 0, "nothing sent again");
+    shut_down_all(&mut set);
+
+    let (dir, mut set, tab, provider) = lose_a_bypass_answer("remote-lost-expired", "lost-e");
+    provider.queue(AgentDomainEvent::PermissionResolved {
+        permission_id: "lost-e".into(),
+        outcome: agent::PermissionOutcome::Expired,
+    });
+    until("the card gone", || {
+        set.pump(&dir, true);
+        !set.get(tab).unwrap().card_is_waiting("lost-e")
+    });
+    for _ in 0..3 {
+        set.pump(&dir, true);
+    }
+    assert!(!set
+        .get(tab)
+        .unwrap()
+        .gate_answers()
+        .iter()
+        .any(|answer| answer.permission_id == "lost-e"));
+    shut_down_all(&mut set);
+}
+
+/// A backend that reports a link to a server answers without waiting on this thread whatever its tab's origin says,
+/// as `approve_pending` does: its answer is tracked until its reply, never waited for here.
+#[test]
+fn a_backend_with_a_link_answers_off_this_thread_under_any_origin() {
+    let dir = workspace("linked-local-origin");
+    let mut set = set();
+    let tab = set.active();
+    let (provider, backend) = live(&dir);
+    provider.set_link(Some(agent::RemoteLinkState::Live));
+    set.get_mut(tab).unwrap().backend = TabBackend::Live(backend);
+    let plan = plan(set.cycle_mode(tab, ViewId::BASE));
+    set.confirm_bypass(plan.scope, plan.nonce, ViewId::BASE).unwrap();
+    provider.hold_permission_replies();
+    provider.queue(write("linked"));
+    until("the host answer on its way", || {
+        set.pump(&dir, true);
+        provider.held_permissions() == 1
+    });
+    assert!(
+        set.get(tab).unwrap().session.human_allowed.has_host_sends(),
+        "tracked until its reply, not waited for"
+    );
+    provider.reply_to_held_permissions(Ok(None));
+    until("the reply read", || {
+        set.pump(&dir, true);
+        set.get(tab).unwrap().session.host_answered.contains("linked")
+    });
+    shut_down_all(&mut set);
+}
+
+/// The person denied a card whose bypass answer was lost, and the deny failed too (the link was down): once the
+/// link is back the lost Allow is not sent over it; the card stays the person's.
+#[test]
+fn a_lost_answer_is_never_sent_over_the_persons_answer() {
+    let (dir, mut set, tab, provider) = lose_a_bypass_answer("remote-lost-then-denied", "lost-d");
+    let send = set
+        .answer_card_async(
+            tab,
+            ViewId::BASE,
+            "lost-d",
+            agent::PermissionDecision::Deny { reason: None },
+        )
+        .unwrap();
+    provider.reply_to_held_permissions(Err(agent::ProviderError::Transport("still down".into())));
+    let reply = loop {
+        if let Some(reply) = set.finish_card_answer(tab, &send) {
+            break reply;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    };
+    assert!(reply.is_err());
+    provider.set_link(Some(agent::RemoteLinkState::Live));
+    for _ in 0..4 {
+        set.pump(&dir, true);
+    }
+    assert_eq!(provider.held_permissions(), 0, "the lost allow is not sent");
+    assert!(set.get(tab).unwrap().card_is_waiting("lost-d"));
+    assert!(set.get(tab).unwrap().session.human_allowed.fell_back("lost-d"));
+    shut_down_all(&mut set);
+}
+
+/// A lost bypass answer is not sent once the person took the tab out of bypass while the link was down: the card
+/// stays theirs.
+#[test]
+fn a_lost_answer_is_not_sent_in_a_mode_it_was_not_planned_under() {
+    let (dir, mut set, tab, provider) = lose_a_bypass_answer("remote-lost-then-manual", "lost-m");
+    assert_eq!(
+        set.cycle_mode(tab, ViewId::BASE),
+        Ok(ModeCycle::Changed(SessionModeChoice::Manual))
+    );
+    provider.set_link(Some(agent::RemoteLinkState::Live));
+    for _ in 0..4 {
+        set.pump(&dir, true);
+    }
+    assert_eq!(provider.held_permissions(), 0, "nothing is sent in manual");
+    assert!(set.get(tab).unwrap().card_is_waiting("lost-m"));
+    shut_down_all(&mut set);
+}
+
+/// The answer's reply comes back lost only after the link already reads live again (its call outlasted the
+/// outage): it is sent once more at the next drain.
+#[test]
+fn a_loss_read_after_the_reconnect_is_sent_again() {
+    let dir = workspace("remote-lost-after-reconnect");
+    let mut set = set();
+    set.set_project_origin(remote_origin()).unwrap();
+    let tab = set.active();
+    let (provider, backend) = live(&dir);
+    provider.set_link(Some(agent::RemoteLinkState::Live));
+    set.get_mut(tab).unwrap().backend = TabBackend::Live(backend);
+    let plan = plan(set.cycle_mode(tab, ViewId::BASE));
+    set.confirm_bypass(plan.scope, plan.nonce, ViewId::BASE).unwrap();
+    provider.hold_permission_replies();
+    provider.queue(write("late"));
+    until("the host answer on its way", || {
+        set.pump(&dir, true);
+        provider.held_permissions() == 1
+    });
+    provider.set_link(Some(agent::RemoteLinkState::Disconnected { since_unix_ms: 1 }));
+    set.pump(&dir, true);
+    set.pump(&dir, true);
+    provider.set_link(Some(agent::RemoteLinkState::Live));
+    set.pump(&dir, true);
+    provider.reply_to_held_permissions(Err(agent::ProviderError::Transport("the link broke".into())));
+    until("the answer sent again", || {
+        set.pump(&dir, true);
+        provider.held_permissions() == 1
+    });
+    shut_down_all(&mut set);
+}
+
+/// No reply in time while the link never went down: the answer is sent once more at the next drain, and lost a
+/// second time it is not sent a third time; its card stays.
+#[test]
+fn a_timeout_with_the_link_live_is_sent_once_more_and_then_left_to_the_person() {
+    let dir = workspace("remote-timeout-live");
+    let mut set = set();
+    set.set_project_origin(remote_origin()).unwrap();
+    let tab = set.active();
+    let (provider, backend) = live(&dir);
+    provider.set_link(Some(agent::RemoteLinkState::Live));
+    set.get_mut(tab).unwrap().backend = TabBackend::Live(backend);
+    let plan = plan(set.cycle_mode(tab, ViewId::BASE));
+    set.confirm_bypass(plan.scope, plan.nonce, ViewId::BASE).unwrap();
+    provider.hold_permission_replies();
+    provider.queue(write("slow"));
+    until("the host answer on its way", || {
+        set.pump(&dir, true);
+        provider.held_permissions() == 1
+    });
+    provider.reply_to_held_permissions(Err(agent::ProviderError::Timeout));
+    until("the answer sent again", || {
+        set.pump(&dir, true);
+        provider.held_permissions() == 1
+    });
+    provider.reply_to_held_permissions(Err(agent::ProviderError::Timeout));
+    until("the card back", || {
+        set.pump(&dir, true);
+        set.get(tab).unwrap().card_is_waiting("slow")
+    });
+    for _ in 0..4 {
+        set.pump(&dir, true);
+    }
+    assert_eq!(provider.held_permissions(), 0, "not sent a third time");
+    assert!(set.get(tab).unwrap().card_is_waiting("slow"));
+    shut_down_all(&mut set);
+}
+
+/// Two answers lost in turn, the first during an outage the drains saw and the second timing out after the
+/// reconnect: each is sent once more.
+#[test]
+fn a_second_loss_does_not_strand_the_first() {
+    let dir = workspace("remote-two-losses");
+    let mut set = set();
+    set.set_project_origin(remote_origin()).unwrap();
+    let tab = set.active();
+    let (provider, backend) = live(&dir);
+    provider.set_link(Some(agent::RemoteLinkState::Live));
+    set.get_mut(tab).unwrap().backend = TabBackend::Live(backend);
+    let plan = plan(set.cycle_mode(tab, ViewId::BASE));
+    set.confirm_bypass(plan.scope, plan.nonce, ViewId::BASE).unwrap();
+    provider.hold_permission_replies();
+    provider.queue(write("first"));
+    provider.queue(write("second"));
+    until("both host answers on their way", || {
+        set.pump(&dir, true);
+        provider.held_permissions() == 2
+    });
+    provider.set_link(Some(agent::RemoteLinkState::Disconnected { since_unix_ms: 1 }));
+    provider.reply_to_held_permission(0, Err(agent::ProviderError::Transport("the link broke".into())));
+    until("the first card", || {
+        set.pump(&dir, true);
+        set.get(tab).unwrap().card_is_waiting("first")
+    });
+    provider.set_link(Some(agent::RemoteLinkState::Live));
+    provider.reply_to_held_permission(0, Err(agent::ProviderError::Timeout));
+    until("both sent again", || {
+        set.pump(&dir, true);
+        provider.held_permissions() == 2
+    });
+    shut_down_all(&mut set);
+}
+
+#[test]
+fn a_lost_host_allow_is_recorded_when_the_person_denied_meanwhile() {
+    for reply_read in [false, true] {
+        let (dir, mut set, tab, provider) = lose_a_bypass_answer("lost-host-person-deny", "lost-person");
+        let send = set
+            .answer_card_async(
+                tab,
+                ViewId::BASE,
+                "lost-person",
+                agent::PermissionDecision::Deny { reason: None },
+            )
+            .unwrap();
+        if reply_read {
+            provider.reply_to_held_permissions(Err(agent::ProviderError::Timeout));
+            until("the person's reply", || set.finish_card_answer(tab, &send).is_some());
+        }
+        provider.queue(AgentDomainEvent::PermissionResolved {
+            permission_id: "lost-person".into(),
+            outcome: agent::PermissionOutcome::Allowed,
+        });
+        until("the host answer recorded", || {
+            set.pump(&dir, true);
+            set.get(tab)
+                .unwrap()
+                .gate_answers()
+                .iter()
+                .any(|a| a.permission_id == "lost-person")
+        });
+        for _ in 0..3 {
+            set.pump(&dir, true);
+        }
+        assert_eq!(
+            set.get(tab)
+                .unwrap()
+                .gate_answers()
+                .iter()
+                .filter(|a| a.permission_id == "lost-person")
+                .count(),
+            1
+        );
+        if !reply_read {
+            provider.reply_to_held_permissions(Err(agent::ProviderError::Timeout));
+            until("the person's late reply", || {
+                set.finish_card_answer(tab, &send).is_some()
+            });
+        }
+        assert_eq!(provider.held_permissions(), 0);
+        shut_down_all(&mut set);
+    }
+}
+
+#[test]
+fn a_taken_host_retry_with_a_lost_reply_is_recorded_once() {
+    for (resolution_first, already_resolved) in [(false, false), (true, false), (false, true), (true, true)] {
+        let (dir, mut set, tab, provider) = lose_a_bypass_answer("lost-retry-taken", "lost-retry");
+        provider.set_link(Some(agent::RemoteLinkState::Live));
+        until("the retry sent", || {
+            set.pump(&dir, true);
+            provider.held_permissions() == 1
+        });
+        let resolved = AgentDomainEvent::PermissionResolved {
+            permission_id: "lost-retry".into(),
+            outcome: agent::PermissionOutcome::Allowed,
+        };
+        if resolution_first {
+            provider.queue(resolved.clone());
+            set.pump(&dir, true);
+        }
+        let error = if already_resolved {
+            agent::ProviderError::Provider {
+                code: agent::ProviderErrorCode::PermissionAlreadyResolved,
+                message: "the earlier answer was taken".into(),
+            }
+        } else {
+            agent::ProviderError::Timeout
+        };
+        provider.reply_to_held_permissions(Err(error));
+        until("the retry reply read", || {
+            set.pump(&dir, true);
+            !set.get(tab).unwrap().session.human_allowed.has_host_sends()
+        });
+        if !resolution_first {
+            provider.queue(resolved);
+        }
+        until("the resolution folded", || {
+            set.pump(&dir, true);
+            !set.get(tab).unwrap().card_is_waiting("lost-retry")
+        });
+        for _ in 0..3 {
+            set.pump(&dir, true);
+        }
+        assert_eq!(
+            set.get(tab)
+                .unwrap()
+                .gate_answers()
+                .iter()
+                .filter(|a| a.permission_id == "lost-retry")
+                .count(),
+            1
+        );
+        assert_eq!(provider.held_permissions(), 0);
+        shut_down_all(&mut set);
+    }
+}

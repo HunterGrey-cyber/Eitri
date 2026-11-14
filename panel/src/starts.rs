@@ -32,6 +32,15 @@ pub(super) enum SpawnCall {
         project: ProjectTrust,
         client_tools: Option<agent::ClientToolSet>,
     },
+    /// A remote tab's session, started on its server through the window's connection, or the CLI's
+    /// session `resume` continued there through a new sidecar.
+    Remote {
+        resume: Option<String>,
+        project: ProjectTrust,
+        client_tools: Option<agent::ClientToolSet>,
+    },
+    /// A saved remote tab taken up again through the window's connection: the agent `helper` names.
+    Reattach { helper: agent::HelperHandoff },
     /// A tab of another agent, fresh or resumed, with the trust plan it was given and, for an ACP
     /// agent, its registration.
     External {
@@ -57,6 +66,9 @@ pub(super) fn resume_in(
     provider_session_id: String,
     select: bool,
 ) -> Result<(), String> {
+    if state.tabs.get(tab).is_some_and(|t| t.is_remote()) {
+        return Err(super::detail::REMOTE_RESUME_UNAVAILABLE.to_string());
+    }
     let agent = state.tabs.get(tab).map_or(AgentId::Claude, |t| t.agent().clone());
     let greeting = BackendGreeting::for_agent_titled(
         state.backend_kind,
@@ -98,6 +110,54 @@ pub(super) fn start_deferred(
 ) -> Outbox {
     let mut out = Outbox::default();
     if state.tabs.get(tab).is_none() {
+        return out;
+    }
+    if let Some(why) = state.tabs.start_refusal(tab) {
+        return put_off_start(state, tab, start, &why);
+    }
+    if state.tabs.get(tab).is_some_and(|tab| tab.is_remote()) {
+        // The one resume a remote tab starts is the person's "resume" after its server lost the agent.
+        let chosen = match &start {
+            DeferredStart::FirstSend { .. } => true,
+            DeferredStart::Resume {
+                provider_session_id, ..
+            } => state.remote_prompts.take_resume(tab, provider_session_id),
+            DeferredStart::Restore { .. } => false,
+        };
+        if !chosen {
+            return put_off_start(state, tab, start, super::detail::REMOTE_RESUME_UNAVAILABLE);
+        }
+        let RemoteConnect {
+            request_id,
+            result_rx,
+            first_turn,
+            resume,
+        } = match remote_connect(state, tab, start, project) {
+            Ok(connect) => connect,
+            Err(out) => return out,
+        };
+        let Some(t) = state.tabs.get_mut(tab) else {
+            return out;
+        };
+        t.session.project_tiers = Some(project);
+        let resuming = resume.is_some();
+        state.tabs.start(
+            tab,
+            PendingStart {
+                request_id,
+                result_rx,
+                first_turn,
+                resume,
+                resumed_title: None,
+                resumed_name: None,
+            },
+        );
+        if resuming {
+            shown_payloads(state, tab, &mut out);
+        } else {
+            let view = state.tabs.view_of(tab);
+            out.push(Dest::Page(view), tabs_payload_recorded(state, view));
+        }
         return out;
     }
     // A question the tab may still have had on screen is spent: the tab is starting.
@@ -197,6 +257,66 @@ pub(super) fn start_deferred(
         }
     }
     out
+}
+
+/// What [`start_deferred`] needs to set a remote tab connecting: its agent starts on the server through the window's
+/// connection to it (`remote_tabs::spawn_remote_connect`), or a resume the person chose continues the CLI's session
+/// there. `Err` with what the start owes when it is put off (no connection yet) or is nothing to start.
+fn remote_connect(
+    state: &mut AgentPanelState,
+    tab: TabId,
+    start: DeferredStart,
+    project: ProjectTrust,
+) -> Result<RemoteConnect, Outbox> {
+    let host = match state.tabs.get(tab).map(|t| t.origin()) {
+        Some(eitri_core::remote_project::TabOrigin::Remote { host, .. }) => host.clone(),
+        _ => return Err(Outbox::default()),
+    };
+    if matches!(state.spawner, Spawner::Real) && state.server.is_none() {
+        return Err(put_off_start(
+            state,
+            tab,
+            start,
+            &super::remote_tabs::no_connection(&host),
+        ));
+    }
+    state.trust.hide(tab);
+    let client_tools = editor_glue::tools_for_start(state, project);
+    let (request_id, resume, first_turn) = match start {
+        DeferredStart::FirstSend { request_id, first_turn } => (request_id, None, Some(first_turn)),
+        DeferredStart::Resume {
+            request_id,
+            provider_session_id,
+            ..
+        } => (request_id, Some(provider_session_id), None),
+        DeferredStart::Restore { .. } => return Err(Outbox::default()),
+    };
+    let result_rx = match &state.spawner {
+        Spawner::Real => match state.server.clone() {
+            Some(connection) => spawn_remote_connect(connection, resume.clone(), project, client_tools),
+            None => return Err(Outbox::default()),
+        },
+        #[cfg(test)]
+        Spawner::Fake(fake) => (fake.borrow_mut())(SpawnCall::Remote {
+            resume: resume.clone(),
+            project,
+            client_tools,
+        }),
+    };
+    Ok(RemoteConnect {
+        request_id,
+        result_rx,
+        first_turn,
+        resume,
+    })
+}
+
+/// A remote tab's connect, begun: what [`start_deferred`] sets the tab connecting with.
+struct RemoteConnect {
+    request_id: String,
+    result_rx: mpsc::Receiver<Result<AgentBackend, BackendError>>,
+    first_turn: Option<FirstTurn>,
+    resume: Option<String>,
 }
 
 /// What a tab of `agent` takes from the project at `project_dir`, given the answer `project`. At a root that is no
@@ -739,6 +859,162 @@ mod tests {
     use super::*;
     use crate::agent_panel::tests::*;
 
+    fn remote_origin() -> eitri_core::remote_project::TabOrigin {
+        eitri_core::remote_project::TabOrigin::Remote {
+            host: "example-host".into(),
+            host_key_sha256: "SHA256:example".into(),
+            root: "/srv/project".into(),
+        }
+    }
+
+    #[test]
+    fn remote_tab_codex_and_acp_refused_in_a_remote_project() {
+        let (state, connected) = recording_panel();
+        let mut state = state.borrow_mut();
+        state.tabs.set_project_origin(remote_origin()).unwrap();
+        for agent in [AgentId::Codex, AgentId::Acp("example-agent".into())] {
+            let tab = state.tabs.open(agent);
+            let why = state.tabs.start_refusal(tab).unwrap();
+            assert_eq!(
+                why,
+                "Codex and ACP tabs cannot run in a remote project yet: they would act on this machine's copy"
+            );
+            let start = || DeferredStart::FirstSend {
+                request_id: "remote-start".into(),
+                first_turn: FirstTurn {
+                    wire: "hello".into(),
+                    typed: "hello".into(),
+                    typed_by_person: true,
+                    shell_line: false,
+                    attachments: Vec::new(),
+                },
+            };
+            assert_eq!(gate_start(&mut state, tab, start()).unwrap_err(), why);
+            let out = start_deferred(&mut state, tab, start(), ProjectTrust::Untrusted);
+            let _ = out;
+            assert!(matches!(state.tabs.get(tab).unwrap().backend(), TabBackend::NotStarted));
+        }
+        assert!(connected.borrow().is_empty());
+    }
+
+    #[test]
+    fn remote_tab_agent_tabs_refused_on_a_local_copy() {
+        let (state, connected) = recording_panel();
+        let mut state = state.borrow_mut();
+        state.tabs.set_local_copy_host(Some("example-host".into()));
+        for agent in [AgentId::Claude, AgentId::Codex, AgentId::Acp("example-agent".into())] {
+            let tab = state.tabs.open(agent);
+            let start = || DeferredStart::FirstSend {
+                request_id: "local-copy-start".into(),
+                first_turn: FirstTurn {
+                    wire: "hello".into(),
+                    typed: "hello".into(),
+                    typed_by_person: true,
+                    shell_line: false,
+                    attachments: Vec::new(),
+                },
+            };
+            let why = gate_start(&mut state, tab, start()).unwrap_err();
+            assert_eq!(
+                why,
+                "this is the local copy of a project on example-host; agent tabs run there"
+            );
+            let _out = start_deferred(&mut state, tab, start(), ProjectTrust::Untrusted);
+            assert!(matches!(state.tabs.get(tab).unwrap().backend(), TabBackend::NotStarted));
+        }
+        assert!(connected.borrow().is_empty());
+    }
+
+    #[test]
+    fn remote_tab_resume_and_restore_are_refused_before_listing() {
+        let (state, connected) = recording_panel();
+        let mut state = state.borrow_mut();
+        state.tabs.set_project_origin(remote_origin()).unwrap();
+        let tab = state.tabs.active();
+        assert!(
+            super::super::detail::remote_page(&state, view(2)),
+            "an empty view inherits the remote project"
+        );
+        assert!(super::super::detail::greeting_for_view(&state, view(2))
+            .resumable
+            .is_empty());
+        assert_eq!(
+            resume_in(&mut state, tab, "remote-resume", "session".into(), true).unwrap_err(),
+            super::super::detail::REMOTE_RESUME_UNAVAILABLE
+        );
+        assert!(!restore_is_on_offer(&state));
+        match ask_for_restore(&mut state, tab, RestoreAsk::Dashboard) {
+            RestoreResult::Refused(why) => assert_eq!(why, super::super::detail::REMOTE_RESUME_UNAVAILABLE),
+            _ => panic!("a remote tab must refuse restore"),
+        }
+        let start = || DeferredStart::Resume {
+            request_id: "remote-resume".into(),
+            provider_session_id: "session".into(),
+            resumed_title: None,
+            resumed_name: None,
+        };
+        assert_eq!(
+            gate_start(&mut state, tab, start()).unwrap_err(),
+            super::super::detail::REMOTE_RESUME_UNAVAILABLE
+        );
+        let _out = start_deferred(&mut state, tab, start(), ProjectTrust::Untrusted);
+        assert!(connected.borrow().is_empty());
+    }
+
+    /// A remote tab's first message starts its agent on the server through the window's connection, never on this
+    /// machine; with no connection given yet the start is put off and says so.
+    #[test]
+    fn a_remote_tabs_first_send_starts_through_the_windows_connection() {
+        let first = || DeferredStart::FirstSend {
+            request_id: "remote-first".into(),
+            first_turn: FirstTurn {
+                wire: "hello".into(),
+                typed: "hello".into(),
+                typed_by_person: true,
+                shell_line: false,
+                attachments: Vec::new(),
+            },
+        };
+        let state = state_for_hooks(TabSet::new(BackendKind::Sidecar, SessionModeChoice::Auto));
+        let remote: Rc<RefCell<Vec<(Option<String>, ProjectTrust, bool)>>> = Rc::default();
+        let into = remote.clone();
+        state.borrow_mut().spawner = Spawner::Fake(Rc::new(RefCell::new(move |call: SpawnCall| {
+            match call {
+                SpawnCall::Remote {
+                    resume,
+                    project,
+                    client_tools,
+                } => into.borrow_mut().push((resume, project, client_tools.is_some())),
+                _ => panic!("a remote tab never starts on this machine"),
+            }
+            mpsc::channel().1
+        })));
+        let mut state = state.borrow_mut();
+        state.tabs.set_project_origin(remote_origin()).unwrap();
+        let tab = state.tabs.active();
+        let _out = start_deferred(&mut state, tab, first(), ProjectTrust::Untrusted);
+        assert_eq!(remote.borrow().len(), 1);
+        assert_eq!(remote.borrow()[0].0, None);
+        assert!(matches!(
+            state.tabs.get(tab).unwrap().backend(),
+            TabBackend::Starting(_)
+        ));
+
+        // The real workers, and no connection given: nothing starts, and the tab says why.
+        state.spawner = Spawner::Real;
+        let other = state.tabs.open(AgentId::Claude);
+        let out = start_deferred(&mut state, other, first(), ProjectTrust::Untrusted);
+        assert!(matches!(
+            state.tabs.get(other).unwrap().backend(),
+            TabBackend::NotStarted
+        ));
+        assert!(out
+            .payloads()
+            .iter()
+            .any(|payload| payload.contains("this window has no connection to example-host yet")));
+        assert_eq!(remote.borrow().len(), 1);
+    }
+
     type Connected = Rc<RefCell<Vec<(Option<String>, ProjectTrust, Option<agent::ClientToolSet>)>>>;
 
     /// A panel whose spawner records each fresh start or resume by hand it is asked for, with the tools it was given.
@@ -913,12 +1189,16 @@ mod tests {
     /// The smallest panel that starts its sessions where it should, for the scan's own test.
     const STARTS_ONLY_IN_THE_GATE: &str = "\
         fn start_deferred(tab: T) { spawn_connect(a); resume_spawner(b); start_restore(c); start_external_tab(d); \
-            tabs.start(tab, PendingStart { x }); }\n\
+            remote_connect(e); tabs.start(tab, PendingStart { x }); }\n\
         fn start_external_tab() { trust_plan(); spawn_external(); }\n\
         fn spawn_external() { AgentBackend::start_external(x); }\n\
         fn spawn_connect() {}\n\
         fn resume_spawner() {}\n\
-        fn spawn_connect_holding() {}\n";
+        fn spawn_connect_holding() {}\n\
+        fn remote_connect() { spawn_remote_connect(x); }\n\
+        fn spawn_remote_connect() { connection.start_tab(a); connection.resume_tab(b); }\n\
+        fn reattach_saved() { reattach_connect(h); tabs.start(id, PendingStart { y }); }\n\
+        fn reattach_connect() { connection.reattach_tab(h); }\n";
 
     #[test]
     fn a_session_started_in_a_second_file_of_the_panel_fails_the_scan() {
@@ -935,8 +1215,96 @@ mod tests {
         assert!(why.contains("spawn_connect is called outside start_deferred"), "{why}");
     }
 
+    /// A remote tab's session started anywhere but the gate's own remote path fails the scan: the remote spawner
+    /// called elsewhere, the connection's start or resume called elsewhere (in the panel or the shell), or any start
+    /// added to the saved remote tabs' reattach, which may only reattach.
+    #[test]
+    fn a_remote_session_started_outside_the_gate_fails_the_scan() {
+        let fails = |extra: &str, shell: &str, expect: &str| {
+            let panel = fixture(&[("panel/src/a.rs", STARTS_ONLY_IN_THE_GATE), ("panel/src/b.rs", extra)]);
+            let others = fixture(&[("shell/src/main.rs", shell)]);
+            let why = scan_failure(|| only_start_deferred_starts_a_session(&panel, &others))
+                .unwrap_or_else(|| panic!("passed the scan: {extra} {shell}"));
+            assert!(why.contains(expect), "{why}");
+        };
+        fails(
+            "fn later() { spawn_remote_connect(x); }",
+            "",
+            "spawn_remote_connect is called outside start_deferred",
+        );
+        fails(
+            "fn later() { server.start_tab(a); }",
+            "",
+            "a remote session is started outside spawn_remote_connect",
+        );
+        fails(
+            "fn later() { server.resume_tab(s, a); }",
+            "",
+            "a remote session is started outside spawn_remote_connect",
+        );
+        fails("", "fn main() { server.start_tab(a); }", "starts a remote session");
+        fails(
+            "fn later() { server.reattach_tab(h); }",
+            "",
+            "a saved remote tab is taken up outside reattach_connect",
+        );
+        fails(
+            "fn later() { RemoteConnection::start_tab(&server, a); }",
+            "",
+            "a remote session is started outside spawn_remote_connect",
+        );
+        fails(
+            "fn later() { RemoteConnection::resume_tab(&server, s, a); }",
+            "",
+            "a remote session is started outside spawn_remote_connect",
+        );
+        fails(
+            "fn later() { RemoteConnection::reattach_tab(&server, h); }",
+            "",
+            "a saved remote tab is taken up outside reattach_connect",
+        );
+        fails(
+            "",
+            "fn main() { eitri_core::remote_project::RemoteConnection::start_tab(&server, a); }",
+            "starts a remote session",
+        );
+        let in_reattach = |body: &str, expect: &str| {
+            let text = STARTS_ONLY_IN_THE_GATE.replace(
+                "fn reattach_saved() { reattach_connect(h);",
+                &format!("fn reattach_saved() {{ reattach_connect(h); {body}"),
+            );
+            let panel = fixture(&[("panel/src/a.rs", text.as_str())]);
+            let why = scan_failure(|| only_start_deferred_starts_a_session(&panel, &[]))
+                .unwrap_or_else(|| panic!("passed the scan: {body}"));
+            assert!(why.contains(expect), "{why}");
+        };
+        in_reattach("spawn_connect(x);", "reattach_saved starts a session (spawn_connect)");
+        in_reattach(
+            "spawn_remote_connect(x);",
+            "spawn_remote_connect is called outside start_deferred",
+        );
+        in_reattach("resume_spawner(x);", "reattach_saved starts a session (resume_spawner)");
+        in_reattach("AgentBackend::start(x);", "reattach_saved starts a backend");
+        in_reattach(
+            "tabs.start(id, PendingStart { z });",
+            "reattach_saved sets more than one tab connecting",
+        );
+        let reattach_starts = STARTS_ONLY_IN_THE_GATE.replace(
+            "fn reattach_connect() { connection.reattach_tab(h); }",
+            "fn reattach_connect() { connection.reattach_tab(h); connection.start_tab(a); }",
+        );
+        let panel = fixture(&[("panel/src/a.rs", reattach_starts.as_str())]);
+        let why = scan_failure(|| only_start_deferred_starts_a_session(&panel, &[])).expect("a start in the reattach");
+        assert!(
+            why.contains("a remote session is started outside spawn_remote_connect"),
+            "{why}"
+        );
+    }
+
     /// Panics unless the panel's code (`panel`, read as a whole) begins a session only in `start_deferred`
-    /// and the workers it calls, and no file of `others` begins one at all.
+    /// and the workers it calls, and no file of `others` begins one at all. A remote tab's session starts only in
+    /// `spawn_remote_connect`, which only `remote_connect` calls, which only `start_deferred` calls; a saved remote
+    /// tab is taken up again only by `reattach_saved` through `reattach_connect`, which may only reattach.
     fn only_start_deferred_starts_a_session(
         panel: &[eitri_core::source_scan::Source],
         others: &[eitri_core::source_scan::Source],
@@ -951,21 +1319,38 @@ mod tests {
             "start_external_tab",
             "start_external",
             "start_external_with",
+            "remote_connect",
+            "spawn_remote_connect",
+            "reattach_connect",
         ];
+        /// A call on the window's connection that starts or continues a session on the server, as a method or by path.
+        const REMOTE_STARTS: &[&str] = &[".start_tab(", ".resume_tab(", "::start_tab(", "::resume_tab("];
+        /// A call that takes a saved remote tab up again, as a method or by path.
+        const REATTACHES: &[&str] = &[".reattach_tab(", "::reattach_tab("];
+        let flat = |code: &str| -> String { code.split_whitespace().collect() };
+        fn one<'a>(code: &'a str, name: &str) -> Vec<&'a str> {
+            let found = eitri_core::source_scan::functions(code, name);
+            assert_eq!(found.len(), 1, "{name} not found once");
+            found
+        }
         let code = production_code(panel);
-        let gate = scan::functions(&code, "start_deferred");
-        assert_eq!(gate.len(), 1, "start_deferred not found");
-        for spawner in ["spawn_connect", "resume_spawner", "start_restore", "start_external_tab"] {
+        let gate = one(&code, "start_deferred");
+        for spawner in [
+            "spawn_connect",
+            "resume_spawner",
+            "start_restore",
+            "start_external_tab",
+            "remote_connect",
+        ] {
             assert!(
                 scan::calls(gate[0], spawner) > 0,
                 "start_deferred no longer calls {spawner}; the scan would prove nothing"
             );
         }
         // A tab is set connecting only by `TabSet::start`, and only with a connect built here.
-        let flat_gate: String = gate[0].split_whitespace().collect();
+        let flat_gate = flat(gate[0]);
         assert!(flat_gate.contains("tabs.start(tab,PendingStart{"));
-        let external = scan::functions(&code, "start_external_tab");
-        assert_eq!(external.len(), 1, "start_external_tab not found");
+        let external = one(&code, "start_external_tab");
         assert!(
             scan::calls(external[0], "spawn_external") > 0,
             "start_external_tab no longer calls spawn_external; the scan would prove nothing"
@@ -974,47 +1359,115 @@ mod tests {
             scan::calls(external[0], "trust_plan") > 0,
             "an external start no longer builds its trust plan"
         );
-        let worker = scan::functions(&code, "spawn_external");
-        assert_eq!(worker.len(), 1, "spawn_external not found");
-        let flat_worker: String = worker[0].split_whitespace().collect();
+        let worker = one(&code, "spawn_external");
         assert!(
-            flat_worker.contains("AgentBackend::start_external("),
+            flat(worker[0]).contains("AgentBackend::start_external("),
             "spawn_external no longer starts the backend; the scan would prove nothing"
         );
-        // Of the two, only `start_deferred` may call `start_external_tab`, and only it may call
-        // `spawn_external`.
-        let without_gate = scan::without(&code, &[gate[0]]);
-        assert_eq!(
-            scan::calls(&without_gate, "start_external_tab"),
-            0,
-            "start_external_tab is called outside start_deferred"
+        let remote = one(&code, "remote_connect");
+        assert!(
+            scan::calls(remote[0], "spawn_remote_connect") > 0,
+            "remote_connect no longer calls spawn_remote_connect; the scan would prove nothing"
         );
-        let without_external = scan::without(&code, &[external[0]]);
-        assert_eq!(
-            scan::calls(&without_external, "spawn_external"),
-            0,
-            "spawn_external is called outside start_external_tab"
+        let remote_worker = one(&code, "spawn_remote_connect");
+        assert!(
+            REMOTE_STARTS[..2]
+                .iter()
+                .all(|start| flat(remote_worker[0]).contains(start)),
+            "spawn_remote_connect no longer starts the remote session; the scan would prove nothing"
         );
+        // Each of these is called only from the one function above it.
+        for (callee, caller) in [
+            ("start_external_tab", gate[0]),
+            ("spawn_external", external[0]),
+            ("remote_connect", gate[0]),
+            ("spawn_remote_connect", remote[0]),
+        ] {
+            assert_eq!(
+                scan::calls(&scan::without(&code, &[caller]), callee),
+                0,
+                "{callee} is called outside start_deferred"
+            );
+        }
+        // The connection's start and resume are called in the remote worker and nowhere else.
+        let without_remote_worker = flat(&scan::without(&code, &[remote_worker[0]]));
+        for start in REMOTE_STARTS {
+            assert!(
+                !without_remote_worker.contains(start),
+                "a remote session is started outside spawn_remote_connect ({start})"
+            );
+        }
+
+        // A remote window takes its saved remote tabs up again outside the gate: that starts no session and loads
+        // nothing new, the agent's session already running on the server. It may only reattach.
+        let reattach = one(&code, "reattach_saved");
+        let reattach_worker = one(&code, "reattach_connect");
+        assert!(
+            scan::calls(reattach[0], "reattach_connect") > 0,
+            "reattach_saved no longer reattaches"
+        );
+        assert!(
+            flat(reattach_worker[0]).contains(".reattach_tab("),
+            "reattach_connect no longer reattaches"
+        );
+        for name in SPAWNERS.iter().filter(|name| **name != "reattach_connect") {
+            assert_eq!(
+                scan::calls(reattach[0], name),
+                0,
+                "reattach_saved starts a session ({name})"
+            );
+            assert_eq!(
+                scan::calls(reattach_worker[0], name),
+                0,
+                "reattach_connect starts a session ({name})"
+            );
+        }
+        for body in [reattach[0], reattach_worker[0]] {
+            let flat = flat(body);
+            assert!(!flat.contains("AgentBackend::"), "reattach_saved starts a backend");
+            for start in ["start_remote(", "resume_remote("] {
+                assert!(!flat.contains(start), "reattach_saved starts a session ({start})");
+            }
+        }
+        assert_eq!(
+            flat(reattach[0]).matches("PendingStart{").count(),
+            1,
+            "reattach_saved sets more than one tab connecting"
+        );
+        assert_eq!(
+            scan::calls(&scan::without(&code, &[reattach[0]]), "reattach_connect"),
+            0,
+            "reattach_connect is called outside reattach_saved"
+        );
+        let without_reattach_worker = flat(&scan::without(&code, &[reattach_worker[0]]));
+        for reattach in REATTACHES {
+            assert!(
+                !without_reattach_worker.contains(reattach),
+                "a saved remote tab is taken up outside reattach_connect ({reattach})"
+            );
+        }
 
         let mut cut: Vec<&str> = gate;
         cut.extend(external);
         cut.extend(worker);
+        cut.extend(remote);
+        cut.extend(remote_worker);
+        cut.extend(reattach);
+        cut.extend(reattach_worker);
         for worker in ["spawn_connect", "resume_spawner", "spawn_connect_holding"] {
-            let found = scan::functions(&code, worker);
-            assert_eq!(found.len(), 1, "{worker} not found");
-            cut.extend(found);
+            cut.extend(one(&code, worker));
         }
         let rest = scan::without(&code, &cut);
         for name in SPAWNERS {
             assert_eq!(scan::calls(&rest, name), 0, "{name} is called outside start_deferred");
         }
-        let flat: String = rest.split_whitespace().collect();
+        let flat_rest = flat(&rest);
         assert!(
-            !flat.contains("PendingStart{"),
+            !flat_rest.contains("PendingStart{"),
             "a tab is set connecting outside start_deferred"
         );
         assert!(
-            !flat.contains("AgentBackend::start"),
+            !flat_rest.contains("AgentBackend::start"),
             "a backend is started outside the connect worker"
         );
 
@@ -1025,9 +1478,16 @@ mod tests {
             for name in SPAWNERS {
                 assert_eq!(scan::calls(&rest, name), 0, "{} calls {name}", other.path);
             }
-            let flat: String = rest.split_whitespace().collect();
+            let flat = flat(&rest);
             assert!(!flat.contains("PendingStart{"), "{} sets a tab connecting", other.path);
             assert!(!flat.contains("AgentBackend::start"), "{} starts a backend", other.path);
+            for start in REMOTE_STARTS.iter().chain(REATTACHES) {
+                assert!(
+                    !flat.contains(start),
+                    "{} starts a remote session ({start})",
+                    other.path
+                );
+            }
         }
     }
 

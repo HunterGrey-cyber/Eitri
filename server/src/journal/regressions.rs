@@ -138,11 +138,11 @@ fn review_pending_matches_renamed_clear_after_directory_sync_failure() {
     let mut pending = Pending::open_with(&path, fs.clone()).unwrap();
     pending.request(1, b"one", "one").unwrap();
     fs.fail.store(true, Ordering::SeqCst);
-    assert!(pending.clear().is_err());
+    assert!(pending.clear(2).is_err());
     assert!(pending.list().is_empty());
     fs.fail.store(false, Ordering::SeqCst);
-    pending.request(2, b"two", "two").unwrap();
-    assert_eq!(Pending::open(&path).unwrap().list(), vec![(2, b"two".to_vec())]);
+    pending.request(3, b"two", "two").unwrap();
+    assert_eq!(Pending::open(&path).unwrap().list(), vec![(3, b"two".to_vec())]);
 }
 
 #[test]
@@ -458,15 +458,15 @@ fn review_pending_resolve_and_request_follow_post_rename_failures() {
     pending.request(1, b"one", "one").unwrap();
     pending.request(2, b"two", "two").unwrap();
     fs.fail.store(true, Ordering::SeqCst);
-    assert!(pending.resolved("one").is_err());
+    assert!(pending.resolved(3, "one").is_err());
     assert_eq!(pending.list(), vec![(2, b"two".to_vec())]);
-    assert!(pending.request(3, b"three", "three").is_err());
+    assert!(pending.request(4, b"three", "three").is_err());
     assert_eq!(Pending::open(&path).unwrap().list(), pending.list());
     fs.fail.store(false, Ordering::SeqCst);
-    pending.request(4, b"four", "four").unwrap();
+    pending.request(5, b"four", "four").unwrap();
     assert_eq!(
         Pending::open(&path).unwrap().list(),
-        vec![(2, b"two".to_vec()), (3, b"three".to_vec()), (4, b"four".to_vec())]
+        vec![(2, b"two".to_vec()), (4, b"three".to_vec()), (5, b"four".to_vec())]
     );
 }
 
@@ -543,11 +543,29 @@ fn review_pending_binary_damage_and_unknown_formats_are_refused() {
     pending.request(1, &[0, 128, 255], "one").unwrap();
     pending.request(2, &[0, 255], "two").unwrap();
     let bytes = fs.read(&path).unwrap();
-    assert!(bytes.starts_with(b"EPN1"));
+    assert!(bytes.starts_with(b"EPN2"));
     for cut in 1..bytes.len() {
         fs.replace(&path, &bytes[..cut]).unwrap();
         assert!(Pending::open_with(&path, fs.clone()).is_err(), "accepted cut {cut}");
     }
+    // The first format has no watermark; its newest request stands for it.
+    let mut first = b"EPN1".to_vec();
+    first.extend(1u32.to_le_bytes());
+    first.extend(3u32.to_le_bytes());
+    first.extend(2u32.to_le_bytes());
+    first.extend(5u64.to_le_bytes());
+    first.extend(b"one");
+    first.extend([0, 255]);
+    fs.replace(&path, &first).unwrap();
+    let pending = Pending::open_with(&path, fs.clone()).unwrap();
+    assert_eq!(pending.list(), vec![(5, vec![0, 255])]);
+    assert_eq!(pending.applied(), 5);
+    // A request newer than the watermark beside it is damage.
+    let mut ahead = b"EPN2".to_vec();
+    ahead.extend(4u64.to_le_bytes());
+    ahead.extend_from_slice(&first[4..]);
+    fs.replace(&path, &ahead).unwrap();
+    assert!(Pending::open_with(&path, fs.clone()).is_err());
 }
 
 #[test]
@@ -635,7 +653,7 @@ fn failed_pending_removals_never_return_on_a_later_write() {
             fs.full.store(!initially_persisted, Ordering::SeqCst);
             assert_eq!(pending.request(7, b"answered", "a").is_ok(), initially_persisted);
             fs.full.store(true, Ordering::SeqCst);
-            let removed = if clear { pending.clear() } else { pending.resolved("a") };
+            let removed = if clear { pending.clear(8) } else { pending.resolved(8, "a") };
             assert_eq!(removed.unwrap_err().raw_os_error(), Some(libc::ENOSPC));
             assert!(pending.list().is_empty());
             fs.full.store(false, Ordering::SeqCst);

@@ -49,6 +49,10 @@ pub(super) const CONNECT_CLOSE_BACKSTOP: std::time::Duration = std::time::Durati
 /// last the previous file stays whole.
 pub(super) const SAVED_TABS_BACKSTOP: std::time::Duration = std::time::Duration::from_secs(5);
 
+/// How long a close waits for a stop being kept in a remote project's record: a small file renamed over the old
+/// one, with a few tries while another window holds the record's lock.
+pub(super) const REMOTE_STOP_WRITE_BACKSTOP: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// How long a close waits for the prompt history's last write: as long as its writer can take, the round
 /// of tries under way when the window closes and one more for what it still holds
 /// (`prompt_history::CLOSE_WAIT`). A write is a small file renamed over the old one, so the previous file
@@ -220,6 +224,18 @@ impl From<AgentBackend> for Leaving {
 pub(super) struct Teardown {
     pub(super) closed: mpsc::Receiver<()>,
     pub(super) dropped: mpsc::Receiver<()>,
+    /// A remote agent the teardown was to stop and could not: where it is and why, for the panel to keep the stop
+    /// for when the server can be reached ([`Retiring::take_not_stopped`]).
+    pub(super) not_stopped: mpsc::Receiver<NotStopped>,
+}
+
+/// A remote agent a close was to stop, left running because the stop did not go through.
+#[derive(Debug, Clone)]
+pub(super) struct NotStopped {
+    pub(super) agent: agent::HelperHandoff,
+    pub(super) why: String,
+    /// Whether the teardown kept the stop in the project's record before it ended the agent.
+    pub(super) kept: bool,
 }
 
 /// Shuts a backend down on a worker thread, then drops it there, and never waits for it. **The one
@@ -248,14 +264,65 @@ pub(super) struct Teardown {
 /// not cover what its own doc derived it from. So `dropped` is sent after the drop, and `closed`,
 /// which the handoff's command waits on, before it.
 pub(super) fn spawn_teardown(leaving: impl Into<Leaving>) -> Teardown {
+    spawn_teardown_as(leaving, Ending::End)
+}
+
+/// What a teardown does to an agent that runs on a server. A local backend is shut down either way.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Ending {
+    /// The person closed the tab (or it was reset, or tripped): its agent is stopped on the server.
+    End,
+    /// The window is closing, or the person chose to leave the agent running: the helper keeps it, and
+    /// a later window can take it up again.
+    LetGo,
+}
+
+/// [`spawn_teardown`] with what happens to an agent on a server said.
+pub(super) fn spawn_teardown_as(leaving: impl Into<Leaving>, ending: Ending) -> Teardown {
+    spawn_teardown_keeping(leaving, ending, None)
+}
+
+/// [`spawn_teardown_as`], with where the agent's project is on its server (`keep_at`, the record's root). Ending a
+/// remote agent there keeps its stop in the project's record first and clears it once the stop went through, so an
+/// agent whose stop fails, or whose teardown the window's close cuts short, is still stopped once the server can be
+/// reached: no remote agent is ended with neither a stop sent nor one kept.
+pub(super) fn spawn_teardown_keeping(
+    leaving: impl Into<Leaving>,
+    ending: Ending,
+    keep_at: Option<std::path::PathBuf>,
+) -> Teardown {
     let mut backend = match leaving.into() {
         Leaving::Retired(retired) => retired.into_backend(),
         Leaving::Unheld(backend) => backend,
     };
     let (closed_tx, closed) = mpsc::channel();
     let (dropped_tx, dropped) = mpsc::channel();
+    let (not_stopped_tx, not_stopped) = mpsc::channel();
     std::thread::spawn(move || {
-        backend.shutdown();
+        match ending {
+            Ending::End => {
+                // Where the agent is, read before the shutdown lets go of it.
+                let agent = backend.helper_handoff();
+                let kept_at = match (&agent, keep_at) {
+                    (Some(agent), Some(root)) => super::remote_tabs::write_stop(&root, agent, true).ok().map(|()| root),
+                    _ => None,
+                };
+                backend.shutdown();
+                match (agent, backend.remote_stop_failure()) {
+                    (Some(agent), Some(why)) => {
+                        let kept = kept_at.is_some();
+                        let _ = not_stopped_tx.send(NotStopped { agent, why, kept });
+                    }
+                    (Some(agent), None) => {
+                        if let Some(root) = kept_at {
+                            let _ = super::remote_tabs::write_stop(&root, &agent, false);
+                        }
+                    }
+                    (None, _) => {}
+                }
+            }
+            Ending::LetGo => backend.detach(),
+        }
         // The receiver is gone if nobody waits for this signal any more; that is not an error.
         let _ = closed_tx.send(());
         // Explicit, and BEFORE the report below rather than at the end of this closure: on the
@@ -263,28 +330,46 @@ pub(super) fn spawn_teardown(leaving: impl Into<Leaving>) -> Teardown {
         drop(backend);
         let _ = dropped_tx.send(());
     });
-    Teardown { closed, dropped }
+    Teardown {
+        closed,
+        dropped,
+        not_stopped,
+    }
 }
 
-/// A backend no tab held, torn down once the window is gone and watched until it is dropped.
-pub(super) fn tear_down(what: &'static str, backend: AgentBackend) -> Watched {
-    watched(what, spawn_teardown(backend).dropped, SESSION_CLOSE_BACKSTOP, |()| {
-        Vec::new()
-    })
+/// A backend no tab held, torn down once the window is gone and watched until it is dropped; `ending` says
+/// whether a remote agent is stopped or left running for a later window.
+pub(super) fn tear_down(
+    what: &'static str,
+    backend: AgentBackend,
+    ending: Ending,
+    keep_at: Option<std::path::PathBuf>,
+) -> Watched {
+    watched(
+        what,
+        spawn_teardown_keeping(backend, ending, keep_at).dropped,
+        SESSION_CLOSE_BACKSTOP,
+        |()| Vec::new(),
+    )
 }
 
 /// Every tab's backend at once, one worker each, under ONE backstop: serial sidecar `CloseSession`s
 /// are bounded at 10 s each, so N tabs torn down in turn could outlive any backstop. A collector waits
 /// for every worker's drop and reports once to the watch. `None` when there is no backend: nothing is
 /// held then.
-pub(super) fn tear_down_all(what: &'static str, backends: Vec<Retired>) -> Option<Watched> {
+pub(super) fn tear_down_all(
+    what: &'static str,
+    backends: Vec<Retired>,
+    ending: Ending,
+    keep_at: Option<std::path::PathBuf>,
+) -> Option<Watched> {
     if backends.is_empty() {
         return None;
     }
     let expected = backends.len();
     let each: Vec<mpsc::Receiver<()>> = backends
         .into_iter()
-        .map(|retired| spawn_teardown(retired).dropped)
+        .map(|retired| spawn_teardown_keeping(retired, ending, keep_at.clone()).dropped)
         .collect();
     let (all_tx, all_rx) = mpsc::channel();
     std::thread::spawn(move || {
@@ -306,7 +391,14 @@ pub(super) fn tear_down_all(what: &'static str, backends: Vec<Retired>) -> Optio
 /// is gone is exactly the orphan `AgentPanelHandle::shutdown` exists to prevent, so one that
 /// finishes inside the backstop is torn down, held and bounded like the installed sessions: its
 /// shutdown reaches the same ingestion-thread join.
-pub(super) fn watch_connect(rx: mpsc::Receiver<Result<AgentBackend, BackendError>>) -> Watched {
+///
+/// `ending` is what becomes of a remote agent the connect reached: a closed tab's, or a fresh start's that no
+/// saved entry names, is stopped; a reattach whose entry the window saved is left running for a later window.
+pub(super) fn watch_connect(
+    rx: mpsc::Receiver<Result<AgentBackend, BackendError>>,
+    ending: Ending,
+    keep_at: Option<std::path::PathBuf>,
+) -> Watched {
     watched(
         "a connect that was still running",
         rx,
@@ -314,7 +406,12 @@ pub(super) fn watch_connect(rx: mpsc::Receiver<Result<AgentBackend, BackendError
         move |result| match result {
             Ok(backend) => {
                 eprintln!("[agent_panel] window closed mid-connect; shutting down the backend that finished anyway");
-                vec![tear_down("a backend that finished mid-connect", backend)]
+                vec![tear_down(
+                    "a backend that finished mid-connect",
+                    backend,
+                    ending,
+                    keep_at.clone(),
+                )]
             }
             Err(e) => {
                 eprintln!(
@@ -345,7 +442,12 @@ pub(super) fn collect_reports(each: impl IntoIterator<Item = mpsc::Receiver<()>>
 #[derive(Default)]
 pub(super) struct Retiring {
     /// Connects of tabs that are gone. Whatever one produces is shut down (`poll`).
-    pub(super) connects: Vec<mpsc::Receiver<Result<AgentBackend, BackendError>>>,
+    pub(super) connects: Vec<(mpsc::Receiver<Result<AgentBackend, BackendError>>, Ending)>,
+    /// What teardowns that were to stop a remote agent report when the stop did not go through.
+    pub(super) not_stopped: Vec<mpsc::Receiver<NotStopped>>,
+    /// Where the window's remote project is on its server: each remote agent ended here keeps its stop in that
+    /// project's record until the stop went through ([`spawn_teardown_keeping`]). `None` in a local window.
+    pub(super) keep_at: Option<std::path::PathBuf>,
     /// One per teardown, the teardown's `dropped`: sent after the backend was shut down AND dropped --
     /// the drop is where the sidecar child actually dies. Each names the tab its [`Retired`] was
     /// counted for, whose presence the set keeps until `poll` returns it; `None` for a backend no tab
@@ -356,16 +458,46 @@ pub(super) struct Retiring {
 impl Retiring {
     /// One backend, torn down by [`spawn_teardown`] and watched here until it is dropped.
     pub(super) fn backend(&mut self, leaving: impl Into<Leaving>) {
+        self.backend_as(leaving, Ending::End);
+    }
+
+    fn backend_as(&mut self, leaving: impl Into<Leaving>, ending: Ending) {
+        let keep_at = self.keep_at.clone();
+        self.backend_keeping(leaving, ending, keep_at);
+    }
+
+    fn backend_keeping(&mut self, leaving: impl Into<Leaving>, ending: Ending, keep_at: Option<std::path::PathBuf>) {
         let leaving = leaving.into();
         let tab = leaving.tab();
-        self.teardowns.push((tab, spawn_teardown(leaving).dropped));
+        let Teardown {
+            dropped, not_stopped, ..
+        } = spawn_teardown_keeping(leaving, ending, keep_at);
+        self.teardowns.push((tab, dropped));
+        self.not_stopped.push(not_stopped);
+    }
+
+    /// The remote agents teardowns could not stop, reported since the last call. `try_recv` only.
+    pub(super) fn take_not_stopped(&mut self) -> Vec<NotStopped> {
+        let mut found = Vec::new();
+        self.not_stopped.retain(|rx| match rx.try_recv() {
+            Ok(not_stopped) => {
+                found.push(not_stopped);
+                false
+            }
+            Err(mpsc::TryRecvError::Empty) => true,
+            Err(mpsc::TryRecvError::Disconnected) => false,
+        });
+        found
     }
 
     /// [`backend`](Self::backend), and a receiver told when it is dropped (or its worker died): for a
     /// start that must not begin before the old session lets go of its lease, which goes with the drop.
     pub(super) fn backend_watched(&mut self, retired: Retired) -> mpsc::Receiver<()> {
         let tab = retired.tab();
-        let dropped = spawn_teardown(retired).dropped;
+        let Teardown {
+            dropped, not_stopped, ..
+        } = spawn_teardown_keeping(retired, Ending::End, self.keep_at.clone());
+        self.not_stopped.push(not_stopped);
         // Two readers want the drop -- this watch and the start -- and a receiver has one, so a relay
         // tells both. A worker that died reads as disconnected, and has dropped the backend on its way.
         let (held_tx, held_rx) = mpsc::channel();
@@ -384,6 +516,12 @@ impl Retiring {
     /// requests the tab still owed a `command_result`, for the caller to refuse -- a connect's
     /// `send_message`/`resume`, and a handoff's `handoff_to_terminal`. The record is never deleted.
     pub(super) fn tab(&mut self, removed: RemovedTab) -> Vec<String> {
+        self.tab_as(removed, Ending::End)
+    }
+
+    /// [`Self::tab`], with what becomes of a remote agent said: `LetGo` leaves it running on its server. A connect
+    /// still running is let go the same way when it finishes.
+    pub(super) fn tab_as(&mut self, removed: RemovedTab, ending: Ending) -> Vec<String> {
         let RemovedTab { mut tab, retired } = removed;
         let mut owed = Vec::new();
         if let Some(handoff) = tab.pending_handoff.take() {
@@ -393,12 +531,16 @@ impl Retiring {
             self.teardowns.push((Some(tab.id), handoff.dropped_rx));
         }
         if let Some(retired) = retired {
-            self.backend(retired);
+            let keep_at = match tab.origin() {
+                eitri_core::remote_project::TabOrigin::Remote { root, .. } => Some(root.clone()),
+                _ => self.keep_at.clone(),
+            };
+            self.backend_keeping(retired, ending, keep_at);
         }
         match tab.into_backend() {
             TabBackend::Starting(pending) => {
                 owed.push(pending.request_id);
-                self.connects.push(pending.result_rx);
+                self.connects.push((pending.result_rx, ending));
             }
             // Nothing was spawned, so there is nothing to stop; the command that asked is owed an answer.
             TabBackend::AwaitingTrust(waiting) => owed.extend(waiting.start.request_id().map(str::to_owned)),
@@ -413,17 +555,17 @@ impl Retiring {
     /// [`TabSet::retire_done`]. `try_recv` only -- this runs on the GTK main loop.
     pub(super) fn poll(&mut self) -> Vec<TabId> {
         let mut finished = Vec::new();
-        self.connects.retain(|rx| match rx.try_recv() {
+        self.connects.retain(|(rx, ending)| match rx.try_recv() {
             Ok(Ok(backend)) => {
-                finished.push(backend);
+                finished.push((backend, *ending));
                 false
             }
             Ok(Err(_)) | Err(mpsc::TryRecvError::Disconnected) => false,
             Err(mpsc::TryRecvError::Empty) => true,
         });
-        for backend in finished {
+        for (backend, ending) in finished {
             eprintln!("[agent_panel] a closed tab's connect finished; shutting its backend down");
-            self.backend(backend);
+            self.backend_as(backend, ending);
         }
         let mut done = Vec::new();
         self.teardowns.retain(|(tab, rx)| {
@@ -438,6 +580,8 @@ impl Retiring {
     }
 
     pub(super) fn is_empty(&self) -> bool {
+        // A teardown sends what it could not stop before it reports its drop, so the tick that reads the drop
+        // reads that too (`remote_tabs::tick`): the reports keep nothing waiting.
         self.connects.is_empty() && self.teardowns.is_empty()
     }
 }
@@ -463,6 +607,19 @@ pub(super) const TAB_CLOSED_MESSAGE: &str = "the tab was closed before this fini
 /// A tab bound to an extra view leaves that view empty: its page is sent its empty strip, and the
 /// window is told by the next tick (`on_view_empty`), never from inside a page's own message.
 pub(super) fn close_tab(state: &mut AgentPanelState, tab: TabId, out: &mut Outbox) -> Result<(), &'static str> {
+    close_tab_as(state, tab, out, Ending::End)
+}
+
+/// [`close_tab`], with what becomes of a remote tab's agent said: `LetGo` leaves it running on its server (the
+/// person chose so, or its stop is kept for when the server is back). A remote tab's running turn is never
+/// interrupted here: the interrupt crosses the network, and this runs on the GTK thread. An ended agent's turn
+/// ends with the stop the teardown sends, on its worker; one let go keeps its turn.
+pub(super) fn close_tab_as(
+    state: &mut AgentPanelState,
+    tab: TabId,
+    out: &mut Outbox,
+    ending: Ending,
+) -> Result<(), &'static str> {
     let before = state.tabs.attention();
     let Some(facts) = state.tabs.close_facts(tab) else {
         return Ok(());
@@ -488,8 +645,15 @@ pub(super) fn close_tab(state: &mut AgentPanelState, tab: TabId, out: &mut Outbo
         .held_send_request(tab)
         .map(|(request_id, page)| (request_id.to_string(), page));
     let mut owed = Vec::new();
+    // A saved remote agent the tab has not reached (its reattach still connecting, or failed) has no backend to end
+    // it: a close that ends it keeps its stop instead.
+    let mut unreached = match ending {
+        Ending::End => super::remote_tabs::unreached_agent(state, tab),
+        Ending::LetGo => None,
+    };
     for step in eitri_core::tabs::close_steps(&facts) {
         match step {
+            eitri_core::tabs::CloseStep::Interrupt if state.tabs.get(tab).is_some_and(|t| t.is_remote()) => {}
             eitri_core::tabs::CloseStep::Interrupt => {
                 let interrupted = backend_for(&mut state.tabs, tab).and_then(AgentBackend::interrupt);
                 if let Err(e) = interrupted {
@@ -509,7 +673,8 @@ pub(super) fn close_tab(state: &mut AgentPanelState, tab: TabId, out: &mut Outbo
             eitri_core::tabs::CloseStep::Shutdown => {}
             eitri_core::tabs::CloseStep::Remove => {
                 if let Some(removed) = state.tabs.remove(tab) {
-                    owed = state.retiring.tab(removed);
+                    owed = state.retiring.tab_as(removed, ending);
+                    super::remote_tabs::keep_unreached(state, unreached.take());
                 }
                 // Its question goes with it: a record still being written for it starts nothing.
                 state.trust.forget_tab(tab);
@@ -566,9 +731,26 @@ pub(super) fn close_tab(state: &mut AgentPanelState, tab: TabId, out: &mut Outbo
 /// [`close_tab`] for a close someone asked for on one tab. The window hears when that was the base view's last: it may
 /// be a chat window with nothing left to show. A tab closed for a hand-over goes through [`close_tab`], since its window
 /// has to stay until the tab is safe in its new one.
+///
+/// A remote tab whose server cannot be reached is not closed yet: the person is asked whether to stop its agent
+/// once the server is back or leave it running (`remote_tabs::ask_before_closing`), and the answer closes it.
 pub(super) fn close_tab_asked(state: &mut AgentPanelState, tab: TabId, out: &mut Outbox) -> Result<(), &'static str> {
+    if super::remote_tabs::ask_before_closing(state, tab, out) {
+        return Ok(());
+    }
+    close_tab_asked_as(state, tab, out, Ending::End)
+}
+
+/// [`close_tab_asked`] once the person answered how: `LetGo` leaves a remote tab's agent running on its server.
+pub(super) fn close_tab_asked_as(
+    state: &mut AgentPanelState,
+    tab: TabId,
+    out: &mut Outbox,
+    ending: Ending,
+) -> Result<(), &'static str> {
     let last = state.tabs.base_tabs() == [tab];
-    close_tab(state, tab, out)?;
+    close_tab_as(state, tab, out, ending)?;
+    state.remote_prompts.forget_tab(tab);
     if last {
         out.effect(Effect::ChatMove(ChatMoveEvent::LastTabClosed));
     }
@@ -636,7 +818,7 @@ mod tests {
             let code = scan::without(&code, &scan::modules(&code, "tests"));
             let flat: String = code.split_whitespace().collect();
             everywhere += flat.matches(".shutdown()").count();
-            for body in scan::functions(&code, "spawn_teardown") {
+            for body in scan::functions(&code, "spawn_teardown_keeping") {
                 let flat: String = body.split_whitespace().collect();
                 in_teardown += flat.matches(".shutdown()").count();
             }

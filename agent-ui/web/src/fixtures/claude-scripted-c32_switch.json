@@ -1237,6 +1237,7 @@
       "cwd": "$RUN/project",
       "history": null,
       "lastTurnEnding": null,
+      "linkState": null,
       "model": "claude-haiku-4-5",
       "notices": [
         {

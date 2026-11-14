@@ -189,7 +189,7 @@ impl Real {
             Arc::new(ClaudeSidecarProvider::connect(&uuid::Uuid::new_v4().to_string()).expect("the sidecar"));
         let conversation =
             AgentConversation::create(provider.clone(), &scratch, ProjectTrust::Untrusted).expect("a conversation");
-        let mut real = Self {
+        let real = Self {
             conversation,
             provider,
             events: Vec::new(),

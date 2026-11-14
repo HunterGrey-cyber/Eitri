@@ -968,6 +968,9 @@ impl AgentPanelHandle {
         // A card nobody answers ends at its limit, and nothing else would run a tick then.
         next = earliest(next, state.editor_tools.next_card_limit().map(after_now));
         next = earliest(next, state.tabs.remote_poll_deadline(now));
+        next = earliest(next, state.tabs.link_poll_deadline(now));
+        // A trust scan on a server is polled on its own slow deadline, never by holding the steady tick.
+        next = earliest(next, state.trust.server_poll_deadline(now));
         // A request held for its call is judged when it has waited its time, by a drain nothing else may wake; one
         // already due is looked at on the steady cadence until a drain has judged it.
         next = earliest(
@@ -1202,6 +1205,15 @@ impl AgentPanelHandle {
             let mut state = self.state.borrow_mut();
             state.tab_memory.finish().or(state.group_tabs.last_write.take())
         };
+        // A window that keeps its tabs lets its remote agents go: each is in the saved file the write above made, for
+        // a later window to take up. One that keeps none (`agent.restore` off) stops them, as it ends its local
+        // sessions: nothing would ever reach them again.
+        let keeps_tabs = self.state.borrow().restore_policy != RestorePolicy::Off;
+        let window_ending = if keeps_tabs { Ending::LetGo } else { Ending::End };
+        // Where an ended remote agent's stop is kept until it went through.
+        let keep_at = self.state.borrow().retiring.keep_at.clone();
+        // A stop that was being kept when the window closed is waited for: a stop half written is no stop.
+        let stop_writes = self.state.borrow_mut().remote_stops.take_writes();
         let tabs = {
             let mut state = self.state.borrow_mut();
             // Read by the tick and by every path into the tab set, all of
@@ -1224,8 +1236,16 @@ impl AgentPanelHandle {
                 ));
             }
             backends.extend(retired);
+            // A connect still running reaches a saved agent only when it takes a saved tab up; a fresh start or a
+            // resume reaches one no file names, which is stopped.
+            let connect_ending = match tab.remote_agent.is_some() {
+                true => window_ending,
+                false => Ending::End,
+            };
             match tab.into_backend() {
-                TabBackend::Starting(pending) => entries.push(watch_connect(pending.result_rx)),
+                TabBackend::Starting(pending) => {
+                    entries.push(watch_connect(pending.result_rx, connect_ending, keep_at.clone()))
+                }
                 // A live backend left the tab retired, above; a start still waiting for the trust
                 // question has spawned nothing.
                 TabBackend::Live(_)
@@ -1234,7 +1254,21 @@ impl AgentPanelHandle {
                 | TabBackend::Failed { .. } => {}
             }
         }
-        entries.extend(tear_down_all("every session tab's teardown", backends));
+        entries.extend(tear_down_all(
+            "every session tab's teardown",
+            backends,
+            window_ending,
+            keep_at.clone(),
+        ));
+        for rx in stop_writes {
+            entries.push(watched_abandoning(
+                "a stop being kept for when the server is back",
+                rx,
+                REMOTE_STOP_WRITE_BACKSTOP,
+                "the stop is not kept: that agent keeps running on its server",
+                |_| Vec::new(),
+            ));
+        }
         if let Some(rx) = history_write {
             entries.push(watched_abandoning(
                 "the prompt history's last write",
@@ -1257,7 +1291,12 @@ impl AgentPanelHandle {
         // Tabs that left earlier, while the window stayed open: their teardowns and connects are
         // still running on workers nothing else would keep alive. Same holds and backstops as the tabs just taken.
         let retiring = std::mem::take(&mut self.state.borrow_mut().retiring);
-        entries.extend(retiring.connects.into_iter().map(watch_connect));
+        entries.extend(
+            retiring
+                .connects
+                .into_iter()
+                .map(|(rx, ending)| watch_connect(rx, ending, keep_at.clone())),
+        );
         for (_, rx) in retiring.teardowns {
             entries.push(watched("a closed tab's teardown", rx, SESSION_CLOSE_BACKSTOP, |()| {
                 Vec::new()
@@ -1536,12 +1575,24 @@ impl AgentPanelHandle {
             state.tab_files = Some(files);
             return;
         }
-        let tabs_dir = eitri_core::saved_tabs::state_dir(
+        let tabs_dir = eitri_core::saved_tabs::state_dir_for(
             state.review_roots.state_home.as_deref(),
             state.review_roots.home.as_deref(),
+            state.tabs.project_origin(),
         );
-        let (offer, notes, takeovers) =
+        let (mut offer, notes, takeovers) =
             files.startup_beyond(state.tab_files.as_ref(), tabs_dir.as_deref(), &state.project_dir);
+        // A window of this machine leaves out of its file the remote tabs a remote window of the same root carried
+        // into its own server's file: kept here too, one agent would come back in two windows.
+        if let (Some(base), Some(offer), eitri_core::remote_project::TabOrigin::Local) =
+            (tabs_dir.as_deref(), offer.as_mut(), state.tabs.project_origin())
+        {
+            let role = state.tab_memory.role();
+            let project_dir = &state.project_dir;
+            offer.remote.retain(|tab| {
+                !eitri_core::saved_tabs::carried_elsewhere(base, project_dir, role, &tab.helper.host_key_sha256)
+            });
+        }
         for note in notes {
             eprintln!("{note}");
             state.startup_problems.push(note);
@@ -1629,6 +1680,98 @@ impl AgentPanelHandle {
         for tab in empty {
             state.tabs.get_mut(tab).unwrap().following = following;
         }
+    }
+
+    pub fn project_origin(&self) -> eitri_core::remote_project::TabOrigin {
+        self.wake();
+        self.state.borrow().tabs.project_origin().clone()
+    }
+
+    /// Startup supplies the remote record's origin before any agent session begins. A project on a server keeps its
+    /// saved tabs apart from its copy's (`saved_tabs::state_dir_for`), and the writer moves there; what the shared file
+    /// held of that server's remote tabs was carried into it before the window was built (`saved_tabs::
+    /// carry_remote_tabs`, at the launch), so nothing here touches the disk.
+    pub fn set_project_origin(&self, origin: eitri_core::remote_project::TabOrigin) -> Result<(), &'static str> {
+        self.wake();
+        let mut state = self.state.borrow_mut();
+        let state = &mut *state;
+        let old = state.tabs.project_origin().clone();
+        if let (
+            eitri_core::remote_project::TabOrigin::Remote {
+                host: old_host,
+                root: old_root,
+                ..
+            },
+            eitri_core::remote_project::TabOrigin::Remote { host, root, .. },
+        ) = (&old, &origin)
+        {
+            if old_host != host || old_root != root {
+                return Err("this project now points at another server; reopen this window");
+            }
+        }
+        state.tabs.set_project_origin(origin.clone())?;
+        if let (
+            eitri_core::remote_project::TabOrigin::Remote {
+                host_key_sha256: old, ..
+            },
+            eitri_core::remote_project::TabOrigin::Remote {
+                host_key_sha256: new, ..
+            },
+        ) = (&old, &origin)
+        {
+            if old != new {
+                if let Some(source) = &mut state.restore_source {
+                    source.rekey_remote(old, new);
+                }
+                for tab in &mut state.unclaimed_remote {
+                    if tab.helper.host_key_sha256 == *old {
+                        tab.helper.host_key_sha256 = new.clone();
+                    }
+                }
+                state.tab_memory.rekey_remote(old, new);
+            }
+        }
+        // Where a remote agent ended here keeps its stop until the stop went through.
+        state.retiring.keep_at = match &origin {
+            eitri_core::remote_project::TabOrigin::Remote { root, .. } => Some(root.clone()),
+            _ => None,
+        };
+        if !matches!(origin, eitri_core::remote_project::TabOrigin::Remote { .. }) {
+            return Ok(());
+        }
+        let roots = &state.review_roots;
+        let Some(keyed) =
+            eitri_core::saved_tabs::state_dir_for(roots.state_home.as_deref(), roots.home.as_deref(), &origin)
+        else {
+            return Ok(());
+        };
+        if let Err(why) = state.tab_memory.move_to(keyed) {
+            eprintln!("[tabs] the saved tabs stay where they were: {why}");
+        }
+        Ok(())
+    }
+
+    /// The window's start path gives a remote project's connection to its server's helper once the host is
+    /// connected (`RemoteConnection::open_over_ssh`, on a worker): the window's remote tabs start, come back and
+    /// continue through it. The stops kept while the server could not be reached go out now, on the window's stop
+    /// sender, and again whenever the server can be reached after an outage. Until it is given, a remote tab's
+    /// start is put off with why.
+    pub fn set_remote_connection(&self, connection: eitri_core::remote_project::RemoteConnection) {
+        self.wake();
+        let sender = super::remote_tabs::stop_sender_for(connection.clone());
+        let mut state = self.state.borrow_mut();
+        state.remote_stops.set_sender(sender);
+        state.server = Some(connection);
+        drop(state);
+        self.run(|state, out| {
+            super::remote_tabs::reattach_saved(state, out);
+        });
+    }
+
+    /// Startup supplies the recorded host when the window was opened on its local copy.
+    pub fn set_local_copy_host(&self, host: Option<String>) {
+        self.wake();
+        self.state.borrow_mut().tabs.set_local_copy_host(host);
     }
 
     /// `review.enabled` and `review.hint` as `init.lua` left them, applied once after it ran. Enabled
@@ -2444,6 +2587,13 @@ impl AgentPanelHandle {
         // prompt in this page -- it was about the tab the user is leaving to see this list. A fresh
         // one raised from inside the chooser (its own Shift+Tab) makes its own plan afterwards.
         self.drop_bypass_prompt_in(view);
+        if super::detail::remote_page(&self.state.borrow(), view) {
+            self.dispatch(
+                view,
+                eitri_core::agent_bridge::serialize_notice_for_js(super::detail::REMOTE_RESUME_UNAVAILABLE),
+            );
+            return;
+        }
         let (payload, listed) = chooser_payload(&self.state.borrow(), view);
         {
             let mut state = self.state.borrow_mut();
@@ -2636,7 +2786,9 @@ impl AgentPanelHandle {
         }
         let ids: Vec<TabId> = {
             let state = self.state.borrow();
-            // Checked for every tab first, so a refusal closes none of them.
+            // Checked for every tab first, so a refusal these checks know of closes none of them. A remote tab whose
+            // server cannot be reached and whose agent cannot be named for a later stop is refused only when its turn
+            // comes, after the tabs before it closed; a live remote tab with a session always names its agent.
             if let Some(why) = tabs_cannot_close(&state, view) {
                 return Err(why);
             }
@@ -2644,7 +2796,7 @@ impl AgentPanelHandle {
         };
         self.run(|state, out| {
             for id in &ids {
-                close_tab(state, *id, out)?;
+                super::remote_tabs::close_tab_unasked(state, *id, out)?;
             }
             eprintln!(
                 "[agent_panel] killed: {} session tab(s) closed, records kept (view {})",
@@ -2923,6 +3075,85 @@ fn tabs_cannot_close(state: &AgentPanelState, view: ViewId) -> Option<&'static s
 mod tests {
     use super::*;
     use crate::agent_panel::tests::*;
+
+    use agent::{AgentProvider, RemoteLinkState};
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Default)]
+    struct RemoteRecordingProvider {
+        inner: RecordingProvider,
+        link: Mutex<Option<RemoteLinkState>>,
+    }
+
+    impl AgentProvider for RemoteRecordingProvider {
+        fn link_state(&self) -> Option<RemoteLinkState> {
+            self.link.lock().unwrap().clone()
+        }
+        fn capabilities(&self) -> agent::ProviderCapabilities {
+            self.inner.capabilities()
+        }
+        fn info(&self) -> agent::ProviderInfo {
+            agent::ProviderInfo {
+                host: Some("example-host".into()),
+                account_name: Some("work".into()),
+                ..self.inner.info()
+            }
+        }
+        fn create_session(&self, request: agent::CreateSessionRequest) -> Result<String, agent::ProviderError> {
+            self.inner.create_session(request)
+        }
+        fn resume_session(&self, request: agent::ResumeSessionRequest) -> Result<String, agent::ProviderError> {
+            self.inner.resume_session(request)
+        }
+        fn send_turn(&self, request: agent::SendTurnRequest) -> Result<String, agent::ProviderError> {
+            self.inner.send_turn(request)
+        }
+        fn interrupt_turn(&self, request: agent::InterruptTurnRequest) -> Result<(), agent::ProviderError> {
+            self.inner.interrupt_turn(request)
+        }
+        fn resolve_permission(&self, request: agent::ResolvePermissionRequest) -> Result<(), agent::ProviderError> {
+            self.inner.resolve_permission(request)
+        }
+        fn close_session(&self, request: agent::CloseSessionRequest) -> Result<(), agent::ProviderError> {
+            self.inner.close_session(request)
+        }
+        fn pump(&self) -> Vec<agent::AgentDomainEvent> {
+            self.inner.pump()
+        }
+    }
+
+    #[test]
+    fn remote_link_deadline_delivers_without_a_wake_and_preserves_local_idle() {
+        use crate::panel_wake::NextTick;
+        use std::time::{Duration, Instant};
+        let (handle, page) = settled_panel();
+        let dir = agent::state_dirs::test_workspace_dir("panel-link-deadline");
+        let provider = Arc::new(RemoteRecordingProvider::default());
+        let (tab, _) = handle.open_live_tab_for_host_test(provider.clone(), &dir);
+        let at = tick_until_quiet(&handle, Instant::now());
+        assert_eq!(handle.run_tick(at), NextTick::OnWake);
+        *provider.link.lock().unwrap() = Some(RemoteLinkState::Live);
+        let NextTick::At(due) = handle.run_tick(at) else {
+            panic!("a remote link needs a slow deadline")
+        };
+        assert!(due > at && due <= at + Duration::from_millis(500));
+        assert!(!handle.state.borrow().tabs.needs_polling());
+        handle.take_wake(due);
+        page.sent.borrow_mut().clear();
+        *provider.link.lock().unwrap() = Some(RemoteLinkState::Disconnected { since_unix_ms: 100 });
+        assert_eq!(
+            handle.take_wake(due),
+            None,
+            "the provider emits no wake for a link change"
+        );
+        assert_eq!(handle.run_tick(due), NextTick::At(due + Duration::from_millis(500)));
+        assert!(page.sent.borrow().iter().map(|p| serde_json::from_str::<serde_json::Value>(p).unwrap()).any(|p|
+            p == serde_json::json!({"kind":"link_state", "tab":tab.0, "linkState":{"kind":"disconnected", "sinceUnixMs":100}})
+        ));
+        *provider.link.lock().unwrap() = None;
+        assert_eq!(handle.run_tick(due + Duration::from_millis(500)), NextTick::OnWake);
+        let _ = handle.shutdown();
+    }
 
     fn offered_pages() -> Vec<eitri_core::agent_bridge::PageLine> {
         vec![eitri_core::agent_bridge::PageLine {
@@ -3974,6 +4205,71 @@ mod tests {
             "{:?}",
             offered(&state)
         );
+        let _ = std::fs::remove_dir_all(&project);
+    }
+
+    /// Once a remote window carried its server's remote tabs out of the project's shared file, a window of this
+    /// machine on the same root is not offered them and does not write them back: one agent never comes back in two
+    /// windows. Another server's tabs it still keeps.
+    #[test]
+    fn a_local_window_leaves_out_the_remote_tabs_a_remote_window_carried() {
+        use eitri_core::saved_tabs::{self, SavedRemoteTab, SavedTabs, TabFiles};
+        use eitri_core::window_link::pair::Role;
+        let project = agent::state_dirs::test_workspace_dir("tab-files-carried");
+        let state_home = project.join("state");
+        let base = saved_tabs::state_dir(Some(state_home.as_os_str()), None).unwrap();
+        let remote = |sidecar: &str, key: &str| SavedRemoteTab {
+            window: None,
+            helper: agent::HelperHandoff {
+                daemon: "".into(),
+                declared_client_tools: Default::default(),
+                host: "example-host".into(),
+                host_key_sha256: key.into(),
+                sidecar_id: sidecar.into(),
+                session_id: format!("s-{sidecar}"),
+                last_folded_sequence: 0,
+            },
+            provider_session_id: None,
+            name: None,
+            mode: Auto,
+        };
+        let shared =
+            SavedTabs::default().with_remote(vec![remote("sc-7", "SHA256:example"), remote("sc-9", "SHA256:other")]);
+        saved_tabs::save_as(&base, &project, Role::Second, &shared).unwrap();
+        let keyed = saved_tabs::state_dir_for(
+            Some(state_home.as_os_str()),
+            None,
+            &eitri_core::remote_project::TabOrigin::Remote {
+                host: "example-host".into(),
+                host_key_sha256: "SHA256:example".into(),
+                root: project.clone(),
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            saved_tabs::carry_remote_tabs(&base, &keyed, &project, Role::Second, "SHA256:example").unwrap(),
+            1
+        );
+        let state = state_for_hooks(TabSet::new(BackendKind::Sidecar, Auto));
+        {
+            let mut s = state.borrow_mut();
+            s.review_roots.state_home = Some(state_home.clone().into_os_string());
+            s.project_dir = project.clone();
+            s.tab_memory = saved_tabs::TabWriter::new_as(Some(base.clone()), project.clone(), Role::Second);
+        }
+        let handle = handle_for(&state);
+        handle.set_tab_files(TabFiles {
+            role: Role::Second,
+            also_offer: Vec::new(),
+            offers_own: true,
+        });
+        let offered: Vec<String> = state
+            .borrow()
+            .restore_source
+            .as_ref()
+            .map(|saved| saved.remote.iter().map(|tab| tab.helper.sidecar_id.clone()).collect())
+            .unwrap_or_default();
+        assert_eq!(offered, ["sc-9"], "the carried server's tab is the remote window's now");
         let _ = std::fs::remove_dir_all(&project);
     }
 }

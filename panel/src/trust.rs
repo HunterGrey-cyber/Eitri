@@ -30,6 +30,99 @@ pub(super) fn trust_profile(registered: &[AgentRegistration], agent: &AgentId) -
     }
 }
 
+/// What `tab`'s trust question is about: the profile its start waits on ([`waiting_profile`]), where the tab
+/// runs ([`subject_for`]).
+pub(super) fn trust_subject(state: &AgentPanelState, tab: TabId) -> Subject {
+    subject_for(state, tab, waiting_profile(state, tab))
+}
+
+/// `profile` where `tab` runs: at the window's root, or for a remote tab at its project's root on its server,
+/// read through the window's connection opened for the host key the project records (none when the window
+/// holds no connection for that key: its check cannot run, and nothing starts). A remote tab is never
+/// checked against this machine's disk.
+pub(super) fn subject_for(state: &AgentPanelState, tab: TabId, profile: Profile) -> Subject {
+    use agent::remote_client::HelperConnections;
+    let Some(eitri_core::remote_project::TabOrigin::Remote {
+        host,
+        host_key_sha256,
+        root,
+    }) = state.tabs.get(tab).map(|t| t.origin())
+    else {
+        return Subject::local(profile);
+    };
+    let account = agent::account::configured().map(|account| account.name().to_string());
+    let reported = reported_config_dir(
+        state
+            .tabs
+            .tabs()
+            .iter()
+            .map(|t| (t.origin(), t.live().and_then(|backend| backend.provider_info()))),
+        host,
+        host_key_sha256,
+        account.as_deref(),
+    );
+    let user_tier = crate::trust_gate::user_tier_words(host, &profile, account.as_deref(), reported.as_deref());
+    let server = state
+        .server
+        .as_ref()
+        .and_then(|connection| connection.open_for(host, host_key_sha256))
+        .map(Server::Helper);
+    Subject::remote(
+        profile,
+        RemotePlace {
+            host: host.clone(),
+            root: eitri_core::project_trust::RemoteRoot {
+                host_key_sha256: host_key_sha256.clone(),
+                root: root.clone(),
+            },
+            user_tier,
+            server,
+        },
+    )
+}
+
+/// The Claude config directory an agent of this window reported in its handshake for the same login on the same
+/// server and account: the host as typed, the host key and the account name all equal, so `alice@build` and
+/// `deploy@build`, one machine and two accounts there, never share one. What the server's login set, which the
+/// laptop cannot know otherwise; `None` when no such agent reported one.
+pub(super) fn reported_config_dir<'a>(
+    tabs: impl Iterator<
+        Item = (
+            &'a eitri_core::remote_project::TabOrigin,
+            Option<&'a agent::ProviderInfo>,
+        ),
+    >,
+    host: &str,
+    host_key_sha256: &str,
+    account: Option<&str>,
+) -> Option<std::path::PathBuf> {
+    tabs.filter_map(|(origin, info)| match origin {
+        eitri_core::remote_project::TabOrigin::Remote {
+            host: tab_host,
+            host_key_sha256: key,
+            ..
+        } if tab_host == host && key == host_key_sha256 => info,
+        _ => None,
+    })
+    .find(|info| info.account_name.as_deref() == account)
+    .and_then(|info| info.account_config_dir.clone())
+}
+
+/// What a page that loaded checks for the tab it shows: a fresh check for `prefix i`'s row and the
+/// question. A remote tab's check is a scan of its server's tree, so it is made only for a tab waiting on
+/// trust, and not while one of that project's checks is queued or running ([`TrustGate::refresh`]).
+pub(super) fn refresh_trust(state: &mut AgentPanelState, tab: TabId) {
+    let subject = trust_subject(state, tab);
+    let waits = matches!(
+        state.tabs.get(tab).map(|t| t.backend()),
+        Some(TabBackend::AwaitingTrust(_))
+    );
+    if subject.is_remote() && !waits {
+        return;
+    }
+    state.trust.refresh(subject);
+}
+
 /// The ACP command a registered agent's tab starts with, or `None` when nothing registered that name.
 pub(super) fn acp_spec(registered: &[AgentRegistration], name: &str) -> Option<agent::providers::acp::AcpAgentSpec> {
     let registration = registered.iter().find(|a| a.name == name)?;
@@ -64,9 +157,19 @@ pub(super) fn waiting_profile(state: &AgentPanelState, tab: TabId) -> Profile {
 /// says how.
 pub(super) fn gate_start(state: &mut AgentPanelState, tab: TabId, start: DeferredStart) -> Result<(), String> {
     state.tabs.defer_start(tab, start)?;
-    let profile = waiting_profile(state, tab);
-    state.trust.wait_for(tab, &profile);
-    state.trust.begin_check(&profile);
+    gate_deferred(state, tab)
+}
+
+/// [`gate_start`] for the resume the person chose on a remote tab whose agent the server no longer runs.
+pub(super) fn gate_remote_resume(state: &mut AgentPanelState, tab: TabId, start: DeferredStart) -> Result<(), String> {
+    state.tabs.defer_remote_resume(tab, start)?;
+    gate_deferred(state, tab)
+}
+
+fn gate_deferred(state: &mut AgentPanelState, tab: TabId) -> Result<(), String> {
+    let subject = trust_subject(state, tab);
+    state.trust.wait_for(tab, &subject);
+    state.trust.begin_check(subject);
     Ok(())
 }
 
@@ -175,8 +278,8 @@ pub(super) fn reroute_or_ask(state: &mut AgentPanelState, tab: TabId) -> Outbox 
     if state.trust.is_waiting(tab) {
         return out;
     }
-    let profile = waiting_profile(state, tab);
-    match state.trust.current_route(&profile) {
+    let subject = trust_subject(state, tab);
+    match state.trust.current_route(&subject) {
         None => {}
         Some(Route::Start(project)) => {
             if let Some(start) = state.tabs.take_deferred(tab) {
@@ -195,7 +298,7 @@ pub(super) fn reroute_or_ask(state: &mut AgentPanelState, tab: TabId) -> Outbox 
             let Ok(nonce) = state.tabs.ask_trust(tab) else {
                 return out;
             };
-            match state.trust.ask(tab, nonce, &profile) {
+            match state.trust.ask(tab, nonce, &subject) {
                 Some(Asked::Prompt(message)) => out.push(Dest::Tab(tab), message),
                 // Nothing in a prompt may be cut, so one too large to show refuses its start.
                 Some(asked @ (Asked::TooLarge { .. } | Asked::Unavailable)) => {
@@ -286,6 +389,14 @@ pub(super) fn trust_events(state: &mut AgentPanelState) -> Outbox {
                     None => state.trust.drop_command_prompt(),
                 }
             }
+            // A check that could not be made starts nothing: the start is put off, saying why.
+            GateEvent::Unavailable { tab, why } => {
+                state.trust.hide(tab);
+                let start = state.tabs.take_deferred(tab).or_else(|| state.tabs.take_recorded(tab));
+                if let Some(start) = start {
+                    out.extend(put_off_start(state, tab, start, &why));
+                }
+            }
             GateEvent::CommandDone {
                 request_id: command,
                 ok,
@@ -354,9 +465,8 @@ pub(super) fn trust_command(
     let command = state
         .owed
         .owe(view, request_id, Owed::TrustCommand { tab, typed_in: view });
-    state
-        .trust
-        .command(command, action, tab, &trust_profile(&state.acp_agents, &running));
+    let subject = subject_for(state, tab, trust_profile(&state.acp_agents, &running));
+    state.trust.command(command, action, tab, subject);
     Ok(())
 }
 
@@ -1732,5 +1842,138 @@ mod tests {
             "page 2's c1 was answered once"
         );
         assert!(handle.state.borrow().owed.is_empty(), "no record is left behind");
+    }
+    /// A remote tab is never checked against this machine's disk, even where the same path holds a
+    /// configuration here: with no connection to its server its check cannot run, and its first message
+    /// starts nothing and comes back with why.
+    #[test]
+    fn a_remote_tab_with_no_connection_starts_nothing_and_says_why() {
+        let (state, fx) = trust_panel("trust-remote-no-connection");
+        fx.write(PROJECT_SETTINGS, &session_start_hook("touch /tmp/on-the-laptop"));
+        let tab = {
+            let mut s = state.borrow_mut();
+            s.tabs
+                .set_project_origin(eitri_core::remote_project::TabOrigin::Remote {
+                    host: "example-host".into(),
+                    host_key_sha256: "SHA256:example".into(),
+                    root: fx.root.clone(),
+                })
+                .unwrap();
+            s.tabs.active()
+        };
+        gate_start(&mut state.borrow_mut(), tab, first_send("r1", "hello")).unwrap();
+        let seen = tick_until(&state, |_| {
+            matches!(state.borrow().tabs.get(tab).unwrap().backend(), TabBackend::NotStarted)
+        });
+        let payloads = all_payloads(&seen);
+        assert!(
+            prompts(&payloads).is_empty(),
+            "nothing is asked about this machine's files"
+        );
+        assert!(
+            notices(&payloads).iter().any(|notice| notice
+                == "not started: the project on example-host could not be checked (this window has no connection \
+                    to example-host); nothing was loaded or recorded"),
+            "{payloads:?}"
+        );
+        assert!(fx.spawned.borrow().is_empty());
+        assert_eq!(state.borrow().tabs.get(tab).unwrap().draft(), "hello");
+    }
+    /// A remote project's window gives its panel the project's origin through the handle (`set_project_origin`,
+    /// before any tab can start): every tab of that window is then checked on its server, at the recorded root under
+    /// the recorded key, never against this machine's copy at the same path, and a changed key is another record,
+    /// so the question is asked again.
+    #[test]
+    fn a_remote_windows_tabs_are_checked_on_their_server() {
+        let (state, fx) = trust_panel("trust-remote-window-path");
+        fx.write(PROJECT_SETTINGS, &session_start_hook("touch /tmp/on-the-laptop"));
+        let origin = |key: &str| eitri_core::remote_project::TabOrigin::Remote {
+            host: "example-host".into(),
+            host_key_sha256: key.into(),
+            root: fx.root.clone(),
+        };
+        let handle = handle_for(&state);
+        handle.set_project_origin(origin("SHA256:example")).unwrap();
+        let tab = state.borrow().tabs.active();
+        let subject = trust_subject(&state.borrow(), tab);
+        assert!(subject.is_remote(), "the tab's question is about the server's files");
+        gate_start(&mut state.borrow_mut(), tab, first_send("r1", "hello")).unwrap();
+        let seen = tick_until(&state, |_| {
+            matches!(state.borrow().tabs.get(tab).unwrap().backend(), TabBackend::NotStarted)
+        });
+        let payloads = all_payloads(&seen);
+        assert!(
+            prompts(&payloads).is_empty(),
+            "nothing is asked about this machine's files"
+        );
+        assert!(
+            notices(&payloads)
+                .iter()
+                .any(|notice| notice.contains("the project on example-host could not be checked")),
+            "{payloads:?}"
+        );
+        assert!(fx.spawned.borrow().is_empty());
+        let renamed = {
+            let mut s = state.borrow_mut();
+            s.tabs.set_project_origin(origin("SHA256:new")).unwrap();
+            trust_subject(&s, tab)
+        };
+        assert_ne!(renamed.key(), subject.key(), "another host key is another trust record");
+    }
+
+    /// A page that loads checks a remote tab only while that tab waits on trust: a running remote tab's
+    /// check would be a scan of the server's tree for a row nobody asked for.
+    #[test]
+    fn a_page_load_scans_no_server_for_a_remote_tab_that_waits_on_nothing() {
+        let (state, fx) = trust_panel("trust-remote-page-load");
+        let tab = {
+            let mut s = state.borrow_mut();
+            s.tabs
+                .set_project_origin(eitri_core::remote_project::TabOrigin::Remote {
+                    host: "example-host".into(),
+                    host_key_sha256: "SHA256:example".into(),
+                    root: fx.root.clone(),
+                })
+                .unwrap();
+            s.tabs.active()
+        };
+        refresh_trust(&mut state.borrow_mut(), tab);
+        assert_eq!(state.borrow().trust.server_jobs(), 0);
+        assert!(!state.borrow().trust.is_busy());
+    }
+    /// The config directory an agent reported is named only for the same login on the same server and account:
+    /// `alice@build` and `deploy@build` share a host key and never a directory.
+    #[test]
+    fn a_reported_config_dir_is_matched_on_host_key_and_account() {
+        use eitri_core::remote_project::TabOrigin;
+        let origin = |host: &str| TabOrigin::Remote {
+            host: host.into(),
+            host_key_sha256: "SHA256:build".into(),
+            root: "/srv/app".into(),
+        };
+        let info = |account: Option<&str>, dir: &str| agent::ProviderInfo {
+            account_name: account.map(str::to_string),
+            account_config_dir: Some(dir.into()),
+            ..Default::default()
+        };
+        let alice = origin("alice@build");
+        let alice_info = info(Some("work"), "/home/alice/.claude-work");
+        let tabs = [(&alice, Some(&alice_info))];
+        assert_eq!(
+            reported_config_dir(tabs.iter().copied(), "deploy@build", "SHA256:build", Some("work")),
+            None
+        );
+        assert_eq!(
+            reported_config_dir(tabs.iter().copied(), "alice@build", "SHA256:build", Some("work")),
+            Some("/home/alice/.claude-work".into())
+        );
+        assert_eq!(
+            reported_config_dir(tabs.iter().copied(), "alice@build", "SHA256:other", Some("work")),
+            None
+        );
+        assert_eq!(
+            reported_config_dir(tabs.iter().copied(), "alice@build", "SHA256:build", Some("personal")),
+            None
+        );
     }
 }

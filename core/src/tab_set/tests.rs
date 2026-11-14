@@ -16,6 +16,7 @@ mod chat_views;
 mod cli_prompts;
 mod manual_mode;
 mod pacing_queue;
+mod remote_desk;
 mod saving;
 mod snapshots;
 mod starts;

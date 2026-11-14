@@ -127,7 +127,7 @@ fn a_queued_message_goes_out_after_an_interrupt() {
     .unwrap();
     match set.send_now(tab, "", String::new(), 2).unwrap() {
         SendNow::Interrupting(outcome) => outcome.map_err(|e| e.message).unwrap(),
-        SendNow::Flushed(_) => panic!("the turn was running"),
+        SendNow::Flushed(_) | SendNow::InterruptOut(_) => panic!("the turn was running, in a local tab"),
     };
     let mut flushed = false;
     pump_until(&mut set, &dir, "the queue to go out and be answered", |set, ended| {

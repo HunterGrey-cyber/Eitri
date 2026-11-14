@@ -364,6 +364,59 @@ fn a_resync_keeps_a_gate_note_whose_only_pending_request_is_held() {
 /// The gate card, human approval through `answer_card`, and gate resolution can be followed by
 /// the CLI's prompt for the same call under a new permission id. That request is accepted and
 /// answered `allow` using the prior human approval, producing exactly one card for the call.
+/// In a remote tab the host's answer goes out without waiting, and the person's one approval of a call is used up
+/// by the first prompt it answers, there and then: a second prompt for the same call in the same batch is a card.
+#[test]
+fn a_remote_tabs_one_approval_answers_one_prompt_while_its_answer_is_out() {
+    let dir = workspace("remote-one-approval");
+    let mut set = set();
+    set.set_project_origin(crate::remote_project::TabOrigin::Remote {
+        host: "example-host".into(),
+        host_key_sha256: "SHA256:example".into(),
+        root: "/srv/project".into(),
+    })
+    .unwrap();
+    let tab = set.active();
+    let (provider, backend) = live(&dir);
+    provider.set_link(Some(agent::RemoteLinkState::Live));
+    set.get_mut(tab).unwrap().backend = TabBackend::Live(backend);
+    provider.queue(gate_write("perm-hook", "toolu_probe2"));
+    until("the gate's card", || {
+        set.pump(&dir, true);
+        set.get(tab).unwrap().attention.attention().pending == 1
+    });
+    let send = set
+        .answer_card_async(tab, ViewId::BASE, "perm-hook", agent::PermissionDecision::Allow)
+        .unwrap();
+    let reply = loop {
+        if let Some(reply) = set.finish_card_answer(tab, &send) {
+            break reply;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    };
+    assert!(reply.is_ok());
+    provider.hold_permission_replies();
+    provider.queue_all(vec![
+        resolved("perm-hook"),
+        cli_prompt("perm-cli-1", "toolu_probe2", "Write", probe_input(), None),
+        cli_prompt("perm-cli-2", "toolu_probe2", "Write", probe_input(), None),
+    ]);
+    until("one prompt answered", || {
+        set.pump(&dir, true);
+        provider.held_permissions() >= 1
+    });
+    for _ in 0..3 {
+        set.pump(&dir, true);
+    }
+    assert_eq!(provider.held_permissions(), 1, "one approval, one answer");
+    assert!(
+        set.get(tab).unwrap().card_is_waiting("perm-cli-2"),
+        "the second is the person's card"
+    );
+    provider.reply_to_held_permissions(Ok(None));
+    shut_down_all(&mut set);
+}
+
 #[test]
 fn approving_the_card_for_a_call_answers_the_clis_own_prompt_that_follows() {
     let dir = workspace("o3-auto-one-card");

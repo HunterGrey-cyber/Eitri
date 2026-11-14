@@ -40,6 +40,8 @@ pub struct GroupTabs {
     writer: TabWriter,
     /// Each chat window's tabs, none of them empty: what it last reported, or the file's part before its first report.
     parts: BTreeMap<WindowName, SavedTabs>,
+    /// Apply accepted key changes in order to queued reports and windows that relink later.
+    remote_rekeys: Vec<(String, String)>,
     /// The group is closing: a window that goes now goes with it, and its tabs stay.
     keep_windows: bool,
     /// Window 1 is closing and the file is done: what is here is what the next launch gets.
@@ -87,6 +89,7 @@ impl GroupTabs {
             startup_problems,
             writer,
             parts,
+            remote_rekeys: Vec::new(),
             keep_windows: false,
             closing: false,
         }
@@ -95,6 +98,18 @@ impl GroupTabs {
     /// The chat windows that hold tabs, by number: the start opens each of them.
     pub fn windows(&self) -> Vec<WindowName> {
         self.parts.keys().cloned().collect()
+    }
+
+    /// Follows a verified replacement key on the same writer, including reports already held in memory.
+    pub fn rekey_remote(&mut self, dir: PathBuf, old: &str, new: &str) -> Result<(), &'static str> {
+        for tabs in self.parts.values_mut() {
+            tabs.rekey_remote(old, new);
+        }
+        self.writer.rekey_remote(old, new);
+        self.writer.move_to(dir)?;
+        self.remote_rekeys.push((old.into(), new.into()));
+        self.save();
+        Ok(())
     }
 
     /// The chat window `name` reported its tabs. Its input: what is no set of tabs leaves its part as it was.
@@ -106,7 +121,10 @@ impl GroupTabs {
             Ok(tabs) if tabs.is_empty() => {
                 self.parts.remove(name);
             }
-            Ok(tabs) => {
+            Ok(mut tabs) => {
+                for (old, new) in &self.remote_rekeys {
+                    tabs.rekey_remote(old, new);
+                }
                 self.parts.insert(name.clone(), tabs.in_base_view());
             }
             Err(why) => {
@@ -329,6 +347,176 @@ mod tests {
         assert!(group.wait_written());
         assert_eq!(sessions(&on_disk(&dir.0)), ["b-1", "b-2"]);
         assert_eq!(group.windows(), [c(2)]);
+    }
+
+    #[test]
+    fn a_rekeyed_group_writes_new_reports_only_under_the_new_key() {
+        let state = Scratch::new("group-tabs-rekey");
+        let root = Path::new("/srv/project");
+        let origin = |key: &str| eitri_core::remote_project::TabOrigin::Remote {
+            host: "example-host".into(),
+            host_key_sha256: key.into(),
+            root: root.into(),
+        };
+        let dir = |key: &str| saved_tabs::state_dir_for(Some(state.0.as_os_str()), None, &origin(key)).unwrap();
+        let old = dir("SHA256:old");
+        let new = dir("SHA256:new");
+        let remote = |id: &str, key: &str| {
+            SavedTabs::default().with_remote(vec![saved_tabs::SavedRemoteTab {
+                helper: agent::HelperHandoff {
+                    host: "example-host".into(),
+                    host_key_sha256: key.into(),
+                    daemon: "installation".into(),
+                    sidecar_id: id.into(),
+                    session_id: format!("session-{id}"),
+                    last_folded_sequence: 4,
+                    declared_client_tools: Default::default(),
+                },
+                provider_session_id: None,
+                name: None,
+                mode: SessionModeChoice::Auto,
+                window: None,
+            }])
+        };
+        let mut group = GroupTabs::read(Some(&old), root, true);
+        group.reported(&c(1), &remote("sc-1", "SHA256:old").to_wire());
+        group.reported(&c(2), &remote("sc-2", "SHA256:old").to_wire());
+        assert!(group.wait_written());
+        group.rekey_remote(new.clone(), "SHA256:old", "SHA256:new").unwrap();
+        assert!(group.wait_written());
+        let old_file = old.join(file_name_as(root, Role::Main));
+        std::fs::remove_file(&old_file).unwrap();
+        group.reported(&c(3), &remote("sc-3", "SHA256:new").to_wire());
+        let done = group.finish().expect("latest report queued");
+        done.recv_timeout(Duration::from_secs(60)).unwrap();
+        assert!(!old_file.exists(), "later reports must not recreate the old-key file");
+        let reopened = GroupTabs::read(Some(&new), root, true);
+        assert_eq!(reopened.windows(), [c(1), c(2), c(3)]);
+        for n in 1..=3 {
+            let saved = given(&reopened, &c(n));
+            assert_eq!(saved.remote[0].helper.sidecar_id, format!("sc-{n}"));
+            assert_eq!(saved.remote[0].helper.host_key_sha256, "SHA256:new");
+            assert_eq!(saved.remote[0].helper.daemon, "installation");
+        }
+    }
+
+    fn late_remote_report(keys: &[&str], reported_key: &str) -> SavedTabs {
+        let state = Scratch::new("group-tabs-late-rekey");
+        let root = Path::new("/srv/project");
+        let dir = |key: &str| state.0.join(eitri_core::remote_project::origin_key(key));
+        let mut group = GroupTabs::read(Some(&dir(keys[0])), root, true);
+        for pair in keys.windows(2) {
+            group.rekey_remote(dir(pair[1]), pair[0], pair[1]).unwrap();
+        }
+        let report = SavedTabs::default().with_remote(vec![saved_tabs::SavedRemoteTab {
+            helper: agent::HelperHandoff {
+                host: "example-host".into(),
+                host_key_sha256: reported_key.into(),
+                daemon: "installation".into(),
+                sidecar_id: "sc-late".into(),
+                session_id: "session-late".into(),
+                last_folded_sequence: 42,
+                declared_client_tools: Default::default(),
+            },
+            provider_session_id: Some("provider-late".into()),
+            name: Some("late agent".into()),
+            mode: SessionModeChoice::Manual,
+            window: None,
+        }]);
+        // A final report replaces an existing part; an orphan's first report follows every migration too.
+        group.reported(&c(1), &report.to_wire());
+        group.keep_every_window();
+        group.reported(&c(1), &report.to_wire());
+        let mut orphan = report.clone();
+        orphan.remote[0].helper.sidecar_id = "sc-orphan".into();
+        orphan.remote[0].helper.session_id = "session-orphan".into();
+        group.reported(&c(2), &orphan.to_wire());
+        group.finish().unwrap().recv_timeout(Duration::from_secs(60)).unwrap();
+        let reopened = GroupTabs::read(Some(&dir(keys.last().unwrap())), root, true);
+        let mut expected = report.clone();
+        expected.remote[0].helper.host_key_sha256 = keys.last().unwrap().to_string();
+        orphan.remote[0].helper.host_key_sha256 = keys.last().unwrap().to_string();
+        assert_eq!(given(&reopened, &c(1)), expected);
+        assert_eq!(given(&reopened, &c(2)), orphan);
+        given(&reopened, &c(1))
+    }
+
+    #[test]
+    fn a_report_from_before_the_rekey_restores_a_tab_with_the_new_connection() {
+        let saved = late_remote_report(&["SHA256:old", "SHA256:new"], "SHA256:old");
+        // A stdio HTTP/2 peer permits a connection without sockets. Close on the first RPC: observe the saved
+        // tab opening independently of the remote agent's later answer.
+        struct Peer;
+        impl agent::ssh::ChannelLauncher for Peer {
+            fn spawn(&self, _: &[std::ffi::OsString]) -> std::io::Result<std::process::Child> {
+                std::process::Command::new("python3")
+                    .args([
+                        "-c",
+                        r#"
+import sys
+i, o = sys.stdin.buffer, sys.stdout.buffer
+o.write(bytes([0, 0, 0, 4, 0, 0, 0, 0, 0])); o.flush()
+if len(i.read(24)) != 24: sys.exit(0)
+while True:
+    h = i.read(9)
+    if len(h) != 9: break
+    i.read(int.from_bytes(h[:3], 'big'))
+    if h[3] == 1: break
+"#,
+                    ])
+                    .stdin(std::process::Stdio::piped())
+                    .stdout(std::process::Stdio::piped())
+                    .stderr(std::process::Stdio::piped())
+                    .spawn()
+            }
+        }
+        let key = "SHA256:new";
+        let client =
+            agent::remote_client::HelperClient::connect(std::sync::Arc::new(Peer), "example-host", Some(key)).unwrap();
+        let project = eitri_core::remote_project::RemoteProject {
+            version: 1,
+            host: "example-host".into(),
+            host_key_sha256: key.into(),
+            root: "/srv/project".into(),
+            helper_version: "installation".into(),
+            sync: None,
+            created_at: 1,
+            queued_stops: Vec::new(),
+        };
+        let panel = eitri_panel::agent_panel::AgentPanelHandle::for_host_test_without_pages();
+        panel.set_restore_policy(eitri_core::tab_restore::RestorePolicy::Auto);
+        panel
+            .set_project_origin(eitri_core::remote_project::TabOrigin::Remote {
+                host: project.host.clone(),
+                host_key_sha256: key.into(),
+                root: project.root.clone(),
+            })
+            .unwrap();
+        assert!(panel.tabs_now().unwrap().remote.is_empty());
+        panel.set_remote_connection(eitri_core::remote_project::RemoteConnection::with_client(
+            client,
+            project,
+            "sidecar".into(),
+            "a".repeat(64),
+        ));
+        panel.give_tabs(saved.clone());
+        assert_eq!(
+            panel.base_tabs().len(),
+            1,
+            "reattachment reuses the untouched empty tab"
+        );
+        assert_eq!(panel.tabs_now().unwrap().remote, saved.remote);
+    }
+
+    #[test]
+    fn late_reports_follow_the_whole_chain_of_rekeys() {
+        late_remote_report(&["SHA256:a", "SHA256:b", "SHA256:c"], "SHA256:a");
+        late_remote_report(&["SHA256:a", "SHA256:b", "SHA256:c"], "SHA256:b");
+    }
+
+    #[test]
+    fn reports_already_on_the_new_key_are_unchanged() {
+        late_remote_report(&["SHA256:old", "SHA256:new"], "SHA256:new");
     }
 
     #[test]

@@ -8,6 +8,8 @@ pub const CAP_JOURNAL: &str = "journal";
 pub const CAP_PENDING: &str = "pending";
 /// The helper runs trust discovery on the server.
 pub const CAP_TRUST_SCAN: &str = "trust-scan";
+/// Connect accepts an installation name as well as a listed run key.
+pub const CAP_INSTALLATION_ARGS: &str = "installation-args";
 pub const SIDECAR_METADATA: &str = "eitri-sidecar";
 pub const JOURNAL_HEAD_METADATA: &str = "eitri-journal-head";
 /// Variables a client may pass to StartSidecar. The account travels in its own field;

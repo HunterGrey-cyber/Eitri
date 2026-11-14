@@ -33,6 +33,9 @@ impl PlanChoice {
 
 /// What `cycle_mode` and `confirm_bypass` say while the session plans.
 pub const PLAN_CYCLE_REFUSAL: &str = "in plan mode: <leader>p leaves plan mode";
+/// Why a plan decision or a switch into or out of plan mode is refused on a remote tab still reading its history.
+pub const PLAN_WHILE_REPLAYING: &str =
+    "the tab is still reading its history from the server; decide when it has caught up";
 /// What they say while a move into or out of plan mode is under way.
 pub const PLAN_CHANGING_REFUSAL: &str = "the mode is changing; try again";
 /// What a second approval says while the first still waits for calls Claude Code is deciding in plan mode.
@@ -124,6 +127,11 @@ impl TabSet {
             }
             if on_screen && !self.is_shown(id) {
                 return Err(benign(format!("tab {} is not the one on screen", tab.number)));
+            }
+            // A remote tab taken up again has not yet looked at where its plan mode stands (`follow_plan_mode`): a
+            // decision or a switch now would be taken for part of the history it is still reading.
+            if tab.live().is_some_and(AgentBackend::replaying_history) {
+                return Err(benign(PLAN_WHILE_REPLAYING));
             }
         }
         self.get_mut(id).ok_or_else(|| benign("no active session"))
@@ -408,12 +416,19 @@ impl TabSet {
     /// origin. An approved plan's mode is taken up once, whichever window sent the approval. When the
     /// session executes again the round closes: after a round that reached plan mode and took up no
     /// approval (a leave of the person's own), the tab is in Manual; an entry that came to nothing, or a
-    /// session that ended, leaves the mode as it was.
+    /// session that ended, leaves the mode as it was. A remote tab taken up again takes its first look only once
+    /// it has read its history back (`AgentBackend::replaying_history`): a plan round or an approval in that
+    /// history happened in the window that saved it, and changes neither the tab's mode nor its round here.
     pub(super) fn follow_plan_mode(tab: &mut Tab) {
         let ended = matches!(tab.wire_state(), TabStateWire::Ended | TabStateWire::Failed);
         let TabBackend::Live(backend) = &tab.backend else {
             return;
         };
+        // Asked before the projection is read, so the projection read below holds at least everything the
+        // replay had folded when it was over.
+        if tab.plan_mode_applied_seq.is_none() && backend.replaying_history() {
+            return;
+        }
         let (planning, reached, latest) = {
             let projection = backend.projection();
             (

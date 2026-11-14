@@ -40,7 +40,7 @@
 //! did. Reporting "I can no longer see this session" is the honest alternative to guessing at the
 //! events that went missing.
 
-use crate::provider::{InteractionState, ProviderError, ProviderErrorCode};
+use crate::provider::{InteractionState, ProviderError, ProviderErrorCode, RemoteLinkState};
 use crate::AgentDomainEvent;
 use std::collections::VecDeque;
 use std::time::Duration;
@@ -53,6 +53,202 @@ pub(crate) const WATCH_RECONNECT_BACKOFF: [Duration; 3] = [
     Duration::from_millis(250),
     Duration::from_millis(600),
 ];
+
+/// How long a remote tab waits before each attempt to reach its session again: rising to a minute and
+/// staying there. There is no last attempt. The agent lives on the server whatever the laptop's link
+/// does, so only the helper's own word (the session or its sidecar is gone, or the journal has a gap)
+/// ends the tab, or the person closing it.
+pub(crate) const REMOTE_RECONNECT_BACKOFF: [Duration; 8] = [
+    Duration::from_millis(500),
+    Duration::from_secs(1),
+    Duration::from_secs(2),
+    Duration::from_secs(4),
+    Duration::from_secs(8),
+    Duration::from_secs(15),
+    Duration::from_secs(30),
+    Duration::from_secs(60),
+];
+
+/// The helper's refusal of a call naming a sidecar it does not run (any more, after a reboot).
+pub(crate) const NO_SUCH_SIDECAR: &str = "no such sidecar on this server";
+
+/// Why one attempt at a session's stream ended without the session closing itself.
+#[derive(Debug)]
+pub(crate) enum WatchFailure {
+    /// Opening the stream failed with this status.
+    Open(tonic::Status),
+    /// The open stream failed with this status.
+    Broke(tonic::Status),
+    /// The stream ended cleanly with no `SessionClosed` before it.
+    EndedEarly,
+}
+
+/// What a local tab does after a failed attempt: today's rule, three quick retries and then the loss.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum LocalWatchVerdict {
+    Retry {
+        after: Duration,
+    },
+    /// The stream is lost; the detail goes into [`stream_ended_early_reason`].
+    End(String),
+}
+
+/// A local tab's verdict after `consecutive_failures` failed attempts in a row. A typed refusal to
+/// open ends at once (`classify_open_failure`); any other failure is retried along
+/// [`WATCH_RECONNECT_BACKOFF`] and ends when it runs out.
+pub(crate) fn local_watch_verdict(failure: &WatchFailure, consecutive_failures: usize) -> LocalWatchVerdict {
+    let detail = match failure {
+        WatchFailure::Open(status) => match classify_open_failure(&super::provider_error_of(status)) {
+            OpenFailure::Fatal(detail) => return LocalWatchVerdict::End(detail),
+            OpenFailure::Retry(detail) => detail,
+        },
+        WatchFailure::Broke(status) => status.to_string(),
+        WatchFailure::EndedEarly => "the provider closed the event stream".to_string(),
+    };
+    match WATCH_RECONNECT_BACKOFF.get(consecutive_failures) {
+        Some(after) => LocalWatchVerdict::Retry { after: *after },
+        None => LocalWatchVerdict::End(detail),
+    }
+}
+
+/// What a remote tab does after a failed attempt.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum RemoteWatchVerdict {
+    /// Try again after this wait; the attempt counter goes on.
+    Retry { after: Duration },
+    /// The helper said the session cannot be followed any more; the detail goes into
+    /// [`stream_ended_early_reason`].
+    Gone(String),
+}
+
+/// A remote tab's verdict after its `attempt`-th failed attempt in a row (counting from 0). Only a
+/// definite answer from the helper ends the tab: `NOT_FOUND` for the session (the runtime's
+/// `SESSION_NOT_FOUND`) or for its sidecar ([`NO_SUCH_SIDECAR`]), or `OUT_OF_RANGE` with `EVENT_GAP`.
+/// Everything else -- a broken channel, `UNAVAILABLE`, a timeout, a dead ssh master, any other refusal
+/// -- is retried along [`REMOTE_RECONNECT_BACKOFF`], without end.
+pub(crate) fn remote_watch_verdict(failure: &WatchFailure, attempt: u32) -> RemoteWatchVerdict {
+    if let WatchFailure::Open(status) | WatchFailure::Broke(status) = failure {
+        let error = super::provider_error_of(status);
+        let code = |wanted| matches!(&error, ProviderError::Provider { code, .. } if *code == wanted);
+        // The helper's own words follow, when it gave any: they name what it could not follow.
+        let said = |what: &str| match status.message() {
+            "" => what.to_string(),
+            words => format!("{what}: {words}"),
+        };
+        if terminal_observation(status) {
+            return RemoteWatchVerdict::Gone(said("the helper cannot continue observing this session"));
+        }
+        match status.code() {
+            tonic::Code::NotFound if code(ProviderErrorCode::SessionNotFound) => {
+                return RemoteWatchVerdict::Gone(said("the server no longer has this session"));
+            }
+            tonic::Code::NotFound if status.message() == NO_SUCH_SIDECAR => {
+                return RemoteWatchVerdict::Gone(format!(
+                    "the server no longer runs this tab's agent ({NO_SUCH_SIDECAR})"
+                ));
+            }
+            tonic::Code::OutOfRange if code(ProviderErrorCode::EventGap) => {
+                return RemoteWatchVerdict::Gone(said(
+                    "the server's journal no longer holds the events that were missed",
+                ));
+            }
+            _ => {}
+        }
+    }
+    let at = (attempt as usize).min(REMOTE_RECONNECT_BACKOFF.len() - 1);
+    RemoteWatchVerdict::Retry {
+        after: REMOTE_RECONNECT_BACKOFF[at],
+    }
+}
+
+fn terminal_observation(status: &tonic::Status) -> bool {
+    use prost::Message;
+    claude_runtime_protocol::v1::ErrorDetail::decode(status.details())
+        .is_ok_and(|detail| detail.reason == "session_observation_ended")
+}
+
+/// Whether a failure [`remote_watch_verdict`] calls gone is the journal's gap (`OUT_OF_RANGE` with
+/// `EVENT_GAP`), after which the agent may still run on the server, rather than the agent itself gone.
+pub(crate) fn remote_gone_is_a_gap(failure: &WatchFailure) -> bool {
+    match failure {
+        WatchFailure::Open(status) | WatchFailure::Broke(status) => {
+            terminal_observation(status)
+                || (status.code() == tonic::Code::OutOfRange
+                    && matches!(
+                        super::provider_error_of(status),
+                        ProviderError::Provider {
+                            code: ProviderErrorCode::EventGap,
+                            ..
+                        }
+                    ))
+        }
+        WatchFailure::EndedEarly => false,
+    }
+}
+
+/// One line saying what a failed attempt was, for the log.
+pub(crate) fn failure_text(failure: &WatchFailure) -> String {
+    match failure {
+        WatchFailure::Open(status) => format!("opening the stream: {:?}: {}", status.code(), status.message()),
+        WatchFailure::Broke(status) => format!("the stream broke: {:?}: {}", status.code(), status.message()),
+        WatchFailure::EndedEarly => "the stream ended without the session's close".to_string(),
+    }
+}
+
+/// Where a remote tab's connection stands, read by the panel at its own pace. Only the watch writes it.
+#[derive(Debug)]
+pub(crate) struct LinkCell(std::sync::Mutex<RemoteLinkState>);
+
+impl Default for LinkCell {
+    fn default() -> Self {
+        Self(std::sync::Mutex::new(RemoteLinkState::Live))
+    }
+}
+
+impl LinkCell {
+    pub(crate) fn get(&self) -> RemoteLinkState {
+        self.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone()
+    }
+
+    pub(crate) fn set(&self, state: RemoteLinkState) {
+        *self.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = state;
+    }
+}
+
+/// A replay in progress after a watch opened: the journal held `head` when the watch opened after
+/// `from`. `None` when there is nothing to catch up on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct CatchUp {
+    from: u64,
+    head: u64,
+}
+
+impl CatchUp {
+    pub(crate) fn opened(from: u64, head: Option<u64>) -> Option<Self> {
+        head.filter(|head| *head > from).map(|head| Self { from, head })
+    }
+
+    /// The link state once the event at `sequence` was delivered, and whether the replay is over.
+    pub(crate) fn at(&self, sequence: u64) -> (RemoteLinkState, bool) {
+        if sequence >= self.head {
+            return (RemoteLinkState::Live, true);
+        }
+        (
+            RemoteLinkState::CatchingUp {
+                done: sequence.saturating_sub(self.from),
+                total: self.head - self.from,
+            },
+            false,
+        )
+    }
+
+    pub(crate) fn start(&self) -> RemoteLinkState {
+        RemoteLinkState::CatchingUp {
+            done: 0,
+            total: self.head - self.from,
+        }
+    }
+}
 
 /// What to do with one event, judged only by the sequence it carries.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -315,9 +511,178 @@ pub(crate) fn reconcile_questions(
     ledger.unseen(pending)
 }
 
+/// What a remote tab's watch says about a permission request the CLI gave up on while no window was
+/// attached. The CLI denies a request nobody answers once its hook's time runs out (ten minutes) and
+/// reports it expired; a remote tab learns of that only when it reattaches, from the replay. So an
+/// expiry the caller judged unattended (sent as expired, read while catching up, past what a window had
+/// folded while attached) is shown as the CLI's denial, with how long the request had waited -- but only
+/// when that wait is the CLI's own time: the person's interrupt cancels a waiting request the same way,
+/// at any moment, and an expiry of a request this watch never saw asked cannot be told from one.
+#[derive(Debug, Default)]
+pub(crate) struct UnattendedExpiry {
+    /// When each request this watch saw was asked, on the events' own clock (milliseconds).
+    asked_at: std::collections::HashMap<String, (i64, Option<String>)>,
+}
+
+/// The shortest wait after which an expiry is the CLI's own: its hook gives a request ten minutes, and the
+/// events' clock is the sidecar's.
+pub(crate) const CLI_PERMISSION_TIMEOUT_FLOOR_MS: i64 = 590_000;
+
+impl UnattendedExpiry {
+    /// Looks at one translated event that arrived stamped `occurred_at`; `unattended` when the caller judged a
+    /// resolution among it to be one read in a replay of what no window saw. Returns the row to show after
+    /// such an expiry.
+    pub(crate) fn observe(
+        &mut self,
+        event: &AgentDomainEvent,
+        occurred_at: i64,
+        unattended: bool,
+    ) -> Option<AgentDomainEvent> {
+        match event {
+            AgentDomainEvent::PermissionRequested {
+                permission_id,
+                tool_use_id,
+                ..
+            } => {
+                self.asked_at
+                    .insert(permission_id.clone(), (occurred_at, tool_use_id.clone()));
+                None
+            }
+            AgentDomainEvent::PermissionResolved { permission_id, outcome } => {
+                let asked = self.asked_at.remove(permission_id);
+                if !unattended || *outcome != crate::PermissionOutcome::Expired {
+                    return None;
+                }
+                let (at, call) = asked.filter(|(at, _)| *at > 0)?;
+                let wait = occurred_at.checked_sub(at)?;
+                if wait < CLI_PERMISSION_TIMEOUT_FLOOR_MS {
+                    return None;
+                }
+                Some(AgentDomainEvent::SessionNotice {
+                    kind: crate::SessionNoticeKind::Informational,
+                    level: crate::NoticeLevel::Notice,
+                    content: Some(format!(
+                        "the CLI denied this request after {} while no window was attached",
+                        waited(wait as u64)
+                    )),
+                    scalars: Default::default(),
+                    task_id: None,
+                    tool_use_id: call,
+                    task_status: None,
+                })
+            }
+            _ => None,
+        }
+    }
+}
+
+/// A wait as a person says it: seconds under two minutes, whole minutes after.
+fn waited(ms: u64) -> String {
+    let seconds = (ms + 500) / 1000;
+    if seconds < 120 {
+        format!("{seconds} s")
+    } else {
+        format!("{} min", (seconds + 30) / 60)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn observation_refusal_ends_retries_without_claiming_the_agent_has_stopped() {
+        use prost::Message;
+        let status = tonic::Status::with_details(
+            tonic::Code::FailedPrecondition,
+            "cannot observe",
+            claude_runtime_protocol::v1::ErrorDetail {
+                reason: "session_observation_ended".into(),
+                ..Default::default()
+            }
+            .encode_to_vec()
+            .into(),
+        );
+        let failure = WatchFailure::Open(status);
+        assert!(matches!(
+            remote_watch_verdict(&failure, 100),
+            RemoteWatchVerdict::Gone(_)
+        ));
+        assert!(remote_gone_is_a_gap(&failure));
+        assert!(matches!(
+            remote_watch_verdict(
+                &WatchFailure::Open(tonic::Status::unavailable("cannot follow yet")),
+                100
+            ),
+            RemoteWatchVerdict::Retry { .. }
+        ));
+    }
+
+    fn requested(id: &str) -> AgentDomainEvent {
+        AgentDomainEvent::PermissionRequested {
+            permission_id: id.into(),
+            tool_use_id: Some(format!("tool-{id}")),
+            tool_name: "Bash".into(),
+            input: serde_json::json!({ "command": "true" }),
+            provider_prompt: None,
+        }
+    }
+
+    fn resolved(id: &str, outcome: crate::PermissionOutcome) -> AgentDomainEvent {
+        AgentDomainEvent::PermissionResolved {
+            permission_id: id.into(),
+            outcome,
+        }
+    }
+
+    /// An expiry judged unattended is the CLI's denial, with how long the request waited; one seen live, any
+    /// other outcome, one sooner than the CLI's own time (the person's interrupt cancels a request the same way)
+    /// and one of a request never seen asked say nothing more than they do today.
+    #[test]
+    fn an_unattended_expiry_is_the_clis_denial_with_its_wait() {
+        let mut expiry = UnattendedExpiry::default();
+        assert_eq!(expiry.observe(&requested("p1"), 1_000, true), None);
+        let note = expiry.observe(
+            &resolved("p1", crate::PermissionOutcome::Expired),
+            1_000 + 598_800,
+            true,
+        );
+        let Some(AgentDomainEvent::SessionNotice {
+            content, tool_use_id, ..
+        }) = note
+        else {
+            panic!("{note:?}");
+        };
+        assert_eq!(
+            content.as_deref(),
+            Some("the CLI denied this request after 10 min while no window was attached")
+        );
+        assert_eq!(tool_use_id.as_deref(), Some("tool-p1"));
+
+        expiry.observe(&requested("p2"), 5_000, false);
+        assert_eq!(
+            expiry.observe(&resolved("p2", crate::PermissionOutcome::Expired), 605_000, false),
+            None,
+            "an expiry seen live was on screen"
+        );
+        expiry.observe(&requested("p3"), 5_000, true);
+        assert_eq!(
+            expiry.observe(&resolved("p3", crate::PermissionOutcome::Denied), 700_000, true),
+            None
+        );
+        expiry.observe(&requested("p5"), 5_000, true);
+        assert_eq!(
+            expiry.observe(&resolved("p5", crate::PermissionOutcome::Expired), 9_000, true),
+            None,
+            "four seconds is the person's interrupt, not the CLI's time"
+        );
+        assert_eq!(
+            expiry.observe(&resolved("p4", crate::PermissionOutcome::Expired), 900_000, true),
+            None,
+            "a request never seen asked cannot be told from an interrupt"
+        );
+        assert_eq!(waited(42_400), "42 s");
+    }
 
     fn asked(id: &str) -> AgentDomainEvent {
         AgentDomainEvent::QuestionAsked {
@@ -473,6 +838,206 @@ mod tests {
         ledger.observe(&settled("q1"));
         ledger.observe(&asked("q2"));
         assert!(ledger.due(8).is_empty());
+    }
+
+    fn refusal(code: tonic::Code, detail: Option<ProtoCode>, message: &str) -> tonic::Status {
+        match detail {
+            Some(detail) => {
+                let bytes = prost::Message::encode_to_vec(&claude_runtime_protocol::v1::ErrorDetail {
+                    code: detail as i32,
+                    message: message.to_string(),
+                    ..Default::default()
+                });
+                tonic::Status::with_details(code, message, bytes.into())
+            }
+            None => tonic::Status::new(code, message),
+        }
+    }
+
+    use claude_runtime_protocol::v1::ErrorCode as ProtoCode;
+
+    /// The three answers that say the session is gone for good end a remote tab, at any attempt.
+    #[test]
+    fn a_remote_watch_ends_only_on_the_helpers_definite_answers() {
+        let gone = [
+            WatchFailure::Open(refusal(tonic::Code::NotFound, Some(ProtoCode::SessionNotFound), "")),
+            WatchFailure::Broke(refusal(tonic::Code::NotFound, Some(ProtoCode::SessionNotFound), "")),
+            WatchFailure::Open(refusal(tonic::Code::NotFound, None, NO_SUCH_SIDECAR)),
+            WatchFailure::Open(refusal(tonic::Code::OutOfRange, Some(ProtoCode::EventGap), "")),
+            WatchFailure::Broke(refusal(tonic::Code::OutOfRange, Some(ProtoCode::EventGap), "")),
+        ];
+        for failure in &gone {
+            for attempt in [0, 3, 500] {
+                assert!(
+                    matches!(remote_watch_verdict(failure, attempt), RemoteWatchVerdict::Gone(_)),
+                    "{failure:?} at {attempt}"
+                );
+            }
+        }
+    }
+
+    /// Of the definite answers, only the journal's gap leaves the agent possibly running on the server;
+    /// the session or sidecar not found means the agent is gone.
+    #[test]
+    fn only_the_journal_gap_is_a_gap() {
+        for failure in [
+            WatchFailure::Open(refusal(tonic::Code::OutOfRange, Some(ProtoCode::EventGap), "")),
+            WatchFailure::Broke(refusal(tonic::Code::OutOfRange, Some(ProtoCode::EventGap), "")),
+        ] {
+            assert!(remote_gone_is_a_gap(&failure), "{failure:?}");
+        }
+        for failure in [
+            WatchFailure::Open(refusal(tonic::Code::NotFound, Some(ProtoCode::SessionNotFound), "")),
+            WatchFailure::Open(refusal(tonic::Code::NotFound, None, NO_SUCH_SIDECAR)),
+            WatchFailure::Open(refusal(tonic::Code::FailedPrecondition, Some(ProtoCode::EventGap), "")),
+            WatchFailure::EndedEarly,
+        ] {
+            assert!(!remote_gone_is_a_gap(&failure), "{failure:?}");
+        }
+    }
+
+    /// Transport failures, `UNAVAILABLE`, timeouts and every other refusal retry without end, the wait
+    /// rising to a minute and staying there.
+    #[test]
+    fn a_remote_watch_retries_forever_and_settles_at_a_minute() {
+        let retried = [
+            WatchFailure::Open(tonic::Status::unavailable("transport error")),
+            WatchFailure::Broke(tonic::Status::unknown("h2 protocol error: broken pipe")),
+            WatchFailure::Open(tonic::Status::deadline_exceeded("timed out")),
+            WatchFailure::EndedEarly,
+            // A NOT_FOUND that names neither the session nor the sidecar is not the helper's word.
+            WatchFailure::Open(refusal(tonic::Code::NotFound, None, "something else")),
+            // A gap reported under another code, and a cursor refused as being in the future.
+            WatchFailure::Open(refusal(tonic::Code::FailedPrecondition, Some(ProtoCode::EventGap), "")),
+            WatchFailure::Open(refusal(
+                tonic::Code::InvalidArgument,
+                Some(ProtoCode::InvalidConfiguration),
+                "replay_cursor_in_future",
+            )),
+        ];
+        for failure in &retried {
+            let waits: Vec<Duration> = (0..12)
+                .map(|attempt| match remote_watch_verdict(failure, attempt) {
+                    RemoteWatchVerdict::Retry { after } => after,
+                    other => panic!("{failure:?} at {attempt}: {other:?}"),
+                })
+                .collect();
+            assert_eq!(waits[..8], REMOTE_RECONNECT_BACKOFF, "{failure:?}");
+            assert!(
+                waits[8..].iter().all(|wait| *wait == Duration::from_secs(60)),
+                "{failure:?}"
+            );
+            assert_eq!(
+                remote_watch_verdict(failure, u32::MAX),
+                RemoteWatchVerdict::Retry {
+                    after: Duration::from_secs(60)
+                }
+            );
+        }
+        let total: Duration = (0..200)
+            .map(|attempt| match remote_watch_verdict(&retried[0], attempt) {
+                RemoteWatchVerdict::Retry { after } => after,
+                RemoteWatchVerdict::Gone(why) => panic!("{why}"),
+            })
+            .sum();
+        assert!(
+            total > Duration::from_secs(2 * 3600),
+            "two hours of failures still retry"
+        );
+    }
+
+    /// A local tab keeps its rule exactly: three retries 100, 250 and 600 ms apart, then the loss; a typed
+    /// refusal to open ends it at once.
+    #[test]
+    fn a_local_watch_keeps_three_quick_retries_and_then_ends() {
+        assert_eq!(
+            WATCH_RECONNECT_BACKOFF,
+            [
+                Duration::from_millis(100),
+                Duration::from_millis(250),
+                Duration::from_millis(600)
+            ]
+        );
+        for failure in [
+            WatchFailure::Open(tonic::Status::unavailable("transport error")),
+            WatchFailure::Broke(tonic::Status::unavailable("transport error")),
+            WatchFailure::EndedEarly,
+        ] {
+            for (attempt, wait) in WATCH_RECONNECT_BACKOFF.iter().enumerate() {
+                assert_eq!(
+                    local_watch_verdict(&failure, attempt),
+                    LocalWatchVerdict::Retry { after: *wait }
+                );
+            }
+            assert!(matches!(local_watch_verdict(&failure, 3), LocalWatchVerdict::End(_)));
+        }
+        assert_eq!(
+            local_watch_verdict(&WatchFailure::EndedEarly, 3),
+            LocalWatchVerdict::End("the provider closed the event stream".to_string())
+        );
+        for failure in [
+            WatchFailure::Open(refusal(tonic::Code::NotFound, Some(ProtoCode::SessionNotFound), "")),
+            WatchFailure::Open(refusal(tonic::Code::OutOfRange, Some(ProtoCode::EventGap), "")),
+        ] {
+            assert!(matches!(local_watch_verdict(&failure, 0), LocalWatchVerdict::End(_)));
+        }
+        // The helper's word for a missing sidecar is a transport failure to a local tab, as before.
+        assert_eq!(
+            local_watch_verdict(
+                &WatchFailure::Open(refusal(tonic::Code::NotFound, None, NO_SUCH_SIDECAR)),
+                0
+            ),
+            LocalWatchVerdict::Retry {
+                after: Duration::from_millis(100)
+            }
+        );
+    }
+
+    /// A definite answer keeps the helper's own words after the reason.
+    #[test]
+    fn a_gone_verdict_keeps_the_helpers_words() {
+        let gone = |failure| match remote_watch_verdict(&failure, 0) {
+            RemoteWatchVerdict::Gone(why) => why,
+            other => panic!("{other:?}"),
+        };
+        let why = gone(WatchFailure::Open(refusal(
+            tonic::Code::NotFound,
+            Some(ProtoCode::SessionNotFound),
+            "the helper cannot follow this session: disk full",
+        )));
+        assert!(
+            why.ends_with(": the helper cannot follow this session: disk full"),
+            "{why}"
+        );
+        let why = gone(WatchFailure::Broke(refusal(
+            tonic::Code::OutOfRange,
+            Some(ProtoCode::EventGap),
+            "journal gap 5..=9: WriteFailed",
+        )));
+        assert!(why.ends_with(": journal gap 5..=9: WriteFailed"), "{why}");
+        assert_eq!(
+            gone(WatchFailure::Open(refusal(
+                tonic::Code::NotFound,
+                Some(ProtoCode::SessionNotFound),
+                ""
+            ))),
+            "the server no longer has this session"
+        );
+    }
+
+    /// A replay reports how far it has come out of how much the journal held when it opened, and is
+    /// live once it reaches that head.
+    #[test]
+    fn catching_up_counts_against_the_head_and_ends_live() {
+        assert_eq!(CatchUp::opened(10, Some(10)), None);
+        assert_eq!(CatchUp::opened(10, None), None);
+        let catch_up = CatchUp::opened(10, Some(30)).unwrap();
+        assert_eq!(catch_up.start(), RemoteLinkState::CatchingUp { done: 0, total: 20 });
+        assert_eq!(
+            catch_up.at(15),
+            (RemoteLinkState::CatchingUp { done: 5, total: 20 }, false)
+        );
+        assert_eq!(catch_up.at(30), (RemoteLinkState::Live, true));
     }
 
     /// A plan waits in the sidecar's list beside the questions: one this watch never delivered comes back

@@ -936,6 +936,7 @@
       "effort": "<cli-text chars=6 sha256=c082456a7766e23a>",
       "history": null,
       "lastTurnEnding": "failed",
+      "linkState": null,
       "model": "claude-opus-5-5",
       "notices": [
         {

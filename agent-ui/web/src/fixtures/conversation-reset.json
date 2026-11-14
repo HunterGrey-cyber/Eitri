@@ -332,6 +332,7 @@
           "cwd": "/ws",
           "history": null,
           "lastTurnEnding": null,
+          "linkState": null,
           "model": "claude-opus-5-5",
           "pendingPermissions": [
             {
@@ -727,6 +728,7 @@
           "cwd": "/ws",
           "history": null,
           "lastTurnEnding": null,
+          "linkState": null,
           "model": "claude-opus-5-5",
           "pendingPermissions": [],
           "provider": null,

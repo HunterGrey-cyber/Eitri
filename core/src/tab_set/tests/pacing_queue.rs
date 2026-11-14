@@ -606,7 +606,7 @@ fn send_now_interrupts_and_the_queue_goes_out_when_the_turn_ends() {
         .unwrap();
     match set.send_now(tab, "two", "two".into(), 2).unwrap() {
         SendNow::Interrupting(outcome) => assert!(outcome.is_ok()),
-        SendNow::Flushed(_) => panic!("a running turn is interrupted first"),
+        SendNow::Flushed(_) | SendNow::InterruptOut(_) => panic!("a running local turn is interrupted first, here"),
     }
     assert_eq!(provider.interrupts(), 1);
     assert!(

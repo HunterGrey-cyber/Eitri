@@ -383,6 +383,9 @@ pub struct AgentConversation {
     /// anyway, exactly the race this field exists to keep closed. Once set, stays set: the lease
     /// must stay held for the rest of this conversation's life, never just until the next call.
     close_failed: bool,
+    /// Why the last `shutdown()` of a remote tab did not stop its agent on the server, for the caller to
+    /// keep the stop for later ([`Self::remote_stop_failure`]); `None` once a stop went through.
+    remote_stop_failed: Option<String>,
     /// The revision of the last snapshot the caller handed its UI, until its next drain takes it
     /// (`note_ui_snapshot`). Held here rather than by the caller so it cannot outlive this
     /// conversation: another session's revisions start again from their own seed and mean nothing
@@ -428,6 +431,38 @@ fn spawn_provider_call<T: Send + 'static>(
             )))));
         }
     }
+}
+
+/// Refuses a remote project root that this machine resolves to another path. A root it does not
+/// have is not refused: there is no other form of it here to disagree.
+fn same_path_here(root: &Path) -> Result<(), ConversationError> {
+    let refuse = |why: String| ConversationError::Cwd(std::io::Error::new(std::io::ErrorKind::InvalidInput, why));
+    if !root.is_absolute() {
+        return Err(refuse(format!(
+            "the remote project root {} is not absolute",
+            root.display()
+        )));
+    }
+    match root.canonicalize() {
+        Ok(here) if here == root => Ok(()),
+        Ok(here) => Err(refuse(format!(
+            "the remote project root {} is {} on this machine; a remote project needs the same absolute \
+             path on both machines",
+            root.display(),
+            here.display()
+        ))),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(ConversationError::Cwd(error)),
+    }
+}
+
+/// How "deny them and stop the agent" went once its requests were sent: whether the agent was stopped on its
+/// server, and every deny or stop that did not go through, in words. The stop is reported apart from the
+/// denies: a stopped agent leaves nothing waiting, whatever became of a deny.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DenyAndStopOutcome {
+    pub stopped: bool,
+    pub failures: Vec<String>,
 }
 
 impl AgentConversation {
@@ -479,6 +514,122 @@ impl AgentConversation {
         );
         conversation.declared_client_tools = declared_client_tools;
         Ok(conversation)
+    }
+
+    /// [`create_with_tools`](Self::create_with_tools) for a remote tab, whose agent runs on the server
+    /// in `root` exactly as the remote project records it: that path is the session's cwd, unchanged.
+    /// A remote project has the same absolute path on both machines, so a root that exists here under
+    /// another canonical path (a symlink on the way, a different case of the same directory) is
+    /// refused, naming both, before anything is sent. A root this machine does not have yet is used as
+    /// recorded.
+    pub fn create_remote_with_tools(
+        provider: Arc<dyn AgentProvider + Send + Sync>,
+        root: &Path,
+        project: ProjectTrust,
+        client_tools: Option<ClientToolSet>,
+    ) -> Result<Self, ConversationError> {
+        let cwd = Self::check_remote_root(root)?;
+        let capabilities = provider.capabilities();
+        let info = provider.info();
+        let declared_client_tools = declared_tools(&capabilities, client_tools.as_ref());
+        let session_id = provider.create_session(CreateSessionRequest {
+            cwd,
+            streaming: crate::provider::StreamingPreference::Partial,
+            project,
+            client_tools,
+        })?;
+        let mut conversation = Self::assembled(
+            provider,
+            None,
+            PROVIDER_NAME,
+            root.to_path_buf(),
+            capabilities,
+            info,
+            session_id,
+        );
+        conversation.declared_client_tools = declared_client_tools;
+        Ok(conversation)
+    }
+
+    /// A remote tab taken up again from its server (a reopened window restoring its saved tabs): the
+    /// session `session_id` that `provider` already watches from the journal's start
+    /// (`ClaudeSidecarProvider::reattach_through_helper`), folded afresh into an empty projection. No
+    /// session is created or resumed and nothing is sent. `root` is the project root as recorded.
+    pub fn reattach_remote(
+        provider: Arc<dyn AgentProvider + Send + Sync>,
+        root: &Path,
+        session_id: &str,
+    ) -> Result<Self, ConversationError> {
+        Self::check_remote_root(root)?;
+        let capabilities = provider.capabilities();
+        let info = provider.info();
+        let tools = provider
+            .helper_handoff()
+            .map(|h| h.declared_client_tools)
+            .unwrap_or_default();
+        let mut conversation = Self::assembled(
+            provider,
+            None,
+            PROVIDER_NAME,
+            root.to_path_buf(),
+            capabilities,
+            info,
+            session_id.to_string(),
+        );
+        conversation.declared_client_tools = tools;
+        Ok(conversation)
+    }
+
+    /// Continues the CLI's own session `provider_session_id` on a server through a new sidecar
+    /// (`provider`), with the same resume request a local tab sends, in `root` as recorded. The
+    /// transcript lives on the server, so nothing here reads or leases one on this machine.
+    pub fn resume_remote_with_tools(
+        provider: Arc<dyn AgentProvider + Send + Sync>,
+        root: &Path,
+        provider_session_id: &str,
+        project: ProjectTrust,
+        client_tools: Option<ClientToolSet>,
+    ) -> Result<Self, ConversationError> {
+        let cwd = Self::check_remote_root(root)?;
+        let capabilities = provider.capabilities();
+        if !capabilities.resume {
+            return Err(ConversationError::Provider(ProviderError::UnsupportedCapability(
+                "resume",
+            )));
+        }
+        let info = provider.info();
+        let declared_client_tools = declared_tools(&capabilities, client_tools.as_ref());
+        let session_id = provider.resume_session(crate::provider::ResumeSessionRequest {
+            provider_session_id: provider_session_id.to_string(),
+            cwd,
+            streaming: crate::provider::StreamingPreference::Partial,
+            project,
+            client_tools,
+        })?;
+        let mut conversation = Self::assembled(
+            provider,
+            None,
+            PROVIDER_NAME,
+            root.to_path_buf(),
+            capabilities,
+            info,
+            session_id,
+        );
+        conversation.declared_client_tools = declared_client_tools;
+        Ok(conversation)
+    }
+
+    /// Every check of a remote project root this machine can make, before anything starts on the
+    /// server: absolute, UTF-8 (the wire carries the path as text), and not resolved here to another
+    /// path ([`create_remote_with_tools`](Self::create_remote_with_tools)). Returns the cwd as sent.
+    pub fn check_remote_root(root: &Path) -> Result<String, ConversationError> {
+        same_path_here(root)?;
+        root.to_str().map(str::to_string).ok_or_else(|| {
+            ConversationError::Cwd(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("the remote project root {} is not UTF-8", root.display()),
+            ))
+        })
     }
 
     /// Creates a fresh session on an external provider. The provider's name keys the lease and the
@@ -560,6 +711,7 @@ impl AgentConversation {
             ingest,
             title_noted: false,
             close_failed: false,
+            remote_stop_failed: None,
             ui_snapshot_revision: None,
             declared_client_tools: BTreeSet::new(),
         }
@@ -714,6 +866,7 @@ impl AgentConversation {
             ingest,
             title_noted: false,
             close_failed: false,
+            remote_stop_failed: None,
             ui_snapshot_revision: None,
             declared_client_tools,
         };
@@ -793,6 +946,7 @@ impl AgentConversation {
             ingest,
             title_noted: false,
             close_failed: false,
+            remote_stop_failed: None,
             ui_snapshot_revision: None,
             declared_client_tools: BTreeSet::new(),
         };
@@ -1116,8 +1270,133 @@ impl AgentConversation {
         Ok(self.provider.client_tool_call_state(&self.require_session()?)?)
     }
 
+    /// The provider's connection state, read live: `Some` for the whole life of a remote tab (`Live`
+    /// when nothing is wrong), `None` for a local one.
+    pub fn link_state(&self) -> Option<crate::provider::RemoteLinkState> {
+        self.provider.link_state()
+    }
+
+    /// Marks this conversation, just taken up again from its server, as reading back history that the window
+    /// which saved it had folded through `sequence`.
+    pub fn replays_history_through(&mut self, sequence: u64) {
+        self.ingest.set_replay_through(Some(sequence));
+    }
+
+    /// Whether what this conversation folds is still old history read back from its server: the link says it is
+    /// catching up, or the fold has not yet passed what the window that saved it had folded. Nothing in that
+    /// history is this window's to act on, such as a mode an approved plan named. Always false for a conversation
+    /// that was not taken up again, and once the session has ended on the server and everything read before
+    /// its end is folded: a journal shorter than what was saved never reaches it.
+    pub fn replaying_history(&self) -> bool {
+        let (through, folded, ended) = {
+            let projection = self.projection();
+            (
+                projection.replay_through(),
+                projection.folded_through(),
+                matches!(projection.status, crate::ProjectionStatus::Unavailable { .. }),
+            )
+        };
+        let Some(through) = through else {
+            return false;
+        };
+        if ended && self.remote_ending().is_some() {
+            self.ingest.set_replay_through(None);
+            return false;
+        }
+        if matches!(
+            self.link_state(),
+            Some(crate::provider::RemoteLinkState::CatchingUp { .. })
+        ) {
+            return true;
+        }
+        folded < through
+    }
+
     pub fn provider_info(&self) -> &ProviderInfo {
         &self.info
+    }
+
+    /// What reaches this remote tab's agent again from a later window; `None` for a local tab.
+    pub fn helper_handoff(&self) -> Option<crate::providers::claude_sidecar::HelperHandoff> {
+        self.provider.helper_handoff().map(|mut handoff| {
+            handoff.declared_client_tools = self.declared_client_tools.clone();
+            handoff
+        })
+    }
+
+    /// Whether this conversation's agent runs on a server: its provider reports a link.
+    pub fn is_remote(&self) -> bool {
+        self.provider.link_state().is_some()
+    }
+
+    /// How this remote tab's session ended, once the server's helper said; `None` while it runs and for
+    /// a local tab.
+    pub fn remote_ending(&self) -> Option<crate::provider::RemoteEnding> {
+        self.provider.remote_ending()
+    }
+
+    /// After a gap: denies each of `permission_ids` -- only requests the helper listed as waiting
+    /// (`RemoteEnding::Gap`) -- through the provider's ordinary answer, the one a card's deny sends,
+    /// and then stops the agent on its server, whatever the denies did: the person chose to stop it, and
+    /// a stopped agent leaves nothing waiting. Runs on a thread of its own, since every step crosses the
+    /// network; the receiver says how it went: `Err` when nothing was sent (a request the helper did not
+    /// list, no session), else whether the agent was stopped and what did not go through. A deny the
+    /// agent refuses as already settled, or because its session is gone, is fine, and so is a stop of a
+    /// sidecar the helper no longer knows; every other failure is reported, all of them together.
+    pub fn deny_waiting_and_stop(
+        &self,
+        permission_ids: Vec<String>,
+    ) -> std::sync::mpsc::Receiver<Result<DenyAndStopOutcome, String>> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let listed: BTreeSet<String> = match self.remote_ending() {
+            Some(crate::provider::RemoteEnding::Gap { waiting }) => {
+                waiting.into_iter().map(|request| request.permission_id).collect()
+            }
+            _ => BTreeSet::new(),
+        };
+        if let Some(stray) = permission_ids.iter().find(|id| !listed.contains(*id)) {
+            let _ = tx.send(Err(format!("{stray} is not a request the server listed as waiting")));
+            return rx;
+        }
+        let Some(session_id) = self.session_id.clone() else {
+            let _ = tx.send(Err("this tab has no session".to_string()));
+            return rx;
+        };
+        let provider = Arc::clone(&self.provider);
+        std::thread::spawn(move || {
+            let mut failures = Vec::new();
+            for permission_id in permission_ids {
+                let denied = provider.resolve_permission(ResolvePermissionRequest {
+                    session_id: session_id.clone(),
+                    permission_id: permission_id.clone(),
+                    decision: crate::PermissionDecision::Deny { reason: None },
+                });
+                match denied {
+                    Ok(())
+                    | Err(ProviderError::Provider {
+                        code:
+                            crate::ProviderErrorCode::PermissionNotFound
+                            | crate::ProviderErrorCode::PermissionAlreadyResolved
+                            | crate::ProviderErrorCode::SessionNotFound,
+                        ..
+                    }) => {}
+                    Err(error) => failures.push(format!("the deny of {permission_id} did not go through: {error}")),
+                }
+            }
+            let stopped = match provider.stop_remote_agent() {
+                Some(Ok(())) => true,
+                Some(Err(error)) => {
+                    failures.push(format!("the agent was not stopped: {error}"));
+                    false
+                }
+                None => {
+                    failures.push("this tab's agent does not run on a server".to_string());
+                    false
+                }
+            };
+            let _ = tx.send(Ok(DenyAndStopOutcome { stopped, failures }));
+        });
+        rx
     }
 
     /// Submits one user turn.
@@ -1721,6 +2000,19 @@ impl AgentConversation {
     /// that is ending can never be genuinely answered and the provider's own terminal events may not
     /// be drained before this process goes away. Idempotent.
     pub fn shutdown(&mut self) {
+        let remote = self.is_remote();
+        // A remote tab whose agent the server no longer runs has nothing there to close or stop. One whose
+        // session ended any other way (a gap, a loss with no word from the helper) may still have its agent
+        // running there: its session is not closed (the tab no longer reads it) but the agent is stopped
+        // below, as closing a remote tab always does. Leaving such an agent running is the person's own
+        // choice, made through `detach`.
+        let ended = remote && matches!(self.projection().status, crate::ProjectionStatus::Unavailable { .. });
+        if ended && self.remote_ending() == Some(crate::provider::RemoteEnding::AgentGone) {
+            return self.detach();
+        }
+        if ended {
+            self.session_id = None;
+        }
         // A failed close means the provider session's own teardown is not known to be done -- a wedged
         // or crashed sidecar, still closing over up to `SIDECAR_EXIT_GRACE` before it is even
         // killed. Releasing the lease anyway would let another client resume the same provider
@@ -1764,6 +2056,35 @@ impl AgentConversation {
         if !self.close_failed {
             self.ingest.release_lease();
         }
+        // A remote agent lives on its server whatever happens here: closing the tab is what stops it. A stop
+        // that fails is kept for the caller, who keeps it to be sent once the server can be reached.
+        if remote {
+            self.remote_stop_failed = match self.provider.stop_remote_agent() {
+                Some(Err(error)) => {
+                    eprintln!("agent: AgentConversation::shutdown: the remote agent was not stopped: {error}");
+                    Some(error.to_string())
+                }
+                _ => None,
+            };
+        }
+    }
+
+    /// Why the last [`Self::shutdown`] did not stop this remote tab's agent on its server; `None` when it did,
+    /// or for a local tab. Its caller keeps such a stop to be sent once the server can be reached.
+    pub fn remote_stop_failure(&self) -> Option<&str> {
+        self.remote_stop_failed.as_deref()
+    }
+
+    /// Lets go of a remote tab without ending its agent: folding stops and nothing is sent to the server,
+    /// whose helper keeps the agent and its journal for a later window (a window closing, "leave it
+    /// running"). A local tab is shut down as [`Self::shutdown`] does. Idempotent.
+    pub fn detach(&mut self) {
+        if !self.is_remote() {
+            return self.shutdown();
+        }
+        self.session_id = None;
+        self.ingest.stop();
+        self.ingest.release_lease();
     }
 
     /// Folds an event this side produced rather than the provider.
@@ -1855,6 +2176,8 @@ impl AgentConversation {
             title_noted,
             // Checked above: a conversation whose close failed does not move.
             close_failed: _,
+            // A stop is tried only by a shutdown, which a moving conversation has not had.
+            remote_stop_failed: _,
             // Revisions are per projection: the destination notes its own first snapshot's.
             ui_snapshot_revision: _,
             declared_client_tools,
@@ -2008,6 +2331,7 @@ impl AgentConversation {
             ingest,
             title_noted,
             close_failed: false,
+            remote_stop_failed: None,
             ui_snapshot_revision: None,
             declared_client_tools,
         })
@@ -2035,6 +2359,7 @@ mod tests {
     /// bound. Every method still takes `&self`, so the lock is never held across a call.
     #[derive(Default)]
     struct FakeProvider {
+        remote_handoff: Mutex<Option<crate::HelperHandoff>>,
         capabilities: ProviderCapabilities,
         calls: Mutex<Vec<String>>,
         queued_events: Mutex<Vec<AgentDomainEvent>>,
@@ -2090,6 +2415,16 @@ mod tests {
     }
 
     impl AgentProvider for FakeProvider {
+        fn helper_handoff(&self) -> Option<crate::HelperHandoff> {
+            self.remote_handoff.lock().unwrap().clone()
+        }
+        fn link_state(&self) -> Option<crate::RemoteLinkState> {
+            self.remote_handoff
+                .lock()
+                .unwrap()
+                .as_ref()
+                .map(|_| crate::RemoteLinkState::Live)
+        }
         fn capabilities(&self) -> ProviderCapabilities {
             self.capabilities.clone()
         }
@@ -2317,6 +2652,28 @@ mod tests {
 
     /// `Box<dyn AgentProvider>` consumes the fake, so tests that need to inspect it afterward keep
     /// a second handle. `AgentProvider`'s methods all take `&self`, so an `Rc` is enough.
+    #[test]
+    fn reattached_remote_conversation_keeps_its_declared_editor_tools() {
+        let fake = Arc::new(FakeProvider::new());
+        let tools = BTreeSet::from(["mcp__eitri__open_file".to_owned()]);
+        let handoff = crate::HelperHandoff {
+            daemon: "older-installation".into(),
+            declared_client_tools: tools.clone(),
+            host: "example-host".into(),
+            host_key_sha256: "SHA256:example".into(),
+            sidecar_id: "sidecar".into(),
+            session_id: "session".into(),
+            last_folded_sequence: 3,
+        };
+        *fake.remote_handoff.lock().unwrap() = Some(handoff);
+        let mut conversation =
+            AgentConversation::reattach_remote(fake.clone(), Path::new("/srv/project"), "session").unwrap();
+        assert_eq!(conversation.declared_client_tools(), &tools);
+        assert_eq!(conversation.helper_handoff().unwrap().declared_client_tools, tools);
+        assert!(fake.calls().is_empty(), "reattachment creates and resumes nothing");
+        conversation.detach();
+    }
+
     fn conversation_with(fake: Arc<FakeProvider>) -> AgentConversation {
         conversation_in(fake, &unique_dir()).expect("create should succeed against the fake provider")
     }
@@ -4127,5 +4484,29 @@ mod tests {
         wait_for(&adopted, "the destination writing the turn's history", |c| {
             history_path(c).exists()
         });
+    }
+}
+
+#[cfg(test)]
+mod remote_root_tests {
+    use super::*;
+
+    /// A remote project root is sent as recorded; one this machine resolves elsewhere is refused with
+    /// both paths named, and one it does not have is not refused.
+    #[test]
+    fn a_remote_root_must_be_the_same_path_here() {
+        let tmp = crate::test_tmp::TmpDir::new("agent", "remote-root");
+        let base = tmp.canonicalize().unwrap();
+        let real = base.join("project");
+        std::fs::create_dir(&real).unwrap();
+        assert!(same_path_here(&real).is_ok());
+        assert!(same_path_here(&base.join("not-here-yet")).is_ok());
+        let link = base.join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let refused = same_path_here(&link).unwrap_err().to_string();
+        assert!(refused.contains(&link.display().to_string()), "{refused}");
+        assert!(refused.contains(&real.display().to_string()), "{refused}");
+        assert!(refused.contains("same absolute path"), "{refused}");
+        assert!(same_path_here(Path::new("relative/root")).is_err());
     }
 }

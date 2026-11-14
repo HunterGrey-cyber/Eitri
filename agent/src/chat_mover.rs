@@ -46,9 +46,24 @@ impl MovedKind {
         }
     }
 
-    /// How many descriptors a provider of this kind hands over: the agent's stdin, stdout and stderr.
+    /// How many descriptors a provider of this kind running on this machine hands over: the agent's
+    /// stdin, stdout and stderr.
     pub fn descriptors(self) -> usize {
         3
+    }
+
+    /// How many descriptors a provider of this kind hands over with `record`: [`Self::descriptors`], or
+    /// none for a Claude chat whose agent runs on a server (its record names the helper's sidecar instead).
+    pub fn descriptors_for(self, record: &Value) -> usize {
+        match self {
+            MovedKind::Claude if runs_on_a_server(record) => 0,
+            _ => self.descriptors(),
+        }
+    }
+
+    /// Whether `record`, a provider's record of this kind, names an agent running on a server.
+    pub fn runs_on_a_server(self, record: &Value) -> bool {
+        self == MovedKind::Claude && runs_on_a_server(record)
     }
 }
 
@@ -91,12 +106,54 @@ pub struct Adopted {
     pub external: Option<Arc<dyn ExternalProvider + Send + Sync>>,
 }
 
-/// Takes up the provider a moved chat's record names, with the descriptors that came with it.
+/// Whether a Claude chat's record names a sidecar the server's helper holds.
+fn runs_on_a_server(record: &Value) -> bool {
+    record
+        .get("transport")
+        .and_then(|transport| transport.get("Helper"))
+        .is_some()
+}
+
+/// Takes up the provider a moved chat's record names, with the descriptors that came with it, in a window
+/// holding no connection to a server: a remote chat is refused ([`adopt_with`]).
 pub fn adopt(kind: MovedKind, record: &Value, fds: Vec<OwnedFd>) -> Result<Adopted, String> {
+    adopt_with(kind, record, fds, &crate::remote_client::NoHelperConnections)
+}
+
+/// [`adopt`] in a window that may hold connections to servers. A remote chat brings no descriptors and is
+/// taken up over the connection `helpers` holds for its host key; a window with none refuses it.
+pub fn adopt_with(
+    kind: MovedKind,
+    record: &Value,
+    fds: Vec<OwnedFd>,
+    helpers: &dyn crate::remote_client::HelperConnections,
+) -> Result<Adopted, String> {
+    let unreadable = |what: &str, err: serde_json::Error| format!("the moved chat's {what} is not readable: {err}");
+    if kind == MovedKind::Claude && runs_on_a_server(record) {
+        if !fds.is_empty() {
+            return Err(format!("a moved remote chat brings no descriptors, not {}", fds.len()));
+        }
+        let handoff: ClaudeProviderHandoff =
+            serde_json::from_value(record.clone()).map_err(|e| unreadable("sidecar record", e))?;
+        let crate::providers::claude_sidecar::TransportKind::Helper(helper) = &handoff.transport else {
+            return Err("the moved chat's record names no server".to_string());
+        };
+        let client = helpers.open_for(&helper.host, &helper.host_key_sha256).ok_or_else(|| {
+            format!(
+                "this window has no connection to {}; open the remote project here first",
+                helper.host
+            )
+        })?;
+        let provider = ClaudeSidecarProvider::adopt_through_helper(handoff, client)
+            .map_err(|e| format!("the moved chat's agent could not be taken over: {e}"))?;
+        return Ok(Adopted {
+            agent: Arc::new(provider),
+            external: None,
+        });
+    }
     let fds: [OwnedFd; 3] = fds
         .try_into()
         .map_err(|fds: Vec<OwnedFd>| format!("a moved {} chat brings 3 descriptors, not {}", kind.wire(), fds.len()))?;
-    let unreadable = |what: &str, err: serde_json::Error| format!("the moved chat's {what} is not readable: {err}");
     match kind {
         MovedKind::Claude => {
             let handoff: ClaudeProviderHandoff =
@@ -158,7 +215,7 @@ impl ChatMover for ClaudeSidecarProvider {
         ClaudeSidecarProvider::live_move(self)
     }
     fn freeze_for_chat_move(&self) -> Result<FrozenProvider, String> {
-        let (handoff, fds) = self.freeze_for_move().map_err(|why| why.to_string())?;
+        let (handoff, fds) = ClaudeSidecarProvider::freeze_for_chat_move(self).map_err(|why| why.to_string())?;
         let record = match serde_json::to_value(&handoff) {
             Ok(record) => record,
             Err(err) => {
@@ -169,7 +226,7 @@ impl ChatMover for ClaudeSidecarProvider {
         Ok(FrozenProvider {
             kind: MovedKind::Claude,
             record,
-            fds: fds.into_array().into(),
+            fds: fds.map_or_else(Vec::new, |fds| fds.into_array().into()),
         })
     }
     fn resume_after_chat_move(&self, frozen: FrozenProvider) -> Result<(), String> {

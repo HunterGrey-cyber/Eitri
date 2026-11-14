@@ -1,7 +1,15 @@
 #[path = "login_env.rs"]
 pub mod login_env;
+#[path = "serve/mod.rs"]
+pub mod serve;
 #[path = "sidecars.rs"]
 pub mod sidecars;
+#[path = "test_exec.rs"]
+#[cfg(test)]
+#[allow(dead_code)]
+pub mod test_exec;
+#[path = "trust.rs"]
+pub mod trust;
 
 use std::io;
 use std::os::unix::fs::PermissionsExt;
@@ -92,6 +100,7 @@ impl OwnedSidecars {
 
 struct Service {
     sidecars: Arc<sidecars::Sidecars>,
+    serving: Arc<serve::Serving>,
 }
 
 #[tonic::async_trait]
@@ -103,13 +112,24 @@ impl Helper for Service {
         Ok(Response::new(HelloResponse {
             protocol_major: PROTOCOL_MAJOR,
             protocol_minor: PROTOCOL_MINOR,
-            capabilities: [CAP_SIDECARS, CAP_JOURNAL, CAP_PENDING, CAP_TRUST_SCAN]
-                .map(str::to_owned)
-                .to_vec(),
+            capabilities: [
+                CAP_SIDECARS,
+                CAP_JOURNAL,
+                CAP_PENDING,
+                CAP_TRUST_SCAN,
+                CAP_INSTALLATION_ARGS,
+            ]
+            .map(str::to_owned)
+            .to_vec(),
             helper_version: crate::VERSION.to_owned(),
             helper_build: crate::REVISION.to_owned(),
-            sidecar_revision: agent::BUNDLED_SIDECAR_REVISION.to_owned(),
-            warnings: self.sidecars.warnings(),
+            sidecar_revision: String::new(),
+            warnings: self
+                .sidecars
+                .warnings()
+                .into_iter()
+                .chain(self.serving.warnings())
+                .collect(),
             login_env: self.sidecars.login_env_state() as i32,
         }))
     }
@@ -145,17 +165,38 @@ impl Helper for Service {
         request: Request<ListSidecarsRequest>,
     ) -> Result<Response<ListSidecarsResponse>, Status> {
         mark_activity(&request);
-        Ok(Response::new(self.sidecars.list()))
+        let mut listed = self.sidecars.list();
+        listed.warnings.extend(self.serving.warnings());
+        for sidecar in &mut listed.sidecars {
+            sidecar.sessions = self.serving.sessions(&sidecar.sidecar_id).await;
+        }
+        Ok(Response::new(listed))
     }
 
     async fn pending(&self, request: Request<PendingRequest>) -> Result<Response<PendingResponse>, Status> {
         mark_activity(&request);
-        Err(Status::unimplemented("pending service is unavailable"))
+        let request = request.into_inner();
+        let requests = self.serving.pending(&request.sidecar_id, &request.session_id).await?;
+        Ok(Response::new(PendingResponse { requests }))
     }
 
     async fn trust_scan(&self, request: Request<TrustScanRequest>) -> Result<Response<TrustScanResponse>, Status> {
         mark_activity(&request);
-        Err(Status::unimplemented("trust scanner is unavailable"))
+        let request = request.into_inner();
+        // Discovery walks and hashes a tree, so it never runs on a runtime thread.
+        let scanned = tokio::task::spawn_blocking(move || trust::scan(&request.root, &request.profile_key))
+            .await
+            .map_err(|error| Status::internal(error.to_string()))?;
+        Ok(Response::new(match scanned {
+            Ok(discovery_json) => TrustScanResponse {
+                discovery_json,
+                refusal: String::new(),
+            },
+            Err(refusal) => TrustScanResponse {
+                discovery_json: Vec::new(),
+                refusal,
+            },
+        }))
     }
 }
 
@@ -182,6 +223,7 @@ pub async fn run_with_environment(
         ));
     }
     let managed = Arc::new(sidecars::Sidecars::new(paths.clone())?);
+    let serving = serve::Serving::new(paths.clone(), managed.clone());
     let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
     let listener = UnixListener::bind(paths.socket()?)?;
     let _cleanup = Cleanup(paths.clone());
@@ -197,19 +239,24 @@ pub async fn run_with_environment(
         protocol_minor: PROTOCOL_MINOR,
         started_unix_ms: crate::run_dir::unix_ms(),
     };
+    // The installation it runs from goes beside: a stop checks the daemon's executable against it.
+    let published = crate::run_dir::Published {
+        info: info.clone(),
+        installation: paths.installation_name(),
+    };
     let dir = agent::private_fs::open_dir(&paths.metadata_run())?;
     agent::private_fs::publish_private_file(
         &dir,
         std::ffi::OsStr::new("info"),
-        &serde_json::to_vec(&info).map_err(io::Error::other)?,
+        &serde_json::to_vec(&published).map_err(io::Error::other)?,
     )?;
-    crate::audit::record(
+    let _ = crate::audit::record(
         &paths.state,
         "daemon-start",
         &format!("version={} pid={}", paths.version, info.pid),
-    )?;
+    );
     for pid in sidecars.children.iter().filter_map(tokio::process::Child::id) {
-        crate::audit::record(&paths.state, "sidecar-start", &format!("pid={pid}"))?;
+        let _ = crate::audit::record(&paths.state, "sidecar-start", &format!("pid={pid}"));
     }
     let environment = {
         let managed = managed.clone();
@@ -256,7 +303,9 @@ pub async fn run_with_environment(
             .http2_keepalive_timeout(Some(Duration::from_secs(20)))
             .add_service(HelperServer::new(Service {
                 sidecars: managed.clone(),
+                serving: serving.clone(),
             }))
+            .add_service(serve::Proxy(serving.clone()))
             .serve_with_incoming(incoming);
         tokio::pin!(server);
         let idle_exit = async {
@@ -273,11 +322,18 @@ pub async fn run_with_environment(
         };
         let maintenance = async {
             let mut tick = tokio::time::interval(Duration::from_secs(10));
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             loop {
                 tick.tick().await;
                 let manager = managed.clone();
                 let _ = tokio::task::spawn_blocking(move || manager.trim_logs()).await;
                 managed.refresh_handshakes().await;
+                if let Err(error) = serving.maintain().await {
+                    serving.audit_budget_error(&error.to_string()).await;
+                }
+                if let Err(error) = serving.adopt().await {
+                    let _ = crate::audit::record(&paths.state, "watch-adoption", &error.to_string());
+                }
             }
         };
         tokio::pin!(maintenance);

@@ -725,6 +725,8 @@ fn every_send_caller_names_its_origin() {
             "core/src/tab_set/remote_turns.rs",
             "send_turn_spawned(request,answered)",
         ),
+        // The desk's turn of a remote tab: its request carries the origin its queue or composer named.
+        ("core/src/tab_set/desk_sends.rs", "send_turn_spawned(request,answered)"),
         (
             "core/src/agent_backend.rs",
             "steer_turn(shown_turn,client_message_id,wire_text,as_typed,origin)",

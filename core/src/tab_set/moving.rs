@@ -34,6 +34,11 @@ const SESSION_ID_WAIT: Duration = Duration::from_secs(2);
 /// watchers (handles into this window's review).
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct TabHandoff {
+    /// Where the tab's agent runs. A window running a build that predates remote tabs writes none, and all its tabs
+    /// are local; a record whose agent runs on a server and says no remote origin is refused where it is taken up
+    /// ([`TabHandoff::check_remote_agent`]).
+    #[serde(default)]
+    origin: TabOrigin,
     name: Option<String>,
     mode: SessionModeChoice,
     agent: AgentId,
@@ -112,6 +117,18 @@ pub struct TabHandoff {
 }
 
 impl TabHandoff {
+    /// Refuses a record whose agent runs on a server (`runs_on_a_server`, read off its provider's record) while its
+    /// origin says the tab is local: taken up as local, its gate would judge the agent's paths against this
+    /// machine's files.
+    pub fn check_remote_agent(&self, runs_on_a_server: bool) -> Result<(), String> {
+        match (&self.origin, runs_on_a_server) {
+            (TabOrigin::Local, true) => {
+                Err("the moved chat's agent runs on a server, but its tab says it is local".into())
+            }
+            _ => Ok(()),
+        }
+    }
+
     /// The agent the tab runs.
     pub fn agent(&self) -> &AgentId {
         &self.agent
@@ -249,6 +266,9 @@ pub enum MoveRefusedWhy {
     Folding,
     /// Its conversation could not be frozen or its records taken.
     Conversation(String),
+    /// It names a saved agent on a server that it has not reached (its reattach is waiting or failed): the record
+    /// would carry nothing naming that agent, which would then be neither saved nor stopped.
+    UnreachedRemoteAgent,
     /// A message waiting to be sent carries images, whose bytes are this window's: one in its queue, a first message
     /// waiting for its start, or a sent one the CLI may still hand back.
     QueuedImages,
@@ -277,6 +297,9 @@ impl std::fmt::Display for MoveRefusedWhy {
             }
             MoveRefusedWhy::Folding => f.write_str("the conversation is folding its events"),
             MoveRefusedWhy::Conversation(why) => f.write_str(why),
+            MoveRefusedWhy::UnreachedRemoteAgent => {
+                f.write_str("the tab's agent on its server has not been reached again yet")
+            }
             MoveRefusedWhy::QueuedImages => {
                 f.write_str("a message waiting to be sent carries images: send it or take it back first")
             }
@@ -427,6 +450,9 @@ fn handoff_of(tab: &Tab, review: Option<ReviewHandoff>) -> TabHandoff {
         // Allocated by the window the tab lands in.
         id: _,
         number: _,
+        origin,
+        // An arrival never takes its destination window's startup origin.
+        origin_from_window: _,
         name,
         mode,
         agent,
@@ -443,6 +469,12 @@ fn handoff_of(tab: &Tab, review: Option<ReviewHandoff>) -> TabHandoff {
         attention,
         failed_after_start,
         failed_resume,
+        // A remote tab moves with its live agent, whose record names where it is; a tab that only names a saved
+        // agent it has not reached does not move (`MoveRefusedWhy::UnreachedRemoteAgent`).
+        remote_agent: _,
+        remote_agent_stopped: _,
+        // A dismissal is this window's pages': the other window's draw the note again.
+        root_note_dismissed: _,
         // Refused by the freeze while set: a terminal handoff in flight does not move.
         pending_handoff: _,
         last_handoff,
@@ -540,6 +572,7 @@ fn handoff_of(tab: &Tab, review: Option<ReviewHandoff>) -> TabHandoff {
         ..plan.clone()
     };
     TabHandoff {
+        origin: origin.clone(),
         name: name.clone(),
         mode: *mode,
         agent: agent.clone(),
@@ -1025,7 +1058,8 @@ impl TabSet {
         if self.moving.contains(&tab.0) {
             return Some(MOVING.to_string());
         }
-        if self.pending_sends.contains_key(&tab.0) || self.remote_sends.contains_key(&tab.0) {
+        if self.pending_sends.contains_key(&tab.0) || self.remote_sends.contains_key(&tab.0) || self.desk_send_out(tab)
+        {
             return Some(SEND_HELD.to_string());
         }
         None
@@ -1037,15 +1071,19 @@ impl TabSet {
         self.poll_at(now)
     }
 
-    /// Whether a prompt of `tab` is held for the presence.
+    /// Whether a prompt of `tab` is held for the presence, or a remote tab's waits for its provider call: either
+    /// way its command is answered by [`TabSet::poll_turn_sends`].
     pub fn send_is_held(&self, tab: TabId) -> bool {
-        self.pending_sends.contains_key(&tab.0)
+        self.pending_sends.contains_key(&tab.0) || self.desk_send_out(tab)
     }
 
     /// The command a held prompt of `tab` owes its answer to: its request id, and for a composer's message
     /// the page it was typed in (`None` for a session's first message, whose start knows its page). `None`
     /// when nothing is held or what is held is the tab's queue, which no command waits on.
     pub fn held_send_request(&self, tab: TabId) -> Option<(&str, Option<ViewId>)> {
+        if self.desk_send_out(tab) {
+            return self.desk_send_request(tab);
+        }
         match &self.pending_sends.get(&tab.0)?.what {
             TurnSend::Queue | TurnSend::Remote { .. } => None,
             TurnSend::First { request_id, .. } => Some((request_id, None)),
@@ -1054,7 +1092,9 @@ impl TabSet {
     }
 
     fn poll_at(&mut self, now: Instant) -> Vec<Sent> {
-        self.decide_every(move |gate, _| gate.poll(now))
+        let mut sent = self.poll_desk_sends();
+        sent.extend(self.decide_every(move |gate, _| gate.poll(now)));
+        sent
     }
 
     /// Asks every held prompt's gate `ask` and does what it says.
@@ -1203,6 +1243,8 @@ impl TabSet {
         {
             self.remote_not_sent(tab, turn, asker, "the tab closed before the message went".to_string());
         }
+        // A remote tab's send whose call is out is answered by nobody now: its close answered its command.
+        self.desk_sends.remove(&tab.0);
         self.unbound_since.remove(&tab.0);
         self.flush_owed.remove(&tab.0);
     }
@@ -1229,6 +1271,7 @@ impl TabSet {
         // pump reconciles that flag; a prompt still held for presence must stay here regardless.
         if self.pending_sends.contains_key(&tab.0)
             || self.remote_sends.contains_key(&tab.0)
+            || self.desk_send_out(tab)
             || (self.starting.contains(&tab.0) && !t.turn_running())
         {
             return Some(MoveRefusedWhy::Starting);
@@ -1246,6 +1289,16 @@ impl TabSet {
         }
         if t.session.queue.iter().any(|q| !q.is_held()) {
             return Some(MoveRefusedWhy::Steered);
+        }
+        if t.remote_agent.is_some() && !matches!(t.backend, TabBackend::Live(_)) {
+            return Some(MoveRefusedWhy::UnreachedRemoteAgent);
+        }
+        // A tab still reading its history back from its server has not taken up where its plan mode stands
+        // (`TabSet::follow_plan_mode`), which the other window would then take from a part of that history.
+        if t.live().is_some_and(AgentBackend::replaying_history) {
+            return Some(MoveRefusedWhy::Conversation(
+                "the tab is still reading its history from the server; move it when it has caught up".to_string(),
+            ));
         }
         // Images live in this process only: a queued message with images, or a sent one the CLI may still hand
         // back to the queue (`opening_prompt`), would arrive in the other window without them.
@@ -1328,7 +1381,7 @@ impl TabSet {
             .expect("checked live above")
             .take_frozen()
             .map_err(|refused| MoveRefusedWhy::Conversation(refused.to_string()))?;
-        let review = match self.turn_review.as_mut() {
+        let review = match self.turn_review.as_mut().filter(|_| !self.tabs[at].is_remote()) {
             None => None,
             Some(review) => match review.hand_over_session(session.as_deref().unwrap_or_default(), tab.0) {
                 Ok(handoff) => Some(handoff),
@@ -1390,6 +1443,7 @@ impl TabSet {
             held_sends: &self.pending_sends,
             untracked_starts: &mut self.untracked_starts,
             observers: &mut self.observers,
+            last_link_states: &mut self.last_link_states,
             #[cfg(test)]
             after_drain: &mut self.after_drain,
             #[cfg(test)]
@@ -1564,6 +1618,7 @@ impl TabSet {
 
     fn adopt(&mut self, handoff: TabHandoff, backend: TabBackend, view: ViewId) -> TabId {
         let TabHandoff {
+            origin,
             name,
             mode,
             agent,
@@ -1633,6 +1688,8 @@ impl TabSet {
         };
         let at = self.position(id).expect("just inserted");
         let t = &mut self.tabs[at];
+        t.origin = origin;
+        t.origin_from_window = false;
         t.name = name;
         t.mode = mode;
         t.plan_origin = plan_origin;
@@ -1713,7 +1770,7 @@ impl TabSet {
     }
 
     /// A tab whose turn is over and whose queue holds messages lets them go at the next pump.
-    fn owe_flush_if_idle(&mut self, tab: TabId) {
+    pub(super) fn owe_flush_if_idle(&mut self, tab: TabId) {
         let owed = self
             .get(tab)
             .is_some_and(|t| t.live().is_some() && !t.turn_running() && !t.session.queue.is_empty());

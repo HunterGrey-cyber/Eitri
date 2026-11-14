@@ -31,6 +31,11 @@ fn invalid(message: impl Into<String>) -> std::io::Error {
     std::io::Error::new(std::io::ErrorKind::InvalidInput, message.into())
 }
 
+/// The installation the fixture's daemon is taken to run from: a test binary runs from no installation of its own.
+fn installation(paths: &run_dir::Paths) -> PathBuf {
+    paths.data.join(format!("{VERSION}-{}", run_dir::rev7(REVISION)))
+}
+
 struct Sandbox {
     root: PathBuf,
 }
@@ -99,7 +104,7 @@ impl Drop for Sandbox {
             &self.root.join("s"),
             &std::env::temp_dir(),
         ) {
-            if let Ok(info) = paths.info() {
+            if let Ok(info) = paths.published().map(|published| published.info) {
                 let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, info.pid as libc::pid_t, 0) };
                 if fd >= 0 {
                     use std::os::fd::{AsRawFd, FromRawFd};
@@ -189,9 +194,9 @@ fn concurrent_ensures_start_one_daemon() {
         assert!(child.0.wait().unwrap().success());
     }
     let paths = sandbox.paths();
-    let first = paths.info().unwrap().pid;
+    let first = paths.published().map(|published| published.info).unwrap().pid;
     assert!(sandbox.command().arg("ensure").status().unwrap().success());
-    assert_eq!(paths.info().unwrap().pid, first);
+    assert_eq!(paths.published().map(|published| published.info).unwrap().pid, first);
     let audit = private_fs::read_private_nofollow_capped(&paths.state.join("audit.log"), 16384).unwrap();
     assert_eq!(audit.lines().filter(|line| line.contains(" daemon-start ")).count(), 1);
     assert_eq!(
@@ -361,7 +366,10 @@ fn long_home_falls_back_to_a_private_tmp_run_dir() {
         assert!(process.0.try_wait().unwrap().is_none());
         runtime().block_on(ensure::hello(&paths)).is_ok()
     });
-    assert_eq!(paths.info().unwrap().pid, process.0.id());
+    assert_eq!(
+        paths.published().map(|published| published.info).unwrap().pid,
+        process.0.id()
+    );
     let listed = sandbox
         .command()
         .arg("list-daemons")
@@ -397,7 +405,7 @@ fn list_daemons_reports_only_live_answering_daemons() {
         .lines()
         .map(|line| serde_json::from_str(line).unwrap())
         .collect();
-    assert_eq!(records, vec![sandbox.paths().info().unwrap()]);
+    assert_eq!(records, vec![sandbox.paths().published().unwrap().info]);
 }
 
 #[test]
@@ -483,7 +491,7 @@ fn stop_daemon_checks_the_exe_before_signalling() {
     let mut child = Process(Command::new("/bin/sleep").arg("60").spawn().unwrap());
     let paths = sandbox.paths();
     write_info(&paths, child.0.id());
-    private_fs::create_private_dir_all(&paths.install(REVISION).join("bin"), &paths.data).unwrap();
+    private_fs::create_private_dir_all(&installation(&paths).join("bin"), &paths.data).unwrap();
     let encoded = eitri_server_proto::args_hex::encode_args(&[std::ffi::OsStr::new(VERSION)]);
     let output = sandbox
         .command()
@@ -491,29 +499,74 @@ fn stop_daemon_checks_the_exe_before_signalling() {
         .output()
         .unwrap();
     assert!(!output.status.success());
-    assert!(String::from_utf8_lossy(&output.stderr).contains("outside that version"));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("daemon executable does not match its recorded installation identity; refusing to signal"),
+        "{stderr}"
+    );
     assert!(child.0.try_wait().unwrap().is_none());
     std::fs::remove_file(paths.metadata_run().join("info")).unwrap();
 }
 
 #[test]
 fn stop_daemon_stops_an_installed_daemon_with_an_open_connection() {
+    stop_daemon_stops_a_daemon_installed_as(&format!("{VERSION}-{}", run_dir::rev7(REVISION)), false);
+}
+
+/// The name the client installs under also carries the helper's and the manifest's hashes.
+#[test]
+fn stop_daemon_stops_a_daemon_of_a_content_keyed_installation() {
+    stop_daemon_stops_a_daemon_installed_as(
+        &format!(
+            "{VERSION}-{}-0123456789abcdef-fedcba9876543210",
+            run_dir::rev7(REVISION)
+        ),
+        false,
+    );
+}
+
+#[test]
+fn stop_daemon_accepts_verified_legacy_metadata_without_an_installation() {
+    stop_daemon_stops_a_daemon_installed_as(&format!("{VERSION}-{}", run_dir::rev7(REVISION)), true);
+}
+
+/// The daemon runs from its installation and is keyed by it: `stop-daemon` takes that key.
+fn stop_daemon_stops_a_daemon_installed_as(name: &str, legacy: bool) {
     let sandbox = Sandbox::new();
-    let paths = sandbox.paths();
-    let bin = paths.install(REVISION).join("bin");
+    let paths = run_dir::Paths::new(
+        &run_dir::run_key_of(name),
+        &sandbox.root.join("d"),
+        &sandbox.root.join("s"),
+        &std::env::temp_dir(),
+    )
+    .unwrap();
+    let bin = paths.data.join(name).join("bin");
     private_fs::create_private_dir_all(&bin, &paths.data).unwrap();
     let installed = bin.join("eitri-server");
-    std::fs::copy(BINARY, &installed).unwrap();
-    std::fs::set_permissions(&installed, std::fs::Permissions::from_mode(0o700)).unwrap();
+    daemon::test_exec::install_executable(std::path::Path::new(BINARY), &installed);
     let mut command = Command::new(&installed);
     sandbox.configure(&mut command);
-    let mut process = Process(command.arg("daemon").spawn().unwrap());
+    let mut process = Process(daemon::test_exec::spawn(command.arg("daemon")).unwrap());
     wait_for(|| {
         assert!(process.0.try_wait().unwrap().is_none());
         runtime().block_on(ensure::hello(&paths)).is_ok()
     });
     let _open = std::os::unix::net::UnixStream::connect(paths.socket().unwrap()).unwrap();
-    let encoded = eitri_server_proto::args_hex::encode_args(&[std::ffi::OsStr::new(VERSION)]);
+    let recorded: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(paths.metadata_run().join("info")).unwrap()).unwrap();
+    assert_eq!(recorded["installation"], name, "the daemon records its installation");
+    assert_eq!(recorded["version"], VERSION);
+    let key = if legacy {
+        let metadata = paths.state.join("run").join(VERSION);
+        private_fs::create_private_dir_all(&metadata, &paths.state).unwrap();
+        let mut old = recorded.clone();
+        old.as_object_mut().unwrap().remove("installation");
+        private_fs::write_private(&metadata.join("info"), &serde_json::to_vec(&old).unwrap()).unwrap();
+        VERSION.to_owned()
+    } else {
+        paths.key.clone()
+    };
+    let encoded = eitri_server_proto::args_hex::encode_args(&[std::ffi::OsStr::new(&key)]);
     let output = sandbox
         .command()
         .args(["stop-daemon", "--args-hex", &encoded])
@@ -601,25 +654,72 @@ fn gc_keeps_the_running_version_and_recent_directories() {
         data: sandbox.root.join("d"),
         state: sandbox.root.join("s"),
         run: sandbox.root.join("r"),
+        key: VERSION.into(),
+        install: Some(
+            sandbox
+                .root
+                .join("d")
+                .join(format!("{VERSION}-{}", run_dir::rev7(REVISION))),
+        ),
+        installed: true,
     };
     let now = SystemTime::UNIX_EPOCH + Duration::from_secs(10 * 24 * 3600);
-    let current = paths.install(REVISION);
+    let current = installation(&paths);
     let recent = paths.data.join("recent-0123456");
     let old = paths.data.join("old-0123456");
     let live = paths.data.join("live-0123456");
     let unstamped = paths.data.join("unstamped-0123456");
+    // The client's content-keyed names: the version is read past both hashes.
+    let old_keyed = paths.data.join("old-0123456-0123456789abcdef-fedcba9876543210");
+    let live_keyed = paths.data.join("live-0123456-0123456789abcdef-fedcba9876543210");
+    // Kept by its own daemon, keyed by the installation's name and recording it.
+    let owned_keyed = paths.data.join("owned-0123456-0123456789abcdef-fedcba9876543210");
     private_fs::create_private_dir_all(&unstamped, &paths.data).unwrap();
-    for (path, stamp) in [(&current, "0"), (&recent, "864000000"), (&old, "0"), (&live, "0")] {
+    for (path, stamp) in [
+        (&current, "0"),
+        (&recent, "864000000"),
+        (&old, "0"),
+        (&live, "0"),
+        (&old_keyed, "0"),
+        (&live_keyed, "0"),
+        (&owned_keyed, "0"),
+    ] {
         private_fs::create_private_dir_all(path, &paths.data).unwrap();
         private_fs::write_private(&path.join("last-used"), stamp.as_bytes()).unwrap();
     }
     let mut live_paths = paths.clone();
     live_paths.version = "live".into();
+    live_paths.key = "live".into();
     live_paths.run = paths.state.join("run/live");
     write_info(&live_paths, std::process::id());
+    let owned_name = "owned-0123456-0123456789abcdef-fedcba9876543210";
+    let mut owned_paths = paths.clone();
+    owned_paths.key = run_dir::run_key_of(owned_name);
+    owned_paths.version = "owned".into();
+    owned_paths.run = paths.state.join("run").join(&owned_paths.key);
+    owned_paths.prepare().unwrap();
+    private_fs::write_private(
+        &owned_paths.metadata_run().join("info"),
+        &serde_json::to_vec(&run_dir::Published {
+            info: DaemonInfo {
+                version: "owned".into(),
+                rev: REVISION.to_owned(),
+                pid: std::process::id(),
+                protocol_major: 1,
+                protocol_minor: 0,
+                started_unix_ms: 0,
+            },
+            installation: Some(owned_name.into()),
+        })
+        .unwrap(),
+    )
+    .unwrap();
     gc::collect(&paths, now).unwrap();
     assert!(current.exists());
     assert!(recent.exists());
+    assert!(!old_keyed.exists());
+    assert!(live_keyed.exists());
+    assert!(owned_keyed.exists());
     assert!(!old.exists());
     assert!(live.exists());
     assert!(unstamped.exists());

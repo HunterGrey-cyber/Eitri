@@ -10,6 +10,7 @@
 
 mod history;
 
+use crate::remote_project::TabOrigin;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -20,8 +21,8 @@ use agent::{AgentDomainEvent, PromptOrigin, RevisedDelivery};
 pub use crate::agent_backend::AgentId;
 use crate::agent_backend::{AgentBackend, BackendError, BackendKind, QuestionSend};
 use crate::agent_bridge::{
-    serialize_events_with_notes_and_revisions_for_js, serialize_handoff_for_js, serialize_snapshot_with_notes_for_js,
-    serialize_tabs_for_js, CallNotes, SessionModeChoice, SnapshotView, TabRef, TabStateWire, TabView, TurnTime,
+    serialize_events_with_notes_and_revisions_for_js, serialize_handoff_for_js, serialize_tabs_for_js, CallNotes,
+    SessionModeChoice, SnapshotView, TabRef, TabStateWire, TabView, TurnTime,
 };
 use crate::attention::{Attention, AttentionTracker};
 use crate::saved_tabs::{SavedTab, SavedTabs};
@@ -43,10 +44,15 @@ mod attachment_tests;
 
 mod live_edits;
 pub use live_edits::LiveEdit;
+mod desk_sends;
+pub use desk_sends::InterruptDone;
 mod moving;
 mod observers;
 mod plan;
-pub use plan::{PlanChoice, PLAN_APPROVAL_DRAINING, PLAN_CARD_FIRST, PLAN_CHANGING_REFUSAL, PLAN_CYCLE_REFUSAL};
+pub use plan::{
+    PlanChoice, PLAN_APPROVAL_DRAINING, PLAN_CARD_FIRST, PLAN_CHANGING_REFUSAL, PLAN_CYCLE_REFUSAL,
+    PLAN_WHILE_REPLAYING,
+};
 mod remote_turns;
 mod shell;
 pub use moving::{FrozenChat, FrozenTab, MoveRefusedWhy, SendGate, Sent, TabHandoff};
@@ -209,6 +215,10 @@ pub struct PendingHandoff {
 /// moment it was queued; `text` is what was typed.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Queued {
+    /// In-memory identity shared by clones, recreated on deserialization: retyping identical text makes a new item.
+    /// Unit equality keeps this token out of value comparisons; restoration uses pointer identity.
+    #[serde(skip)]
+    identity: Arc<()>,
     pub text: String,
     pub wire: String,
     pub queued_at_ms: u64,
@@ -263,6 +273,7 @@ impl Queued {
     /// A message waiting for the turn to end.
     pub fn held(text: &str, wire: String, queued_at_ms: u64) -> Queued {
         Queued {
+            identity: Arc::new(()),
             text: text.to_string(),
             wire,
             queued_at_ms,
@@ -370,6 +381,9 @@ pub struct Flush {
 pub enum SendNow {
     /// A turn was running: it was asked to stop; the queue goes out when it ends.
     Interrupting(Result<(), BackendError>),
+    /// A remote tab's turn was running: it is being asked to stop off this thread, and what became of that comes
+    /// from [`TabSet::poll_interrupts`] under this number; the queue goes out when the turn ends.
+    InterruptOut(u64),
     /// Idle: flushed at once (`None` when there was nothing to send).
     Flushed(Option<Flush>),
 }
@@ -422,6 +436,10 @@ impl ReviewTicket {
 }
 
 pub struct Tab {
+    /// Fixed when the tab is opened and preserved when it moves between windows.
+    origin: TabOrigin,
+    /// Only tabs created here take this window's startup origin; an arrival keeps its recorded origin.
+    origin_from_window: bool,
     /// Whether completed edits are shown in the editor without taking focus.
     pub following: bool,
     pub id: TabId,
@@ -466,6 +484,15 @@ pub struct Tab {
     /// until the tab is closed or started over. Read only while the backend is `Failed`; every place
     /// that swaps `Failed` in sets it.
     pub failed_resume: Option<String>,
+    /// A remote tab's agent as a later window reaches it again, and the CLI's session, kept from the moment
+    /// a saved remote tab was taken up in it ([`TabSet::open_reattaching`]): the saved-tabs file keeps the agent
+    /// while the tab is still starting, failed to start, or ended with its agent possibly still running.
+    pub remote_agent: Option<(agent::HelperHandoff, Option<String>)>,
+    /// Whether this remote tab's agent was stopped on its server at the person's choice: it is not saved again.
+    pub remote_agent_stopped: bool,
+    /// The text of the tab's own note the person dismissed, in whichever page: it stays dismissed in every page
+    /// the tab is shown in while the note says the same.
+    root_note_dismissed: Option<String>,
     pub pending_handoff: Option<PendingHandoff>,
     /// Held here, not only in the WebView, so a panel reload cannot lose it (see the doc this field
     /// had on `AgentPanelState` before session tabs; it moved per tab with them).
@@ -741,8 +768,8 @@ pub const NAME_UNKNOWN_LINE: &str = "Eitri could not read all of your Codex conf
                                      may be in it; the editor tools are off in this tab (see the agents guide)";
 
 impl SessionState {
-    /// The pending requests no page shows: those answered on the user's behalf, and the CLI prompts held
-    /// for an approval in flight. A held one is either in `held` or matched by `holds`, and every
+    /// The pending requests no page shows: those answered on the user's behalf (recorded, or for a
+    /// remote tab still on their way), and the CLI prompts held for an approval in flight. A held one is either in `held` or matched by `holds`, and every
     /// match is moved into `held` when its send settles or its turn ends, so whatever a snapshot hid
     /// here is reconsidered by a drain. A request the user answered is never hidden as held.
     fn hidden_permissions(&self, projection: &agent::AgentSessionProjection) -> BTreeSet<String> {
@@ -758,6 +785,7 @@ impl SessionState {
             .filter(|id| !self.user_answered.contains(id));
         self.host_answered
             .iter()
+            .chain(self.human_allowed.host_send_ids())
             .cloned()
             .chain(held)
             .chain(self.plan.held.iter().cloned())
@@ -826,6 +854,41 @@ impl SessionState {
 }
 
 impl Tab {
+    pub fn origin(&self) -> &TabOrigin {
+        &self.origin
+    }
+
+    pub fn is_remote(&self) -> bool {
+        matches!(self.origin, TabOrigin::Remote { .. })
+    }
+
+    pub fn gate_root<'a>(&self, local_root: &'a Path) -> agent::GateRoot<'a> {
+        match self.origin {
+            TabOrigin::Local => agent::GateRoot::Local(local_root),
+            TabOrigin::Remote { .. } => agent::GateRoot::RemoteWithoutFacts,
+        }
+    }
+
+    pub fn root_note(&self) -> Option<String> {
+        match &self.origin {
+            TabOrigin::Local => None,
+            TabOrigin::Remote { host, .. } => Some(format!(
+                "this tab runs on {host}; path checks on the server are not available yet"
+            )),
+        }
+    }
+
+    /// Whether the person dismissed the tab's own note as it reads now.
+    pub fn root_note_dismissed(&self) -> bool {
+        self.root_note()
+            .is_some_and(|note| self.root_note_dismissed.as_deref() == Some(note.as_str()))
+    }
+
+    /// The person dismissed the tab's own note reading `text`.
+    pub fn dismiss_root_note(&mut self, text: &str) {
+        self.root_note_dismissed = Some(text.to_owned());
+    }
+
     /// The composer mirror survives tab switches and page reloads.
     pub fn draft(&self) -> &str {
         &self.session.draft
@@ -850,8 +913,20 @@ impl Tab {
         &self.row_key
     }
 
+    /// Whether this is an empty tab nobody has used yet: nothing started, nothing typed, no name.
+    fn is_untouched_start(&self) -> bool {
+        matches!(self.backend, TabBackend::NotStarted)
+            && self.name.is_none()
+            && self.session.draft.trim().is_empty()
+            && self.session.queue.is_empty()
+            && self.view.is_base()
+            && self.remote_agent.is_none()
+    }
+
     fn new(id: TabId, number: u16, mode: SessionModeChoice, agent: AgentId, following: bool) -> Self {
         Tab {
+            origin: TabOrigin::Local,
+            origin_from_window: true,
             following,
             id,
             number,
@@ -869,6 +944,9 @@ impl Tab {
             row_key: RowKey::new(),
             failed_after_start: false,
             failed_resume: None,
+            remote_agent: None,
+            remote_agent_stopped: false,
+            root_note_dismissed: None,
             pending_handoff: None,
             last_handoff: None,
             editing_draft: None,
@@ -937,6 +1015,10 @@ impl Tab {
     /// said it can load a saved session. Before its session is live, an ACP tab that is resuming one
     /// holds a session its agent recorded as loadable; the agent is asked again when that resume starts.
     pub fn resumable(&self, kind: BackendKind) -> bool {
+        if self.is_remote() {
+            return false;
+        }
+
         match &self.agent {
             AgentId::Claude => kind == BackendKind::Sidecar,
             AgentId::Codex => true,
@@ -1689,7 +1771,15 @@ pub enum RestoreStep {
     Confirm(RestorePrompt),
 }
 
+pub const REMOTE_RESUME_UNAVAILABLE: &str = "session resume is not available on remote tabs yet";
+
+/// Why a `!` line is refused in a remote tab: Eitri runs it on this machine, where the project is not the server's.
+pub const SHELL_LINES_REMOTE_UNAVAILABLE: &str = "shell lines are not available on remote tabs yet";
+
 pub struct TabSet {
+    last_link_states: BTreeMap<u64, (u64, Option<agent::RemoteLinkState>)>,
+    project_origin: TabOrigin,
+    local_copy_host: Option<String>,
     tabs: Vec<Tab>,
     history_clears: Vec<(ViewId, String)>,
     /// Whatever follows a tab from outside the desk ([`TabSet::observe`]), fed by the tick beside the pages.
@@ -1759,6 +1849,13 @@ pub struct TabSet {
     pending_sends: BTreeMap<u64, moving::PendingSend>,
     /// A phone's sends whose provider call is out, by tab: at most one per tab ([`TabSet::poll_remote_sends`]).
     remote_sends: BTreeMap<u64, remote_turns::RemoteSendWait>,
+    /// The desk's sends to a remote tab whose provider call is out, by tab: at most one per tab
+    /// ([`TabSet::poll_turn_sends`]).
+    desk_sends: BTreeMap<u64, desk_sends::DeskSendWait>,
+    /// Interrupts of remote tabs whose provider call is out ([`TabSet::poll_interrupts`]), and the number the next
+    /// one is told under.
+    interrupts_out: Vec<desk_sends::InterruptWait>,
+    next_interrupt: u64,
     /// A phone's sends refused before their provider call was made, for the next [`TabSet::poll_remote_sends`].
     remote_sent: Vec<RemoteSent>,
     /// A phone's queued messages taken out unsent because their tab's mode widened ([`TabSet::take_remote_refused`]).
@@ -1853,6 +1950,7 @@ impl TabSet {
             mode => mode,
         };
         let mut set = TabSet {
+            last_link_states: BTreeMap::new(),
             tabs: Vec::new(),
             history_clears: Vec::new(),
             observers: observers::Observers::default(),
@@ -1873,6 +1971,8 @@ impl TabSet {
             pending_restore: None,
             mode_note: None,
             closing: false,
+            project_origin: TabOrigin::Local,
+            local_copy_host: None,
             turn_review: None,
             turn_review_off: false,
             presence: None,
@@ -1881,6 +1981,9 @@ impl TabSet {
             starting_since: BTreeMap::new(),
             pending_sends: BTreeMap::new(),
             remote_sends: BTreeMap::new(),
+            desk_sends: BTreeMap::new(),
+            interrupts_out: Vec::new(),
+            next_interrupt: 0,
             remote_sent: Vec::new(),
             remote_refused: Vec::new(),
             remote_withdrawn: Vec::new(),
@@ -1977,10 +2080,14 @@ impl TabSet {
     /// not announce its events (the legacy one, or any before [`set_ui_wake`](Self::set_ui_wake)), turn
     /// review waiting for its workers, or a prompt held for the presence (the presence thread's
     /// confirmation and the hold's own deadline raise no wake; [`TabSet::poll_turn_sends`] finds them).
-    /// When this is false, nothing changes here until a backend's wake, or a command from the window, says
-    /// so.
+    /// Connection state is checked separately at [`Self::link_poll_deadline`], without keeping the
+    /// steady work-polling cadence running.
     pub fn needs_polling(&self) -> bool {
-        if !self.pending_sends.is_empty() || self.remote_needs_polling() {
+        if !self.pending_sends.is_empty() || self.remote_needs_polling() || self.desk_calls_out() {
+            return true;
+        }
+        // A remote tab's host answer on its way raises no wake when its reply comes; the tick reads it.
+        if self.tabs.iter().any(|tab| tab.session.human_allowed.has_host_sends()) {
             return true;
         }
         self.tabs.iter().any(|tab| {
@@ -1994,6 +2101,56 @@ impl TabSet {
             .turn_review
             .as_ref()
             .is_some_and(crate::turn_review::TurnReview::has_work_in_flight)
+    }
+
+    /// Connection state changes carry no conversation event or wake. Keep a slow deadline while
+    /// any live provider exposes it, independently of the steady work-polling cadence. (A remote tab's
+    /// host answers on their way keep [`Self::needs_polling`] on by themselves.)
+    pub fn link_poll_deadline(&self, now: std::time::Instant) -> Option<std::time::Instant> {
+        self.tabs
+            .iter()
+            .any(|tab| tab.live().is_some_and(|backend| backend.link_state().is_some()))
+            .then_some(now + std::time::Duration::from_millis(500))
+    }
+
+    pub fn project_origin(&self) -> &TabOrigin {
+        &self.project_origin
+    }
+
+    /// Applies startup's project origin to this window's own tabs before any session starts.
+    /// Adopted tabs keep their recorded origin; new tabs inherit the window's origin.
+    pub fn set_project_origin(&mut self, origin: TabOrigin) -> Result<(), &'static str> {
+        if self
+            .tabs
+            .iter()
+            .any(|tab| !matches!(tab.backend, TabBackend::NotStarted))
+        {
+            return Err("a project's origin must be set before any agent tab starts");
+        }
+        self.project_origin = origin.clone();
+        for tab in &mut self.tabs {
+            if tab.origin_from_window {
+                tab.origin = origin.clone();
+            }
+        }
+        Ok(())
+    }
+
+    /// Startup supplies the recorded host when the person explicitly opens its local copy.
+    pub fn set_local_copy_host(&mut self, host: Option<String>) {
+        self.local_copy_host = host;
+    }
+
+    pub fn start_refusal(&self, tab: TabId) -> Option<String> {
+        if let Some(host) = &self.local_copy_host {
+            return Some(format!(
+                "this is the local copy of a project on {host}; agent tabs run there"
+            ));
+        }
+        let tab = self.get(tab)?;
+        (tab.is_remote() && tab.agent().is_external()).then(|| {
+            "Codex and ACP tabs cannot run in a remote project yet: they would act on this machine's copy".to_string()
+        })
     }
 
     /// How long until a request held for its call on some tab is judged without it (`PlanBook::next_sequence_release`):
@@ -2159,6 +2316,9 @@ impl TabSet {
 
     /// The session `tab` reviews under and the review itself, or why there is neither.
     fn review_target(&self, tab: TabId) -> Result<(&crate::turn_review::TurnReview, String), String> {
+        if self.get(tab).is_some_and(Tab::is_remote) {
+            return Err(crate::turn_review::REMOTE_UNAVAILABLE.to_string());
+        }
         if self.turn_review_off {
             return Err(TURN_REVIEW_OFF.to_string());
         }
@@ -2627,7 +2787,8 @@ impl TabSet {
             agent.offered_mode(self.default_mode)
         };
         let mut tab = Tab::new(id, number, mode, agent, self.following_default);
-        tab.session.client_calls.live_edits_on = self.live_edits;
+        tab.origin = self.project_origin.clone();
+        tab.session.client_calls.live_edits_on = self.live_edits && !tab.is_remote();
         self.tabs.push(tab);
         self.tabs.sort_by_key(|t| t.number);
         id
@@ -3257,18 +3418,34 @@ impl TabSet {
                     // Disjoint fields of `self` (`tabs` vs `default_mode`): `tab` stays borrowed.
                     self.default_mode = SessionModeChoice::Bypass;
                 }
-                let answered = match tab.live_mut() {
-                    Some(backend) => backend.approve_pending(&now, "on entering bypass"),
-                    None => crate::agent_backend::Approved::default(),
+                let remote = tab.is_remote();
+                let sending_before: BTreeSet<String> = tab.session.human_allowed.host_send_ids().cloned().collect();
+                let answered = match &mut tab.backend {
+                    TabBackend::Live(backend) => {
+                        backend.approve_pending(&now, "on entering bypass", remote, &mut tab.session.human_allowed)
+                    }
+                    _ => crate::agent_backend::Approved::default(),
                 };
                 tab.session.host_answered.extend(answered.ids.iter().cloned());
                 // The CLI's own prompts it answered say so on their calls' rows once those complete.
                 tab.session
                     .note_ledger
                     .record_report(NoteReport::prompts(answered.prompts));
-                let answered_set: BTreeSet<String> = answered.ids.iter().cloned().collect();
+                // A remote tab's answers are on their way: hidden and uncounted until their replies are
+                // read, and counted again as cards if refused.
+                let answered_set: BTreeSet<String> = answered
+                    .ids
+                    .iter()
+                    .chain(
+                        tab.session
+                            .human_allowed
+                            .host_send_ids()
+                            .filter(|id| !sending_before.contains(*id)),
+                    )
+                    .cloned()
+                    .collect();
                 tab.attention.retain_pending(|id| !answered_set.contains(id));
-                let approved = answered.ids.len();
+                let approved = answered_set.len();
                 let number = tab.number;
                 eprintln!("[permission] mode is now bypass (tab {number}, approved {approved} waiting)");
                 Ok(ConfirmOutcome::Entered { approved })
@@ -3347,6 +3524,17 @@ impl TabSet {
             }
         }
         let tab = self.get_mut(id).ok_or_else(no_session)?;
+        if tab
+            .session
+            .human_allowed
+            .host_send_ids()
+            .any(|sent| sent == permission_id)
+        {
+            return Err(BackendError {
+                message: "this request is being answered".into(),
+                benign: true,
+            });
+        }
         if tab.session.user_answered.contains(permission_id) {
             return Err(BackendError {
                 message: "this request was already answered".into(),
@@ -3366,6 +3554,12 @@ impl TabSet {
             });
         let approves = decision.allows();
         let turn_id = backend.projection().active_turn_id.clone();
+        // The person's answer is the last word on this request: a host answer lost on its way is never sent
+        // over it, even when this one fails too.
+        tab.session
+            .human_allowed
+            .person_answers(permission_id, decision.clone());
+        let backend = tab.live_mut().ok_or_else(no_session)?;
         let send = if asynchronous {
             backend.respond_permission_async(permission_id, decision)?
         } else {
@@ -3544,6 +3738,28 @@ impl TabSet {
     /// a session, one that is connecting and one already waiting each have their own start.
     /// A tab frozen for a move starts nothing here: its record is already taken.
     pub fn defer_start(&mut self, tab: TabId, start: DeferredStart) -> Result<(), String> {
+        self.defer(tab, start, false)
+    }
+
+    /// [`Self::defer_start`] for the one resume a remote tab starts: the person chose to continue the CLI's
+    /// session through a new sidecar after the server no longer ran the tab's agent.
+    pub fn defer_remote_resume(&mut self, tab: TabId, start: DeferredStart) -> Result<(), String> {
+        if !matches!(start, DeferredStart::Resume { .. }) || !self.get(tab).is_some_and(Tab::is_remote) {
+            return Err("only a remote tab's resume is started this way".to_string());
+        }
+        self.defer(tab, start, true)
+    }
+
+    fn defer(&mut self, tab: TabId, start: DeferredStart, remote_resume: bool) -> Result<(), String> {
+        if let Some(why) = self.start_refusal(tab) {
+            return Err(why);
+        }
+        if self.get(tab).is_some_and(Tab::is_remote)
+            && !remote_resume
+            && !matches!(start, DeferredStart::FirstSend { .. })
+        {
+            return Err(REMOTE_RESUME_UNAVAILABLE.to_string());
+        }
         if self.moving.contains(&tab.0) {
             return Err(MOVING.to_string());
         }
@@ -3736,6 +3952,9 @@ impl TabSet {
         tab.clear_history();
         let old = std::mem::replace(&mut tab.backend, TabBackend::NotStarted);
         tab.session = SessionState::default();
+        // Whatever agent the tab reached on a server goes with its old backend, which the caller ends.
+        tab.remote_agent = None;
+        tab.remote_agent_stopped = false;
         tab.replace_draft(parts.join("\n\n"));
         tab.attention.restart();
         self.pending_bypass = None;
@@ -3842,6 +4061,8 @@ impl TabSet {
     pub fn pump_views(&mut self, project_root: &Path, mapped: &dyn Fn(ViewId) -> bool) -> PumpOutput {
         // Observers an owner left behind when it went are forgotten before this pump queues anything for them.
         self.observers.reap();
+        self.last_link_states
+            .retain(|id, _| self.tabs.iter().any(|tab| tab.id.0 == *id));
         let active = self.active;
         self.project_root = Some(project_root.to_path_buf());
         let mut out = match self.held_pump.take() {
@@ -3871,6 +4092,7 @@ impl TabSet {
             held_sends: &self.pending_sends,
             untracked_starts: &mut self.untracked_starts,
             observers: &mut self.observers,
+            last_link_states: &mut self.last_link_states,
             #[cfg(test)]
             after_drain: &mut self.after_drain,
             #[cfg(test)]
@@ -3894,8 +4116,33 @@ impl TabSet {
                 in_a_page,
                 on_screen: in_a_page && mapped(tab.view),
             };
-            tab.session.client_calls.live_edits_on = self.live_edits;
+            tab.session.client_calls.live_edits_on = self.live_edits && !tab.is_remote();
             Self::pump_tab(tab, &mut tick, review.as_deref_mut(), place, &mut out);
+            if let TabBackend::Live(backend) = &tab.backend {
+                let link_state = backend.link_state();
+                let previous = tick
+                    .last_link_states
+                    .get(&tab.id.0)
+                    .filter(|(generation, _)| *generation == tab.backend_generation)
+                    .and_then(|(_, state)| state.clone());
+                if previous != link_state && place.in_a_page {
+                    out.view_payloads.push(ShownPayload {
+                        view: tab.view,
+                        tab: tab.id,
+                        payload: crate::agent_bridge::serialize_link_state_for_js(tab.id, link_state.as_ref()),
+                        class: if matches!(link_state, Some(agent::RemoteLinkState::Disconnected { .. }))
+                            && !matches!(previous, Some(agent::RemoteLinkState::Disconnected { .. }))
+                        {
+                            crate::panel_cadence::EnvelopeClass::Immediate
+                        } else {
+                            crate::panel_cadence::EnvelopeClass::Stream
+                        },
+                        first_text: false,
+                    });
+                    tick.last_link_states
+                        .insert(tab.id.0, (tab.backend_generation, link_state));
+                }
+            }
         }
         out.queue_changed.extend(self.withdraw_remote());
         for id in self.steer_waiting(wall_clock_ms()) {
@@ -3946,6 +4193,11 @@ impl TabSet {
         place: PumpPlace,
         out: &mut PumpOutput,
     ) {
+        let remote = tab.is_remote();
+        if remote {
+            review = None;
+        }
+        let gate_root = tab.gate_root(tick.project_root);
         Self::follow_cli_out_of_auto(tab);
         Self::follow_plan_mode(tab);
         Self::poll_plan_start(tab);
@@ -3971,7 +4223,7 @@ impl TabSet {
         // Every fold through this revision is in this drain or an earlier one, whatever the drain then drops.
         let folded_before = backend.projection().last_revision;
         let delivery = backend.take_revised_ui_delivery_after_answers(
-            tick.project_root,
+            gate_root,
             tick.rules,
             crate::agent_backend::GateMode {
                 mode: tab.mode.into(),
@@ -4097,8 +4349,10 @@ impl TabSet {
         let observed = tick.observers.watches(tab.id);
         let generation = tab.backend_generation;
         let mut live = LiveTab {
+            remote,
             live_edits: tab.session.client_calls.live_edits_on,
             following: tab.following,
+            generation: tab.backend_generation,
             id: tab.id,
             mode: tab.mode,
             plan_followed: !tab.plan_cycle.open,
@@ -4158,7 +4412,9 @@ impl TabSet {
                 // as one by the very mechanism meant to rebuild the panel honestly. This also hides
                 // what the classifier already answered in `Auto`, closing the gap `attention`'s module
                 // doc used to record for `resync` itself. Answered here, outside every guard of the
-                // projection: answering a permission must happen outside the lock.
+                // projection: answering a permission must happen outside the lock. A remote tab's
+                // answers join its host answers on their way, so the snapshot below hides them too. A
+                // request whose host answer was refused or lost is the person's card and is not swept.
                 // Never in plan mode or while the mode changes, never before the tab has taken up the mode the end
                 // of plan mode gave it (a session that left plan mode after the pump's last look still shows the
                 // tab in the mode plan mode began in), and never a card raised in plan mode.
@@ -4178,6 +4434,7 @@ impl TabSet {
                             .filter(|id| {
                                 !hidden.contains(*id)
                                     && !live.session.user_answered.contains(*id)
+                                    && !live.session.human_allowed.fell_back(id)
                                     && !live.session.plan.cards.contains(*id)
                                     && !began_in_plan_mode(&projection, id)
                             })
@@ -4189,7 +4446,12 @@ impl TabSet {
                     }
                     // The events (legacy's own resolutions) are not needed here: the snapshot is read
                     // after they were folded, so it already shows those cards answered.
-                    let answered = live.backend.approve_pending(&sweep, "in bypass after a resync");
+                    let answered = live.backend.approve_pending(
+                        &sweep,
+                        "in bypass after a resync",
+                        live.remote,
+                        &mut live.session.human_allowed,
+                    );
                     live.session.host_answered.extend(answered.ids);
                     live.session
                         .note_ledger
@@ -4295,7 +4557,9 @@ impl TabSet {
             .map_or(through_revision, |(revision, _)| revision.saturating_sub(1));
         let (revisions, events): (Vec<u64>, Vec<AgentDomainEvent>) = tagged.into_iter().unzip();
         let (in_snapshot, fresh) = events.split_at(shown);
-        live_edits::collect(live, &events);
+        if !live.remote {
+            live_edits::collect(live, &events);
+        }
         for event in &events {
             match event {
                 AgentDomainEvent::TurnStarted { .. } => live.session.was_running = true,
@@ -4368,7 +4632,11 @@ impl TabSet {
             } else {
                 BTreeMap::new()
             },
-            creates_file: note_new_files(&mut live.notes.creates_file, &events, project_root),
+            creates_file: if live.remote {
+                Default::default()
+            } else {
+                note_new_files(&mut live.notes.creates_file, &events, project_root)
+            },
             auto_creates_file: std::mem::take(&mut live.session.creates_file_unsent),
             // Only a shown tab's payload leaves here; a background tab's turns wait for the snapshot
             // its next switch sends.
@@ -4391,6 +4659,14 @@ impl TabSet {
         };
         live.notes.remote_notes_dirty = false;
         live.session.note_ledger.fold(&events, live.notes, &mut fresh_notes);
+        if live.remote {
+            // A remote tab records a host answer when its reply is read, which can be after its call's
+            // `ToolCallCompleted` was folded: such a note goes out with this batch.
+            let projection = live.backend.projection();
+            live.session
+                .note_ledger
+                .finish_completed(&projection, live.notes, &mut fresh_notes);
+        }
         // Every card in the batch is counted, those the snapshot drew included: they are pending all
         // the same, and this tab has not counted them yet.
         live.attention.observe(&events, place.on_screen);
@@ -4507,10 +4783,11 @@ impl TabSet {
                 hook(live.backend);
             }
         }
-        #[cfg(not(test))]
-        let _ = tick;
         let (payload, revision) = {
             let hidden;
+            let link_state = live.backend.link_state();
+            tick.last_link_states
+                .insert(live.id.0, (live.generation, link_state.clone()));
             let mut view = SnapshotView::of(live.backend, &live.session.host_answered);
             hidden = live.session.hidden_permissions(&view.projection);
             view.hidden_pending = Some(&hidden);
@@ -4528,12 +4805,13 @@ impl TabSet {
                 wall_clock_ms(),
             );
             live.notes.prune_evicted_if_moved(&view.projection);
-            let payload = serialize_snapshot_with_notes_for_js(
+            let payload = crate::agent_bridge::serialize_snapshot_with_link_for_js(
                 live.id,
                 &view,
                 live.session.turn_clock.as_ref().map(|(_, at)| *at),
                 live.notes,
                 &live.session.editor_cards,
+                link_state.as_ref(),
             );
             live.session.turn_times_unsent = 0;
             // Under the guard the snapshot is serialized from (see `pump_arm_resync`'s doc).
@@ -4819,10 +5097,13 @@ impl TabSet {
         let tab = self.get_mut(tab).expect("a shown tab exists");
         tab.session.stale = false;
         let mut payloads = Vec::new();
+        let mut snapshot_link = None;
         match &mut tab.backend {
             TabBackend::Live(backend) => {
                 let (payload, revision) = {
                     let hidden;
+                    let link_state = backend.link_state();
+                    snapshot_link = Some((tab.id.0, tab.backend_generation, link_state.clone()));
                     let mut view = SnapshotView::of(backend, &tab.session.host_answered);
                     hidden = tab.session.hidden_permissions(&view.projection);
                     view.hidden_pending = Some(&hidden);
@@ -4848,12 +5129,13 @@ impl TabSet {
                         &view.projection,
                         wall_clock_ms(),
                     );
-                    let payload = serialize_snapshot_with_notes_for_js(
+                    let payload = crate::agent_bridge::serialize_snapshot_with_link_for_js(
                         tab.id,
                         &view,
                         tab.session.turn_clock.as_ref().map(|(_, at)| *at),
                         &tab.notes,
                         &tab.session.editor_cards,
+                        link_state.as_ref(),
                     );
                     tab.session.turn_times_unsent = 0;
                     (payload, view.projection.last_revision)
@@ -4897,6 +5179,9 @@ impl TabSet {
         ));
         if let Some(page) = tab.history_payload() {
             payloads.push(page);
+        }
+        if let Some((id, generation, link_state)) = snapshot_link {
+            self.last_link_states.insert(id, (generation, link_state));
         }
         payloads
     }
@@ -5174,6 +5459,7 @@ impl TabSet {
             }
         }
         tab.session.queue.push(Queued {
+            identity: Arc::new(()),
             text: text.to_string(),
             wire,
             queued_at_ms: now_ms,
@@ -5324,6 +5610,9 @@ impl TabSet {
     /// apart, a delivery and the turn's end folded between the two reads would make a message the agent
     /// read look unreported, and it would be sent again.
     pub fn flush_queue(&mut self, id: TabId) -> Option<Flush> {
+        if self.defer_desk_flush(id) {
+            return None;
+        }
         // A turn already starting in the tab takes the queue at its end, as a running turn does: sent
         // now, the queue would be a second turn the agent refuses. A phone's send whose provider call is
         // still out is such a start, whatever the pump has seen since.
@@ -5427,6 +5716,7 @@ impl TabSet {
                     self.end_start_of(&gate);
                     return None;
                 }
+                let off_thread = self.sends_off_thread(id);
                 let tab = self.get_mut(id).expect("checked by queue_can_go");
                 if !tab.session.queue.iter().all(Queued::is_held) {
                     eprintln!(
@@ -5464,6 +5754,24 @@ impl TabSet {
                 // still waits for a turn's end if any of its parts was sent to.
                 let after_turn = items().any(|item| item.after_turn);
                 let trace = crate::turn_trace::TurnTrace::start();
+                if off_thread {
+                    let mut items = Vec::with_capacity(turn.len());
+                    for index in turn.iter().rev() {
+                        items.push(tab.session.queue.remove(*index));
+                    }
+                    items.reverse();
+                    let what = desk_sends::DeskTurn::Queue {
+                        items,
+                        indices: turn,
+                        kept: tab.session.queue.iter().map(|item| item.identity.clone()).collect(),
+                        wire: wire.clone(),
+                        typed: typed.clone(),
+                        origin,
+                        after_turn,
+                        trace,
+                    };
+                    return self.spawn_desk_send(gate, wire, typed, origin, what);
+                }
                 let mode = tab.mode;
                 let carried: Vec<ReadyImage> = items().flat_map(|item| item.attachments.iter().cloned()).collect();
                 let images = carried.iter().map(|ready| ready.image.clone()).collect();
@@ -5525,6 +5833,18 @@ impl TabSet {
                     let outcome = self.start_shell_line(id, &turn.typed);
                     self.end_start_of(&gate);
                     outcome
+                } else if self.sends_off_thread(id) {
+                    if let Some(tab) = self.get_mut(id) {
+                        tab.session.turn_trace = crate::turn_trace::TurnTrace::start();
+                    }
+                    let (wire, typed, origin) = (turn.wire.clone(), turn.typed.clone(), turn.origin());
+                    return self.spawn_desk_send(
+                        gate,
+                        wire,
+                        typed,
+                        origin,
+                        desk_sends::DeskTurn::First { request_id, turn },
+                    );
                 } else {
                     self.send_one(&gate, &turn)
                 };
@@ -5556,6 +5876,14 @@ impl TabSet {
                         typed: turn.typed,
                         outcome,
                     });
+                }
+                if self.sends_off_thread(id) {
+                    if let Some(tab) = self.get_mut(id) {
+                        tab.session.turn_trace = crate::turn_trace::TurnTrace::start();
+                    }
+                    let (wire, typed, origin) = (turn.wire.clone(), turn.typed.clone(), turn.origin());
+                    let what = desk_sends::DeskTurn::Prompt { request_id, page, turn };
+                    return self.spawn_desk_send(gate, wire, typed, origin, what);
                 }
                 let mut outcome = self.send_one(&gate, &turn);
                 // The agent had a turn open that this side had not seen: the message waits to steer
@@ -5751,8 +6079,15 @@ impl TabSet {
         if !text.trim().is_empty() {
             self.queue_message(id, text, wire, now_ms, true, PromptOrigin::Typed)?;
         }
+        let off_thread = self.sends_off_thread(id);
         let tab = self.get_mut(id).ok_or_else(|| format!("no tab {}", id.0))?;
         if tab.turn_running() {
+            if off_thread {
+                return Ok(match self.interrupt_spawned(id) {
+                    Ok(number) => SendNow::InterruptOut(number),
+                    Err(error) => SendNow::Interrupting(Err(error)),
+                });
+            }
             let backend = tab.live_mut().expect("a running turn has a backend");
             return Ok(SendNow::Interrupting(backend.interrupt()));
         }
@@ -6157,7 +6492,7 @@ impl TabSet {
         let mut listed: Vec<(TabId, SavedTab)> = self
             .tabs
             .iter()
-            .filter(|tab| tab.agent == AgentId::Claude)
+            .filter(|tab| tab.agent == AgentId::Claude && !tab.is_remote())
             .filter_map(|tab| {
                 let session = self.saved_session_id(tab)?;
                 Some((
@@ -6246,7 +6581,86 @@ impl TabSet {
             others,
             others_active,
         );
+        let saved = saved.with_remote(self.saved_remote_tabs());
         Some(if mixed { saved.with_bar(bar) } else { saved })
+    }
+
+    /// The tabs whose agent runs on a server and may still be running there, in tab-bar order: where each agent is
+    /// and the CLI's session, read in its own statement per tab (the lock-order rule above). A tab taken up from the
+    /// saved tabs keeps its entry while it is starting or failed to start ([`Tab::remote_agent`]), and so does one
+    /// whose session ended with a gap: its agent may still run there, by the person's choice or because nobody
+    /// chose yet. Left out: a tab whose agent the server no longer runs, one whose agent the person stopped, and a
+    /// fresh start that has not reached its agent yet.
+    fn saved_remote_tabs(&self) -> Vec<crate::saved_tabs::SavedRemoteTab> {
+        self.tabs
+            .iter()
+            .filter(|tab| tab.is_remote() && !tab.remote_agent_stopped)
+            .filter_map(|tab| {
+                let kept = tab.remote_agent.clone();
+                let (helper, provider_session_id) = match tab.live() {
+                    Some(backend) => {
+                        if backend.remote_ending() == Some(agent::RemoteEnding::AgentGone) {
+                            return None;
+                        }
+                        let mut helper = backend
+                            .helper_handoff()
+                            .or_else(|| kept.as_ref().map(|(helper, _)| helper.clone()))?;
+                        // What a window had folded while attached only grows: a reattach replays from the journal's
+                        // start, and one closed partway through must not save less than the entry it took up.
+                        if let Some((saved, _)) = kept.as_ref().filter(|(saved, _)| {
+                            saved.daemon == helper.daemon
+                                && saved.sidecar_id == helper.sidecar_id
+                                && saved.session_id == helper.session_id
+                        }) {
+                            helper.last_folded_sequence = helper.last_folded_sequence.max(saved.last_folded_sequence);
+                        }
+                        let session = backend
+                            .provider_session_id()
+                            .or_else(|| kept.and_then(|(_, session)| session));
+                        (helper, session)
+                    }
+                    None => kept?,
+                };
+                Some(crate::saved_tabs::SavedRemoteTab {
+                    window: None,
+                    helper,
+                    provider_session_id,
+                    name: tab.name.clone(),
+                    mode: tab.mode,
+                })
+            })
+            .collect()
+    }
+
+    /// A saved remote tab taken up again: the window's first tab when it is still the untouched empty one it opened
+    /// with, else a new tab that is not selected, so the tab on screen stays the one that was. It keeps its name
+    /// and the mode it was saved in, except bypass, which comes back as manual: the requests its journal replays as
+    /// waiting are the person's to answer, and only the person enters bypass. It keeps the saved agent
+    /// ([`Tab::remote_agent`]) until the caller's start reaches it.
+    pub fn open_reattaching(&mut self, saved: &crate::saved_tabs::SavedRemoteTab) -> TabId {
+        let untouched = match self.tabs.as_slice() {
+            [only] if only.is_untouched_start() && only.agent == AgentId::Claude => Some(only.id),
+            _ => None,
+        };
+        let id = untouched.unwrap_or_else(|| self.insert_tab(AgentId::Claude, false));
+        let tab = self.get_mut(id).expect("just opened");
+        tab.mode = match saved.mode {
+            SessionModeChoice::Bypass => tab.agent.offered_mode(SessionModeChoice::Manual),
+            mode => tab.agent.offered_mode(mode),
+        };
+        tab.name = saved.name.clone();
+        tab.remote_agent = Some((saved.helper.clone(), saved.provider_session_id.clone()));
+        tab.remote_agent_stopped = false;
+        debug_assert!(self.v1_holds());
+        id
+    }
+
+    /// The person stopped `id`'s agent on its server (deny them and stop the agent): it is not saved again.
+    pub fn remote_agent_stopped(&mut self, id: TabId) {
+        if let Some(tab) = self.get_mut(id) {
+            tab.remote_agent = None;
+            tab.remote_agent_stopped = true;
+        }
     }
 
     /// Puts a saved draft in a tab's composer, after what the tab holds already.
@@ -7075,6 +7489,33 @@ impl NoteLedger {
             .retain(|(id, kind), _| !(kind.dropped_by_a_later_card() && still_pending.contains(id.as_str())));
     }
 
+    /// Turns every candidate whose call the projection shows finished into its note, in `kept` and in
+    /// `fresh`: its `ToolCallCompleted` was folded before the answer was recorded.
+    fn finish_completed(
+        &mut self,
+        projection: &agent::AgentSessionProjection,
+        kept: &mut CallNotes,
+        fresh: &mut CallNotes,
+    ) {
+        let finished: Vec<(String, NoteKind)> = self
+            .candidates
+            .keys()
+            .filter(|(id, _)| {
+                projection
+                    .tool_calls
+                    .iter()
+                    .any(|call| &call.tool_use_id == id && call.result.is_some())
+            })
+            .cloned()
+            .collect();
+        for key in finished {
+            if let Some(candidate) = self.candidates.remove(&key) {
+                candidate.clone().note_into(key.0.clone(), kept);
+                candidate.note_into(key.0, fresh);
+            }
+        }
+    }
+
     /// Forgets every candidate: the session that answered them is gone.
     fn clear(&mut self) {
         self.candidates.clear();
@@ -7177,6 +7618,11 @@ fn waiting_cards(tab: &Tab) -> Vec<String> {
                 cards.contains(&p.permission_id)
                     && !tab.session.host_answered.contains(&p.permission_id)
                     && !tab.session.user_answered.contains(&p.permission_id)
+                    && !tab
+                        .session
+                        .human_allowed
+                        .host_send_ids()
+                        .any(|id| id == &p.permission_id)
                     && !tab.session.plan.cards.contains(&p.permission_id)
                     && !projection.began_outside_executing(p.tool_use_id.as_deref().filter(|id| !id.is_empty()))
                     && projection.request_placed(&p.permission_id)
@@ -7213,6 +7659,7 @@ struct PumpTick<'a> {
     untracked_starts: &'a mut BTreeSet<u64>,
     /// `TabSet::observers`: fed from each tab's drain, whatever page shows it.
     observers: &'a mut observers::Observers,
+    last_link_states: &'a mut BTreeMap<u64, (u64, Option<agent::RemoteLinkState>)>,
     #[cfg(test)]
     after_drain: &'a mut Option<BackendSeam>,
     #[cfg(test)]
@@ -7236,6 +7683,8 @@ struct PumpPlace {
 
 /// The parts of a live tab a pump arm works on, borrowed apart so the backend is used beside them.
 struct LiveTab<'a> {
+    generation: u64,
+    remote: bool,
     live_edits: bool,
     following: bool,
     id: TabId,
@@ -7283,6 +7732,12 @@ struct ArmOutcome {
 }
 
 fn refresh_offers(tab: &mut Tab, project_root: &Path) -> bool {
+    if tab.is_remote() {
+        let had = !tab.session.rule_offers.is_empty();
+        tab.session.rule_offers.clear();
+        tab.session.rule_offers_seen.clear();
+        return had;
+    }
     let Some(backend) = tab.live() else {
         let had = !tab.session.rule_offers.is_empty();
         tab.session.rule_offers.clear();

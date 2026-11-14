@@ -145,7 +145,10 @@ pub(super) fn hold(state: &mut AgentPanelState, message: InboundMessage, view: V
     let Some(tab) = admitted.target.filter(|_| keeps_order(&message)) else {
         return Held::Goes(message, admitted);
     };
-    let claude = state.tabs.get(tab).is_some_and(|t| *t.agent() == AgentId::Claude);
+    let claude = state
+        .tabs
+        .get(tab)
+        .is_some_and(|t| *t.agent() == AgentId::Claude && !t.is_remote());
     let behind = state.mentions.waiting.iter().any(|waiting| waiting.tab == tab);
     let kinds: Vec<Kind> = match words_of(&message) {
         Some(text) if claude => requested(text),
@@ -263,6 +266,10 @@ mod tests {
     }
 
     fn ready(label: &str) -> Ready {
+        ready_at_origin(label, false)
+    }
+
+    fn ready_at_origin(label: &str, remote: bool) -> Ready {
         agent::state_dirs::redirect_state_to_a_test_root();
         let dir = agent::state_dirs::test_workspace_dir(label);
         let (handle, page, _second) = handle_with_two_pages();
@@ -270,6 +277,16 @@ mod tests {
         {
             let mut state = handle.state.borrow_mut();
             state.project_dir = dir.clone();
+            if remote {
+                state
+                    .tabs
+                    .set_project_origin(eitri_core::remote_project::TabOrigin::Remote {
+                        host: "example-host".into(),
+                        host_key_sha256: "SHA256:example".into(),
+                        root: "/srv/project".into(),
+                    })
+                    .unwrap();
+            }
             state.editor_rpc = Some(editor.clone());
         }
         let (tab, provider) = live_tab(&handle, &dir);
@@ -282,6 +299,41 @@ mod tests {
             provider,
             editor,
             dir,
+        }
+    }
+
+    #[test]
+    fn remote_tab_offers_no_session_mentions_or_resume_list() {
+        for kind in ["buffers", "quickfix", "diagnostics"] {
+            let r = ready_at_origin("remote-tab-mentions", true);
+            let text = format!("see @{kind}");
+            r.handle
+                .page_message(ViewId::BASE, &send("send_message", "remote-send", r.tab, &text));
+            tick_handle_until(&r.handle, "the plain turn", || !r.provider.turns().is_empty());
+            assert_eq!(r.provider.turns()[0], text);
+            assert!(r.editor.asked().is_empty());
+            assert!(!r.handle.state.borrow().mentions.is_waiting());
+            let (payload, listed) = super::super::detail::chooser_payload(&r.handle.state.borrow(), ViewId::BASE);
+            assert!(listed.is_empty());
+            let value: serde_json::Value = serde_json::from_str(&payload).unwrap();
+            assert_eq!(value["kind"], "notice");
+            assert!(payload.contains(super::super::detail::REMOTE_RESUME_UNAVAILABLE));
+            r.page.sent.borrow_mut().clear();
+            r.handle.open_chooser(ViewId::BASE);
+            assert!(r
+                .page
+                .sent
+                .borrow()
+                .iter()
+                .any(|line| line.contains(super::super::detail::REMOTE_RESUME_UNAVAILABLE)));
+            assert!(!r
+                .page
+                .sent
+                .borrow()
+                .iter()
+                .any(|line| line.contains("\"kind\":\"chooser\"")));
+            let greeting = super::super::detail::greeting_for_view(&r.handle.state.borrow(), ViewId::BASE);
+            assert!(greeting.resumable.is_empty());
         }
     }
 

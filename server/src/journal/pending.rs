@@ -11,10 +11,14 @@ const MAX_PENDING_BYTES: usize = 16 * 1024 * 1024;
 
 /// Independently durable permission requests, in `pending/<session>.bin`.
 /// The caller clears them when a turn ends or a session closes, before accepting any later answer.
+/// The file also holds the watermark: the last event sequence whose effect on these requests was applied.
+/// Recovery replays only the journal after it, so an answer that reached this file but not the journal
+/// cannot bring its request back.
 pub struct Pending {
     path: PathBuf,
     fs: Arc<dyn FileSystem>,
     requests: Requests,
+    applied: u64,
     dirty: bool,
 }
 impl Pending {
@@ -34,7 +38,7 @@ impl Pending {
         if bytes.len() > MAX_PENDING_BYTES {
             return Err(invalid("pending requests exceed the size limit"));
         }
-        let requests = decode_requests(&bytes)?;
+        let (applied, requests) = decode_requests(&bytes)?;
         if requests
             .iter()
             .any(|(id, (sequence, _))| id.is_empty() || *sequence == 0)
@@ -45,8 +49,13 @@ impl Pending {
             path: path.into(),
             fs,
             requests,
+            applied,
             dirty: false,
         })
+    }
+    /// The last sequence whose effect is in this file (or in memory, after a failed write).
+    pub fn applied(&self) -> u64 {
+        self.applied
     }
     pub fn request(&mut self, sequence: u64, event: &[u8], permission_id: &str) -> io::Result<()> {
         if sequence == 0 || permission_id.is_empty() {
@@ -54,8 +63,8 @@ impl Pending {
         }
         if let Some((previous, bytes)) = self.requests.get(permission_id) {
             return if *previous == sequence && bytes == event {
-                if self.dirty {
-                    self.rewrite(self.requests.clone())
+                if self.dirty || self.applied < sequence {
+                    self.rewrite(self.requests.clone(), sequence)
                 } else {
                     Ok(())
                 }
@@ -65,31 +74,34 @@ impl Pending {
         }
         let mut next = self.requests.clone();
         next.insert(permission_id.into(), (sequence, event.to_vec()));
-        self.rewrite(next)
+        self.rewrite(next, sequence)
     }
-    pub fn resolved(&mut self, permission_id: &str) -> io::Result<()> {
+    /// The answer at `sequence` removes its request.
+    pub fn resolved(&mut self, sequence: u64, permission_id: &str) -> io::Result<()> {
         let mut next = self.requests.clone();
         next.remove(permission_id);
-        self.rewrite(next)
+        self.rewrite(next, sequence)
     }
-    /// A turn's end or the session's close settles every request still listed: none can be answered after it.
-    pub fn clear(&mut self) -> io::Result<()> {
-        self.rewrite(BTreeMap::new())
+    /// A turn's end or the session's close at `sequence` settles every request still listed: none can be
+    /// answered after it.
+    pub fn clear(&mut self, sequence: u64) -> io::Result<()> {
+        self.rewrite(BTreeMap::new(), sequence)
     }
-    fn rewrite(&mut self, next: Requests) -> io::Result<()> {
-        let bytes = encode_requests(&next)?;
-        match self.fs.replace(&self.path, &bytes) {
-            Ok(()) => {
-                self.requests = next;
-                self.dirty = false;
-                Ok(())
-            }
-            Err(error) => {
-                self.requests = next;
-                self.dirty = true;
-                Err(error)
-            }
-        }
+    pub fn len(&self) -> usize {
+        self.requests.len()
+    }
+    pub fn is_empty(&self) -> bool {
+        self.requests.is_empty()
+    }
+    fn rewrite(&mut self, next: Requests, sequence: u64) -> io::Result<()> {
+        let applied = self.applied.max(sequence);
+        let bytes = encode_requests(applied, &next)?;
+        let written = self.fs.replace(&self.path, &bytes);
+        // Memory follows the event even when the file could not; the next successful write catches the file up.
+        self.requests = next;
+        self.applied = applied;
+        self.dirty = written.is_err();
+        written
     }
     pub fn list(&self) -> Vec<(u64, Vec<u8>)> {
         let mut requests: Vec<_> = self.requests.values().cloned().collect();
@@ -98,19 +110,17 @@ impl Pending {
     }
 }
 
-fn encode_requests(requests: &Requests) -> io::Result<Vec<u8>> {
-    if requests.is_empty() {
-        return Ok(Vec::new());
-    }
+fn encode_requests(applied: u64, requests: &Requests) -> io::Result<Vec<u8>> {
     let size = requests
         .iter()
-        .try_fold(8usize, |size, (id, (_, event))| {
+        .try_fold(16usize, |size, (id, (_, event))| {
             size.checked_add(16)?.checked_add(id.len())?.checked_add(event.len())
         })
         .filter(|size| *size <= MAX_PENDING_BYTES)
         .ok_or_else(|| invalid("pending requests exceed the size limit"))?;
     let mut bytes = Vec::with_capacity(size);
-    bytes.extend(b"EPN1");
+    bytes.extend(b"EPN2");
+    bytes.extend(applied.to_le_bytes());
     bytes.extend((requests.len() as u32).to_le_bytes());
     for (id, (sequence, event)) in requests {
         bytes.extend((id.len() as u32).to_le_bytes());
@@ -121,11 +131,18 @@ fn encode_requests(requests: &Requests) -> io::Result<Vec<u8>> {
     }
     Ok(bytes)
 }
-fn decode_requests(bytes: &[u8]) -> io::Result<Requests> {
+fn decode_requests(bytes: &[u8]) -> io::Result<(u64, Requests)> {
     if bytes.is_empty() {
-        return Ok(BTreeMap::new());
+        return Ok((0, BTreeMap::new()));
     }
-    let Some(mut tail) = bytes.strip_prefix(b"EPN1") else {
+    let (watermark, mut tail) = if let Some(tail) = bytes.strip_prefix(b"EPN2") {
+        if tail.len() < 8 {
+            return Err(invalid("incomplete pending watermark"));
+        }
+        (Some(u64::from_le_bytes(tail[..8].try_into().unwrap())), &tail[8..])
+    } else if let Some(tail) = bytes.strip_prefix(b"EPN1") {
+        (None, tail)
+    } else {
         return Err(invalid("invalid pending request format"));
     };
     if tail.len() < 4 {
@@ -158,5 +175,10 @@ fn decode_requests(bytes: &[u8]) -> io::Result<Requests> {
     if !tail.is_empty() {
         return Err(invalid("trailing pending request bytes"));
     }
-    Ok(requests)
+    // The first format had no watermark: its newest request stood for every earlier update.
+    let applied = watermark.unwrap_or_else(|| requests.values().map(|(sequence, _)| *sequence).max().unwrap_or(0));
+    if requests.values().any(|(sequence, _)| *sequence > applied) {
+        return Err(invalid("pending request is newer than its watermark"));
+    }
+    Ok((applied, requests))
 }

@@ -223,6 +223,19 @@ pub(super) fn command_prompt_is_in(state: &AgentPanelState, view: ViewId) -> boo
     command.page.is_none() || typed_in == view || state.tabs.get(tab).is_none_or(|t| t.view_id() != typed_in)
 }
 
+/// The `root_note` envelope of `tab`'s own note, naming the tab, when it has one (a remote tab). A local tab has
+/// none: its page draws the window's note, told after every `hello`, so showing a local tab sends nothing and a
+/// dismissed window note stays dismissed. The page keeps a tab's note, and its Dismiss, per tab.
+pub(super) fn tab_root_note(state: &AgentPanelState, tab: TabId) -> Option<String> {
+    let t = state.tabs.get(tab)?;
+    let note = t.root_note()?;
+    Some(eitri_core::agent_bridge::serialize_tab_root_note_for_js(
+        tab,
+        &note,
+        t.root_note_dismissed(),
+    ))
+}
+
 /// The base page's `tabs`, then the active tab's own state (always, not only when stale), and the
 /// trust question again when the tab on screen waits for one: routing away took the old one off. A
 /// `:trust` question typed in the base page goes with any move there, answered as not trusted, and so
@@ -239,7 +252,8 @@ pub(super) fn switch_payloads(state: &mut AgentPanelState, out: &mut Outbox) {
     out.send(ViewId::BASE, strip);
     out.send_all(ViewId::BASE, state.tabs.active_state_payloads());
     let active = state.tabs.active();
-    if state.trust.current_route(&waiting_profile(state, active)) == Some(Route::Ask) {
+    out.send_all(ViewId::BASE, tab_root_note(state, active));
+    if state.trust.current_route(trust_subject(state, active)) == Some(Route::Ask) {
         out.extend(reroute_or_ask(state, active));
     }
 }
@@ -258,7 +272,8 @@ pub(super) fn view_payloads(state: &mut AgentPanelState, view: ViewId, out: &mut
         return;
     };
     out.send_all(view, state.tabs.state_payloads(tab));
-    if state.trust.current_route(&waiting_profile(state, tab)) == Some(Route::Ask) {
+    out.send_all(view, tab_root_note(state, tab));
+    if state.trust.current_route(trust_subject(state, tab)) == Some(Route::Ask) {
         out.extend(reroute_or_ask(state, tab));
     }
 }
@@ -324,12 +339,7 @@ pub(super) fn send_hello_if_open_sessions_changed(state: &mut AgentPanelState, o
         {
             continue;
         }
-        let mut greeting = BackendGreeting::for_agent_titled(
-            state.backend_kind,
-            &agent,
-            state.project_dir.clone(),
-            eitri_core::agent_backend::Titles::Cached(&state.titles),
-        );
+        let mut greeting = super::detail::greeting_for_view(state, view);
         greeting
             .resumable
             .retain(|r| !eitri_core::tab_restore::is_open(&open, r));
@@ -643,6 +653,236 @@ mod tests {
         handle.page_message(ViewId::BASE, READY);
         handle.page_message(ViewId::BASE, READY);
         assert_eq!(root_note_texts(&page.inner.sent.borrow()), [ROOT_NOTE, ROOT_NOTE]);
+    }
+
+    #[test]
+    fn dismissed_local_root_note_stays_dismissed_on_switch_start_and_arrival() {
+        let (handle, base, _host) = handle_with_recording_page();
+        let extra = attach_recording_page(&handle, view(2));
+        handle.state.borrow_mut().project_dir = scratch_under_target("local-root-note").join("project");
+        handle.state.borrow_mut().root_note = Some(ROOT_NOTE.to_owned());
+        handle.page_message(ViewId::BASE, READY);
+        handle.page_message(view(2), READY);
+        assert_eq!(root_note_texts(&base.sent.borrow()), [ROOT_NOTE]);
+        assert_eq!(root_note_texts(&extra.sent.borrow()), [ROOT_NOTE]);
+        clear(&[&base, &extra]);
+        // Dismiss lives in the page, so the host still holds the note.
+        let first = handle.state.borrow().tabs.active();
+        handle.new_tab();
+        assert!(handle.select_tab(first));
+        let dir = handle.state.borrow().project_dir.clone();
+        let (_provider, backend) = live_backend(&dir);
+        let (result_tx, result_rx) = std::sync::mpsc::channel();
+        let tab = {
+            let mut state = handle.state.borrow_mut();
+            let tab = state.tabs.open(AgentId::Claude);
+            state.tabs.start(
+                tab,
+                PendingStart {
+                    request_id: "local-start".into(),
+                    result_rx,
+                    first_turn: None,
+                    resume: None,
+                    resumed_title: None,
+                    resumed_name: None,
+                },
+            );
+            tab
+        };
+        result_tx.send(Ok(backend)).unwrap();
+        handle.run_seen(|state, screen, out| super::super::starts::collect_pending_starts(state, screen, out));
+        assert!(handle.state.borrow().tabs.get(tab).unwrap().live().is_some());
+        assert_eq!(result_for(&base.sent.borrow(), "local-start"), Some(Ok(())));
+        handle.run(|state, out| {
+            assert_eq!(state.tabs.break_out(view(2)).unwrap(), tab);
+            view_payloads(state, view(2), out);
+        });
+        for page in [&base, &extra] {
+            assert!(root_note_texts(&page.sent.borrow()).is_empty());
+        }
+        shut_down_every_tab(&handle);
+    }
+
+    const REMOTE_NOTE: &str = "this tab runs on example-host; path checks on the server are not available yet";
+
+    /// Every `root_note` envelope as (its tab, its text); a window's own note names no tab.
+    fn root_notes(sent: &[String]) -> Vec<(Option<u64>, String)> {
+        sent.iter()
+            .filter(|e| kind_of(e) == "root_note")
+            .map(|e| {
+                let note: serde_json::Value = serde_json::from_str(e).unwrap();
+                (note["tab"].as_u64(), note["text"].as_str().unwrap().to_owned())
+            })
+            .collect()
+    }
+
+    /// A window at a local no-boundary root holding its own local tab and an unstarted remote tab moved in
+    /// from another window, with the base page ready and its sends cleared.
+    fn mixed_window(
+        label: &str,
+    ) -> (
+        AgentPanelHandle,
+        std::rc::Rc<RecordingPage>,
+        std::rc::Rc<RecordingHost>,
+        TabId,
+        TabId,
+    ) {
+        let (handle, base, host) = handle_with_recording_page();
+        handle.state.borrow_mut().project_dir = scratch_under_target(label).join("project");
+        handle.state.borrow_mut().root_note = Some(ROOT_NOTE.to_owned());
+        let mut source = eitri_core::tab_set::TabSet::new(
+            eitri_core::agent_backend::BackendKind::Sidecar,
+            eitri_core::agent_bridge::SessionModeChoice::Auto,
+        );
+        source
+            .set_project_origin(eitri_core::remote_project::TabOrigin::Remote {
+                host: "example-host".into(),
+                host_key_sha256: "SHA256:example".into(),
+                root: "/srv/project".into(),
+            })
+            .unwrap();
+        let moved = source.active();
+        let frozen = source.freeze_for_move(moved).unwrap();
+        let local = handle.state.borrow().tabs.active();
+        let remote = handle
+            .state
+            .borrow_mut()
+            .tabs
+            .adopt_moved_unstarted(frozen.tab, ViewId::BASE)
+            .unwrap();
+        let _ = source.hand_over(moved);
+        assert!(!handle.state.borrow().tabs.get(local).unwrap().is_remote());
+        assert!(handle.state.borrow().tabs.get(remote).unwrap().is_remote());
+        handle.page_message(ViewId::BASE, READY);
+        clear(&[&base]);
+        (handle, base, host, local, remote)
+    }
+
+    #[test]
+    fn remote_tab_note_names_its_tab_and_a_local_tab_sends_none() {
+        let (handle, base, _host, local, remote) = mixed_window("mixed-root-note");
+        assert!(handle.select_tab(remote));
+        assert_eq!(
+            root_notes(&base.sent.borrow()),
+            [(Some(remote.0), REMOTE_NOTE.to_owned())]
+        );
+        clear(&[&base]);
+        // The page draws a local tab's banner from the window's note it already holds; nothing is re-sent, as
+        // for a window with no remote tab.
+        assert!(handle.select_tab(local));
+        assert!(root_notes(&base.sent.borrow()).is_empty());
+        // A reloaded page is told the window's note and the shown tab's own.
+        assert!(handle.select_tab(remote));
+        clear(&[&base]);
+        handle.page_message(ViewId::BASE, READY);
+        assert_eq!(
+            root_notes(&base.sent.borrow()),
+            [(None, ROOT_NOTE.to_owned()), (Some(remote.0), REMOTE_NOTE.to_owned())]
+        );
+    }
+
+    #[test]
+    fn remote_tab_note_is_told_again_unchanged_so_its_dismissal_holds() {
+        let (handle, base, _host, local, remote) = mixed_window("remote-note-again");
+        assert!(handle.select_tab(remote));
+        let first = root_notes(&base.sent.borrow());
+        assert_eq!(first, [(Some(remote.0), REMOTE_NOTE.to_owned())]);
+        assert!(handle.select_tab(local));
+        clear(&[&base]);
+        assert!(handle.select_tab(remote));
+        assert_eq!(root_notes(&base.sent.borrow()), first);
+        clear(&[&base]);
+        let extra = attach_recording_page(&handle, view(2));
+        handle.page_message(view(2), READY);
+        clear(&[&base, &extra]);
+        handle.run(|state, out| {
+            assert_eq!(state.tabs.break_out(view(2)).unwrap(), remote);
+            view_payloads(state, view(2), out);
+        });
+        assert_eq!(root_notes(&extra.sent.borrow()), first);
+    }
+
+    /// A tab note dismissed in one page is told dismissed to the page the tab moves into, and to the first page
+    /// again: the window keeps the dismissal, not the page.
+    #[test]
+    fn a_dismissed_tab_note_stays_dismissed_in_the_page_the_tab_moves_into() {
+        let (handle, base, _host, _local, remote) = mixed_window("remote-note-dismissed");
+        assert!(handle.select_tab(remote));
+        let dismissed = |sent: &[String]| {
+            sent.iter()
+                .filter(|e| kind_of(e) == "root_note")
+                .map(|e| serde_json::from_str::<serde_json::Value>(e).unwrap()["dismissed"] == true)
+                .collect::<Vec<bool>>()
+        };
+        assert_eq!(dismissed(&base.sent.borrow()), [false]);
+        let dismiss = serde_json::json!({
+            "type": "root_note_dismissed", "request_id": "d1", "tab": remote.0, "text": REMOTE_NOTE,
+        });
+        handle.page_message(ViewId::BASE, &dismiss.to_string());
+        let extra = attach_recording_page(&handle, view(2));
+        handle.page_message(view(2), READY);
+        clear(&[&base, &extra]);
+        handle.run(|state, out| {
+            assert_eq!(state.tabs.break_out(view(2)).unwrap(), remote);
+            view_payloads(state, view(2), out);
+        });
+        assert_eq!(dismissed(&extra.sent.borrow()), [true]);
+    }
+
+    #[test]
+    fn remote_tab_terminal_handoff_is_refused_without_closing_the_session() {
+        let (handle, page, _host) = handle_with_recording_page();
+        handle.state.borrow_mut().project_dir = scratch_under_target("remote-handoff").join("project");
+        handle
+            .state
+            .borrow_mut()
+            .tabs
+            .set_project_origin(eitri_core::remote_project::TabOrigin::Remote {
+                host: "example-host".into(),
+                host_key_sha256: "SHA256:example".into(),
+                root: "/srv/project".into(),
+            })
+            .unwrap();
+        let dir = handle.state.borrow().project_dir.clone();
+        let (tab, provider) = live_tab(&handle, &dir);
+        provider.open_session("12345678-1234-4234-8234-123456789abc", &dir);
+        tick_handle_until(&handle, "remote session opened", || {
+            handle
+                .state
+                .borrow()
+                .tabs
+                .get(tab)
+                .unwrap()
+                .provider_session_id()
+                .is_some()
+        });
+        clear(&[&page]);
+        handle.page_message(
+            ViewId::BASE,
+            &serde_json::json!({
+                "type": "handoff_to_terminal", "request_id": "remote-handoff", "tab": tab.0
+            })
+            .to_string(),
+        );
+        let payloads = page.sent.borrow();
+        assert_eq!(
+            result_for(&payloads, "remote-handoff"),
+            Some(Err("terminal handoff is not available on remote tabs yet".into()))
+        );
+        assert!(!payloads
+            .iter()
+            .any(|p| kind_of(p) == "handoff" || p.contains("claude --resume")));
+        let state = handle.state.borrow();
+        let tab = state.tabs.get(tab).unwrap();
+        assert!(tab.live().is_some());
+        assert!(tab.pending_handoff.is_none());
+        assert_eq!(
+            tab.provider_session_id().as_deref(),
+            Some("12345678-1234-4234-8234-123456789abc")
+        );
+        drop(state);
+        drop(payloads);
+        shut_down_every_tab(&handle);
     }
 
     /// `agent.thinking` reaches the page: at once to a page already listening, and again on every

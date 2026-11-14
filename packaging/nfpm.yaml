@@ -47,7 +47,7 @@ overrides:
       - neovim
 
 contents:
-  # All five must land in one directory: companions are found beside current_exe(). Splitting
+  # All six must land in one directory: companions are found beside current_exe(). Splitting
   # them leaves pane switching unavailable. No agent-hook is needed because
   # release builds exclude the legacy backend whose PreToolUse gate it relays.
   - src: ./target/release/shell
@@ -58,11 +58,13 @@ contents:
     dst: /usr/lib/eitri/eitri-run-guard
   - src: ./target/release/eitri-editor-bridge
     dst: /usr/lib/eitri/eitri-editor-bridge
+  - src: ./target/release/eitri-server
+    dst: /usr/lib/eitri/eitri-server
   - src: ./target/release/eitri-claude-handoff
     dst: /usr/lib/eitri/eitri-claude-handoff
 
   # The Verdandi sidecar, as a self-contained executable with no Node runtime dependency (its own
-  # build bundles one). Installed beside the five binaries above, under a versionless name: the
+  # build bundles one). Installed beside the six binaries above, under a versionless name: the
   # artifact's own file name carries its version and architecture, which is right for a download and wrong for an
   # installed path -- encoding it here would make every sidecar upgrade a change to this file. The
   # compatibility statement lives in the handshake (protocol major plus sidecar_version).

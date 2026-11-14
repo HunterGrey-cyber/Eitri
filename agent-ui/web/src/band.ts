@@ -1,13 +1,13 @@
 import type { PanelMode } from "./keymap";
 import type { RemoteConnectedDevice } from "./bridge";
-import type { BackgroundTaskRecord, EditorLink, TurnEnding, UsageInfo } from "./types";
+import type { BackgroundTaskRecord, RemoteLinkState, EditorLink, TurnEnding, UsageInfo } from "./types";
 import { turnEndingBandText } from "./turnEnding";
 import { revealedPathText, revealedText } from "./revealHidden";
 import { SHORT_FLASH } from "./app/flashes";
 
 /** One segment's identity, in priority order (used only for lookups here --
  *  `bandLayout`'s own construction order, not this list, decides degrade order and render order). */
-export type SegId = "mode" | "pill" | "showcmd" | "message" | "prompt" | "warn" | "unread" | "cards" | "card" | "queue" | "context" | "link" | "position" | "model" | "effort" | "usage" | "review" | "recovery" | "ending" | "background" | "following" | "phone";
+export type SegId = "location" | "mode" | "pill" | "showcmd" | "message" | "prompt" | "warn" | "unread" | "cards" | "card" | "queue" | "context" | "link" | "position" | "model" | "effort" | "usage" | "review" | "recovery" | "ending" | "background" | "following" | "phone";
 
 /** One piece of the band: the text to show and which side of the gap it belongs on (left of the
  *  gap is mode, pill, `⚑N`, `⧗N`, message; right of it is showcmd, `⚠`, context,
@@ -39,6 +39,8 @@ export type Seg = {
  *  a pure function over this plus the measured width, so the degrade rule is testable
  *  with no browser. */
 export type BandFacts = {
+  host?: string | null;
+  accountName?: string | null;
   mode: PanelMode;
   pill: string;
   showcmd: string | null;
@@ -111,6 +113,16 @@ export type BandFacts = {
    *  within `OWN_MOVE_MS` of a key outside INSERT is the reader's own move and is drawn at once (`steadyBand.ts`). */
   keyAge?: number;
 };
+
+export function remoteLinkLine(host: string | null | undefined, state: RemoteLinkState | null | undefined): string | null {
+  if (!state || !host || state.kind === "live") return null;
+  const name = revealedText(host);
+  switch (state.kind) {
+    case "disconnected": return `disconnected from ${name}; the agent may still be working`;
+    case "reconnecting": return `reconnecting to ${name}… (attempt ${state.attempt})`;
+    case "catching_up": return `catching up ${state.done} / ${state.total}`;
+  }
+}
 
 /** The phone mark's tooltip: each connected phone with its grant and the `Host` it came through (a phone's and the
  *  network's words, with their hidden characters written as escapes), and the host's sandbox report. */
@@ -355,6 +367,7 @@ export function bandLayoutSteady(
   // mode, the pill and the figures. The band names card mode only while it holds a card.
   const cardText = cardForms ? cardForms.long : null;
   const cardAs = (text: string) => (s: Seg[]) => s.map((x) => (x.id === "card" ? { ...x, text } : x));
+  const location = [f.host ? revealedText(f.host) : "", f.accountName ? `account ${revealedText(f.accountName)}` : ""].filter(Boolean).join(" · ");
   let segs: Seg[] = [
     mode,
     pill,
@@ -362,6 +375,7 @@ export function bandLayoutSteady(
     ...(f.cards + (f.questions ?? 0) > 0 ? [{ id: "cards", text: `⚑${f.cards + (f.questions ?? 0)}`, side: "left" } as Seg] : []),
     ...(f.queued > 0 ? [{ id: "queue", text: `⧗${f.queued}`, side: "left" } as Seg] : []),
     ...phone,
+    ...(location ? [{ id: "location", text: location, side: "right" } as Seg] : []),
     ...(background ? [{ id: "background", text: background, side: "left" } as Seg] : []),
     ...(f.following ? [{ id: "following", text: "following", side: "left" } as Seg] : []),
     ...(f.ending ? [{ id: "ending", text: turnEndingBandText(f.ending), side: "left" } as Seg] : []),
@@ -383,8 +397,9 @@ export function bandLayoutSteady(
   const cellsOf = (x: Seg) => Math.max(textWidth(x.text), x.cells ?? 0);
   const width = (s: Seg[]) => s.reduce((n, x) => n + cellsOf(x) + PAD + (x.id === "mode" ? MODE_ARROW : 0), 0);
   const steps: ((s: Seg[]) => Seg[])[] = [
+    (s) => s.filter((x) => x.id !== "location"),
     (s) => tasks === null ? s : s.map((x) => x.id === "background" ? { ...x, text: backgroundFallback(tasks.length) } : x),
-    // The usage figure is the least urgent thing on the band -- it goes before even the context
+    // The usage figure goes before the context
     // is shortened, so a narrow panel never trades the file it is showing for a running total.
     (s) => s.filter((x) => x.id !== "usage"),
     (s) => s.map((x) => (x.id === "context" && f.context ? { ...x, text: `⧉ ${f.context.file}` } : x)),

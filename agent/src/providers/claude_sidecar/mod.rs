@@ -251,6 +251,15 @@ fn capabilities_from_handshake(response: &HandshakeResponse) -> ProviderCapabili
     }
 }
 
+/// What the history of a session whose sidecar no longer runs is judged against. No handshake says what the session
+/// asked for, so its CLI may have reported the CLI's own auto mode, its `default` fallback or plan mode, as any
+/// session this window creates may: none of those closes the tab, while a mode no session here asks for (bypass,
+/// `acceptEdits`) still does. Nothing is sent or answered on such a session.
+const HISTORY_ONLY_EXPECTATION: crate::CliExpectation = crate::CliExpectation {
+    requested: crate::RequestedCliMode::Auto,
+    plan_offered: true,
+};
+
 /// What every session this provider creates asks the CLI to run in under the gate.
 fn requested_cli_mode(capabilities: &ProviderCapabilities) -> crate::RequestedCliMode {
     if capabilities.cli_auto_mode {
@@ -265,10 +274,13 @@ fn info_from_handshake(
     build_description: Option<String>,
     startup_diagnostics: Vec<String>,
 ) -> ProviderInfo {
+    let stated = |value: &str| (!value.is_empty()).then(|| value.to_string());
     ProviderInfo {
         host: None,
-        account_name: None,
-        account_config_dir: None,
+        // The account the sidecar resolved for itself and the directory its CLI really reads, local
+        // and remote alike: the sidecar is the one that knows.
+        account_name: stated(&response.account_name),
+        account_config_dir: stated(&response.effective_claude_config_dir).map(std::path::PathBuf::from),
         sidecar_version: response.sidecar_version.clone(),
         claude_agent_sdk_version: response.claude_agent_sdk_version.clone(),
         actual_claude_code_version: response.actual_claude_code_version.clone(),
@@ -411,7 +423,8 @@ pub struct ClaudeSidecarProvider {
     /// Behind a lock because a move hands it on (or takes it up) while the provider is shared with
     /// its conversation's ingest thread.
     transport: Mutex<Box<dyn SidecarTransport>>,
-    runtime: RuntimeThread,
+    /// Shared with the helper connection of a remote tab, whose channel lives on it.
+    runtime: Arc<RuntimeThread>,
     client: RuntimeClient,
     events: Arc<EventQueue>,
     backpressure: Arc<BackpressureCounters>,
@@ -431,6 +444,9 @@ pub struct ClaudeSidecarProvider {
     claude_code_prompt: bool,
     /// The handshake's limit on one request; 0 when the peer stated none. Read by the answer path.
     max_message_bytes: u64,
+    /// A remote tab whose sidecar the helper no longer runs (`journal_only`): only its history is read back, and
+    /// its CLI's reports are judged by what any session this window creates may report (`session_expectation`).
+    history_only: bool,
     #[cfg(feature = "test-support")]
     questions_override: Option<bool>,
     #[cfg(feature = "test-support")]
@@ -441,7 +457,6 @@ pub struct ClaudeSidecarProvider {
     plan_offered: AtomicBool,
     /// The watch task of each session opened, newest last; a move cancels the source's. Only a move
     /// reads it, so a build without moves keeps none.
-    #[cfg(target_os = "linux")]
     watches: Mutex<Vec<Watch>>,
     /// A sidecar taken over from another process and not committed yet: the session whose watch the
     /// commit opens, and where it goes on from. Nothing is watched, read or answered until then.
@@ -450,10 +465,26 @@ pub struct ClaudeSidecarProvider {
     released: AtomicBool,
     #[cfg(feature = "test-support")]
     per_task_stop_override: Option<bool>,
+    /// What only a remote tab has: its helper connection and the state of its link. `None` for a
+    /// sidecar on this machine, whose watch keeps its own rule.
+    remote: Option<RemoteSide>,
 }
 
-/// One session's watch task.
-#[cfg(target_os = "linux")]
+/// What checks a remote tab's link, the state the panel reads, and the clock its reconnects wait on.
+/// The watch task keeps a copy, so it holds nothing that owns the runtime it runs on: the helper
+/// connection (and with it the runtime) is the transport's, and goes with the provider.
+#[derive(Clone)]
+struct RemoteSide {
+    checker: crate::remote_client::LinkChecker,
+    link: Arc<watch::LinkCell>,
+    clock: Arc<dyn crate::remote_client::ReconnectClock>,
+    /// Asks the helper what waits in a session whose journal has a gap.
+    asker: crate::remote_client::PendingAsker,
+    /// How the session ended, once the helper said: written before its loss is queued.
+    ending: Arc<Mutex<Option<crate::provider::RemoteEnding>>>,
+}
+
+/// One session's watch task. It ends with the provider (`Drop`), whoever else keeps the runtime alive.
 struct Watch {
     session_id: String,
     task: tokio::task::JoinHandle<()>,
@@ -482,6 +513,9 @@ struct WatchState {
     /// The questions this watch delivered an ask or a settlement for, so the reconcile after a re-opened
     /// stream adds only questions it never saw (`watch::reconcile_questions`).
     questions: watch::QuestionLedger,
+    /// The last sequence a window had folded before it let go of the session: what the replay reads up to
+    /// there happened while a window was attached. 0 for a session this watch follows from its start.
+    attached_through: u64,
 }
 
 /// Where a session's watch stood just after one event: the event's sequence, and the state its
@@ -509,6 +543,7 @@ impl WatchState {
             cli_mode_note: translate::CliModeNote::new(requested),
             consecutive_failures: 0,
             questions: watch::QuestionLedger::default(),
+            attached_through: 0,
         }
     }
 
@@ -525,6 +560,7 @@ impl WatchState {
             cli_mode_note: translate::CliModeNote::resuming(requested, mark.cli_mode_noted),
             consecutive_failures: 0,
             questions: watch::QuestionLedger::default(),
+            attached_through: mark.sequence,
         }
     }
 
@@ -540,6 +576,8 @@ impl WatchState {
             // Not carried: the other process's projection holds the questions already asked, and a
             // reconcile there that adds one of them again replaces its record with the same set.
             questions: _,
+            // Not carried: the taking side's watch reads on from the mark, which is where it is attached from.
+            attached_through: _,
         } = self;
         WatchMark {
             sequence: tracker.after_sequence(),
@@ -560,6 +598,23 @@ struct Handshaken {
     provider_prompts: bool,
     claude_code_prompt: bool,
     max_message_bytes: u64,
+    /// Made up for a sidecar that no longer runs: no handshake took place (`journal_only`).
+    history_only: bool,
+}
+
+fn handshake_failure(status: tonic::Status) -> std::io::Error {
+    let text = format!("handshake failed: {status}");
+    let incompatible = error_detail(&status).is_some_and(|d| d.code == ProtoErrorCode::IncompatibleProtocol as i32);
+    if incompatible {
+        std::io::Error::other(RefusedThisClient {
+            text,
+            words: status.message().to_string(),
+        })
+    } else if status.code() == tonic::Code::Unavailable && status.message().starts_with("the helper is adopting") {
+        std::io::Error::new(std::io::ErrorKind::WouldBlock, text)
+    } else {
+        std::io::Error::other(text)
+    }
 }
 
 /// Connects to the sidecar's socket and runs the real `Handshake`, refusing a socket served by another
@@ -589,19 +644,7 @@ fn handshake_with(
             UNARY_RPC_TIMEOUT,
         )
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::TimedOut, e.to_string()))?
-        .map_err(|status| {
-            let text = format!("handshake failed: {status}");
-            let incompatible =
-                error_detail(&status).is_some_and(|d| d.code == ProtoErrorCode::IncompatibleProtocol as i32);
-            if incompatible {
-                std::io::Error::other(RefusedThisClient {
-                    text,
-                    words: status.message().to_string(),
-                })
-            } else {
-                std::io::Error::other(text)
-            }
-        })?
+        .map_err(handshake_failure)?
         .into_inner();
 
     // An incompatible major is refused, minor differences are tolerated
@@ -670,6 +713,7 @@ fn handshake_with(
         provider_prompts,
         claude_code_prompt,
         max_message_bytes: handshake.max_message_bytes,
+        history_only: false,
     })
 }
 
@@ -729,7 +773,7 @@ impl ClaudeSidecarProvider {
             spawn::spawn_program(instance_id, path)
                 .map_err(|error| did_not_start(spawn::start_failure_reason(&error)))?,
         );
-        let runtime = RuntimeThread::spawn();
+        let runtime = Arc::new(RuntimeThread::spawn());
         let mut handshaken =
             handshake_with(&runtime, &sidecar, None, spawn::running_exe_dir().as_deref()).map_err(|error| {
                 if let Some(refused) = error
@@ -753,7 +797,7 @@ impl ClaudeSidecarProvider {
             lacks,
         })?;
         handshaken.info.sidecar_update = Some(version.to_string());
-        Ok(Self::holding(sidecar, runtime, handshaken))
+        Ok(Self::holding(Box::new(sidecar), runtime, handshaken, None))
     }
 
     /// [`Self::connect`] with what the files on disk would say given by the caller: `update` is the
@@ -802,6 +846,211 @@ impl ClaudeSidecarProvider {
             .map_err(|error| with_failure_notes(error, Some(exe_dir)))
     }
 
+    /// A remote tab's provider: asks the helper behind `client` to start a sidecar for `start`, then
+    /// runs the same handshake over the helper connection. The tab's watch reconnects for as long as
+    /// the helper may hold the agent (`watch::remote_watch_verdict`), and `link_state` reports the
+    /// connection for the tab's whole life. Blocking: a worker's call.
+    ///
+    /// `client` must have been opened for `host_key_sha256` (`HelperClient::connect`); a connection
+    /// opened for another key, or for none, is refused before anything is asked of the helper. Refuses
+    /// a helper of another protocol major, naming both versions, and an account the server lacks,
+    /// naming the host. A sidecar that started and then failed its handshake is stopped again.
+    pub fn connect_through_helper(
+        client: crate::remote_client::HelperClient,
+        host_key_sha256: &str,
+        start: &crate::remote_client::SidecarStart,
+    ) -> std::io::Result<Self> {
+        Self::through_helper(
+            client,
+            host_key_sha256,
+            start,
+            Arc::new(crate::remote_client::SystemClock),
+        )
+    }
+
+    /// [`Self::connect_through_helper`] with reconnects waiting on `clock`, and this process's state in
+    /// the test's own root.
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    pub fn connect_through_helper_on(
+        client: crate::remote_client::HelperClient,
+        host_key_sha256: &str,
+        start: &crate::remote_client::SidecarStart,
+        clock: Arc<dyn crate::remote_client::ReconnectClock>,
+    ) -> std::io::Result<Self> {
+        crate::state_dirs::redirect_state_to_a_test_root();
+        Self::through_helper(client, host_key_sha256, start, clock)
+    }
+
+    fn through_helper(
+        client: crate::remote_client::HelperClient,
+        host_key_sha256: &str,
+        start: &crate::remote_client::SidecarStart,
+        clock: Arc<dyn crate::remote_client::ReconnectClock>,
+    ) -> std::io::Result<Self> {
+        let host = client.host().to_string();
+        // Every check of the root this machine can make comes before the server starts anything.
+        crate::AgentConversation::check_remote_root(&start.root)
+            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error.to_string()))?;
+        // The connection must be one opened for this project's recorded key, so that its first channel
+        // was compared with that key and so is every later one; asked before Hello, so nothing starts on
+        // a connection opened for another key or for none.
+        let checker = client.link_checker(Some(host_key_sha256))?;
+        let refused = |status: tonic::Status| std::io::Error::other(status.message().to_string());
+        let hello = client.hello().map_err(refused)?;
+        let sidecar_id = client.start_sidecar(start).map_err(|status| {
+            if status.code() == tonic::Code::NotFound {
+                refused(status)
+            } else {
+                std::io::Error::other(format!(
+                    "the agent's sidecar did not start on {host}: {}",
+                    status.message()
+                ))
+            }
+        })?;
+        let transport = transport::helper::ThroughHelper::new(
+            client.clone(),
+            sidecar_id.clone(),
+            host_key_sha256.to_string(),
+            &hello,
+        );
+        let runtime = client.runtime();
+        let mut handshaken = match handshake_with(&runtime, &transport, None, None) {
+            Ok(handshaken) => handshaken,
+            Err(error) => {
+                let mut transport = transport;
+                if let Err(stop) = transport.stop() {
+                    eprintln!(
+                        "agent: ClaudeSidecarProvider: the sidecar on {host} that failed its handshake was not \
+                         stopped: {stop}"
+                    );
+                }
+                return Err(std::io::Error::new(
+                    error.kind(),
+                    format!("the agent's sidecar on {host} did not answer: {error}"),
+                ));
+            }
+        };
+        handshaken.info.host = Some(host);
+        let remote = RemoteSide {
+            checker,
+            link: Arc::default(),
+            clock,
+            asker: client.pending_asker(&sidecar_id),
+            ending: Arc::default(),
+        };
+        Ok(Self::holding(Box::new(transport), runtime, handshaken, Some(remote)))
+    }
+
+    /// A remote tab taken up again in a window that did not start it (a reopened window restoring its
+    /// saved tabs): the sidecar `helper` names, reached over `client` (opened for its host key), and the
+    /// session's history folded afresh from the journal's start -- never a resume. When the helper no
+    /// longer runs that sidecar (it ended, or the server restarted) the watch still opens: it folds what
+    /// the helper still serves of the journal and ends with the agent gone
+    /// ([`crate::provider::RemoteEnding::AgentGone`]), so the CLI's session can be continued by a new
+    /// sidecar. Blocking: a worker's call.
+    pub fn reattach_through_helper(
+        client: crate::remote_client::HelperClient,
+        helper: &HelperHandoff,
+    ) -> std::io::Result<Self> {
+        Self::reattach_on(client, helper, Arc::new(crate::remote_client::SystemClock))
+    }
+
+    /// [`Self::reattach_through_helper`] with reconnects waiting on `clock`, and this process's state in
+    /// the test's own root.
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    pub fn reattach_through_helper_on(
+        client: crate::remote_client::HelperClient,
+        helper: &HelperHandoff,
+        clock: Arc<dyn crate::remote_client::ReconnectClock>,
+    ) -> std::io::Result<Self> {
+        crate::state_dirs::redirect_state_to_a_test_root();
+        Self::reattach_on(client, helper, clock)
+    }
+
+    fn reattach_on(
+        client: crate::remote_client::HelperClient,
+        helper: &HelperHandoff,
+        clock: Arc<dyn crate::remote_client::ReconnectClock>,
+    ) -> std::io::Result<Self> {
+        let (transport, runtime, handshaken, remote) = Self::reaching(client, helper, clock)?;
+        let provider = Self::holding(transport, runtime, handshaken, Some(remote));
+        // The record does not say whether the session's creation offered plan mode: it is taken as offered when
+        // this build offers it to this sidecar, so the journal's plans and the CLI's `plan` reports fold as on
+        // the window that created it.
+        provider
+            .plan_offered
+            .store(provider.offers_plan_mode(), Ordering::SeqCst);
+        // Folded afresh from the journal's start; what the window that saved the tab had folded happened while
+        // it was attached.
+        let mut state = WatchState::fresh(provider.splits_messages, provider.session_expectation());
+        state.attached_through = helper.last_folded_sequence;
+        provider.watch_from(helper.session_id.clone(), state);
+        Ok(provider)
+    }
+
+    /// Reaches a sidecar the helper already holds, over `client` (which must have been opened for the
+    /// record's host key): Hello, then the handshake when the helper lists the sidecar as running. When
+    /// it does not, the provider sends nothing and only watches, which says how the session ended.
+    fn reaching(
+        client: crate::remote_client::HelperClient,
+        helper: &HelperHandoff,
+        clock: Arc<dyn crate::remote_client::ReconnectClock>,
+    ) -> std::io::Result<(Box<dyn SidecarTransport>, Arc<RuntimeThread>, Handshaken, RemoteSide)> {
+        let host = client.host().to_string();
+        let client = client
+            .for_sidecar(&helper.daemon, &helper.sidecar_id)
+            .map_err(|status| std::io::Error::other(status.message().to_owned()))?;
+        let checker = client.link_checker(Some(&helper.host_key_sha256))?;
+        let refused = |status: tonic::Status| std::io::Error::other(status.message().to_string());
+        let hello = match client.hello() {
+            Ok(hello) => hello,
+            Err(_) if client.installation_gone() => eitri_server_proto::HelloResponse::default(),
+            Err(status) => return Err(refused(status)),
+        };
+        let gone = client.installation_gone();
+        let running = !gone
+            && client
+                .list()
+                .map_err(refused)?
+                .iter()
+                .any(|sidecar| sidecar.sidecar_id == helper.sidecar_id && sidecar.alive);
+        let transport = transport::helper::ThroughHelper::new(
+            client.clone(),
+            helper.sidecar_id.clone(),
+            helper.host_key_sha256.clone(),
+            &hello,
+        )
+        .with_tools(&helper.declared_client_tools);
+        let runtime = client.runtime();
+        let mut handshaken = if running {
+            retry_adoption(
+                || handshake_with(&runtime, &transport, None, None),
+                |wait| {
+                    let _ = runtime.block_on(clock.sleep(wait), UNARY_RPC_TIMEOUT);
+                },
+            )
+            .map_err(|error| {
+                std::io::Error::new(
+                    error.kind(),
+                    format!("the agent's sidecar on {host} did not answer: {error}"),
+                )
+            })?
+        } else {
+            journal_only(&runtime, &transport)?
+        };
+        handshaken.info.host = Some(host);
+        let remote = RemoteSide {
+            checker,
+            link: Arc::default(),
+            clock,
+            asker: client.pending_asker(&helper.sidecar_id),
+            ending: Arc::new(Mutex::new(gone.then_some(crate::provider::RemoteEnding::AgentGone))),
+        };
+        Ok((Box::new(transport), runtime, handshaken, remote))
+    }
+
     /// A provider driving `sidecar`, which this process started and holds.
     fn around(sidecar: SpawnedSidecar) -> std::io::Result<Self> {
         let exe = std::env::current_exe().ok();
@@ -810,7 +1059,7 @@ impl ClaudeSidecarProvider {
 
     fn around_in(sidecar: SpawnedSidecar, exe_dir: Option<&std::path::Path>) -> std::io::Result<Self> {
         let sidecar = LocalChild::new(sidecar);
-        let runtime = RuntimeThread::spawn();
+        let runtime = Arc::new(RuntimeThread::spawn());
         let handshaken = handshake_with(&runtime, &sidecar, None, exe_dir).map_err(|error| {
             let stderr = sidecar.stderr_tail();
             if stderr.is_empty() {
@@ -822,10 +1071,15 @@ impl ClaudeSidecarProvider {
                 )
             }
         })?;
-        Ok(Self::holding(sidecar, runtime, handshaken))
+        Ok(Self::holding(Box::new(sidecar), runtime, handshaken, None))
     }
 
-    fn holding(sidecar: LocalChild, runtime: RuntimeThread, handshaken: Handshaken) -> Self {
+    fn holding(
+        sidecar: Box<dyn SidecarTransport>,
+        runtime: Arc<RuntimeThread>,
+        handshaken: Handshaken,
+        remote: Option<RemoteSide>,
+    ) -> Self {
         let Handshaken {
             client,
             capabilities,
@@ -834,9 +1088,10 @@ impl ClaudeSidecarProvider {
             provider_prompts,
             claude_code_prompt,
             max_message_bytes,
+            history_only,
         } = handshaken;
         Self {
-            transport: Mutex::new(Box::new(sidecar)),
+            transport: Mutex::new(sidecar),
             runtime,
             client,
             events: Arc::new(EventQueue::default()),
@@ -847,17 +1102,18 @@ impl ClaudeSidecarProvider {
             provider_prompts,
             claude_code_prompt,
             max_message_bytes,
+            history_only,
             #[cfg(feature = "test-support")]
             questions_override: None,
             #[cfg(feature = "test-support")]
             plan_mode_override: None,
             plan_offered: AtomicBool::new(false),
-            #[cfg(target_os = "linux")]
             watches: Mutex::new(Vec::new()),
             parked: Mutex::new(None),
             released: AtomicBool::new(false),
             #[cfg(feature = "test-support")]
             per_task_stop_override: None,
+            remote,
         }
     }
 
@@ -889,6 +1145,13 @@ impl ClaudeSidecarProvider {
         #[cfg(not(feature = "test-support"))]
         let readiness = None;
         PlanPolicy::resolve(self.capabilities.plan_mode_v1, readiness)
+    }
+
+    /// Whether a session this provider creates offers plan mode: the peer offers it, the host is ready for
+    /// it, and the session runs the CLI's own prompts (as `build_create_request_loading` decides).
+    fn offers_plan_mode(&self) -> bool {
+        let plans = self.plan_policy();
+        plans.capable && plans.client_implements && self.provider_prompts
     }
 
     /// A private harness choice, made before creating a session; it never overrides a missing capability.
@@ -942,6 +1205,13 @@ impl ClaudeSidecarProvider {
         }
     }
 
+    /// The most this provider's event queue ever held at once, by its own estimate.
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    pub fn queue_peak_bytes(&self) -> usize {
+        self.events.lock().peak_bytes
+    }
+
     /// The sidecar process's recent stderr, for diagnosing a provider that connected but is
     /// misbehaving. `info().startup_diagnostics` is the curated subset worth showing a user.
     pub fn sidecar_stderr_tail(&self) -> Vec<String> {
@@ -974,8 +1244,34 @@ impl ClaudeSidecarProvider {
     /// Never match sidecar or `claude` processes by name for that purpose: Claude Code sessions on a
     /// developer machine are themselves processes named `claude`, so a name-matched search sweeps up
     /// the session running the test. Capture this pid, check this pid.
+    ///
+    /// A remote tab's sidecar is not on this machine, and this panics rather than give a number that
+    /// could reach `kill`; [`Self::local_sidecar_pid`] says which it is.
     pub fn sidecar_pid(&self) -> u32 {
+        self.local_sidecar_pid()
+            .expect("a remote tab's sidecar runs on its server, not on this machine")
+    }
+
+    /// The OS pid of the sidecar this provider holds on this machine; `None` for a remote tab.
+    pub fn local_sidecar_pid(&self) -> Option<u32> {
         lock(&self.transport).pid()
+    }
+
+    /// Stops a remote tab's sidecar on its server (`StopSidecar`): a start that failed after the sidecar
+    /// was started, a tab closed while connected, the person's "deny them and stop the agent". Nothing
+    /// for a sidecar on this machine, which its holder ends. Refused while another window drives the
+    /// session (this one handed it on, or has taken it and not committed): the agent is that window's.
+    /// Blocking.
+    pub fn stop_remote_sidecar(&self) -> std::io::Result<()> {
+        if self.remote.is_none() {
+            return Ok(());
+        }
+        if self.released.load(Ordering::SeqCst) || lock(&self.parked).is_some() {
+            return Err(std::io::Error::other(
+                "this chat's agent is driven from another window now",
+            ));
+        }
+        transport::stop_remote(&self.transport)
     }
 
     fn map_status(&self, status: tonic::Status) -> ProviderError {
@@ -1078,6 +1374,9 @@ impl ClaudeSidecarProvider {
     /// What the reports of this provider's session are judged against: the mode every session it opens
     /// asks for, and whether the one it opened offered plan mode.
     fn session_expectation(&self) -> crate::CliExpectation {
+        if self.history_only {
+            return HISTORY_ONLY_EXPECTATION;
+        }
         crate::CliExpectation {
             requested: requested_cli_mode(&self.capabilities),
             plan_offered: self.plan_offered.load(Ordering::SeqCst),
@@ -1095,7 +1394,9 @@ impl ClaudeSidecarProvider {
         // Questions and plans still waiting are read back after a re-opened stream.
         let plans_offered = requested.plan_offered;
         let asks_questions = self.capabilities.structured_questions_v1 || plans_offered;
-        #[cfg(target_os = "linux")]
+        // A remote tab's watch differs in three things only: what ends it (`remote_watch_verdict`),
+        // the link state it keeps, and that it stops reading while the queue is full.
+        let remote = self.remote.clone();
         let watched = session_id.clone();
         let watch = async move {
             // The single exit for every abnormal path. Nothing here may return quietly except the
@@ -1105,9 +1406,20 @@ impl ClaudeSidecarProvider {
                 events.push(AgentDomainEvent::SessionUnavailable { reason });
             };
 
+            if let Some(remote) = remote.as_ref().filter(|remote| remote.checker.installation_gone()) {
+                *lock(&remote.ending) = Some(crate::provider::RemoteEnding::AgentGone);
+                remote.link.set(crate::provider::RemoteLinkState::Live);
+                report(crate::remote_client::MISSING_INSTALLATION.into());
+                return;
+            }
+
             // The first open reads from the session's start; every later one is a re-watch.
             let mut reopening = false;
+            let mut outage = Outage::default();
+            // A remote tab's: what the CLI decided about a request while no window was attached.
+            let mut unattended = watch::UnattendedExpiry::default();
             loop {
+                let after = state.tracker.after_sequence();
                 let request = WatchSessionEventsRequest {
                     session_id: session_id.clone(),
                     // Always AFTER_SEQUENCE, on the first open as well as every reconnect. See
@@ -1115,35 +1427,43 @@ impl ClaudeSidecarProvider {
                     // both are defined as unable to report a gap, which is the one thing this client
                     // must never accept silently.
                     start: ReplayStart::AfterSequence as i32,
-                    after_sequence: Some(state.tracker.after_sequence()),
+                    after_sequence: Some(after),
                 };
                 let opened = {
                     let mut client = client.clone();
                     client.watch_session_events(request).await
                 };
-                let mut stream = match opened {
+                let (mut stream, mut catch_up) = match opened {
                     Ok(response) => {
+                        let catch_up = remote
+                            .as_ref()
+                            .and_then(|_| watch::CatchUp::opened(after, journal_head(response.metadata())));
+                        if let Some(remote) = &remote {
+                            remote
+                                .link
+                                .set(catch_up.map_or(crate::provider::RemoteLinkState::Live, |c| c.start()));
+                            outage.opened(remote.clock.now_unix_ms());
+                        }
                         let snapshot = (std::mem::replace(&mut reopening, true) && asks_questions)
                             .then(|| read_interaction_state(&client, &session_id, plans_offered));
                         stream_reopened(&events, &mut state, snapshot).await;
-                        response.into_inner()
+                        (response.into_inner(), catch_up)
                     }
                     Err(status) => {
-                        let detail = match watch::classify_open_failure(&map_status(status)) {
-                            watch::OpenFailure::Fatal(detail) => {
-                                report(watch::stream_ended_early_reason(&detail));
-                                return;
-                            }
-                            watch::OpenFailure::Retry(detail) => detail,
-                        };
-                        match watch::WATCH_RECONNECT_BACKOFF.get(state.consecutive_failures) {
-                            Some(delay) => {
-                                state.consecutive_failures += 1;
-                                backpressure.watch_reconnects.fetch_add(1, Ordering::Relaxed);
-                                tokio::time::sleep(*delay).await;
-                                continue;
-                            }
-                            None => {
+                        let failure = watch::WatchFailure::Open(status);
+                        let ended = after_failure(
+                            remote.as_ref(),
+                            &events,
+                            &failure,
+                            &mut state,
+                            &mut outage,
+                            &backpressure,
+                            (&session_id, requested),
+                        )
+                        .await;
+                        match ended {
+                            None => continue,
+                            Some(detail) => {
                                 report(watch::stream_ended_early_reason(&detail));
                                 return;
                             }
@@ -1153,11 +1473,23 @@ impl ClaudeSidecarProvider {
 
                 let mut delivered_since_open = false;
                 let mut closed_by_session = false;
-                let end_detail = loop {
+                let failure = loop {
+                    if remote.is_some() {
+                        // A replay of thousands of events stops here while the conversation catches
+                        // up, so what is queued stays far below the queue's budget.
+                        events.below_high_water().await;
+                    }
                     match stream.message().await {
                         Ok(Some(mut event)) => {
                             let sequence = event.sequence;
-                            record_delivery_lag(&backpressure, event.occurred_at);
+                            let occurred_at = event.occurred_at;
+                            // An expiry the CLI reported as such, read in a replay past what a window had folded
+                            // while attached: the one kind of resolution that may be its unattended denial.
+                            let unattended_expiry = remote.is_some()
+                                && catch_up.is_some()
+                                && sequence > state.attached_through
+                                && translate::expired_on_the_wire(&event);
+                            record_delivery_lag(&backpressure, occurred_at);
                             match state.tracker.observe(sequence) {
                                 watch::SequenceVerdict::Deliver => {
                                     delivered_since_open = true;
@@ -1184,7 +1516,11 @@ impl ClaudeSidecarProvider {
                                             continue;
                                         }
                                         let effort = events.effort_answer(&domain_event);
+                                        let unattended_note = remote.as_ref().and_then(|_| {
+                                            unattended.observe(&domain_event, occurred_at, unattended_expiry)
+                                        });
                                         translated.push(domain_event);
+                                        translated.extend(unattended_note);
                                         translated.extend(effort);
                                     }
                                     // The asks a reconcile held back until the replay got this far.
@@ -1192,11 +1528,21 @@ impl ClaudeSidecarProvider {
                                     // Queued with the watch's position after the event, so whoever
                                     // takes them knows where the watch stood as of the last one.
                                     events.push_wire(translated, state.mark());
+                                    if let (Some(remote), Some(replay)) = (&remote, catch_up) {
+                                        let (link, over) = replay.at(sequence);
+                                        remote.link.set(link);
+                                        if over {
+                                            catch_up = None;
+                                        }
+                                    }
                                 }
                                 // Replay after a reconnect legitimately re-sends what was already
                                 // delivered. Dropping those is the one silent path that is correct.
                                 watch::SequenceVerdict::Duplicate => {}
                                 watch::SequenceVerdict::Lost { first, last } => {
+                                    if let Some(remote) = &remote {
+                                        note_remote_ending(remote, &session_id, true, requested).await;
+                                    }
                                     report(watch::events_lost_reason(first, last));
                                     return;
                                 }
@@ -1211,8 +1557,8 @@ impl ClaudeSidecarProvider {
                         // A clean end AFTER the session's own terminal event is normal. A clean end
                         // without one is not: the sidecar's pump loop reaches exactly that state
                         // when it tears a session down with no terminal event left to broadcast.
-                        Ok(None) => break "the provider closed the event stream".to_string(),
-                        Err(status) => break status.to_string(),
+                        Ok(None) => break watch::WatchFailure::EndedEarly,
+                        Err(status) => break watch::WatchFailure::Broke(status),
                     }
                 };
 
@@ -1225,33 +1571,287 @@ impl ClaudeSidecarProvider {
                 if delivered_since_open {
                     state.consecutive_failures = 0;
                 }
-                match watch::WATCH_RECONNECT_BACKOFF.get(state.consecutive_failures) {
-                    Some(delay) => {
-                        state.consecutive_failures += 1;
-                        backpressure.watch_reconnects.fetch_add(1, Ordering::Relaxed);
-                        tokio::time::sleep(*delay).await;
+                if let Some(remote) = &remote {
+                    // A stream that stayed open a while ended an outage even with nothing to deliver
+                    // (a tab waiting for its person): the next one counts its attempts from the start.
+                    if outage.stayed_open(remote.clock.now_unix_ms()) {
+                        state.consecutive_failures = 0;
                     }
-                    None => {
-                        report(watch::stream_ended_early_reason(&end_detail));
-                        return;
-                    }
+                }
+                if let Some(detail) = after_failure(
+                    remote.as_ref(),
+                    &events,
+                    &failure,
+                    &mut state,
+                    &mut outage,
+                    &backpressure,
+                    (&session_id, requested),
+                )
+                .await
+                {
+                    report(watch::stream_ended_early_reason(&detail));
+                    return;
                 }
             }
         };
         let events = Arc::clone(&self.events);
+        // However the watch ends (a loss, an overflow, the session closing), a remote tab's link is not
+        // left reading as if it were still reconnecting or catching up.
+        let link = self.remote.as_ref().map(|remote| Arc::clone(&remote.link));
         let task = self.runtime.handle().spawn(async move {
             events.observe(watch).await;
+            if let Some(link) = link {
+                link.set(crate::provider::RemoteLinkState::Live);
+            }
         });
-        #[cfg(target_os = "linux")]
         lock(&self.watches).push(Watch {
             session_id: watched,
             task,
         });
-        // Nothing moves a session here, so nothing will cancel its watch: dropping the handle leaves the
-        // task running, as keeping it did.
-        #[cfg(not(target_os = "linux"))]
-        drop(task);
     }
+}
+
+impl Drop for ClaudeSidecarProvider {
+    /// The watches end with the provider. The runtime they run on may outlive it (a remote tab's helper
+    /// connection can be shared), and a watch left running would go on reconnecting for nobody.
+    fn drop(&mut self) {
+        for watch in lock(&self.watches).drain(..) {
+            watch.task.abort();
+        }
+    }
+}
+
+/// How long a remote tab's stream has to stay open for the next failure to count as a new outage.
+const REMOTE_STREAM_STABLE_MS: u64 = 30_000;
+
+/// What a remote tab's watch keeps about the outage it is in, on the reconnect clock.
+#[derive(Debug, Default)]
+struct Outage {
+    /// When the first failure of this outage happened; `None` while the stream is open.
+    since_unix_ms: Option<u64>,
+    /// When the stream last opened.
+    opened_unix_ms: Option<u64>,
+    /// Failure kinds already reported in this outage, including alternating refusals.
+    said: std::collections::HashSet<String>,
+    check_said: std::collections::HashSet<String>,
+}
+
+impl Outage {
+    fn opened(&mut self, now: u64) {
+        self.since_unix_ms = None;
+        self.opened_unix_ms = Some(now);
+        self.said.clear();
+        self.check_said.clear();
+    }
+
+    fn link_failed(&mut self, events: &Arc<EventQueue>, host: &str, text: String) {
+        if self.check_said.insert(text.clone()) {
+            eprintln!("agent: connection to {} is not usable: {text}", host);
+            events.push(AgentDomainEvent::SessionNotice {
+                kind: crate::SessionNoticeKind::Informational,
+                level: crate::NoticeLevel::Warning,
+                content: Some(text.clone()),
+                scalars: Default::default(),
+                task_id: None,
+                tool_use_id: None,
+                task_status: None,
+            });
+        }
+    }
+
+    fn stayed_open(&self, now: u64) -> bool {
+        self.opened_unix_ms
+            .is_some_and(|opened| now.saturating_sub(opened) >= REMOTE_STREAM_STABLE_MS)
+    }
+}
+
+/// After a failed attempt: waits before the next one and returns `None`, or returns the detail of a
+/// loss that ends the watch. A local tab keeps its three quick retries (`watch::local_watch_verdict`).
+/// A remote one ends only on the helper's definite answer; otherwise its link reads disconnected (since
+/// the outage began) while the ssh master is checked and restarted if it is gone, then reconnecting
+/// while it waits.
+async fn after_failure(
+    remote: Option<&RemoteSide>,
+    events: &Arc<EventQueue>,
+    failure: &watch::WatchFailure,
+    state: &mut WatchState,
+    outage: &mut Outage,
+    backpressure: &BackpressureCounters,
+    (session_id, requested): (&str, crate::CliExpectation),
+) -> Option<String> {
+    let Some(remote) = remote else {
+        return match watch::local_watch_verdict(failure, state.consecutive_failures) {
+            watch::LocalWatchVerdict::Retry { after } => {
+                state.consecutive_failures += 1;
+                backpressure.watch_reconnects.fetch_add(1, Ordering::Relaxed);
+                tokio::time::sleep(after).await;
+                None
+            }
+            watch::LocalWatchVerdict::End(detail) => Some(detail),
+        };
+    };
+    use crate::provider::RemoteLinkState;
+    if remote.checker.installation_gone() {
+        *lock(&remote.ending) = Some(crate::provider::RemoteEnding::AgentGone);
+        remote.link.set(RemoteLinkState::Live);
+        return Some(crate::remote_client::MISSING_INSTALLATION.into());
+    }
+    let attempt = u32::try_from(state.consecutive_failures).unwrap_or(u32::MAX);
+    match watch::remote_watch_verdict(failure, attempt) {
+        watch::RemoteWatchVerdict::Gone(detail) => {
+            // The helper answered: the link works, and the loss is the session's.
+            remote.link.set(RemoteLinkState::Live);
+            note_remote_ending(remote, session_id, watch::remote_gone_is_a_gap(failure), requested).await;
+            Some(detail)
+        }
+        watch::RemoteWatchVerdict::Retry { after } => {
+            let what = watch::failure_text(failure);
+            if outage.said.insert(what.clone()) {
+                eprintln!(
+                    "agent: ClaudeSidecarProvider: reconnecting to {} after: {what}",
+                    remote.checker.host()
+                );
+            }
+            let since_unix_ms = *outage.since_unix_ms.get_or_insert_with(|| remote.clock.now_unix_ms());
+            remote.link.set(RemoteLinkState::Disconnected { since_unix_ms });
+            if let crate::ssh::LinkCheck::Failed(error) = remote.checker.check().await {
+                outage.link_failed(events, remote.checker.host(), error.to_string());
+            }
+            state.consecutive_failures = state.consecutive_failures.saturating_add(1);
+            backpressure.watch_reconnects.fetch_add(1, Ordering::Relaxed);
+            remote.link.set(RemoteLinkState::Reconnecting {
+                attempt: attempt.saturating_add(1),
+                next_in_ms: after.as_millis() as u64,
+            });
+            remote.clock.sleep(after).await;
+            None
+        }
+    }
+}
+
+/// Records how a remote tab's session ended, before its loss is queued. On a gap the helper is asked
+/// which permission requests wait in the session, so the person can see them and decide; a request
+/// whose event cannot be read is left out. When the helper cannot be asked, nothing is listed.
+async fn note_remote_ending(remote: &RemoteSide, session_id: &str, gap: bool, requested: crate::CliExpectation) {
+    use crate::provider::RemoteEnding;
+    let ending = if gap {
+        let waiting = match remote.asker.ask(session_id).await {
+            Ok(pending) => pending
+                .iter()
+                .filter_map(|request| waiting_request(&request.event, requested))
+                .collect(),
+            Err(status) => {
+                eprintln!(
+                    "agent: ClaudeSidecarProvider: could not ask {} what waits in the session: {}",
+                    remote.checker.host(),
+                    status.message()
+                );
+                Vec::new()
+            }
+        };
+        RemoteEnding::Gap { waiting }
+    } else {
+        RemoteEnding::AgentGone
+    };
+    *lock(&remote.ending) = Some(ending);
+}
+
+/// The permission request in one event the helper kept, as the person reads it.
+fn waiting_request(bytes: &[u8], requested: crate::CliExpectation) -> Option<crate::provider::WaitingRequest> {
+    use prost::Message as _;
+    let event = claude_runtime_protocol::v1::SessionEvent::decode(bytes).ok()?;
+    translate::translate(event, requested)
+        .into_iter()
+        .find_map(|event| match event {
+            AgentDomainEvent::PermissionRequested {
+                permission_id,
+                tool_name,
+                input,
+                ..
+            } => Some(crate::provider::WaitingRequest {
+                permission_id,
+                tool_name,
+                input_line: input_line(&input),
+            }),
+            _ => None,
+        })
+}
+
+/// A tool input on one short line: the field that says what the call acts on when it has one, the whole
+/// input otherwise.
+fn input_line(input: &serde_json::Value) -> String {
+    const WIDTH: usize = 120;
+    let named = [
+        "command",
+        "file_path",
+        "path",
+        "notebook_path",
+        "url",
+        "pattern",
+        "query",
+    ]
+    .iter()
+    .find_map(|key| input.get(*key).and_then(serde_json::Value::as_str));
+    let text = match named {
+        Some(text) => text.to_string(),
+        None => input.to_string(),
+    };
+    crate::providers::acp::wire::one_line(&text, WIDTH)
+}
+
+fn retry_adoption<T>(
+    mut handshake: impl FnMut() -> std::io::Result<T>,
+    mut wait: impl FnMut(Duration),
+) -> std::io::Result<T> {
+    let mut waits = [
+        Duration::from_millis(500),
+        Duration::from_secs(1),
+        Duration::from_secs(2),
+    ]
+    .into_iter();
+    loop {
+        match handshake() {
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => match waits.next() {
+                Some(delay) => wait(delay),
+                None => return Err(error),
+            },
+            result => return result,
+        }
+    }
+}
+
+/// A provider for a remote tab whose sidecar the helper no longer runs: its watch opens (folding what the
+/// helper still serves, then ending with the agent gone), and nothing else can be sent. It states no capability,
+/// so no command is offered; text is split by message id, as every sidecar this window drives sends it.
+fn journal_only(runtime: &RuntimeThread, transport: &dyn SidecarTransport) -> std::io::Result<Handshaken> {
+    let channel = transport.channel(runtime, None)?;
+    let client = RuntimeServiceClient::with_interceptor(channel, CallMetadata::new(transport.call_metadata())?);
+    Ok(history_only_handshake(client, transport.build_description()))
+}
+
+/// What [`journal_only`] stands in for a handshake with.
+fn history_only_handshake(client: RuntimeClient, build_description: String) -> Handshaken {
+    Handshaken {
+        client,
+        capabilities: ProviderCapabilities::default(),
+        info: ProviderInfo {
+            build_description: Some(build_description),
+            ..ProviderInfo::default()
+        },
+        splits_messages: true,
+        provider_prompts: false,
+        claude_code_prompt: false,
+        max_message_bytes: 0,
+        history_only: true,
+    }
+}
+
+/// The helper's journal head when a watch opened (`eitri-journal-head`), if it sent one.
+fn journal_head(metadata: &tonic::metadata::MetadataMap) -> Option<u64> {
+    metadata
+        .get(eitri_server_proto::JOURNAL_HEAD_METADATA)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse().ok())
 }
 
 /// The watch stream is open again. First, when `snapshot` reads the sidecar's list of questions still
@@ -1367,7 +1967,12 @@ fn map_status(status: tonic::Status) -> ProviderError {
     // development -- `status.metadata().get_bin("grpc-status-details-bin")`
     // silently returned `None` every time; `status.details()` decoded correctly on the first
     // try). Do not "fix" this back to a `.metadata()` lookup -- that was the actual bug.
-    match error_detail(&status) {
+    provider_error_of(&status)
+}
+
+/// [`map_status`] for a status kept for its code as well.
+fn provider_error_of(status: &tonic::Status) -> ProviderError {
+    match error_detail(status) {
         Some(detail) => ProviderError::Provider {
             code: provider_error_code(detail.code()),
             message: detail.message,
@@ -1894,6 +2499,29 @@ pub fn task_refusal(error: ProviderError) -> String {
 }
 
 impl AgentProvider for ClaudeSidecarProvider {
+    /// `Some` for a remote tab from its start to its end, `Live` when nothing is wrong; `None` for a
+    /// sidecar on this machine.
+    fn link_state(&self) -> Option<crate::provider::RemoteLinkState> {
+        self.remote.as_ref().map(|remote| remote.link.get())
+    }
+
+    fn remote_ending(&self) -> Option<crate::provider::RemoteEnding> {
+        self.remote.as_ref().and_then(|remote| lock(&remote.ending).clone())
+    }
+
+    fn stop_remote_agent(&self) -> Option<std::io::Result<()>> {
+        self.remote.as_ref().map(|_| self.stop_remote_sidecar())
+    }
+
+    /// What reaches this remote tab's agent again, as of the last event folded; `None` for a sidecar on
+    /// this machine, or a remote one with no session watched.
+    fn helper_handoff(&self) -> Option<HelperHandoff> {
+        self.remote.as_ref()?;
+        let session_id = lock(&self.watches).last()?.session_id.clone();
+        let folded = self.events.taken_sequence();
+        lock(&self.transport).helper_handoff(session_id, folded)
+    }
+
     fn capabilities(&self) -> ProviderCapabilities {
         self.capabilities.clone()
     }
@@ -2455,6 +3083,12 @@ impl AgentProvider for ClaudeSidecarProvider {
 const MOVE_UNFOLDED_LIMIT: u64 = 500;
 
 const EVENT_QUEUE_BYTES: usize = 64 * 1024 * 1024;
+
+/// A remote tab's watch stops reading while more than this is queued and not yet taken, and reads on
+/// once less than [`REMOTE_REPLAY_LOW_WATER`] is: a replay of thousands of events after a long outage
+/// then waits on the conversation instead of crossing [`EVENT_QUEUE_BYTES`] and losing the session.
+const REMOTE_REPLAY_HIGH_WATER: usize = 16 * 1024 * 1024;
+const REMOTE_REPLAY_LOW_WATER: usize = 8 * 1024 * 1024;
 const EVENT_QUEUE_LOST: &str =
     "Claude event queue exceeded its memory limit; buffered events were lost and observation stopped";
 
@@ -2486,12 +3120,16 @@ struct EventQueue {
     follow_up_wait: Duration,
     /// Cancels the watch even when it is awaiting headers, a reconnect or the next event.
     overflow: tokio::sync::Notify,
+    /// Raised by every `take`, for a watch waiting for the queue to drain.
+    drained: tokio::sync::Notify,
 }
 
 #[derive(Default)]
 struct QueueState {
     ready: Vec<AgentDomainEvent>,
     ready_bytes: usize,
+    /// The most ever queued at once, held events included.
+    peak_bytes: usize,
     overflowed: bool,
     gate: steer::SteerGate<ProtoSteerTurnRequest>,
     /// The watch's position after the last wire event queued.
@@ -2564,6 +3202,30 @@ impl EventQueue {
             signal: Arc::default(),
             follow_up_wait,
             overflow: tokio::sync::Notify::new(),
+            drained: tokio::sync::Notify::new(),
+        }
+    }
+
+    /// What is queued and not yet taken, held events included, by the queue's estimate.
+    fn queued_bytes(&self) -> usize {
+        let state = self.lock();
+        state.ready_bytes.saturating_add(state.gate.held_bytes())
+    }
+
+    /// Returns at once unless more than [`REMOTE_REPLAY_HIGH_WATER`] is queued; then once a `take` left
+    /// less than [`REMOTE_REPLAY_LOW_WATER`]. An overflowed queue is ending the watch anyway.
+    async fn below_high_water(&self) {
+        if self.queued_bytes() <= REMOTE_REPLAY_HIGH_WATER {
+            return;
+        }
+        loop {
+            let drained = self.drained.notified();
+            tokio::pin!(drained);
+            drained.as_mut().enable();
+            if self.queued_bytes() < REMOTE_REPLAY_LOW_WATER || self.lock().overflowed {
+                return;
+            }
+            drained.await;
         }
     }
 
@@ -2625,6 +3287,7 @@ impl EventQueue {
             return;
         }
         state.ready_bytes = bytes;
+        state.peak_bytes = state.peak_bytes.max(bytes.saturating_add(state.gate.held_bytes()));
         state.ready.extend(events);
         self.signal.raise();
     }
@@ -2730,6 +3393,11 @@ impl EventQueue {
     fn thaw(&self) {
         self.lock().frozen = false;
         self.signal.raise();
+    }
+
+    /// The sequence of the last wire event whose translation was taken (folded); 0 before any.
+    fn taken_sequence(&self) -> u64 {
+        self.lock().taken.as_ref().map_or(0, |mark| mark.sequence)
     }
 
     /// Hands nothing over any more: the session is driven from another process now.
@@ -2965,6 +3633,8 @@ impl EventQueue {
         state.ready_bytes = 0;
         let events = std::mem::take(&mut state.ready);
         state.gate.taken(&events);
+        drop(state);
+        self.drained.notify_waiters();
         events
     }
 
@@ -3465,6 +4135,7 @@ mod tests {
                 stderr_tail: Vec::new(),
                 build_description: "local sidecar".into(),
                 build_warnings: Vec::new(),
+                remote_facts: None,
             },
             SidecarFds {
                 stdin: descriptor(),
@@ -3472,6 +4143,76 @@ mod tests {
                 stderr: descriptor(),
             },
         )
+    }
+
+    #[test]
+    fn link_refusals_are_visible_once_per_kind_in_an_outage() {
+        let events = Arc::new(EventQueue::default());
+        let mut outage = Outage::default();
+        for _ in 0..3 {
+            outage.link_failed(&events, "example-host", "host key changed".into());
+        }
+        let notices = events.take();
+        assert_eq!(notices.len(), 1);
+        assert!(matches!(&notices[0], AgentDomainEvent::SessionNotice {
+            kind: crate::SessionNoticeKind::Informational, level: crate::NoticeLevel::Warning,
+            content: Some(text), ..
+        } if text == "host key changed"));
+        outage.link_failed(&events, "example-host", "another refusal".into());
+        assert_eq!(events.take().len(), 1);
+        for _ in 0..3 {
+            outage.link_failed(&events, "example-host", "host key changed".into());
+            outage.link_failed(&events, "example-host", "another refusal".into());
+        }
+        assert!(events.take().is_empty());
+        outage.opened(1);
+        outage.link_failed(&events, "example-host", "host key changed".into());
+        assert_eq!(events.take().len(), 1);
+    }
+
+    #[test]
+    fn adoption_handshake_retries_only_retryable_refusals_and_has_a_bound() {
+        let mut attempts = 0;
+        let mut waits = Vec::new();
+        let result = retry_adoption(
+            || {
+                attempts += 1;
+                if attempts < 3 {
+                    Err(handshake_failure(tonic::Status::unavailable(
+                        "the helper is adopting this sidecar",
+                    )))
+                } else {
+                    Ok("ready")
+                }
+            },
+            |wait| waits.push(wait),
+        );
+        assert_eq!(result.unwrap(), "ready");
+        assert_eq!(attempts, 3);
+        assert_eq!(waits.len(), 2);
+        let mut attempts = 0;
+        let result = retry_adoption::<()>(
+            || {
+                attempts += 1;
+                Err(handshake_failure(tonic::Status::unavailable(
+                    "the helper is adopting this sidecar",
+                )))
+            },
+            |_| {},
+        );
+        assert!(result.is_err());
+        assert_eq!(attempts, 4);
+        let mut attempts = 0;
+        let _ = retry_adoption::<()>(
+            || {
+                attempts += 1;
+                Err(handshake_failure(tonic::Status::unavailable(
+                    "the socket is unavailable",
+                )))
+            },
+            |_| panic!("permanent refusal was retried"),
+        );
+        assert_eq!(attempts, 1);
     }
 
     #[cfg(target_os = "linux")]
@@ -3504,10 +4245,63 @@ mod tests {
             provider_prompts: false,
             claude_code_prompt: false,
             max_message_bytes: 0,
+            history_only: false,
         };
-        let provider = ClaudeSidecarProvider::holding(local, runtime, handshaken);
+        let provider = ClaudeSidecarProvider::holding(Box::new(local), Arc::new(runtime), handshaken, None);
         assert_eq!(provider.link_state(), None);
         assert_eq!(provider.info().host, None);
+    }
+
+    /// A remote tab whose sidecar no longer runs reads its history back without a handshake: its CLI's `auto`,
+    /// `default` and `plan` reports, which a session this window created may have made, do not close it; a mode
+    /// no session here asks for still does.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_history_only_session_reads_back_the_modes_this_window_asks_for() {
+        use claude_runtime_protocol::v1::session_event::Event as ProtoEvent;
+        let child = ChildGuard(
+            std::process::Command::new("/bin/cat")
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::null())
+                .spawn()
+                .unwrap(),
+        );
+        let socket = crate::socket_path::in_dir(std::path::Path::new("/srv/project"), "socket").unwrap();
+        let (handoff, fds) = local_handoff(socket, child.0.id());
+        let local = LocalChild::adopt(&handoff, fds).unwrap();
+        let runtime = RuntimeThread::spawn();
+        let channel = {
+            let _entered = runtime.handle().enter();
+            tonic::transport::Endpoint::from_static("http://[::]:50051").connect_lazy()
+        };
+        let client = RuntimeServiceClient::with_interceptor(channel, CallMetadata::new(Vec::new()).unwrap());
+        let handshaken = history_only_handshake(client, "gone".into());
+        let provider = ClaudeSidecarProvider::holding(Box::new(local), Arc::new(runtime), handshaken, None);
+        let expectation = AgentProvider::cli_expectation(&provider);
+        let closes = |mode: &str| {
+            let ready = ProtoEvent::SessionReady(claude_runtime_protocol::v1::SessionReady {
+                permission_mode: mode.into(),
+                ..Default::default()
+            });
+            let reported = ProtoEvent::CliModeReported(claude_runtime_protocol::v1::CliModeReported {
+                permission_mode: mode.into(),
+            });
+            [ready, reported].into_iter().any(|event| {
+                let event = claude_runtime_protocol::v1::SessionEvent {
+                    event: Some(event),
+                    ..Default::default()
+                };
+                translate::translate(event, expectation)
+                    .iter()
+                    .any(|event| matches!(event, AgentDomainEvent::UngatedCliMode { .. }))
+            })
+        };
+        for mode in ["auto", "default", "plan"] {
+            assert!(!closes(mode), "{mode}");
+        }
+        for mode in ["bypassPermissions", "acceptEdits"] {
+            assert!(closes(mode), "{mode}");
+        }
     }
 
     #[cfg(target_os = "linux")]
@@ -3553,16 +4347,68 @@ mod tests {
 
         let (mut helper, fds) = local_handoff(handoff.socket_path, child.0.id());
         helper.transport = TransportKind::Helper(HelperHandoff {
+            daemon: "".into(),
+            declared_client_tools: Default::default(),
             host: "example-host".into(),
             host_key_sha256: "example-key".into(),
             sidecar_id: "example-sidecar".into(),
+            session_id: "example-session".into(),
+            last_folded_sequence: 0,
         });
         let error = match ClaudeSidecarProvider::adopt(helper, fds) {
-            Ok(_) => panic!("accepted an unsupported helper handoff"),
+            Ok(_) => panic!("took a helper handoff up as a local sidecar"),
             Err(error) => error,
         };
-        assert_eq!(error.kind(), std::io::ErrorKind::Unsupported);
-        assert_eq!(error.to_string(), "a helper handoff is not supported yet");
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+    }
+
+    /// A move record written before remote tabs existed (no `transport`) reads as a local sidecar's; a
+    /// helper record requires its remote identities, while an absent daemon uses the current installation.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn an_old_move_record_reads_as_local_and_a_helper_record_needs_every_fact() {
+        let socket = crate::socket_path::in_dir(std::path::Path::new("/srv/project"), "socket").unwrap();
+        let (handoff, _fds) = local_handoff(socket, std::process::id());
+        let mut old = serde_json::to_value(&handoff).unwrap();
+        old.as_object_mut().unwrap().remove("transport");
+        assert_eq!(
+            serde_json::from_value::<ClaudeProviderHandoff>(old).unwrap().transport,
+            TransportKind::Local
+        );
+        let helper = serde_json::json!({
+            "daemon": "0.3.0-abcdef0",
+            "host": "example-host",
+            "host_key_sha256": "SHA256:example",
+            "sidecar_id": "sc-1",
+            "session_id": "session-1",
+            "last_folded_sequence": 7,
+        });
+        let mut record = serde_json::to_value(&handoff).unwrap();
+        record["transport"] = serde_json::json!({ "Helper": helper });
+        let read = serde_json::from_value::<ClaudeProviderHandoff>(record.clone()).unwrap();
+        assert!(
+            matches!(&read.transport, TransportKind::Helper(h) if h.sidecar_id == "sc-1" && h.last_folded_sequence == 7)
+        );
+        let mut legacy = record.clone();
+        legacy["transport"]["Helper"].as_object_mut().unwrap().remove("daemon");
+        assert!(
+            matches!(serde_json::from_value::<ClaudeProviderHandoff>(legacy).unwrap().transport,
+            TransportKind::Helper(h) if h.daemon.is_empty())
+        );
+        for missing in [
+            "host",
+            "host_key_sha256",
+            "sidecar_id",
+            "session_id",
+            "last_folded_sequence",
+        ] {
+            let mut short = record.clone();
+            short["transport"]["Helper"].as_object_mut().unwrap().remove(missing);
+            assert!(
+                serde_json::from_value::<ClaudeProviderHandoff>(short).is_err(),
+                "a helper record without {missing} was read"
+            );
+        }
     }
 
     #[test]

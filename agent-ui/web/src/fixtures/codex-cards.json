@@ -58,6 +58,7 @@
           "cwd": "/project",
           "history": null,
           "lastTurnEnding": null,
+          "linkState": null,
           "model": "gpt-5-codex",
           "pendingPermissions": [
             {
@@ -157,6 +158,7 @@
           "cwd": "/project",
           "history": null,
           "lastTurnEnding": null,
+          "linkState": null,
           "model": "gpt-5-codex",
           "pendingPermissions": [
             {
@@ -259,6 +261,7 @@
           "cwd": "/project",
           "history": null,
           "lastTurnEnding": null,
+          "linkState": null,
           "model": "gpt-5-codex",
           "pendingPermissions": [
             {
@@ -362,6 +365,7 @@
           "cwd": "/project",
           "history": null,
           "lastTurnEnding": null,
+          "linkState": null,
           "model": "gpt-5-codex",
           "pendingPermissions": [
             {
@@ -471,6 +475,7 @@
           "cwd": "/project",
           "history": null,
           "lastTurnEnding": null,
+          "linkState": null,
           "model": "gpt-5-codex",
           "pendingPermissions": [
             {
@@ -580,6 +585,7 @@
           "cwd": "/project",
           "history": null,
           "lastTurnEnding": null,
+          "linkState": null,
           "model": "gpt-5-codex",
           "pendingPermissions": [
             {
@@ -782,6 +788,7 @@
           "cwd": "/project",
           "history": null,
           "lastTurnEnding": null,
+          "linkState": null,
           "model": "gpt-5-codex",
           "pendingPermissions": [],
           "provider": null,
@@ -977,6 +984,7 @@
           "cwd": "/project",
           "history": null,
           "lastTurnEnding": "limit_reached",
+          "linkState": null,
           "model": "gpt-5-codex",
           "pendingPermissions": [],
           "provider": null,

@@ -13,6 +13,9 @@ convention for a symbol with a fallback -- the research found `pidfd_spawnp` wea
 Usage:
     packaging/check-abi-floor.py BIN... [--gtk 4.14] [--webkit 2.40] [--glibc 2.39]
 
+release.sh runs this check over all six shipped binaries, including eitri-server. The helper has
+no toolkit imports, but its glibc references must still stay within the release floor.
+
 Exit 0: one summary line per binary. Exit 1: every violation, then a summary line per binary.
 """
 

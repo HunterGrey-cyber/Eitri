@@ -788,8 +788,48 @@ pub enum RemoteLinkState {
     CatchingUp { done: u64, total: u64 },
 }
 
+/// How a remote tab's session ended, as the server's helper said it. Set before the session's
+/// `SessionUnavailable` is queued, so whoever sees that event can read this.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RemoteEnding {
+    /// The journal no longer holds the events the tab missed. The agent may still be running there;
+    /// `waiting` is what the helper said is waiting for an answer, oldest first (empty when nothing
+    /// waits or the helper could not be asked).
+    Gap { waiting: Vec<WaitingRequest> },
+    /// The server no longer runs the tab's agent (it restarted, or the sidecar ended); what the journal
+    /// held was delivered first. The CLI's own session can be continued by a new sidecar.
+    AgentGone,
+}
+
+/// One permission request the server's helper holds unanswered, as the person reads it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WaitingRequest {
+    pub permission_id: String,
+    pub tool_name: String,
+    /// The request's input on one line, shortened.
+    pub input_line: String,
+}
+
 pub trait AgentProvider {
+    /// The connection to a remote provider. A remote provider reports `Some` for its whole life,
+    /// `Live` when nothing is wrong, and never `None`: the panel's link polling runs only while some
+    /// provider reports `Some`. A provider on this machine reports `None`.
     fn link_state(&self) -> Option<RemoteLinkState> {
+        None
+    }
+    /// How a remote tab's session ended, once it has; `None` while it runs and for a provider on this
+    /// machine.
+    fn remote_ending(&self) -> Option<RemoteEnding> {
+        None
+    }
+    /// Stops a remote tab's agent on its server (`StopSidecar`): the explicit act that ends it, since
+    /// dropping the provider ends nothing there. `None` for a provider on this machine. Blocking.
+    fn stop_remote_agent(&self) -> Option<std::io::Result<()>> {
+        None
+    }
+    /// What reaches a remote tab's agent again from another window or a later one (its saved state, a
+    /// move); `None` for a provider on this machine.
+    fn helper_handoff(&self) -> Option<crate::providers::claude_sidecar::HelperHandoff> {
         None
     }
     fn capabilities(&self) -> ProviderCapabilities;

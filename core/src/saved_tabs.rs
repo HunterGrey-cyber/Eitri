@@ -11,6 +11,12 @@
 //! so that an older build -- which reads `tabs` only and ignores what it does not know -- never
 //! resumes another agent's session as a Claude one. Such a build drops the array on its next write,
 //! which loses only the offer to bring those tabs back. The format's version stays 1 for that reason.
+//! A tab whose agent runs on a server is in `remote_tabs`, for the same reason: an older build must never
+//! resume it as a local Claude tab. It names where its agent is ([`agent::HelperHandoff`]) and is taken up
+//! from the server's journal, never resumed; it does not cross to another window of a pair.
+//! **Which directory.** A window of a project on a server keeps its files in a directory of that server's own below
+//! this one ([`state_dir_for`]): it shares its root with a window of the project's copy on this machine, and the two
+//! are different projects.
 //! **Whose file.** Each window of a project's pair writes its own: window 1 (or a window alone) today's
 //! `<16 hex>.json`, window 2 `<16 hex>-w2.json`, a window that runs unpaired `<16 hex>-u.json`
 //! ([`file_name_as`]). Unpaired windows share theirs and the last writer wins; the session leases, not
@@ -170,6 +176,37 @@ pub struct SavedTabs {
     /// known (a file from before it was kept, a set built from several windows). `tabs` itself always lists the
     /// Claude tabs first, so this is where a mix of agents keeps its order: [`SavedTabs::in_bar_order`] reads it.
     pub bar: Vec<(AgentId, String)>,
+    /// The tabs whose agent runs on a server, in tab-bar order: none of `tabs`, `active` or `bar` names one.
+    pub remote: Vec<SavedRemoteTab>,
+}
+
+/// A tab whose agent runs on a server, worth bringing back: where the agent is, so a reopened window takes it up
+/// from the server's journal (never a resume), and the CLI's own session, to continue it through a new sidecar if
+/// the server no longer runs that agent.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SavedRemoteTab {
+    pub helper: agent::HelperHandoff,
+    /// The CLI's session id, once the agent reported it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_session_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    pub mode: SessionModeChoice,
+    /// Owning compositor chat window; absent means the first window or a standalone panel.
+    #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "lenient_view")]
+    pub window: Option<u8>,
+}
+
+impl SavedRemoteTab {
+    /// Whether `other` names the same agent: the same session of the same sidecar under the same helper installation
+    /// on the same server. A file read
+    /// back and two files joined keep one entry per agent by this.
+    fn same_agent(&self, other: &SavedRemoteTab) -> bool {
+        self.helper.host_key_sha256 == other.helper.host_key_sha256
+            && self.helper.daemon == other.helper.daemon
+            && self.helper.sidecar_id == other.helper.sidecar_id
+            && self.helper.session_id == other.helper.session_id
+    }
 }
 
 impl SavedTabs {
@@ -197,6 +234,7 @@ impl SavedTabs {
             active: others_active.or(claude_active),
             claude_active,
             bar: Vec::new(),
+            remote: Vec::new(),
         }
     }
 
@@ -223,12 +261,30 @@ impl SavedTabs {
     /// These tabs with no place of their own: the window they are given to says where they show.
     pub fn in_base_view(mut self) -> SavedTabs {
         self.tabs = self.tabs.into_iter().map(SavedTab::in_base_view).collect();
+        for tab in &mut self.remote {
+            tab.window = None;
+        }
         self
     }
 
-    /// No tab of any agent.
+    /// A window following a verified replacement key keeps loaded handoffs aligned with its saved file.
+    pub fn rekey_remote(&mut self, old: &str, new: &str) {
+        for tab in &mut self.remote {
+            if tab.helper.host_key_sha256 == old {
+                tab.helper.host_key_sha256 = new.to_owned();
+            }
+        }
+    }
+
+    /// No tab of any agent, on this machine or a server.
     pub fn is_empty(&self) -> bool {
-        self.tabs.is_empty()
+        self.tabs.is_empty() && self.remote.is_empty()
+    }
+
+    /// These tabs with `remote`'s tabs whose agents run on a server.
+    pub fn with_remote(mut self, remote: Vec<SavedRemoteTab>) -> SavedTabs {
+        self.remote = remote;
+        self
     }
 
     /// These tabs as they cross the link to another window of the project.
@@ -245,6 +301,9 @@ impl SavedTabs {
                 .iter()
                 .map(|(agent, id)| serde_json::json!({ "agent": agent, "provider_session_id": id }))
                 .collect();
+        }
+        if !self.remote.is_empty() {
+            wire["remote_tabs"] = serde_json::to_value(&self.remote).expect("saved remote tabs serialize");
         }
         wire
     }
@@ -287,6 +346,10 @@ impl SavedTabs {
             active,
             claude_active,
             bar,
+            remote: match value.get("remote_tabs") {
+                None => Vec::new(),
+                Some(remote) => serde_json::from_value(remote.clone()).map_err(|e| format!("remote tabs: {e}"))?,
+            },
         })
     }
 
@@ -370,6 +433,19 @@ struct TabsFile {
     /// know it ignores it and restores the Claude tabs first, as it always did.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     tab_bar: Vec<BarSlot>,
+    /// The tabs whose agent runs on a server, in an array of their own so an older build, which reads `tabs` and
+    /// ignores what it does not know, never resumes one as a local Claude tab. Absent when there is none. An entry
+    /// this build cannot read (a field missing, a later build's shape) is a hole, as in `external_tabs`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    remote_tabs: Vec<RemoteEntry>,
+}
+
+/// One entry of `remote_tabs`.
+#[derive(Serialize, Deserialize)]
+#[serde(untagged)]
+enum RemoteEntry {
+    Known(SavedRemoteTab),
+    Unknown(serde_json::Value),
 }
 
 /// One place in `tab_bar`. An agent this build does not know (a later build's) is a place nobody here fills, as in
@@ -464,6 +540,106 @@ pub fn state_dir(xdg_state_home: Option<&OsStr>, home: Option<&OsStr>) -> Option
     state_subdir(xdg_state_home, home, "tabs")
 }
 
+/// Where a window of `origin` keeps its saved tabs: [`state_dir`] for a local project and a remote project's copy,
+/// and below it, for a project on a server, a directory named by the server's key
+/// ([`crate::remote_project::origin_key`]). A window of a remote project and a `--local` window of its copy share a
+/// root, and each keeps its own file.
+pub fn state_dir_for(
+    xdg_state_home: Option<&OsStr>,
+    home: Option<&OsStr>,
+    origin: &crate::remote_project::TabOrigin,
+) -> Option<PathBuf> {
+    let base = state_dir(xdg_state_home, home)?;
+    Some(match crate::remote_project::tab_origin_key(origin) {
+        Some(key) => base.join(key),
+        None => base,
+    })
+}
+
+/// The marker a remote window leaves in its server's directory once the shared file's remote tabs of that server were
+/// carried for `project_root` and `role`, copied or not: `<file>.carried` beside the window's file.
+fn carried_marker(project_root: &Path, role: Role) -> String {
+    let file = file_name_as(project_root, role);
+    format!("{}.carried", file.strip_suffix(".json").unwrap_or(&file))
+}
+
+/// A remote window's first start, once per root and role: the remote tabs of the server of `host_key` that the
+/// project's file in `base` (of the same `role`) holds, written there before files were kept by origin, are copied
+/// into the window's file in `keyed` when it has none, and the carry is marked done ([`carried_marker`]) whatever it
+/// copied. A marked carry never runs again, so a remote tab claimed or set aside later is not copied back; the copies
+/// left in `base` are dropped by the next write of a window of this machine ([`carried_elsewhere`]). Returns how
+/// many were copied. Disk work, before the window shows.
+pub fn carry_remote_tabs(
+    base: &Path,
+    keyed: &Path,
+    project_root: &Path,
+    role: Role,
+    host_key: &str,
+) -> std::io::Result<usize> {
+    let marker = keyed.join(carried_marker(project_root, role));
+    if marker.exists() {
+        return Ok(0);
+    }
+    let mut carried = 0;
+    if load_as(keyed, project_root, role) == Loaded::Missing {
+        if let Loaded::Saved(saved) = load_as(base, project_root, role) {
+            let remote: Vec<SavedRemoteTab> = saved
+                .remote
+                .into_iter()
+                .filter(|tab| tab.helper.host_key_sha256 == host_key)
+                .collect();
+            if !remote.is_empty() {
+                carried = remote.len();
+                save_as(keyed, project_root, role, &SavedTabs::default().with_remote(remote))?;
+            }
+        }
+    }
+    create_state_dir(keyed)?;
+    agent::private_fs::write_private(&marker, b"")?;
+    Ok(carried)
+}
+
+/// Whether the remote tabs of the server of `host_key` saved in the shared file of `project_root` and `role` now live
+/// in that server's own directory below `base` (a remote window carried them, [`carry_remote_tabs`]): a window of this
+/// machine no longer keeps them in its file, so no agent is taken up by two windows.
+pub fn carried_elsewhere(base: &Path, project_root: &Path, role: Role, host_key: &str) -> bool {
+    base.join(crate::remote_project::origin_key(host_key))
+        .join(carried_marker(project_root, role))
+        .exists()
+}
+
+/// After a server's host key changed from `old_key` to `new_key` (the project's record took the new one): each saved
+/// tabs file of `project_root` in the old key's directory below `base` moves to the new key's, unless the new one has
+/// that role's file already, its remote tabs taking the new key, so a window under the new key takes them up again.
+/// Returns how many remote tabs moved. Disk work, on the worker that compared the keys.
+pub fn carry_to_new_host_key(base: &Path, project_root: &Path, old_key: &str, new_key: &str) -> std::io::Result<usize> {
+    let old_dir = base.join(crate::remote_project::origin_key(old_key));
+    let new_dir = base.join(crate::remote_project::origin_key(new_key));
+    let mut moved = 0;
+    for role in [Role::Main, Role::Second, Role::Unpaired] {
+        let Loaded::Saved(mut saved) = load_as(&old_dir, project_root, role) else {
+            continue;
+        };
+        if load_as(&new_dir, project_root, role) != Loaded::Missing {
+            continue;
+        }
+        for tab in &mut saved.remote {
+            if tab.helper.host_key_sha256 == old_key {
+                tab.helper.host_key_sha256 = new_key.to_owned();
+                moved += 1;
+            }
+        }
+        save_as(&new_dir, project_root, role, &saved)?;
+        std::fs::remove_file(old_dir.join(file_name_as(project_root, role)))?;
+        // The shared file's copies were carried under the old key already.
+        let marker = old_dir.join(carried_marker(project_root, role));
+        if marker.exists() {
+            agent::private_fs::write_private(&new_dir.join(carried_marker(project_root, role)), b"")?;
+        }
+    }
+    Ok(moved)
+}
+
 /// The file's text for `saved`: pretty JSON, so a person can read and fix it.
 pub fn encode(saved: &SavedTabs, project_root: &Path) -> String {
     let file = TabsFile {
@@ -516,6 +692,7 @@ pub fn encode(saved: &SavedTabs, project_root: &Path) -> String {
         } else {
             Vec::new()
         },
+        remote_tabs: saved.remote.iter().cloned().map(RemoteEntry::Known).collect(),
     };
     serde_json::to_string_pretty(&file).expect("saved tabs always serialize")
 }
@@ -602,7 +779,18 @@ pub fn decode(text: &str, project_root: &Path) -> Result<SavedTabs, String> {
             BarSlot::Unknown(_) => None,
         })
         .collect();
-    Ok(SavedTabs::from_parts(claude, claude_at, others, others_at).with_bar(bar))
+    // A server's agent listed twice is kept once.
+    let mut remote: Vec<SavedRemoteTab> = Vec::new();
+    for entry in file.remote_tabs {
+        if let RemoteEntry::Known(tab) = entry {
+            if !remote.iter().any(|kept| kept.same_agent(&tab)) {
+                remote.push(tab);
+            }
+        }
+    }
+    Ok(SavedTabs::from_parts(claude, claude_at, others, others_at)
+        .with_bar(bar)
+        .with_remote(remote))
 }
 
 /// `tabs` without a blank entry, a repeat of an earlier one, or one of the wrong kind.
@@ -631,7 +819,20 @@ pub fn merge_windows(parts: &[(WindowName, SavedTabs)], active_from: Option<&Win
         .collect();
     windows.sort_by_key(|(number, _)| *number);
     let mut merged: Vec<SavedTab> = Vec::new();
+    let mut remote: Vec<SavedRemoteTab> = Vec::new();
     for (number, part) in windows {
+        for tab in &part.remote {
+            if !remote.iter().any(|kept| {
+                kept.helper.host_key_sha256 == tab.helper.host_key_sha256
+                    && kept.helper.daemon == tab.helper.daemon
+                    && kept.helper.sidecar_id == tab.helper.sidecar_id
+                    && kept.helper.session_id == tab.helper.session_id
+            }) {
+                let mut tab = tab.clone();
+                tab.window = (number != 1).then_some(number);
+                remote.push(tab);
+            }
+        }
         let on_screen = part.active.or(part.claude_active).unwrap_or(0);
         for (index, tab) in part.tabs.iter().enumerate() {
             if merged.iter().any(|kept| kept.key() == tab.key()) {
@@ -669,7 +870,9 @@ pub fn merge_windows(parts: &[(WindowName, SavedTabs)], active_from: Option<&Win
     } else {
         Vec::new()
     };
-    from_tabs(merged, &on_screen, &claude_on_screen).with_bar(bar)
+    from_tabs(merged, &on_screen, &claude_on_screen)
+        .with_bar(bar)
+        .with_remote(remote)
 }
 
 /// The window `name`'s part of `file`, each tab in the base view: the tabs whose window or view says it is theirs,
@@ -707,12 +910,29 @@ pub fn tabs_for(file: &SavedTabs, name: &WindowName) -> SavedTabs {
             .map(SavedTab::key)
             .collect()
     };
-    from_tabs(tabs, &on_screen, &claude_on_screen).with_bar(bar)
+    let remote = file
+        .remote
+        .iter()
+        .filter(|tab| tab.window.unwrap_or(1) == number)
+        .cloned()
+        .map(|mut tab| {
+            tab.window = None;
+            tab
+        })
+        .collect();
+    from_tabs(tabs, &on_screen, &claude_on_screen)
+        .with_bar(bar)
+        .with_remote(remote)
 }
 
 /// The chat windows `file` holds tabs for, by number.
 pub fn windows_holding(file: &SavedTabs) -> Vec<WindowName> {
-    let numbers: std::collections::BTreeSet<u8> = file.tabs.iter().map(SavedTab::chat_window).collect();
+    let numbers: std::collections::BTreeSet<u8> = file
+        .tabs
+        .iter()
+        .map(SavedTab::chat_window)
+        .chain(file.remote.iter().map(|tab| tab.window.unwrap_or(1)))
+        .collect();
     numbers.into_iter().map(WindowName::Chat).collect()
 }
 
@@ -1156,7 +1376,15 @@ impl SavedTabs {
         };
         let claude_at = at(&claude, &claude_active).unwrap_or(0);
         let others_at = at(&others, &active);
-        SavedTabs::from_parts(claude, claude_at, others, others_at).with_bar(bar)
+        let mut remote = self.remote;
+        for tab in later.remote {
+            if !remote.iter().any(|kept| kept.same_agent(&tab)) {
+                remote.push(tab);
+            }
+        }
+        SavedTabs::from_parts(claude, claude_at, others, others_at)
+            .with_bar(bar)
+            .with_remote(remote)
     }
 
     /// Whether every one of `sessions` is listed here.
@@ -1293,6 +1521,7 @@ const FAILED_WRITE_RETRY: std::time::Duration = std::time::Duration::from_secs(1
 
 #[derive(Default)]
 struct WriterQueue {
+    dir: Option<PathBuf>,
     next: Option<SavedTabs>,
     /// Taken by the thread and being written now.
     writing: bool,
@@ -1321,6 +1550,33 @@ impl TabWriter {
             #[cfg(any(test, feature = "test-support"))]
             before_write: None,
         }
+    }
+
+    /// Whose file in the pair this writer writes.
+    pub fn role(&self) -> Role {
+        self.role
+    }
+
+    /// Writes into `dir` from now on. The existing worker serializes the move after any in-flight write, then flushes
+    /// the latest set there. A disabled writer stays disabled. No disk work runs on the caller's thread.
+    pub fn move_to(&mut self, dir: PathBuf) -> Result<(), &'static str> {
+        if self.dir.is_some() {
+            if let Some(worker) = &self.worker {
+                let mut queue = worker.shared.queue.lock().unwrap_or_else(|e| e.into_inner());
+                if queue.finished {
+                    return Err("the saved-tabs writer has finished");
+                }
+                queue.dir = Some(dir.clone());
+                queue.next = Some(self.last.clone());
+                worker.shared.ready.notify_all();
+            }
+            self.dir = Some(dir);
+        }
+        Ok(())
+    }
+
+    pub fn rekey_remote(&mut self, old: &str, new: &str) {
+        self.last.rekey_remote(old, new);
     }
 
     /// `saved` is what the file holds already, read by the caller: the next set is a change from it, so one with no tabs
@@ -1480,6 +1736,9 @@ fn write_loop(shared: &WriterShared, mut memory: TabMemory, before_write: impl F
                     return;
                 }
                 if let Some(next) = queue.next.take() {
+                    if let Some(dir) = queue.dir.take() {
+                        memory = TabMemory::new_as(Some(dir), memory.project_root.clone(), memory.role);
+                    }
                     queue.writing = true;
                     break next;
                 }
@@ -2691,8 +2950,272 @@ mod tests {
         assert_eq!(older.active, 1, "and a Claude tab to fall back to as the active one");
     }
 
+    fn remote_tab(sidecar: &str) -> SavedRemoteTab {
+        SavedRemoteTab {
+            window: None,
+            helper: agent::HelperHandoff {
+                daemon: "".into(),
+                declared_client_tools: Default::default(),
+                host: "example-host".into(),
+                host_key_sha256: "SHA256:example".into(),
+                sidecar_id: sidecar.into(),
+                session_id: format!("session-{sidecar}"),
+                last_folded_sequence: 9,
+            },
+            provider_session_id: Some(format!("claude-{sidecar}")),
+            name: Some("api".into()),
+            mode: SessionModeChoice::Auto,
+        }
+    }
+
+    #[test]
+    fn remote_tabs_from_two_installations_keep_distinct_identities() {
+        let mut old = remote_tab("same-sidecar");
+        old.helper.daemon = "old-installation".into();
+        let mut new = old.clone();
+        new.helper.daemon = "new-installation".into();
+        let first = SavedTabs::default().with_remote(vec![old.clone()]);
+        let later = SavedTabs::default().with_remote(vec![new.clone()]);
+        let both = SavedTabs::default().with_remote(vec![old, new]);
+        assert_eq!(decode(&encode(&both, &root()), &root()).unwrap().remote.len(), 2);
+        assert_eq!(first.clone().followed_by(later.clone()).remote.len(), 2);
+        assert_eq!(
+            merge_windows(&[(WindowName::Chat(1), first), (WindowName::Chat(2), later)], None)
+                .remote
+                .len(),
+            2
+        );
+    }
+
+    /// Remote tabs are written in an array of their own: an older build, which reads `tabs`, never resumes one
+    /// as a local Claude tab, and a file written before them reads as having none. An entry missing a remote
+    /// fact is a hole, not a tab, and a tab listed twice is kept once.
+    #[test]
+    fn remote_tabs_have_their_own_array_an_older_build_never_reads() {
+        let saved = two().with_remote(vec![remote_tab("sc-1"), remote_tab("sc-2")]);
+        let text = encode(&saved, &root());
+        let older: OlderTabsFile = serde_json::from_str(&text).expect("an older build reads the file");
+        let read: Vec<&str> = older.tabs.iter().map(|t| t.provider_session_id.as_str()).collect();
+        assert_eq!(read, ["s-one", "s-two"], "no remote tab among the Claude tabs");
+        let back = decode(&text, &root()).unwrap();
+        assert_eq!(back, saved);
+        assert!(!back.is_empty());
+        assert!(!SavedTabs::default().with_remote(vec![remote_tab("sc-1")]).is_empty());
+
+        let mut value: serde_json::Value = serde_json::from_str(&text).unwrap();
+        value["remote_tabs"][0]["helper"]
+            .as_object_mut()
+            .unwrap()
+            .remove("sidecar_id");
+        value["remote_tabs"]
+            .as_array_mut()
+            .unwrap()
+            .push(serde_json::to_value(remote_tab("sc-2")).unwrap());
+        let holes = decode(&value.to_string(), &root()).unwrap();
+        assert_eq!(holes.remote, vec![remote_tab("sc-2")]);
+
+        // A later build's tab, with a field this build does not know, is still this build's tab to keep.
+        let mut value: serde_json::Value = serde_json::from_str(&text).unwrap();
+        value["remote_tabs"][0]["helper"]["added_later"] = serde_json::json!("0.4.0");
+        let later = decode(&value.to_string(), &root()).unwrap();
+        assert_eq!(later.remote, vec![remote_tab("sc-1"), remote_tab("sc-2")]);
+
+        let before = encode(&two(), &root());
+        assert!(
+            !before.contains("remote_tabs"),
+            "a file with no remote tab is what it always was"
+        );
+        assert!(decode(&before, &root()).unwrap().remote.is_empty());
+    }
+
+    /// A file read back and two files joined keep one entry per agent, and agree on what one agent is: two sessions
+    /// of one sidecar are two entries both ways, one session listed twice is one.
+    #[test]
+    fn joined_and_read_files_keep_the_same_remote_tabs() {
+        let mut other_session = remote_tab("sc-1");
+        other_session.helper.session_id = "session-other".into();
+        let joined = SavedTabs::default()
+            .with_remote(vec![remote_tab("sc-1")])
+            .followed_by(SavedTabs::default().with_remote(vec![remote_tab("sc-1"), other_session.clone()]));
+        assert_eq!(joined.remote, vec![remote_tab("sc-1"), other_session.clone()]);
+        let text = encode(
+            &SavedTabs::default().with_remote(vec![remote_tab("sc-1"), other_session.clone(), remote_tab("sc-1")]),
+            &root(),
+        );
+        assert_eq!(decode(&text, &root()).unwrap().remote, joined.remote);
+    }
+
     fn one_tab(session: &str) -> SavedTabs {
         SavedTabs::from_parts(vec![tab(session, None, SessionModeChoice::Auto)], 0, Vec::new(), None)
+    }
+
+    /// The carry from the shared file runs once per root and role: once it is marked, a keyed file claimed or set aside
+    /// later is not filled again from the shared file, and the shared file's copies are known to live elsewhere. A carry
+    /// with nothing to copy is marked too.
+    #[test]
+    fn the_carry_from_the_shared_file_runs_once_per_root_and_role() {
+        use crate::remote_project::TabOrigin;
+        let state = ScratchDir::new("nv-tabs-origin", "once");
+        let origin = TabOrigin::Remote {
+            host: "example-host".into(),
+            host_key_sha256: "SHA256:example".into(),
+            root: root(),
+        };
+        let local = state_dir(Some(state.as_os_str()), None).unwrap();
+        let remote = state_dir_for(Some(state.as_os_str()), None, &origin).unwrap();
+        save_as(
+            &local,
+            &root(),
+            Role::Second,
+            &SavedTabs::default().with_remote(vec![remote_tab("sc-7")]),
+        )
+        .unwrap();
+        assert!(!carried_elsewhere(&local, &root(), Role::Second, "SHA256:example"));
+        assert_eq!(
+            carry_remote_tabs(&local, &remote, &root(), Role::Second, "SHA256:example").unwrap(),
+            1
+        );
+        assert!(carried_elsewhere(&local, &root(), Role::Second, "SHA256:example"));
+        assert!(!carried_elsewhere(&local, &root(), Role::Main, "SHA256:example"));
+        assert!(!carried_elsewhere(&local, &root(), Role::Second, "SHA256:other"));
+        // Window 1 claimed window 2's keyed file: it left its place, and the shared file still lists the tab.
+        std::fs::remove_file(remote.join(file_name_as(&root(), Role::Second))).unwrap();
+        assert_eq!(
+            carry_remote_tabs(&local, &remote, &root(), Role::Second, "SHA256:example").unwrap(),
+            0
+        );
+        assert_eq!(load_as(&remote, &root(), Role::Second), Loaded::Missing);
+        assert_eq!(
+            carry_remote_tabs(&local, &remote, &root(), Role::Main, "SHA256:example").unwrap(),
+            0
+        );
+        assert!(carried_elsewhere(&local, &root(), Role::Main, "SHA256:example"));
+    }
+
+    /// After a host-key change each role's file of the root moves from the old key's directory to the new key's, its
+    /// remote tabs taking the new key, once; a role whose file the new key has already is left where it is.
+    #[test]
+    fn a_changed_host_key_moves_the_old_keys_saved_tabs() {
+        use crate::remote_project::origin_key;
+        let state = ScratchDir::new("nv-tabs-origin", "rekey");
+        let base = state_dir(Some(state.as_os_str()), None).unwrap();
+        let old = base.join(origin_key("SHA256:example"));
+        let new = base.join(origin_key("SHA256:new"));
+        save_as(
+            &old,
+            &root(),
+            Role::Main,
+            &one_tab("s-1").with_remote(vec![remote_tab("sc-1")]),
+        )
+        .unwrap();
+        save_as(
+            &old,
+            &root(),
+            Role::Second,
+            &SavedTabs::default().with_remote(vec![remote_tab("sc-2")]),
+        )
+        .unwrap();
+        save_as(
+            &new,
+            &root(),
+            Role::Second,
+            &SavedTabs::default().with_remote(vec![remote_tab("sc-3")]),
+        )
+        .unwrap();
+        assert_eq!(
+            carry_to_new_host_key(&base, &root(), "SHA256:example", "SHA256:new").unwrap(),
+            1
+        );
+        let Loaded::Saved(main) = load_as(&new, &root(), Role::Main) else {
+            panic!("window 1's file moved");
+        };
+        assert_eq!(main.remote[0].helper.sidecar_id, "sc-1");
+        assert_eq!(main.remote[0].helper.host_key_sha256, "SHA256:new");
+        assert_eq!(load_as(&old, &root(), Role::Main), Loaded::Missing);
+        assert!(
+            matches!(load_as(&old, &root(), Role::Second), Loaded::Saved(_)),
+            "kept beside the new key's own"
+        );
+        assert_eq!(
+            carry_to_new_host_key(&base, &root(), "SHA256:example", "SHA256:new").unwrap(),
+            0
+        );
+    }
+
+    /// A window of a remote project and a `--local` window of its copy, open at once on one root, each keep their own
+    /// file: neither write touches the other's tabs. A remote window's first start copies the remote tabs of its
+    /// server that the shared file held before files were kept by origin, once, and leaves that file whole.
+    #[test]
+    fn saved_tabs_are_keyed_by_origin() {
+        use crate::remote_project::TabOrigin;
+        let state = ScratchDir::new("nv-tabs-origin", "both");
+        let remote_origin = TabOrigin::Remote {
+            host: "example-host".into(),
+            host_key_sha256: "SHA256:example".into(),
+            root: root(),
+        };
+        let local = state_dir_for(Some(state.as_os_str()), None, &TabOrigin::Local).unwrap();
+        let remote = state_dir_for(Some(state.as_os_str()), None, &remote_origin).unwrap();
+        assert_eq!(local, state_dir(Some(state.as_os_str()), None).unwrap());
+        assert_eq!(remote.parent(), Some(local.as_path()));
+        assert_ne!(local, remote);
+
+        // Written before files were kept by origin: the local window carried a remote tab forward, and another
+        // server's tab was saved there too.
+        let mut other_server = remote_tab("sc-other");
+        other_server.helper.host_key_sha256 = "SHA256:other".into();
+        let shared = one_tab("s-local").with_remote(vec![remote_tab("sc-1"), other_server.clone()]);
+        save(&local, &root(), &shared).unwrap();
+
+        assert_eq!(
+            carry_remote_tabs(&local, &remote, &root(), Role::Main, "SHA256:example").unwrap(),
+            1
+        );
+        assert_eq!(
+            load(&remote, &root()),
+            Loaded::Saved(SavedTabs::default().with_remote(vec![remote_tab("sc-1")]))
+        );
+        assert_eq!(
+            load(&local, &root()),
+            Loaded::Saved(shared.clone()),
+            "the shared file is left whole"
+        );
+        assert_eq!(
+            carry_remote_tabs(&local, &remote, &root(), Role::Main, "SHA256:example").unwrap(),
+            0
+        );
+
+        // Both windows open at once, each writing as its tabs change.
+        let mut local_writer = TabWriter::new(Some(local.clone()), root());
+        let mut remote_writer = TabWriter::new(Some(state.join("unused")), root());
+        remote_writer.move_to(remote.clone()).unwrap();
+        local_writer.observe(Some(one_tab("s-local-2").with_remote(vec![other_server.clone()])));
+        remote_writer.observe(Some(
+            SavedTabs::default().with_remote(vec![remote_tab("sc-1"), remote_tab("sc-2")]),
+        ));
+        local_writer
+            .finish()
+            .unwrap()
+            .recv_timeout(std::time::Duration::from_secs(60))
+            .unwrap();
+        remote_writer
+            .finish()
+            .unwrap()
+            .recv_timeout(std::time::Duration::from_secs(60))
+            .unwrap();
+        assert_eq!(
+            load(&local, &root()),
+            Loaded::Saved(one_tab("s-local-2").with_remote(vec![other_server]))
+        );
+        assert_eq!(
+            load(&remote, &root()),
+            Loaded::Saved(SavedTabs::default().with_remote(vec![remote_tab("sc-1"), remote_tab("sc-2")]))
+        );
+        assert!(!state.join("unused").exists());
+        assert!(remote_writer.move_to(local).is_err(), "a finished writer cannot move");
+        let mut off = TabWriter::new(None, root());
+        off.move_to(remote).unwrap();
+        assert!(!off.is_enabled());
     }
 
     fn sessions_of(saved: &SavedTabs) -> Vec<&str> {
@@ -3245,6 +3768,53 @@ mod tests {
         writer.observe(Some(SavedTabs::default()));
         assert!(writer.wait_written(std::time::Duration::from_secs(5)));
         assert_eq!(load(&dir, &root()), Loaded::Saved(SavedTabs::default()));
+    }
+    #[test]
+    fn remote_group_tabs_keep_their_window_through_wire_and_disk() {
+        let first = SavedTabs::default().with_remote(vec![remote_tab("sc-1")]);
+        let third = SavedTabs::default().with_remote(vec![remote_tab("sc-3"), remote_tab("sc-4")]);
+        let third = SavedTabs::from_wire(&third.to_wire()).unwrap();
+        let merged = merge_windows(
+            &[
+                (WindowName::Chat(3), third.clone()),
+                (WindowName::Chat(1), first.clone()),
+            ],
+            Some(&WindowName::Chat(3)),
+        );
+        let saved = decode(&encode(&merged, &root()), &root()).unwrap();
+        assert_eq!(windows_holding(&saved), [WindowName::Chat(1), WindowName::Chat(3)]);
+        assert_eq!(tabs_for(&saved, &WindowName::Chat(1)), first);
+        assert_eq!(tabs_for(&saved, &WindowName::Chat(3)), third);
+        assert_eq!(SavedTabs::from_wire(&saved.to_wire()).unwrap(), saved);
+    }
+
+    #[test]
+    fn a_running_writer_moves_and_flushes_rekeyed_tabs() {
+        let base = ScratchDir::new("nv-tabs-move", "writer");
+        let old = base.join("old");
+        let new = base.join("new");
+        let mut writer = TabWriter::new(Some(old.clone()), root());
+        writer.observe(Some(SavedTabs::default().with_remote(vec![remote_tab("sc-1")])));
+        assert!(writer.wait_written(std::time::Duration::from_secs(60)));
+        let before = std::fs::read(old.join(file_name_as(&root(), Role::Main))).unwrap();
+        writer.rekey_remote("SHA256:example", "SHA256:new");
+        writer.move_to(new.clone()).unwrap();
+        assert!(writer.wait_written(std::time::Duration::from_secs(60)));
+        let Loaded::Saved(saved) = load(&new, &root()) else {
+            panic!("new file missing")
+        };
+        assert_eq!(saved.remote[0].helper.host_key_sha256, "SHA256:new");
+        writer.observe(Some(one_tab("s-after")));
+        writer
+            .finish()
+            .unwrap()
+            .recv_timeout(std::time::Duration::from_secs(60))
+            .unwrap();
+        assert_eq!(load(&new, &root()), Loaded::Saved(one_tab("s-after")));
+        assert_eq!(
+            std::fs::read(old.join(file_name_as(&root(), Role::Main))).unwrap(),
+            before
+        );
     }
 }
 

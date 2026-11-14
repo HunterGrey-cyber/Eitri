@@ -74,9 +74,47 @@ const BYE_CHARS: usize = 300;
 /// What an orphan holds now, read as it welcomes a window 1 that came back.
 pub type HeldNow = std::rc::Rc<dyn Fn() -> BTreeSet<String>>;
 
-/// The directory the orphan's socket lives in: the companion panel's control directory.
+/// The origin of this process's windows ([`set_origin`]), decided once at the launch.
+static ORIGIN: std::sync::OnceLock<eitri_core::remote_project::WindowOrigin> = std::sync::OnceLock::new();
+
+/// Records the launch's origin, before any window of the pair looks for the other: a remote project's window and a
+/// window of its copy share a root, and an orphan of the one is never the other's.
+pub fn set_origin(origin: &eitri_core::remote_project::WindowOrigin) {
+    let _ = ORIGIN.set(origin.clone());
+}
+
+/// The directory the orphan's socket lives in, isolated from local copies and stable across a remote key change.
 pub fn orphan_dir() -> PathBuf {
-    eitri_core::panel_control::control_dir(std::env::var_os("XDG_RUNTIME_DIR").as_deref(), &std::env::temp_dir())
+    orphan_dir_for(ORIGIN.get().unwrap_or(&eitri_core::remote_project::WindowOrigin::Local))
+}
+
+/// A remote pairing belongs to the host as typed, so a replacement key does not strand an orphan under the old key.
+pub fn orphan_dir_path(origin: &eitri_core::remote_project::WindowOrigin) -> PathBuf {
+    orphan_dir_at(
+        &crate::remote_window::control_dir(&eitri_core::remote_project::WindowOrigin::Local),
+        origin,
+    )
+}
+
+fn orphan_dir_at(base: &Path, origin: &eitri_core::remote_project::WindowOrigin) -> PathBuf {
+    match origin.remote() {
+        Some(project) => base.join(format!(
+            "rh-{}",
+            eitri_core::state_paths::project_key(Path::new(&project.host))
+        )),
+        None => base.to_owned(),
+    }
+}
+
+/// [`orphan_dir_path`], the shared directory a remote project's is made in made first.
+pub fn orphan_dir_for(origin: &eitri_core::remote_project::WindowOrigin) -> PathBuf {
+    let dir = orphan_dir_path(origin);
+    if let Some(shared) = dir.parent().filter(|_| origin.key().is_some()) {
+        if let Err(why) = eitri_core::panel_control::ensure_dir(shared) {
+            eprintln!("[window] {why}");
+        }
+    }
+    dir
 }
 
 /// Window 2's socket, `dir/w-<16 hex>.sock`, checked against the socket path limit.

@@ -3,7 +3,7 @@
 //! answers cards by itself is checked to answer nothing a plan-mode card asks.
 #![cfg(test)]
 use super::*;
-use crate::agent_backend::{plan_verdict, PlanGate, PlanVerdict};
+use crate::agent_backend::{plan_verdict, HumanApprovals, PlanGate, PlanVerdict};
 use crate::test_providers::RecordingProvider;
 use agent::{
     AgentConversation, AgentDomainEvent, PermissionDecision, PermissionMode, PlanExecutionMode, PlanOutcome, PlanPhase,
@@ -829,13 +829,12 @@ fn bypass_approve_pending_confirm_bypass_and_cycle_never_settle_a_plan() {
     p.enter();
     p.propose();
     assert_eq!(p.set.cycle_mode(p.tab, ViewId::BASE).unwrap_err(), PLAN_CYCLE_REFUSAL);
-    let answered = p
-        .set
-        .get_mut(p.tab)
-        .unwrap()
-        .live_mut()
-        .unwrap()
-        .approve_pending(&["p1".to_string()], "on entering bypass");
+    let answered = p.set.get_mut(p.tab).unwrap().live_mut().unwrap().approve_pending(
+        &["p1".to_string()],
+        "on entering bypass",
+        false,
+        &mut HumanApprovals::default(),
+    );
     assert!(answered.ids.is_empty());
     assert!(p.provider.interactions().is_empty());
     assert!(p.provider.decisions().is_empty());
@@ -1851,7 +1850,10 @@ fn confirming_bypass_skips_a_card_whose_call_is_unseen() {
     );
     let ids = vec!["g".to_string()];
     let backend = p.set.get_mut(p.tab).unwrap().live_mut().unwrap();
-    assert!(backend.approve_pending(&ids, "in a test").ids.is_empty());
+    assert!(backend
+        .approve_pending(&ids, "in a test", false, &mut HumanApprovals::default())
+        .ids
+        .is_empty());
     assert_eq!(p.decision("g"), None);
     p.start("g", "WebFetch", fetch);
     assert_eq!(waiting_cards(p.tab()), ids, "placed: executing when it began");
@@ -1935,7 +1937,10 @@ fn the_sweeps_skip_a_card_whose_call_began_outside_executing() {
     );
     let ids = vec!["g".to_string()];
     let backend = p.set.get_mut(p.tab).unwrap().live_mut().unwrap();
-    assert!(backend.approve_pending(&ids, "in a test").ids.is_empty());
+    assert!(backend
+        .approve_pending(&ids, "in a test", false, &mut HumanApprovals::default())
+        .ids
+        .is_empty());
     assert_eq!(p.decision("g"), None);
     p.shut_down();
 }
@@ -2415,4 +2420,312 @@ fn a_new_session_takes_up_its_own_approvals_whatever_the_old_one_numbered() {
         "the approval into Auto was taken up"
     );
     p.shut_down();
+}
+
+/// What the window that saved a reattached tab had folded of its session (the provider's sequence).
+const ATTACHED: u64 = 9;
+
+/// A remote tab in `mode` taken up again in a new window from its saved state, its saving window having folded the
+/// session through [`ATTACHED`]: its history has not been read back yet.
+fn reattached(label: &str, mode: SessionModeChoice) -> Plan {
+    let dir = workspace(label).canonicalize().unwrap();
+    let provider = Arc::new(RecordingProvider::planning(false));
+    provider.set_link(Some(agent::RemoteLinkState::Live));
+    let conversation = AgentConversation::reattach_remote(provider.clone(), &dir, "session").unwrap();
+    let mut set = TabSet::new(BackendKind::Sidecar, SessionModeChoice::Auto);
+    let tab = set.active();
+    set.get_mut(tab).unwrap().backend = TabBackend::Live(AgentBackend::reattached(conversation, ATTACHED));
+    set.get_mut(tab).unwrap().set_mode_for_test(mode);
+    Plan {
+        dir,
+        set,
+        tab,
+        provider,
+    }
+}
+
+impl Plan {
+    /// A stretch of the session as the provider delivers it, the last of `events` at its sequence `through`, then
+    /// two pumps.
+    fn deliver(&mut self, events: Vec<AgentDomainEvent>, through: u64) {
+        self.provider.queue_through(events, through);
+        self.provider.wait_until_folded();
+        self.set.pump(&self.dir, true);
+        self.set.pump(&self.dir, true);
+    }
+}
+
+/// The model enters plan mode in turn `turn` and the CLI says so.
+fn entered_in(turn: &str) -> Vec<AgentDomainEvent> {
+    vec![
+        AgentDomainEvent::CliPermissionMode {
+            reported: "default".into(),
+        },
+        AgentDomainEvent::TurnStarted { turn_id: turn.into() },
+        AgentDomainEvent::ToolCallStarted {
+            turn_id: turn.into(),
+            tool_use_id: format!("toolu_enter_{turn}"),
+            name: "EnterPlanMode".into(),
+            input: serde_json::json!({}),
+        },
+        AgentDomainEvent::CliPlanMode {
+            source: "CliModeReported".into(),
+        },
+    ]
+}
+
+/// The plan `plan` proposed, approved into `mode` and the CLI back in `default`.
+fn approved(plan: &str, mode: PlanExecutionMode) -> Vec<AgentDomainEvent> {
+    vec![
+        AgentDomainEvent::PlanProposed {
+            interaction_id: plan.into(),
+            tool_use_id: Some(format!("toolu_exit_{plan}")),
+            plan: "# Plan\n\n1. Do it".into(),
+            plan_sha256: SHA.into(),
+            allowed_prompts: Vec::new(),
+            unsupported_reason: None,
+        },
+        AgentDomainEvent::PlanSettled {
+            interaction_id: plan.into(),
+            outcome: PlanOutcome::Approved,
+            mode_after: Some(mode),
+            feedback: None,
+            reason: None,
+        },
+        AgentDomainEvent::CliPermissionMode {
+            reported: "default".into(),
+        },
+    ]
+}
+
+/// A reattached tab's history, read back in two stretches with a pump between, holds a plan the window that saved it
+/// approved into Auto: the tab, restored in Manual, stays in Manual. A plan approved after the history was read back
+/// is taken up as ever.
+#[test]
+fn a_reattached_tab_takes_up_no_approval_its_history_reads_back() {
+    let mut p = reattached("plan-reattach-auto", SessionModeChoice::Manual);
+    p.deliver(entered_in("t1"), 4);
+    assert_eq!(p.phase(), PlanPhase::Planning, "the history's plan round is folded");
+    p.deliver(approved("p1", PlanExecutionMode::Auto), ATTACHED);
+    assert_eq!(p.phase(), PlanPhase::Executing);
+    assert_eq!(
+        p.tab().mode(),
+        SessionModeChoice::Manual,
+        "an approval read back is not taken up"
+    );
+    assert_eq!(p.tab().plan_origin(), None);
+
+    let mut next_round = vec![turn_done()];
+    next_round.extend(entered_in("t2"));
+    p.deliver(next_round, 13);
+    assert_eq!(
+        p.tab().plan_origin(),
+        Some(SessionModeChoice::Manual),
+        "a live round is followed"
+    );
+    p.deliver(approved("p2", PlanExecutionMode::Auto), 16);
+    assert_eq!(
+        p.tab().mode(),
+        SessionModeChoice::Auto,
+        "an approval after the history is taken up"
+    );
+    p.shut_down();
+}
+
+/// A plan round in a reattached tab's history, approved into Manual by the window that saved it, neither puts the tab
+/// (restored in Auto) in Manual nor holds its mode changes once the history is read back.
+#[test]
+fn a_reattached_tabs_history_neither_forces_manual_nor_holds_mode_changes() {
+    let mut p = reattached("plan-reattach-manual", SessionModeChoice::Auto);
+    p.deliver(entered_in("t1"), 4);
+    p.deliver(approved("p1", PlanExecutionMode::Manual), ATTACHED);
+    assert_eq!(p.phase(), PlanPhase::Executing);
+    assert_eq!(p.tab().mode(), SessionModeChoice::Auto);
+    assert!(!p.tab().plan_cycle.open, "no round is left open");
+    assert!(p.set.plan_mode_refusal(p.tab).is_none(), "mode changes are not held");
+    assert!(matches!(
+        p.set.cycle_mode(p.tab, ViewId::BASE),
+        Ok(ModeCycle::Confirm(_))
+    ));
+    p.shut_down();
+}
+
+/// A remote Bypass tab's answer is lost while the link is down, and the session enters plan mode before the link is
+/// back: the answer is not sent again, and the request stays the person's card.
+#[test]
+fn a_lost_answer_is_not_sent_again_while_the_session_plans() {
+    let mut p = Plan::new("plan-lost-answer", false, SessionModeChoice::Bypass);
+    p.provider.set_link(Some(agent::RemoteLinkState::Live));
+    p.queue(vec![AgentDomainEvent::TurnStarted { turn_id: "t1".into() }]);
+    p.pump();
+    p.provider.hold_permission_replies();
+    p.ask("w", "Write", write(), false);
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while p.provider.held_permissions() != 1 {
+        assert!(Instant::now() < deadline, "the host answer never went out");
+        p.pump();
+    }
+    p.provider
+        .set_link(Some(agent::RemoteLinkState::Disconnected { since_unix_ms: 1 }));
+    p.provider
+        .reply_to_held_permissions(Err(agent::ProviderError::Transport("the link broke".into())));
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while !p.tab().card_is_waiting("w") {
+        assert!(Instant::now() < deadline, "the card never came back");
+        p.pump();
+    }
+    p.queue(vec![
+        AgentDomainEvent::ToolCallStarted {
+            turn_id: "t1".into(),
+            tool_use_id: "toolu_enter".into(),
+            name: "EnterPlanMode".into(),
+            input: serde_json::json!({}),
+        },
+        AgentDomainEvent::CliPlanMode {
+            source: "CliModeReported".into(),
+        },
+    ]);
+    p.pump_until("planning", |projection| {
+        projection.planning.phase == PlanPhase::Planning
+    });
+    p.provider.set_link(Some(agent::RemoteLinkState::Live));
+    for _ in 0..4 {
+        p.pump();
+    }
+    assert_eq!(p.provider.held_permissions(), 0, "nothing is sent again in plan mode");
+    assert!(p.tab().card_is_waiting("w"));
+    assert!(p.tab().session.human_allowed.fell_back("w"));
+    p.shut_down();
+}
+
+/// The CLI's own reports of a plan-mode switch the person made in the window that saved a reattached tab: the history
+/// holds them without the move the host folded only there.
+fn host_switch_reports() -> (Vec<AgentDomainEvent>, Vec<AgentDomainEvent>) {
+    let into = vec![
+        AgentDomainEvent::CliPermissionMode {
+            reported: "default".into(),
+        },
+        AgentDomainEvent::CliPlanMode {
+            source: "CliModeReported".into(),
+        },
+    ];
+    let out = vec![AgentDomainEvent::CliPermissionMode {
+        reported: "default".into(),
+    }];
+    (into, out)
+}
+
+/// A reattached tab whose history holds a switch into plan mode and out of it that the person made with the host's
+/// own switch reads it back as that switch: the tab stays live in its mode and nothing trips. The same report once
+/// the history has been read back still trips, and so does an ungated mode in the history.
+#[test]
+fn a_reattached_tabs_history_reads_back_the_persons_own_plan_switch() {
+    let mut p = reattached("plan-reattach-host-switch", SessionModeChoice::Auto);
+    let (into, out) = host_switch_reports();
+    p.deliver(into, 4);
+    assert_eq!(p.phase(), PlanPhase::Planning);
+    p.deliver(out, ATTACHED);
+    assert_eq!(p.phase(), PlanPhase::Executing);
+    assert!(p.backend().projection().ungated_cli_mode.is_none());
+    assert!(!matches!(
+        p.tab().wire_state(),
+        TabStateWire::Failed | TabStateWire::Ended
+    ));
+    assert_eq!(p.tab().mode(), SessionModeChoice::Auto);
+    assert_eq!(p.provider.remote_stops(), 0);
+
+    p.deliver(
+        vec![AgentDomainEvent::CliPlanMode {
+            source: "CliModeReported".into(),
+        }],
+        12,
+    );
+    assert!(
+        p.set.get(p.tab).unwrap().live().is_none(),
+        "after the history a switch nobody made trips"
+    );
+    p.shut_down();
+
+    let mut p = reattached("plan-reattach-ungated", SessionModeChoice::Auto);
+    p.deliver(
+        vec![AgentDomainEvent::UngatedCliMode {
+            reported: "bypassPermissions".into(),
+            detail: "CliModeReported".into(),
+        }],
+        4,
+    );
+    assert!(
+        p.set.get(p.tab).unwrap().live().is_none(),
+        "an ungated mode in the history still trips"
+    );
+    p.shut_down();
+}
+
+/// While a reattached tab reads its history back, no plan decision or switch is taken; once it has, they are.
+#[test]
+fn a_reattached_tab_takes_no_plan_act_while_it_reads_its_history() {
+    let mut p = reattached("plan-reattach-acts", SessionModeChoice::Auto);
+    p.deliver(entered_in("t1"), 4);
+    p.deliver(
+        vec![AgentDomainEvent::PlanProposed {
+            interaction_id: "p1".into(),
+            tool_use_id: Some("toolu_exit_p1".into()),
+            plan: "# Plan\n\n1. Do it".into(),
+            plan_sha256: SHA.into(),
+            allowed_prompts: Vec::new(),
+            unsupported_reason: None,
+        }],
+        6,
+    );
+    assert!(p.backend().projection().waiting_plan().is_some());
+    let refused = |result: Result<(), BackendError>| result.unwrap_err().message;
+    assert_eq!(
+        refused(
+            p.set
+                .approve_plan(p.tab, ViewId::BASE, "p1", PlanChoice::ApproveManual, SHA, 0)
+                .map(|_| ())
+        ),
+        PLAN_WHILE_REPLAYING
+    );
+    assert_eq!(
+        refused(
+            p.set
+                .keep_planning(p.tab, ViewId::BASE, "p1", String::new())
+                .map(|_| ())
+        ),
+        PLAN_WHILE_REPLAYING
+    );
+    assert_eq!(
+        refused(p.set.set_planning(p.tab, ViewId::BASE, false, 0).map(|_| ())),
+        PLAN_WHILE_REPLAYING
+    );
+    p.deliver(Vec::new(), ATTACHED);
+    assert!(!p.backend().replaying_history());
+    assert!(p.set.keep_planning(p.tab, ViewId::BASE, "p1", String::new()).is_ok());
+    p.shut_down();
+}
+
+/// A reattached tab whose session ended on the server before its journal reached what was saved stops reading its
+/// history back once that end is folded, so it is not refused moves for good.
+#[test]
+fn a_gone_reattached_tab_stops_reading_its_history_at_its_end() {
+    let dir = workspace("plan-reattach-gone").canonicalize().unwrap();
+    let provider = Arc::new(RecordingProvider::planning(false));
+    provider.set_link(Some(agent::RemoteLinkState::Live));
+    let conversation = AgentConversation::reattach_remote(provider.clone(), &dir, "session").unwrap();
+    let mut backend = AgentBackend::reattached(conversation, ATTACHED);
+    assert!(backend.replaying_history());
+    provider.set_remote(Some(agent::RemoteEnding::AgentGone), None);
+    provider.queue_through(
+        vec![AgentDomainEvent::SessionUnavailable {
+            reason: "the agent is gone".into(),
+        }],
+        2,
+    );
+    provider.wait_until_folded();
+    assert!(
+        !backend.replaying_history(),
+        "nothing more is read back after the session's end"
+    );
+    backend.shutdown();
 }

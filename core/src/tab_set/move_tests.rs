@@ -44,6 +44,151 @@ fn until(what: &str, mut done: impl FnMut() -> bool) {
     }
 }
 
+#[test]
+fn remote_tab_origin_survives_a_window_move() {
+    let mut source = set();
+    let origin = TabOrigin::Remote {
+        host: "example-host".into(),
+        host_key_sha256: "SHA256:example".into(),
+        root: "/srv/project".into(),
+    };
+    source.set_project_origin(origin.clone()).unwrap();
+    let tab = source.active();
+    let frozen = freeze_settled(&mut source, tab).unwrap();
+    let record = serde_json::from_str(&serde_json::to_string(&frozen.tab).unwrap()).unwrap();
+    let mut dest = set();
+    let arrived = dest.adopt_moved_unstarted(record, ViewId::BASE).unwrap();
+    for _ in 0..4 {
+        dest.pump(Path::new("/srv/project"), true);
+        assert_eq!(dest.get(arrived).unwrap().origin(), &origin);
+        assert!(matches!(
+            dest.get(arrived).unwrap().gate_root(Path::new("/srv/project")),
+            agent::GateRoot::RemoteWithoutFacts
+        ));
+        assert_eq!(
+            dest.review_session(arrived).err().as_deref(),
+            Some(crate::turn_review::REMOTE_UNAVAILABLE)
+        );
+    }
+    let _ = source.hand_over(tab);
+}
+
+#[test]
+fn startup_origin_changes_only_tabs_created_by_this_window() {
+    for arrived_origin in [
+        TabOrigin::Local,
+        TabOrigin::Remote {
+            host: "example-host".into(),
+            host_key_sha256: "SHA256:example".into(),
+            root: "/srv/project".into(),
+        },
+    ] {
+        let mut source = set();
+        source.set_project_origin(arrived_origin.clone()).unwrap();
+        let tab = source.active();
+        let frozen = freeze_settled(&mut source, tab).unwrap();
+        let mut dest = set();
+        let own = dest.active();
+        let arrived = dest.adopt_moved_unstarted(frozen.tab, ViewId::BASE).unwrap();
+        let new_origin = TabOrigin::Remote {
+            host: "example-host".into(),
+            host_key_sha256: "SHA256:other".into(),
+            root: "/srv/project".into(),
+        };
+        dest.set_project_origin(new_origin.clone()).unwrap();
+        assert_eq!(dest.get(arrived).unwrap().origin(), &arrived_origin);
+        assert_eq!(dest.get(own).unwrap().origin(), &new_origin);
+        let opened = dest.open(AgentId::Claude);
+        assert_eq!(dest.get(opened).unwrap().origin(), &new_origin);
+        dest.set_project_origin(TabOrigin::Local).unwrap();
+        assert_eq!(dest.get(arrived).unwrap().origin(), &arrived_origin);
+        assert_eq!(dest.get(own).unwrap().origin(), &TabOrigin::Local);
+        assert_eq!(dest.get(opened).unwrap().origin(), &TabOrigin::Local);
+        let _ = source.hand_over(tab);
+    }
+}
+
+/// A window running a build that predates remote tabs writes no origin: its tabs are all local, and its move reads
+/// as one.
+#[test]
+fn a_move_record_without_origin_reads_as_local() {
+    let mut source = set();
+    let tab = source.active();
+    let frozen = freeze_settled(&mut source, tab).unwrap();
+    let mut record = serde_json::to_value(&frozen.tab).unwrap();
+    assert!(record.as_object_mut().unwrap().remove("origin").is_some());
+    let read = serde_json::from_value::<TabHandoff>(record).expect("an older peer's move is taken");
+    let mut dest = set();
+    let arrived = dest.adopt_moved_unstarted(read, ViewId::BASE).unwrap();
+    assert_eq!(dest.get(arrived).unwrap().origin(), &TabOrigin::Local);
+    let _ = source.hand_over(tab);
+}
+
+/// A record whose agent runs on a server is taken up only under a remote origin: one that says local would have its
+/// gate judge the agent's paths against this machine's files.
+#[test]
+fn a_record_whose_agent_runs_on_a_server_must_name_a_remote_origin() {
+    let mut source = set();
+    let tab = source.active();
+    let frozen = freeze_settled(&mut source, tab).unwrap();
+    assert!(frozen.tab.check_remote_agent(true).is_err());
+    assert!(frozen.tab.check_remote_agent(false).is_ok());
+    let _ = source.hand_over(tab);
+    let mut source = set();
+    source
+        .set_project_origin(TabOrigin::Remote {
+            host: "example-host".into(),
+            host_key_sha256: "SHA256:example".into(),
+            root: "/srv/project".into(),
+        })
+        .unwrap();
+    let tab = source.active();
+    let frozen = freeze_settled(&mut source, tab).unwrap();
+    assert!(frozen.tab.check_remote_agent(true).is_ok());
+    let _ = source.hand_over(tab);
+}
+
+/// A tab that only names its saved remote agent (its reattach failed, or has not reached the agent) does not move:
+/// the other window would take it with nothing naming the agent, which would then be neither saved nor stopped.
+#[test]
+fn a_tab_that_only_names_its_saved_remote_agent_does_not_move() {
+    let mut source = set();
+    source
+        .set_project_origin(TabOrigin::Remote {
+            host: "example-host".into(),
+            host_key_sha256: "SHA256:example".into(),
+            root: "/srv/project".into(),
+        })
+        .unwrap();
+    let saved = crate::saved_tabs::SavedRemoteTab {
+        helper: agent::HelperHandoff {
+            host: "example-host".into(),
+            host_key_sha256: "SHA256:example".into(),
+            sidecar_id: "sc-1".into(),
+            session_id: "session-1".into(),
+            last_folded_sequence: 3,
+            daemon: String::new(),
+            declared_client_tools: Default::default(),
+        },
+        provider_session_id: Some("claude-1".into()),
+        name: None,
+        mode: SessionModeChoice::Auto,
+        window: None,
+    };
+    let tab = source.open_reattaching(&saved);
+    source.get_mut(tab).unwrap().backend = TabBackend::Failed {
+        reason: "the server could not be reached".into(),
+    };
+    assert!(source.move_blocker(tab).is_some(), "the move is refused");
+    assert!(freeze_settled(&mut source, tab).is_err());
+    assert!(!source.is_moving(tab));
+    assert_eq!(
+        source.saved_snapshot("c").unwrap().remote.len(),
+        1,
+        "the agent stays named here"
+    );
+}
+
 fn set() -> TabSet {
     TabSet::new(BackendKind::Sidecar, SessionModeChoice::Auto)
 }

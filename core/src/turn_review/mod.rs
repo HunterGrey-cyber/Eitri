@@ -6,7 +6,7 @@
 //! the user's git configuration and environment so that no filter, hook or conversion runs over
 //! the user's files.
 //!
-//! [`TurnReview`] ([`lifecycle`]) follows the turns of every tab and queues their snapshots on a
+//! [`TurnReview`] ([`lifecycle`]) follows local tabs' turns and queues their snapshots on a
 //! worker thread per session; [`attribution`] says which changed files a turn's own edit calls
 //! named.
 //!
@@ -46,6 +46,9 @@ pub mod shadow;
 pub(crate) mod test_hooks;
 pub mod write;
 pub mod write_slot;
+
+/// Remote edits have no baseline on this machine to review against.
+pub const REMOTE_UNAVAILABLE: &str = "not available on remote tabs yet";
 
 pub use attribution::{edited_by, named_paths, origin, NamedPaths, Origin};
 

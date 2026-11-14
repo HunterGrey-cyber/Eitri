@@ -23,6 +23,7 @@ use eitri_core::companion::env::OPEN_SOCKET_ENV;
 use eitri_core::nvim_rpc::Pending;
 use eitri_core::open_socket::{deliver, socket_path, Answer, Answering, Delivered, OpenServer, Raised, Request};
 use eitri_core::project_root::Launch;
+use eitri_core::remote_project::WindowOrigin;
 use eitri_core::wm::{EditorEvent, HostEvent, HostSink, WinId};
 use gtk4::glib;
 
@@ -33,8 +34,10 @@ const LOOKS: u32 = 100;
 /// Why an open has no answer, for the line that says the file is not open yet.
 const NO_ANSWER: &str = "nvim did not answer; it may be waiting at a prompt";
 
-fn control_dir() -> PathBuf {
-    eitri_core::panel_control::control_dir(std::env::var_os("XDG_RUNTIME_DIR").as_deref(), &std::env::temp_dir())
+/// Where the sockets of windows of `origin` are: a remote project's window and a window of its copy share a root
+/// and are still two projects, so each answers only for its own.
+fn control_dir(origin: &WindowOrigin) -> PathBuf {
+    crate::remote_window::control_dir(origin)
 }
 
 /// The socket of the terminal this process was started in. For `main` to read before it scrubs the variable.
@@ -70,16 +73,18 @@ fn activation_token(get: &dyn Fn(&str) -> Option<String>) -> Option<String> {
         .find_map(|name| get(name).filter(|token| !token.is_empty()))
 }
 
-/// Gives the launch's files to a running window. `Some` is how this process ends, and nothing of a window of its own
-/// has been started; `None` is a launch that goes on to its own window.
+/// Gives the launch's files to a running window of the same project and origin. `Some` is how this process ends, and
+/// nothing of a window of its own has been started; `None` is a launch that goes on to its own window. A terminal's
+/// hint names the window it was started in, whatever its origin: that window is the one asked first.
 pub(crate) fn hand_over(
     launch: &Launch,
+    origin: &WindowOrigin,
     clean: bool,
     backend: BackendKind,
     hint: Option<&Path>,
     token: Option<&str>,
 ) -> Option<glib::ExitCode> {
-    hand_over_in(&control_dir(), launch, clean, backend, hint, token)
+    hand_over_in(&control_dir(origin), launch, clean, backend, hint, token)
 }
 
 fn hand_over_in(
@@ -112,8 +117,14 @@ fn hand_over_in(
 
 /// Asks the running window of the launch's root to come forward. `Some` is how this process ends, and nothing of a
 /// window of its own has been started; `None` is a launch that goes on to be that window.
-pub(crate) fn raise(launch: &Launch, clean: bool, backend: BackendKind, token: Option<&str>) -> Option<glib::ExitCode> {
-    raise_in(&control_dir(), launch, clean, backend, token)
+pub(crate) fn raise(
+    launch: &Launch,
+    origin: &WindowOrigin,
+    clean: bool,
+    backend: BackendKind,
+    token: Option<&str>,
+) -> Option<glib::ExitCode> {
+    raise_in(&control_dir(origin), launch, clean, backend, token)
 }
 
 fn raise_in(
@@ -143,8 +154,8 @@ fn opened_line(root: Option<&Path>) -> String {
 
 /// What a terminal's shell is told: the socket this window holds, or the root's when it holds none, as window 2 does,
 /// whose editor is window 1's. A window whose root's socket has no usable name tells it nothing.
-pub(crate) fn shell_env(held: Option<&OpenRequests>, root: &Path) -> Vec<(OsString, OsString)> {
-    shell_env_in(held.map(OpenRequests::socket), &control_dir(), root)
+pub(crate) fn shell_env(held: Option<&OpenRequests>, root: &Path, origin: &WindowOrigin) -> Vec<(OsString, OsString)> {
+    shell_env_in(held.map(OpenRequests::socket), &control_dir(origin), root)
 }
 
 fn shell_env_in(held: Option<&Path>, dir: &Path, root: &Path) -> Vec<(OsString, OsString)> {
@@ -164,7 +175,9 @@ pub(crate) struct OpenRequests {
     sink: Weak<dyn HostSink>,
     /// Keyed by the id of the event each was posted as. Dropping one answers `busy`.
     waiting: RefCell<HashMap<u64, Answering>>,
-    last_id: Cell<u64>,
+    last_id: Rc<Cell<u64>>,
+    /// A replacement host key gets its own address; existing terminal hints keep reaching this same window.
+    aliases: RefCell<Vec<Rc<OpenRequests>>>,
     /// Removed before the server closes: the watch reads the server's descriptor.
     watch: Cell<Option<glib::SourceId>>,
 }
@@ -172,9 +185,22 @@ pub(crate) struct OpenRequests {
 impl OpenRequests {
     /// Claims the socket of `root`, which must be canonical. A failed claim is one log line: the window runs without
     /// reuse.
-    pub(crate) fn claim(root: &Path, sink: Weak<dyn HostSink>) -> Option<Rc<OpenRequests>> {
-        match OpenServer::claim(&control_dir(), root) {
-            Ok(server) => Some(OpenRequests::new(server, sink)),
+    pub(crate) fn claim(root: &Path, origin: &WindowOrigin, sink: Weak<dyn HostSink>) -> Option<Rc<OpenRequests>> {
+        Self::claim_server(root, origin).map(|server| OpenRequests::new(server, sink))
+    }
+
+    /// Claims an origin's address on a worker when a connected window discovers a replacement host key.
+    pub(crate) fn claim_server(root: &Path, origin: &WindowOrigin) -> Option<OpenServer> {
+        let dir = control_dir(origin);
+        // A remote origin's directory is made inside the shared one, which may not exist yet.
+        if let Some(shared) = dir.parent().filter(|_| origin.key().is_some()) {
+            if let Err(why) = eitri_core::panel_control::ensure_dir(shared) {
+                eprintln!("[open] {why}; this window runs without reuse");
+                return None;
+            }
+        }
+        match OpenServer::claim(&dir, root) {
+            Ok(server) => Some(server),
             Err(why) => {
                 eprintln!("[open] {why}; this window runs without reuse");
                 None
@@ -187,9 +213,27 @@ impl OpenRequests {
             server,
             sink,
             waiting: RefCell::default(),
-            last_id: Cell::new(0),
+            last_id: Rc::new(Cell::new(0)),
+            aliases: RefCell::default(),
             watch: Cell::new(None),
         })
+    }
+
+    pub(crate) fn add_origin(&self, server: OpenServer) {
+        self.keep_origin(server).watch();
+    }
+
+    fn keep_origin(&self, server: OpenServer) -> Rc<OpenRequests> {
+        let alias = Rc::new(OpenRequests {
+            server,
+            sink: self.sink.clone(),
+            waiting: RefCell::default(),
+            last_id: self.last_id.clone(),
+            aliases: RefCell::default(),
+            watch: Cell::new(None),
+        });
+        self.aliases.borrow_mut().push(alias.clone());
+        alias
     }
 
     pub(crate) fn socket(&self) -> &Path {
@@ -258,6 +302,9 @@ impl OpenRequests {
     /// its client has its answer.
     pub(crate) fn answer(&self, id: u64, accepted: bool) {
         let Some(answering) = self.waiting.borrow_mut().remove(&id) else {
+            for alias in self.aliases.borrow().iter() {
+                alias.answer(id, accepted);
+            }
             return;
         };
         answering.answer(if accepted { Answer::Accepted } else { Answer::Busy });
@@ -265,6 +312,9 @@ impl OpenRequests {
 
     /// Takes the socket away and answers `busy` to whatever is still unanswered. Idempotent.
     pub(crate) fn close(&self) {
+        for alias in self.aliases.borrow_mut().drain(..) {
+            alias.close();
+        }
         if let Some(source) = self.watch.take() {
             source.remove();
         }
@@ -357,6 +407,8 @@ mod tests {
 
         fn launch(&self, open: &[&Path]) -> Launch {
             Launch {
+                ssh: None,
+                local: false,
                 root: self.root.clone(),
                 wider_roots: Vec::new(),
                 open: open
@@ -922,5 +974,32 @@ mod tests {
         let mut left = 2;
         assert_eq!(look(&pending, &mut left), None);
         assert_eq!(look(&pending, &mut left), Some(Err(NO_ANSWER.to_owned())));
+    }
+    #[test]
+    fn a_replacement_origin_and_existing_terminal_hint_reach_the_same_window() {
+        let scratch = Scratch::new();
+        let sink = Rc::new(RecordingSink::default());
+        let requests = scratch.requests(&sink);
+        let new_dir = scratch.top.join("new-key");
+        let new_server = OpenServer::claim(&new_dir, &scratch.root).unwrap();
+        let new_address = new_server.socket().to_owned();
+        let alias = requests.keep_origin(new_server);
+        let old_file = scratch.file("old-terminal");
+        let new_file = scratch.file("outside-launch");
+        let old_client = ask(requests.socket(), &old_file);
+        let old_id = receive_one(&requests, &sink);
+        let new_client = ask(&new_address, &new_file);
+        let new_id = receive_one(&alias, &sink);
+        assert_ne!(old_id, new_id);
+        requests.answer(old_id, true);
+        requests.answer(new_id, true);
+        assert_eq!(old_client.join().unwrap(), "ok");
+        assert_eq!(new_client.join().unwrap(), "ok");
+        assert_eq!(
+            opens(&sink).iter().map(|(_, path)| path).collect::<Vec<_>>(),
+            [&old_file, &new_file]
+        );
+        requests.close();
+        assert!(!new_address.exists());
     }
 }

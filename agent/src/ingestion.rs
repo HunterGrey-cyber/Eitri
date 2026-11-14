@@ -262,6 +262,11 @@ struct IngestState {
     ///
     /// [`AgentProvider::pumped_through`]: crate::provider::AgentProvider::pumped_through
     folded_through: u64,
+    /// A remote tab taken up again from its server: the last sequence the window that saved it had folded
+    /// (`AgentConversation::replays_history_through`). A batch that begins below it is that session's history
+    /// read back, and is folded as such (`PlanningState::replaying_history`); `None` otherwise, and once the
+    /// conversation said its history has been read back for good.
+    replay_through: Option<u64>,
     /// The `folded_through` through which the stored history holds everything this conversation owes
     /// it. Set to the position the last write's snapshot was taken at once `store::save` returned, and
     /// to `folded_through` whenever the thread finds nothing owed (`history_dirty` false between its own
@@ -681,6 +686,8 @@ impl IngestState {
             lifecycle_since_open,
             running_turn,
             folded_through,
+            // A conversation still reading its history back from a server does not move (the tab set refuses it).
+            replay_through: _,
             // The destination's thread starts its own account of what it has written; a failed write
             // moves as history owed (below).
             history_saved_through: _,
@@ -808,6 +815,7 @@ impl IngestState {
             lifecycle_since_open,
             running_turn,
             folded_through,
+            replay_through: None,
             // What the source wrote is on disk; with nothing owed, through the position it moved at. A
             // failed write carried in the middle of a turn is owed at that turn's end and reads as saved
             // until then: only the test-support accessor reads this, and only once the tab is idle.
@@ -894,6 +902,18 @@ pub struct ProjectionGuard<'a> {
 }
 
 impl ProjectionGuard<'_> {
+    /// The provider's own sequence of the last event folded into this projection (`AgentProvider::pumped_through`),
+    /// 0 before any.
+    pub fn folded_through(&self) -> u64 {
+        self.state.folded_through
+    }
+
+    /// What the window that saved a remote tab taken up again had folded, while its history is being read back
+    /// (`ConversationIngest::set_replay_through`).
+    pub fn replay_through(&self) -> Option<u64> {
+        self.state.replay_through
+    }
+
     /// Calls removed from the projection whose attribution delivery has not been handled yet.
     pub fn evicted_calls(&self) -> impl Iterator<Item = &crate::ToolCallRecord> {
         self.state.evicted_calls.iter().flat_map(|(_, calls)| calls)
@@ -1017,6 +1037,7 @@ impl ConversationIngest {
             lifecycle_since_open: Vec::new(),
             running_turn: None,
             folded_through: 0,
+            replay_through: None,
             history_saved_through: 0,
             history_save_failed: false,
             #[cfg(feature = "test-support")]
@@ -1258,6 +1279,12 @@ impl ConversationIngest {
 
     /// The state lock, for an accessor named `accessor`: refused first (in a debug build) when this
     /// thread holds the projection guard, since the lock would then wait on its own thread.
+    /// Marks what this conversation folds below `through` as its session's history read back from a server
+    /// (`Some`), or ends that (`None`).
+    pub fn set_replay_through(&self, through: Option<u64>) {
+        self.lock_state("set_replay_through").replay_through = through;
+    }
+
     fn lock_state(&self, accessor: &'static str) -> MutexGuard<'_, IngestState> {
         self.holder.refuse_reentry(accessor);
         self.state.lock().unwrap()
@@ -1597,13 +1624,13 @@ fn fold_batch(
     session_id: &Mutex<Option<String>>,
     context: &AdoptionContext,
     events: Vec<AgentDomainEvent>,
-    mut through: Option<u64>,
+    through: Option<u64>,
     reset_expected: &mut Option<String>,
     ui_wake: &Mutex<Option<UiWake>>,
 ) {
     let mut events = events.into_iter().peekable();
     while events.peek().is_some() {
-        let stretch = fold_stretch(state, session_id, &mut events, through.take(), reset_expected);
+        let stretch = fold_stretch(state, session_id, &mut events, through, reset_expected);
         // After the lock is released: the UI takes the same lock when it is woken.
         wake_ui(ui_wake);
         if let Some(provider_session_id) = stretch.adopt {
@@ -1651,9 +1678,11 @@ fn fold_stretch(
 ) -> Stretch {
     let mut stretch = Stretch::default();
     let mut guard = state.lock().unwrap();
-    if let Some(through) = through {
-        guard.folded_through = through;
-    }
+    // The batch began within a remote tab's history read back when what was folded before it is below where the
+    // window that saved the tab had folded. `folded_through` moves only at a batch's last stretch, so every stretch
+    // of one batch reads the same.
+    let replaying = guard.replay_through.is_some_and(|replay| guard.folded_through < replay);
+    guard.projection.planning.replaying_history = replaying;
     while let Some(event) = events.peek() {
         if let AgentDomainEvent::ConversationReset {
             new_conversation_id, ..
@@ -1702,6 +1731,14 @@ fn fold_stretch(
         }
         guard.fold(event);
     }
+    // The batch's position is recorded with its last stretch, so a reader between stretches (a `/clear` splits a
+    // batch) never takes the batch for folded while events after the reset are still to come.
+    if events.peek().is_none() {
+        if let Some(through) = through {
+            guard.folded_through = through;
+        }
+    }
+    guard.projection.planning.replaying_history = false;
     // A detached session's history is still to be written: `fold_batch` notes the end once it has been.
     if stretch.cleared.is_none() {
         note_nothing_owed(&mut guard);
@@ -3369,6 +3406,30 @@ pub(crate) mod tests {
         assert_eq!(new.title, None);
     }
 
+    /// A batch a `/clear` splits into stretches records how far it folded only with its last stretch: a reader
+    /// between the stretches never takes the batch for folded while the events after the reset are still to come.
+    #[test]
+    fn a_split_batch_records_its_position_with_its_last_stretch() {
+        let state = Mutex::new(state());
+        state.lock().unwrap().folded_through = 3;
+        let session_id = Mutex::new(None);
+        let mut reset_expected = None;
+        let mut events = vec![
+            AgentDomainEvent::UserPromptSubmitted { text: "before".into() },
+            reset("conv-new"),
+            AgentDomainEvent::UserPromptSubmitted { text: "after".into() },
+        ]
+        .into_iter()
+        .peekable();
+        let first = fold_stretch(&state, &session_id, &mut events, Some(9), &mut reset_expected);
+        assert!(events.peek().is_some(), "the reset ends the first stretch");
+        assert_eq!(state.lock().unwrap().folded_through, 3, "the batch is not folded yet");
+        drop(first);
+        let _last = fold_stretch(&state, &session_id, &mut events, Some(9), &mut reset_expected);
+        assert!(events.peek().is_none());
+        assert_eq!(state.lock().unwrap().folded_through, 9);
+    }
+
     pub(super) fn state() -> IngestState {
         IngestState {
             projection: AgentSessionProjection::default(),
@@ -3395,6 +3456,7 @@ pub(crate) mod tests {
             lifecycle_since_open: Vec::new(),
             running_turn: None,
             folded_through: 0,
+            replay_through: None,
             history_saved_through: 0,
             history_save_failed: false,
             #[cfg(feature = "test-support")]

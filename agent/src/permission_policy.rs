@@ -172,6 +172,13 @@ use crate::project_boundary::{checked_root, Identity};
 use serde_json::Value;
 use std::path::{Path, PathBuf};
 
+/// The filesystem facts available to the gate. A remote root supplies no laptop facts.
+#[derive(Debug, Clone, Copy)]
+pub enum GateRoot<'a> {
+    Local(&'a Path),
+    RemoteWithoutFacts,
+}
+
 /// What to do with one tool call that reached the gate.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PermissionVerdict {
@@ -520,6 +527,22 @@ pub fn classify_in_manual(
     classify_with_rules(tool_name, input, project_root, rules)
 }
 
+/// The policy at a root with no boundary, without reading any filesystem or identity facts.
+/// Path-judged calls carry the same reason as a root whose own mode permits other users to write.
+/// No saved rule replaces that refusal. Manual keeps its unconditional edit reason.
+pub fn classify_without_a_boundary(
+    tool_name: &str,
+    input: &Value,
+    _rules: &crate::permission_rules::PrefixRules,
+    manual: bool,
+) -> Classification {
+    if manual && EDIT_TOOLS.contains(&tool_name) {
+        return ask(REASON_MANUAL_ASKS_BEFORE_EVERY_EDIT);
+    }
+    classify_by_name(tool_name, input)
+        .unwrap_or_else(|| ask(crate::project_boundary::NotABoundary::OthersCanWrite.reason()))
+}
+
 /// The rule [`classify_with_rules`] would answer this call with, in Claude Code's own syntax
 /// (`Bash(git log *)`), or `None` when the call is not one a rule answers -- the same condition,
 /// so the two can never disagree. What a transcript row names when a saved rule, not the user,
@@ -671,21 +694,8 @@ fn classify_within_budget(
     surroundings: &Surroundings,
 ) -> Classification {
     let home = surroundings.home;
-    // Before anything else: a call whose input is not even an object is not a call this module can
-    // read. Both backends deliver `input` as whatever JSON arrived, so this is reachable.
-    if !input.is_object() {
-        return ask("the tool input is not a JSON object");
-    }
-
-    if NEVER_ASK_TOOLS.contains(&tool_name) {
-        return allow("this tool changes no file, runs no command and reaches no network");
-    }
-    if ALWAYS_ASK_TOOLS.contains(&tool_name) {
-        return ask("the CLI asks about this tool every time in its default mode");
-    }
-
-    if !matches!(tool_name, "Read" | "Grep" | "Glob" | "Bash") && !EDIT_TOOLS.contains(&tool_name) {
-        return ask("this tool is not in the policy's table");
+    if let Some(classification) = classify_by_name(tool_name, input) {
+        return classification;
     }
     // Every remaining tool is judged against the project root, so the root has to be a boundary.
     let root = match boundary(project_root, home, surroundings.who) {
@@ -721,6 +731,29 @@ fn classify_within_budget(
         "NotebookEdit" => classify_edit_target(input, "notebook_path", &root),
         _ => classify_bash(input, &root, surroundings),
     }
+}
+
+// Name-only decisions are shared so remote calls cannot drift from a local no-boundary root.
+fn classify_by_name(tool_name: &str, input: &Value) -> Option<Classification> {
+    // Before anything else: a call whose input is not even an object is not a call this module can
+    // read. Both backends deliver `input` as whatever JSON arrived, so this is reachable.
+    if !input.is_object() {
+        return Some(ask("the tool input is not a JSON object"));
+    }
+
+    if NEVER_ASK_TOOLS.contains(&tool_name) {
+        return Some(allow(
+            "this tool changes no file, runs no command and reaches no network",
+        ));
+    }
+    if ALWAYS_ASK_TOOLS.contains(&tool_name) {
+        return Some(ask("the CLI asks about this tool every time in its default mode"));
+    }
+
+    if !matches!(tool_name, "Read" | "Grep" | "Glob" | "Bash") && !EDIT_TOOLS.contains(&tool_name) {
+        return Some(ask("this tool is not in the policy's table"));
+    }
+    None
 }
 
 /// The canonical project root, or a card if it cannot serve as a boundary
@@ -5535,19 +5568,8 @@ mod tests {
         rules
     }
 
-    /// Every syntax or path refusal must still card with a matching rule present.
-    /// The corpus is every card-producing `Bash` input this module's
-    /// tests use, copied here verbatim, against a workspace with the same links those tests make.
-    #[test]
-    fn no_rule_ever_turns_a_card_the_classifier_refused_on_syntax_or_paths_into_an_allow() {
-        let ws = Workspace::new();
-        let outside = std::env::temp_dir().join(format!("agent-policy-outside-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&outside).unwrap();
-        std::fs::write(outside.join("secret"), "s").unwrap();
-        std::os::unix::fs::symlink(&outside, ws.path().join("escape")).unwrap();
-        std::os::unix::fs::symlink(ws.path().join("nowhere"), ws.path().join("dangling")).unwrap();
-        let long = format!("ls {}", "a".repeat(MAX_BASH_COMMAND_LEN));
-        let corpus: Vec<&str> = vec![
+    fn bash_refusal_corpus(long: &str) -> Vec<&str> {
+        vec![
             "echo hi > c.txt",
             "echo hi >> c.txt",
             "cat < a.txt",
@@ -5601,8 +5623,74 @@ mod tests {
             "cd",
             "cd src",
             "cd .",
-            &long,
-        ];
+            long,
+        ]
+    }
+
+    #[test]
+    fn remote_tab_classify_without_a_boundary_matches_a_real_no_boundary_root() {
+        let ws = Workspace::new();
+        chmod(ws.path(), 0o702);
+        assert_eq!(
+            crate::project_boundary::refusal(ws.path(), None, &Identity::current()),
+            Some(crate::project_boundary::NotABoundary::OthersCanWrite)
+        );
+        let mut calls = Vec::new();
+        let long = "x".repeat(MAX_BASH_COMMAND_LEN + 1);
+        for command in
+            bash_refusal_corpus(&long)
+                .into_iter()
+                .chain(["cat src/main.rs", "git -C /srv/project log", "pwd", "rm x"])
+        {
+            calls.push(("Bash", json!({"command": command})));
+        }
+        for tool in TOOLS_OFFERED_BY_CLI_2_1_311
+            .iter()
+            .chain(["Grep", "Glob", "NotebookEdit", "MultiEdit", "Unknown"].iter())
+        {
+            for input in [
+                Value::Null,
+                json!([]),
+                json!({}),
+                json!({"file_path":"src/main.rs"}),
+                json!({"file_path":"/srv/project/main.rs"}),
+                json!({"path":"src","pattern":"**/*"}),
+                json!({"path": false}),
+                json!({"command": 4}),
+            ] {
+                calls.push((*tool, input));
+            }
+        }
+        for (tool, input) in calls {
+            let rules = rules_for(input.get("command").and_then(Value::as_str).unwrap_or("cat x"));
+            for manual in [false, true] {
+                let real = if manual {
+                    classify_in_manual(tool, &input, ws.path(), &rules)
+                } else {
+                    classify_with_rules(tool, &input, ws.path(), &rules)
+                };
+                assert_eq!(
+                    classify_without_a_boundary(tool, &input, &rules, manual),
+                    real,
+                    "{tool} {input} manual={manual}"
+                );
+            }
+        }
+    }
+
+    /// Every syntax or path refusal must still card with a matching rule present.
+    /// The corpus is every card-producing `Bash` input this module's
+    /// tests use, copied here verbatim, against a workspace with the same links those tests make.
+    #[test]
+    fn no_rule_ever_turns_a_card_the_classifier_refused_on_syntax_or_paths_into_an_allow() {
+        let ws = Workspace::new();
+        let outside = std::env::temp_dir().join(format!("agent-policy-outside-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("secret"), "s").unwrap();
+        std::os::unix::fs::symlink(&outside, ws.path().join("escape")).unwrap();
+        std::os::unix::fs::symlink(ws.path().join("nowhere"), ws.path().join("dangling")).unwrap();
+        let long = format!("ls {}", "a".repeat(MAX_BASH_COMMAND_LEN));
+        let corpus = bash_refusal_corpus(&long);
         for command in corpus {
             let input = json!({ "command": command });
             let plain = classify_permission_request("Bash", &input, ws.path());

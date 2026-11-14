@@ -19,7 +19,7 @@
 #                 so eitri-git's pkgver() runs against a latest tag that is a prerelease, the
 #                 case an earlier sed broke on),
 #                 --neovide-mirror (must carry neovibe-integration, with the checkout's submodule
-#                 commit on it) and --verdandi-mirror (must hold agent/Cargo.toml's pinned rev) --
+#                 commit on it) and --verdandi-mirror (must hold the workspace's pinned rev) --
 #                 no tag needed on either; both are checked before the container starts.
 #                 node-<...>.tar.xz is the same real nodejs.org download as -bin's, and cargo still
 #                 fetches the pinned Verdandi crate from its real public URL -- unless
@@ -39,6 +39,19 @@
 # public clone/mirrors correspond to that release (a fresh public export for a real cut, or the
 # same ones here if the commits have not moved).
 set -euo pipefail
+
+# Read the workspace pin at a commit, with the older per-crate layout as a fallback.
+verdandi_pin_at() {
+    local rev
+    rev="$(git -C "$1" show "$2:Cargo.toml" |
+        awk '/^\[workspace.dependencies\]/ { inside=1; next } /^\[/ { inside=0 } inside' |
+        sed -n 's/^claude-runtime-protocol[[:space:]]*=.*rev[[:space:]]*=[[:space:]]*"\([0-9a-f]*\)".*/\1/p')"
+    if [ -z "$rev" ]; then
+        rev="$(git -C "$1" show "$2:agent/Cargo.toml" |
+            sed -n 's/^claude-runtime-protocol[[:space:]]*=.*rev[[:space:]]*=[[:space:]]*"\([0-9a-f]*\)".*/\1/p')"
+    fi
+    printf '%s\n' "$rev"
+}
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 
@@ -257,9 +270,8 @@ test_git() {
 	# the neovide mirror out by the PKGBUILD's #branch=neovibe-integration).
 	local fork_commit verdandi_rev
 	fork_commit="$(git -C "$WORK/eitri-tagged.git" rev-parse "$head:neovide")"
-	verdandi_rev="$(git -C "$WORK/eitri-tagged.git" show "$head:agent/Cargo.toml" |
-		sed -n 's/^claude-runtime-protocol[[:space:]]*=.*rev[[:space:]]*=[[:space:]]*"\([0-9a-f]*\)".*/\1/p')"
-	[ -n "$verdandi_rev" ] || die "$EITRI_CHECKOUT's agent/Cargo.toml pins no claude-runtime-protocol rev"
+	verdandi_rev="$(verdandi_pin_at "$WORK/eitri-tagged.git" "$head")"
+	[ -n "$verdandi_rev" ] || die "$EITRI_CHECKOUT pins no claude-runtime-protocol rev in Cargo.toml or agent/Cargo.toml"
 	git -C "$NEOVIDE_MIRROR" rev-parse --verify --quiet refs/heads/neovibe-integration >/dev/null ||
 		die "--neovide-mirror $NEOVIDE_MIRROR has no neovibe-integration branch (the PKGBUILD's #branch=)"
 	git -C "$NEOVIDE_MIRROR" merge-base --is-ancestor "$fork_commit" refs/heads/neovibe-integration ||
@@ -276,7 +288,7 @@ test_git() {
 	# paths and mounted nothing but /build, so makepkg's first clone could never have succeeded --
 	# this half had never been run until the script was hardened.)
 	mkdir -p -- "$WORK/build/eitri-git"
-	cp -- "$SCRIPT_DIR/eitri-git/PKGBUILD" "$WORK/build/eitri-git/PKGBUILD"
+	cp -- "$SCRIPT_DIR/eitri-git/PKGBUILD" "$SCRIPT_DIR/eitri-git/eitri-git.install" "$WORK/build/eitri-git/"
 	sed -i \
 		-e "s#git+https://github.com/HunterGrey-cyber/eitri.git#git+file:///mirrors/eitri.git#" \
 		-e "s#git+https://github.com/HunterGrey-cyber/neovide.git#git+file:///mirrors/neovide.git#" \

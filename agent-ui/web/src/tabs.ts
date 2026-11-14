@@ -10,7 +10,7 @@ import type { PermissionModeChoice, PlanningState, TabId, TabInfo, TabMarker, Ta
  *  not); `review_hint` is deliberately not here -- it is kept for the tab it names while
  *  another is on screen. */
 const TAB_SCOPED = new Set([
-  "events", "snapshot", "history_page", "editor_cards", "handoff", "error", "focus_permission", "tab_detail", "confirm_close", "begin_rename",
+  "link_state", "events", "snapshot", "history_page", "editor_cards", "handoff", "error", "focus_permission", "tab_detail", "confirm_close", "begin_rename",
   "queue", "shell_running", "draft", "queue_taken", "rule_offers", "scratch", "review", "review_diff",
   "review_draft", "review_send_preview", "trust_prompt", "attachment_state", "draft_attachments",
 ]);

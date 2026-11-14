@@ -16,6 +16,7 @@ it (cargo prints its own progress) and before the sidecar build, and nothing els
 nothing for the quick ones).
 """
 
+import hashlib
 import os
 import shutil
 import subprocess
@@ -109,7 +110,7 @@ class _PackageCase(unittest.TestCase):
         )
         return subprocess.run(["bash", "-c", script], capture_output=True, text=True, timeout=60)
 
-    def build(self, extra_path=""):
+    def build(self, extra_path="", extra_env=None):
         """Run the PKGBUILD's build() with a makepkg-style msg2; return the CompletedProcess."""
         script = (
             f'set -euo pipefail; source "{self.pkgbuild}"; srcdir="{self.srcdir}"; pkgdir="{self.pkgdir}"; '
@@ -117,7 +118,7 @@ class _PackageCase(unittest.TestCase):
         )
         path = f"{extra_path}:{os.environ['PATH']}" if extra_path else os.environ["PATH"]
         return subprocess.run(
-            ["bash", "-c", script], capture_output=True, text=True, timeout=60, env=dict(os.environ, PATH=path)
+            ["bash", "-c", script], capture_output=True, text=True, timeout=60, env=dict(os.environ, PATH=path, **(extra_env or {}))
         )
 
     def installed(self):
@@ -191,8 +192,11 @@ class EitriBinPackage(_PackageCase):
     def setUp(self):
         super().setUp()
         top = os.path.join(self.srcdir, "eitri-0.2.0-x86_64-linux")
-        for name in ("shell", "eitri-tmux-shim", "eitri-claude-handoff", "eitri-run-guard", "eitri-editor-bridge", "eitri-setup"):
+        for name in ("shell", "eitri-tmux-shim", "eitri-claude-handoff", "eitri-run-guard", "eitri-editor-bridge", "eitri-server", "eitri-setup"):
             _touch(os.path.join(top, "lib", "eitri", name), mode=0o755)
+        helper = b"built release helper\n"
+        self.baked_hash = hashlib.sha256(helper).hexdigest()
+        _touch(os.path.join(top, "lib", "eitri", "eitri-server"), helper, 0o755)
         _touch(os.path.join(top, "lib", "eitri", "RELEASE"))
         _touch(os.path.join(top, "bin", "eitri"), mode=0o755)
         os.makedirs(os.path.join(top, "share", "applications"))
@@ -222,6 +226,12 @@ class EitriBinPackage(_PackageCase):
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertEqual(_read(os.path.join(self.pkgdir, "usr", "share", "licenses", "eitri-bin", "NOTICE")), b"NOTICE")
         self.assert_desktop_and_icons()
+
+    def test_packaged_helper_is_the_built_one(self):
+        proc = self.package()
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        helper = _read(os.path.join(self.pkgdir, "usr/lib/eitri/eitri-server"))
+        self.assertEqual(hashlib.sha256(helper).hexdigest(), self.baked_hash)
 
     def test_build_says_one_line_before_the_sidecar_build_and_nothing_else(self):
         setup = os.path.join(self.srcdir, "eitri-0.2.0-x86_64-linux", "lib", "eitri", "eitri-setup")
@@ -260,7 +270,7 @@ class EitriGitPackage(_PackageCase):
     def setUp(self):
         super().setUp()
         tree = os.path.join(self.srcdir, "eitri-git")
-        for name in ("shell", "eitri-tmux-shim", "eitri-claude-handoff", "eitri-run-guard", "eitri-editor-bridge"):
+        for name in ("shell", "eitri-tmux-shim", "eitri-claude-handoff", "eitri-run-guard", "eitri-editor-bridge", "eitri-server"):
             _touch(os.path.join(tree, "target", "release", name), mode=0o755)
         for name in ("install.sh", "eitri.launcher.sh"):
             _touch(os.path.join(tree, "packaging", name), mode=0o755)
@@ -284,6 +294,59 @@ class EitriGitPackage(_PackageCase):
         proc = self.package()
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assert_desktop_and_icons()
+
+    def test_packaged_helper_is_the_built_one(self):
+        source = os.path.join(self.srcdir, "eitri-git/target/release/eitri-server")
+        _touch(source, b"built source helper\n", 0o755)
+        proc = self.package()
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(_read(source), _read(os.path.join(self.pkgdir, "usr/lib/eitri/eitri-server")))
+
+    def test_unsigned_helper_message_is_registered_and_shown_on_install_and_upgrade(self):
+        directory = os.path.dirname(self.pkgbuild)
+        script = ('set -eu; source "$1"; printf "%s\\n" "$install"; '
+                  'source "$2/$install"; post_install; post_upgrade')
+        proc = subprocess.run(["bash", "-c", script, "bash", self.pkgbuild, directory],
+                              capture_output=True, text=True, timeout=60)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(proc.stdout.splitlines()[0], "eitri-git.install")
+        for message in (
+            "unsigned build compiled locally",
+            "hash from the locally built file rather than from a signed release",
+            "asks before the first helper install on a server and identifies it as unsigned",
+            "Once accepted on that server, newer helper builds install there without asking",
+            "Remote development is off unless remote_dev.enabled is set",
+        ):
+            self.assertEqual(proc.stdout.count(message), 2, proc.stdout)
+        with open(os.path.join(directory, ".SRCINFO")) as f:
+            info = f.read()
+            self.assertIn("\tinstall = eitri-git.install\n", info)
+            self.assertLess(info.index("\turl ="), info.index("\tinstall ="))
+
+    def test_container_copies_every_registered_install_file(self):
+        with open(os.path.join(_PACKAGING, "aur", "test-in-container.sh")) as f:
+            container = f.read()
+        for package in ("eitri-bin", "eitri-git"):
+            pkgbuild = os.path.join(_PACKAGING, "aur", package, "PKGBUILD")
+            proc = subprocess.run(
+                ["bash", "-c", 'source "$1"; printf "%s" "${install:-}"', "bash", pkgbuild],
+                capture_output=True, text=True, check=True,
+            )
+            if proc.stdout:
+                self.assertIn(f'"$SCRIPT_DIR/{package}/{proc.stdout}"', container)
+                self.assertRegex(container, rf'cp -- [^\n]*"\$SCRIPT_DIR/{package}/{proc.stdout}" '
+                                           rf'"\$WORK/build/{package}/"')
+
+    def test_source_build_clears_an_inherited_helper_hash(self):
+        tree = os.path.join(self.srcdir, "eitri-git")
+        shutil.copy(os.path.join(_PACKAGING, "pins.env"), os.path.join(tree, "packaging", "pins.env"))
+        _touch(os.path.join(tree, "packaging", "install.sh"), b"exit 0\n", mode=0o755)
+        bindir = os.path.join(self.scratch, "bin")
+        _touch(os.path.join(bindir, "cargo"),
+               b'#!/bin/sh\n[ "${EITRI_SERVER_SHA256+x}" != x ] || exit 91\necho unsigned\n', mode=0o755)
+        proc = self.build(extra_path=bindir, extra_env={"EITRI_SERVER_SHA256": "stray-caller-hash"})
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("unsigned", proc.stdout)
 
     def test_build_says_one_line_for_the_sidecar_and_none_for_cargo(self):
         tree = os.path.join(self.srcdir, "eitri-git")

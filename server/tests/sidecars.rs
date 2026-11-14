@@ -28,6 +28,11 @@ fn invalid(message: impl Into<String>) -> std::io::Error {
     std::io::Error::new(std::io::ErrorKind::InvalidInput, message.into())
 }
 
+/// The installation the fixture's daemon is taken to run from: a test binary runs from no installation of its own.
+fn installation(paths: &run_dir::Paths) -> PathBuf {
+    paths.data.join(format!("{VERSION}-{}", run_dir::rev7(REVISION)))
+}
+
 struct Fixture {
     root: PathBuf,
     paths: run_dir::Paths,
@@ -58,9 +63,9 @@ impl Fixture {
             "build agent's eitri-sidecar-standin with test-support first: {}",
             binary.display()
         );
-        let installed = paths.install(REVISION).join("sidecar/test-rev");
+        let installed = installation(&paths).join("sidecar/test-rev");
         private_fs::create_private_dir_all(&installed, &paths.data).unwrap();
-        std::fs::copy(binary, installed.join("verdandi-claude-sidecar")).unwrap();
+        daemon::test_exec::install_executable(&binary, &installed.join("verdandi-claude-sidecar"));
         let mut env = BTreeMap::from([
             (OsString::from("HOME"), root.clone().into_os_string()),
             ("PATH".into(), "/usr/bin:/bin".into()),
@@ -86,10 +91,7 @@ impl Fixture {
     }
 
     fn request(&self, command_id: &str) -> StartSidecarRequest {
-        let binary = self
-            .paths
-            .install(REVISION)
-            .join("sidecar/test-rev/verdandi-claude-sidecar");
+        let binary = installation(&self.paths).join("sidecar/test-rev/verdandi-claude-sidecar");
         StartSidecarRequest {
             root: self.root.to_str().unwrap().to_owned(),
             account: "example-account".into(),
@@ -249,7 +251,8 @@ fn fixture_daemon_entry() {
         .build()
         .unwrap();
     rt.block_on(async {
-        let paths = run_dir::Paths::from_env(VERSION).unwrap();
+        let mut paths = run_dir::Paths::from_env(VERSION).unwrap();
+        paths.install = Some(installation(&paths));
         let mut baseline = daemon::login_env::minimal_environment().unwrap();
         for key in ["HOME", "SHELL"] {
             baseline.insert(key.into(), std::env::var_os(key).unwrap());
@@ -347,9 +350,7 @@ async fn a_changed_sidecar_binary_is_not_started() {
     let mut client = f.start().await;
     let req = f.request("changed");
     std::fs::write(
-        f.paths
-            .install(REVISION)
-            .join("sidecar/test-rev/verdandi-claude-sidecar"),
+        installation(&f.paths).join("sidecar/test-rev/verdandi-claude-sidecar"),
         b"changed",
     )
     .unwrap();

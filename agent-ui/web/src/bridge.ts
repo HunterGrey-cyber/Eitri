@@ -9,6 +9,30 @@ import type { TabViewState } from "./tabs";
 import { detectTransport } from "./transport";
 import type { Transport } from "./transport";
 
+/** What a remote tab's question offers: the words `RemotePromptAction` takes in `core/src/agent_bridge.rs`. */
+export type RemotePromptAction = "deny_and_stop" | "leave_waiting" | "stop_when_back" | "leave_running" | "resume";
+
+const REMOTE_PROMPT_ACTIONS: readonly RemotePromptAction[] = [
+  "deny_and_stop", "leave_waiting", "stop_when_back", "leave_running", "resume",
+];
+
+export type RemotePromptChoice = { key: string; label: string; action: RemotePromptAction };
+
+export type RemotePromptEnvelope = {
+  kind: "remote_prompt"; tab: TabId; nonce: number; lines: string[]; choices: RemotePromptChoice[];
+};
+
+/** Whether a `remote_prompt` can be drawn and answered: a numeric tab and nonce, lines of text, and choices each with
+ *  one key, words, and an action Rust takes. */
+export function isWellFormedRemotePrompt(value: unknown): value is RemotePromptEnvelope {
+  const v = value as Partial<RemotePromptEnvelope> | null;
+  return v !== null && typeof v === "object" && typeof v.tab === "number" && typeof v.nonce === "number"
+    && Array.isArray(v.lines) && v.lines.every((line) => typeof line === "string")
+    && Array.isArray(v.choices) && v.choices.length > 0
+    && v.choices.every((c) => c !== null && typeof c === "object" && typeof c.key === "string" && c.key.length === 1
+      && typeof c.label === "string" && REMOTE_PROMPT_ACTIONS.includes(c.action as RemotePromptAction));
+}
+
 /** A plan dock's decision, as the closed set the host parses (`PlanChoiceWire`). */
 export type PlanChoiceWire = "keep_planning" | "approve_manual" | "approve_auto" | "approve_bypass";
 
@@ -112,6 +136,9 @@ export type OutboundMessage =
   | { type: "queue_message"; request_id: string; tab: TabId; text: string; turn_id: string | null; after_turn?: boolean; attachments?: string[] }
   /** `↑`: empty the tab's queue and hand its texts back as `queue_taken`. */
   | { type: "take_back_queue"; request_id: string; tab: TabId }
+  /** The Dismiss of `tab`'s own note reading `text`: the window keeps it dismissed in every page the tab is shown
+   *  in (`root_note`'s `dismissed`). */
+  | { type: "root_note_dismissed"; request_id: string; tab: TabId; text: string }
   /** `Ctrl+Enter`: queue this text (if non-empty), then interrupt if a turn is
    *  running, or flush at once if idle. */
   | { type: "send_now"; request_id: string; tab: TabId; text: string }
@@ -166,6 +193,9 @@ export type OutboundMessage =
    *  echoed back so only the prompt that was shown can be answered. Window-level, like
    *  `confirm_bypass`. `InboundMessage::RestoreAnswer`, `core/src/agent_bridge.rs`. */
   | { type: "restore_answer"; request_id: string; nonce: number; keep_bypass: boolean }
+  /** The key a `remote_prompt` offered, pressed: its choice's `action`, with the prompt's own `tab` and `nonce` echoed
+   *  back so only the question shown is answered. `InboundMessage::RemotePromptAnswer`, `core/src/agent_bridge.rs`. */
+  | { type: "remote_prompt_answer"; request_id: string; tab: TabId; nonce: number; action: RemotePromptAction }
   /** `y` or `n` to a `trust_prompt`, past the same guards as the bypass prompt's `y`. `tab` and `nonce` name the
    *  prompt that was shown, and `fingerprint`/`findings_digest` are that envelope's `fingerprint` and
    *  `findingsDigest` copied verbatim -- this side never computes either, so Rust can tell an answer to what is
@@ -388,8 +418,12 @@ type InboundHandler = (
      *  before the tabs. */
     | { kind: "display"; thinking: ThinkingDisplay }
     /** Why the project folder is no boundary (`serialize_root_note_for_js`, `core/src/agent_bridge.rs`).
-     *  Window-level, sent right after `hello` on every `ready`; the page shows it until its own Dismiss. */
-    | { kind: "root_note"; text: string }
+     *  Window-level, sent right after `hello` on every `ready`; the page shows it until its own Dismiss. With
+     *  `tab`, one tab's own note (`serialize_tab_root_note_for_js`: a remote tab's), sent when that tab is shown
+     *  or arrives; the page draws it in place of the window's only while that tab is shown, and a Dismiss of it
+     *  holds for that tab until its text changes. */
+    | { kind: "root_note"; text: string; tab?: TabId; dismissed?: boolean }
+    | import("./types").LinkStateEnvelope
     /** The window's turn review switches (`serialize_review_settings_for_js`, `core/src/agent_bridge.rs`).
      *  Window-level, sent on every `ready` before the tabs and again when `init.lua`'s values arrive. */
     | { kind: "review_settings"; enabled: boolean; hint: ReviewHintLevel | boolean }
@@ -468,6 +502,14 @@ type InboundHandler = (
      *  `n` brings the bypass tabs back in auto. `nonce` is echoed back on either answer, as
      *  `confirm_bypass`'s is. `serialize_confirm_restore_for_js`, `core/src/agent_bridge.rs`. */
     | { kind: "confirm_restore"; nonce: number; lines: string[] }
+    /** A remote tab's question: what to do about requests left waiting on its server after a gap, how to close it
+     *  while its server cannot be reached, or whether to continue a session the server lost. `lines` are Rust's words,
+     *  `choices` the keys that answer it; any other key puts it away and chooses nothing.
+     *  `serialize_remote_prompt_for_js`, `core/src/agent_bridge.rs`. */
+    | RemotePromptEnvelope
+    /** Rust no longer holds this tab's remote question `nonce` (the tab's agent changed under it): the page drops
+     *  it. `serialize_remote_prompt_clear_for_js`, `core/src/agent_bridge.rs`. */
+    | { kind: "remote_prompt_clear"; tab: TabId; nonce: number }
     /** The question before a session loads this project's own configuration for the tab's agent, with what it
      *  would load. Tab-scoped. A second one for the same tab replaces the first. `serialize_trust_prompt_for_js`,
      *  `core/src/agent_bridge.rs`. */
@@ -819,6 +861,16 @@ export function installDispatch(handler: InboundHandler): void {
         console.warn("agent-ui: __eitriDispatch received a malformed confirm_restore envelope (no nonce)", parsed);
         return;
       }
+      // A remote question is answered by echoing its nonce and a choice it offered: one with neither is dropped.
+      if (obj.kind === "remote_prompt" && !isWellFormedRemotePrompt(parsed)) {
+        console.warn("agent-ui: __eitriDispatch received a malformed remote_prompt envelope", parsed);
+        return;
+      }
+      if (obj.kind === "remote_prompt_clear" && (typeof (obj as { tab?: unknown }).tab !== "number"
+        || typeof (obj as { nonce?: unknown }).nonce !== "number")) {
+        console.warn("agent-ui: __eitriDispatch received a malformed remote_prompt_clear envelope", parsed);
+        return;
+      }
       // The trust question can only be answered by echoing what it showed, so one that cannot be echoed is
       // dropped here rather than drawn: a numeric nonce, both 64-hex digests, a known `remember` and the list
       // it draws.
@@ -902,6 +954,7 @@ export function installDispatch(handler: InboundHandler): void {
         obj.kind === "theme" ||
         obj.kind === "display" ||
         obj.kind === "root_note" ||
+        obj.kind === "link_state" ||
         obj.kind === "review_settings" ||
         obj.kind === "pane_focus" ||
         obj.kind === "editor_typing" ||
@@ -927,6 +980,8 @@ export function installDispatch(handler: InboundHandler): void {
         obj.kind === "confirm_close_others" ||
         obj.kind === "confirm_bypass" ||
         obj.kind === "confirm_restore" ||
+        obj.kind === "remote_prompt" ||
+        obj.kind === "remote_prompt_clear" ||
         obj.kind === "trust_prompt" ||
         obj.kind === "begin_rename" ||
         obj.kind === "queue" ||

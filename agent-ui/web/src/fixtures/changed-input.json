@@ -71,6 +71,7 @@
       "cwd": "/project",
       "history": null,
       "lastTurnEnding": null,
+      "linkState": null,
       "model": "claude-sonnet-5",
       "pendingPermissions": [
         {

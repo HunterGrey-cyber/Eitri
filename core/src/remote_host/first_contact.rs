@@ -80,6 +80,8 @@ fn contact_command() -> Command {
     let mut command = Command::new("ssh");
     command.args(CHANNEL_OPTIONS).args([
         "-o",
+        "KnownHostsCommand=none",
+        "-o",
         "VerifyHostKeyDNS=no",
         "-o",
         "ControlMaster=no",
@@ -294,6 +296,11 @@ fn open_user_known_hosts(path: &Path) -> io::Result<std::fs::File> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn first_contact_uses_the_same_known_host_sources_as_the_master() {
+        let command = contact_command();
+        assert!(command.get_args().any(|arg| arg == "KnownHostsCommand=none"));
+    }
 
     #[test]
     fn first_contact_uses_a_scratch_known_hosts_and_only_a_fixed_noop() {

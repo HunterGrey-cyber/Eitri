@@ -774,21 +774,49 @@ def _artifact(path, executable=True):
 
 
 class BuildOutputTests(unittest.TestCase):
-    FOUR = [f"/build/target/release/{b}" for b in rc.RELEASE_BINARIES]
+    SIX = [f"/build/target/release/{b}" for b in rc.RELEASE_BINARIES]
 
-    def test_exactly_the_four_executables_in_release_order(self):
+    def test_every_shipped_binary_list_names_eitri_server(self):
+        repo = os.path.dirname(_PACKAGING)
+        lists = {
+            "packaging/release.sh": [r"RS_BINARIES=\(([^)]+)\)", r"\n\tcargo tree ([^\n]+)",
+                                     r"(cargo build --release --locked --offline -p eitri-server [^\n]+)",
+                                     r"\n\t\tcargo build --release --offline --locked ([^\n]+)"],
+            "packaging/release_check.py": [r"RELEASE_BINARIES = ([^\n]+)"],
+            "packaging/install.sh": [r"NV_BINARIES='([^']+)'",
+                                     r'if \[ -f "\$NV_FROM_SOURCE_DIR/server/Cargo.toml" \]; then set -- ([^;]+); fi'],
+            "packaging/collect-licenses.py": [r"SHIPPED_BINARIES = ([^\n]+)",
+                                             r"SHIPPED_CARGO_PACKAGES = ([^\n]+)"],
+            "packaging/nfpm.yaml": [r"(src: ./target/release/eitri-server\s+dst: /usr/lib/eitri/eitri-server)"],
+            "packaging/nfpm-public.yaml": [r"(src: ./target/release/eitri-server\s+dst: /usr/lib/eitri/eitri-server)"],
+            "packaging/aur/eitri-bin/PKGBUILD": [r'(install -m0755 "\$top/lib/eitri/eitri-server"[^\n]+)'],
+            "packaging/aur/eitri-git/PKGBUILD": [r'(install -m0755 "target/release/eitri-server"[^\n]+)',
+                                               r"cargo build ([^\n]+)"],
+            "publish.sh": [r"for b in ([^;]+); do", r'("\$TT/lib/eitri/eitri-server")'],
+        }
+        for rel, patterns in lists.items():
+            with open(os.path.join(repo, rel)) as f:
+                text = f.read()
+            for pattern in patterns:
+                with self.subTest(file=rel, pattern=pattern):
+                    matches = re.findall(pattern, text)
+                    self.assertTrue(matches, "no binary list found")
+                    for value in matches:
+                        self.assertIn("eitri-server", value)
+
+    def test_exactly_the_six_executables_in_release_order(self):
         lines = ["Compiling ...", _artifact("/build/target/release/libagent.rlib", executable=False)]
-        lines += [_artifact(p) for p in reversed(self.FOUR)]
-        self.assertEqual(rc.release_executables(lines), self.FOUR)
+        lines += [_artifact(p) for p in reversed(self.SIX)]
+        self.assertEqual(rc.release_executables(lines), self.SIX)
 
     def test_an_agent_hook_in_the_build_fails(self):
-        lines = [_artifact(p) for p in self.FOUR] + [_artifact("/build/target/release/agent-hook")]
+        lines = [_artifact(p) for p in self.SIX] + [_artifact("/build/target/release/agent-hook")]
         with self.assertRaisesRegex(rc.ReleaseCheckError, "agent-hook"):
             rc.release_executables(lines)
 
     def test_a_missing_binary_fails(self):
         with self.assertRaisesRegex(rc.ReleaseCheckError, "did not build: eitri-tmux-shim"):
-            rc.release_executables([_artifact(p) for p in self.FOUR if not p.endswith("tmux-shim")])
+            rc.release_executables([_artifact(p) for p in self.SIX if not p.endswith("tmux-shim")])
 
     def test_the_skia_bindings_out_dir_in_either_package_id_spelling(self):
         for pid in ("registry+https://github.com/rust-lang/crates.io-index#skia-bindings@0.153.3",

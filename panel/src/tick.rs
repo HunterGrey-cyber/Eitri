@@ -40,6 +40,7 @@ pub(super) fn tick_collect(state: &mut AgentPanelState, screen: &Screen, out: &m
     poll_permission_sends(state, out);
     let project_dir = state.project_dir.clone();
     let pumped = state.tabs.pump_views(&project_dir, &|view| screen.shows(view));
+    super::remote_tabs::tick(state, out);
     // Whose first text each payload carries, kept with it: the cadence may release it after
     // the tab, or that tab's turn, has changed (`panel_pacer::FirstText`).
     let mut streams: Vec<(ViewId, Stream)> = Vec::new();
@@ -90,9 +91,14 @@ pub(super) fn tick_send(
     for tab in pumped.queue_changed {
         send_queue(state, tab, out);
     }
-    // Prompts a linked window held until its presence marked their turns as running.
+    // Prompts a linked window held until its presence marked their turns as running, and a remote tab's whose
+    // provider call has answered.
     for sent in state.tabs.poll_turn_sends(std::time::Instant::now()) {
         apply_sent(state, screen, sent, out);
+    }
+    // A remote tab's interrupts whose provider call has answered: each owes its command, if its page is there.
+    for done in state.tabs.poll_interrupts() {
+        apply_interrupt_done(state, screen, done, out);
     }
     // The `!` lines that ended: each row went into its session, and its report goes out as a turn.
     for ended in state.tabs.poll_shell_lines() {
@@ -434,6 +440,8 @@ pub(super) fn needs_polling(state: &AgentPanelState) -> bool {
         || state.mentions.is_waiting()
         || state.trust.is_busy()
         || state.history_writer.is_busy()
+        || state.remote_prompts.needs_polling()
+        || state.remote_stops.needs_polling()
 }
 
 /// The sooner of two moments a tick is due, either of which may not be set.
@@ -441,6 +449,35 @@ pub(super) fn earliest(a: Option<std::time::Instant>, b: Option<std::time::Insta
     match (a, b) {
         (Some(a), Some(b)) => Some(a.min(b)),
         (a, b) => a.or(b),
+    }
+}
+
+/// An interrupt outcome belongs only to the session that sent it; its command is answered either way.
+fn apply_interrupt_done(
+    state: &mut AgentPanelState,
+    screen: &Screen,
+    done: eitri_core::tab_set::InterruptDone,
+    out: &mut Outbox,
+) {
+    let owed = state
+        .owed
+        .take_where(|answer| answer.what == Owed::Interrupt(done.number));
+    let request = owed
+        .as_ref()
+        .and_then(|answer| answer.page.map(|page| (page, answer.request_id.as_str())));
+    if state
+        .tabs
+        .get(done.tab)
+        .is_some_and(|tab| tab.backend_generation() == done.generation)
+    {
+        super::inbound::apply_outcome(state, screen, done.tab, request, done.outcome, out);
+    } else if let Some((view, request_id)) = request {
+        let result = done
+            .outcome
+            .as_ref()
+            .map(|_| ())
+            .map_err(|error| error.message.as_str());
+        out.send(view, serialize_command_result_for_js(request_id, result));
     }
 }
 
@@ -509,6 +546,50 @@ pub(super) fn trace_discarded_first_texts(
 mod tests {
     use super::*;
     use crate::agent_panel::tests::*;
+
+    #[test]
+    fn a_late_interrupt_failure_only_answers_its_command() {
+        let (handle, _) = settled_panel();
+        let dir = agent::state_dirs::test_workspace_dir("panel-stale-interrupt");
+        let (tab, _) = live_tab(&handle, &dir);
+        let mut state = handle.state.borrow_mut();
+        let generation = state.tabs.get(tab).unwrap().backend_generation();
+        let (_, replacement) = live_backend(&dir);
+        let old = state
+            .tabs
+            .get_mut(tab)
+            .unwrap()
+            .set_backend(TabBackend::Live(replacement));
+        let key = state.owed.owe(ViewId::BASE, "interrupt-old", Owed::Interrupt(7));
+        let mut out = Outbox::default();
+        apply_interrupt_done(
+            &mut state,
+            &Screen::nothing_shown(),
+            eitri_core::tab_set::InterruptDone {
+                number: 7,
+                tab,
+                generation,
+                outcome: Err(eitri_core::agent_backend::BackendError {
+                    message: "provider request timed out".into(),
+                    benign: false,
+                }),
+            },
+            &mut out,
+        );
+        assert!(
+            state.tabs.get(tab).unwrap().live().is_some(),
+            "the replacement remains live"
+        );
+        assert!(state.owed.get(&key).is_none(), "the old command was answered");
+        let replies: Vec<_> = out.payloads().iter().map(|payload| json_of(payload)).collect();
+        assert_eq!(replies.len(), 1);
+        assert_eq!(replies[0]["kind"], "command_result");
+        assert_eq!(replies[0]["requestId"], "interrupt-old");
+        assert_eq!(replies[0]["ok"], false);
+        drop(state);
+        drop(old);
+        let _ = handle.shutdown();
+    }
 
     /// A new tab whose session was given a tool, opened (so selected) in the base view.
     fn declaring_tab(handle: &AgentPanelHandle, dir: &std::path::Path) -> (TabId, std::sync::Arc<RecordingProvider>) {

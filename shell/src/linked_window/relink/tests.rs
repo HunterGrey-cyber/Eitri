@@ -43,6 +43,66 @@ fn root() -> PathBuf {
     PathBuf::from("/srv/relink-project")
 }
 
+fn remote_origin(key: &str) -> eitri_core::remote_project::WindowOrigin {
+    eitri_core::remote_project::WindowOrigin::Remote(eitri_core::remote_project::RemoteProject {
+        version: 1,
+        host: "example-host".into(),
+        host_key_sha256: key.into(),
+        root: "/srv/project".into(),
+        helper_version: "0.3.0".into(),
+        sync: None,
+        created_at: 1,
+        queued_stops: Vec::new(),
+    })
+}
+
+#[test]
+fn a_remote_orphans_address_survives_a_host_key_change_and_excludes_the_copy() {
+    use eitri_core::remote_project::WindowOrigin;
+    let base = Path::new("/tmp/control");
+    let old = orphan_dir_at(base, &remote_origin("SHA256:old"));
+    let new = orphan_dir_at(base, &remote_origin("SHA256:new"));
+    assert_eq!(old, new);
+    assert_ne!(old, orphan_dir_at(base, &WindowOrigin::Local));
+    assert_ne!(
+        old,
+        orphan_dir_at(
+            base,
+            &WindowOrigin::LocalCopy {
+                host: "example-host".into()
+            }
+        )
+    );
+    let mut other = remote_origin("SHA256:new");
+    if let WindowOrigin::Remote(project) = &mut other {
+        project.host = "other-example-host".into();
+    }
+    assert_ne!(old, orphan_dir_at(base, &other));
+}
+
+#[test]
+fn a_new_key_window_1_relinks_to_the_remote_window_2_left_under_the_old_key() {
+    let (layout, lock) = held_pair("relink-rekey");
+    let run = RunDir::new();
+    std::fs::create_dir_all(&run.dir).unwrap();
+    let old = orphan_dir_at(&run.dir, &remote_origin("SHA256:old"));
+    let new = orphan_dir_at(&run.dir, &remote_origin("SHA256:new"));
+    let socket = OrphanSocket::bind(&old, &root()).unwrap();
+    let (tell, then) = mpsc::channel();
+    let saw = orphan(
+        socket,
+        lock,
+        crate::version::fingerprint(),
+        relink_welcome(&BTreeSet::new(), Vec::new()),
+        then,
+    );
+    let (found, note) = relink_at_start(&new, &layout.0, &root(), crate::version::fingerprint(), RELINK_WITHIN);
+    tell.send(None).unwrap();
+    let saw = saw.join().unwrap();
+    assert!(matches!(found, StartRelink::Window2(_)), "{note:?}");
+    assert_eq!((saw.accepted, saw.linked), (1, true));
+}
+
 /// A control directory of the test's own, short enough for a socket path, removed when the test ends.
 struct RunDir {
     top: PathBuf,

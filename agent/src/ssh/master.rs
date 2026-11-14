@@ -148,6 +148,23 @@ impl ControlMaster {
         self.ensure_locked()
     }
 
+    /// Restarts the master only if it is still dead once the lock is held: another caller (a second
+    /// tab, another window) may have brought it back meanwhile, and closing that one would cut every
+    /// channel through it. `Ok(false)` when it was alive. The lock is waited for at most `lock_wait`.
+    pub fn restart_if_dead(&self, lock_wait: Duration) -> Result<bool, ConnectError> {
+        super::validate_host(&self.host)?;
+        let _lock = super::lock_within(&self.control_path.with_extension("lock"), lock_wait)?;
+        if self.check(Duration::from_secs(2)) {
+            return Ok(false);
+        }
+        let output = super::run(&mut self.operation("exit"), Duration::from_secs(2))?;
+        if output.timed_out {
+            return Err(output.connect_error(&self.host));
+        }
+        self.ensure_locked()?;
+        Ok(true)
+    }
+
     pub fn verified_host_key(&self) -> io::Result<HostKey> {
         if !self.check(Duration::from_secs(2)) {
             return Err(io::Error::new(

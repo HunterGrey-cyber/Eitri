@@ -91,8 +91,8 @@ impl SidecarTransport for LocalChild {
     fn build_warnings(&self) -> Vec<String> {
         self.child.build_warnings.clone()
     }
-    fn pid(&self) -> u32 {
-        self.child.pid()
+    fn pid(&self) -> Option<u32> {
+        Some(self.child.pid())
     }
     #[cfg(feature = "test-support")]
     fn socket_path(&self) -> std::path::PathBuf {

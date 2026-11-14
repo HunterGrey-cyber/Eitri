@@ -3,6 +3,37 @@
 
 use super::*;
 
+pub(super) use eitri_core::tab_set::REMOTE_RESUME_UNAVAILABLE;
+
+pub(super) fn remote_page(state: &AgentPanelState, view: ViewId) -> bool {
+    state.tab_of_page(view).and_then(|id| state.tabs.get(id)).map_or_else(
+        || {
+            matches!(
+                state.tabs.project_origin(),
+                eitri_core::remote_project::TabOrigin::Remote { .. }
+            )
+        },
+        |tab| tab.is_remote(),
+    )
+}
+
+/// The greeting is chosen before any session records are read.
+pub(super) fn greeting_for_view(state: &AgentPanelState, view: ViewId) -> BackendGreeting {
+    let agent = hello_agent(state, view);
+    let root = if remote_page(state, view) {
+        agent::GateRoot::RemoteWithoutFacts
+    } else {
+        agent::GateRoot::Local(&state.project_dir)
+    };
+    BackendGreeting::for_agent_at_root(
+        state.backend_kind,
+        &agent,
+        state.project_dir.clone(),
+        eitri_core::agent_backend::Titles::Cached(&state.titles),
+        root,
+    )
+}
+
 /// Titles the worker read: `hello` is owed again after a change, and a tab resumed with its record's title
 /// takes the CLI's once it is known (the `tabs` envelope that follows carries it).
 pub(super) fn apply_title_reads(state_ref: &mut AgentPanelState) {
@@ -75,6 +106,12 @@ pub(super) fn with_running_agents_sessions(
 /// to an extra view naming it, then every record open in no tab, each marked if another window holds
 /// its lease. Also each record listed with the title shown.
 pub(super) fn chooser_payload(state: &AgentPanelState, view: ViewId) -> (String, Vec<(String, Option<String>)>) {
+    if remote_page(state, view) {
+        return (
+            eitri_core::agent_bridge::serialize_notice_for_js(REMOTE_RESUME_UNAVAILABLE),
+            Vec::new(),
+        );
+    }
     // The records offered are the agent's of the tab the opening page shows, as the resume that
     // follows starts in it.
     let agent = hello_agent(state, view);
@@ -138,12 +175,12 @@ pub(super) fn detail_payload(state: &AgentPanelState, tab: TabId) -> String {
                 .as_ref()
                 .map(|d| eitri_core::permission_store::path(d, &state.project_dir))
                 .as_deref(),
-            &trust_row(state, t.agent()),
+            &trust_row(state, t.id, t.agent()),
             super::starts::project_trust_at_root(
                 t.agent(),
                 state
                     .trust
-                    .next_session_trust(&trust_profile(&state.acp_agents, t.agent())),
+                    .next_session_trust(subject_for(state, t.id, trust_profile(&state.acp_agents, t.agent()))),
                 &state.project_dir,
             ),
             &state.acp_agents,
@@ -303,8 +340,10 @@ pub(super) fn detail_rows(
 }
 
 /// The `trust` row of a tab: the answer on record, and whether it counts for this tab at this root.
-fn trust_row(state: &AgentPanelState, agent: &AgentId) -> String {
-    let row = state.trust.row(&trust_profile(&state.acp_agents, agent));
+fn trust_row(state: &AgentPanelState, tab: TabId, agent: &AgentId) -> String {
+    let row = state
+        .trust
+        .row(subject_for(state, tab, trust_profile(&state.acp_agents, agent)));
     let counts = super::starts::project_trust_at_root(agent, ProjectTrust::Trusted, &state.project_dir);
     if counts == ProjectTrust::Trusted {
         row

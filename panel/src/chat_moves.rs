@@ -29,7 +29,7 @@
 
 use super::*;
 #[cfg(target_os = "linux")]
-use agent::chat_mover::{adopt, Adopted, ChatMover, FrozenProvider, MovedKind};
+use agent::chat_mover::{adopt_with, Adopted, ChatMover, FrozenProvider, MovedKind};
 use eitri_core::agent_bridge::{serialize_view_export_for_js, serialize_view_import_for_js};
 use eitri_core::tab_set::{FrozenChat, FrozenTab, MoveRefusedWhy, TabHandoff};
 use eitri_core::turn_review::Held;
@@ -38,7 +38,7 @@ use std::collections::BTreeSet;
 use std::os::fd::OwnedFd;
 use std::time::{Duration, Instant};
 #[cfg(not(target_os = "linux"))]
-use unmovable::{adopt, Adopted, ChatMover, FrozenProvider, MovedKind};
+use unmovable::{adopt_with, Adopted, ChatMover, FrozenProvider, MovedKind};
 
 /// How long the page is given to answer with its view of the tab before the tab moves without it.
 pub(super) const VIEW_WAIT: Duration = Duration::from_secs(1);
@@ -86,7 +86,10 @@ pub(super) mod unmovable {
         pub(crate) fn from_wire(_name: &str) -> Option<MovedKind> {
             None
         }
-        pub(crate) fn descriptors(self) -> usize {
+        pub(crate) fn descriptors_for(self, _record: &serde_json::Value) -> usize {
+            match self {}
+        }
+        pub(crate) fn runs_on_a_server(self, _record: &serde_json::Value) -> bool {
             match self {}
         }
     }
@@ -116,7 +119,12 @@ pub(super) mod unmovable {
         pub external: Option<Arc<dyn agent::ExternalProvider + Send + Sync>>,
     }
 
-    pub(crate) fn adopt(kind: MovedKind, _record: &serde_json::Value, _fds: Vec<OwnedFd>) -> Result<Adopted, String> {
+    pub(crate) fn adopt_with(
+        kind: MovedKind,
+        _record: &serde_json::Value,
+        _fds: Vec<OwnedFd>,
+        _helpers: &dyn agent::remote_client::HelperConnections,
+    ) -> Result<Adopted, String> {
         match kind {}
     }
 }
@@ -144,7 +152,13 @@ pub enum ChatMoveEvent {
 }
 
 /// What takes a moved chat's provider up by its kind: the providers' own adopt, or a test's stand-in.
-pub(super) type Adopter = fn(MovedKind, &serde_json::Value, Vec<OwnedFd>) -> Result<Adopted, String>;
+/// A remote chat brings no descriptors and is taken up over the window's own connection to its server.
+pub(super) type Adopter = fn(
+    MovedKind,
+    &serde_json::Value,
+    Vec<OwnedFd>,
+    &dyn agent::remote_client::HelperConnections,
+) -> Result<Adopted, String>;
 
 /// The panel's moves in flight.
 pub(super) struct ChatMoves {
@@ -184,7 +198,7 @@ impl Default for ChatMoves {
             frozen: BTreeMap::new(),
             arrivals: BTreeMap::new(),
             next_request: 1,
-            adopter: adopt,
+            adopter: adopt_with,
             hook: None,
             imports: Vec::new(),
         }
@@ -670,7 +684,10 @@ fn read_record(record: &serde_json::Value, fds: usize) -> Result<Arriving, Strin
     }
     let panel = PanelTabHandoff::from_value(field("panel"))?;
     let view = Some(field("view").clone()).filter(|v| v.is_object() && v.to_string().len() <= VIEW_MAX_BYTES);
-    let expected = chat.as_ref().map_or(0, |(_, kind, _)| kind.descriptors()) + usize::from(lease);
+    let expected = chat
+        .as_ref()
+        .map_or(0, |(_, kind, record)| kind.descriptors_for(record))
+        + usize::from(lease);
     if fds != expected {
         return Err(format!("the moved chat brought {fds} descriptors, not {expected}"));
     }
@@ -741,13 +758,19 @@ pub(super) fn adopt_moved(
     let id = match chat {
         None => state.tabs.adopt_moved_unstarted(tab, view)?,
         Some((chat, kind, provider_record)) => {
-            let provider_fds: Vec<OwnedFd> = fds.by_ref().take(kind.descriptors()).collect();
+            tab.check_remote_agent(kind.runs_on_a_server(&provider_record))?;
+            let provider_fds: Vec<OwnedFd> = fds.by_ref().take(kind.descriptors_for(&provider_record)).collect();
             let lease_fd = if lease { fds.next() } else { None };
             let session = chat.conversation.provider_session_id.clone();
             let folded_through = chat.core.folded_through;
             let provider_name = chat.conversation.provider_name.clone();
             let cwd = chat.conversation.canonical_cwd.to_string_lossy().into_owned();
-            let Adopted { agent, external } = (state.chat_moves.adopter)(kind, &provider_record, provider_fds)?;
+            let helpers: &dyn agent::remote_client::HelperConnections = match &state.server {
+                Some(connection) => connection,
+                None => &agent::remote_client::NoHelperConnections,
+            };
+            let Adopted { agent, external } =
+                (state.chat_moves.adopter)(kind, &provider_record, provider_fds, helpers)?;
             let lease = match (lease_fd, session.as_deref()) {
                 (Some(fd), Some(session)) => Some(
                     agent::lease::SessionLease::from_moved(fd, &provider_name, &cwd, session)

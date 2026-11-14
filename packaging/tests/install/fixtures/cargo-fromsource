@@ -1,8 +1,9 @@
 #!/bin/sh
-# Test double for `cargo`, standing in for the whole `cargo build --release --locked -p shell -p
-# agent --bins` recipe --from-source runs: no test here ever runs a real multi-crate release compile. Records its argv (one line per
-# call) to <scratch>/logs/cargo.log and, on a `build` call, writes the binaries install.sh's own
-# NV_BINARIES names, and agent-hook, into <target-dir>/release/. EITRI_INSTALL_TEST_CARGO_MODE selects the
+# Test double for `cargo`, standing in for the `cargo build --release --locked -p shell -p agent
+# [-p eitri-server] --bins` recipe: the server package is requested when its manifest exists.
+# No test here runs a real multi-crate release compile. Records its argv (one line per
+# call) to <scratch>/logs/cargo.log and, on a `build` call, writes the binaries the requested
+# packages and source tree provide into <target-dir>/release/. EITRI_INSTALL_TEST_CARGO_MODE selects the
 # behaviour (default "ok"): "fail" makes the build call exit 1, so nothing after it in
 # do_from_source ever runs. "skip" exits 0 without writing anything at all into
 # <target-dir> -- standing in for a build genuinely redirected elsewhere (build.target,
@@ -26,6 +27,7 @@ S=$(cd "$(dirname "$0")/.." && pwd)
 	# Record the Skia URL so a test can assert that the build sees the pinned, checksummed archive,
 	# never skia-bindings' unauthenticated download.
 	printf 'SKIA_BINARIES_URL=%s\n' "${SKIA_BINARIES_URL:-<unset>}"
+	printf 'EITRI_SERVER_SHA256=%s\n' "${EITRI_SERVER_SHA256-<unset>}"
 } >>"$S/logs/cargo.log"
 case $1 in
 build)
@@ -40,13 +42,25 @@ build)
 	esac
 	_cfs_target_dir=
 	_cfs_prev=
+	_cfs_packages=" "
 	for _cfs_a in "$@"; do
 		if [ "$_cfs_prev" = --target-dir ]; then _cfs_target_dir=$_cfs_a; fi
+		if [ "$_cfs_prev" = -p ]; then _cfs_packages="$_cfs_packages$_cfs_a "; fi
 		_cfs_prev=$_cfs_a
 	done
 	if [ -z "$_cfs_target_dir" ]; then _cfs_target_dir=${CARGO_TARGET_DIR:-target}; fi
 	mkdir -p "$_cfs_target_dir/release" || exit 1
-	for b in shell eitri-tmux-shim eitri-claude-handoff eitri-run-guard eitri-editor-bridge agent-hook; do
+	for b in shell eitri-tmux-shim eitri-claude-handoff eitri-run-guard eitri-editor-bridge eitri-server agent-hook; do
+		case $b in
+		eitri-server)
+			case $_cfs_packages in *" eitri-server "*) ;; *) continue ;; esac
+			[ -f server/Cargo.toml ] || exit 1 ;;
+		eitri-editor-bridge)
+			case $_cfs_packages in *" shell "*) ;; *) continue ;; esac
+			[ -f shell/src/bin/eitri-editor-bridge.rs ] || continue ;;
+		agent-hook) case $_cfs_packages in *" agent "*) ;; *) continue ;; esac ;;
+		*) case $_cfs_packages in *" shell "*) ;; *) continue ;; esac ;;
+		esac
 		printf '#!/bin/sh\necho "stub %s (from-source test build)"\n' "$b" >"$_cfs_target_dir/release/$b" || exit 1
 		chmod 0755 "$_cfs_target_dir/release/$b" || exit 1
 	done

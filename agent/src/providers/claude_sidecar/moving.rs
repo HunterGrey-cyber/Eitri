@@ -22,9 +22,13 @@
 
 use super::spawn::{HandedOutput, SidecarFds};
 use super::transport::{self, TransportHandoff, TransportKind};
-use super::{handshake_with, lock, ClaudeSidecarProvider, EventQueue, Handshaken, ParkedWatch, WatchMark, WatchState};
+use super::transport::{CallMetadata, SidecarTransport};
+use super::{
+    handshake_with, lock, ClaudeSidecarProvider, EventQueue, Handshaken, ParkedWatch, RemoteSide, WatchMark, WatchState,
+};
 use crate::child::{ChildKind, ChildRecord};
 use crate::runtime_thread::RuntimeThread;
+use claude_runtime_protocol::v1::runtime_service_client::RuntimeServiceClient;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -72,6 +76,34 @@ pub struct ClaudeProviderHandoff {
     pub stderr_tail: Vec<u8>,
     pub build_description: String,
     pub build_warnings: Vec<String>,
+    /// For a remote tab, what its window's handshake with the sidecar and Hello with the helper said, so
+    /// the taking window needs no round trip to take it up; `None` for a sidecar on this machine.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote_facts: Option<RemoteFacts>,
+}
+
+/// What a remote tab's provider learned from its handshake and its helper's Hello.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RemoteFacts {
+    pub capabilities: crate::provider::ProviderCapabilities,
+    pub info: crate::provider::ProviderInfo,
+    pub splits_messages: bool,
+    pub provider_prompts: bool,
+    pub claude_code_prompt: bool,
+    pub max_message_bytes: u64,
+    pub helper_version: String,
+    pub helper_warnings: Vec<String>,
+}
+
+/// What a freeze took from the transport.
+enum Handed {
+    Local {
+        fds: SidecarFds,
+        socket_path: PathBuf,
+        child: ChildRecord,
+    },
+    Helper(super::HelperHandoff),
 }
 
 /// Why a Claude chat's sidecar was not handed over. The words are a note the giving window shows.
@@ -94,6 +126,8 @@ pub enum MoveRefusedWhy {
     NotDriving,
     /// The sidecar's output closed or a descriptor could not be duplicated: it is ending.
     SidecarEnding(std::io::Error),
+    /// This kind of chat cannot move between windows yet; the text says which.
+    Unsupported(String),
     /// The chat has fallen so far behind the events already read that the sidecar may no longer be
     /// able to replay them from where it stands; it catches up within moments.
     FoldBehind,
@@ -111,6 +145,7 @@ impl std::fmt::Display for MoveRefusedWhy {
             MoveRefusedWhy::SeveralSessions => f.write_str("the chat watches more than one session"),
             MoveRefusedWhy::NotDriving => f.write_str("this window does not drive the chat"),
             MoveRefusedWhy::SidecarEnding(why) => write!(f, "the agent's sidecar is ending: {why}"),
+            MoveRefusedWhy::Unsupported(what) => f.write_str(what),
             MoveRefusedWhy::FoldBehind => f.write_str("the chat has not caught up with its agent's output yet"),
         }
     }
@@ -136,6 +171,18 @@ impl ClaudeSidecarProvider {
     /// Destructures the provider without a rest pattern, so a field added to it has to say whether
     /// the taking side needs it.
     pub fn freeze_for_move(&self) -> Result<(ClaudeProviderHandoff, SidecarFds), MoveRefusedWhy> {
+        self.freeze(false)
+            .map(|(handoff, fds)| (handoff, fds.expect("a local sidecar hands its descriptors over")))
+    }
+
+    /// [`Self::freeze_for_move`] for a chat whose agent may run on a server: a remote tab hands over its
+    /// [`HelperHandoff`](super::HelperHandoff) and no descriptors, and the taking window reaches the same
+    /// sidecar through its own helper connection ([`Self::adopt_through_helper`]).
+    pub fn freeze_for_chat_move(&self) -> Result<(ClaudeProviderHandoff, Option<SidecarFds>), MoveRefusedWhy> {
+        self.freeze(true)
+    }
+
+    fn freeze(&self, helper_too: bool) -> Result<(ClaudeProviderHandoff, Option<SidecarFds>), MoveRefusedWhy> {
         let ClaudeSidecarProvider {
             transport,
             // Rebuilt: the taking side runs its own runtime and connection.
@@ -144,13 +191,16 @@ impl ClaudeSidecarProvider {
             events,
             // Rebuilt: its counters describe this process's stream.
             backpressure: _,
-            // Rebuilt from the taking side's own handshake with the same sidecar.
-            capabilities: _,
-            info: _,
-            splits_messages: _,
-            provider_prompts: _,
-            claude_code_prompt: _,
-            max_message_bytes: _,
+            // Rebuilt from the taking side's own handshake with the same sidecar; a remote tab's travel
+            // in the record, since the taking window takes it up with no round trip.
+            capabilities,
+            info,
+            splits_messages,
+            provider_prompts,
+            claude_code_prompt,
+            max_message_bytes,
+            // A sidecar that no longer runs has nothing to move.
+            history_only: _,
             // Not carried: only a session create or resume reads it, and the taking side opens none.
             #[cfg(feature = "test-support")]
                 questions_override: _,
@@ -162,6 +212,8 @@ impl ClaudeSidecarProvider {
             released,
             #[cfg(feature = "test-support")]
                 per_task_stop_override: _,
+            // A remote tab's link state stays here; the taking window keeps its own.
+            remote: _,
         } = self;
         if released.load(Ordering::SeqCst) || lock(parked).is_some() {
             return Err(MoveRefusedWhy::NotDriving);
@@ -180,14 +232,23 @@ impl ClaudeSidecarProvider {
         let taken = transport.freeze_for_move().and_then(|handoff| match handoff {
             TransportHandoff::Local { fds, socket_path, pid } => {
                 let start = crate::child::start_time(pid).map_err(MoveRefusedWhy::SidecarEnding)?;
-                Ok((fds, socket_path, pid, start))
+                Ok(Handed::Local {
+                    fds,
+                    socket_path,
+                    child: ChildRecord {
+                        pid,
+                        start,
+                        kind: ChildKind::Sidecar,
+                    },
+                })
             }
-            TransportHandoff::Helper(_) => Err(MoveRefusedWhy::SidecarEnding(std::io::Error::new(
-                std::io::ErrorKind::Unsupported,
-                "a helper handoff is not supported yet",
+            TransportHandoff::Helper(handoff) if helper_too => Ok(Handed::Helper(handoff)),
+            TransportHandoff::Helper(handoff) => Err(MoveRefusedWhy::Unsupported(format!(
+                "a chat whose agent runs on {} moves only through the chat mover",
+                handoff.host
             ))),
         });
-        let (fds, socket_path, pid, start) = match taken {
+        let handed = match taken {
             Ok(taken) => taken,
             Err(why) => {
                 let _ = transport.restart_output();
@@ -207,15 +268,47 @@ impl ClaudeSidecarProvider {
             child_replies,
             cli_mode_noted,
         } = mark;
+        let remote_facts = match &handed {
+            Handed::Local { .. } => None,
+            Handed::Helper(_) => Some(RemoteFacts {
+                capabilities: capabilities.clone(),
+                info: info.clone(),
+                splits_messages: *splits_messages,
+                provider_prompts: *provider_prompts,
+                claude_code_prompt: *claude_code_prompt,
+                max_message_bytes: *max_message_bytes,
+                helper_version: transport.helper_version().unwrap_or_default(),
+                helper_warnings: transport.build_warnings(),
+            }),
+        };
+        let (kind, fds, socket_path, child) = match handed {
+            Handed::Local {
+                fds,
+                socket_path,
+                child,
+            } => (TransportKind::Local, Some(fds), socket_path, child),
+            // No process here and no descriptors: the record names the sidecar and the session, and
+            // where the watch stood.
+            Handed::Helper(helper) => (
+                TransportKind::Helper(super::HelperHandoff {
+                    session_id: session_id.clone(),
+                    last_folded_sequence: sequence,
+                    ..helper
+                }),
+                None,
+                PathBuf::new(),
+                ChildRecord {
+                    pid: 0,
+                    start: 0,
+                    kind: ChildKind::Sidecar,
+                },
+            ),
+        };
         let handoff = ClaudeProviderHandoff {
-            transport: TransportKind::Local,
+            transport: kind,
             provider_session_id: session_id,
             socket_path,
-            child: ChildRecord {
-                pid,
-                start,
-                kind: ChildKind::Sidecar,
-            },
+            child,
             folded_through: sequence,
             last_text,
             last_text_open: Some(last_text_open),
@@ -228,8 +321,119 @@ impl ClaudeSidecarProvider {
             stderr_tail,
             build_description: transport.build_description(),
             build_warnings: transport.build_warnings(),
+            remote_facts,
         };
         Ok((handoff, fds))
+    }
+
+    /// Takes up a remote tab another window froze for a move: the same sidecar, reached through this
+    /// window's own connection to its helper (`client`, opened for the record's host key). Nothing
+    /// crosses the network here (it runs where the move is taken up, on the GTK thread): the handshake's
+    /// facts come with the record ([`RemoteFacts`]), and nothing is watched, read or answered until
+    /// [`Self::commit`], whose watch reads on from the handed-over sequence. Dropping the result ends
+    /// nothing on the server.
+    pub fn adopt_through_helper(
+        handoff: ClaudeProviderHandoff,
+        client: crate::remote_client::HelperClient,
+    ) -> std::io::Result<Self> {
+        let invalid = |why: &str| std::io::Error::new(std::io::ErrorKind::InvalidData, why.to_string());
+        let TransportKind::Helper(helper) = &handoff.transport else {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "the moved chat's agent does not run on a server",
+            ));
+        };
+        if helper.session_id != handoff.provider_session_id || helper.last_folded_sequence != handoff.folded_through {
+            return Err(invalid(
+                "the moved chat's record names two different places to go on from",
+            ));
+        }
+        let helper = helper.clone();
+        let ClaudeProviderHandoff {
+            transport: _,
+            provider_session_id: session_id,
+            socket_path: _,
+            child: _,
+            folded_through,
+            last_text,
+            last_text_open,
+            last_child_replies,
+            cli_mode_noted,
+            plan_offered,
+            steers_given_up,
+            stdout_partial: _,
+            stderr_partial: _,
+            stderr_tail: _,
+            build_description: _,
+            build_warnings: _,
+            remote_facts,
+        } = handoff;
+        let RemoteFacts {
+            capabilities,
+            info,
+            splits_messages,
+            provider_prompts,
+            claude_code_prompt,
+            max_message_bytes,
+            helper_version,
+            helper_warnings,
+        } = remote_facts.ok_or_else(|| invalid("the moved chat's record lacks its agent's handshake"))?;
+        if client.host() != helper.host {
+            return Err(invalid("the connection given for the moved chat is to another host"));
+        }
+        let client = client.for_known_owner(&helper.daemon)?;
+        let checker = client.link_checker(Some(&helper.host_key_sha256))?;
+        let transport = super::transport::helper::ThroughHelper::known(
+            client.clone(),
+            helper.sidecar_id.clone(),
+            helper.host_key_sha256.clone(),
+            helper_version,
+            helper_warnings,
+        )
+        .with_tools(&helper.declared_client_tools);
+        let runtime = client.runtime();
+        let channel = transport.channel(&runtime, None)?;
+        let runtime_client =
+            RuntimeServiceClient::with_interceptor(channel, CallMetadata::new(transport.call_metadata())?);
+        let mark = WatchMark {
+            sequence: folded_through,
+            last_text_open: last_text_open.unwrap_or(last_text.is_some()),
+            last_text,
+            child_replies: last_child_replies,
+            cli_mode_noted,
+        };
+        let remote = RemoteSide {
+            checker,
+            link: Arc::default(),
+            clock: Arc::new(crate::remote_client::SystemClock),
+            asker: client.pending_asker(&helper.sidecar_id),
+            ending: Arc::default(),
+        };
+        Ok(ClaudeSidecarProvider {
+            transport: Mutex::new(Box::new(transport)),
+            runtime,
+            client: runtime_client,
+            events: Arc::new(EventQueue::taking_over(mark.clone(), steers_given_up)),
+            backpressure: Arc::default(),
+            capabilities,
+            info,
+            splits_messages,
+            provider_prompts,
+            claude_code_prompt,
+            max_message_bytes,
+            history_only: false,
+            #[cfg(feature = "test-support")]
+            questions_override: None,
+            #[cfg(feature = "test-support")]
+            plan_mode_override: None,
+            plan_offered: AtomicBool::new(plan_offered),
+            watches: Mutex::new(Vec::new()),
+            parked: Mutex::new(Some(ParkedWatch { session_id, mark })),
+            released: AtomicBool::new(false),
+            #[cfg(feature = "test-support")]
+            per_task_stop_override: None,
+            remote: Some(remote),
+        })
     }
 
     /// After a freeze whose move did not happen: the drains read on from where they stopped, and the
@@ -265,8 +469,9 @@ impl ClaudeSidecarProvider {
             stderr_tail: _,
             build_description: _,
             build_warnings: _,
+            remote_facts: _,
         } = handoff;
-        let runtime = RuntimeThread::spawn();
+        let runtime = Arc::new(RuntimeThread::spawn());
         let Handshaken {
             client,
             capabilities,
@@ -275,6 +480,7 @@ impl ClaudeSidecarProvider {
             provider_prompts,
             claude_code_prompt,
             max_message_bytes,
+            history_only: _,
         } = handshake_with(
             &runtime,
             transport.as_ref(),
@@ -300,6 +506,7 @@ impl ClaudeSidecarProvider {
             provider_prompts,
             claude_code_prompt,
             max_message_bytes,
+            history_only: false,
             #[cfg(feature = "test-support")]
             questions_override: None,
             #[cfg(feature = "test-support")]
@@ -310,6 +517,7 @@ impl ClaudeSidecarProvider {
             released: AtomicBool::new(false),
             #[cfg(feature = "test-support")]
             per_task_stop_override: None,
+            remote: None,
         })
     }
 

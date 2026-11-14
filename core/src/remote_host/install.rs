@@ -18,6 +18,8 @@ pub enum InstallError {
     Reinstall(String),
     Invalid(String),
     Command(String),
+    DaemonStillRuns(String),
+    SidecarsStillRun(String),
 }
 
 impl fmt::Display for InstallError {
@@ -30,7 +32,9 @@ impl fmt::Display for InstallError {
                 f,
                 "server files could not be verified; reinstall the server helper: {why}"
             ),
-            Self::Invalid(why) | Self::Command(why) => f.write_str(why),
+            Self::Invalid(why) | Self::Command(why) | Self::DaemonStillRuns(why) | Self::SidecarsStillRun(why) => {
+                f.write_str(why)
+            }
         }
     }
 }
@@ -58,9 +62,22 @@ pub struct InstallPlan {
     consented: bool,
     host_key: Option<String>,
     warnings: Vec<String>,
+    free_bytes: Option<u64>,
 }
 
 impl InstallPlan {
+    pub(super) fn check_upload_space(&self) -> Result<(), InstallError> {
+        let required = self
+            .helper_bytes
+            .saturating_add(self.sidecar_bytes)
+            .saturating_add(100 * 1024 * 1024);
+        if self.free_bytes.is_none_or(|free| free < required) {
+            return Err(InstallError::Invalid(format!(
+                "server needs {required} free bytes for the upload with 100 MiB to spare"
+            )));
+        }
+        Ok(())
+    }
     pub fn version(&self) -> &str {
         &self.version
     }
@@ -78,6 +95,14 @@ impl InstallPlan {
     }
     pub fn install_path(&self) -> PathBuf {
         self.data_dir.join(&self.version)
+    }
+    /// The helper's data directory on the server, as the probe found it.
+    pub fn data_dir(&self) -> &Path {
+        &self.data_dir
+    }
+    /// The helper's state directory on the server, as the probe found it.
+    pub fn state_dir(&self) -> &Path {
+        &self.state_dir
     }
     pub fn warnings(&self) -> &[String] {
         &self.warnings
@@ -166,6 +191,13 @@ impl InstallPlan {
 }
 
 pub fn plan_install(probe: &ProbeReport, sidecar: &Path) -> Result<InstallPlan, InstallError> {
+    let plan = plan_connection(probe, sidecar)?;
+    plan.check_upload_space()?;
+    Ok(plan)
+}
+
+/// Prepare the identity even when no upload would fit: an existing installation needs no upload space.
+pub fn plan_connection(probe: &ProbeReport, sidecar: &Path) -> Result<InstallPlan, InstallError> {
     super::probe_step::validate(probe)?;
     let upload = agent::sidecar_for_upload().map_err(InstallError::Invalid)?;
     if upload.path != sidecar {
@@ -176,10 +208,34 @@ pub fn plan_install(probe: &ProbeReport, sidecar: &Path) -> Result<InstallPlan, 
     let helper = sibling_helper()?;
     let provenance = super::provenance::helper_provenance(helper.parent().expect("sibling parent"))?;
     let version = helper_version(&helper)?;
-    make_plan(probe, &provenance, upload, helper, version)
+    make_connection_plan(probe, &provenance, upload, helper, version)
+}
+
+/// The plan [`plan_install`] makes, for a helper and sidecar named outright rather than found beside this
+/// executable: `provenance` must describe `helper`, whose own `--version` names its installation. Changes nothing.
+pub fn plan_for(
+    probe: &ProbeReport,
+    provenance: &HelperProvenance,
+    sidecar: agent::UploadSidecar,
+    helper: PathBuf,
+) -> Result<InstallPlan, InstallError> {
+    let version = helper_version(&helper)?;
+    make_plan(probe, provenance, sidecar, helper, version)
 }
 
 fn make_plan(
+    probe: &ProbeReport,
+    provenance: &HelperProvenance,
+    sidecar: agent::UploadSidecar,
+    helper: PathBuf,
+    version: String,
+) -> Result<InstallPlan, InstallError> {
+    let plan = make_connection_plan(probe, provenance, sidecar, helper, version)?;
+    plan.check_upload_space()?;
+    Ok(plan)
+}
+
+fn make_connection_plan(
     probe: &ProbeReport,
     provenance: &HelperProvenance,
     sidecar: agent::UploadSidecar,
@@ -222,14 +278,6 @@ fn make_plan(
     let version = format!("{version}-{}-{}", &provenance.sha256()[..16], &manifest_hash[..16]);
     let helper_bytes = std::fs::metadata(&helper)?.len();
     let sidecar_bytes = std::fs::metadata(&sidecar.path)?.len();
-    let required = helper_bytes
-        .saturating_add(sidecar_bytes)
-        .saturating_add(100 * 1024 * 1024);
-    if probe.free_bytes.is_none_or(|free| free < required) {
-        return Err(InstallError::Invalid(format!(
-            "server needs {required} free bytes for the upload with 100 MiB to spare"
-        )));
-    }
     Ok(InstallPlan {
         helper_bytes,
         sidecar_bytes,
@@ -244,6 +292,7 @@ fn make_plan(
         consented: false,
         host_key: None,
         warnings,
+        free_bytes: probe.free_bytes,
     })
 }
 
@@ -275,6 +324,8 @@ pub fn install_with(
     if !plan.consented {
         return Err(InstallError::ConsentRequired);
     }
+    plan.check_upload_space()?;
+    let host_key = plan.host_key.as_deref().ok_or(InstallError::ConsentRequired)?;
     // Re-read and check before any remote write; local files may have changed since consent.
     let helper = std::fs::read(&plan.helper)?;
     let sidecar = std::fs::read(&plan.sidecar.path)?;
@@ -295,44 +346,56 @@ pub fn install_with(
     let stage = format!(".install-{}", uuid::Uuid::new_v4().simple());
     let args = [checked_path(&plan.data_dir)?, &stage];
     let result = (|| {
-        let child = if plan.gzip {
-            launcher.spawn_step(steps::UPLOAD, &args)?
-        } else {
-            launcher.spawn_step(steps::UPLOAD_PLAIN, &args)?
+        let child = {
+            let _key = launcher.hold_host_key(host_key)?;
+            let child = if plan.gzip {
+                launcher.spawn_step(steps::UPLOAD, &args)?
+            } else {
+                launcher.spawn_step(steps::UPLOAD_PLAIN, &args)?
+            };
+            attached(child)?
         };
         communicate(child, &helper, &|n, _| progress(n, total))?;
         uploaded += helper.len() as u64;
         let mut input = format!("{}\n", sidecar_directory(&plan.sidecar.revision, plan.sidecar_sha256())).into_bytes();
         let header_len = input.len() as u64;
         input.extend_from_slice(&sidecar);
-        let child = if plan.gzip {
-            launcher.spawn_step(steps::UPLOAD_SIDECAR, &args)?
-        } else {
-            launcher.spawn_step(steps::UPLOAD_SIDECAR_PLAIN, &args)?
+        let child = {
+            let _key = launcher.hold_host_key(host_key)?;
+            let child = if plan.gzip {
+                launcher.spawn_step(steps::UPLOAD_SIDECAR, &args)?
+            } else {
+                launcher.spawn_step(steps::UPLOAD_SIDECAR_PLAIN, &args)?
+            };
+            attached(child)?
         };
         communicate(child, &input, &|n, _| {
             progress(uploaded + n.saturating_sub(header_len), total)
         })?;
-        communicate(
-            launcher.spawn_step(steps::WRITE_MANIFEST, &args)?,
-            &plan.manifest.render()?,
-            &|_, _| {},
-        )?;
+        let child = {
+            let _key = launcher.hold_host_key(host_key)?;
+            attached(launcher.spawn_step(steps::WRITE_MANIFEST, &args)?)?
+        };
+        communicate(child, &plan.manifest.render()?, &|_, _| {})?;
         let input = format!(
             "{}\n{}\n",
             plan.version,
             sidecar_directory(&plan.sidecar.revision, plan.sidecar_sha256())
         );
-        communicate(
-            launcher.spawn_step(steps::PUBLISH, &args)?,
-            input.as_bytes(),
-            &|_, _| {},
-        )?;
+        let child = {
+            let _key = launcher.hold_host_key(host_key)?;
+            attached(launcher.spawn_step(steps::PUBLISH, &args)?)?
+        };
+        communicate(child, input.as_bytes(), &|_, _| {})?;
         progress(total, total);
         Ok(())
     })();
     if result.is_err() {
-        if let Ok(child) = launcher.spawn_step(steps::CLEANUP, &args) {
+        let cleanup = (|| {
+            let _key = launcher.hold_host_key(host_key)?;
+            attached(launcher.spawn_step(steps::CLEANUP, &args)?)
+        })();
+        if let Ok(child) = cleanup {
             let _ = communicate(child, &[], &|_, _| {});
         }
     }
@@ -354,33 +417,15 @@ pub fn ensure_started_with(launcher: &dyn ChannelLauncher, plan: &InstallPlan) -
         return Err(InstallError::ConsentRequired);
     }
     let args = [checked_path(&plan.data_dir)?, &plan.version];
-    communicate(
-        launcher.spawn_step(steps::START, &args)?,
-        &plan.manifest.render()?,
-        &|_, _| {},
-    )
-    .map_err(|error| InstallError::Reinstall(error.to_string()))?;
+    let child = {
+        let _key = launcher.hold_host_key(plan.host_key.as_deref().ok_or(InstallError::ConsentRequired)?)?;
+        attached(launcher.spawn_step(steps::START, &args)?)?
+    };
+    communicate_start(child, &plan.manifest.render()?, &|_, _| {})?;
     Ok(())
 }
 
-/// Attach to an installed version using only the hashes saved on this machine.
-pub fn ensure_recorded_started(
-    master: &ControlMaster,
-    host: &RemoteHost,
-    version: &str,
-    revision: &str,
-) -> Result<(), InstallError> {
-    if !host.consented {
-        return Err(InstallError::ConsentRequired);
-    }
-    let launcher = SshLauncher {
-        master: master.clone(),
-        helper: host.data_dir.join(version).join("bin/eitri-server"),
-    };
-    start_recorded_with(&launcher, host, version, revision)
-}
-
-fn start_recorded_with(
+pub(crate) fn start_recorded_with(
     launcher: &dyn ChannelLauncher,
     host: &RemoteHost,
     version: &str,
@@ -390,13 +435,110 @@ fn start_recorded_with(
         return Err(InstallError::ConsentRequired);
     }
     let manifest = Manifest::from_record(host, version, revision)?;
-    let args = [checked_path(&host.data_dir)?, version];
-    communicate(
-        launcher.spawn_step(steps::START, &args)?,
-        &manifest.render()?,
-        &|_, _| {},
-    )
-    .map_err(|error| InstallError::Reinstall(error.to_string()))?;
+    start_manifest_with(launcher, host, version, &manifest, false)
+}
+
+/// Recovery for an explicit stop checks every artifact recorded for this installation before adoption.
+pub(crate) fn recover_recorded_with(
+    launcher: &dyn ChannelLauncher,
+    host: &RemoteHost,
+    installation: &str,
+) -> Result<(), InstallError> {
+    if !host.consented {
+        return Err(InstallError::ConsentRequired);
+    }
+    if !safe_name(installation) {
+        return Err(InstallError::Invalid("invalid installation name".into()));
+    }
+    let hash = host
+        .helpers
+        .get(installation)
+        .ok_or_else(|| InstallError::Invalid("no recorded helper hash".into()))?;
+    let mut manifest = Manifest {
+        lines: vec![(hash.clone(), "bin/eitri-server".into())],
+    };
+    let prefix = format!("{installation}/");
+    for key in host.sidecars.keys() {
+        if let Some(revision) = key.strip_prefix(&prefix) {
+            let recorded = Manifest::from_record(host, installation, revision)?;
+            manifest.lines.extend(
+                recorded
+                    .lines
+                    .into_iter()
+                    .filter(|(_, path)| path != "bin/eitri-server"),
+            );
+        }
+    }
+    start_manifest_with(launcher, host, installation, &manifest, true)
+}
+
+/// Checked candidates are sent by the laptop; the server's own manifest cannot authorize a checker.
+pub(crate) fn recorded_checkers(host: &RemoteHost, preferred: &str) -> Result<Vec<u8>, InstallError> {
+    let mut installations: Vec<_> = host.helpers.iter().collect();
+    installations.sort_by_key(|(name, _)| name.as_str() != preferred);
+    let mut input = Vec::new();
+    for (name, hash) in installations {
+        if !safe_name(name) {
+            return Err(InstallError::Invalid("invalid installation name".into()));
+        }
+        Manifest {
+            lines: vec![(hash.clone(), "bin/eitri-server".into())],
+        }
+        .render()?;
+        writeln!(input, "{name} {hash}")?;
+    }
+    Ok(input)
+}
+
+pub(crate) fn live_recorded_runs_with(
+    launcher: &dyn ChannelLauncher,
+    host: &RemoteHost,
+    installation: &str,
+) -> Result<(Vec<u8>, Vec<u8>), InstallError> {
+    if !host.consented {
+        return Err(InstallError::ConsentRequired);
+    }
+    if !safe_name(installation) {
+        return Err(InstallError::Invalid("invalid installation name".into()));
+    }
+    let hash = host
+        .helpers
+        .get(installation)
+        .ok_or_else(|| InstallError::Invalid("no recorded helper hash".into()))?;
+    let manifest = Manifest {
+        lines: vec![(hash.clone(), "bin/eitri-server".into())],
+    }
+    .render()?;
+    let args = [
+        checked_path(&host.data_dir)?,
+        installation,
+        checked_path(&host.state_dir)?,
+    ];
+    let child = {
+        let _key = launcher.hold_host_key(&host.host_key_sha256)?;
+        attached(launcher.spawn_step(steps::CHECK_SIDECARS, &args)?)?
+    };
+    communicate_start_output(child, &manifest, &|_, _| {})
+}
+
+fn start_manifest_with(
+    launcher: &dyn ChannelLauncher,
+    host: &RemoteHost,
+    version: &str,
+    manifest: &Manifest,
+    recovery: bool,
+) -> Result<(), InstallError> {
+    let run_key = super::cli::installation_run_key(version);
+    let mut args = vec![checked_path(&host.data_dir)?, version];
+    if recovery {
+        args.push(checked_path(&host.state_dir)?);
+        args.push(&run_key);
+    }
+    let child = {
+        let _key = launcher.hold_host_key(&host.host_key_sha256)?;
+        attached(launcher.spawn_step(steps::START, &args)?)?
+    };
+    communicate_start(child, &manifest.render()?, &|_, _| {})?;
     Ok(())
 }
 
@@ -410,11 +552,109 @@ fn payload(bytes: Vec<u8>, gzip: bool) -> Result<Vec<u8>, InstallError> {
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()?;
-    communicate_uncapped(child, &bytes, &|_, _| {}, usize::MAX)
+    communicate_uncapped(child, &bytes, &|_, _| {}, usize::MAX, None).map(|(out, _)| out)
+}
+
+/// Consume only the attachment marker, with the caller's key guard still held. No payload may be sent before it.
+pub(crate) fn attached(child: Child) -> Result<Child, InstallError> {
+    attached_within(child, std::time::Duration::from_secs(5))
+}
+
+fn attached_within(mut child: Child, wait: std::time::Duration) -> Result<Child, InstallError> {
+    use std::os::fd::AsRawFd;
+    #[cfg(test)]
+    before_attachment::run();
+    let result = (|| {
+        let stdout = child
+            .stdout
+            .as_mut()
+            .ok_or_else(|| InstallError::Invalid("lifecycle launcher did not pipe stdout".into()))?;
+        let deadline = std::time::Instant::now() + wait;
+        for expected in agent::ssh::channel::LIFECYCLE_ATTACHED {
+            loop {
+                let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+                if remaining.is_zero() {
+                    return Err(InstallError::Command("lifecycle attachment timed out".into()));
+                }
+                let mut fd = libc::pollfd {
+                    fd: stdout.as_raw_fd(),
+                    events: libc::POLLIN,
+                    revents: 0,
+                };
+                // SAFETY: stdout owns this descriptor throughout the poll and its one-byte read.
+                let ready =
+                    unsafe { libc::poll(&mut fd, 1, remaining.as_millis().max(1).min(i32::MAX as u128) as i32) };
+                if ready < 0 {
+                    let error = std::io::Error::last_os_error();
+                    if error.kind() == std::io::ErrorKind::Interrupted {
+                        continue;
+                    }
+                    return Err(error.into());
+                }
+                if ready == 0 {
+                    continue;
+                }
+                let mut byte = [0];
+                match stdout.read(&mut byte) {
+                    Ok(1) if byte[0] == *expected => break,
+                    Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                    Err(error) => return Err(error.into()),
+                    _ => {
+                        return Err(InstallError::Command(
+                            "invalid or missing lifecycle attachment marker".into(),
+                        ))
+                    }
+                }
+            }
+        }
+        Ok(())
+    })();
+    if let Err(error) = result {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(error);
+    }
+    Ok(child)
+}
+
+#[cfg(test)]
+pub(crate) mod before_attachment {
+    use std::cell::RefCell;
+
+    thread_local! {
+        pub(crate) static HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
+    }
+
+    pub(super) fn run() {
+        if let Some(hook) = HOOK.with(|cell| cell.borrow_mut().take()) {
+            hook();
+        }
+    }
 }
 
 pub(crate) fn communicate(child: Child, input: &[u8], progress: &dyn Fn(u64, u64)) -> Result<Vec<u8>, InstallError> {
-    communicate_uncapped(child, input, progress, 64 * 1024)
+    communicate_uncapped(child, input, progress, 64 * 1024, None).map(|(out, _)| out)
+}
+
+fn communicate_start(child: Child, input: &[u8], progress: &dyn Fn(u64, u64)) -> Result<Vec<u8>, InstallError> {
+    communicate_start_output(child, input, progress).map(|(out, _)| out)
+}
+
+fn communicate_start_output(
+    child: Child,
+    input: &[u8],
+    progress: &dyn Fn(u64, u64),
+) -> Result<(Vec<u8>, Vec<u8>), InstallError> {
+    if input.len() > 4096 {
+        return Err(InstallError::Invalid("startup manifest exceeds one pipe write".into()));
+    }
+    communicate_uncapped(
+        child,
+        input,
+        progress,
+        64 * 1024,
+        Some(std::time::Duration::from_secs(25)),
+    )
 }
 
 fn communicate_uncapped(
@@ -422,7 +662,9 @@ fn communicate_uncapped(
     input: &[u8],
     progress: &dyn Fn(u64, u64),
     cap: usize,
-) -> Result<Vec<u8>, InstallError> {
+    timeout: Option<std::time::Duration>,
+) -> Result<(Vec<u8>, Vec<u8>), InstallError> {
+    let deadline = timeout.map(|wait| std::time::Instant::now() + wait);
     let mut stdin = child.stdin.take().expect("launcher pipes stdin");
     let mut stdout = child.stdout.take().expect("launcher pipes stdout");
     let mut stderr = child.stderr.take().expect("launcher pipes stderr");
@@ -460,20 +702,66 @@ fn communicate_uncapped(
             Ok::<_, std::io::Error>(())
         })();
         drop(stdin);
-        if written.is_err() {
+        // START can refuse before reading its manifest. Keep its exit status and diagnostic rather than
+        // replacing them with SIGKILL; its deadline still bounds a child that stopped reading and stays alive.
+        if written.is_err() && deadline.is_none() {
             let _ = child.kill();
         }
-        let status = child.wait();
+        #[cfg(test)]
+        after_start_input::run();
+        let mut timed_out = false;
+        let status = if let Some(deadline) = deadline {
+            loop {
+                match child.try_wait() {
+                    Ok(Some(status)) => break Ok(status),
+                    Ok(None) if std::time::Instant::now() < deadline => {
+                        std::thread::sleep(std::time::Duration::from_millis(20))
+                    }
+                    Ok(None) => {
+                        timed_out = true;
+                        let _ = child.kill();
+                        break child.wait();
+                    }
+                    Err(error) => break Err(error),
+                }
+            }
+        } else {
+            child.wait()
+        };
         let out = out.join().expect("output reader panicked")?;
         let err = err.join().expect("error reader panicked")?;
-        if !status?.success() {
+        let status = status?;
+        if timed_out {
+            return Err(InstallError::Command("checked helper startup timed out".into()));
+        }
+        if status.code() == Some(66) {
+            return Err(InstallError::Reinstall(
+                agent::remote_client::MISSING_INSTALLATION.into(),
+            ));
+        }
+        if status.code() == Some(67) {
+            return Err(InstallError::Reinstall(
+                String::from_utf8_lossy(&err).trim().to_string(),
+            ));
+        }
+        if status.code() == Some(75) {
+            return Err(InstallError::DaemonStillRuns(
+                String::from_utf8_lossy(&err).trim().to_string(),
+            ));
+        }
+        if status.code() == Some(76) {
+            return Err(InstallError::SidecarsStillRun(
+                String::from_utf8_lossy(&err).trim().to_string(),
+            ));
+        }
+        if !status.success() {
             return Err(InstallError::Command(String::from_utf8_lossy(&err).trim().to_string()));
         }
         written?;
         if out.len() > cap {
             return Err(InstallError::Invalid("command output exceeds 64 KiB".into()));
         }
-        Ok(out)
+        Ok((out, err))
     })
 }
 
@@ -492,16 +780,13 @@ fn helper_version(helper: &Path) -> Result<String, InstallError> {
     let ["eitri-server", version, revision] = fields.as_slice() else {
         return Err(InstallError::Invalid("invalid helper version output".into()));
     };
+    if *revision == "unknown" {
+        return Err(InstallError::Invalid("this helper was built without a Git identity; rebuild from a Git checkout or set EITRI_BUILD_COMMIT to the source commit".into()));
+    }
     if !output.status.success() || !safe_name(version) || !valid_revision(revision) {
         return Err(InstallError::Invalid("invalid helper version identity".into()));
     }
     Ok(format!("{version}-{revision}"))
-}
-
-pub(crate) fn current_helper_prefix() -> Result<String, InstallError> {
-    let helper = sibling_helper()?;
-    let provenance = super::provenance::helper_provenance(helper.parent().expect("sibling parent"))?;
-    Ok(format!("{}-{}-", helper_version(&helper)?, &provenance.sha256()[..16]))
 }
 
 pub(crate) fn sidecar_directory(revision: &str, hash: &str) -> String {
@@ -532,6 +817,41 @@ pub(crate) fn checked_path(path: &Path) -> Result<&str, InstallError> {
         })
 }
 
+/// A plan for a fixture helper and sidecar under `root`, and the launcher that runs its steps there: what other
+/// modules' tests install and start.
+#[cfg(test)]
+pub(crate) fn test_plan(root: &Path, flavor: &str) -> (InstallPlan, agent::ssh::LocalExec) {
+    tests::fixture(root, flavor, false)
+}
+
+/// The consented host record of `plan` installed, as `record_installed` leaves it.
+#[cfg(test)]
+pub(crate) fn test_host_record(plan: &InstallPlan) -> RemoteHost {
+    tests::record(plan)
+}
+
+#[cfg(test)]
+pub(crate) fn test_plan_without_upload_space(root: &Path) -> InstallPlan {
+    let mut plan = tests::fixture(root, "open", false).0;
+    plan.free_bytes = Some(0);
+    plan
+}
+
+#[cfg(test)]
+mod after_start_input {
+    use std::cell::RefCell;
+
+    thread_local! {
+        pub(super) static HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
+    }
+
+    pub(super) fn run() {
+        if let Some(hook) = HOOK.with(|cell| cell.borrow_mut().take()) {
+            hook();
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -539,13 +859,91 @@ mod tests {
     use agent::ssh::LocalExec;
     use std::os::unix::fs::PermissionsExt;
 
-    fn fixture(root: &Path, flavor: &str, gzip: bool) -> (InstallPlan, LocalExec) {
+    #[test]
+    fn stop_recovery_checks_recorded_sidecar_hashes_before_adopting() {
+        let root = crate::test_scratch_dir::ScratchDir::new("remote", "recover-hashes");
+        let (mut plan, launcher) = super::test_plan(&root, "recover");
+        let host = super::test_host_record(&plan);
+        plan.use_host_record(&host).unwrap();
+        super::install_with(&launcher, &plan, &|_, _| {}).unwrap();
+        super::recover_recorded_with(&launcher, &host, plan.version()).unwrap();
+        let started = plan.install_path().join("started");
+        assert!(started.exists());
+        std::fs::remove_file(&started).unwrap();
+        std::fs::write(plan.install_path().join(&plan.manifest.lines[1].1), b"changed").unwrap();
+        assert!(super::recover_recorded_with(&launcher, &host, plan.version()).is_err());
+        assert!(!started.exists());
+    }
+
+    #[test]
+    fn a_start_that_closes_stdin_keeps_its_reinstall_status() {
+        for (code, expected) in [
+            (66, agent::remote_client::MISSING_INSTALLATION),
+            (67, "manifest refused"),
+        ] {
+            let mut child = Command::new("sh")
+                .args([
+                    "-c",
+                    "exec 0<&-; kill -STOP $$; printf 'manifest refused' >&2; exit \"$1\"",
+                    "sh",
+                    &code.to_string(),
+                ])
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap();
+            let pid = child.id() as libc::pid_t;
+            let mut status = 0;
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+            loop {
+                // SAFETY: this child belongs to the test and status lives through the call.
+                let found = unsafe { libc::waitpid(pid, &mut status, libc::WUNTRACED | libc::WNOHANG) };
+                if found == pid {
+                    break;
+                }
+                if found < 0 || std::time::Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    panic!("the child did not stop after closing stdin");
+                }
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            assert!(libc::WIFSTOPPED(status));
+            after_start_input::HOOK.with(|cell| {
+                *cell.borrow_mut() = Some(Box::new(move || {
+                    // SAFETY: only the test's stopped child is resumed, after the manifest write has failed.
+                    unsafe { libc::kill(pid, libc::SIGCONT) };
+                }));
+            });
+            let error = communicate_start(child, b"manifest\n", &|_, _| {}).unwrap_err();
+            assert!(
+                matches!(&error, InstallError::Reinstall(why) if why == expected),
+                "{error:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_helper_without_git_identity_explains_how_to_build_an_installable_one() {
+        let root = ScratchDir::new("remote", "unknown-build");
+        let helper = root.join("eitri-server");
+        std::fs::write(&helper, "#!/bin/sh\nprintf 'eitri-server 0.3.0 unknown\\n'\n").unwrap();
+        std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let why = helper_version(&helper).unwrap_err().to_string();
+        assert!(
+            why.contains("without a Git identity") && why.contains("EITRI_BUILD_COMMIT"),
+            "{why}"
+        );
+    }
+
+    pub(super) fn fixture(root: &Path, flavor: &str, gzip: bool) -> (InstallPlan, LocalExec) {
         let local = root.join(format!("local-{flavor}"));
         std::fs::create_dir_all(&local).unwrap();
         let helper = local.join("eitri-server");
         std::fs::write(
             &helper,
-            format!("#!/bin/sh\ntest \"$1\" = ensure || exit 1\nprintf {flavor} > started\n"),
+            format!("#!/bin/sh\ntest \"$1\" = ensure || exit 1\ntest ! -e ensure-fails || {{ echo ensure-refused >&2; exit 1; }}\nprintf {flavor} > started\n"),
         )
         .unwrap();
         std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o700)).unwrap();
@@ -571,7 +969,7 @@ mod tests {
         )
     }
 
-    fn record(plan: &InstallPlan) -> RemoteHost {
+    pub(super) fn record(plan: &InstallPlan) -> RemoteHost {
         RemoteHost {
             version: 1,
             host_key_sha256: "SHA256:example".into(),
@@ -589,6 +987,221 @@ mod tests {
 
     fn authorize(plan: &mut InstallPlan) {
         plan.use_host_record(&record(plan)).unwrap();
+    }
+
+    struct GuardedSteps {
+        local: LocalExec,
+        held: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        starts: std::sync::atomic::AtomicUsize,
+        waiting: PathBuf,
+        release: PathBuf,
+    }
+
+    struct KeyGuard(std::sync::Arc<std::sync::atomic::AtomicBool>);
+    impl Drop for KeyGuard {
+        fn drop(&mut self) {
+            self.0.store(false, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    impl ChannelLauncher for GuardedSteps {
+        fn spawn(&self, _: &[std::ffi::OsString]) -> std::io::Result<Child> {
+            unreachable!()
+        }
+
+        fn hold_host_key(&self, expected: &str) -> std::io::Result<Box<dyn Send>> {
+            assert_eq!(expected, "SHA256:example");
+            if self.held.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                return Err(std::io::Error::from(std::io::ErrorKind::WouldBlock));
+            }
+            Ok(Box::new(KeyGuard(self.held.clone())))
+        }
+
+        fn spawn_step(&self, literal: &'static str, args: &[&str]) -> std::io::Result<Child> {
+            assert!(
+                self.held.load(std::sync::atomic::Ordering::SeqCst),
+                "the key check and spawn must exclude a restart"
+            );
+            if literal == steps::START {
+                let first = self.starts.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0;
+                return Command::new("sh")
+                    .args([
+                        "-c",
+                        if first {
+                            r#"printf "eitri-lifecycle-attached-v1\n"; cat >/dev/null; touch "$1"; while ! test -e "$2"; do sleep 0.01; done"#
+                        } else {
+                            r#"printf "eitri-lifecycle-attached-v1\n"; cat >/dev/null"#
+                        },
+                        "sh",
+                    ])
+                    .arg(&self.waiting)
+                    .arg(&self.release)
+                    .stdin(Stdio::piped())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped())
+                    .spawn();
+            }
+            match literal {
+                steps::UPLOAD => self.local.spawn_step(steps::UPLOAD, args),
+                steps::UPLOAD_PLAIN => self.local.spawn_step(steps::UPLOAD_PLAIN, args),
+                steps::UPLOAD_SIDECAR => self.local.spawn_step(steps::UPLOAD_SIDECAR, args),
+                steps::UPLOAD_SIDECAR_PLAIN => self.local.spawn_step(steps::UPLOAD_SIDECAR_PLAIN, args),
+                steps::WRITE_MANIFEST => self.local.spawn_step(steps::WRITE_MANIFEST, args),
+                steps::PUBLISH => self.local.spawn_step(steps::PUBLISH, args),
+                steps::CLEANUP => self.local.spawn_step(steps::CLEANUP, args),
+                _ => unreachable!(),
+            }
+        }
+    }
+
+    fn guarded(root: &Path, local: LocalExec) -> GuardedSteps {
+        GuardedSteps {
+            local,
+            held: Default::default(),
+            starts: Default::default(),
+            waiting: root.join("waiting"),
+            release: root.join("release"),
+        }
+    }
+
+    #[test]
+    fn concurrent_starts_do_not_hold_the_restart_lock_while_waiting_for_start() {
+        let root = ScratchDir::new("remote", "concurrent-starts");
+        let (mut plan, local) = fixture(&root, "one", false);
+        authorize(&mut plan);
+        let launcher = guarded(&root, local);
+        std::thread::scope(|threads| {
+            let first = threads.spawn(|| ensure_started_with(&launcher, &plan));
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+            while !launcher.waiting.exists() {
+                assert!(
+                    !first.is_finished(),
+                    "the first start ended before consuming its manifest"
+                );
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "the first start never received its manifest"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            let second = start_recorded_with(&launcher, &record(&plan), &plan.version, &plan.sidecar.revision);
+            std::fs::write(&launcher.release, b"go").unwrap();
+            first.join().unwrap().unwrap();
+            second.unwrap();
+            assert_eq!(launcher.starts.load(std::sync::atomic::Ordering::SeqCst), 2);
+        });
+    }
+
+    #[test]
+    fn uploads_release_the_restart_lock_between_spawn_and_progress() {
+        let root = ScratchDir::new("remote", "upload-restart-lock");
+        let (mut plan, local) = fixture(&root, "one", false);
+        authorize(&mut plan);
+        let launcher = guarded(&root, local);
+        install_with(&launcher, &plan, &|_, _| {
+            assert!(
+                !launcher.held.load(std::sync::atomic::Ordering::SeqCst),
+                "upload progress must not hold up another window's start"
+            );
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn an_upload_keeps_the_restart_lock_until_its_delayed_attachment() {
+        let root = ScratchDir::new("remote", "upload-attach");
+        let (mut plan, local) = fixture(&root, "one", false);
+        authorize(&mut plan);
+        let launcher = super::super::tests::DelayedAttachment {
+            local,
+            target: steps::UPLOAD_PLAIN,
+            root: root.to_path_buf(),
+            held: Default::default(),
+            refused: Default::default(),
+        };
+        install_with(&launcher, &plan, &|done, _| {
+            assert!(!launcher.held.load(std::sync::atomic::Ordering::SeqCst));
+            if done > 0 {
+                assert!(
+                    launcher.refused.load(std::sync::atomic::Ordering::SeqCst),
+                    "replacement must be refused until the child attaches"
+                );
+            }
+        })
+        .unwrap();
+        assert!(launcher.refused.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    #[test]
+    fn an_absent_or_wrong_attachment_marker_kills_and_reaps_without_sending_input() {
+        for output in ["", "wrong\\n", "eitri-lifecycle-attached-v1"] {
+            let child = Command::new("sh")
+                .args(["-c", "printf '%b' \"$1\"; exec 1>&-; exec cat", "sh", output])
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap();
+            let pid = child.id() as libc::pid_t;
+            let result = attached(child);
+            assert!(matches!(result, Err(InstallError::Command(_))));
+            let mut status = 0;
+            assert_eq!(unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) }, -1);
+            assert_eq!(std::io::Error::last_os_error().raw_os_error(), Some(libc::ECHILD));
+        }
+    }
+
+    #[test]
+    fn a_silent_attachment_is_bounded_and_reaped() {
+        let child = Command::new("cat")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let pid = child.id() as libc::pid_t;
+        let result = attached_within(child, std::time::Duration::ZERO);
+        assert!(matches!(result, Err(InstallError::Command(why)) if why.contains("timed out")));
+        let mut status = 0;
+        assert_eq!(unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) }, -1);
+        assert_eq!(std::io::Error::last_os_error().raw_os_error(), Some(libc::ECHILD));
+    }
+
+    #[test]
+    fn an_upload_without_its_marker_receives_no_payload_or_progress() {
+        struct Unmarked {
+            local: LocalExec,
+            received: PathBuf,
+        }
+        impl ChannelLauncher for Unmarked {
+            fn spawn(&self, _: &[std::ffi::OsString]) -> std::io::Result<Child> {
+                unreachable!()
+            }
+            fn spawn_step(&self, literal: &'static str, args: &[&str]) -> std::io::Result<Child> {
+                if literal == steps::CLEANUP {
+                    return self.local.spawn_step(steps::CLEANUP, args);
+                }
+                assert_eq!(literal, steps::UPLOAD_PLAIN, "no subsequent installation step may run");
+                Command::new("sh")
+                    .args(["-c", r#"exec 3>"$1"; exec 1>&-; exec cat >&3"#, "sh"])
+                    .arg(&self.received)
+                    .stdin(Stdio::piped())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped())
+                    .spawn()
+            }
+        }
+        let root = ScratchDir::new("remote", "upload-no-marker");
+        let (mut plan, local) = fixture(&root, "one", false);
+        authorize(&mut plan);
+        let launcher = Unmarked {
+            local,
+            received: root.join("received"),
+        };
+        let result = install_with(&launcher, &plan, &|done, _| assert_eq!(done, 0));
+        assert!(matches!(result, Err(InstallError::Command(why)) if why.contains("attachment marker")));
+        assert_eq!(std::fs::read(&launcher.received).unwrap(), b"");
+        assert!(!plan.install_path().exists());
     }
 
     #[test]
@@ -1136,20 +1749,43 @@ mod tests {
                         && !name.is_empty()
                         && name.bytes().all(|b| b.is_ascii_uppercase() || b == b'_')
                 });
-                let adapter = path == "agent/src/ssh/launcher.rs"
+                let forwarded = text[open + 1..args.last().unwrap().end]
+                    .split_whitespace()
+                    .collect::<String>();
+                let ssh_adapter = path == "agent/src/ssh/launcher.rs"
                     && name == "step_argv"
                     && argument == "literal"
-                    && text[open + 1..args.last().unwrap().end]
-                        .split_whitespace()
+                    && forwarded == "&self.master,literal,args";
+                let installation_adapter = path == "core/src/remote_project/connection.rs"
+                    && name == "spawn_step"
+                    && before
+                        .chars()
+                        .filter(|c| !c.is_whitespace())
                         .collect::<String>()
-                        == "&self.master,literal,args";
-                if !(inline || declared || step_constant || adapter) {
+                        .ends_with("self.base.")
+                    && forwarded == "literal,args";
+                if !(inline || declared || step_constant || ssh_adapter || installation_adapter) {
                     return Err(format!("{path}: dynamic {name} literal: {raw}"));
                 }
                 count += 1;
             }
         }
         Ok(count)
+    }
+
+    #[test]
+    fn step_scan_accepts_only_the_installation_launchers_unchanged_forwarding() {
+        let path = "core/src/remote_project/connection.rs";
+        let forwarding = "fn spawn_step(&self, literal: &'static str, args: &[&str]) {\n self . base . spawn_step ( literal, args )\n}";
+        assert_eq!(step_calls_are_fixed(path, forwarding).unwrap(), 1);
+        for changed in [
+            forwarding.replace("literal, args", "dynamic, args"),
+            forwarding.replace("literal, args", "literal, other_args"),
+            forwarding.replace("self . base", "self . other"),
+        ] {
+            assert!(step_calls_are_fixed(path, &changed).is_err(), "{changed}");
+        }
+        assert!(step_calls_are_fixed("other/src/lib.rs", forwarding).is_err());
     }
 
     #[test]
@@ -1203,5 +1839,36 @@ mod tests {
                 "step must fit one quoted login-shell line"
             );
         }
+    }
+    #[test]
+    fn starting_existing_files_needs_no_upload_space_and_only_missing_files_reinstall() {
+        let root = ScratchDir::new("remote", "start-no-space");
+        let (mut plan, launcher) = fixture(&root, "one", false);
+        authorize(&mut plan);
+        install_with(&launcher, &plan, &|_, _| {}).unwrap();
+        let mut probe = super::super::probe_step::fixture(&root);
+        probe.free_bytes = Some(0);
+        let mut squeezed = make_connection_plan(
+            &probe,
+            &plan.provenance,
+            plan.sidecar.clone(),
+            plan.helper.clone(),
+            "0.3.0-123abcd".into(),
+        )
+        .unwrap();
+        authorize(&mut squeezed);
+        ensure_started_with(&launcher, &squeezed).unwrap();
+        assert!(install_with(&launcher, &squeezed, &|_, _| {})
+            .unwrap_err()
+            .to_string()
+            .contains("100 MiB"));
+        std::fs::write(plan.install_path().join("ensure-fails"), "").unwrap();
+        let error = ensure_started_with(&launcher, &plan).unwrap_err();
+        assert!(matches!(error, InstallError::Command(_)), "{error}");
+        std::fs::remove_file(plan.install_path().join("bin/eitri-server")).unwrap();
+        assert!(matches!(
+            ensure_started_with(&launcher, &plan),
+            Err(InstallError::Reinstall(_))
+        ));
     }
 }

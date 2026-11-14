@@ -42,8 +42,17 @@ const PROJECT_DIR_ENV: &str = "EITRI_PROJECT_DIR";
 /// it in every build lets that path report `LEGACY_NOT_IN_BUILD`, rather than an unrecognized
 /// option or a silently opened cwd.
 ///
-/// `--new-window` and `--raise` are read by [`resolve_launch_in`]; the directory-only resolvers step over them.
-const KNOWN_FLAGS: [&str; 5] = ["--clean", "--version", "--legacy", "--new-window", "--raise"];
+/// `--new-window`, `--raise` and `--local` are read by [`resolve_launch_in`]; the directory-only resolvers step over
+/// them. `--local` opens a remote project's copy on this machine as a local project, with no agent tabs.
+const KNOWN_FLAGS: [&str; 6] = ["--clean", "--version", "--legacy", "--new-window", "--raise", "--local"];
+
+/// `--ssh <host>`: the project of the path that follows is on `host`, an OpenSSH destination. It takes a separate
+/// value, so it is not in [`KNOWN_FLAGS`]: the parsers that know it take the host from the next token.
+pub const SSH_FLAG: &str = "--ssh";
+
+/// What every reader that is not the window says to `--ssh`: only a window opens a remote project.
+const SSH_ONLY_IN_A_WINDOW: &str =
+    "--ssh opens a remote project in a window of its own (eitri --ssh <host> <path>); it cannot be used here";
 
 /// The conventional end-of-flags separator. What follows it is read verbatim, so a path whose name
 /// really does begin with `-` is reachable.
@@ -78,6 +87,9 @@ pub enum RootSource {
     Env(OsString),
     /// Neither was given -- fall back to this process's own working directory.
     Cwd,
+    /// `--ssh <host> <path>`: a project on a server, its path as typed. Only the window opens one; every
+    /// directory-only resolver refuses it.
+    Remote { host: String, path: PathBuf },
 }
 
 impl RootSource {
@@ -92,6 +104,7 @@ impl RootSource {
             RootSource::Argument(path) => format!("the project directory argument {path:?}"),
             RootSource::Env(path) => format!("{PROJECT_DIR_ENV}={path:?}"),
             RootSource::Cwd => "the current working directory".to_string(),
+            RootSource::Remote { host, path } => format!("{} on {host}", path.display()),
         }
     }
 }
@@ -350,22 +363,37 @@ fn resolve_from<'a>(
 /// shell happened to be sitting in, with nothing printed. `--` ends flag parsing, so a directory
 /// whose name genuinely begins with `-` is still reachable as `shell -- -myproj`.
 ///
-/// The one real limitation left: an option that takes a *separate* value (`--foo bar`) cannot be
-/// handled by a membership test -- `bar` would be read here as the project directory. Such an
-/// option has to be taught to this function, not just added to `KNOWN_FLAGS`.
+/// An option that takes a *separate* value (`--foo bar`) cannot be handled by a membership test --
+/// `bar` would be read here as the project directory. Such an option has to be taught to this
+/// function, not just added to `KNOWN_FLAGS`: `--ssh <host>` is, and its project is the path that
+/// follows ([`RootSource::Remote`]), which needs one: the environment and the cwd do not name a
+/// project on a server.
 pub fn select_root_source<'a>(
     args: impl IntoIterator<Item = &'a OsStr>,
     env: Option<&OsStr>,
 ) -> Result<RootSource, String> {
     let mut args = args.into_iter();
+    let mut ssh: Option<String> = None;
+    let mut found: Option<OsString> = None;
     while let Some(arg) = args.next() {
         if arg == OsStr::new(END_OF_FLAGS) {
             // Whatever follows is a path, whatever it looks like. A bare trailing `--` (nothing
             // after it) is simply "no positional argument", same as no arguments at all.
-            if let Some(path) = args.next() {
-                return Ok(RootSource::Argument(path.to_os_string()));
+            if found.is_none() {
+                found = args.next().map(OsStr::to_os_string);
             }
             break;
+        }
+        if arg == OsStr::new(SSH_FLAG) {
+            let host = ssh_host(args.next())?;
+            if ssh.replace(host).is_some() {
+                return Err(String::from("--ssh takes one host"));
+            }
+            continue;
+        }
+        // After the path only `--ssh` is still looked for; nothing else there is read.
+        if found.is_some() {
+            continue;
         }
         // Byte-wise, not `to_string_lossy().starts_with()`: a non-UTF-8 path must be classified
         // by what it actually starts with, not by what a replacement character makes of it.
@@ -373,7 +401,17 @@ pub fn select_root_source<'a>(
             check_flag(arg)?;
             continue;
         }
-        return Ok(RootSource::Argument(arg.to_os_string()));
+        found = Some(arg.to_os_string());
+    }
+    if let Some(host) = ssh {
+        let path = found.ok_or_else(|| format!("--ssh {host} needs the project's path on the server after it"))?;
+        return Ok(RootSource::Remote {
+            host,
+            path: PathBuf::from(path),
+        });
+    }
+    if let Some(path) = found {
+        return Ok(RootSource::Argument(path));
     }
     Ok(match env {
         // An empty value is treated as unset: `export EITRI_PROJECT_DIR=` (or a launcher
@@ -384,13 +422,24 @@ pub fn select_root_source<'a>(
     })
 }
 
+/// The token after `--ssh`: an OpenSSH destination in UTF-8, refused before any ssh runs when it is
+/// missing, looks like an option, or holds whitespace or a control character.
+fn ssh_host(value: Option<&OsStr>) -> Result<String, String> {
+    let host = value
+        .ok_or_else(|| String::from("--ssh needs a host (eitri --ssh <host> <path>)"))?
+        .to_str()
+        .ok_or_else(|| String::from("--ssh needs a host in UTF-8"))?;
+    agent::ssh::validate_host(host).map_err(|why| format!("--ssh {host:?}: {why}"))?;
+    Ok(host.to_owned())
+}
+
 /// A `-...` token before `--`: one of [`KNOWN_FLAGS`], or the sentence refusing it.
 fn check_flag(arg: &OsStr) -> Result<(), String> {
     if KNOWN_FLAGS.iter().any(|flag| arg == OsStr::new(flag)) {
         return Ok(());
     }
     Err(format!(
-        "unrecognized option {arg:?} -- shell accepts {}; if that was meant to be a \
+        "unrecognized option {arg:?} -- shell accepts {} and {SSH_FLAG} <host>; if that was meant to be a \
          project directory, pass it after `--` (shell -- {arg:?})",
         KNOWN_FLAGS.join(" and ")
     ))
@@ -404,6 +453,7 @@ fn check_flag(arg: &OsStr) -> Result<(), String> {
 /// bare panic) is reachable from a test.
 fn canonicalize_source(source: &RootSource, cwd: io::Result<PathBuf>) -> Result<PathBuf, String> {
     let raw = match source {
+        RootSource::Remote { .. } => return Err(String::from(SSH_ONLY_IN_A_WINDOW)),
         RootSource::Argument(path) | RootSource::Env(path) => PathBuf::from(path),
         RootSource::Cwd => cwd.map_err(|e| {
             format!(
@@ -462,6 +512,11 @@ pub struct Launch {
     /// Sentences for stderr, without the `eitri: ` the caller puts in front: what was named and is not honoured in
     /// full.
     pub notes: Vec<String>,
+    /// `--ssh <host>`: the project at `root` is on `host`, and `root` is the path as typed, which this machine has
+    /// as the same directory.
+    pub ssh: Option<String>,
+    /// `--local`: a remote project's copy here opens as a local project.
+    pub local: bool,
 }
 
 /// How many repositories the search for a usable top looks at. A file under more unusable
@@ -511,6 +566,9 @@ pub fn resolve_launch_in(
     if parsed.raise && !parsed.is_one_verbatim_path() {
         return Err(String::from("--raise takes exactly one path after --"));
     }
+    if let Some(host) = &parsed.ssh {
+        return remote_launch(host, &parsed);
+    }
     if parsed.paths.is_empty() {
         if let Some(spec) = parsed.line_spec {
             return Err(needs_a_file(&spec.token));
@@ -522,6 +580,8 @@ pub fn resolve_launch_in(
             new_window: parsed.new_window,
             raise: parsed.raise,
             notes: Vec::new(),
+            ssh: None,
+            local: parsed.local,
         });
     }
 
@@ -584,7 +644,81 @@ pub fn resolve_launch_in(
         new_window: parsed.new_window,
         raise: parsed.raise,
         notes,
+        ssh: None,
+        local: parsed.local,
     })
+}
+
+/// What a remote project's path on this machine must be until a mirror exists to make it: the same directory, so
+/// the editor, the terminal and the agent's paths agree.
+pub const REMOTE_PATH_NEEDED: &str = "remote projects need the same path on this machine; M2's sync will create it";
+
+/// `--ssh <host> <path>`: one path, the project's on the server as typed, absolute and in normal form, which must
+/// be the same directory here (no link or `..` leading elsewhere). It opens no file and takes no line.
+fn remote_launch(host: &str, parsed: &ParsedLaunch) -> Result<Launch, String> {
+    if parsed.local {
+        return Err(String::from("--ssh and --local cannot be given together"));
+    }
+    if parsed.line_spec.is_some() {
+        return Err(String::from("--ssh opens a project folder, not a file at a line"));
+    }
+    let [path] = parsed.paths.as_slice() else {
+        return Err(format!(
+            "--ssh {host} takes one project path (eitri --ssh <host> <path>)"
+        ));
+    };
+    let root = PathBuf::from(&path.name);
+    let text = root
+        .to_str()
+        .ok_or_else(|| format!("{:?}: a remote project's path must be UTF-8", path.name))?;
+    if !is_normal_absolute(text) {
+        return Err(format!(
+            "{text:?}: --ssh needs the project's absolute path on the server, with no trailing slash, `.` or `..`"
+        ));
+    }
+    match std::fs::metadata(&root) {
+        Ok(meta) if meta.is_dir() => {}
+        Ok(_) => {
+            return Err(format!(
+                "{text} is not a directory on this machine; {REMOTE_PATH_NEEDED}"
+            ))
+        }
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Err(format!("{text}: {REMOTE_PATH_NEEDED}")),
+        Err(e) => {
+            return Err(format!(
+                "cannot open {text} on this machine ({e}); {REMOTE_PATH_NEEDED}"
+            ))
+        }
+    }
+    let canonical = root
+        .canonicalize()
+        .map_err(|e| format!("cannot open {text} on this machine ({e}); {REMOTE_PATH_NEEDED}"))?;
+    if canonical != root {
+        return Err(format!(
+            "{text} is {} on this machine; a remote project needs the same path on both machines",
+            canonical.display()
+        ));
+    }
+    Ok(Launch {
+        root,
+        wider_roots: Vec::new(),
+        open: Vec::new(),
+        new_window: parsed.new_window,
+        raise: parsed.raise,
+        notes: Vec::new(),
+        ssh: Some(host.to_owned()),
+        local: false,
+    })
+}
+
+/// `/`, or an absolute path whose components are all non-empty and none is `.` or `..`: the form a remote
+/// project's record and its server use.
+fn is_normal_absolute(path: &str) -> bool {
+    path == "/"
+        || (path.starts_with('/')
+            && path[1..]
+                .split('/')
+                .all(|part| !part.is_empty() && part != "." && part != ".."))
 }
 
 /// The arguments for nvim after `--embed`. Every path starts with `/`, so none can read as an option
@@ -617,6 +751,8 @@ struct PathArg {
 struct ParsedLaunch {
     new_window: bool,
     raise: bool,
+    local: bool,
+    ssh: Option<String>,
     line_spec: Option<LineSpec>,
     paths: Vec<PathArg>,
 }
@@ -635,19 +771,29 @@ fn parse_launch_args(args: &[OsString]) -> Result<ParsedLaunch, String> {
     let mut parsed = ParsedLaunch {
         new_window: false,
         raise: false,
+        local: false,
+        ssh: None,
         line_spec: None,
         paths: Vec::new(),
     };
     let mut args = args.iter();
-    for arg in args.by_ref() {
+    while let Some(arg) = args.next() {
         if arg == OsStr::new(END_OF_FLAGS) {
             break;
+        }
+        if arg == OsStr::new(SSH_FLAG) {
+            let host = ssh_host(args.next().map(OsString::as_os_str))?;
+            if parsed.ssh.replace(host).is_some() {
+                return Err(String::from("--ssh takes one host"));
+            }
+            continue;
         }
         match arg.as_bytes().first() {
             Some(b'-') => {
                 check_flag(arg)?;
                 parsed.new_window |= arg == OsStr::new("--new-window");
                 parsed.raise |= arg == OsStr::new("--raise");
+                parsed.local |= arg == OsStr::new("--local");
             }
             Some(b'+') => match line_of_spec(arg.as_bytes()) {
                 Some(line) if parsed.paths.is_empty() => {
@@ -2171,6 +2317,106 @@ mod tests {
         assert_eq!(launch.open, [plain(lib)]);
         assert!(launch.raise);
         assert!(!launch.asks_for_a_raise(), "a file is handed over");
+    }
+
+    /// `--ssh` takes the next token as its host, whatever follows it; the project is the path after it, and only
+    /// the window opens one: the directory-only resolvers refuse it by name.
+    #[test]
+    fn ssh_flag_takes_a_separate_host_value() {
+        let remote = |host: &str, path: &str| RootSource::Remote {
+            host: host.into(),
+            path: path.into(),
+        };
+        assert_eq!(
+            select(["--ssh", "example-host", "/srv/project"], None),
+            Ok(remote("example-host", "/srv/project"))
+        );
+        assert_eq!(
+            select(["--ssh", "example-host", "--", "/srv/project"], None),
+            Ok(remote("example-host", "/srv/project"))
+        );
+        assert_eq!(
+            select(["/srv/project", "--ssh", "example-host"], Some("/from/env")),
+            Ok(remote("example-host", "/srv/project"))
+        );
+        assert_eq!(
+            select(["--clean", "--ssh", "user@example-host", "/srv/project"], None),
+            Ok(remote("user@example-host", "/srv/project"))
+        );
+        assert!(select(["--ssh"], None).unwrap_err().contains("needs a host"));
+        assert!(select(["/srv/project", "--ssh"], None).is_err());
+        assert!(select(["--ssh", "--clean", "/srv/project"], None).is_err());
+        assert!(select(["--ssh", "example-host"], Some("/from/env")).is_err());
+        assert!(select(["--ssh", "a", "--ssh", "b", "/p"], None).is_err());
+        assert_eq!(select(["--", "--ssh"], None), Ok(argument("--ssh")));
+        assert_eq!(select(["--", "--ssh", "example-host"], None), Ok(argument("--ssh")));
+        let args: Vec<OsString> = ["--ssh", "example-host", "/srv/project"].map(OsString::from).to_vec();
+        let refused = resolve_in(&args, None, Ok(PathBuf::from("/nowhere"))).unwrap_err();
+        assert!(refused.contains("--ssh") && refused.contains("window"), "got {refused}");
+        let (_s, home) = scratch_home("rl-ssh-args");
+        let project = dir(home.join("project"));
+        let launch = at(&home, &["--ssh", "example-host", text(&project)], &home).unwrap();
+        assert_eq!(launch.ssh.as_deref(), Some("example-host"));
+        assert_eq!(launch.root, project);
+        assert!(launch.open.is_empty() && !launch.local);
+        let launch = at(
+            &home,
+            &["--raise", "--ssh", "example-host", "--", text(&project)],
+            &home,
+        )
+        .unwrap();
+        assert!(launch.asks_for_a_raise());
+        assert!(at(&home, &["--ssh"], &home).is_err());
+        assert!(at(&home, &["--ssh", "example-host"], &home).is_err());
+        assert!(at(&home, &["--ssh", "example-host", text(&project), text(&project)], &home).is_err());
+        assert!(at(&home, &["--ssh", "example-host", "--local", text(&project)], &home).is_err());
+        assert!(at(&home, &["--ssh", "example-host", "+3", text(&project)], &home).is_err());
+        assert!(at(&home, &["--ssh", "example-host", "project"], &home).is_err());
+        let trailing = format!("{}/", text(&project));
+        assert!(at(&home, &["--ssh", "example-host", &trailing], &home).is_err());
+        let dotted = format!("{}/.", text(&project));
+        assert!(at(&home, &["--ssh", "example-host", &dotted], &home).is_err());
+    }
+
+    /// `--local` is a flag of the window's; the directory-only resolvers step over it.
+    #[test]
+    fn local_flag_is_known() {
+        assert_eq!(select(["--local"], None), Ok(RootSource::Cwd));
+        assert_eq!(select(["--local", "/x"], None), Ok(argument("/x")));
+        assert_eq!(select(["--", "--local"], None), Ok(argument("--local")));
+        let (_s, home) = scratch_home("rl-local");
+        let project = dir(home.join("project"));
+        let launch = at(&home, &["--local", text(&project)], &home).unwrap();
+        assert!(launch.local);
+        assert_eq!(launch.ssh, None);
+        assert_eq!(launch.root, project);
+        assert!(!at(&home, &[text(&project)], &home).unwrap().local);
+        let launch = at(&home, &["--local"], &project).unwrap();
+        assert!(launch.local && launch.root == project);
+    }
+
+    /// With no mirror yet, a remote project's path must already be the same directory here: one missing, a file,
+    /// or one that resolves elsewhere is refused with the reason.
+    #[test]
+    fn missing_local_path_is_refused() {
+        let (_s, home) = scratch_home("rl-ssh-missing");
+        let missing = home.join("project");
+        let err = at(&home, &["--ssh", "example-host", text(&missing)], &home).unwrap_err();
+        assert!(
+            err.contains(REMOTE_PATH_NEEDED) && err.contains(text(&missing)),
+            "got {err}"
+        );
+        let plain = file(home.join("notes.txt"));
+        let err = at(&home, &["--ssh", "example-host", text(&plain)], &home).unwrap_err();
+        assert!(err.contains("not a directory"), "got {err}");
+        let real = dir(home.join("real"));
+        let link = home.join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let err = at(&home, &["--ssh", "example-host", text(&link)], &home).unwrap_err();
+        assert!(
+            err.contains("same path on both machines") && err.contains(text(&real)),
+            "got {err}"
+        );
     }
 
     #[test]

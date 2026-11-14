@@ -163,6 +163,8 @@ pub(crate) fn run(args: PageArgs) -> glib::ExitCode {
         eprintln!("[memory] JavaScriptCore refused useJIT=false; the UI process keeps its JIT");
     }
     let root_note = crate::agent_panel::root_note_for(&project_root);
+    // Reads the project's remote record, so here rather than on the GTK thread.
+    let origin = crate::remote_window::origin_for_root(&project_root);
     // Stats, so here rather than on the GTK thread.
     let exe = crate::project_start::exe_to_start(std::env::current_exe(), &|path| path.exists());
     let start = crate::linked_window::WindowStart::Beside {
@@ -198,7 +200,13 @@ pub(crate) fn run(args: PageArgs) -> glib::ExitCode {
         // Nothing is built or shown until the page's slot is installed: a refusal or a failed attach ends the start
         // with no window. Held meanwhile, as the application has no window to keep it running.
         let hold = app.hold();
-        let (app, panel_notice, root_note, exe) = (app.clone(), panel_notice.clone(), root_note.clone(), exe.clone());
+        let (app, panel_notice, root_note, exe, origin) = (
+            app.clone(),
+            panel_notice.clone(),
+            root_note.clone(),
+            exe.clone(),
+            origin.clone(),
+        );
         await_install(link.clone(), move |installed| {
             let _hold = hold;
             if let Err((code, line, to_starter)) = installed {
@@ -213,6 +221,7 @@ pub(crate) fn run(args: PageArgs) -> glib::ExitCode {
                 &app,
                 false,
                 &root,
+                &origin,
                 backend_kind,
                 panel_notice.as_deref(),
                 root_note,

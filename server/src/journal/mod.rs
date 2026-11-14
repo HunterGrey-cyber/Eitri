@@ -5,7 +5,8 @@ mod poison;
 mod segment;
 
 pub use budget::{
-    enforce_budget, enforce_budget_with, BudgetOutcome, BudgetPressure, Evicted, FreeSpace, SessionUsage,
+    available_bytes, enforce_budget, enforce_budget_with, BudgetOutcome, BudgetPressure, Evicted, FreeSpace,
+    SessionUsage,
 };
 pub use pending::Pending;
 pub use segment::{Clock, Disk, FileEntry, FileSystem, SegmentReader, SystemClock};
@@ -722,6 +723,22 @@ impl Journal {
         let synced = self.syncer.flush(true);
         written.and(synced)
     }
+    /// Removes cached locations after retention deleted this completed session's files.
+    pub fn forget_history(&mut self) {
+        self.entries.clear();
+        self.unwritten.clear();
+        self.segments.clear();
+    }
+
+    /// A completed session remains readable without a periodic sync worker.
+    pub fn finish_sync(&mut self) {
+        let _ = self.turn_ended();
+        self.syncer.state.0.lock().unwrap().stop = true;
+        self.syncer.state.1.notify_one();
+        if let Some(worker) = self.syncer.worker.take() {
+            let _ = worker.join();
+        }
+    }
     /// Drives the same deadline check as the worker, useful with an injected clock.
     pub fn sync_due(&self) -> io::Result<()> {
         self.syncer.flush(false)
@@ -764,6 +781,20 @@ mod tests {
             std::fs::remove_dir_all(&self.0).unwrap();
         }
     }
+    #[test]
+    fn a_completed_journal_keeps_replay_without_a_sync_thread() {
+        let root = Scratch::new();
+        let mut journal = Journal::open(root.path(), &JournalConfig::default()).unwrap();
+        journal.append(1, b"event").unwrap();
+        assert!(journal.syncer.worker.is_some());
+        journal.finish_sync();
+        assert!(journal.syncer.worker.is_none());
+        assert!(matches!(
+            journal.read_after(0, 100).unwrap()[0],
+            Record::Event { sequence: 1, .. }
+        ));
+    }
+
     #[derive(Default)]
     struct ManualClock(AtomicU64);
     impl ManualClock {
@@ -1061,11 +1092,12 @@ mod tests {
         pending.request(4, b"four", "four").unwrap();
         pending.request(2, b"two", "two").unwrap();
         assert_eq!(pending.list(), vec![(2, b"two".to_vec()), (4, b"four".to_vec())]);
-        pending.resolved("two").unwrap();
+        pending.resolved(5, "two").unwrap();
         assert_eq!(Pending::open(&path).unwrap().list(), vec![(4, b"four".to_vec())]);
-        pending.clear().unwrap();
-        assert!(Disk.read(&path).unwrap().is_empty());
-        assert!(Pending::open(&path).unwrap().list().is_empty());
+        pending.clear(6).unwrap();
+        let reopened = Pending::open(&path).unwrap();
+        assert!(reopened.list().is_empty());
+        assert_eq!(reopened.applied(), 6);
     }
     #[test]
     fn a_failed_pending_clear_preserves_disk_and_removes_memory() {
@@ -1075,7 +1107,7 @@ mod tests {
         let mut pending = Pending::open_with(&path, fs.clone()).unwrap();
         pending.request(1, b"one", "one").unwrap();
         fs.fail_replace.store(true, Ordering::SeqCst);
-        assert!(pending.clear().is_err());
+        assert!(pending.clear(2).is_err());
         assert_eq!(Pending::open(&path).unwrap().list(), vec![(1, b"one".to_vec())]);
         assert!(pending.list().is_empty());
         assert_eq!(Disk.entries(path.parent().unwrap()).unwrap().len(), 1);

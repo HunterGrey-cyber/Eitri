@@ -6,7 +6,8 @@ use super::*;
 /// Whether the launch dashboard may offer to bring the last window's tabs back at all: the policy is
 /// to offer, there is something saved, no tab here has started a session and no restore is running.
 pub(super) fn restore_is_on_offer(state: &AgentPanelState) -> bool {
-    state.restore_policy == RestorePolicy::Offer
+    !super::detail::remote_page(state, ViewId::BASE)
+        && state.restore_policy == RestorePolicy::Offer
         && state.restore_source.is_some()
         && state.restore_run.is_none()
         && state.tabs.is_pristine()
@@ -22,7 +23,8 @@ pub(super) fn restore_settled(state: &AgentPanelState) -> bool {
 /// Whether `agent.restore = "auto"` has its go still to come: the source waits for the base page's first `ready`, or
 /// the launch is held.
 pub(super) fn launch_restore_waits(state: &AgentPanelState) -> bool {
-    state.restore_policy == RestorePolicy::Auto
+    !super::detail::remote_page(state, ViewId::BASE)
+        && state.restore_policy == RestorePolicy::Auto
         && ((state.restore_source.is_some() && !state.ready(ViewId::BASE))
             || state.launch_restore_held
             || state.launch_restore_owed)
@@ -44,6 +46,9 @@ pub(super) fn restore_plan(state: &AgentPanelState) -> eitri_core::tab_restore::
 
 /// Which of `saved` can come back, judged against the records and leases as they are now.
 pub(super) fn plan_of(state: &AgentPanelState, saved: &SavedTabs) -> eitri_core::tab_restore::RestorePlan {
+    if super::detail::remote_page(state, ViewId::BASE) {
+        return eitri_core::tab_restore::plan(saved, &[], &[], |_, _| false);
+    }
     let canonical = state.canonical_project_dir.as_str();
     // Read here rather than taken from a greeting: the greeting lists the active tab's agent's
     // records, and the saved Claude tabs are matched with Claude's whichever agent that tab runs. The
@@ -121,6 +126,9 @@ pub(super) fn resume_spawner(
 /// tabs. Nothing is started unless this window has started nothing yet; what is cleared waits for the
 /// trust question before anything is leased or started.
 pub(super) fn ask_for_restore(state: &mut AgentPanelState, from: TabId, ask: RestoreAsk) -> RestoreResult {
+    if state.tabs.get(from).is_some_and(|tab| tab.is_remote()) {
+        return RestoreResult::Refused(super::detail::REMOTE_RESUME_UNAVAILABLE.to_string());
+    }
     // Another agent's saved tab does not need the sidecar; a window with only Claude tabs saved does.
     let saved_external = state.restore_source.as_ref().is_some_and(SavedTabs::has_other_agents);
     if state.backend_kind != BackendKind::Sidecar && !saved_external {
@@ -237,9 +245,9 @@ pub(super) fn start_restore(
     // Each waiting tab is checked for its own agent now; the tick asks the question once the tab is
     // on screen, or starts it at once when the window already has that agent's answer.
     for &tab in run.awaiting_trust() {
-        let profile = waiting_profile(state, tab);
-        state.trust.wait_for(tab, &profile);
-        state.trust.begin_check(&profile);
+        let subject = trust_subject(state, tab);
+        state.trust.wait_for(tab, &subject);
+        state.trust.begin_check(subject);
     }
     // The tabs this restore just set connecting are the only starting ones without their tiers:
     // every other start names them as it begins.
@@ -350,6 +358,7 @@ pub(super) fn launch_restore(state: &mut AgentPanelState) -> Option<RestoreResul
 /// The launch restore the base page's `ready` owed while it was held, once the hold is let go: run on the
 /// tick after.
 pub(super) fn restore_once_released(state: &mut AgentPanelState, screen: &Screen, out: &mut Outbox) {
+    super::remote_tabs::reattach_saved(state, out);
     if state.launch_restore_owed && !state.launch_restore_held && state.ready(ViewId::BASE) {
         restore_at_launch(state, screen, out);
     }
@@ -371,6 +380,7 @@ pub(super) fn take_given_tabs(state: &mut AgentPanelState, screen: &Screen, tabs
         return;
     }
     state.restore_source = Some(tabs);
+    super::remote_tabs::reattach_saved(state, out);
     if state.ready(ViewId::BASE) {
         restore_at_launch(state, screen, out);
     }
@@ -390,6 +400,7 @@ pub(super) fn tabs_to_keep(state: &AgentPanelState) -> Option<SavedTabs> {
         (Some(now), Some(unopened)) => now.followed_by(unopened),
         (now, unopened) => now.or(unopened)?,
     };
+    let tabs = keeping_unclaimed(state, tabs);
     (state.group_tabs.told || !tabs.is_empty()).then_some(tabs)
 }
 
@@ -401,7 +412,11 @@ pub(super) fn remember_tabs(state_ref: &mut AgentPanelState) {
     if state_ref.tabs.settle_waiting_restore() {
         state_ref.restore_source = None;
     }
-    let snapshot = state_ref.tabs.saved_snapshot(&state_ref.conversation_id);
+    let mut snapshot = state_ref.tabs.saved_snapshot(&state_ref.conversation_id);
+    // Remote tabs this window read and has not taken up (it has no connection to their server, or not yet) stay in
+    // the file: a window of the same path on this machine must not drop the remote window's tabs.
+    super::remote_tabs::claim_saved(state_ref);
+    snapshot = snapshot.map(|snapshot| keeping_unclaimed(state_ref, snapshot));
     if state_ref.restore_policy != RestorePolicy::Off {
         let AgentPanelState {
             group_tabs,
@@ -411,6 +426,15 @@ pub(super) fn remember_tabs(state_ref: &mut AgentPanelState) {
         group_tabs.observe(snapshot.as_ref(), restore_source.as_ref());
     }
     state_ref.tab_memory.observe(snapshot);
+}
+
+/// Agents not yet attached stay in ordinary reports and in the final close report alike.
+fn keeping_unclaimed(state: &AgentPanelState, tabs: SavedTabs) -> SavedTabs {
+    if state.unclaimed_remote.is_empty() {
+        tabs
+    } else {
+        tabs.followed_by(SavedTabs::default().with_remote(state.unclaimed_remote.clone()))
+    }
 }
 
 /// Where a chat window of a group tells its tabs.
@@ -2114,6 +2138,8 @@ mod tests {
                 match call {
                     SpawnCall::Resume { id, .. } => resumed.borrow_mut().push(id),
                     SpawnCall::Connect { .. } => panic!("a restore resumes; it never connects afresh"),
+                    SpawnCall::Remote { .. } => panic!("a restore starts no remote tab"),
+                    SpawnCall::Reattach { .. } => panic!("a restore takes no remote tab up"),
                     SpawnCall::External {
                         agent,
                         plan,

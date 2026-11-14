@@ -86,6 +86,8 @@ mod remote_entry;
 mod remote_host_test;
 #[path = "remote_socket/mod.rs"]
 mod remote_socket;
+#[path = "remote_tabs.rs"]
+mod remote_tabs;
 #[path = "restore.rs"]
 mod restore;
 #[path = "review_glue.rs"]
@@ -107,7 +109,9 @@ mod verbs;
 
 use crate::panel_document::{PanelDocument, IDLE_DOCUMENT, PANEL_BASE_URI};
 use crate::panel_page::{PanelHost, PanelPage};
-use crate::trust_gate::{AnswerOutcome, Asked, CommandAnswer, GateEvent, Route, TrustGate};
+use crate::trust_gate::{
+    AnswerOutcome, Asked, CommandAnswer, GateEvent, RemotePlace, Route, Server, Subject, TrustGate,
+};
 use agent::setting_sources::ProjectTrust;
 use eitri_core::agent_backend::{AgentBackend, BackendError, BackendGreeting, BackendKind};
 use eitri_core::agent_bridge::{
@@ -154,6 +158,7 @@ pub use remote_entry::{
     REMOTE_TEXT_MAX_BYTES,
 };
 pub use remote_socket::{Pairing, RemoteSocket};
+use remote_tabs::spawn_remote_connect;
 use restore::*;
 pub use review_glue::ReviewConfig;
 use review_glue::*;
@@ -488,6 +493,17 @@ struct AgentPanelState {
     trust: TrustGate,
     /// What starts a session's backend: the real connect workers, or a test's stand-in.
     spawner: Spawner,
+    /// A remote project's connection to its server's helper, given by the window's start path once the
+    /// host is connected: remote tabs start, come back and continue through it. `None` in a local window,
+    /// and in a remote one until then (its tabs' starts are put off with why).
+    server: Option<eitri_core::remote_project::RemoteConnection>,
+    /// A remote tab's questions open in its page, and the work the person's choices started.
+    remote_prompts: remote_tabs::RemotePrompts,
+    /// Stops of agents on this window's server kept for when it can be reached, and what sends them.
+    remote_stops: remote_tabs::RemoteStops,
+    /// Saved remote tabs read at launch and not taken up yet: kept in the file by every write until a window with a
+    /// connection to their server takes them up.
+    unclaimed_remote: Vec<eitri_core::saved_tabs::SavedRemoteTab>,
     /// Tabs moving to or from the other window of a linked pair (`chat_moves.rs`).
     chat_moves: chat_moves::ChatMoves,
     hand_overs: hand_over::HandOvers,
@@ -590,6 +606,10 @@ impl AgentPanelState {
             host,
             trust,
             spawner: Spawner::Real,
+            server: None,
+            remote_prompts: remote_tabs::RemotePrompts::default(),
+            remote_stops: remote_tabs::RemoteStops::default(),
+            unclaimed_remote: Vec::new(),
             chat_moves: chat_moves::ChatMoves::default(),
             hand_overs: hand_over::HandOvers::default(),
             tabs,
@@ -1368,6 +1388,8 @@ mod tests {
             }
             SpawnCall::Connect { .. } => panic!("a restore resumes; it never connects afresh"),
             SpawnCall::External { .. } => panic!("a restore starts only Claude tabs"),
+            SpawnCall::Remote { .. } => panic!("a restore starts no remote tab"),
+            SpawnCall::Reattach { .. } => panic!("a restore takes no remote tab up"),
         })));
         let result = f();
         state.borrow_mut().spawner = spawn_nothing();
@@ -1516,7 +1538,10 @@ mod tests {
             let counted_external = external.clone();
             s.spawner = Spawner::Fake(Rc::new(RefCell::new(move |call: SpawnCall| {
                 match call {
-                    SpawnCall::Connect { resume, project, .. } => counted.borrow_mut().push((resume, project)),
+                    SpawnCall::Connect { resume, project, .. } | SpawnCall::Remote { resume, project, .. } => {
+                        counted.borrow_mut().push((resume, project))
+                    }
+                    SpawnCall::Reattach { .. } => panic!("a trust test takes no remote tab up"),
                     SpawnCall::Resume { id, project, .. } => counted.borrow_mut().push((Some(id), project)),
                     SpawnCall::External {
                         agent,

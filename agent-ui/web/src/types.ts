@@ -454,7 +454,17 @@ export type ModelOption = {
 
 /** Descriptive only -- for display and diagnostics, never for deciding whether a control is
  * available. That decision belongs to `Capabilities`. */
+export type RemoteLinkState =
+  | { kind: "live" }
+  | { kind: "disconnected"; sinceUnixMs: number }
+  | { kind: "reconnecting"; attempt: number; nextInMs: number }
+  | { kind: "catching_up"; done: number; total: number };
+
+export type LinkStateEnvelope = { kind: "link_state"; tab: TabId; linkState: RemoteLinkState | null };
+
 export type ProviderInfo = {
+  host?: string | null;
+  accountName?: string | null;
   sidecarVersion: string;
   claudeAgentSdkVersion: string;
   claudeCodeVersion: string;
@@ -574,6 +584,7 @@ export type AgentUiState = {
   editorCards: PermissionRequestRecord[];
   capabilities: Capabilities;
   provider: ProviderInfo | null;
+  linkState?: RemoteLinkState | null;
   /** The last usage this tab's provider reported, or `null` before it has (what the band's usage
    * segment reads). A turn that reports one replaces it whole -- a running total, so a lower figure is
    * the truth after `/clear` -- and a turn that reports none leaves it (`reducer.ts`). On the wire: a

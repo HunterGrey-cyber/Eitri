@@ -6,13 +6,24 @@
 //! Trust is exact to the root and agent: parents, children and other agents have separate records.
 //! No other program's notion of trust is read.
 //!
+//! A project on a server ([`TrustPlace::Remote`]) is keyed by the host key the remote project records
+//! (the caller takes a scan only when the connection it came through shows that key) and the root as
+//! the remote project records it: `<16 hex of SHA-256("eitri-remote-trust\0" || host key || "\0" ||
+//! root)>.json`, plus the profile's suffix. Such a record also names the host key and the directory
+//! the scan found that root to be (`scanned_root`); a record for this machine names neither. So a
+//! record for one place never answers for the other, even for the same path; a rotated host key is a
+//! new place that is asked about again; and the recorded root leading to another directory on the
+//! server, even one holding the same configuration, is asked about again, as a different canonical
+//! root is here. The name holds only the recorded root, so `:untrust` needs no scan.
+//!
 //! Beside a record lies `<record>~last-trusted`, the instruction files as that `y` saw them
 //! ([`super::last_trusted`]). It is written after the record, removed with it, and reads as nothing
 //! when it is missing or does not match: only the record decides. A profile's key never holds a `~`,
 //! so no agent's record can have that name.
 //!
-//! A record that cannot be used (missing, not JSON, another version, another root, owned by
-//! someone else, a link, a FIFO, or written after a prompt that showed less than this one does)
+//! A record that cannot be used (missing, not JSON, another version, another root, another place (a
+//! record naming another host key, or none where one is wanted, or another scanned directory), owned
+//! by someone else, a link, a FIFO, or written after a prompt that showed less than this one does)
 //! reads as untrusted and stays in place: renaming a planted file aside only moves someone else's
 //! file around. Answering `y` replaces it atomically without following a planted link.
 //!
@@ -36,6 +47,59 @@ use super::last_trusted::{self, ChangedText, MAX_KEPT_BYTES};
 use super::nofollow::{read_regular_nofollow, Owner};
 use super::{discover, Discovery, EntryKind, Limits, Profile, ProfileEnv};
 use crate::state_paths;
+
+/// Whose disk a record is about.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum TrustPlace {
+    /// This machine: the record is keyed by the root it names.
+    Local,
+    /// A project on a server, whose configuration its helper read there.
+    Remote(RemoteRoot),
+}
+
+/// A project on a server, as a trust record is keyed.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct RemoteRoot {
+    /// The SHA-256 fingerprint of the server's host key the remote project records. Whoever reads the
+    /// server's configuration for this place takes it only when the connection shows this key.
+    pub host_key_sha256: String,
+    /// The root as the remote project records it.
+    pub root: PathBuf,
+}
+
+impl RemoteRoot {
+    /// The first 16 hex digits of `SHA-256("eitri-remote-trust\0" || host key || "\0" || root)`, the
+    /// root's bytes as they are: the name of this project's records.
+    pub fn record_id(&self) -> String {
+        use sha2::{Digest, Sha256};
+        use std::os::unix::ffi::OsStrExt;
+        let mut hash = Sha256::new();
+        hash.update(b"eitri-remote-trust\0");
+        hash.update(self.host_key_sha256.as_bytes());
+        hash.update(b"\0");
+        hash.update(self.root.as_os_str().as_bytes());
+        super::hex(&hash.finalize())[..16].to_string()
+    }
+}
+
+impl TrustPlace {
+    /// The root a record for this place names: `root` (the discovery's) on this machine, the remote
+    /// project's own on a server.
+    fn record_root<'a>(&'a self, root: &'a Path) -> &'a Path {
+        match self {
+            TrustPlace::Local => root,
+            TrustPlace::Remote(remote) => &remote.root,
+        }
+    }
+
+    /// The host key a record for this place names: none on this machine.
+    fn host_key(&self) -> Option<&str> {
+        match self {
+            TrustPlace::Local => None,
+            TrustPlace::Remote(remote) => Some(&remote.host_key_sha256),
+        }
+    }
+}
 
 /// A record larger than this is not one of ours. The record is read on every check, from a state
 /// directory another program of the user's could fill, so the reader stays small; a configuration
@@ -114,14 +178,27 @@ struct Record {
     /// [`DISCLOSURE`] when the record was written; a missing field reads as 0 and is unusable.
     #[serde(default)]
     disclosure: u32,
+    /// The server's host key for a project on a server ([`TrustPlace::Remote`]); absent for this
+    /// machine's, which keeps those records as they were.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    host_key_sha256: Option<String>,
+    /// For a project on a server, the directory the scan found the recorded root to be (the
+    /// discovery's root); absent for this machine's, whose `root` already is that directory.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    scanned_root: Option<String>,
 }
 
-/// The record's file name for `root` and `profile`. Keep Claude's name stable so existing records
-/// still answer; every other profile adds its key to that name.
-fn record_name(root: &Path, profile: &Profile) -> String {
+/// The record's file name for `root` (or a remote place's own root) and `profile`. Keep Claude's name
+/// stable so existing records still answer; every other profile adds its key to that name. A project on
+/// a server is named by its host key and root, never by the path alone.
+fn record_name(place: &TrustPlace, root: &Path, profile: &Profile) -> String {
+    let base = match place {
+        TrustPlace::Local => state_paths::file_name(root),
+        TrustPlace::Remote(remote) => format!("{}.json", remote.record_id()),
+    };
     match profile {
-        Profile::Claude => state_paths::file_name(root),
-        other => format!("{}.{}", state_paths::file_name(root), other.key()),
+        Profile::Claude => base,
+        other => format!("{base}.{}", other.key()),
     }
 }
 
@@ -138,18 +215,30 @@ fn record_temporary(path: &Path) -> PathBuf {
     path.with_file_name(name)
 }
 
-/// The record at `path` when it is a usable one for `root` and `profile`, read without following
-/// a link.
-fn read_usable_at(path: &Path, root: &Path, profile: &Profile) -> Option<Record> {
+/// The record at `path` when it is a usable one for `place`, `root` (the discovery's) and `profile`,
+/// read without following a link. A record names the host key of the server it is about and the
+/// directory scanned there, or neither for this machine, and is usable only for that place.
+fn read_usable_at(path: &Path, place: &TrustPlace, root: &Path, profile: &Profile) -> Option<Record> {
     let bytes = read_regular_nofollow(path, MAX_RECORD_BYTES, Owner::Me).ok()?;
     let record: Record = serde_json::from_slice(&bytes).ok()?;
     let usable = record.version == 1
         && record.disclosure >= DISCLOSURE
         && record.profile == profile_field(profile)
-        && root.to_str() == Some(record.root.as_str())
+        && record.host_key_sha256.as_deref() == place.host_key()
+        && record.scanned_root.as_deref() == scanned_root(place, root)
+        && place.record_root(root).to_str() == Some(record.root.as_str())
         && record.fingerprint.len() == 64
         && record.fingerprint.bytes().all(|b| b.is_ascii_hexdigit());
     usable.then_some(record)
+}
+
+/// The directory a record for `place` names as scanned, given the discovery's root `root`: none for this
+/// machine; for a server, `root` (`None` when it is not UTF-8, which no record can name).
+fn scanned_root<'a>(place: &TrustPlace, root: &'a Path) -> Option<&'a str> {
+    match place {
+        TrustPlace::Local => None,
+        TrustPlace::Remote(_) => root.to_str(),
+    }
 }
 
 /// What a record for `profile` says it is about: nothing for Claude, else the profile's key.
@@ -160,6 +249,7 @@ fn profile_field(profile: &Profile) -> Option<String> {
     }
 }
 
+#[derive(Clone)]
 pub struct TrustStore {
     dir: Option<PathBuf>,
 }
@@ -180,8 +270,8 @@ impl TrustStore {
 
     /// The record's path: the store's directory with its links resolved ([`without_links`]), and
     /// [`record_name`] in it, which is never resolved.
-    fn record_path(&self, root: &Path, profile: &Profile) -> Option<PathBuf> {
-        self.real_dir().map(|dir| dir.join(record_name(root, profile)))
+    fn record_path(&self, place: &TrustPlace, root: &Path, profile: &Profile) -> Option<PathBuf> {
+        self.real_dir().map(|dir| dir.join(record_name(place, root, profile)))
     }
 
     /// The store's directory with its links resolved. Touches the disk: worker only.
@@ -194,11 +284,17 @@ impl TrustStore {
     /// An empty discovery is "nothing to trust" except for a profile that needs an explicit `y`: that
     /// one is asked about, and its record holds the empty fingerprint.
     pub fn state(&self, discovery: Discovery) -> TrustState {
+        self.state_at(&TrustPlace::Local, discovery)
+    }
+
+    /// [`Self::state`] for a discovery made at `place`: on a server, the record of its host key and
+    /// root, never one of this machine's.
+    pub fn state_at(&self, place: &TrustPlace, discovery: Discovery) -> TrustState {
         if discovery.nothing_to_trust() && !discovery.profile.requires_explicit_yes() {
             return TrustState::NothingToTrust(discovery);
         }
-        let remember = self.remember_for(&discovery);
-        let Some(record) = self.read_usable(&discovery.root, &discovery.profile) else {
+        let remember = self.remember_for(place, &discovery);
+        let Some(record) = self.read_usable(place, &discovery.root, &discovery.profile) else {
             return TrustState::Untrusted { discovery, remember };
         };
         if record.fingerprint == discovery.fingerprint.hex() {
@@ -212,7 +308,7 @@ impl TrustStore {
             return TrustState::Untrusted { discovery, remember };
         }
         let diff = diff(&record.files, &discovery);
-        let copy = self.read_copy(&discovery);
+        let copy = self.read_copy(place, &discovery);
         let texts = last_trusted::compare(&record.files, copy.as_ref(), &discovery, &diff);
         TrustState::Changed {
             discovery,
@@ -223,32 +319,32 @@ impl TrustStore {
     }
 
     /// The copy kept at the last `y`, read as the record is, when it is one for this root and agent.
-    fn read_copy(&self, discovery: &Discovery) -> Option<last_trusted::KeptFiles> {
-        let record = self.record_path(&discovery.root, &discovery.profile)?;
+    fn read_copy(&self, place: &TrustPlace, discovery: &Discovery) -> Option<last_trusted::KeptFiles> {
+        let record = self.record_path(place, &discovery.root, &discovery.profile)?;
         let bytes = read_regular_nofollow(&copy_path(&record), MAX_KEPT_BYTES, Owner::Me).ok()?;
         last_trusted::decode(&bytes, &discovery.root, profile_field(&discovery.profile))
     }
 
-    fn remember_for(&self, discovery: &Discovery) -> Remember {
+    fn remember_for(&self, place: &TrustPlace, discovery: &Discovery) -> Remember {
         if !discovery.fully_hashed() {
             return Remember::SessionOnly(not_hashed_note(discovery));
         }
         if self.dir.is_none() {
             return Remember::WindowOnly("no usable state directory (XDG_STATE_HOME/HOME)".to_string());
         }
-        if discovery.root.to_str().is_none() {
+        if place.record_root(&discovery.root).to_str().is_none() || discovery.root.to_str().is_none() {
             return Remember::WindowOnly("the project path is not valid UTF-8".to_string());
         }
         // Sized for the latest time a record can carry, so a record written later is never larger.
-        let size = record_text(discovery, u64::MAX).map_or(u64::MAX, |text| text.len() as u64);
+        let size = record_text(place, discovery, u64::MAX).map_or(u64::MAX, |text| text.len() as u64);
         if size > MAX_RECORD_BYTES {
             return Remember::WindowOnly(too_large_to_record(discovery, size));
         }
         Remember::Yes
     }
 
-    fn read_usable(&self, root: &Path, profile: &Profile) -> Option<Record> {
-        read_usable_at(&self.record_path(root, profile)?, root, profile)
+    fn read_usable(&self, place: &TrustPlace, root: &Path, profile: &Profile) -> Option<Record> {
+        read_usable_at(&self.record_path(place, root, profile)?, place, root, profile)
     }
 
     /// Writes the record for `discovery`: a temporary file beside it, 0600, renamed over the
@@ -256,6 +352,11 @@ impl TrustStore {
     /// everything, and a store with no directory, writing nothing. A directory that cannot be created
     /// or used is the error; a copy that cannot be written is not.
     pub fn record(&self, discovery: &Discovery, now_unix: u64) -> io::Result<()> {
+        self.record_at(&TrustPlace::Local, discovery, now_unix)
+    }
+
+    /// [`Self::record`] for a discovery made at `place`.
+    pub fn record_at(&self, place: &TrustPlace, discovery: &Discovery, now_unix: u64) -> io::Result<()> {
         if !discovery.fully_hashed() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -268,8 +369,8 @@ impl TrustStore {
                 "no usable state directory (XDG_STATE_HOME/HOME)",
             ));
         };
-        let path = dir.join(record_name(&discovery.root, &discovery.profile));
-        let text = record_text(discovery, now_unix)?;
+        let path = dir.join(record_name(place, &discovery.root, &discovery.profile));
+        let text = record_text(place, discovery, now_unix)?;
         // A record the reader would refuse is never written: it could only ever read as untrusted.
         if text.len() as u64 > MAX_RECORD_BYTES {
             return Err(io::Error::new(
@@ -285,7 +386,7 @@ impl TrustStore {
         // What `state` will read must be what was just written; anything else would tell the user
         // the project is trusted while the next start asks again.
         let fingerprint = discovery.fingerprint.hex();
-        let reads_back = read_usable_at(&path, &discovery.root, &discovery.profile)
+        let reads_back = read_usable_at(&path, place, &discovery.root, &discovery.profile)
             .is_some_and(|read| read.fingerprint == fingerprint);
         if !reads_back {
             return Err(io::Error::other(format!(
@@ -293,7 +394,7 @@ impl TrustStore {
                 path.display()
             )));
         }
-        keep_copy(&path, discovery);
+        keep_copy(place, &path, discovery);
         Ok(())
     }
 
@@ -301,7 +402,13 @@ impl TrustStore {
     /// user owns; `true` if a record existed. A foreign file or a link is left in place and named in
     /// the error. The copy is still removed when the record cannot be, and the other way round.
     pub fn forget(&self, root: &Path, profile: &Profile) -> io::Result<bool> {
-        let Some(path) = self.record_path(root, profile) else {
+        self.forget_at(&TrustPlace::Local, root, profile)
+    }
+
+    /// [`Self::forget`] at `place`: on a server, the record of its host key and root (`root` is not
+    /// used there).
+    pub fn forget_at(&self, place: &TrustPlace, root: &Path, profile: &Profile) -> io::Result<bool> {
+        let Some(path) = self.record_path(place, root, profile) else {
             return Ok(false);
         };
         let record = remove_own_file(&path, "record");
@@ -325,14 +432,14 @@ fn replace_private(path: &Path, text: &str) -> io::Result<()> {
 /// Keeps what `discovery` read of the instruction files beside `record`, which has been written. The
 /// record is what trust rests on, so a copy that cannot be written costs only the next diff; the old
 /// one goes, since it no longer matches.
-fn keep_copy(record: &Path, discovery: &Discovery) {
+fn keep_copy(place: &TrustPlace, record: &Path, discovery: &Discovery) {
     let path = copy_path(record);
     let kept = last_trusted::encode(discovery, profile_field(&discovery.profile));
     let written = kept.is_some_and(|text| replace_private(&path, &text).is_ok());
     // Another window's `:untrust` can have taken the record since it was read back; its text goes too.
     let fingerprint = discovery.fingerprint.hex();
-    let record_stands =
-        read_usable_at(record, &discovery.root, &discovery.profile).is_some_and(|read| read.fingerprint == fingerprint);
+    let record_stands = read_usable_at(record, place, &discovery.root, &discovery.profile)
+        .is_some_and(|read| read.fingerprint == fingerprint);
     if !written || !record_stands {
         let _ = remove_own_file(&path, "copy of the instruction files");
     }
@@ -367,9 +474,9 @@ fn remove_own_file(path: &Path, what: &str) -> io::Result<bool> {
     Ok(true)
 }
 
-/// The record of `discovery` as written, trusted at `now_unix`.
-fn record_text(discovery: &Discovery, now_unix: u64) -> io::Result<String> {
-    let Some(root) = discovery.root.to_str() else {
+/// The record of `discovery`, made at `place`, as written, trusted at `now_unix`.
+fn record_text(place: &TrustPlace, discovery: &Discovery, now_unix: u64) -> io::Result<String> {
+    let (Some(root), Some(_)) = (place.record_root(&discovery.root).to_str(), discovery.root.to_str()) else {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             "the project path is not valid UTF-8",
@@ -383,6 +490,8 @@ fn record_text(discovery: &Discovery, now_unix: u64) -> io::Result<String> {
         files: files_of(discovery),
         profile: profile_field(&discovery.profile),
         disclosure: DISCLOSURE,
+        host_key_sha256: place.host_key().map(str::to_string),
+        scanned_root: scanned_root(place, &discovery.root).map(str::to_string),
     };
     serde_json::to_string_pretty(&record).map_err(io::Error::other)
 }
@@ -520,7 +629,7 @@ mod path_tests {
         let profiles = [Profile::Claude, Profile::Codex, acp];
         let paths: Vec<_> = profiles
             .iter()
-            .map(|profile| store.record_path(&root, profile).unwrap())
+            .map(|profile| store.record_path(&TrustPlace::Local, &root, profile).unwrap())
             .collect();
         let temps: Vec<_> = paths.iter().map(|path| record_temporary(path)).collect();
         for (path, temp) in paths.iter().zip(&temps) {
@@ -591,11 +700,179 @@ mod path_tests {
             &ProfileEnv::default(),
         );
         store.record(&found, 1).unwrap();
-        let record = store.record_path(&root, &Profile::Claude).unwrap();
+        let record = store.record_path(&TrustPlace::Local, &root, &Profile::Claude).unwrap();
         assert!(copy_path(&record).is_file());
         std::fs::remove_file(&record).unwrap();
-        keep_copy(&record, &found);
+        keep_copy(&TrustPlace::Local, &record, &found);
         assert!(!copy_path(&record).exists());
+    }
+
+    fn remote(host_key: &str, root: &Path) -> TrustPlace {
+        TrustPlace::Remote(RemoteRoot {
+            host_key_sha256: host_key.to_string(),
+            root: root.to_path_buf(),
+        })
+    }
+
+    /// A configuration at `root`, found as a server's helper finds it (the same `discover`), with a
+    /// hook in it.
+    fn found_with_a_hook(scratch: &Path, root: &Path, command: &str) -> Discovery {
+        std::fs::create_dir_all(root.join(".claude")).unwrap();
+        std::fs::write(
+            root.join(".claude/settings.json"),
+            format!(r#"{{"hooks":{{"Stop":[{{"hooks":[{{"type":"command","command":"{command}"}}]}}]}}}}"#),
+        )
+        .unwrap();
+        discover(
+            root,
+            Some(scratch),
+            &Limits::default(),
+            &Profile::Claude,
+            &ProfileEnv::default(),
+        )
+    }
+
+    /// A remote project's record is found only under the host key and root it was written for: this
+    /// machine's own record for the same path, and a record for another host key, are not it.
+    #[test]
+    fn remote_trust_is_keyed_by_host_key_and_root() {
+        let scratch = crate::plugin::test_support::Scratch::new("trust-remote-keyed");
+        let root = scratch.0.join("project");
+        let found = found_with_a_hook(&scratch.0, &root, "true");
+        let store = TrustStore::at(Some(scratch.0.join("trust")));
+        let here = remote("SHA256:host-a", &root);
+
+        // This machine's record for the same path does not answer for the server.
+        store.record(&found, 1).unwrap();
+        assert!(matches!(store.state(found.clone()), TrustState::Trusted { .. }));
+        assert!(matches!(
+            store.state_at(&here, found.clone()),
+            TrustState::Untrusted { .. }
+        ));
+
+        // A record for the server answers for it and for nothing else: not for another key, not for
+        // another root on the same server.
+        store.record_at(&here, &found, 2).unwrap();
+        assert!(matches!(
+            store.state_at(&here, found.clone()),
+            TrustState::Trusted { since_unix: 2, .. }
+        ));
+        assert!(matches!(
+            store.state_at(&remote("SHA256:host-b", &root), found.clone()),
+            TrustState::Untrusted { .. }
+        ));
+        assert!(matches!(
+            store.state_at(&remote("SHA256:host-a", &scratch.0.join("elsewhere")), found.clone()),
+            TrustState::Untrusted { .. }
+        ));
+
+        // Forgetting one leaves the other.
+        assert!(store.forget(&root, &Profile::Claude).unwrap());
+        assert!(matches!(store.state(found.clone()), TrustState::Untrusted { .. }));
+        assert!(matches!(
+            store.state_at(&here, found.clone()),
+            TrustState::Trusted { .. }
+        ));
+        assert!(store.forget_at(&here, &root, &Profile::Claude).unwrap());
+        assert!(matches!(store.state_at(&here, found), TrustState::Untrusted { .. }));
+    }
+
+    /// A local record and a remote one for the same path never match each other, even when one lies
+    /// under the other's name.
+    #[test]
+    fn a_local_and_a_remote_record_for_the_same_path_never_match() {
+        let scratch = crate::plugin::test_support::Scratch::new("trust-local-vs-remote");
+        let root = scratch.0.join("project");
+        let found = found_with_a_hook(&scratch.0, &root, "true");
+        let store = TrustStore::at(Some(scratch.0.join("trust")));
+        let server = remote("SHA256:host-a", &root);
+        let local_path = store.record_path(&TrustPlace::Local, &root, &Profile::Claude).unwrap();
+        let remote_path = store.record_path(&server, &root, &Profile::Claude).unwrap();
+        assert_ne!(local_path, remote_path);
+
+        // A local record copied to the remote name names no host key: not the server's.
+        store.record(&found, 1).unwrap();
+        std::fs::copy(&local_path, &remote_path).unwrap();
+        assert!(matches!(
+            store.state_at(&server, found.clone()),
+            TrustState::Untrusted { .. }
+        ));
+        std::fs::remove_file(&remote_path).unwrap();
+
+        // A remote record copied to the local name names a host key: not this machine's.
+        store.forget(&root, &Profile::Claude).unwrap();
+        store.record_at(&server, &found, 1).unwrap();
+        std::fs::copy(&remote_path, &local_path).unwrap();
+        assert!(matches!(store.state(found.clone()), TrustState::Untrusted { .. }));
+        let written: serde_json::Value = serde_json::from_slice(&std::fs::read(&remote_path).unwrap()).unwrap();
+        assert_eq!(written["host_key_sha256"], "SHA256:host-a");
+        assert_eq!(written["root"], root.to_str().unwrap());
+    }
+
+    /// A remote record is exact to the directory the scan found the recorded root to be: the same root
+    /// leading to another tree there, even one holding the same configuration, is asked about again.
+    #[test]
+    fn a_remote_record_answers_only_for_the_directory_it_was_scanned_in() {
+        let scratch = crate::plugin::test_support::Scratch::new("trust-remote-canonical");
+        let first = found_with_a_hook(&scratch.0, &scratch.0.join("a"), "true");
+        let second = found_with_a_hook(&scratch.0, &scratch.0.join("b"), "true");
+        assert_eq!(first.fingerprint, second.fingerprint);
+        let store = TrustStore::at(Some(scratch.0.join("trust")));
+        let place = remote("SHA256:host-a", Path::new("/srv/project"));
+        store.record_at(&place, &first, 1).unwrap();
+        assert!(matches!(
+            store.state_at(&place, first.clone()),
+            TrustState::Trusted { .. }
+        ));
+        assert!(matches!(store.state_at(&place, second), TrustState::Untrusted { .. }));
+        let path = store.record_path(&place, &first.root, &Profile::Claude).unwrap();
+        let written: serde_json::Value = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        assert_eq!(written["root"], "/srv/project");
+        assert_eq!(written["scanned_root"], first.root.to_str().unwrap());
+        // `:untrust` needs no scan: the record is found by the recorded root alone.
+        assert!(store
+            .forget_at(&place, Path::new("/elsewhere"), &Profile::Claude)
+            .unwrap());
+    }
+
+    /// The host key ssh verified is part of the identity: a key that rotates is a new place, asked about
+    /// again rather than read as a change to what was trusted.
+    #[test]
+    fn rotated_host_key_is_a_new_identity() {
+        let scratch = crate::plugin::test_support::Scratch::new("trust-remote-rotated");
+        let root = scratch.0.join("project");
+        let found = found_with_a_hook(&scratch.0, &root, "true");
+        let store = TrustStore::at(Some(scratch.0.join("trust")));
+        store.record_at(&remote("SHA256:old", &root), &found, 1).unwrap();
+        assert!(matches!(
+            store.state_at(&remote("SHA256:new", &root), found),
+            TrustState::Untrusted {
+                remember: Remember::Yes,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn a_remote_record_is_named_by_host_key_and_root() {
+        let store = TrustStore::new(Some(OsStr::new("/state")), Some(OsStr::new("/home/test")));
+        let dir = store.dir.unwrap();
+        let root = Path::new("/srv/project");
+        let place = remote("SHA256:example", root);
+        use sha2::{Digest, Sha256};
+        let expected = crate::project_trust::hex(&Sha256::digest(b"eitri-remote-trust\0SHA256:example\0/srv/project"));
+        assert_eq!(
+            dir.join(record_name(&place, root, &Profile::Claude)),
+            Path::new(&format!("/state/eitri/trust/{}.json", &expected[..16])),
+        );
+        assert_eq!(
+            dir.join(record_name(&place, Path::new("/elsewhere"), &Profile::Codex)),
+            Path::new(&format!("/state/eitri/trust/{}.json.codex", &expected[..16])),
+        );
+        assert_ne!(
+            record_name(&place, root, &Profile::Claude),
+            record_name(&TrustPlace::Local, root, &Profile::Claude)
+        );
     }
 
     #[test]
@@ -604,11 +881,11 @@ mod path_tests {
         let dir = store.dir.unwrap();
         let root = Path::new("/projects/state-paths");
         assert_eq!(
-            dir.join(record_name(root, &Profile::Claude)),
+            dir.join(record_name(&TrustPlace::Local, root, &Profile::Claude)),
             Path::new("/state/eitri/trust/410d926fb96fb107.json"),
         );
         assert_eq!(
-            dir.join(record_name(root, &Profile::Codex)),
+            dir.join(record_name(&TrustPlace::Local, root, &Profile::Codex)),
             Path::new("/state/eitri/trust/410d926fb96fb107.json.codex"),
         );
     }
