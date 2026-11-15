@@ -148,7 +148,7 @@ class EnvironmentTwinsTests(unittest.TestCase):
 
 class RecipeLinksTests(unittest.TestCase):
     """Every relative link in a recipe's README (and its twin) lands on a file of the public tree, where examples/ and
-    docs/guide/ are both at the root; in this tree docs/guide/ is under publish/files/."""
+    docs/ are both at the root; in this tree docs/guide/ and docs/images/ are under publish/files/."""
 
     def test_every_relative_link_in_the_recipes_resolves(self):
         checked = 0
@@ -161,9 +161,13 @@ class RecipeLinksTests(unittest.TestCase):
                     rel = os.path.normpath(os.path.join("examples", "environments", name, target.split("#", 1)[0]))
                     self.assertFalse(rel.startswith(".."), f"{name}/{readme}: {target}")
                     here = os.path.join(_REPO_ROOT, rel)
-                    guide = os.path.join(_guide_dir(), os.path.relpath(rel, os.path.join("docs", "guide")))
-                    in_guide = rel.startswith(os.path.join("docs", "guide") + os.sep)
-                    self.assertTrue(os.path.isfile(guide if in_guide else here), f"{name}/{readme}: {target} -> {rel}")
+                    # docs/guide/ and docs/images/ (the recipes' screenshots) sit beside each other under the
+                    # public docs root
+                    docs_root = os.path.dirname(_guide_dir())
+                    in_docs = rel.startswith(os.path.join("docs", "guide") + os.sep) or rel.startswith(
+                        os.path.join("docs", "images") + os.sep)
+                    public = os.path.join(docs_root, os.path.relpath(rel, "docs"))
+                    self.assertTrue(os.path.isfile(public if in_docs else here), f"{name}/{readme}: {target} -> {rel}")
                     checked += 1
         self.assertGreater(checked, 10)
 

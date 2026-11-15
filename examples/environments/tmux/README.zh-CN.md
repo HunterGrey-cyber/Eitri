@@ -1,5 +1,5 @@
 [English](README.md) | 简体中文
-<!-- translated-from: README.md sha256=f841c2e035e66ecd3495cd1e08f472d6b788fe5d2dbd01d930ce7b9b81c227bb -->
+<!-- translated-from: README.md sha256=5c9ad790c0ce77fa6992e8eb4483210f56d62674aa1ff1d0ba82e09264bb683c -->
 
 # tmux 用户
 
@@ -15,4 +15,6 @@ Eitri 启动时会读你的 tmux 配置（`keymap.from_tmux`），所以你的�
 
 把 `init.lua` 复制到 `~/.config/eitri/init.lua`，或者把你想要的部分粘贴进你自己的，再打开一个新窗口。如果你的 tmux 配置把 `\` 或 `-` 绑到了别的东西上，这里的调用优先，Eitri 不会提它替换掉的 tmux 绑定。
 
-<!-- screenshot: the first window, then the shells workspace -->
+![第一个窗口：Neovim 和对话左右并排，终端在底部，显示着 shell 提示符](../../../docs/images/recipe-tmux-1.png)
+
+![shells 工作区：Neovim 和对话之间上下叠着两个终端，一个在 data/，一个在 tests/](../../../docs/images/recipe-tmux-2.png)

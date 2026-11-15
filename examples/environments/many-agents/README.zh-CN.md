@@ -1,5 +1,5 @@
 [English](README.md) | 简体中文
-<!-- translated-from: README.md sha256=e39bb69dba17912817d2680f27c5c9a7dab8b4fa6a97d81e939a9a574d18996f -->
+<!-- translated-from: README.md sha256=3151e8add88f92c2ef332d97f48e238bb458f9ec29a1344fd8b1a0136c965dae -->
 
 # 同时跑很多 agent 的人
 
@@ -15,4 +15,6 @@
 
 把 `init.lua` 复制到 `~/.config/eitri/init.lua`，或者把你想要的部分粘贴进你自己的，再打开一个新窗口。
 
-<!-- screenshot: the rail, The pass with two waiting, and the table -->
+![一个项目里的三个 agent：左边缘的窄栏，Neovim 上方的 The pass 显示两个在等（一个问题、一张权限卡），右边是第二个对话视图](../../../docs/images/recipe-many-agents-1.png)
+
+![prefix g 打开的表格，盖在主区域上，按状态排序，权限卡和问题排在前面](../../../docs/images/recipe-many-agents-2.png)

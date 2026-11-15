@@ -27,4 +27,4 @@ to your Neovim; with lazy.nvim and a package install:
 the panel for the current directory and `<leader>em` (or `:EitriPage markdown`) the preview. From a shell,
 `eitri panel` in Neovim's own terminal attaches to it too.
 
-<!-- screenshot: a terminal Neovim with the panel and the preview windows beside it -->
+![LazyVim in a terminal on the left; on the right the panel window with a short finished turn, and below it the Markdown preview window following README.md (sway tiles the three windows)](../../../docs/images/recipe-beside-nvim-1.png)

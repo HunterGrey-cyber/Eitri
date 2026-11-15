@@ -19,4 +19,6 @@ arrives in it, without moving the keys.
 
 Copy `init.lua` to `~/.config/eitri/init.lua`, or paste the parts you want into yours, and open a new window.
 
-<!-- screenshot: the rail, The pass with two waiting, and the table -->
+![Three agents in one project: the rail at the left edge, The pass above Neovim with two waiting (a question and a permission card), and a second chat view at the right](../../../docs/images/recipe-many-agents-1.png)
+
+![The table on prefix g: over the main area, sorted by state, the card and the question first](../../../docs/images/recipe-many-agents-2.png)

@@ -16,4 +16,4 @@ at hand to read or check what you wrote.
 
 Copy `init.lua` to `~/.config/eitri/init.lua`, or paste the parts you want into yours, and open a new window.
 
-<!-- screenshot: a Markdown file with the preview beside it and the chat below -->
+![A README open in Neovim with its rendered preview beside it, and the chat below with one short finished turn](../../../docs/images/recipe-markdown-writer-1.png)

@@ -604,5 +604,7 @@ module that has the keys). A few things the page relies on:
   `agents.reset`, as [The events](#the-events) describes.
 - It never declares `net`, which it could not have beside `agents` anyway.
 
+![Who waits beside the editor: two agents waiting, oldest first, the first one picked](../images/plugin-waiting-list.png)
+
 To have an agent write a plugin like this for you, give it this page and [Pages you build](pages.md), describe what
 the page should do, and read what it wrote before you load it.

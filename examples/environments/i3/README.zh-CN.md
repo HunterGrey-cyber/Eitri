@@ -1,5 +1,5 @@
 [English](README.md) | 简体中文
-<!-- translated-from: README.md sha256=f91a5b27727b08fe1d8dedb10032288b4ef323d8cf11062f36b5374af901b0dc -->
+<!-- translated-from: README.md sha256=8008b9b4582b6d43f3ac6da85e4aabbe1dd59b79571b6dd9b40efd2c36d64171 -->
 
 # i3 用户
 
@@ -15,4 +15,6 @@ Eitri 的容器键是在前缀之后按的 i3 `$mod` 组合键（`<prefix> Alt+w
 
 把 `init.lua` 复制到 `~/.config/eitri/init.lua`，或者把你想要的部分粘贴进你自己的，再打开一个新窗口。
 
-<!-- screenshot: the tabbed container, then the drop-down terminal -->
+![第一个窗口：左边是 Neovim，右边是一个带 agent 和 terminal 两个标签的标签式容器，显示的是 agent](../../../docs/images/recipe-i3-1.png)
+
+![按 <prefix> F2 之后：第二个终端作为下拉终端浮在窗口上](../../../docs/images/recipe-i3-2.png)

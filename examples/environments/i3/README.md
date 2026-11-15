@@ -21,4 +21,6 @@ With Alt as your window manager's `$mod`, the window manager takes those chords 
 
 Copy `init.lua` to `~/.config/eitri/init.lua`, or paste the parts you want into yours, and open a new window.
 
-<!-- screenshot: the tabbed container, then the drop-down terminal -->
+![The first window: Neovim on the left, a tabbed container on the right with the agent and terminal tabs, the agent tab shown](../../../docs/images/recipe-i3-1.png)
+
+![After <prefix> F2: the second terminal floating over the window as a drop-down](../../../docs/images/recipe-i3-2.png)

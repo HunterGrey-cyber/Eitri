@@ -1,5 +1,5 @@
 [English](README.md) | 简体中文
-<!-- translated-from: README.md sha256=7986c9941e5240fc122e2ecff752f49664577d5d56bbdce20fbdd9681dd04584 -->
+<!-- translated-from: README.md sha256=40ae0a3d4e390a424ed2698aa16ef327dc0eb51bc043dedfa434ab4a1e18834e -->
 
 # Markdown 写作者
 
@@ -14,4 +14,4 @@
 
 把 `init.lua` 复制到 `~/.config/eitri/init.lua`，或者把你想要的部分粘贴进你自己的，再打开一个新窗口。
 
-<!-- screenshot: a Markdown file with the preview beside it and the chat below -->
+![Neovim 里打开的 README，旁边是渲染好的预览，下面的对话里有一个已结束的简短回合](../../../docs/images/recipe-markdown-writer-1.png)

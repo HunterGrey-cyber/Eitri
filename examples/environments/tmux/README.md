@@ -20,4 +20,6 @@ Copy `init.lua` to `~/.config/eitri/init.lua`, or paste the parts you want into 
 tmux configuration binds `\` or `-` to something else, the call here wins, and Eitri says nothing about the tmux
 binding it replaced.
 
-<!-- screenshot: the first window, then the shells workspace -->
+![The first window: Neovim and the chat side by side, the terminal along the bottom with a shell prompt](../../../docs/images/recipe-tmux-1.png)
+
+![The shells workspace: two terminals stacked between Neovim and the chat, one in data/ and one in tests/](../../../docs/images/recipe-tmux-2.png)

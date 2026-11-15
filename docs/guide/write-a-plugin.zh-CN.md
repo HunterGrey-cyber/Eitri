@@ -1,5 +1,5 @@
 [English](write-a-plugin.md) | 简体中文
-<!-- translated-from: write-a-plugin.md sha256=58eab61dd2fee321ffb5f369d2119f0cc6194d151d3fad020ab65cc69db34afc -->
+<!-- translated-from: write-a-plugin.md sha256=8c51fef0a0dadb1e61ae29ebcc707257f247ad010c4d771eb294dc88098e607e -->
 
 # 写一个插件
 
@@ -486,5 +486,7 @@ eitri.plugin.load("waiting-list", { key = "y" })
 - `Enter` 就是 `agents.focus` 需要的手势，而按键只有在页面拿着按键时才会到达页面，所以另一个条件也成立。点击只有在页面拿着按键时才算作手势。
 - 它按 key 保存行，只有 `id` 匹配时才在 `agents.gone` 上移除一行，并从 `agents.reset` 重新开始，就像[事件](#the-events)所说的那样。
 - 它从不声明 `net`，反正它也没法在 `agents` 旁边声明。
+
+![编辑器旁边的“谁在等”：两个 agent 在等，最早的在前，第一个被选中](../images/plugin-waiting-list.png)
 
 想让一个 agent 替你写这样的插件，把这一页和[你自己做的页面](pages.zh-CN.md)交给它，描述页面该做什么，并在加载之前读一读它写的东西。

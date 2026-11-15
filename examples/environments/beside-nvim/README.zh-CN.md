@@ -1,5 +1,5 @@
 [English](README.md) | 简体中文
-<!-- translated-from: README.md sha256=99d88657bf2fd12cd767c19decfe3c09c094d07c0a04efeef7a75be5e18fe740 -->
+<!-- translated-from: README.md sha256=d678d3da7908c2bbc5c74d446e8c4bd9613f426603fa874544c28016c0c61891 -->
 
 # 在终端 Neovim 旁边
 
@@ -21,4 +21,4 @@
 
 （压缩包安装程序把它放在 `~/.local/share/eitri/eitri.nvim`。）在 Neovim 里，`<leader>ep`（或 `:EitriPanel`）为当前目录打开面板，`<leader>em`（或 `:EitriPage markdown`）打开预览。在 shell 里，Neovim 自己的终端里的 `eitri panel` 也会附着到它。
 
-<!-- screenshot: a terminal Neovim with the panel and the preview windows beside it -->
+![左边是终端里的 LazyVim；右边上方是面板窗口，里面有一轮做完的简短回合，下方是跟着 README.md 的 Markdown 预览窗口（sway 把三个窗口平铺开）](../../../docs/images/recipe-beside-nvim-1.png)
