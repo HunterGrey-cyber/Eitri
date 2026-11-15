@@ -1393,6 +1393,25 @@ describe("the starting screen's checkout hint is delayed 10s", () => {
     }
   });
 
+  it.each([
+    ["codex", "Codex"],
+    ["acp:demo", "demo"],
+  ])("shows the agent's waiting line for %s after 10s", (agent, title) => {
+    vi.useFakeTimers();
+    try {
+      const { container, getByText } = renderEmpty({ tab: { ...TAB, agent, state: "starting" } });
+      const waiting = `still starting — waiting for ${title} to answer`;
+      expect(container.textContent).not.toContain(waiting);
+      act(() => vi.advanceTimersByTime(9_999));
+      expect(container.textContent).not.toContain(waiting);
+      act(() => vi.advanceTimersByTime(1));
+      getByText(waiting);
+      expect(container.textContent).not.toMatch(/sidecar|Verdandi/i);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("never shows it once the tab is no longer starting", () => {
     vi.useFakeTimers();
     try {

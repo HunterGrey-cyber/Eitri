@@ -220,12 +220,9 @@ export function EmptyTab(props: EmptyTabProps) {
     setDashCursor((cursor) => Math.min(cursor, Math.max(0, dashCount - 1)));
   }, [dashCount]);
   const rootRef = useRef<HTMLDivElement>(null);
-  /** "The first start on a fresh Verdandi checkout also builds the sidecar." used
-   *  to be shown unconditionally on every starting screen, which is irrelevant on an installed
-   *  build where nothing gets built at all. It now waits 10s, per THIS tab's own starting spell
-   *  (`tab.id` in the deps below, so a switch to a different starting tab restarts the wait rather
-   *  than inheriting the old tab's elapsed time), and reads differently once it does. No wire
-   *  change: `tab.state` already said "starting", this only delays and rewords one sentence. */
+  /** After 10s starting, Claude tabs explain the possible sidecar build; other agents name who is
+   *  still expected to answer. The wait belongs to this tab's starting spell: switching tabs restarts
+   *  it rather than inheriting another tab's elapsed time. */
   const [stillStarting, setStillStarting] = useState(false);
   useEffect(() => {
     if (!starting || awaitingTrust) {
@@ -844,10 +841,14 @@ export function EmptyTab(props: EmptyTabProps) {
       {starting && !awaitingTrust && (
         <>
           <p className="connecting">Starting the agent backend…</p>
-          {/* Irrelevant on an installed build, where nothing gets built at all --
-              shown only once this tab has been starting for 10s, not on every starting screen. */}
+          {/* The Claude checkout hint is irrelevant on an installed build, where nothing gets built.
+              Each agent's line appears only once this tab has been starting for 10s. */}
           {stillStarting && (
-            <p className="connecting">still starting — a first start from a Verdandi checkout builds the sidecar</p>
+            <p className="connecting">
+              {isExternalAgent(tab.agent)
+                ? `still starting — waiting for ${agentTitle(tab.agent)} to answer`
+                : "still starting — a first start from a Verdandi checkout builds the sidecar"}
+            </p>
           )}
         </>
       )}
