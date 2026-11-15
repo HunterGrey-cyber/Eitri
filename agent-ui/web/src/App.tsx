@@ -7844,6 +7844,10 @@ export default function App() {
       <QueueLines items={queue} error={queueError} note={queueNote} />
       <ActivityLine
         state={state}
+        look={{
+          kind: isAcpAgent(activeTab?.agent) ? "acp" : isExternalAgent(activeTab?.agent) ? "codex" : "claude",
+          name: isExternalAgent(activeTab?.agent) ? agentTitle(activeTab?.agent) : "Claude Code",
+        }}
         onOpenTasks={() => openTasksOverlay()}
         turnClock={turnClock}
         canInterrupt={state.capabilities.interrupt}

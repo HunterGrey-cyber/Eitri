@@ -9,6 +9,8 @@ import { revealedText } from "../revealHidden";
 
 type Props = {
   state: AgentUiState;
+  /** The tab's visual identity; provider capabilities still decide which controls are available. */
+  look?: { kind: "claude" | "codex" | "acp"; name: string };
   onOpenTasks?: () => void;
   /** How long the current turn has been running, tracked in `App.tsx` (`TurnClock`) rather than in
    *  `AgentUiState` -- see that type's own doc comment. `null` before any turn has started, and
@@ -39,7 +41,8 @@ type Props = {
 /** One mono line above the composer while a turn runs: motion, elapsed time and interrupt. With no turn
  *  running it shows idle background work in the same slot. The interrupt words are the Stop button itself,
  *  keeping the mouse route available. */
-export function ActivityLine({ state, turnClock = null, canInterrupt, onInterrupt, queued = 0, pendingTool = null, shellRunning = false, mode = "browse", cardEntry = "elsewhere", onOpenTasks }: Props) {
+export function ActivityLine({ state, look = { kind: "claude", name: "Claude Code" }, turnClock = null, canInterrupt, onInterrupt, queued = 0, pendingTool = null, shellRunning = false, mode = "browse", cardEntry = "elsewhere", onOpenTasks }: Props) {
+  const agentName = look.kind === "claude" ? "Claude Code" : look.name;
   // A terminal status wins over `activeTurnId`, so a dead session cannot read as working.
   // The reducer clears it on `session_unavailable`/`session_closed`; keep this guard for other endings.
   const working = state.status.kind === "running" && state.activeTurnId !== null;
@@ -56,7 +59,7 @@ export function ActivityLine({ state, turnClock = null, canInterrupt, onInterrup
     return () => window.clearInterval(timer);
   }, [ticking]);
   if (state.questions.some((q) => q.state.kind !== "settled")) return (
-    <div className="activity-line activity-question">⚑ Claude has a question{mode === "browse" ? " — i to answer" : ""}</div>
+    <div className="activity-line activity-question">⚑ {look.kind === "claude" ? "Claude" : revealedText(agentName)} has a question{mode === "browse" ? " — i to answer" : ""}</div>
   );
   // Only a person's choice on the dock settles a plan: the line names where that is, never a card key.
   if ((state.plans ?? []).some((p) => p.state.kind !== "settled")) return (
@@ -80,22 +83,21 @@ export function ActivityLine({ state, turnClock = null, canInterrupt, onInterrup
   const causeText = cause?.kind === "task" ? taskWakeText(cause)
     : cause?.kind === "peer" ? `Message from @${cause.peerName ?? "unknown"}: ${cause.text ?? ""}`
     : cause?.kind === "scheduled" ? cause.scheduleReason ?? cause.prompt ?? "Scheduled wake-up"
-    : "Claude Code started this turn";
+    : `${agentName} started this turn`;
   const phase = phaseOf(state);
-  // The star is the line's one moving thing, and it moves only while the agent is working: a card
-  // waiting, or a phase that is the user's to end, holds it still (`index.css`'s `turn-breath`).
+  // The glyph moves only while the agent works; a waiting card or usage limit holds it still.
   const moving = pendingTool === null && phase.kind !== "blocked" && !limit;
   return (
     <div className="activity-line" data-nav-stop="status">
-      <span className="activity-glyph" aria-hidden="true" data-moving={moving ? "true" : undefined}>
-        ✻
+      <span className="activity-glyph" aria-hidden="true" data-look={look.kind} data-moving={moving ? "true" : undefined}>
+        {look.kind === "claude" ? "✻" : "•"}
       </span>
       {" "}
       {/* A phase word beside the card cuts off the approval keys at 520px, so the card owns the line. */}
       {pendingTool === null && (special !== null ? (
         <span className="turn-activity">{revealedText(special)}{state.compacting && !state.apiRetry ? ` ${elapsedWords(now - compactingSince)}` : ""}</span>
       ) : start ? (
-        <span className="turn-activity">Claude Code is handling: {revealedText(causeText)}</span>
+        <span className="turn-activity">{revealedText(agentName)} is handling: {revealedText(causeText)}</span>
       ) : <TurnActivity phase={phase} clock={turnClock} />)}
       {pendingTool !== null ? (
         <span className="activity-card">

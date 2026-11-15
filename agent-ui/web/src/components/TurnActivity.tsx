@@ -11,7 +11,7 @@ type Props = {
 
 /** The caller mounts this only while ActivityLine's working predicate holds; mounting claims a
  *  turn is in flight, so this component must not re-derive that condition. The phase and elapsed
- *  clock stay visible while blocked, but ActivityLine's star holds still: a permission wait means
+ *  clock stay visible while blocked, but ActivityLine's glyph holds still: a permission wait means
  *  the agent is not working. */
 export function TurnActivity({ phase, clock }: Props) {
   // One tick a second, local to this leaf: `setState` here re-renders only this component, not the

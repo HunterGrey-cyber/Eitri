@@ -6,8 +6,61 @@ import { applyEvent, initialState } from "../reducer";
 import protocol322 from "../fixtures/protocol-322.json";
 import type { AgentDomainEvent, AgentUiState } from "../types";
 
-afterEach(cleanup);
+afterEach(() => { cleanup(); vi.useRealTimers(); });
 const running = (over: Partial<AgentUiState>): AgentUiState => ({ ...initialState(), status: { kind: "running" }, ...over });
+
+it.each([
+  { kind: "claude", name: "Claude Code", glyph: "✻" },
+  { kind: "codex", name: "Codex", glyph: "•" },
+  { kind: "acp", name: "gemini", glyph: "•" },
+] as const)("uses $name's activity look while preserving the phase, clock and motion stops", ({ kind, name, glyph }) => {
+  vi.useFakeTimers();
+  const state = running({ activeTurnId: "t1" });
+  const props = { state, look: { kind, name }, canInterrupt: true, onInterrupt: vi.fn(),
+    turnClock: { turnId: "t1", since: Date.now(), exact: true } };
+  const { container, rerender } = render(<ActivityLine {...props} />);
+  const mark = () => container.querySelector<HTMLElement>(".activity-glyph")!;
+  expect(mark().textContent?.trim()).toBe(glyph);
+  expect(mark().dataset.look).toBe(kind);
+  expect(mark().dataset.moving).toBe("true");
+  expect(mark().getAttribute("aria-hidden")).toBe("true");
+  expect(container.querySelector(".turn-state")?.textContent).toBe("working");
+  expect(container.querySelector(".turn-elapsed")?.textContent).toBe("0s");
+  if (kind !== "claude") expect(container.textContent).not.toContain("✻");
+  rerender(<ActivityLine {...props} pendingTool="command" />);
+  expect(mark().dataset.moving).toBeUndefined();
+  rerender(<ActivityLine {...props} state={{ ...state, accountLimits: {
+    usedPercent: 100, windowMinutes: null, resetsAt: 1800000000, plan: null,
+  } }} />);
+  expect(mark().dataset.moving).toBeUndefined();
+});
+
+it.each([
+  { kind: "claude", name: "Claude Code", questionName: "Claude" },
+  { kind: "codex", name: "Codex", questionName: "Codex" },
+  { kind: "acp", name: "gemini", questionName: "gemini" },
+] as const)("names $name in questions and agent-started turn causes", ({ kind, name, questionName }) => {
+  const state = running({ activeTurnId: "t1", turnStarts: [
+    { seq: 1, turnId: "t1", origin: "cli", cause: null },
+  ] });
+  const props = { state, look: { kind, name }, canInterrupt: false, onInterrupt: vi.fn() };
+  const { container, rerender } = render(<ActivityLine {...props} />);
+  expect(container.querySelector(".turn-activity")?.textContent).toBe(`${name} is handling: ${name} started this turn`);
+  rerender(<ActivityLine {...props} state={{ ...state, turnStarts: [
+    { ...state.turnStarts[0], cause: {
+      kind: "scheduled", scheduleReason: "due", taskId: null, taskKind: null, taskStatus: null,
+      description: null, summary: null, peerName: null, text: null, wakeupSource: null,
+      scheduledForMs: null, cronId: null, prompt: null,
+    } },
+  ] }} />);
+  expect(container.querySelector(".turn-activity")?.textContent).toBe(`${name} is handling: due`);
+  rerender(<ActivityLine {...props} state={{ ...state, questions: [{
+    seq: 2, interactionId: "q1", toolUseId: null, turnId: "t1", unsupportedReason: null,
+    state: { kind: "waiting" }, questions: [],
+  }] }} />);
+  expect(container.textContent).toBe(`⚑ ${questionName} has a question — i to answer`);
+  if (kind !== "claude") expect(container.textContent).not.toContain("Claude");
+});
 
 it("is absent while no turn runs, and after the session ended whatever its last fields say", () => {
   const onInterrupt = vi.fn();

@@ -888,16 +888,21 @@ describe("index.css", () => {
     expect("min(8 * 1CQI, 120px)").toMatch(CONTAINER_UNIT);
   });
 
-  it("puts every animation OR transition declaration on .activity-glyph[data-moving], with exactly one @keyframes", () => {
-    // The activity star is the one moving thing.
+  it("keeps all motion on the activity glyph, with one animation for each look", () => {
+    // Only the working glyph moves; the tab chooses its animation.
     const moving = movingSelectorsIn(css);
     expect(moving.length).toBeGreaterThan(0);
-    for (const selector of moving) {
-      expect(selector).toBe(".activity-glyph[data-moving]");
+    for (const selector of moving.flatMap((group) => group.split(",").map((s) => s.trim()))) {
+      expect([
+        ".activity-glyph[data-moving]",
+        '.activity-glyph[data-moving][data-look="codex"]',
+        '.activity-glyph[data-moving][data-look="acp"]',
+      ]).toContain(selector);
     }
     const keyframeBlocks = withoutComments.match(/@keyframes\s+[\w-]+\s*\{/g) ?? [];
-    expect(keyframeBlocks).toHaveLength(1);
+    expect(keyframeBlocks).toHaveLength(2);
     expect(keyframeBlocks[0]).toContain("turn-breath");
+    expect(keyframeBlocks[1]).toContain("turn-pulse");
 
     // Negative control: a second animated selector and a second @keyframes.
     const twoAnimations =
@@ -942,6 +947,26 @@ describe("index.css", () => {
     // decoding idents needs a real tokenizer. Asserted as it behaves, so the day someone adds one
     // this line is what tells them the guard was never claiming to.
     expect(movingSelectorsIn(".row-current { animati\\6fn: turn-meter 2s; }")).toEqual([]);
+  });
+
+  it("pulses Codex and ACP bullets by opacity only and rests both under reduced motion", () => {
+    const frames = withoutComments.match(/@keyframes turn-pulse \{([\s\S]*?)\n\}/);
+    expect(frames).not.toBeNull();
+    const declarations = keyframeDeclarations(frames![1]);
+    expect(declarations.length).toBeGreaterThan(0);
+    for (const declaration of declarations) expect(declaration).toMatch(/^opacity\s*:/);
+    expect(frames![1]).toMatch(/0%,\s*100%\s*\{\s*opacity: 1;/);
+    expect(frames![1]).toMatch(/50%\s*\{\s*opacity: 0\.5;/);
+    const reduced = withoutComments.match(/@media \(prefers-reduced-motion: reduce\) \{[\s\S]*?\n\}/)![0];
+    for (const look of ["codex", "acp"]) {
+      const selector = `.activity-glyph[data-moving][data-look="${look}"]`;
+      const rule = splitRules(withoutComments).find((r) =>
+        r.selector.split(",").map((s) => s.trim()).includes(selector) && r.declarations.includes("turn-pulse"));
+      expect(rule?.declarations).toContain("animation: turn-pulse calc(var(--meter-step, 300ms) * 4) ease-in-out infinite;");
+      expect(reduced).toContain(selector);
+    }
+    expect(reduced).toContain("animation: none;");
+    expect(reduced).toContain("opacity: 1;");
   });
 
   /// A quote-unaware stripper can treat two content values as a comment pair and delete real rules

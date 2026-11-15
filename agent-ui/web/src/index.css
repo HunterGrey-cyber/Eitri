@@ -1094,10 +1094,25 @@ pre {
     transform: scale(0.6);
   }
 }
+.activity-glyph[data-moving][data-look="codex"],
+.activity-glyph[data-moving][data-look="acp"] {
+  animation: turn-pulse calc(var(--meter-step, 300ms) * 4) ease-in-out infinite;
+}
+@keyframes turn-pulse {
+  0%, 100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.5;
+  }
+}
 @media (prefers-reduced-motion: reduce) {
-  .activity-glyph[data-moving] {
+  .activity-glyph[data-moving],
+  .activity-glyph[data-moving][data-look="codex"],
+  .activity-glyph[data-moving][data-look="acp"] {
     animation: none;
     transform: scale(1);
+    opacity: 1;
   }
 }
 .turn-activity {
