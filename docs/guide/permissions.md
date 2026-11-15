@@ -60,8 +60,8 @@ This is the normal case. Eitri asks Claude Code to run its own auto mode and the
   rule did it.
 - Every other call is left to Claude Code's auto mode, which decides with its own classifier. Eitri draws no card
   for it and does not apply its own checks.
-  The exception is a project that is [no boundary](#a-folder-that-is-no-boundary): there Eitri's own rules answer,
-  as in a Manual tab.
+  The exceptions are a project that is [no boundary](#a-folder-that-is-no-boundary): there Eitri's own rules answer,
+  as in a Manual tab; and a write into [Eitri's own configuration](#eitris-own-configuration), which is a card.
 - When Claude Code refuses a call, the tool's row says `blocked by auto: <reason>`. After repeated refusals
   Claude Code asks you itself, on a card.
 
@@ -115,6 +115,35 @@ Claude Code never runs in its own bypass mode under Eitri: it runs in its defaul
 front of it, and "bypass" is only Eitri answering for you. Eitri also checks which mode Claude Code reports. If
 a session reports a mode Eitri did not ask for and does not expect, such as Claude Code's own bypass mode, Eitri
 ends that session with a message and answers nothing further in it.
+
+### Eitri's own configuration
+
+What Eitri reads when it starts takes effect the next time you open a window, and nobody is asked then. So a call
+that writes into one of these places is a card in manual and in auto, also where Claude Code runs its own auto mode,
+and no saved rule allows it:
+
+- your configuration directory, `~/.config/eitri` (and `$XDG_CONFIG_HOME/eitri` or `$EITRI_CONFIG_DIR` when you set
+  them): `init.lua`, what it `require`s from `lua/`, `neovide.toml`;
+- `~/.local/share/eitri` (and `$XDG_DATA_HOME/eitri`): your own plugins, which win over the shipped ones, and the
+  Neovim and the agent sidecar Eitri installed for itself;
+- `~/.local/state/eitri` (and `$XDG_STATE_HOME/eitri`): your saved rules, the projects you trusted, the mode each
+  project remembers, layouts;
+- the directory the `eitri` program runs from, which holds the shipped plugins and the sidecar, and for the
+  installer's copy `~/.local/lib/eitri` and the `~/.local/bin/eitri` launcher;
+- `eitri` under each system data directory the plugin search reads (`$XDG_DATA_DIRS`, or `/usr/local/share` and
+  `/usr/share`), where an installed package's plugins live.
+
+Eitri follows links on the way, so a link in your project that leads into one of them counts, and so does a
+configuration directory that is itself a link into a dotfiles repository you have open. It also follows the links
+inside these directories back to where they lead: when a dotfiles manager linked `~/.config/eitri/init.lua` to a file
+in your dotfiles repository, a write to that file is a card too. A file with a second name (a hard link) is a card,
+since that other name could be one of these files. If your project is one of these directories, lies inside one, or
+is where a link in one leads, every edit and command in it is a card. This check leaves reading alone (a read outside
+the project asks for its own reason), and bypass allows the writes as it allows everything else.
+
+A shell command is judged by its text, as everywhere in Eitri: one that names one of these directories
+(`~/.config/eitri`, `$HOME/.local/share/eitri`, the full path, or a variable such as `$XDG_CONFIG_HOME`) is a card.
+One that gets there another way, a script or a `cd` first, is not seen; see [Known limits](#known-limits).
 
 ## A folder that is no boundary
 
@@ -406,6 +435,10 @@ Turn review, the other thing the panel can show after a turn, is described in [R
 Most of these are also in the [known issues](../known-issues.md#security), and they are the places where the behaviour
 above is weaker than it may sound.
 
+- **A command can reach Eitri's own configuration without naming it.** Eitri reads a shell command's text, so a
+  command that writes there through a script, a `cd` first or a path it builds is not a card for that reason
+  ([Eitri's own configuration](#eitris-own-configuration)). In an Auto tab, Claude Code's auto mode decides it, as it
+  decides a write to `~/.bashrc`.
 - **A hook can change a call after it was approved.** A hook in your own Claude Code settings, or in a trusted
   project's, can rewrite a tool call's input after Eitri has seen the original. When Claude Code then asks, its
   card shows the rewritten input and the tool's row shows the original. Hooks work this way in a terminal too.

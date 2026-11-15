@@ -172,6 +172,11 @@ use crate::project_boundary::{checked_root, Identity};
 use serde_json::Value;
 use std::path::{Path, PathBuf};
 
+mod eitri_places;
+pub use eitri_places::{
+    eitri_places_card, EitriPlaceInputs, EitriPlaces, REASON_EITRI_OWN_PLACES, REASON_EITRI_PLACE_UNKNOWN,
+};
+
 /// The filesystem facts available to the gate. A remote root supplies no laptop facts.
 #[derive(Debug, Clone, Copy)]
 pub enum GateRoot<'a> {
@@ -477,7 +482,31 @@ struct Surroundings<'a> {
 ///
 /// Total: every input produces a verdict, and every path that is not a positive, confident match
 /// produces [`PermissionVerdict::AskTheUser`].
+///
+/// A call that writes, or may write, into one of Eitri's own places ([`EitriPlaces`], this process's) is a card
+/// before anything else is asked.
 pub fn classify_permission_request(tool_name: &str, input: &Value, project_root: &Path) -> Classification {
+    classify_with_places(tool_name, input, project_root, &EitriPlaces::from_process())
+}
+
+/// [`classify_permission_request`] with the places passed in.
+fn classify_with_places(tool_name: &str, input: &Value, project_root: &Path, places: &EitriPlaces) -> Classification {
+    let place_card = eitri_places_card(tool_name, input, project_root, places);
+    if let Some(card) = place_card.filter(|card| card.reason == REASON_EITRI_OWN_PLACES) {
+        return card;
+    }
+    // A place card that only says where the call writes is unknown gives way to a card of the policy's own, whose
+    // reason is the more exact one, unless a saved rule could answer that card; it still cards where the policy
+    // would allow.
+    let classification = classify_without_places(tool_name, input, project_root);
+    match place_card {
+        Some(card) if !classification.needs_a_human() || REPLACEABLE_BY_A_RULE.contains(&classification.reason) => card,
+        _ => classification,
+    }
+}
+
+/// [`classify_permission_request`] without the places' check.
+fn classify_without_places(tool_name: &str, input: &Value, project_root: &Path) -> Classification {
     let home = std::env::var_os("HOME").map(PathBuf::from);
     let surroundings = Surroundings {
         home: home.as_deref(),
@@ -497,10 +526,21 @@ pub fn classify_with_rules(
     project_root: &Path,
     rules: &crate::permission_rules::PrefixRules,
 ) -> Classification {
-    if rule_that_allows(tool_name, input, project_root, rules).is_some() {
+    classify_with_rules_and_places(tool_name, input, project_root, rules, &EitriPlaces::from_process())
+}
+
+/// [`classify_with_rules`] with the places passed in.
+fn classify_with_rules_and_places(
+    tool_name: &str,
+    input: &Value,
+    project_root: &Path,
+    rules: &crate::permission_rules::PrefixRules,
+    places: &EitriPlaces,
+) -> Classification {
+    if rule_that_allows_with_places(tool_name, input, project_root, rules, places).is_some() {
         return allow(REASON_ALLOWED_BY_A_PROJECT_RULE);
     }
-    classify_permission_request(tool_name, input, project_root)
+    classify_with_places(tool_name, input, project_root, places)
 }
 
 /// Why a file write or edit is a card in a Manual tab, wherever it points.
@@ -521,10 +561,21 @@ pub fn classify_in_manual(
     project_root: &Path,
     rules: &crate::permission_rules::PrefixRules,
 ) -> Classification {
+    classify_in_manual_with_places(tool_name, input, project_root, rules, &EitriPlaces::from_process())
+}
+
+/// [`classify_in_manual`] with the places passed in.
+fn classify_in_manual_with_places(
+    tool_name: &str,
+    input: &Value,
+    project_root: &Path,
+    rules: &crate::permission_rules::PrefixRules,
+    places: &EitriPlaces,
+) -> Classification {
     if EDIT_TOOLS.contains(&tool_name) {
         return ask(REASON_MANUAL_ASKS_BEFORE_EVERY_EDIT);
     }
-    classify_with_rules(tool_name, input, project_root, rules)
+    classify_with_rules_and_places(tool_name, input, project_root, rules, places)
 }
 
 /// The policy at a root with no boundary, without reading any filesystem or identity facts.
@@ -556,8 +607,19 @@ pub fn rule_that_allows(
     project_root: &Path,
     rules: &crate::permission_rules::PrefixRules,
 ) -> Option<String> {
+    rule_that_allows_with_places(tool_name, input, project_root, rules, &EitriPlaces::from_process())
+}
+
+/// [`rule_that_allows`] with the places passed in: a call into one of them is never one a rule answers.
+fn rule_that_allows_with_places(
+    tool_name: &str,
+    input: &Value,
+    project_root: &Path,
+    rules: &crate::permission_rules::PrefixRules,
+    places: &EitriPlaces,
+) -> Option<String> {
     let rule = rules.matching_rule(tool_name, input)?;
-    let classification = classify_permission_request(tool_name, input, project_root);
+    let classification = classify_with_places(tool_name, input, project_root, places);
     (classification.needs_a_human() && REPLACEABLE_BY_A_RULE.contains(&classification.reason))
         .then(|| rule.to_rule_string())
 }

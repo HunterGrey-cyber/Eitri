@@ -103,8 +103,9 @@ pub use move_seed::{
     ChatMoveCore, ConversationHandoff, HandoffRefused, MoveSeed, MovedProvider, PendingName, SeedRefused,
 };
 pub use permission_policy::{
-    classify_in_manual, classify_permission_request, classify_with_rules, classify_without_a_boundary, judge_edit_path,
-    judge_project_path, rule_that_allows, Classification, GateRoot, OutsideReason, PathJudgement, PermissionVerdict,
+    classify_in_manual, classify_permission_request, classify_with_rules, classify_without_a_boundary,
+    eitri_places_card, judge_edit_path, judge_project_path, rule_that_allows, Classification, EitriPlaceInputs,
+    EitriPlaces, GateRoot, OutsideReason, PathJudgement, PermissionVerdict,
 };
 pub use permission_rules::{PrefixRule, PrefixRules, RuleRefusal};
 pub use persistence::{

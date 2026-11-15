@@ -1,5 +1,5 @@
 [English](permissions.md) | 简体中文
-<!-- translated-from: permissions.md sha256=f0313dfa77afac8259f8cdf8623b00af474a9c7703d549f4a08edbb65393e842 -->
+<!-- translated-from: permissions.md sha256=593ae621be65344725bf69158b3746d31fc70df1ce179794936142b2e2a77a1b -->
 
 # 权限与信任
 
@@ -31,7 +31,7 @@ Claude Code 的定时和任务工具在任何模式下都不出卡片，因为 C
 
 - 你的[保存的规则](#saved-rules)允许的调用会被立即批准，工具那一行会说是哪条规则做的。
 - 其他每一次调用都交给 Claude Code 的 auto 模式，由它用自己的分类器来决定。Eitri 不为它画卡片，也不应用自己的检查。
-  例外是[不算边界](#a-folder-that-is-no-boundary)的项目：在那里由 Eitri 自己的规则来回答，和 Manual 标签页一样。
+  例外有两个：[不算边界](#a-folder-that-is-no-boundary)的项目，在那里由 Eitri 自己的规则来回答，和 Manual 标签页一样；以及写进 [Eitri 自己的配置](#eitris-own-configuration)的调用，那是一张卡片。
 - Claude Code 拒绝一次调用时，工具那一行会写 `blocked by auto: <原因>`。多次被拒绝之后，Claude Code 会自己用一张卡片来问你。
 
 <a id="auto-when-claude-code-is-not-running-its-auto-mode"></a>
@@ -59,6 +59,21 @@ Claude 问你的选择题，bypass 永远不会回答（[Claude 问你的问题]
 ### Claude Code 自己运行在什么模式下
 
 在 Eitri 之下，Claude Code 从不运行在它自己的 bypass 模式里：它运行在它的默认模式或 auto 模式里，Eitri 站在它前面，而“bypass”只是 Eitri 替你回答。Eitri 还会检查 Claude Code 报告的是哪种模式。如果一个会话报告的模式是 Eitri 没有要求、也不预期的，比如 Claude Code 自己的 bypass 模式，Eitri 会带着一条消息结束那个会话，并且在其中不再回答任何东西。
+
+<a id="eitris-own-configuration"></a>
+### Eitri 自己的配置
+
+Eitri 启动时读到的东西，会在你下一次打开窗口时生效，那时不会有人被问到。所以往下面这些地方写入的调用，在 manual 和 auto 下都是一张卡片，Claude Code 运行它自己的 auto 模式时也一样，而且没有哪条保存的规则能放行它：
+
+- 你的配置目录 `~/.config/eitri`（以及你设置了的 `$XDG_CONFIG_HOME/eitri` 或 `$EITRI_CONFIG_DIR`）：`init.lua`、它从 `lua/` 里 `require` 的文件、`neovide.toml`；
+- `~/.local/share/eitri`（以及 `$XDG_DATA_HOME/eitri`）：你自己的插件（它们优先于随附的插件），还有 Eitri 给自己装的 Neovim 和 agent sidecar；
+- `~/.local/state/eitri`（以及 `$XDG_STATE_HOME/eitri`）：你保存的规则、你信任过的项目、每个项目记住的模式、布局；
+- `eitri` 程序所在的目录，里面放着随附的插件和 sidecar；用安装脚本装的，还有 `~/.local/lib/eitri` 和启动脚本 `~/.local/bin/eitri`；
+- 插件搜索会读的每个系统数据目录（`$XDG_DATA_DIRS`，或 `/usr/local/share` 和 `/usr/share`）下的 `eitri`，安装包的插件就放在那里。
+
+Eitri 会沿途跟随链接，所以项目里一个通往这些目录之一的链接也算，配置目录本身是一个指向你正打开的 dotfiles 仓库的链接时也算。它也会顺着这些目录里面的链接找到它们指向的地方：dotfiles 管理工具把 `~/.config/eitri/init.lua` 链接到你 dotfiles 仓库里的某个文件时，往那个文件写入也是一张卡片。有第二个名字的文件（硬链接）也是一张卡片，因为那个名字可能就是这些文件之一。如果你的项目就是这些目录之一、在其中某个目录里面，或者是其中某个链接指向的地方，那么在它里面的每一次编辑和每一条命令都是卡片。这项检查不管读取（读项目之外的文件会因为它自己的原因询问），bypass 照样放行这些写入，和它放行其他一切一样。
+
+和 Eitri 里其他地方一样，shell 命令按它的文字来判断：点名这些目录之一的命令（`~/.config/eitri`、`$HOME/.local/share/eitri`、完整路径，或者 `$XDG_CONFIG_HOME` 这样的变量）是一张卡片。用别的办法到达那里的命令，比如通过脚本或先 `cd`，不会被看到；见[已知限制](#known-limits)。
 
 <a id="a-folder-that-is-no-boundary"></a>
 ## 不算边界的文件夹
@@ -205,6 +220,7 @@ eitri.config.set("agent.user_settings", false)    -- true (the default) or false
 
 其中大多数也在[已知问题](../known-issues.zh-CN.md#安全)里，它们是上面所述的行为比听起来要弱的地方。
 
+- **命令可以不点名就到达 Eitri 自己的配置。** Eitri 读的是 shell 命令的文字，所以通过脚本、先 `cd`，或者自己拼出路径往那里写的命令，不会因此成为卡片（[Eitri 自己的配置](#eitris-own-configuration)）。在 Auto 标签页里，由 Claude Code 的 auto 模式来决定它，就像它决定一次对 `~/.bashrc` 的写入一样。
 - **一个 hook 可以在调用被批准之后改动它。** 你自己的 Claude Code 设置里的 hook，或者被信任的项目里的 hook，可以在 Eitri 看到原始调用之后改写一次工具调用的输入。这时 Claude Code 再询问，它的卡片显示的是改写后的输入，而工具那一行显示的是原来的。在终端里 hook 也是这样工作的。
 - **在 Auto 标签页里，Claude Code 的 auto 模式可以不询问就写入 `.git/` 下**，新的 git hook 也包括在内。Manual 标签页把每一次 `Write`、`Edit` 和 `NotebookEdit` 调用都放到卡片上，但不是每一次写入：shell 命令按它的文字判断，所以像 `Bash(cp *)` 这样保存的规则仍然会让 `cp x .git/hooks/pre-commit` 运行。回合审阅不显示 `.git/` 下的改动，信任问题盯着 `.claude/`、`.mcp.json` 和 `CLAUDE.md`，不盯 `.git/`。在一个你在意的仓库里完成一个回合之后，值得看一眼 `ls .git/hooks`。对 `.claude/` 下的编辑，Eitri 确实会在下一个会话之前再问一次信任问题。
 - **被信任的项目自己的 `permissions.allow` 规则，只有在你也在终端 `claude` 里信任了那个目录时，才会到达 Auto 标签页。** 这是 Claude Code 自己的规则。你的用户设置里的规则始终适用。

@@ -247,6 +247,11 @@ one-window mode.
   git hook included. Turn review does not show changes under `.git/`, and the trust question watches `.claude/`,
   `.mcp.json` and `CLAUDE.md`, not `.git/`. After a turn in a repository you care about, `ls .git/hooks` is worth a
   look. An edit under `.claude/`, by contrast, makes Eitri ask the trust question again before the next session.
+- **A shell command can reach Eitri's own configuration without naming it.** A write into `~/.config/eitri`, Eitri's
+  data and state directories or the directory the program runs from is a card in Manual and Auto
+  ([the permissions guide](guide/permissions.md#eitris-own-configuration)), but a shell command is judged by its text:
+  one that gets there through a script, a `cd` first or a path it builds is not caught, and in an Auto tab Claude
+  Code's auto mode decides it, as it decides a write to `~/.bashrc`.
 - **A hook in your own Claude Code settings (or a trusted project's) can change a tool call after you approved
   it.** Claude Code applies a hook's rewritten input after Eitri has seen the original; when Claude Code then
   asks, its card shows the rewritten input and the tool's row the original. Hooks work this way in a terminal too.

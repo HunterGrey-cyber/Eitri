@@ -2711,6 +2711,8 @@ impl AgentBackend {
         // request below, because ingestion keeps folding while earlier answers of this batch are
         // sent, and a trip or a fallback to `default` it folds there must reach the next request.
         let mut tripped = false;
+        // Read once per batch: the environment and the running binary do not move under a window.
+        let places = agent::EitriPlaces::from_process();
         let mut kept = Vec::with_capacity(events.len());
         for (revision, event) in events {
             // The host reads these from the projection, where a resync cannot lose them; no page has
@@ -2834,6 +2836,7 @@ impl AgentBackend {
                 project_root,
                 approvals: &*approvals,
                 planning,
+                places: &places,
             };
             // The tab's mode is the mode plan mode was entered from: while the CLI runs plan mode, its table
             // decides (`plan_verdict`).
@@ -3710,6 +3713,9 @@ struct Judge<'a> {
     /// Set when the request is judged as one the CLI made in plan mode (`RequestPhase::Planning`, and the plan
     /// half of an uncertain one): the plan table answers first, and every prompt of the CLI's own is a card.
     planning: Option<PlanGate>,
+    /// Where Eitri reads its own configuration and code at start: a call that may write there is a card in every
+    /// mode but Bypass, ahead of the plan table and the deferral to the CLI.
+    places: &'a agent::EitriPlaces,
 }
 
 /// The CLI runs plan mode, entered from the tab's mode `origin`. `cli_runs_auto` is whether the session runs
@@ -3966,6 +3972,7 @@ fn decide(request: GateRequest<'_>, judge: Judge<'_>) -> Option<PlannedAnswer> {
         project_root,
         approvals,
         planning,
+        places,
     } = judge;
     let GateRequest {
         tool_use_id,
@@ -4062,6 +4069,16 @@ fn decide(request: GateRequest<'_>, judge: Judge<'_>) -> Option<PlannedAnswer> {
             format!("left to the editor broker: {tool_name}"),
             format!("leave {tool_name} to the editor broker"),
         ));
+    }
+    // Ahead of the plan table, bypass and the deferral: a write into Eitri's own configuration takes effect at its
+    // next start, so neither the CLI's classifier nor a saved rule answers it. Bypass outside plan mode allows it, as
+    // it allows a write into the other protected paths.
+    // In plan mode a Bypass tab answers nothing itself (`plan_verdict`), so the check holds there too.
+    if let (true, GateRoot::Local(path)) = (mode != PermissionMode::Bypass || planning.is_some(), project_root) {
+        if let Some(card) = agent::eitri_places_card(tool_name, input, path, places) {
+            eprintln!("[permission] asking the user: {tool_name} ({})", card.reason);
+            return None;
+        }
     }
     let mode = match planning.map(|gate| plan_verdict(tool_name, false, gate, gate_root_is_a_boundary(project_root))) {
         None => mode,
@@ -7467,6 +7484,115 @@ mod tests {
         (delivered, answered)
     }
 
+    /// A write into Eitri's own configuration takes effect at its next start, so on an auto session it is a card and
+    /// is never left to the CLI's classifier, by whichever tool it comes. The places are this process's own (`$HOME`
+    /// as the test runs), as the window reads them; nothing is written there.
+    #[test]
+    fn an_auto_tab_on_an_auto_session_cards_a_write_into_eitris_own_places() {
+        let home = std::env::var_os("HOME").map(PathBuf::from).expect("HOME is set");
+        let home = home.display();
+        let dir = a_workspace_holding_one_file();
+        let (provider, mut backend) = auto_backend(&dir);
+        let config = format!("{home}/.config/eitri/init.lua");
+        let plugin = format!("{home}/.local/share/eitri/plugins/md/main.lua");
+        let rules_file = format!("{home}/.local/state/eitri/permissions/rules.json");
+        let carded_ids = [
+            "perm-write",
+            "perm-edit",
+            "perm-multi",
+            "perm-notebook",
+            "perm-echo",
+            "perm-cp",
+            "perm-monitor",
+            "perm-mcp",
+        ];
+        provider.queue_all(vec![
+            cli_reports("auto"),
+            gate(
+                "perm-write",
+                "tu-1",
+                "Write",
+                serde_json::json!({ "file_path": config, "content": "x" }),
+            ),
+            gate(
+                "perm-edit",
+                "tu-2",
+                "Edit",
+                serde_json::json!({ "file_path": config, "old_string": "a", "new_string": "b" }),
+            ),
+            gate(
+                "perm-multi",
+                "tu-3",
+                "MultiEdit",
+                serde_json::json!({ "file_path": plugin, "edits": [] }),
+            ),
+            gate(
+                "perm-notebook",
+                "tu-4",
+                "NotebookEdit",
+                serde_json::json!({ "notebook_path": rules_file, "new_source": "x" }),
+            ),
+            gate(
+                "perm-echo",
+                "tu-5",
+                "Bash",
+                serde_json::json!({ "command": "echo 'x' >> ~/.config/eitri/init.lua" }),
+            ),
+            gate(
+                "perm-cp",
+                "tu-6",
+                "Bash",
+                serde_json::json!({ "command": format!("cp evil.lua {plugin}") }),
+            ),
+            gate(
+                "perm-monitor",
+                "tu-7",
+                "Monitor",
+                serde_json::json!({ "command": "sh -c 'cat a > $HOME/.config/eitri/init.lua'" }),
+            ),
+            gate(
+                "perm-mcp",
+                "tu-8",
+                "mcp__fs__write_file",
+                serde_json::json!({ "path": config, "content": "x" }),
+            ),
+            gate(
+                "perm-ok",
+                "tu-9",
+                "Write",
+                serde_json::json!({ "file_path": "main.rs", "content": "x" }),
+            ),
+            gate(
+                "perm-build",
+                "tu-10",
+                "Bash",
+                serde_json::json!({ "command": "cargo build" }),
+            ),
+        ]);
+        let rules = agent::PrefixRules::default().with(agent::PrefixRule::parse("Bash(cp *)").unwrap());
+        let (delivered, _) = deliver_noting(
+            &provider,
+            &mut backend,
+            &dir,
+            &rules,
+            PermissionMode::Auto,
+            &mut BTreeSet::new(),
+            &mut HumanApprovals::default(),
+        );
+        for id in carded_ids {
+            assert!(carded(&delivered, id), "{id}: {delivered:?}");
+        }
+        assert_eq!(
+            provider.decisions(),
+            vec![
+                ("perm-ok".to_string(), PermissionDecision::Defer),
+                ("perm-build".to_string(), PermissionDecision::Defer),
+            ],
+            "only the calls that name no place are left to the CLI"
+        );
+        backend.shutdown();
+    }
+
     #[test]
     fn an_auto_tab_on_an_auto_session_defers_every_gate_request_and_draws_no_card() {
         let dir = a_workspace_holding_one_file();
@@ -9875,6 +10001,7 @@ mod eitri_gate_tests {
                 project_root: root,
                 approvals: &HumanApprovals::default(),
                 planning: None,
+                places: &agent::EitriPlaces::default(),
             },
         )
     }
@@ -10139,6 +10266,107 @@ mod eitri_gate_tests {
         assert_eq!(got.decisions, [("p1".to_string(), PermissionDecision::Defer)]);
     }
 
+    /// What `decide` says of one request at `root`, with these places and no declared tools.
+    fn decided_at(
+        root: &Path,
+        mode: PermissionMode,
+        defers_to_the_cli: bool,
+        planning: Option<PlanGate>,
+        tool: &str,
+        input: &serde_json::Value,
+        places: &agent::EitriPlaces,
+    ) -> Option<PlannedAnswer> {
+        let rules = agent::PrefixRules::default().with(agent::PrefixRule::parse("Bash(cp *)").unwrap());
+        decide(
+            GateRequest {
+                permission_id: "p1",
+                tool_use_id: &Some("tu-1".into()),
+                tool_name: tool,
+                input,
+                provider_prompt: None,
+            },
+            Judge {
+                mode,
+                external: false,
+                defers_to_the_cli,
+                own_tools: None,
+                rules: &rules,
+                project_root: GateRoot::Local(root),
+                approvals: &HumanApprovals::default(),
+                planning,
+                places,
+            },
+        )
+    }
+
+    /// Every mode but Bypass cards a write into Eitri's own places: Manual, Auto on Eitri's policy, Auto on an
+    /// auto session (where every other call is left to the CLI), and plan mode (where a main-thread `Write` is left to
+    /// the CLI's plan mode). Bypass allows it, as it allows a write into the other protected paths.
+    #[test]
+    fn a_write_into_eitris_own_places_is_a_card_in_every_mode_but_bypass() {
+        agent::state_dirs::redirect_state_to_a_test_root();
+        let root = agent::state_dirs::test_workspace_dir("eitri-places-decide");
+        // Whatever the umask: a root others can write to is no boundary.
+        std::fs::set_permissions(&root, std::os::unix::fs::PermissionsExt::from_mode(0o700)).unwrap();
+        let places = agent::EitriPlaces::from_values(&agent::EitriPlaceInputs {
+            home: Some(std::ffi::OsStr::new("/h")),
+            ..Default::default()
+        });
+        let plan = |origin| {
+            Some(PlanGate {
+                origin,
+                cli_runs_auto: true,
+                main_thread: true,
+            })
+        };
+        let calls = [
+            (
+                "Write",
+                serde_json::json!({ "file_path": "/h/.config/eitri/init.lua", "content": "x" }),
+            ),
+            (
+                "Bash",
+                serde_json::json!({ "command": "cp evil.lua /h/.config/eitri/init.lua" }),
+            ),
+            (
+                "Bash",
+                serde_json::json!({ "command": "echo x > ~/.local/share/eitri/plugins/md/main.lua" }),
+            ),
+        ];
+        for (tool, input) in &calls {
+            for (mode, defers, planning) in [
+                (PermissionMode::Manual, false, None),
+                (PermissionMode::Auto, false, None),
+                (PermissionMode::Auto, true, None),
+                (PermissionMode::Auto, true, plan(PermissionMode::Auto)),
+                (PermissionMode::Manual, false, plan(PermissionMode::Manual)),
+                (PermissionMode::Bypass, true, plan(PermissionMode::Bypass)),
+            ] {
+                assert!(
+                    decided_at(&root, mode, defers, planning, tool, input, &places).is_none(),
+                    "{mode:?} defers={defers} plan={planning:?} {tool} {input}"
+                );
+            }
+            let bypass = decided_at(&root, PermissionMode::Bypass, true, None, tool, input, &places).unwrap();
+            assert_eq!(bypass.decision, PermissionDecision::Allow, "{tool} {input}");
+        }
+        // With no places the same calls are left to the CLI, so the cards above are the places' own.
+        let none = agent::EitriPlaces::default();
+        let (tool, input) = &calls[0];
+        let deferred = decided_at(&root, PermissionMode::Auto, true, None, tool, input, &none).unwrap();
+        assert_eq!(deferred.decision, PermissionDecision::Defer);
+        let in_plan = decided_at(
+            &root,
+            PermissionMode::Auto,
+            true,
+            plan(PermissionMode::Auto),
+            tool,
+            input,
+            &none,
+        );
+        assert_eq!(in_plan.unwrap().decision, PermissionDecision::Defer);
+    }
+
     /// What `decide` says about one request, with the declared set in hand: the log line tells the broker's
     /// answer from bypass's, which are the same `allow`.
     fn decided(mode: PermissionMode, own: bool) -> Option<String> {
@@ -10161,6 +10389,7 @@ mod eitri_gate_tests {
                 project_root: GateRoot::Local(Path::new("/nonexistent")),
                 approvals: &HumanApprovals::default(),
                 planning: None,
+                places: &agent::EitriPlaces::default(),
             },
         )
         .map(|planned| planned.sent)
