@@ -299,11 +299,11 @@ fn a_shell_that_ignores_sighup_is_killed_after_the_grace_period() {
 
 #[test]
 fn a_large_input_is_delivered_whole_without_stalling() {
-    let gate = ChildGate::new();
+    let (first, second) = (ChildGate::new(), ChildGate::new());
     let script = format!(
         "stty raw -echo; printf ready; read x < {}; printf mid; read x < {}; head -c 200000 | wc -c",
-        gate.path(),
-        gate.path()
+        first.path(),
+        second.path()
     );
     let mut h = Harness::start(spec("/bin/sh", &["-c", &script]), size(80, 5));
     h.wait_for(WAIT, |h| h.text().first().is_some_and(|l| l.starts_with("ready")));
@@ -312,10 +312,10 @@ fn a_large_input_is_delivered_whole_without_stalling() {
         bracketed: false,
     });
     // The child cannot drain the paste until the host has seen mid.
-    gate.release();
+    first.release();
     h.wait_for(WAIT, |h| h.text().iter().any(|l| l.contains("mid")));
     assert!(h.session.outbox_high_water() > 0, "the paste waited in the outbox");
-    gate.release();
+    second.release();
     h.wait_for(WAIT, |h| h.exited.is_some());
     assert!(h.text().iter().any(|l| l.contains("200000")), "{:?}", h.text());
 }

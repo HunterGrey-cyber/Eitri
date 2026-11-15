@@ -988,8 +988,8 @@ mod linux {
                 &lock,
                 || clock.get(),
                 || {
+                    // Free once dropped: the drop unlocks before it closes, whatever copies a fork holds.
                     drop(probe.take());
-                    // A concurrent fork can hold a copy until it execs.
                     assert!(Instant::now() < guard, "the released lock never came free");
                     std::thread::yield_now();
                 }
@@ -1142,8 +1142,7 @@ mod linux {
             assert!(!is_running(&dirs).unwrap(), "a look's shared hold read as serve");
             drop(look);
             let serve = PrivateLock::open(&path).unwrap();
-            // A child forked by another test shares the dropped look's description until exec.
-            // Wait for the exclusive take itself: a shared probe can still succeed in that interval.
+            // The dropped look unlocked before it closed, so this take succeeds at once; the loop is a hang guard.
             let until = Instant::now() + Duration::from_secs(60);
             while !serve.try_lock().unwrap() {
                 assert!(Instant::now() < until, "the shared hold was never let go");

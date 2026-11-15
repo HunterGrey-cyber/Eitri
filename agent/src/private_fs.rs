@@ -623,19 +623,34 @@ pub fn read_private_to_string(path: &Path) -> std::io::Result<String> {
 }
 
 /// A lock file of this user's whose exclusive `flock` stands for one store file's read-modify-write.
-/// The lock, when [`try_lock`](Self::try_lock) took it, is held until this is dropped: closing the
-/// descriptor releases it, and so does the process ending, however it ends, so a crashed window never
-/// leaves a store locked.
+/// The lock, when [`try_lock`](Self::try_lock) took it, is held until this is dropped: the drop unlocks
+/// and closes the descriptor, and the process ending releases it too, however it ends, so a crashed window
+/// never leaves a store locked.
 ///
 /// The lock is a file beside the store, never the store itself: a store is replaced by a rename, and a
 /// lock on the inode a writer opened would not exclude one that opened the file renamed over it.
 /// `flock` belongs to the open file description, so two opens of one lock file exclude each other even
 /// inside one process (two threads, each with its own `PrivateLock`); over NFS Linux takes it as a
 /// byte-range lock, which excludes other processes only, so there each store must keep a single writer
-/// per process (each window has one per store). A child forked while it is held
-/// shares the description until its `exec` closes it (`O_CLOEXEC`), so it may hold a moment longer.
+/// per process (each window has one per store).
+///
+/// A child another thread forks shares every open file description until its `exec` closes the copy
+/// (`O_CLOEXEC`), and a lock lives as long as any descriptor of its description, so closing this one alone
+/// would leave the lock held for as long as such a child takes to reach its `exec` -- long, on a loaded
+/// machine. The drop therefore lets the lock go with `LOCK_UN` before the descriptor closes, which releases
+/// it for every copy at once, however it was taken (through this type or a `flock` on [`Self::as_file`]).
+/// On a local file system the unlock acts on this open's description only, so a handle that never took the
+/// lock unlocks nothing and another open's lock is never touched; over NFS, where the lock is a byte-range
+/// lock of the process, the unlock can release no more than the close after it already could.
 pub struct PrivateLock {
     file: std::fs::File,
+}
+
+impl Drop for PrivateLock {
+    fn drop(&mut self) {
+        // SAFETY: the descriptor is `self.file`'s own and still open; `flock` takes no pointers.
+        unsafe { libc::flock(self.file.as_raw_fd(), libc::LOCK_UN) };
+    }
 }
 
 impl PrivateLock {
@@ -1900,13 +1915,8 @@ mod tests {
     }
 
     /// Two opens of one lock file exclude each other, in one process too: the second try fails while the
-    /// first holds it and succeeds once that one is dropped. The file is 0600 and never truncated.
-    ///
-    /// "Once dropped" is not "at the same instant": the lib tests run on many threads and some spawn a
-    /// process, and a child forked while the first lock is held shares its open file description until
-    /// the child's `exec` closes it (`O_CLOEXEC`), so the lock can stay held for a moment after the drop.
-    /// The test therefore tries again until the lock is free, within a hang guard that only stops a lock
-    /// that never frees; it asserts no wall-clock bound on how soon.
+    /// first holds it and succeeds as soon as that one is dropped, whatever children other test threads are
+    /// forking meanwhile (the drop unlocks before it closes). The file is 0600 and never truncated.
     #[test]
     fn a_private_lock_excludes_another_open_of_the_same_file_until_dropped() {
         let base = scratch("lock");
@@ -1918,15 +1928,36 @@ mod tests {
         let second = PrivateLock::open(&path).unwrap();
         assert!(!second.try_lock().unwrap(), "held by the first open");
         drop(first);
-        let give_up = std::time::Instant::now() + std::time::Duration::from_secs(10);
-        let mut free = second.try_lock().unwrap();
-        while !free && std::time::Instant::now() < give_up {
-            std::thread::sleep(std::time::Duration::from_millis(2));
-            free = second.try_lock().unwrap();
-        }
-        assert!(free, "free once the first is dropped");
+        assert!(second.try_lock().unwrap(), "free once the first is dropped");
         assert_eq!(mode(&path), 0o600);
         assert_eq!(std::fs::read(&path).unwrap(), b"kept");
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    /// A dropped lock is free at once even while another descriptor of its open file description lives: what
+    /// a child another thread has forked but not yet `exec`ed holds. Here the copy is a `dup` in this process,
+    /// which shares the description just as the child's does; a drop that only closed would leave the lock
+    /// held by the copy. A copy of a handle that never took the lock keeps nothing, and its drop leaves
+    /// another open's lock alone.
+    #[test]
+    fn a_dropped_lock_is_free_at_once_whatever_copies_its_descriptor_has() {
+        let base = scratch("lock-copies");
+        let path = base.join("live.lock");
+        let held = PrivateLock::open(&path).unwrap();
+        assert!(held.try_lock().unwrap());
+        let copy = held.as_file().try_clone().unwrap();
+        drop(held);
+        let other = PrivateLock::open(&path).unwrap();
+        assert!(other.try_lock().unwrap(), "the copy kept the dropped lock held");
+        let looker = PrivateLock::open(&path).unwrap();
+        assert!(!looker.try_lock().unwrap(), "held by the other open");
+        drop(looker);
+        let third = PrivateLock::open(&path).unwrap();
+        assert!(
+            !third.try_lock().unwrap(),
+            "a drop that never held the lock let the other open's go"
+        );
+        drop(copy);
         std::fs::remove_dir_all(&base).unwrap();
     }
 

@@ -499,8 +499,8 @@ mod tests {
         assert!(said[0].contains("remote.listen") && said[0].contains("wildcard"));
     }
 
-    /// Lets `held` go and waits until the lock is free: a child another test forks shares the lock's open file until
-    /// its `exec` closes it, so the lock can stay held a moment after the drop.
+    /// Lets `held` go and waits until the lock reads free. The drop unlocks before it closes, so the lock is free at
+    /// once whatever child another test is forking; the wait only stops a test whose lock is never let go.
     fn release(dirs: &Dirs, held: agent::private_fs::PrivateLock) {
         drop(held);
         let until = Instant::now() + Duration::from_secs(10);

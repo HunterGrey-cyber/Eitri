@@ -2275,6 +2275,12 @@ impl AgentBackend {
             followed_out_of_auto,
             plan_followed,
         } = mode.into();
+        // How far the projection had folded before this drain took its events. A sidecar's ingestion thread
+        // folds on while the drain runs, so a request the projection no longer lists when the drain looks
+        // later may have left by an event the next drain delivers; a lost answer is dropped with its request
+        // only when nothing was folded since this point (see the pruning below).
+        let folded_before_take = (!approvals.lost.0.is_empty() || !approvals.host_sends.0.is_empty())
+            .then(|| self.projection().last_revision);
         let delivery = match self {
             AgentBackend::Legacy(session) => {
                 let events = session.pump_revised();
@@ -2286,6 +2292,8 @@ impl AgentBackend {
             }
             AgentBackend::Conversation { conversation, .. } => conversation.take_revised_ui_delivery(),
         };
+        #[cfg(test)]
+        drain_test_hooks::after_take(self);
         // A prompt can precede the acknowledgement of the approval that covers it. Keep it
         // pending, and reconsider it from canonical state after that send settles. A backend's
         // resync may have dropped a turn boundary, so recorded approvals end with it; this is the
@@ -2372,10 +2380,16 @@ impl AgentBackend {
             approvals
                 .fell_back
                 .retain(|id| projection.pending_permissions.contains_key(id));
-            approvals
-                .lost
-                .0
-                .retain(|lost| projection.pending_permissions.contains_key(&lost.planned.permission_id));
+            // A lost answer is kept for its resolution (`record_lost_answers_taken`), so it goes with its
+            // request only once every fold is one a drain has delivered: had the projection moved since it was
+            // read before this drain's take, the request may have left by a resolution the next drain brings,
+            // and dropping the answer now would leave that resolution nothing to record.
+            if folded_before_take == Some(projection.last_revision) {
+                approvals
+                    .lost
+                    .0
+                    .retain(|lost| projection.pending_permissions.contains_key(&lost.planned.permission_id));
+            }
         }
         if !cards_only.is_empty() {
             let projection = self.projection();
@@ -3123,6 +3137,13 @@ impl AgentBackend {
                 .pending_permissions
                 .contains_key(&planned.permission_id);
             if !pending {
+                // Kept for a resolution still on its way; the drain's pruning drops it with its request.
+                approvals.lost.0.push(LostAnswer {
+                    planned,
+                    mode: planned_under,
+                    retry,
+                    person,
+                });
                 continue;
             }
             match self.respond_permission_async(&planned.permission_id, planned.decision.clone()) {
@@ -4194,7 +4215,8 @@ pub struct HumanApprovals {
     #[serde(skip)]
     fell_back: BTreeSet<String>,
     /// Host answers lost on their way to a remote agent (the connection broke, or no reply came in time),
-    /// pruned to pending requests. Each may be retried once; a person's card answer or another loss stops
+    /// pruned to pending requests at a drain during which nothing was folded since the projection was read
+    /// before its take (a resolution folded later is the next drain's to record). Each may be retried once; a person's card answer or another loss stops
     /// retries while retaining the plan to identify a later resolution.
     #[serde(skip)]
     lost: HostSendsLost,
@@ -4893,6 +4915,30 @@ pub(crate) fn test_claude_projects_root() -> PathBuf {
         root
     })
     .join("projects")
+}
+
+/// A hook a test sets on its own thread to run right after a drain took its events and before it reads the
+/// projection again, so a fold can be made to land in that gap as an ingestion thread's can.
+#[cfg(test)]
+pub(crate) mod drain_test_hooks {
+    use std::cell::RefCell;
+
+    type Hook = Box<dyn FnOnce(&super::AgentBackend)>;
+
+    thread_local! {
+        static AFTER_TAKE: RefCell<Option<Hook>> = RefCell::new(None);
+    }
+
+    pub(crate) fn set_after_take(hook: impl FnOnce(&super::AgentBackend) + 'static) {
+        AFTER_TAKE.with(|h| *h.borrow_mut() = Some(Box::new(hook)));
+    }
+
+    pub(super) fn after_take(backend: &super::AgentBackend) {
+        let hook = AFTER_TAKE.with(|h| h.borrow_mut().take());
+        if let Some(hook) = hook {
+            hook(backend);
+        }
+    }
 }
 
 #[cfg(test)]

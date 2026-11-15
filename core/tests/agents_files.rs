@@ -1475,7 +1475,9 @@ mod read {
         ph.stop();
     }
 
-    /// A child keeps the probe's open file description after the probing thread closes its copy.
+    /// A child keeps the probe's open file description after the probing thread closes its copy without
+    /// unlocking it: what a process killed while it held the lock and was forking leaves (no drop runs, so no
+    /// `LOCK_UN`). A dropped `PrivateLock` unlocks first, which would free the child's copy too.
     struct InheritedProbe {
         release: Option<OwnedFd>,
         pid: libc::pid_t,
@@ -1519,7 +1521,11 @@ mod read {
                 pid
             };
             assert!(pid > 0, "fork: {}", std::io::Error::last_os_error());
-            drop(held);
+            // Closed as a killed holder's descriptor is: no unlock, only the close.
+            let raw = std::os::fd::AsRawFd::as_raw_fd(held.as_file());
+            std::mem::forget(held);
+            // SAFETY: `raw` was the forgotten lock's own descriptor, open and closed nowhere else.
+            unsafe { libc::close(raw) };
             // SAFETY: the successful pipe call made this descriptor, owned only here.
             InheritedProbe {
                 release: Some(unsafe { OwnedFd::from_raw_fd(pipe[1]) }),

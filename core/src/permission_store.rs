@@ -373,8 +373,9 @@ mod tests {
         assert_eq!(load(&dir, &root), LoadedRules::Rules(rules));
     }
 
-    /// Saves once the lock is free: a child another test thread is starting holds a copy of every descriptor
-    /// until it execs, and with it the lock a test just dropped, so "free at once" is not promised.
+    /// Saves once the lock is free. A lock a test just dropped is free at once (a `PrivateLock`'s drop unlocks
+    /// before it closes, so a copy a child another thread is forking holds keeps nothing); the wait is only a
+    /// guard that stops a test whose lock never comes free.
     fn once_free<T>(save: impl Fn() -> std::io::Result<T>) -> std::io::Result<T> {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         loop {

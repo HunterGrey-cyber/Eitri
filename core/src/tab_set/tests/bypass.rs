@@ -1591,6 +1591,60 @@ fn a_lost_answer_the_agent_took_is_recorded() {
     shut_down_all(&mut set);
 }
 
+/// The resolution of a lost answer the agent took can be folded while a drain runs: after the drain took its
+/// events and before it looks at the projection again, which then no longer lists the request. That drain must
+/// not drop the lost answer with its request, or the next drain, which delivers the resolution, has nothing to
+/// record it against. The hook folds the resolution in exactly that gap, as a sidecar's ingestion thread can.
+/// With the link still down the drain only prunes; with it back the drain also looks at resending the answer
+/// and finds its request gone.
+#[test]
+fn a_resolution_folded_while_a_drain_runs_still_records_the_lost_answer() {
+    resolution_folded_mid_drain("remote-lost-mid-drain", "lost-m", false);
+}
+
+#[test]
+fn a_resolution_folded_while_a_drain_runs_with_the_link_back_still_records_the_lost_answer() {
+    resolution_folded_mid_drain("remote-lost-mid-drain-live", "lost-l", true);
+}
+
+fn resolution_folded_mid_drain(label: &str, id: &'static str, link_back: bool) {
+    let (dir, mut set, tab, provider) = lose_a_bypass_answer(label, id);
+    if link_back {
+        provider.set_link(Some(agent::RemoteLinkState::Live));
+    }
+    let folder = provider.clone();
+    let folded = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let seen = folded.clone();
+    crate::agent_backend::drain_test_hooks::set_after_take(move |backend| {
+        folder.queue(AgentDomainEvent::PermissionResolved {
+            permission_id: id.into(),
+            outcome: agent::PermissionOutcome::Allowed,
+        });
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while backend.projection().pending_permissions.contains_key(id) {
+            assert!(Instant::now() < deadline, "the resolution was never folded");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        seen.store(true, std::sync::atomic::Ordering::SeqCst);
+    });
+    set.pump(&dir, true);
+    assert!(folded.load(std::sync::atomic::Ordering::SeqCst), "the hooked drain ran");
+    for _ in 0..3 {
+        set.pump(&dir, true);
+    }
+    assert!(
+        set.get(tab)
+            .unwrap()
+            .gate_answers()
+            .iter()
+            .any(|answer| answer.permission_id == id),
+        "the lost answer the agent took is recorded"
+    );
+    assert!(!set.get(tab).unwrap().card_is_waiting(id));
+    assert_eq!(provider.held_permissions(), 0, "nothing sent again");
+    shut_down_all(&mut set);
+}
+
 /// A backend that reports a link to a server answers without waiting on this thread whatever its tab's origin says,
 /// as `approve_pending` does: its answer is tracked until its reply, never waited for here.
 #[test]

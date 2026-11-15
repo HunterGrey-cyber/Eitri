@@ -1137,10 +1137,9 @@ mod tests {
         }
     }
 
-    /// Waits until `sock`'s liveness lock can be taken. A child forked by another test keeps a dropped
-    /// holder's descriptor until it execs, so a lock just let go can look held for a moment; one that
-    /// was never let go is still held at the end of the wait. The probe is unlocked before it goes, so
-    /// a fork's copy of the probe cannot hold the lock past its drop either.
+    /// Waits until `sock`'s liveness lock can be taken; one that was never let go is still held at the end of
+    /// the wait. The probe is unlocked before it goes (its drop would unlock too), so a fork's copy of the
+    /// probe cannot hold the lock past it.
     fn liveness_comes_free(sock: &Path) {
         let give_up = Instant::now() + PATIENCE;
         let probe = loop {

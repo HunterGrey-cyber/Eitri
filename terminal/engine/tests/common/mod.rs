@@ -296,6 +296,15 @@ impl Raster {
     }
 }
 
+/// A FIFO a child blocks on (`read x < <path>`) until the test lets it go.
+///
+/// A gate is let go once ([`release`](Self::release) takes it), and a script that waits twice needs two gates.
+/// One FIFO waited on twice is no gate the second time: release opens its writing end only once the child
+/// has the FIFO open for reading, writes the line and closes, and a child that has read the line and opens
+/// the FIFO again before that close -- the test thread preempted between the write and the close, or a child
+/// another test thread was forking at that moment still holding a copy of the writing end until its `exec` --
+/// finds a writer there, its open returns, and its `read` meets end-of-file once the writer goes: it passes
+/// without a release, and the next release waits for a reader that never comes.
 pub struct ChildGate(std::path::PathBuf);
 impl ChildGate {
     pub fn new() -> Self {
@@ -313,7 +322,9 @@ impl ChildGate {
     pub fn path(&self) -> String {
         format!("'{}'", self.0.display().to_string().replace('\'', "'\\''"))
     }
-    pub fn release(&self) {
+    /// Waits for the child to open the gate, writes it one line and closes. The 60 s only stops a test
+    /// whose child never comes to the gate; how soon it comes is never asserted.
+    pub fn release(self) {
         use std::io::Write;
         use std::os::unix::fs::OpenOptionsExt;
         let deadline = Instant::now() + Duration::from_secs(60);
@@ -329,7 +340,7 @@ impl ChildGate {
                 }
                 Err(e) if e.raw_os_error() == Some(libc::ENXIO) => {
                     assert!(Instant::now() < deadline, "child never waited at the gate");
-                    std::thread::yield_now();
+                    std::thread::sleep(Duration::from_millis(1));
                 }
                 Err(e) => panic!("open child gate: {e}"),
             }

@@ -611,8 +611,9 @@ mod tests {
     }
 
     /// Holds `file`'s store lock through a descriptor of its own, as another window's process would.
-    /// Saves once the lock is free: a child another test thread is starting holds a copy of every descriptor
-    /// until it execs, and with it the lock a test just dropped, so "free at once" is not promised.
+    /// Saves once the lock is free. A lock a test just dropped is free at once (a `PrivateLock`'s drop unlocks
+    /// before it closes, so a copy a child another thread is forking holds keeps nothing); the wait is only a
+    /// guard that stops a test whose lock never comes free.
     fn once_free<T>(save: impl Fn() -> std::io::Result<T>) -> std::io::Result<T> {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         loop {
@@ -764,9 +765,8 @@ mod tests {
         assert_eq!(longest, Some(2 * per), "{a_last:?} {b_last:?}");
     }
 
-    /// Tries enough for the moment after `drop(held)`: a child another test is starting holds a copy of the
-    /// test's descriptor until it execs, so the lock may stay held a little past the drop. While the test
-    /// holds it, every round fails whatever the count.
+    /// A few tries, as a guard: the lock is free as soon as `drop(held)` ran (the drop unlocks before it
+    /// closes). While the test holds it, every round fails whatever the count.
     fn tries_past_a_release() -> crate::state_paths::LockTries {
         crate::state_paths::LockTries {
             attempts: 50,
