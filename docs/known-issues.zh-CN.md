@@ -1,5 +1,5 @@
 [English](known-issues.md) | 简体中文
-<!-- translated-from: known-issues.md sha256=1af1e7d17015c2256eda84c7ab67ab6e372fb115a9dec4212d994df5b58090f8 -->
+<!-- translated-from: known-issues.md sha256=57daaa4f1f83d31714f6f4c184b8f68f815ec335b400afa40cc182f4679949b2 -->
 
 # 已知问题与限制
 
@@ -7,7 +7,7 @@
 
 ## 能在哪里运行
 
-- **x86_64 的 Linux，Wayland。** X11 没有测试过（不过欢迎来自 X11 的反馈）。macOS：移植中。Windows：不支持，WSL2 配合 WSLg 也许能用，但没有测试过。目前还没有 ARM 版本。
+- **x86_64 的 Linux，Wayland。** X11 只试过一种会话：Ubuntu 24.04 上的 GNOME on Xorg，在一台没有 GPU 加速的虚拟机里。窗口、编辑器、agent 面板、底部终端和平铺在那里都能用。X11 上编辑器始终用 GTK 方式绘制，GNOME Shell 扩展和 companion 模式的焦点移动对 X11 窗口不起作用。其他 X11 桌面和窗口管理器（包括 i3）没有测试过（欢迎反馈）。macOS：移植中。Windows：不支持，WSL2 配合 WSLg 也许能用，但没有测试过。目前还没有 ARM 版本。
 - **在 GNOME 和 sway 上测试过，companion 模式还在 Hyprland 上测试过。** 其他桌面和合成器，包括 KDE Plasma，没有测试过，欢迎反馈。Hyprland：companion 模式（焦点移动和置前）在真实运行的 0.57.0 和 0.56.2 上跑过（0.56.2 分别用 `hyprland.conf` 和 `hyprland.lua`）；第二个窗口的置前没有跑过。
 - **[合成器窗口](guide/compositor-windows.zh-CN.md)**是 Hyprland、sway 和 niri 上的默认行为，目前只在无界面会话和虚拟机里跑过，还有一些地方不符合预期：见指南里的[已知缺口](guide/compositor-windows.zh-CN.md#known-gaps)。
 - **需要 WebKitGTK 2.40 或更新**（`webkitgtk-6.0` API）。预构建二进制按 glibc 2.39 和 GTK 4.14 构建，更旧的版本没有测试过。Ubuntu 24.04、Debian 13、Fedora 40+、RHEL 10 和 Arch 满足要求；Ubuntu 22.04 和 Debian 12 不满足。

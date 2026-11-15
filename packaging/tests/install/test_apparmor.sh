@@ -52,10 +52,15 @@ t_apparmor_steps_when_restricted() {
 	expect_file "$src"
 	expect_eq "$(cat "$src")" "$(aa_expected "$name" "$lib/shell")" "the rendered profile"
 	expect_eq "$(tail -c 1 "$src" | od -An -c | tr -d ' ')" '\n' "the profile's last byte"
-	expect_out "needs an AppArmor profile for this install. It is written to $src; install and load it once:"
+	expect_out "eitri: the agent panel stays off until these two commands are run once. Why: this system restricts unprivileged user namespaces (Ubuntu's AppArmor rule), so the agent panel's sandbox (WebKit's bwrap) needs an AppArmor profile for this install, and putting one in place takes sudo, which this installer never runs."
+	expect_out "The profile is written to $src."
 	expect_out "eitri:     sudo install -m 0644 $(aa_q "$src") $(aa_q "$T/apparmor.d/$name")"
 	expect_out "eitri:     sudo apparmor_parser -r $(aa_q "$T/apparmor.d/$name")"
-	expect_out 'WEBKIT_DISABLE_SANDBOX_THIS_IS_DANGEROUS=1 also works, but that removes the operating system'"'"'s sandbox from the process that renders the model'"'"'s output'
+	expect_out 'WEBKIT_DISABLE_SANDBOX_THIS_IS_DANGEROUS=1 also brings the panel up, but that removes the operating system'"'"'s sandbox from the process that renders the model'"'"'s output'
+	# Said once: one line says the panel is off, and the two commands appear once each.
+	expect_eq "$(grep -c -F 'agent panel stays off' "$OUT")" 1 "lines saying the panel stays off"
+	expect_eq "$(grep -c -F 'sudo install -m 0644' "$OUT")" 1 "lines carrying the first command"
+	expect_eq "$(grep -c -F 'sudo apparmor_parser -r' "$OUT")" 1 "lines carrying the second command"
 	# At the end: after the line that says the install is done, and nothing after the steps.
 	installed=$(line_of 'installed Eitri 1.0.0 into')
 	steps=$(line_of 'sudo install -m 0644')
@@ -63,7 +68,7 @@ t_apparmor_steps_when_restricted() {
 		fail "the steps are not after the install's last line (installed at ${installed:-none}, steps at ${steps:-none})"
 	fi
 	case $(tail -n 1 "$OUT") in
-	'eitri: until then Eitri shows these steps in the agent panel'*) ;;
+	"eitri:     sudo apparmor_parser -r $(aa_q "$T/apparmor.d/$name")") ;;
 	*) fail "the last line is not the steps' own: $(tail -n 1 "$OUT")" ;;
 	esac
 	# Nothing else in the tree: the three entries of the profile's own directory.
@@ -108,7 +113,7 @@ t_apparmor_profile_already_in_place() {
 	expect_rc 0
 	expect_out "the AppArmor profile $T/apparmor.d/$name for this install is in place; it loads at boot, or now with: sudo apparmor_parser -r $(aa_q "$T/apparmor.d/$name")"
 	expect_no_out 'sudo install'
-	expect_no_out 'install and load it once'
+	expect_no_out 'agent panel stays off'
 	# A different file there (another path, an older text) is not "in place": the steps again.
 	use_home "$T/home2"
 	aa_inst --
@@ -133,7 +138,7 @@ t_apparmor_up_to_date_rerun_says_it_again() {
 	expect_file "$src"
 	expect_out "eitri:     sudo install -m 0644 $(aa_q "$src") $(aa_q "$T/apparmor.d/$name")"
 	case $(tail -n 1 "$OUT") in
-	'eitri: until then Eitri shows these steps in the agent panel'*) ;;
+	"eitri:     sudo apparmor_parser -r $(aa_q "$T/apparmor.d/$name")") ;;
 	*) fail "the last line is not the steps' own: $(tail -n 1 "$OUT")" ;;
 	esac
 	# Once the steps were run: the same re-run says the profile is in place, and no steps.

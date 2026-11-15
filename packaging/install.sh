@@ -1,20 +1,24 @@
 #!/bin/sh
+{
 # Eitri's installer: download a release, verify it, install it for this user, upgrade it, or
 # uninstall it. Nothing here runs sudo
 # or a package manager: when something is missing it prints the command and stops.
 #
-#   curl --proto '=https' --tlsv1.2 -fsSL https://github.com/HunterGrey-cyber/eitri/releases/latest/download/install.sh | sh
-#   curl --proto '=https' --tlsv1.2 -fsSL .../install.sh | sh -s -- --version 0.2.0 --yes
+#   curl --proto '=https' --proto-redir '=https' --tlsv1.2 -sSfL https://github.com/HunterGrey-cyber/eitri/releases/latest/download/install.sh | sh
+#   curl --proto '=https' --proto-redir '=https' --tlsv1.2 -sSfL .../install.sh | sh -s -- --version 0.4.0 --yes
 #   eitri setup        (this same file, installed as lib/eitri/eitri-setup)
 #
 # `sh install.sh --help` lists the options.
 #
 # Three rules plain `set -eu` does not give; packaging/tests/install/ holds each:
 #
-# 1. Nothing runs until the whole script arrives: one brace group ends with main "$@", and
-#    the closing brace is the last line. The shell parses that whole command first, so a cut
-#    before the brace runs nothing, including rm -rf, swaps and uninstall. Main outside the
-#    group would let a cut after `}; main` invoke it without the intended arguments.
+# 1. Nothing runs until the whole script arrives: the brace group opens on the second line and
+#    ends with main "$@", and its closing brace is the last line. The shell parses that whole
+#    command first, so a cut anywhere after the first line runs nothing (rm -rf, swaps and
+#    uninstall included) and sh exits with a syntax error. Main outside the group would let a cut
+#    after `}; main` invoke it without the intended arguments. A download that delivered no byte
+#    leaves sh an empty script, which exits 0: only the pipeline's own status (pipefail) or a
+#    download to a file can report that.
 # 2. `set -e` is never relied on inside a function. POSIX (dash included) ignores it in any
 #    function called from an `if`, `&&`, `||` or `!` context, where a failed `tar` or `mv` would
 #    carry on. So every fallible command ends in `|| die "..."` (or `|| return 1`), and every
@@ -28,7 +32,6 @@
 # 3. stdin is the script under `curl | sh`, so it is never read: `main` runs with stdin from
 #    /dev/null, and a prompt may only ever read /dev/tty (`read ans </dev/tty`), never decide
 #    whether to prompt by testing if stdin is a terminal (it is a pipe for every curl user).
-{
 set -eu
 
 NV_DEFAULT_BASE_URL='https://github.com/HunterGrey-cyber/eitri'
@@ -52,6 +55,12 @@ NV_BINARIES='shell eitri-tmux-shim eitri-claude-handoff eitri-run-guard eitri-ed
 NV_SERVER_SINCE=0.3.2
 # First release line requiring the editor bridge, including that line's candidates.
 NV_BRIDGE_SINCE=0.3.1
+# The oldest release line whose layout this installer lays out, including that line's candidates. From
+# 0.3.1 on, a release carries the page window's desktop entry, the nvim plugin's health check
+# (lua/eitri/health.lua) and the agents-strips, agents-top and agents-pass plugins; 0.3.0 carries none of
+# them. An older version is refused before its tarball is fetched (refuse_older_layout), with the way to
+# install it with its own installer.
+NV_LAYOUT_SINCE=0.3.1
 NV_LICENCE_FILES='LICENSE THIRD-PARTY-LICENSES SOURCE'
 # The desktop entry is named by the application id (the compositor matches a window to <id>.desktop;
 # the icon theme's icon name and the window's class, shell/src/main.rs's APP_ID, are the same string).
@@ -143,8 +152,11 @@ NV_APPARMOR_D=/etc/apparmor.d
 #   EITRI_INSTALL_TEST_OS_RELEASE       read instead of /etc/os-release;
 #   EITRI_INSTALL_TEST_PROC             a directory read instead of /proc (only its
 #                                         sys/kernel/apparmor_restrict_unprivileged_userns);
-#   EITRI_INSTALL_TEST_APPARMOR_D       a directory standing in for /etc/apparmor.d.
-# The last two default, in test mode, to directories that do not exist, so a test that does not set
+#   EITRI_INSTALL_TEST_APPARMOR_D       a directory standing in for /etc/apparmor.d;
+#   EITRI_INSTALL_TEST_NET_DELAY        seconds before the first retry of a download (default 0,
+#                                         doubling up to eight times this, like NV_NET_DELAY);
+#   EITRI_INSTALL_TEST_NET_STALL        seconds under 1 KiB/s before an attempt is given up.
+# PROC and APPARMOR_D default, in test mode, to directories that do not exist, so a test that does not set
 # them never reads this host's own restriction or profiles.
 # None of them touches the trust anchor: the release key is never taken from the environment (only
 # --release-signers replaces it, with a warning). At worst they make a system check pass or keep
@@ -181,12 +193,19 @@ TAKEOVER_HELD=0
 NV_LOCK=
 NV_NEW_CREATED=0
 NV_CACHE_CREATED=0
-NV_LOOPBACK=0
 # Every download's bounds: refused past 1 GiB (the release tarball and the Node, nvim and Skia
-# archives are tens of MB) and given up when it moves under 1 KiB/s for five minutes or cannot
-# connect within a minute, so a server that never ends or stalls a transfer cannot hold a run for good
-# while a slow link still finishes.
+# archives are tens of MB); an attempt is given up when it moves under 1 KiB/s for a minute or cannot
+# connect within 30 seconds, so a server that never ends or stalls a transfer cannot hold a run for
+# good. A broken or stalled attempt is tried again (net_get), resuming the partial file, until
+# NV_NET_TRIES (8) attempts in a row have added nothing, about five minutes on a link that times out
+# every connection, or NV_NET_MAX_TRIES (20) were made in all, waiting 2, 4, 8, then 16 seconds between
+# attempts; a slow link that keeps moving still finishes.
 NV_MAX_DOWNLOAD_BYTES=1073741824
+NV_NET_CONNECT=30
+NV_NET_STALL=60
+NV_NET_TRIES=8
+NV_NET_MAX_TRIES=20
+NV_NET_DELAY=2
 # A sidecar release's own files are small, and each is held to what it can reasonably be: its
 # SHA256SUMS, .sig and SIDECAR-RELEASE, then its source and protoc archives.
 NV_SIDECAR_META_MAX_BYTES=65536
@@ -504,6 +523,17 @@ set_paths() {
 		NV_TEST_LIBDIRS=${EITRI_INSTALL_TEST_LIBDIRS-}
 		NV_PROC=${EITRI_INSTALL_TEST_PROC-/nonexistent/eitri-test-proc}
 		NV_APPARMOR_D=${EITRI_INSTALL_TEST_APPARMOR_D-/nonexistent/eitri-test-apparmor.d}
+		# A test waits no time between download attempts unless it asks to, and may shorten the
+		# stall bound so a stalling fixture server is given up in seconds.
+		NV_NET_DELAY=${EITRI_INSTALL_TEST_NET_DELAY-0}
+		NV_NET_STALL=${EITRI_INSTALL_TEST_NET_STALL-$NV_NET_STALL}
+		for _sp_v in "$NV_NET_DELAY" "$NV_NET_STALL"; do
+			case $_sp_v in
+			0 | [1-9] | [1-9]*[0-9]) case $_sp_v in *[!0-9]*) _sp_v=bad ;; esac ;;
+			*) _sp_v=bad ;;
+			esac
+			if [ "$_sp_v" = bad ]; then die "EITRI_INSTALL_TEST_NET_DELAY and EITRI_INSTALL_TEST_NET_STALL are whole seconds without a leading zero"; fi
+		done
 		# The download overrides lead only to a loopback server and the repository overrides only to a
 		# local path: a test mode left switched on in an environment can then send no download, clone
 		# or build anywhere else.
@@ -1212,7 +1242,7 @@ report_claude() {
 # ---------------------------------------------------------------------------------------------
 # Downloads
 
-# check_base_url URL: sets NV_BASE and NV_LOOPBACK. https only; plain http only for exactly
+# check_base_url URL: sets NV_BASE. https only; plain http only for exactly
 # 127.0.0.1 or localhost with an optional numeric port, and no `@` anywhere in the authority -- so
 # http://localhost@<host>/ and http://127.0.0.1.<host>/ are both refused.
 check_base_url() {
@@ -1224,7 +1254,7 @@ check_base_url() {
 		esac
 	done
 	case $_bu in
-	https://?*) NV_LOOPBACK=0 ;;
+	https://?*) ;;
 	http://*)
 		_bu_auth=${_bu#http://}
 		_bu_auth=${_bu_auth%%/*}
@@ -1238,7 +1268,6 @@ check_base_url() {
 			;;
 		*) die "--base-url $1: plain http is accepted only for http://127.0.0.1[:port] or http://localhost[:port]; use https://" ;;
 		esac
-		NV_LOOPBACK=1
 		;;
 	*) die "--base-url $1: the URL must start with https://" ;;
 	esac
@@ -1276,19 +1305,235 @@ size_within() {
 	fi
 }
 
-# fetch URL DEST WHAT LIMIT: download URL to DEST ('-' = stdout), refusing more than LIMIT bytes.
-# HTTPS-only for every non-loopback URL, on every redirect too (--proto/--proto-redir); a loopback
-# download reads no curl config and follows no redirect.
+# net_retryable RC MESSAGE: NR_RETRY=1 when curl's exit status RC (with its MESSAGE) is a failure
+# another attempt can cure: the name lookup, connection, TLS handshake or transfer broke or stalled,
+# or the server said 408, 429 or 5xx. A 404, a refused redirect, a file over its limit, a certificate
+# problem or a local write error is an answer, and is not asked again. Rule 2: a variable.
+net_retryable() {
+	NR_RETRY=0
+	case $1 in
+	5 | 6 | 7 | 16 | 18 | 28 | 35 | 52 | 55 | 56 | 92) NR_RETRY=1 ;;
+	22)
+		case $2 in
+		*'returned error: 408'* | *'returned error: 429'* | *'returned error: 5'[0-9][0-9]*) NR_RETRY=1 ;;
+		esac
+		;;
+	esac
+}
+
+# net_get URL DEST LIMIT: download URL into the file DEST, or with DEST '-' into NG_TEXT (byte for
+# byte), refusing more than LIMIT bytes. HTTPS-only for every non-loopback URL, on every redirect
+# too (--proto/--proto-redir); a loopback URL reads no curl config and follows no redirect. An
+# attempt the network broke is made again (NV_NET_* above); a file download resumes its partial
+# file (curl -C -) and starts over when the server cannot resume it. Every caller checks the whole
+# file against a hash or a signature afterwards, so a resumed file that is not the file fails that
+# check like any corrupt download. Sets NG_OK=1, or NG_OK=0 with NG_ERR (curl's last message, and
+# what was tried when it was the network) and NG_HINT (what the user can change, or empty when the
+# server answered). Rule 2: a plain statement; it dies only on a URL no caller may pass.
+net_get() {
+	NG_OK=0
+	NG_ERR=
+	NG_HINT=
+	NG_TEXT=
+	_ng_url=$1
+	_ng_dest=$2
+	_ng_lim=$3
+	case $_ng_url in
+	https://*) _ng_lb=0 ;;
+	http://*)
+		loopback_http "$_ng_url"
+		if [ "$LH" != 1 ]; then die "$_ng_url: plain http is only for a loopback test server"; fi
+		_ng_lb=1
+		;;
+	*) die "$_ng_url is not an http(s) URL" ;;
+	esac
+	_ng_host=${_ng_url#*://}
+	_ng_host=${_ng_host%%/*}
+	_ng_name=${_ng_url##*/}
+	_ng_via=
+	_ng_at=$_ng_host
+	_ng_n=0
+	_ng_dry=0
+	_ng_resume=0
+	_ng_resumed=0
+	_ng_wait=$NV_NET_DELAY
+	_ng_t0=$(date +%s) || _ng_t0=0
+	# A partial file a run before this one left is not this run's progress.
+	if [ "$_ng_dest" != - ]; then rm -f -- "$_ng_dest" || die "cannot remove $_ng_dest"; fi
+	while :; do
+		_ng_n=$((_ng_n + 1))
+		_ng_before=0
+		_ng_max=$_ng_lim
+		if [ "$_ng_resume" = 1 ]; then
+			_ng_before=$(wc -c <"$_ng_dest") || _ng_before=0
+			# A resumed attempt may add only what the limit leaves: --max-filesize sees one response.
+			if [ "$_ng_before" -ge "$_ng_lim" ]; then
+				rm -f -- "$_ng_dest" || :
+				NG_ERR="it reached the $_ng_lim bytes it can be over $((_ng_n - 1)) attempts: refusing it"
+				return 0
+			fi
+			_ng_max=$((_ng_lim - _ng_before))
+			set -- -C -
+		else
+			set --
+		fi
+		# For a file, one capture holds curl's own messages and the address and HTTP status it ended
+		# at; for text, the capture is the body alone (curl's messages, and any a user's curl config
+		# asks for, go to stderr as they are). The exit status is printed only when curl failed, so
+		# the substitution itself always succeeds. The x keeps the text's own trailing newlines.
+		if [ "$_ng_dest" = - ]; then
+			if [ "$_ng_lb" = 1 ]; then
+				_ng_out=$(
+					curl -q --max-redirs 0 --proto '=http' --connect-timeout "$NV_NET_CONNECT" --speed-limit 1024 --speed-time "$NV_NET_STALL" --max-filesize "$_ng_lim" -fsS -o - -- "$_ng_url" || printf '\nNV-RC %s' "$?"
+					printf x
+				)
+			else
+				_ng_out=$(
+					curl --proto '=https' --proto-redir '=https' --tlsv1.2 --connect-timeout "$NV_NET_CONNECT" --speed-limit 1024 --speed-time "$NV_NET_STALL" --max-filesize "$_ng_lim" -fsSL -o - -- "$_ng_url" || printf '\nNV-RC %s' "$?"
+					printf x
+				)
+			fi
+		elif [ "$_ng_lb" = 1 ]; then
+			_ng_out=$(
+				curl -q --max-redirs 0 --proto '=http' --connect-timeout "$NV_NET_CONNECT" --speed-limit 1024 --speed-time "$NV_NET_STALL" --max-filesize "$_ng_max" -fsS -w 'NV-URL %{url_effective}\nNV-CODE %{http_code}\n' "$@" -o "$_ng_dest" -- "$_ng_url" 2>&1 || printf '\nNV-RC %s' "$?"
+				printf x
+			)
+		else
+			_ng_out=$(
+				curl --proto '=https' --proto-redir '=https' --tlsv1.2 --connect-timeout "$NV_NET_CONNECT" --speed-limit 1024 --speed-time "$NV_NET_STALL" --max-filesize "$_ng_max" -fsSL -w 'NV-URL %{url_effective}\nNV-CODE %{http_code}\n' "$@" -o "$_ng_dest" -- "$_ng_url" 2>&1 || printf '\nNV-RC %s' "$?"
+				printf x
+			)
+		fi
+		_ng_out=${_ng_out%x}
+		_ng_rc=0
+		case $_ng_out in
+		*"${NV_NL}NV-RC "*)
+			_ng_rc=${_ng_out##*"${NV_NL}NV-RC "}
+			# The marker is printed only for a failure, so "NV-RC 0" at the end is the body's own text.
+			if [ "$_ng_rc" = 0 ]; then
+				_ng_rc=0
+			else
+				_ng_out=${_ng_out%"${NV_NL}NV-RC "*}
+			fi
+			;;
+		esac
+		_ng_code=
+		case $_ng_out in
+		*'NV-CODE '*)
+			_ng_code=${_ng_out##*NV-CODE }
+			_ng_code=${_ng_code%%"$NV_NL"*}
+			;;
+		esac
+		# curl takes a 416 to a resumption as the file being complete and exits 0, with the partial
+		# file as it was: when that file is not the whole one, the check after would refuse it, so the
+		# file is downloaded again from the start instead.
+		if [ "$_ng_rc" = 0 ] && [ "$_ng_resume" = 1 ] && [ "$_ng_code" = 416 ]; then
+			_ng_rc=416
+		fi
+		if [ "$_ng_rc" = 0 ]; then
+			if [ "$_ng_dest" = - ]; then NG_TEXT=$_ng_out; fi
+			NG_OK=1
+			return 0
+		fi
+		_ng_msg=
+		case $_ng_out in
+		*'curl: ('*)
+			_ng_msg="curl: (${_ng_out##*curl: (}"
+			_ng_msg=${_ng_msg%%"$NV_NL"*}
+			;;
+		esac
+		if [ "$_ng_rc" = 416 ]; then
+			_ng_msg="the server answered 416 to the resumption"
+		elif [ -z "$_ng_msg" ] && [ "$_ng_dest" = - ]; then
+			_ng_msg="curl exited with status $_ng_rc (its message is above)"
+		elif [ -z "$_ng_msg" ]; then
+			_ng_msg="curl exited with status $_ng_rc"
+		fi
+		# The host this attempt ended at: a redirect seen once does not mean every later failure was there.
+		_ng_at=$_ng_host
+		case $_ng_out in
+		*'NV-URL '*)
+			_ng_eff=${_ng_out##*NV-URL }
+			_ng_eff=${_ng_eff%%"$NV_NL"*}
+			_ng_eff=${_ng_eff#*://}
+			_ng_eff=${_ng_eff%%/*}
+			if [ -n "$_ng_eff" ]; then _ng_at=$_ng_eff; fi
+			if [ -n "$_ng_eff" ] && [ "$_ng_eff" != "$_ng_host" ]; then _ng_via=$_ng_eff; fi
+			;;
+		esac
+		# A resumed attempt the server cannot serve (no ranges, or the range is past the end): start
+		# the file again, as an attempt of its own.
+		if [ "$_ng_resume" = 1 ]; then
+			case $_ng_rc:$_ng_msg in
+			33:* | 416:* | 22:*'returned error: 416'*)
+				rm -f -- "$_ng_dest" || :
+				_ng_resume=0
+				if [ "$_ng_n" -ge "$NV_NET_MAX_TRIES" ]; then break; fi
+				printf 'eitri: %s from %s: the server cannot resume it (%s); downloading it again from the start\n' "$_ng_name" "$_ng_host" "$_ng_msg" >&2
+				continue
+				;;
+			esac
+		fi
+		net_retryable "$_ng_rc" "$_ng_msg"
+		if [ "$NR_RETRY" != 1 ]; then
+			NG_ERR=$_ng_msg
+			return 0
+		fi
+		_ng_after=0
+		if [ "$_ng_dest" != - ] && [ -f "$_ng_dest" ]; then _ng_after=$(wc -c <"$_ng_dest") || _ng_after=0; fi
+		# Each attempt is bounded by --max-filesize, but resumed attempts add up: the file as a whole
+		# is held to the limit after every one.
+		if [ "$_ng_after" -gt "$_ng_lim" ]; then
+			rm -f -- "$_ng_dest" || :
+			NG_ERR="it grew past the $_ng_lim bytes it can be over $_ng_n attempts: refusing it"
+			return 0
+		fi
+		if [ "$_ng_after" -gt "$_ng_before" ]; then
+			_ng_dry=0
+			_ng_wait=$NV_NET_DELAY
+		else
+			_ng_dry=$((_ng_dry + 1))
+		fi
+		if [ "$_ng_dry" -ge "$NV_NET_TRIES" ] || [ "$_ng_n" -ge "$NV_NET_MAX_TRIES" ]; then break; fi
+		_ng_resume=0
+		_ng_from=
+		if [ "$_ng_after" -gt 0 ]; then
+			_ng_resume=1
+			_ng_resumed=1
+			_ng_from=", resuming at $((_ng_after / 1024)) KiB"
+		fi
+		printf 'eitri: %s from %s: %s; trying again in %s s (attempt %s)%s\n' "$_ng_name" "$_ng_at" "$_ng_msg" "$_ng_wait" "$((_ng_n + 1))" "$_ng_from" >&2
+		sleep "$_ng_wait" || :
+		_ng_wait=$((_ng_wait * 2))
+		if [ "$_ng_wait" -gt $((NV_NET_DELAY * 8)) ]; then _ng_wait=$((NV_NET_DELAY * 8)); fi
+	done
+	_ng_t1=$(date +%s) || _ng_t1=$_ng_t0
+	NG_ERR="$_ng_msg; $_ng_n attempts over $((_ng_t1 - _ng_t0)) s to $_ng_host"
+	if [ -n "$_ng_via" ]; then NG_ERR="$NG_ERR (redirected to $_ng_via)"; fi
+	if [ "$_ng_resumed" = 1 ]; then NG_ERR="$NG_ERR, resuming the partial file"; fi
+	if [ "$_ng_lb" = 1 ]; then
+		NG_HINT="; check that the server at $_ng_host is running"
+		return 0
+	fi
+	NG_HINT=". If this network reaches $_ng_at only through a proxy, set https_proxy (for example https_proxy=http://127.0.0.1:7890) and re-run"
+	case $_ng_url in
+	"${NV_BASE-}"/*)
+		if [ -n "${NV_BASE-}" ]; then NG_HINT="$NG_HINT; --base-url URL downloads the release files from a mirror of the release page instead"; fi
+		;;
+	esac
+}
+
+# fetch URL DEST WHAT LIMIT: download URL to DEST ('-' = stdout, byte for byte) through net_get, and
+# die naming WHAT when that fails.
 fetch() {
-	if [ "$NV_LOOPBACK" = 1 ]; then
-		curl -q --max-redirs 0 --proto '=http' --connect-timeout 60 --speed-limit 1024 --speed-time 300 --max-filesize "$4" -fsS -o "$2" -- "$1" || die "could not download $3 from $1: is the server at $NV_BASE running?"
-	else
-		curl --proto '=https' --proto-redir '=https' --tlsv1.2 --connect-timeout 60 --speed-limit 1024 --speed-time 300 --max-filesize "$4" -fsSL -o "$2" -- "$1" || die "could not download $3 from $1: check your network connection and re-run"
+	net_get "$1" "$2" "$4"
+	if [ "$NG_OK" != 1 ]; then die "could not download $3 from $1: $NG_ERR$NG_HINT"; fi
+	if [ "$2" = - ]; then
+		printf '%s' "$NG_TEXT"
+		return 0
 	fi
-	if [ "$2" != - ]; then
-		size_within "$2" "$4"
-		if [ "$SW_OK" != 1 ]; then die "$3 from $1 is more than the $4 bytes it can be: refusing it"; fi
-	fi
+	size_within "$2" "$4"
+	if [ "$SW_OK" != 1 ]; then die "$3 from $1 is more than the $4 bytes it can be: refusing it"; fi
 }
 
 # sums_hash NAME: the hash of the unique SHA256SUMS line whose second field equals NAME.
@@ -1340,36 +1585,21 @@ download_verified() {
 # curl_get URL DEST LIMIT: like fetch, but reports failure through CG_OK/CG_ERR instead of dying (rule 2:
 # a predicate reports through a variable), because the sidecar build's own first download (Node) is
 # the one place in this installer where "the network is not reachable" is not fatal (a
-# release with no sidecar still installs; the panel says how to get one). HTTPS is held across every
-# redirect, exactly like fetch; a loopback download reads no curl config and follows no redirect.
+# release with no sidecar still installs; the panel says how to get one). The same net_get, so the
+# same retries, resumption and HTTPS rules as fetch.
 curl_get() {
 	CG_OK=0
 	CG_ERR=
-	case $1 in
-	https://*)
-		if _cg_out=$(curl --proto '=https' --proto-redir '=https' --tlsv1.2 --connect-timeout 60 --speed-limit 1024 --speed-time 300 --max-filesize "$3" -fsSL -o "$2" -- "$1" 2>&1); then
-			CG_OK=1
-		else
-			CG_ERR=$_cg_out
-		fi
-		;;
-	http://*)
-		loopback_http "$1"
-		if [ "$LH" != 1 ]; then die "curl_get: $1: plain http is only for a loopback test server"; fi
-		if _cg_out=$(curl -q --max-redirs 0 --proto '=http' --connect-timeout 60 --speed-limit 1024 --speed-time 300 --max-filesize "$3" -fsS -o "$2" -- "$1" 2>&1); then
-			CG_OK=1
-		else
-			CG_ERR=$_cg_out
-		fi
-		;;
-	*) die "curl_get: $1 is not an http(s) URL" ;;
-	esac
-	if [ "$CG_OK" = 1 ]; then
-		size_within "$2" "$3"
-		if [ "$SW_OK" != 1 ]; then
-			CG_OK=0
-			CG_ERR="it is more than the $3 bytes it can be"
-		fi
+	net_get "$1" "$2" "$3"
+	if [ "$NG_OK" != 1 ]; then
+		CG_ERR=$NG_ERR$NG_HINT
+		return 0
+	fi
+	CG_OK=1
+	size_within "$2" "$3"
+	if [ "$SW_OK" != 1 ]; then
+		CG_OK=0
+		CG_ERR="it is more than the $3 bytes it can be"
 	fi
 }
 
@@ -1586,6 +1816,7 @@ obtain_release() {
 		if [ -n "$OPT_VERSION" ] && [ "$OPT_VERSION" != "$NV_VERSION" ]; then
 			die "--version $OPT_VERSION, but $OPT_SUMS is for $NV_VERSION"
 		fi
+		refuse_older_layout "$NV_VERSION"
 		NV_TARBALL_NAME=eitri-$NV_VERSION-x86_64-linux.tar.gz
 		if [ "${OPT_TARBALL##*/}" != "$NV_TARBALL_NAME" ]; then
 			die "--tarball must be the file named $NV_TARBALL_NAME that SHA256SUMS lists (it is ${OPT_TARBALL##*/})"
@@ -1598,7 +1829,10 @@ obtain_release() {
 		return 0
 	fi
 
+	# A version named on the command line is judged before anything is downloaded; the latest one as soon as
+	# SHA256SUMS names it, before the signature, the tarball or anything else is fetched.
 	if [ -n "$OPT_VERSION" ]; then
+		refuse_older_layout "$OPT_VERSION"
 		_or_dir=releases/download/v$OPT_VERSION
 	else
 		_or_dir=releases/latest/download
@@ -1613,6 +1847,7 @@ obtain_release() {
 	if [ -n "$OPT_VERSION" ] && [ "$OPT_VERSION" != "$NV_VERSION" ]; then
 		die "asked for $OPT_VERSION, but the release's SHA256SUMS is for $NV_VERSION: check --version and --base-url"
 	fi
+	refuse_older_layout "$NV_VERSION"
 	NV_TARBALL_NAME=eitri-$NV_VERSION-x86_64-linux.tar.gz
 	# From here on every file comes from releases/download/v<X>/, so a release published between
 	# two requests cannot mix files.
@@ -2296,8 +2531,15 @@ sidecar_build_core() {
 	cp -- "$_sbc_node_tar" "$_sbc_cache_dir/" || die "cannot copy $_sbc_node_tar into $_sbc_cache_dir"
 
 	_sbc_npm_cache=$_sbc_workdir/npm-cache
+	# npm retries a failed registry request itself (twice by default, waiting 10 to 60 s); it is
+	# asked for five tries starting at 2 s, like this script's own downloads, unless the user's
+	# environment sets them (npm_config_* or NPM_CONFIG_*; a value in ~/.npmrc ranks below these).
+	# Every package is still checked against the lockfile's integrity hash.
+	_sbc_npm_retries=${npm_config_fetch_retries:-${NPM_CONFIG_FETCH_RETRIES:-5}}
+	_sbc_npm_retry_min=${npm_config_fetch_retry_mintimeout:-${NPM_CONFIG_FETCH_RETRY_MINTIMEOUT:-2000}}
 	# shellcheck disable=SC2086 # a list of npm's own flags, empty or set by this script
 	run_in "$_sbc_repo" env "PATH=$_sbc_node_bin:$PATH" "npm_config_cache=$_sbc_npm_cache" \
+		"npm_config_fetch_retries=$_sbc_npm_retries" "npm_config_fetch_retry_mintimeout=$_sbc_npm_retry_min" \
 		"$_sbc_node_bin/npm" ci --no-audit --no-fund $SB_NPM_CI_FLAGS
 	if [ -n "$SB_PROTOC_TARBALL" ]; then sidecar_place_protoc "$_sbc_repo"; fi
 	sidecar_sdk_notice "$_sbc_repo"
@@ -3950,10 +4192,10 @@ apparmor_note() {
 		say "the AppArmor profile $AA_TARGET for this install is in place; it loads at boot, or now with: $AA_CMD2"
 		return 0
 	fi
-	say "$_an_why. It is written to $AA_SRC; install and load it once:"
+	# Said once, last, and plainly: what stays off, until what, and why; the two commands end the run.
+	say "the agent panel stays off until these two commands are run once. Why: $_an_why, and putting one in place takes sudo, which this installer never runs. The editor and the terminal work without it, and Eitri shows the same steps in the panel's place. The profile is written to $AA_SRC. (Starting Eitri with WEBKIT_DISABLE_SANDBOX_THIS_IS_DANGEROUS=1 also brings the panel up, but that removes the operating system's sandbox from the process that renders the model's output.)"
 	say "    $AA_CMD1"
 	say "    $AA_CMD2"
-	say "$_an_hatch"
 }
 
 # fetch_skia_binaries WORKDIR PINS_FILE: `cargo build` on a
@@ -4010,6 +4252,10 @@ do_from_source() {
 	# the target. Refuse other architectures before cloning or compiling, rather than reach a
 	# confusing linker error. ARM builds remain unsupported until an architecture-selected Skia
 	# archive is pinned and can be tested.
+	if [ -z "$OPT_CHECKOUT" ]; then
+		check_base_url "${OPT_BASE_URL:-$NV_DEFAULT_BASE_URL}"
+		refuse_older_layout_early
+	fi
 	_dfs_arch=$(uname -m) || die "uname failed"
 	case $_dfs_arch in
 	x86_64) ;;
@@ -4180,11 +4426,20 @@ unpack_new() {
 		die "$NV_TARBALL_NAME is from a release before Eitri's app icon (its desktop entry is share/applications/$NV_OLD_DESKTOP, not $NV_MAIN_DESKTOP), which this installer does not lay out. $(before_icon_advice 'that release with its own install.sh, a release asset')"
 	fi
 	if [ ! -f "$_un_top/bin/eitri" ]; then die "$NV_TARBALL_NAME has no bin/eitri: it is not a valid Eitri release. Nothing was changed; report it at $NV_ISSUES"; fi
+	# A file the layout gained in NV_LAYOUT_SINCE is missing from a release that says it is older: that
+	# release is old, not broken. (refuse_older_layout stops such a version before it is downloaded; this
+	# is the same answer for a route that reaches here.)
+	_un_why="it is not a valid Eitri release. Nothing was changed; report it at $NV_ISSUES"
+	older_layout "$NV_VERSION"
+	if [ "$OL_OLDER" = 1 ]; then
+		_un_how=$(older_layout_how "$NV_VERSION")
+		_un_why="Eitri $NV_VERSION is older than this installer installs (it lays out releases from $NV_LAYOUT_SINCE on). Nothing was changed; install $_un_how"
+	fi
 	for _un_f in $NV_DESKTOP; do
-		if [ ! -f "$_un_top/share/applications/$_un_f" ]; then die "$NV_TARBALL_NAME has no share/applications/$_un_f: it is not a valid Eitri release. Nothing was changed; report it at $NV_ISSUES"; fi
+		if [ ! -f "$_un_top/share/applications/$_un_f" ]; then die "$NV_TARBALL_NAME has no share/applications/$_un_f: $_un_why"; fi
 	done
 	for _un_f in $NV_PLUGIN_FILES; do
-		if [ ! -f "$_un_top/share/eitri/eitri.nvim/$_un_f" ]; then die "$NV_TARBALL_NAME has no share/eitri/eitri.nvim/$_un_f: it is not a valid Eitri release. Nothing was changed; report it at $NV_ISSUES"; fi
+		if [ ! -f "$_un_top/share/eitri/eitri.nvim/$_un_f" ]; then die "$NV_TARBALL_NAME has no share/eitri/eitri.nvim/$_un_f: $_un_why"; fi
 	done
 	for _un_f in $NV_EXT_FILES; do
 		if [ ! -f "$_un_top/share/gnome-shell/extensions/$NV_EXT_ID/$_un_f" ]; then die "$NV_TARBALL_NAME has no share/gnome-shell/extensions/$NV_EXT_ID/$_un_f: it is not a valid Eitri release. Nothing was changed; report it at $NV_ISSUES"; fi
@@ -4213,7 +4468,7 @@ unpack_new() {
 		die "$NV_TARBALL_NAME is from a release before Eitri shipped plugins (it has no lib/eitri/plugins/), which this installer does not lay out. Nothing was changed. To install that release, use its own install.sh (a release asset)."
 	fi
 	for _un_f in $NV_SHIPPED_PLUGINS; do
-		if [ ! -f "$_un_top/lib/eitri/plugins/$_un_f/eitri-plugin.toml" ]; then die "$NV_TARBALL_NAME has no lib/eitri/plugins/$_un_f/eitri-plugin.toml: it is not a valid Eitri release. Nothing was changed; report it at $NV_ISSUES"; fi
+		if [ ! -f "$_un_top/lib/eitri/plugins/$_un_f/eitri-plugin.toml" ]; then die "$NV_TARBALL_NAME has no lib/eitri/plugins/$_un_f/eitri-plugin.toml: $_un_why"; fi
 	done
 	if [ ! -f "$_un_top/lib/eitri/RELEASE" ]; then die "$NV_TARBALL_NAME has no lib/eitri/RELEASE: it is not a valid Eitri release. Nothing was changed; report it at $NV_ISSUES"; fi
 	parse_release "$_un_top/lib/eitri/RELEASE"
@@ -4246,6 +4501,52 @@ swap_in() {
 desktop_exec_quote() {
 	_dq=$(printf '%s\n' "$1" | sed -e 's/[\\"`$]/\\&/g' -e 's/\\/\\\\/g' -e 's/%/%%/g') || die "sed failed"
 	printf '"%s"\n' "$_dq"
+}
+
+# older_layout VERSION: OL_OLDER=1 when VERSION is below NV_LAYOUT_SINCE, that line's candidates
+# included. Rule 2: a variable.
+older_layout() {
+	OL_OLDER=0
+	_ol_cmp=$(semver_cmp "$1" "$NV_LAYOUT_SINCE-rc.0")
+	if [ "$_ol_cmp" -lt 0 ]; then OL_OLDER=1; fi
+}
+
+# older_layout_how VERSION: how to install VERSION with its own installer: the release asset from the base
+# URL in use, and, for the public repository, the file at the tag.
+older_layout_how() {
+	_olh_base=${NV_BASE:-$NV_DEFAULT_BASE_URL}
+	_olh_how="$1 with its own install.sh: the release asset $_olh_base/releases/download/v$1/install.sh"
+	if [ "$_olh_base" = "$NV_DEFAULT_BASE_URL" ]; then
+		_olh_how="$_olh_how, or the file at the tag, https://raw.githubusercontent.com/HunterGrey-cyber/eitri/v$1/packaging/install.sh"
+	fi
+	if [ "$OPT_MODE" = from-source ]; then _olh_how="$_olh_how (with --from-source --version $1)"; fi
+	printf '%s\n' "$_olh_how"
+}
+
+# refuse_older_layout VERSION: when VERSION is older than this installer lays out, stop before its
+# tarball is fetched and before anything is changed, saying how to install it instead.
+refuse_older_layout() {
+	older_layout "$1"
+	if [ "$OL_OLDER" != 1 ]; then return 0; fi
+	_rol_how=$(older_layout_how "$1")
+	die "Eitri $1 is older than this installer installs: it lays out releases from $NV_LAYOUT_SINCE on, which carry the page window's desktop entry, the nvim plugin's health check and the agents plugins that $1 does not. $(before_icon_advice "$_rol_how")"
+}
+
+# refuse_older_layout_early: what the command line alone says about the version (--version, or the version in
+# the --tarball file's name) is judged before the install lock is taken and before an interrupted run is
+# recovered, so this refusal changes nothing, not even a --keep-build tree a later cleanup would remove. The
+# latest version is known only from SHA256SUMS, after the lock (obtain_release).
+refuse_older_layout_early() {
+	if [ -n "$OPT_VERSION" ]; then
+		refuse_older_layout "$OPT_VERSION"
+		return 0
+	fi
+	if [ -n "$OPT_TARBALL" ]; then
+		_role_v=${OPT_TARBALL##*/}
+		_role_v=${_role_v#eitri-}
+		_role_v=${_role_v%-x86_64-linux.tar.gz}
+		if printf '%s\n' "$_role_v" | grep -Eqx "$NV_VERSION_ERE"; then refuse_older_layout "$_role_v"; fi
+	fi
 }
 
 # before_icon_advice WHAT: the way back to a release (or a source tree) from before the app icon, whose
@@ -4636,6 +4937,7 @@ do_install() {
 		require_curl
 		check_base_url "${OPT_BASE_URL:-$NV_DEFAULT_BASE_URL}"
 	fi
+	refuse_older_layout_early
 	acquire_lock
 	recover_interrupted
 	# Read now, before anything is downloaded or changed: prune_sidecars keeps this rev, and a

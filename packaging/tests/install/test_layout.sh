@@ -319,27 +319,68 @@ t_upgrade_bad_layout() {
 	expect_eq "$(snap "$TH")" "$before" "the home after a refused upgrade"
 }
 
-TESTS="$TESTS t_release_before_notice_still_installs"
-t_release_before_notice_still_installs() {
-	# Through 0.3.0 the acknowledgement sits inside LICENSE and the tarball has no NOTICE; --version reaches them.
-	mk_release 0.3.0 "$REV_A" unpinned
+TESTS="$TESTS t_release_older_than_the_layout_is_refused_before_download"
+t_release_older_than_the_layout_is_refused_before_download() {
+	# 0.3.0 has none of the files the layout gained in 0.3.1. Named with --version it is refused before any
+	# request; as the latest release, once SHA256SUMS names it, before the signature or the tarball; from
+	# local files, before anything is unpacked. Each time nothing changes and the message says how to
+	# install it with its own installer.
 	serve 1.0.0 0.3.0
+	# A tree an earlier --keep-build run kept: a run that takes the lock and fails removes it, so a refusal
+	# judged from the command line must come before the lock.
+	mkdir -p "$TH/.cache/eitri/src"
+	printf 'kept\n' >"$TH/.cache/eitri/src/kept"
+	before=$(snap "$TH")
+	srv_mark
 	inst_net --version 0.3.0
-	expect_rc 0
-	expect_eq "$(installed_version)" 0.3.0 "the version installed"
-	expect_file "$(data_of)/licenses/eitri/LICENSE"
-	expect_absent "$(data_of)/licenses/eitri/NOTICE"
-	expect_absent "$TH/.local/lib/eitri/eitri-server"
-	expect_absent "$TH/.local/lib/eitri/eitri-editor-bridge"
+	expect_fail "--version 0.3.0"
+	expect_out "eitri: error: Eitri 0.3.0 is older than this installer installs: it lays out releases from 0.3.1 on"
+	expect_out "then install 0.3.0 with its own install.sh: the release asset http://127.0.0.1:$PORT/releases/download/v0.3.0/install.sh"
+	expect_out 'Nothing was changed.'
+	expect_no_out 'raw.githubusercontent.com'
+	expect_eq "$(srv_paths)" '' "requests for a --version older than the layout"
+	expect_eq "$(snap "$TH")" "$before" "the home after --version 0.3.0"
+	inst_net --version 0.3.0 --dry-run
+	expect_fail "a dry run of --version 0.3.0"
+	expect_out 'is older than this installer installs'
+	d=$S/fix/v0.3.0
+	inst -- --tarball "$d/eitri-0.3.0-x86_64-linux.tar.gz" --sums "$d/SHA256SUMS" --sig "$d/SHA256SUMS.sig" \
+		--release-signers "$SIGNERS"
+	expect_fail "release files older than the layout"
+	expect_out 'Eitri 0.3.0 is older than this installer installs'
+	expect_out 'or the file at the tag, https://raw.githubusercontent.com/HunterGrey-cyber/eitri/v0.3.0/packaging/install.sh'
+	expect_eq "$(snap "$TH")" "$before" "the home after 0.3.0 from files"
+	# The latest version is known only from SHA256SUMS, after the lock: refused before the signature and
+	# the tarball, with the cleanup any failed locked run makes (the kept tree goes, as on any failure).
+	rm -r "$TH/.cache"
+	before=$(snap "$TH")
+	serve 0.3.0
+	srv_mark
+	inst_net
+	expect_fail "a latest release older than the layout"
+	expect_out 'Eitri 0.3.0 is older than this installer installs'
+	expect_eq "$(srv_paths)" '/releases/latest/download/SHA256SUMS' "requests for a latest release older than the layout"
+	expect_eq "$(snap "$TH")" "$before" "the home after a latest 0.3.0"
+}
+
+TESTS="$TESTS t_release_at_the_layout_minimum_installs"
+t_release_at_the_layout_minimum_installs() {
+	# 0.3.1 is the oldest release the layout accepts; it predates the server helper. Its fixture has no
+	# protoc pin (a sidecar build above 0.3.0 would refuse that), so its sidecar is planted first.
+	serve 1.0.0 0.3.1
 	plant_sidecar aaaaaaa
-	inst_net --version 0.3.0
+	inst_net --version 0.3.1
+	expect_rc 0
+	expect_eq "$(installed_version)" 0.3.1 "the version installed"
+	expect_absent "$TH/.local/lib/eitri/eitri-server"
+	expect_exec "$TH/.local/lib/eitri/eitri-editor-bridge"
+	expect_file "$TH/.local/share/applications/cn.huntergrey.eitri.Page.desktop"
+	inst_net --version 0.3.1
 	expect_rc 0
 	expect_out 'is up to date'
 	# Uninstall removes companions even when this installed release predates them.
-	for b in eitri-server eitri-editor-bridge; do
-		printf '#!/bin/sh\nexit 0\n' >"$TH/.local/lib/eitri/$b"
-		chmod 0755 "$TH/.local/lib/eitri/$b"
-	done
+	printf '#!/bin/sh\nexit 0\n' >"$TH/.local/lib/eitri/eitri-server"
+	chmod 0755 "$TH/.local/lib/eitri/eitri-server"
 	inst -- --uninstall
 	expect_rc 0
 	expect_absent "$TH/.local/lib/eitri"

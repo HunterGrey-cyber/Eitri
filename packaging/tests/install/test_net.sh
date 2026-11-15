@@ -84,7 +84,7 @@ t_downloads_bounded() {
 			esac
 			;;
 		esac
-		for want in " --connect-timeout 60 " " --speed-limit 1024 --speed-time 300 " " --max-filesize 1073741824 "; do
+		for want in " --connect-timeout 30 " " --speed-limit 1024 --speed-time 60 " " --max-filesize 1073741824 "; do
 			case $line in
 			*"$want"*) ;;
 			*) fail "a curl call without$want: $line" ;;

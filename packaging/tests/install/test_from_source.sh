@@ -228,18 +228,20 @@ t_from_source_clone_head_match_builds_and_installs() {
 	fi
 }
 
-# fs_install_030: a --from-source install of a tree that calls itself 0.3.0, the version of the last release with
-# the acknowledgement inside LICENSE.
+# fs_install_030: a --from-source --checkout install of a tree that calls itself 0.3.0, the version of the last
+# release with the acknowledgement inside LICENSE. A checkout's version does not say its layout (a development
+# tree keeps the last release's number), so a checkout is not refused for it, while --version 0.3.0 is.
 fs_install_030() {
 	FS_FORK_REV=eeeeeee111111111111111111111111111111111
-	fs_repo 0.3.0 https://github.com/HunterGrey-cyber/verdandi.git ddddddd000000000000000000000000000000000
-	mk_from_source_release 0.3.0 ddddddd000000000000000000000000000000000 "$FS_HEAD"
-	serve 0.3.0
+	fs_verdandi_checkout "$T/verdandi-src"
+	FS_DIR=$T/fs-repo
+	fs_scaffold "$FS_DIR" 0.3.0 https://github.com/HunterGrey-cyber/verdandi.git "$FS_VC_HEAD"
+	fs_commit_and_tag "$FS_DIR" 0.3.0
 	PRE_STUBS=$(fs_cargo_stubs)
-	inst --set "EITRI_INSTALL_TEST_REPO_URL=$FS_DIR" \
+	inst --set "EITRI_INSTALL_TEST_VERDANDI_REPO_URL=$T/verdandi-src" \
 		--set "EITRI_INSTALL_TEST_NODE_BASE_URL=http://127.0.0.1:$PORT/dist" \
 		--set "EITRI_INSTALL_TEST_SKIA_BASE_URL=http://127.0.0.1:$PORT/skia" \
-		-- --from-source --version 0.3.0 --base-url "http://127.0.0.1:$PORT" --release-signers "$SIGNERS"
+		-- --from-source --checkout "$FS_DIR"
 	expect_rc 0
 }
 
@@ -280,8 +282,26 @@ fs_legacy_companions() {
 	*) expect_exec "$TH/.local/lib/eitri/eitri-editor-bridge" ;;
 	esac
 }
-TESTS="$TESTS t_from_source_030_without_companions t_from_source_031_without_server t_from_source_031_rc_without_server"
-t_from_source_030_without_companions() { fs_legacy_companions 0.3.0; }
+TESTS="$TESTS t_from_source_030_refused_before_work t_from_source_031_without_server t_from_source_031_rc_without_server"
+t_from_source_030_refused_before_work() {
+	# A release older than the layout is refused before any download, clone or build, also from source.
+	FS_FORK_REV=eeeeeee111111111111111111111111111111111
+	fs_repo 0.3.0 https://github.com/HunterGrey-cyber/verdandi.git ddddddd000000000000000000000000000000000
+	mk_from_source_release 0.3.0 ddddddd000000000000000000000000000000000 "$FS_HEAD"
+	serve 0.3.0
+	PRE_STUBS=$(fs_cargo_stubs)
+	srv_mark
+	inst --set "EITRI_INSTALL_TEST_REPO_URL=$FS_DIR" \
+		--set "EITRI_INSTALL_TEST_NODE_BASE_URL=http://127.0.0.1:$PORT/dist" \
+		--set "EITRI_INSTALL_TEST_SKIA_BASE_URL=http://127.0.0.1:$PORT/skia" \
+		-- --from-source --version 0.3.0 --base-url "http://127.0.0.1:$PORT" --release-signers "$SIGNERS"
+	expect_fail "--from-source --version 0.3.0"
+	expect_out 'Eitri 0.3.0 is older than this installer installs'
+	expect_out '(with --from-source --version 0.3.0)'
+	expect_eq "$(srv_paths)" '' "requests for an older --from-source --version"
+	if grep -q '^cargo ' "$S/logs/cargo.log"; then fail "cargo ran for a release older than the layout"; fi
+	expect_absent "$TH/.local/lib/eitri"
+}
 t_from_source_031_without_server() { fs_legacy_companions 0.3.1; }
 t_from_source_031_rc_without_server() { fs_legacy_companions 0.3.1-rc.1; }
 

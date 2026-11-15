@@ -742,6 +742,24 @@ done
     assert proc.stdout.splitlines() == [f"eitri-editor-bridge={bridge}", f"eitri-server={server}", "shell=1"]
 
 
+@pytest.mark.parametrize("shell", ["bash", "dash"])
+@pytest.mark.parametrize("version,older", [
+    ("0.2.0", 1), ("0.2.2", 1), ("0.3.0-rc.1", 1), ("0.3.0", 1),
+    ("0.3.1-rc.0", 0), ("0.3.1-rc.1", 0), ("0.3.1", 0), ("0.3.2", 0), ("0.4.0", 0), ("0.10.0", 0), ("1.0.0", 0),
+])
+def test_layout_boundary(shell, version, older):
+    """The oldest layout this installer lays out is the 0.3.1 line, its candidates included."""
+    if shutil.which(shell) is None:
+        pytest.skip(f"{shell} is not installed")
+    script = INSTALLER.read_text().replace('main "$@" </dev/null', r'''
+older_layout "$1"
+printf 'older=%s\n' "$OL_OLDER"
+''')
+    proc = subprocess.run([shell, "-s", "--", version], input=script, capture_output=True, text=True, timeout=10)
+    assert proc.returncode == 0, report(proc)
+    assert proc.stdout.splitlines() == [f"older={older}"], report(proc)
+
+
 @pytest.mark.parametrize("version", [
     "0.2.2", "0.3.0-rc.1", "0.3.0", "0.3.1-rc.1", "0.3.1",
     "0.3.2-rc.0", "0.3.2-rc.1", "0.3.2", "0.10.0",

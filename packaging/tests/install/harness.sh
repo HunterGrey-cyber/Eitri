@@ -777,6 +777,7 @@ TESTS=
 . "$HERE/test_recovery.sh"
 . "$HERE/test_verify.sh"
 . "$HERE/test_net.sh"
+. "$HERE/test_net_retry.sh"
 . "$HERE/test_system.sh"
 . "$HERE/test_uninstall.sh"
 . "$HERE/test_sidecar.sh"

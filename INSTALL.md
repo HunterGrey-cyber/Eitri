@@ -15,10 +15,43 @@ curl --proto '=https' --proto-redir '=https' --tlsv1.2 -sSfL https://github.com/
 This is the recommended way, on every distribution; on Arch, the [AUR package](#aur-arch) fits better.
 It installs into `~/.local`, without `sudo`, and builds the agent sidecar on your machine
 ([why](#why-the-sidecar-is-built-on-your-machine)), which takes a few minutes, network access and about
-1.4 GiB of free disk space while it builds. Options go after `sh -s --`, for example `… | sh -s -- --version 0.3.0 --yes`;
-`sh install.sh --help` lists them all.
+1.4 GiB of free disk space while it builds. Options go after `sh -s --`, for example `… | sh -s -- --version 0.4.0 --yes`;
+`sh install.sh --help` lists them all. This installer installs 0.3.1 and later; to install an older release, use that
+release's own `install.sh` (its release asset, for example
+`https://github.com/HunterGrey-cyber/eitri/releases/download/v0.3.0/install.sh`).
 
 To check the download's signature before running it, see [Verify before running](#verify-before-running).
+
+### On a slow or filtered network
+
+Every file the installer downloads (the release files, Node, the npm packages, the compiler for the sidecar and
+the private nvim) is tried again when the connection breaks or stalls, and a file download picks up where it stopped.
+Each file is still checked against the release's signature, its pinned hash or npm's lockfile afterwards, so a
+retried or resumed file that is not the right one is refused. When a download still fails, the message names the
+file, the host and what was tried.
+
+If those hosts are reachable only through a proxy, set it before running the line: curl, npm and the installer all
+read `https_proxy`.
+
+```sh
+export https_proxy=http://127.0.0.1:7890    # your proxy's address
+```
+
+`--base-url URL` takes Eitri's own release files from a mirror laid out like the GitHub release page; Node, npm,
+the compiler and nvim still come from their usual hosts.
+
+**If `install.sh` itself does not arrive in full**, `sh` runs none of it: a cut-off script ends in a syntax error and
+a non-zero exit status. A download that breaks before its first byte, though, hands `sh` an empty script, and the
+line then exits 0 with only curl's `curl: (NN) …` line to show for it. In a script, or whenever the exit status
+matters, download first and then run it:
+
+```sh
+curl --proto '=https' --proto-redir '=https' --tlsv1.2 --retry 5 --retry-all-errors -sSfL -o eitri-install.sh https://github.com/HunterGrey-cyber/eitri/releases/latest/download/install.sh && sh eitri-install.sh
+```
+
+In bash or zsh, `set -o pipefail` before the quick-install line also makes it fail with curl's status. Do not add
+`--retry` to the piped line: curl cannot take back what it already passed to `sh`, so a retry sends the script
+again after the part that already went.
 
 ## AUR (Arch)
 
@@ -179,6 +212,9 @@ What the installer says, abridged:
 - **`this system has GTK 4.N, and Eitri needs GTK 4.14 or newer`**, **`WebKitGTK 6.0 … was not found`** or
   **`Eitri's prebuilt binaries need glibc 2.39 or newer`**: the distribution is too old (Ubuntu 22.04 and
   Debian 12 are) or a runtime package is missing; the message names the package for your distribution.
+- **`could not download … from …: curl: (NN) …; N attempts over N s to <host>`**: the network kept breaking that
+  download. Set `https_proxy` if that host is reachable only through a proxy, or use `--base-url` for Eitri's own
+  release files ([On a slow or filtered network](#on-a-slow-or-filtered-network)).
 - **`checksum mismatch for …`**: the download is corrupt. Run the installer again.
 - **`the signature on SHA256SUMS does not verify`**: stop, and do not install this release.
 - **`ssh-keygen was not found, so the release signature cannot be checked`**: install the OpenSSH client
@@ -201,8 +237,9 @@ work, and the agent panel shows the fix instead of crashing. The installer print
 
 - **`.deb`**: the package ships the profile `/etc/apparmor.d/eitri`. Load it once with
   `sudo apparmor_parser -r /etc/apparmor.d/eitri`, or restart.
-- **Every other route**: the installer (or Eitri, at startup) writes a profile for your install and prints
-  the two `sudo` commands that put it in place. Run them once.
+- **Every other route**: the installer (or Eitri, at startup) writes a profile for your install and ends by
+  saying that the agent panel stays off until you run the two `sudo` commands it prints. Run them once, then start
+  (or restart) Eitri. The installer never runs `sudo` itself.
 
 **The cost:** the profile lets every process Eitri starts create user namespaces, including the editor,
 the terminal's shell and the commands the agent runs. For a per-user install the profile is tied to a path

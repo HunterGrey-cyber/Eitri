@@ -1,5 +1,5 @@
 [English](INSTALL.md) | 简体中文
-<!-- translated-from: INSTALL.md sha256=6fbed3694d7b7712e3a899e6bfee4a676b0d12a24724bda3e3bd24fb4444b6c0 -->
+<!-- translated-from: INSTALL.md sha256=33ebd19ce4b72595c17a56a1b5cf143016119b532b543dc0e0b814a1f80a1d99 -->
 
 # 安装 Eitri
 
@@ -12,9 +12,30 @@
 curl --proto '=https' --proto-redir '=https' --tlsv1.2 -sSfL https://github.com/HunterGrey-cyber/eitri/releases/latest/download/install.sh | sh
 ```
 
-这是推荐的安装方式，适用于所有发行版；Arch 上用 [AUR 包](#aur-arch)更合适。装到 `~/.local`，不需要 `sudo`。安装时还会在你的机器上构建 agent sidecar（[原因](#why-the-sidecar-is-built-on-your-machine)），要几分钟，需要联网，构建时需要大约 1.4 GiB 的可用磁盘空间。选项写在 `sh -s --` 后面，例如 `… | sh -s -- --version 0.3.0 --yes`；全部选项见 `sh install.sh --help`。
+这是推荐的安装方式，适用于所有发行版；Arch 上用 [AUR 包](#aur-arch)更合适。装到 `~/.local`，不需要 `sudo`。安装时还会在你的机器上构建 agent sidecar（[原因](#why-the-sidecar-is-built-on-your-machine)），要几分钟，需要联网，构建时需要大约 1.4 GiB 的可用磁盘空间。选项写在 `sh -s --` 后面，例如 `… | sh -s -- --version 0.4.0 --yes`；全部选项见 `sh install.sh --help`。这个安装脚本安装 0.3.1 及以后的版本；要安装更早的版本，请用那个版本自己的 `install.sh`（它的发布文件，例如 `https://github.com/HunterGrey-cyber/eitri/releases/download/v0.3.0/install.sh`）。
 
 想在运行前先校验下载的签名，见[运行前先验证](#verify-before-running)。
+
+<a id="on-a-slow-or-filtered-network"></a>
+### 网络慢或受限时
+
+安装脚本下载的每个文件（发布文件、Node、npm 包、sidecar 用的编译器和私有 nvim）在连接断开或卡住时都会重试，文件下载会从断开的地方接着下。每个文件下载完仍然要对照发布签名、固定的哈希或 npm 的 lockfile 校验，所以重试或续传得到的文件如果不对，会被拒绝。重试之后仍然失败时，错误信息会写明是哪个文件、哪台主机，以及试过什么。
+
+如果这些主机只能通过代理访问，运行前先设好代理：curl、npm 和安装脚本都读 `https_proxy`。
+
+```sh
+export https_proxy=http://127.0.0.1:7890    # 换成你的代理地址
+```
+
+`--base-url URL` 让 Eitri 自己的发布文件改从一个和 GitHub 发布页面结构相同的镜像下载；Node、npm、编译器和 nvim 仍然从原来的主机下载。
+
+**如果 `install.sh` 本身没有完整下载下来**，`sh` 一行也不会执行：被截断的脚本会以语法错误结束，退出状态不为 0。但如果下载在收到第一个字节之前就断了，`sh` 拿到的是一个空脚本，这一行的退出状态就是 0，只有 curl 打印的 `curl: (NN) …` 那一行能看出出了问题。在脚本里，或者需要靠退出状态判断时，先下载再运行：
+
+```sh
+curl --proto '=https' --proto-redir '=https' --tlsv1.2 --retry 5 --retry-all-errors -sSfL -o eitri-install.sh https://github.com/HunterGrey-cyber/eitri/releases/latest/download/install.sh && sh eitri-install.sh
+```
+
+在 bash 或 zsh 里，先执行 `set -o pipefail` 再运行快速安装那一行，也能让它带着 curl 的状态失败。不要给管道那一行加 `--retry`：curl 收不回已经交给 `sh` 的内容，重试会把脚本接在已经发出去的那部分后面再发一遍。
 
 <a id="aur-arch"></a>
 ## AUR（Arch）
@@ -136,6 +157,7 @@ Linux 上，不管哪种方式，若 `XDG_CONFIG_HOME` 非空且为绝对路径�
 
 - **`run this as the user who will run Eitri`**：不要以 root 身份运行；sidecar 是按用户构建的。`--allow-root` 只是给容器用的。
 - **`this system has GTK 4.N, and Eitri needs GTK 4.14 or newer`**、**`WebKitGTK 6.0 … was not found`** 或 **`Eitri's prebuilt binaries need glibc 2.39 or newer`**：发行版太旧（Ubuntu 22.04 和 Debian 12 就是），或者缺运行时的包；错误信息里会给出你这个发行版对应的包名。
+- **`could not download … from …: curl: (NN) …; N attempts over N s to <host>`**：网络反复中断了这个下载。如果那台主机只能通过代理访问，设好 `https_proxy`；Eitri 自己的发布文件也可以用 `--base-url`（见[网络慢或受限时](#on-a-slow-or-filtered-network)）。
 - **`checksum mismatch for …`**：下载损坏了。重新运行一次安装脚本。
 - **`the signature on SHA256SUMS does not verify`**：停下，不要安装这个版本。
 - **`ssh-keygen was not found, so the release signature cannot be checked`**：装上 OpenSSH 客户端（Debian 和 Ubuntu 上是 `openssh-client`，Fedora 上是 `openssh-clients`，Arch 上是 `openssh`）。`--insecure-skip-signature` 不校验签名直接安装，这时只校验 checksum。
@@ -149,7 +171,7 @@ Linux 上，不管哪种方式，若 `XDG_CONFIG_HOME` 非空且为绝对路径�
 Ubuntu（包括 24.04）只允许在授权了的 AppArmor profile 下创建用户命名空间，而 WebKitGTK 的沙盒需要它。Eitri 启动时会检查：编辑器和终端照常工作，agent 面板会显示修复方法，而不是崩溃。安装脚本也会打印同样的修复方法。
 
 - **`.deb`**：软件包里带有 profile `/etc/apparmor.d/eitri`。运行一次 `sudo apparmor_parser -r /etc/apparmor.d/eitri` 加载它，或者重启。
-- **其他所有方式**：安装脚本（或者 Eitri 启动时）会为你的安装写一份 profile，并打印把它装好的两条 `sudo` 命令。运行一次就好。
+- **其他所有方式**：安装脚本（或者 Eitri 启动时）会为你的安装写一份 profile，最后说明：在你运行它打印的两条 `sudo` 命令之前，agent 面板一直不可用。运行一次，然后启动（或重新启动）Eitri。安装脚本自己从不运行 `sudo`。
 
 **代价：** 这份 profile 让 Eitri 启动的每个进程都能创建用户命名空间，包括编辑器、终端里的 shell 和 agent 运行的命令。按用户安装时，profile 绑定的是你 home 目录下的一个路径，所以放在那里的任何程序都能用上它。
 

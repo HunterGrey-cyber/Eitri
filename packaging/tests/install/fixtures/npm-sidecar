@@ -16,6 +16,8 @@
 #
 # EITRI_INSTALL_TEST_NPM_LOG, when set, names a file that gets one line per step: `ci` with its
 # arguments, and `build` with whether grpc-tools' protoc and plugin were in place by then.
+# EITRI_INSTALL_TEST_NPM_ENV_LOG, when set, names a file that gets one line per `npm ci`: the retry
+# settings npm would read from its environment.
 # EITRI_INSTALL_TEST_GRPC_TOOLS_VERSION is the grpc-tools version `npm ci` lays down.
 # EITRI_INSTALL_TEST_SDK_VERSION, _PROTOCOL_MINOR and _EXECUTABLES are what the artifact's
 # --version --json reports, beside the version and stamp above.
@@ -31,6 +33,10 @@ npm_log=${EITRI_INSTALL_TEST_NPM_LOG:-}
 case $1 in
 ci)
 	if [ -n "$npm_log" ]; then printf '%s\n' "$*" >>"$npm_log"; fi
+	if [ -n "${EITRI_INSTALL_TEST_NPM_ENV_LOG:-}" ]; then
+		printf 'fetch_retries=%s fetch_retry_mintimeout=%s\n' "${npm_config_fetch_retries-unset}" \
+			"${npm_config_fetch_retry_mintimeout-unset}" >>"$EITRI_INSTALL_TEST_NPM_ENV_LOG"
+	fi
 	case $mode in
 	fail-ci)
 		echo "npm-sidecar-stub: simulated npm ci failure" >&2

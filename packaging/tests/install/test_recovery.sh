@@ -267,6 +267,47 @@ t_truncated_script() {
 	expect_eq "$(snap "$TH")" "$before" "the home after half a script ran"
 }
 
+TESTS="$TESTS t_truncated_anywhere"
+t_truncated_anywhere() {
+	# A real install's arguments, with the script cut at every byte of its first lines and at 60 points
+	# spread over the rest (t_truncated_every_cut_point covers the last three lines): a cut that holds
+	# no more than the first line is a comment, and sh exits 0 having done nothing; any longer cut
+	# runs nothing, downloads nothing and fails.
+	serve 1.0.0
+	size=$(wc -c <"$INSTALLER")
+	line1=$(head -n 1 "$INSTALLER" | wc -c)
+	tail3=$(tail -n 3 "$INSTALLER" | wc -c)
+	before=$(snap "$TH")
+	srv_mark
+	cuts=
+	n=0
+	while [ "$n" -le $((line1 + 40)) ]; do
+		cuts="$cuts $n"
+		n=$((n + 1))
+	done
+	k=1
+	while [ "$k" -le 60 ]; do
+		cuts="$cuts $(((size - tail3) * k / 61))"
+		k=$((k + 1))
+	done
+	for n in $cuts; do
+		head -c "$n" "$INSTALLER" >"$T/cut.sh"
+		"$WRAP" --home "$TH" --cwd "$T/cwd" --stubs "$S/stubs" --stubs "$S/stubs-probeuname" --set EITRI_INSTALL_TEST=1 \
+			-- "$NV_SH" -s -- --base-url "http://127.0.0.1:$PORT" --release-signers "$SIGNERS" <"$T/cut.sh" >"$OUT" 2>&1
+		RC=$?
+		if grep -F -e PROBE-UNAME -e 'eitri:' "$OUT" >/dev/null; then
+			fail "cut at byte $n of $size ran something: $(cat "$OUT")"
+		fi
+		if [ "$n" -le "$line1" ]; then
+			expect_rc 0 "a script of only its first line's $n bytes"
+		else
+			expect_fail "a script cut at byte $n of $size"
+		fi
+	done
+	expect_eq "$(srv_paths)" '' "requests made by cut scripts"
+	expect_eq "$(snap "$TH")" "$before" "the home after every cut"
+}
+
 TESTS="$TESTS t_truncated_every_cut_point"
 t_truncated_every_cut_point() {
 	# Every cut of the last three lines, piped to sh with --help: no prefix ending before the final

@@ -1,7 +1,8 @@
 #!/bin/sh
 # Test double for curl against a non-loopback --base-url (https://mirror.example): records its argv
 # in <scratch>/logs/curl.log, then serves the URL's path from <scratch>/srv, failing like `curl -f`
-# (exit 22) when there is no such file.
+# (exit 22) when there is no such file. A file <scratch>/logs/curl-fail/<name> holding a count N > 0
+# makes the next N downloads of a URL ending in /<name> fail as a connection reset (exit 56).
 S=$(cd "$(dirname "$0")/.." && pwd)
 {
 	printf 'curl'
@@ -21,5 +22,14 @@ while [ $# -gt 0 ]; do
 done
 p=${url#*://}
 p=/${p#*/}
+f=$S/logs/curl-fail/${p##*/}
+if [ -f "$f" ]; then
+	n=$(cat "$f")
+	if [ "$n" -gt 0 ]; then
+		echo $((n - 1)) >"$f"
+		echo 'curl: (56) Recv failure: Connection reset by peer' >&2
+		exit 56
+	fi
+fi
 [ -f "$S/srv$p" ] || exit 22
 if [ "$out" = - ]; then cat "$S/srv$p"; else cat "$S/srv$p" >"$out"; fi

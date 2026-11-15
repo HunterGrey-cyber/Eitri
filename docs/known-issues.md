@@ -8,8 +8,12 @@ bug, and tell us if something here is wrong or has changed. The requirements are
 
 ## Where it runs
 
-- **Linux on x86_64, Wayland.** X11 is untested (a report from X11 is still welcome). macOS is in progress.
-  Windows is not supported; WSL2 with WSLg may work, untested. There is no ARM build yet.
+- **Linux on x86_64, Wayland.** X11 has been tried in one session: GNOME on Xorg on Ubuntu 24.04, in a virtual
+  machine without GPU acceleration. The window, the editor, the agent panel, the bottom terminal and tiling worked
+  there. On X11 the editor always draws the GTK way, and the GNOME Shell extension and companion mode's focus moves
+  do not apply to X11 windows. Other X11 desktops and window managers, i3 among them, are untested (reports are
+  welcome). macOS is in progress. Windows is not supported; WSL2 with WSLg may work, untested. There is no ARM
+  build yet.
 - **Tested on GNOME and sway, and companion mode on Hyprland.** Other desktops and compositors, KDE Plasma
   among them, have not been tested; reports from them are welcome. Hyprland: companion mode (focus moves and
   raises) was run on a live 0.57.0 and 0.56.2 (with `hyprland.conf` and with `hyprland.lua`); the second window's

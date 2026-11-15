@@ -635,17 +635,15 @@ t_build_sidecar_into_ignores_xdg_data_home_outside_home() {
 
 TESTS="$TESTS t_bundled_protoc_legacy_warning t_bundled_protoc_missing_refuses t_bundled_protoc_download_fatal"
 t_bundled_protoc_legacy_warning() {
+	# This installer no longer installs 0.3.0 itself (its layout is older), but an installed 0.3.0's
+	# eitri setup still builds its sidecar, with the legacy warning and npm's install scripts.
 	serve 0.3.0
-	sc_inst_net --set "EITRI_INSTALL_TEST_NPM_LOG=$T/npm.log"
+	sc_setup_release 0.3.0 "$REV_A"
+	sc_inst_setup --set "EITRI_INSTALL_TEST_NPM_LOG=$T/npm.log" -- --sidecar-only
 	expect_rc 0
 	expect_out "warning:"
 	expect_out "unverified compiler download"
 	if grep -q -- --ignore-scripts "$T/npm.log"; then fail "legacy build disabled scripts"; fi
-	sc_setup_release 0.3.0 "$REV_A"
-	rm -rf "$TH/.local/share/eitri/sidecar"
-	sc_inst_setup -- --sidecar-only
-	expect_rc 0
-	expect_out "unverified compiler download"
 }
 
 t_bundled_protoc_missing_refuses() {

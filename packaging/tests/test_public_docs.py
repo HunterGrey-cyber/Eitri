@@ -1,7 +1,7 @@
 """Tests for the public docs under publish/files/ -- or, in the public tree this file also ships in, at the root, where publish/export.sh
 copies them (public_docs_dir(); `PublicTreeLayoutTests` runs this whole suite in that layout): every
 documented `curl ... install.sh | sh` command must carry the same HTTPS-safety flags
-packaging/install.sh's own fetch() function uses for the identical download (a GitHub
+packaging/install.sh's own net_get() function uses for the identical download (a GitHub
 `releases/latest/download/` URL answers with a 302, and without `-L` (or `--proto-redir`) `curl -sSf | sh` silently pipes nothing to
 `sh` and exits 0 -- no install happens and no error is shown).
 
@@ -28,7 +28,7 @@ build their fixtures under pytest's own `tmp_path` fixture (an autouse fixture, 
 `unittest.TestCase`s; pytest puts it under `$TMPDIR`, else `/tmp`, unless `--basetemp` is given), or,
 under plain unittest, in a fresh directory under `~/.cache/eitri-public-docs-tests` removed after
 each test -- never a bare `tempfile.mkdtemp()`. The required flags are parsed out of the real
-packaging/install.sh -- never hardcoded a second time here -- so a future change to fetch()'s own
+packaging/install.sh -- never hardcoded a second time here -- so a future change to net_get()'s own
 flags is what this test tracks, not a copy that could drift from it. The "catches a regression" tests
 below construct their own in-memory command lines; they do not mutate any tracked file.
 """
@@ -86,12 +86,12 @@ _CURL_INSTALL_LINE_RE = re.compile(r"^\s*curl\b.*\binstall\.sh\b.*\|\s*sh\b")
 
 
 def _fetch_https_branch(install_sh_text):
-    """The body of packaging/install.sh's fetch() function, and within it the `else` branch's curl
-    invocation -- the one used for every non-loopback (real) download, i.e. every URL a public doc
-    also tells a user to fetch by hand."""
-    m = re.search(r"\nfetch\(\) \{\n(.*?)\n\}\n", install_sh_text, re.DOTALL)
+    """The body of packaging/install.sh's net_get() function (every download goes through it), and
+    within it the first https curl invocation -- the one used for every non-loopback (real)
+    download, i.e. every URL a public doc also tells a user to fetch by hand."""
+    m = re.search(r"\nnet_get\(\) \{\n(.*?)\n\}\n", install_sh_text, re.DOTALL)
     if not m:
-        raise AssertionError("packaging/install.sh: could not find a fetch() function to read flags from")
+        raise AssertionError("packaging/install.sh: could not find a net_get() function to read flags from")
     body = m.group(1)
     https_line = None
     for line in body.splitlines():
@@ -100,8 +100,8 @@ def _fetch_https_branch(install_sh_text):
             https_line = stripped
             break
     if https_line is None:
-        raise AssertionError("packaging/install.sh: fetch() has no https-branch curl invocation to read flags from")
-    # Drop the trailing `|| die "..."`: only the curl invocation itself is parsed.
+        raise AssertionError("packaging/install.sh: net_get() has no https curl invocation to read flags from")
+    # Drop the trailing `|| printf ...`: only the curl invocation itself is parsed.
     return https_line.split(" || ", 1)[0].strip()
 
 
@@ -137,14 +137,14 @@ def curl_flags(curl_command_text):
 
 def required_fetch_flags():
     """The flags this test requires of every documented install one-liner, read live from
-    packaging/install.sh's own fetch() -- not a second, hand-kept copy."""
+    packaging/install.sh's own net_get() -- not a second, hand-kept copy."""
     with open(_INSTALL_SH, encoding="utf-8") as f:
         install_sh_text = f.read()
     https_curl = _fetch_https_branch(install_sh_text)
     flags = curl_flags(https_curl)
     if flags["proto"] is None or flags["proto_redir"] is None or not flags["has_follow_redirects"]:
         raise AssertionError(
-            f"packaging/install.sh's own fetch() no longer sets --proto/--proto-redir/-L "
+            f"packaging/install.sh's own net_get() no longer sets --proto/--proto-redir/-L "
             f"(parsed {flags!r} from {https_curl!r}); this test's own baseline changed, look there first"
         )
     return flags
@@ -181,7 +181,7 @@ def public_doc_paths():
 
 
 class FetchFlagsFromInstallShTests(unittest.TestCase):
-    """required_fetch_flags() reads packaging/install.sh's own fetch(), rather than a hardcoded copy."""
+    """required_fetch_flags() reads packaging/install.sh's own net_get(), rather than a hardcoded copy."""
 
     def test_the_https_branch_sets_proto_proto_redir_and_follow_redirects(self):
         required = required_fetch_flags()
@@ -190,7 +190,7 @@ class FetchFlagsFromInstallShTests(unittest.TestCase):
         self.assertTrue(required["has_follow_redirects"])
 
     def test_the_loopback_branch_is_not_what_this_test_reads(self):
-        # The loopback branch (NV_LOOPBACK=1) uses --proto '=http' with no --proto-redir/-L -- it is
+        # The loopback branch (a loopback http URL) uses --proto '=http' with no --proto-redir/-L -- it is
         # a local-testing-only path and must never be mistaken for the public download's requirements.
         with open(_INSTALL_SH, encoding="utf-8") as f:
             install_sh_text = f.read()
@@ -259,7 +259,7 @@ class FindCurlInstallLinesTests(unittest.TestCase):
 
 class PublicDocsCurlLinesTests(unittest.TestCase):
     """The real check: every curl ... install.sh | sh line in every public doc (publish/files/ here,
-    the root in the public tree) carries the flags packaging/install.sh's own fetch() requires."""
+    the root in the public tree) carries the flags packaging/install.sh's own net_get() requires."""
 
     def test_every_public_doc_curl_install_line_has_the_required_flags(self):
         required = required_fetch_flags()
@@ -346,7 +346,7 @@ class VerifyRecipeHashStepTests(unittest.TestCase):
 class VerifyRecipeRefusesTamperedInstallShTests(unittest.TestCase):
     """The recipe extracted verbatim from INSTALL.md, run for real against a throwaway ssh key and
     a tiny self-signed SHA256SUMS this test builds itself in a scratch directory (never against
-    /scratch/... or the real rc.1 release -- this suite ships publicly and must run for any
+    a build machine's own files or the real rc.1 release -- this suite ships publicly and must run for any
     contributor). It must run install.sh when everything matches, and refuse -- never running
     install.sh -- when install.sh's bytes were swapped after signing while SHA256SUMS/.sig were
     left alone: exactly the attack the recipe must stop (a compromised release host or mirror)."""
