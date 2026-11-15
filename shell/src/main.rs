@@ -13,6 +13,7 @@ mod chrome;
 mod close_prompt;
 mod companion;
 mod compositor_mode;
+mod diagram_renderer;
 mod editor_feeds;
 mod editor_hole;
 mod editor_presentation;

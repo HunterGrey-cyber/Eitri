@@ -2878,6 +2878,7 @@ describe("VISUAL mode", () => {
       if (!/user-select\s*:\s*none\s*;?/.test(rule.declarations)) continue;
       for (const selector of rule.selector.split(",")) found.add(selector.trim());
     }
+    expect(found.has(".diagram-error")).toBe(true);
     expect(found).toEqual(new Set(VISUAL_CHROME));
   });
 
@@ -2892,6 +2893,7 @@ describe("VISUAL mode", () => {
         if (match) found.add(match[1].trim());
       }
     }
+    expect(found.has(".diagram-error")).toBe(true);
     expect(found).toEqual(new Set(VISUAL_CHROME));
   });
 

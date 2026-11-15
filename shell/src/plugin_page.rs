@@ -210,7 +210,7 @@ fn respond_static(request: &URISchemeRequest, text: &'static str, mime: &str) {
 /// the plugin's site and, for a page that follows a document, image files of that document's project, which
 /// anyone who wrote to the project chose the bytes of: the type the host decided is final, so an image can
 /// never be taken for a script or a style sheet, even by a tag that the page's own policy would let load.
-fn respond(request: &URISchemeRequest, stream: &impl IsA<gio::InputStream>, len: i64, mime: &str) {
+pub(crate) fn respond(request: &URISchemeRequest, stream: &impl IsA<gio::InputStream>, len: i64, mime: &str) {
     let response = webkit6::URISchemeResponse::new(stream, len);
     response.set_status(200, None);
     response.set_content_type(mime);

@@ -462,3 +462,15 @@ fn the_plugin_page_project_watches_its_sources_and_build_files() {
 mod script_fixture {
     include!(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/support/executable.rs"));
 }
+
+#[test]
+fn diagram_renderer_html_is_fingerprinted_and_watched() {
+    let fixture = Fixture::new("diagram-renderer-html");
+    let html = fixture.web_dir.join("diagram-renderer.html");
+    fs::write(&html, "<html>renderer</html>").unwrap();
+    assert!(web_build_inputs(&fixture.web_dir).contains(&html));
+    assert!(web_build_watch_paths(&fixture.web_dir, "dist/index.html").contains(&html));
+    let before = compute_fingerprint(&fixture.web_dir).unwrap();
+    append(&html, "<!-- policy change -->");
+    assert_ne!(compute_fingerprint(&fixture.web_dir).unwrap(), before);
+}

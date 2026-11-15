@@ -45,6 +45,9 @@ await build({ ...common, entryPoints: ["src/main.ts"], outfile: "dist/preview.js
 // Mermaid with everything it imports in one file, rather than a hundred chunks to ship and list.
 await build({ ...common, entryPoints: ["src/mermaid-entry.ts"], outfile: "dist/mermaid.js", splitting: false });
 
+await build({ ...common, entryPoints: ["src/diagram-renderer.ts"], outfile: "dist/diagram-renderer.js", external: ["./mermaid.js"] });
+await copyFile(new URL("diagram-renderer.html", import.meta.url), new URL("diagram-renderer.html", dist));
+
 await copyFile(new URL("index.html", import.meta.url), new URL("index.html", dist));
 const fonts = new URL("node_modules/katex/dist/fonts/", import.meta.url);
 for (const name of (await readdir(fonts)).filter((n) => n.endsWith(".woff2"))) {

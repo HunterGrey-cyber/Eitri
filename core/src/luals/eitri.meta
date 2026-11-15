@@ -8,6 +8,7 @@
 ---| "agent.codex.command"
 ---| "agent.default"
 ---| "agent.default_mode"
+---| "agent.diagrams"
 ---| "agent.editor.follow"
 ---| "agent.editor.tool.apply_code_action"
 ---| "agent.editor.tool.apply_proposal"

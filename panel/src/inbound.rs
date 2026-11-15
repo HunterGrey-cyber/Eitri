@@ -703,7 +703,23 @@ pub(super) fn handle_inbound_message(
     }
 
     match message {
+        InboundMessage::RenderDiagram { id, source } => {
+            if state.diagrams.available() {
+                let vars: std::collections::BTreeMap<_, _> = state.theme.css_vars().into_iter().collect();
+                state.diagrams.request(
+                    std::time::Instant::now(),
+                    view,
+                    id,
+                    state.diagram_generation,
+                    source,
+                    serde_json::to_string(&vars).expect("theme serializes"),
+                );
+            } else {
+                out.send(view, crate::diagrams::DiagramOutcome::disabled().envelope(&id));
+            }
+        }
         InboundMessage::Ready { .. } => {
+            state.diagrams.reset(view);
             for pending in &mut state.permission_sends {
                 pending.orphaned |= pending.view == view;
             }
@@ -743,7 +759,8 @@ pub(super) fn handle_inbound_message(
                 let agent = hello_agent(state, view);
                 let greeting = super::detail::greeting_for_view(state, view);
                 let open = state.tabs.open_sessions();
-                let theme = eitri_core::agent_bridge::serialize_theme_for_js(&state.theme);
+                let theme =
+                    eitri_core::agent_bridge::serialize_diagram_theme_for_js(&state.theme, state.diagram_generation);
                 let context =
                     eitri_core::agent_bridge::context_summary((state.editor_context)().as_ref(), &state.project_dir);
                 let context_payload = eitri_core::agent_bridge::serialize_editor_context_for_js(context.as_ref());
@@ -756,7 +773,10 @@ pub(super) fn handle_inbound_message(
                 // How thinking is shown, before the tabs and the snapshot it applies to.
                 window.insert(
                     0,
-                    eitri_core::agent_bridge::serialize_display_for_js(state.thinking_display),
+                    eitri_core::agent_bridge::serialize_display_with_diagrams_for_js(
+                        state.thinking_display,
+                        state.diagrams.available(),
+                    ),
                 );
                 // Whether the page may speak of a turn's changes, before the tabs it would speak of.
                 window.insert(1, review_settings_payload(state));

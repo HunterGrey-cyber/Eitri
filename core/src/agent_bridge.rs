@@ -110,6 +110,10 @@ pub enum PaneNavDirection {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum InboundMessage {
+    RenderDiagram {
+        id: String,
+        source: String,
+    },
     Ready {
         request_id: String,
     },
@@ -885,7 +889,8 @@ pub enum TabRef {
 impl InboundMessage {
     pub fn tab_ref(&self) -> TabRef {
         let tab = match self {
-            InboundMessage::Ready { .. }
+            InboundMessage::RenderDiagram { .. }
+            | InboundMessage::Ready { .. }
             | InboundMessage::HintRequest { .. }
             | InboundMessage::HintTargets { .. }
             | InboundMessage::HistoryPush { .. }
@@ -1185,6 +1190,7 @@ impl DecisionChoice {
 impl InboundMessage {
     pub fn request_id(&self) -> &str {
         match self {
+            InboundMessage::RenderDiagram { id, .. } => id,
             InboundMessage::LoadPage { .. } | InboundMessage::PageLine { .. } => "",
             InboundMessage::Ready { request_id }
             | InboundMessage::SendMessage { request_id, .. }
@@ -1280,7 +1286,21 @@ impl InboundMessage {
 /// frontend).
 pub fn parse_inbound_message(json_str: &str) -> Option<InboundMessage> {
     match serde_json::from_str(json_str) {
-        Ok(msg) => Some(msg),
+        Ok(msg) => {
+            if let InboundMessage::RenderDiagram { id, source } = &msg {
+                if id.is_empty()
+                    || id.len() > 40
+                    || !id
+                        .bytes()
+                        .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+                    || source.chars().count() > 20_000
+                    || source.split('\n').count() > 500
+                {
+                    return None;
+                }
+            }
+            Some(msg)
+        }
         Err(e) => {
             // Only the place and the kind: the message is what the person typed, and `e` can quote it.
             let (line, column, kind) = (e.line(), e.column(), e.classify());
@@ -1560,6 +1580,35 @@ pub fn serialize_theme_for_js(tokens: &crate::theme::ThemeTokens) -> String {
         .map(|(name, value)| (name, serde_json::Value::String(value)))
         .collect();
     json!({ "kind": "theme", "vars": vars }).to_string()
+}
+
+/// Bounds are checked again at the host boundary before text can enter a renderer argument.
+pub fn validate_diagram_source(source: &str) -> Result<(), &'static str> {
+    if source
+        .chars()
+        .any(|ch| !matches!(ch, ' ' | '\n' | '\t') && crate::onboarding::display::is_hidden(ch))
+    {
+        return Err("it holds hidden characters");
+    }
+    if source.chars().count() > 20_000 {
+        return Err("too long for the panel (the limit is 20,000 characters)");
+    }
+    if source.split('\n').count() > 500 {
+        return Err("too many source lines (the limit is 500)");
+    }
+    Ok(())
+}
+
+/// Window display settings, independent of backend capabilities.
+pub fn serialize_display_with_diagrams_for_js(thinking: crate::agent_prefs::ThinkingDisplay, diagrams: bool) -> String {
+    json!({ "kind": "display", "thinking": thinking.as_str(), "diagrams": diagrams }).to_string()
+}
+
+/// Host-owned generation accompanies the complete theme. Pages cannot choose the renderer's colours.
+pub fn serialize_diagram_theme_for_js(tokens: &crate::theme::ThemeTokens, generation: u64) -> String {
+    let mut value: Value = serde_json::from_str(&serialize_theme_for_js(tokens)).expect("theme serializes");
+    value["diagramGeneration"] = generation.into();
+    value.to_string()
 }
 
 /// `{"kind":"display","thinking":"collapsed"|"preview"|"expanded"|"hidden"}`: how the panel shows the

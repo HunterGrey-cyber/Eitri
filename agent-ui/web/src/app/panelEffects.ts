@@ -1,3 +1,4 @@
+import { panelDiagrams } from "../diagrams";
 import { useEffect, useLayoutEffect, useRef } from "react";
 import type { Dispatch, MutableRefObject, RefObject, SetStateAction } from "react";
 import { buildDisplay, indexOfKey } from "../display";
@@ -328,6 +329,11 @@ export function useWatchFrozenSelection(
   modeRef: MutableRefObject<PanelMode>,
   exitRegion: () => void,
 ) {
+  const diagramsFrozen = isRegionMode(mode);
+  useLayoutEffect(() => {
+    panelDiagrams.freeze(diagramsFrozen);
+  }, [diagramsFrozen]);
+  useEffect(() => () => panelDiagrams.freeze(false), []);
   useEffect(() => {
     if (!isRegionMode(mode)) return;
     if (typeof MutationObserver === "undefined") return;

@@ -198,3 +198,42 @@ describe("a streaming reply", () => {
     expect(body().innerHTML).toBe(renderMarkdown("A new reply"));
   });
 });
+
+describe("streamed reply diagrams", () => {
+  afterEach(() => { vi.useRealTimers(); vi.restoreAllMocks(); });
+  it("attaches after the slow-tail timer, keeps cached images through deltas and stream end", () => {
+    vi.useFakeTimers();
+    let clock = 1000;
+    vi.spyOn(performance, "now").mockImplementation(() => clock);
+    const sent: { type: string; id?: string }[] = [];
+    const { deliver, delta, body } = mount();
+    window.webkit = { messageHandlers: { eitriAgent: { postMessage: (m) => sent.push(JSON.parse(m)) } } };
+    act(() => window.__eitriDispatch!(JSON.stringify({ kind: "display", thinking: "collapsed", diagrams: true })));
+    const real = Element.prototype.insertAdjacentHTML;
+    vi.spyOn(Element.prototype, "insertAdjacentHTML").mockImplementation(function (this: Element, where, html) {
+      clock += 20; real.call(this, where as InsertPosition, html);
+    });
+    const renders = () => sent.filter((m) => m.type === "render_diagram");
+    delta("```mermaid\nflowchart LR; A-->B\n");
+    expect(renders()).toHaveLength(0);
+    delta("```");
+    act(() => { clock += 200; vi.advanceTimersByTime(200); });
+    expect(renders()).toHaveLength(0);
+    delta("\n");
+    act(() => { clock += 200; vi.advanceTimersByTime(200); });
+    expect(renders()).toHaveLength(1);
+    act(() => window.__eitriDispatch!(JSON.stringify({ kind: "diagram", id: renders()[0].id,
+      svg: '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 200 100"><text>A</text></svg>' })));
+    const url = body().querySelector("img")!.src;
+    for (let i = 0; i < 10; i++) {
+      delta("\nmore text " + i);
+      act(() => { clock += 200; vi.advanceTimersByTime(200); });
+      expect(body().querySelector("img"), body().innerHTML + " iteration " + i).not.toBeNull();
+      expect(body().querySelector("img")!.src).toBe(url);
+      expect(body().querySelector("pre")!.classList.contains("diagram-drawn")).toBe(true);
+    }
+    deliver([{ type: "assistant_message_boundary" }]);
+    expect(body().querySelector("img")!.src).toBe(url);
+    expect(renders()).toHaveLength(1);
+  });
+});

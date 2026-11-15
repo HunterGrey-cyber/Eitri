@@ -235,6 +235,8 @@ struct AgentPanelState {
     /// things: the `ready` batch, the `<style>` inlined into every `load_html`, and the WebView's
     /// own background colour.
     theme: eitri_core::theme::ThemeTokens,
+    diagrams: crate::diagrams::DiagramClient,
+    diagram_generation: u64,
     /// The `?` overlay's rows (`serialize_keymap_for_js`), sent with the theme on every `ready` so
     /// a reloaded document is told the keymap it needs, not the one baked into a hand list.
     keymap_help: Option<String>,
@@ -653,6 +655,8 @@ impl AgentPanelState {
             #[cfg(any(test, feature = "test-support"))]
             ticks_run: 0,
             theme,
+            diagrams: crate::diagrams::DiagramClient::default(),
+            diagram_generation: crate::diagrams::next_theme_generation(),
             keymap_help: None,
             page_lines: None,
             load_page_hook: None,

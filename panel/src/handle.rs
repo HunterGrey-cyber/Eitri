@@ -957,6 +957,17 @@ impl AgentPanelHandle {
     pub fn run_tick(&self, now: std::time::Instant) -> crate::panel_wake::NextTick {
         use crate::panel_wake::NextTick;
         let polled_before = needs_polling(&self.state.borrow());
+        let queue = self.state.borrow().diagrams.queue();
+        if let Some(queue) = queue {
+            queue.borrow_mut().poll(now);
+        }
+        self.run(|state, out| {
+            for delivery in state.diagrams.drain() {
+                if state.ready(delivery.view) {
+                    out.send(delivery.view, delivery.outcome.envelope(&delivery.id));
+                }
+            }
+        });
         self.state.borrow_mut().last_tick = Some(now);
         if !self.tick() {
             return NextTick::Stop;
@@ -967,6 +978,7 @@ impl AgentPanelHandle {
         let after_now = |at: std::time::Instant| at.max(now + std::time::Duration::from_millis(1));
         // A card nobody answers ends at its limit, and nothing else would run a tick then.
         next = earliest(next, state.editor_tools.next_card_limit().map(after_now));
+        next = earliest(next, state.diagrams.earliest().map(after_now));
         next = earliest(next, state.tabs.remote_poll_deadline(now));
         next = earliest(next, state.tabs.link_poll_deadline(now));
         // A trust scan on a server is polled on its own slow deadline, never by holding the steady tick.
@@ -1183,6 +1195,10 @@ impl AgentPanelHandle {
     /// the watch keeps alive belongs to the application that owns the loop this panel's timers run on.
     pub fn shutdown(&self) -> ShutdownWatch {
         self.wake();
+        let diagrams = self.state.borrow_mut().diagrams.close();
+        if let Some((queue, owner)) = diagrams {
+            queue.borrow_mut().release(owner);
+        }
         // The `rv-` socket goes first: its observers are the tabs' and the tabs are taken below.
         let remote = self.remote.borrow_mut().take();
         if let Some(socket) = remote {
@@ -1439,8 +1455,13 @@ impl AgentPanelHandle {
     /// sends the recorded envelope anyway, so neither ordering loses it.
     pub fn set_theme(&self, tokens: &eitri_core::theme::ThemeTokens) {
         self.wake();
-        let payload = eitri_core::agent_bridge::serialize_theme_for_js(tokens);
-        self.state.borrow_mut().theme = tokens.clone();
+        let generation = crate::diagrams::next_theme_generation();
+        let payload = eitri_core::agent_bridge::serialize_diagram_theme_for_js(tokens, generation);
+        {
+            let mut state = self.state.borrow_mut();
+            state.theme = tokens.clone();
+            state.diagram_generation = generation;
+        }
         // Every page, idle ones too: a reused page must not show the old colours for a frame.
         for page in self.pages.every() {
             page.set_background([tokens.bg.r, tokens.bg.g, tokens.bg.b]);
@@ -1822,13 +1843,36 @@ impl AgentPanelHandle {
         self.dispatch(view, eitri_core::agent_bridge::serialize_pane_focus_for_js(focused));
     }
 
+    /// Installs the shared renderer queue. Without it, the display capabilities keep diagrams disabled.
+    pub fn set_diagram_renderer(&self, queue: Rc<RefCell<crate::diagrams::DiagramQueue>>) {
+        self.wake();
+        if self.state.borrow().shutting_down {
+            return;
+        }
+        let wake = self.raise.clone();
+        self.state.borrow_mut().diagrams.install(queue, wake);
+        let display = self.state.borrow().thinking_display;
+        self.set_thinking_display(display);
+    }
+
+    pub fn set_diagrams_enabled(&self, enabled: bool) {
+        self.wake();
+        self.state.borrow_mut().diagrams.enabled = enabled;
+        let display = self.state.borrow().thinking_display;
+        self.set_thinking_display(display);
+    }
+
     /// `agent.thinking` as `init.lua` left it, applied once after it ran. Recorded for every later
     /// `ready` and told to a document that is already listening (the dispatch is guarded, as
     /// `set_pane_focused`'s is).
     pub fn set_thinking_display(&self, display: eitri_core::agent_prefs::ThinkingDisplay) {
         self.wake();
         self.state.borrow_mut().thinking_display = display;
-        self.dispatch_every(eitri_core::agent_bridge::serialize_display_for_js(display));
+        let payload = {
+            let state = self.state.borrow();
+            eitri_core::agent_bridge::serialize_display_with_diagrams_for_js(display, state.diagrams.available())
+        };
+        self.dispatch_every(payload);
     }
 
     /// Asks the panel to open its composer with the caret in it. Sent only from the new-tab path
@@ -3120,6 +3164,120 @@ mod tests {
         fn pump(&self) -> Vec<agent::AgentDomainEvent> {
             self.inner.pump()
         }
+    }
+
+    #[test]
+    fn diagrams_expire_and_drop_on_an_otherwise_idle_panel() {
+        use crate::diagrams::{DiagramDone, DiagramQueue, DiagramRenderer, IDLE_DROP, RENDER_BUDGET};
+        use crate::panel_wake::NextTick;
+        use std::{cell::Cell, time::Instant};
+        #[derive(Default)]
+        struct Silent {
+            calls: RefCell<Vec<DiagramDone>>,
+            kills: Cell<usize>,
+            drops: Cell<usize>,
+            now: Cell<Option<Instant>>,
+        }
+        impl DiagramRenderer for Silent {
+            fn render(
+                &self,
+                _: &str,
+                _: &str,
+                _: Instant,
+                started: crate::diagrams::DiagramStarted,
+                done: DiagramDone,
+            ) {
+                assert!(started(self.now.get().unwrap()));
+                self.calls.borrow_mut().push(done);
+            }
+            fn stop(&self) {
+                self.kills.set(self.kills.get() + 1);
+            }
+            fn cancel(&self) {
+                self.stop();
+            }
+            fn drop_idle(&self) {
+                self.drops.set(self.drops.get() + 1);
+            }
+        }
+        let (a, page) = settled_panel();
+        let (b, idle_page) = settled_panel();
+        let renderer = Rc::new(Silent::default());
+        let queue = Rc::new(RefCell::new(DiagramQueue::new(renderer.clone())));
+        a.set_diagram_renderer(queue.clone());
+        b.set_diagram_renderer(queue);
+        let now = tick_until_quiet(&a, Instant::now());
+        let now = tick_until_quiet(&b, now);
+        renderer.now.set(Some(now));
+        a.page_message(
+            ViewId::BASE,
+            r#"{"type":"render_diagram","id":"d1","source":"flowchart LR;A-->B"}"#,
+        );
+        let mut next_a = a.run_tick(now);
+        let next_b = b.run_tick(now);
+        assert_eq!(next_b, NextTick::At(now + RENDER_BUDGET));
+        let mut at = now;
+        for _ in 0..300 {
+            let NextTick::At(due) = next_a else {
+                panic!("the rendering window must keep a deadline")
+            };
+            assert!(due > at);
+            at = due;
+            if at >= now + RENDER_BUDGET {
+                break;
+            }
+            next_a = a.run_tick(at);
+        }
+        assert_eq!(at, now + RENDER_BUDGET);
+        // The idle window follows only the shared deadlines and can enforce both of them itself.
+        let NextTick::At(kill_at) = next_b else { unreachable!() };
+        let next_b = b.run_tick(kill_at);
+        assert_eq!(renderer.kills.get(), 1);
+        assert_eq!(next_b, NextTick::At(kill_at + IDLE_DROP));
+        renderer.calls.borrow_mut().remove(0)(crate::diagrams::DiagramOutcome::svg("<svg/>"));
+        assert_eq!(a.run_tick(kill_at), next_b);
+        let NextTick::At(drop_at) = next_b else { unreachable!() };
+        assert_eq!(b.run_tick(drop_at), NextTick::OnWake);
+        assert_eq!(renderer.drops.get(), 1);
+        let outcomes: Vec<_> = page
+            .sent
+            .borrow()
+            .iter()
+            .filter_map(|s| serde_json::from_str::<serde_json::Value>(s).ok())
+            .filter(|v| v["kind"] == "diagram" && v["id"] == "d1")
+            .collect();
+        assert_eq!(outcomes.len(), 1);
+        assert_eq!(outcomes[0]["error"], "took longer than 4 s");
+        assert!(!idle_page
+            .sent
+            .borrow()
+            .iter()
+            .any(|s| s.contains("\"kind\":\"diagram\"")));
+        assert_eq!(a.run_tick(drop_at), NextTick::OnWake);
+        let _ = a.shutdown();
+        let _ = b.shutdown();
+    }
+
+    #[test]
+    fn a_diagram_request_while_disabled_gets_one_plain_code_answer() {
+        let (handle, page) = settled_panel();
+        handle.state.borrow_mut().diagrams.enabled = false;
+        handle.page_message(
+            ViewId::BASE,
+            r#"{"type":"render_diagram","id":"disabled","source":"flowchart LR;A-->B"}"#,
+        );
+        handle.run_tick(std::time::Instant::now());
+        let outcomes: Vec<_> = page
+            .sent
+            .borrow()
+            .iter()
+            .filter_map(|s| serde_json::from_str::<serde_json::Value>(s).ok())
+            .filter(|v| v["kind"] == "diagram" && v["id"] == "disabled")
+            .collect();
+        assert_eq!(outcomes.len(), 1);
+        assert_eq!(outcomes[0]["disabled"], true);
+        assert!(outcomes[0].get("error").is_none());
+        let _ = handle.shutdown();
     }
 
     #[test]

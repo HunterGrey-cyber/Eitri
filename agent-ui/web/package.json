@@ -5,7 +5,7 @@
   "type": "module",
   "scripts": {
     "dev": "vite",
-    "build": "tsc -b && vite build && node scripts/size-check.mjs 275000",
+    "build": "tsc -b && vite build && node scripts/size-check.mjs 289000",
     "build:transcript": "tsc -b && vite build -c vite.transcript.config.ts && node scripts/size-check.mjs 200000 dist-transcript/index.html && node scripts/transcript-bundle-check.mjs dist-transcript/index.html",
     "test": "vitest run && node --test scripts/size-check.test.mjs scripts/transcript-bundle-check.test.mjs"
   },

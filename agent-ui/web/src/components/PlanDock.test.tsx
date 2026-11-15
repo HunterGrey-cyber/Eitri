@@ -308,3 +308,9 @@ it("an unsupported plan disables every action and explains how to end it", () =>
   expect(container.querySelector(".plan-feedback")).toBeNull();
   expect(resolves()).toEqual([]);
 });
+
+it("a Mermaid fence in a plan stays code with no diagram marker", () => {
+  const { container } = setup({ plan: record("```mermaid\nflowchart LR; A-->B\n```\n") });
+  expect(container.querySelector("pre.code-block")?.textContent).toContain("A-->B");
+  expect(container.querySelector("[data-code-diagram], img")).toBeNull();
+});

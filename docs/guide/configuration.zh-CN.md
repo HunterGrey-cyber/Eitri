@@ -1,5 +1,5 @@
 [English](configuration.md) | 简体中文
-<!-- translated-from: configuration.md sha256=ba8164d38525199c9f21a08680374885872c735ee05d79e226bd73fe92759e1b -->
+<!-- translated-from: configuration.md sha256=cb4ad53c073e05b1fb74f3b1ef7bab29f235f9df675b4b5461c0f3fa2d1ccb5c -->
 
 # 配置
 
@@ -81,6 +81,7 @@ API 定义保存在 `$XDG_DATA_HOME/eitri/lua/meta/eitri.lua`；`XDG_DATA_HOME` 
 | `agent.codex.command` | 绝对路径，或裸命令名 | 未设置 | Codex 标签页运行的 `codex`。`EITRI_CODEX` 优先于它；两者都没有时用 `PATH` 上的 `codex`，再去 Codex 的安装程序放它的地方找（[Agent](agents.zh-CN.md)）。带目录部分的相对路径会被拒绝，这个设置保持未设置。 |
 | `agent.default_mode` | `"manual"`、`"auto"` 或 `"bypass"` | `"auto"` | 新标签页开始时所处的模式。见[一次启动怎样开始](#how-a-launch-starts)。 |
 | `agent.restore` | `"offer"`、`"auto"`、`"off"` 或 `false` | `"offer"` | 对这个项目上一个窗口里开着的标签页怎么办。见[一次启动怎样开始](#how-a-launch-starts)。 |
+| `agent.diagrams` | `"on"` 或 `"off"` | `"on"` | 在支持图表的主机上，将智能体回复中已闭合的 Mermaid 代码块绘制为图表。计划、问题预览、手机记录和 Mac 主机仍显示源码。复制代码时取得源码；复制整行时在图表位置放入带围栏的源码。 |
 | `agent.thinking` | `"collapsed"`、`"preview"`、`"expanded"` 或 `"hidden"` | `"collapsed"` | agent 面板怎样显示 agent 的思考过程。`"collapsed"` 每段思考画成一行不显眼的行，像工具输出一样用 `Enter` 展开；`"preview"` 在一段思考还在写的时候，另外在一个不会变高的框里显示它最新的几行；`"expanded"` 完整显示每段思考；`"hidden"` 一段也不显示。无论这里怎么设，`zi`（输入框里是 `Ctrl+o`）都会完整显示每段思考。 |
 | `agent.user_settings` | `true` / `"on"` 或 `false` / `"off"` | `true` | agent 会话是否加载你自己的 Claude Code 配置（你的 hook、插件、skill、`CLAUDE.md` 和权限规则），和终端里的 `claude` 一样。`false` 把你自己的配置排除在外；项目自己的配置由[信任](permissions.zh-CN.md)管，不由这个键管。 |
 | `agent.editor.tools` | `true` / `"on"` 或 `false` / `"off"` | `true` | 任何标签页里的 agent 是否得到[编辑器工具](editor-tools.zh-CN.md)。`false` 一个都不声明；已经在运行的会话沿用它开始时的工具。 |

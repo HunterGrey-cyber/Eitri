@@ -249,6 +249,7 @@ pub(crate) fn build_agent_panel(
         return (crate::webkit_sandbox::notice_widget(notice), handle);
     }
     let handle = AgentPanelHandle::new(init, true, Rc::new(GtkPanelHost));
+    crate::diagram_renderer::install(&handle);
     install_attachments(&handle);
     let (webview, _page) = build_chat_page(&handle, ViewId::BASE, related);
 
@@ -282,7 +283,9 @@ pub(crate) fn make_panel_handle(
         theme,
         root_note,
     };
-    AgentPanelHandle::new(init, false, Rc::new(GtkPanelHost))
+    let handle = AgentPanelHandle::new(init, false, Rc::new(GtkPanelHost));
+    crate::diagram_renderer::install(&handle);
+    handle
 }
 
 /// The window's attachment desk, for a panel with pages: composer images are staged, decoded in a child of this
@@ -1454,7 +1457,7 @@ for (const first of [new Error('first'), undefined, null, false, 0]) {
 
     /// The files under `shell/src` whose own pages are not chat pages: the grid probe's test pages, the Lua
     /// panels and the plugin pages (each with its own scheme, policy and bridge, `plugin_page.rs`).
-    /// Everything else that builds a page builds a chat page.
+    /// Other page builders are pinned individually in the constructor scan.
     const NOT_CHAT_PAGES: &[&str] = &[
         "shell/src/grid_probe/",
         "shell/src/lua/panel.rs",
@@ -1470,10 +1473,10 @@ for (const first of [new Error('first'), undefined, null, false, 0]) {
     ];
 
     /// Every chat page comes from `build_chat_page`: in the code of `shell/src` (comments, literals and
-    /// test modules blanked), outside the files that build pages that are not chat pages, a `WebView` is
-    /// built, a content manager made and a message handler registered once each, and that once is inside
-    /// `build_chat_page`'s body. A second constructor would be a page without the policy, or with a
-    /// handler that answers for some other view.
+    /// test modules blanked), outside the exempt page files, a `WebView` is built, a content manager made
+    /// and a message handler registered once each inside `build_chat_page`'s body. The private diagram
+    /// renderer has exactly one separate view, content manager and readiness message handler (`ready`/`failed`). Any other
+    /// constructor would be a page without the policy, or with a handler that answers for some other view.
     #[test]
     fn every_chat_page_is_built_by_the_one_constructor() {
         use eitri_core::source_scan as scan;
@@ -1506,18 +1509,24 @@ for (const first of [new Error('first'), undefined, null, false, 0]) {
             }
         }
         let expected: Vec<(String, &str, usize)> = [
-            "WebView::builder()",
-            "UserContentManager::new()",
-            "register_script_message_handler",
+            ("shell/src/agent_panel.rs", "WebView::builder()", 1),
+            ("shell/src/agent_panel.rs", "UserContentManager::new()", 1),
+            ("shell/src/agent_panel.rs", "register_script_message_handler", 1),
+            ("shell/src/diagram_renderer.rs", "WebView::builder()", 1),
+            ("shell/src/diagram_renderer.rs", "UserContentManager::new()", 1),
+            ("shell/src/diagram_renderer.rs", "register_script_message_handler", 1),
         ]
         .into_iter()
-        .map(|maker| ("shell/src/agent_panel.rs".to_string(), maker, 1))
+        .map(|(path, maker, count)| (path.to_string(), maker, count))
         .collect();
         let mut found_sorted = found.clone();
         found_sorted.sort();
         let mut expected_sorted = expected;
         expected_sorted.sort();
-        assert_eq!(found_sorted, expected_sorted, "a page is built outside build_chat_page");
+        assert_eq!(
+            found_sorted, expected_sorted,
+            "unexpected page constructor or message handler"
+        );
         for maker in [
             "WebView::builder()",
             "UserContentManager::new()",

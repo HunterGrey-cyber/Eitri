@@ -332,3 +332,10 @@ describe("question dock", () => {
     expect(container.querySelector('[data-focused="true"]')?.textContent).toBe("Submit");
   });
 });
+
+it("a Mermaid fence in a question preview stays code", () => {
+  const question = { ...spec, options: [{ ...spec.options[0], preview: "```mermaid\nflowchart LR; A-->B\n```\n" }] };
+  const { container } = setup([question]);
+  expect(container.querySelector(".question-preview pre.code-block")?.textContent).toContain("A-->B");
+  expect(container.querySelector(".question-preview img")).toBeNull();
+});

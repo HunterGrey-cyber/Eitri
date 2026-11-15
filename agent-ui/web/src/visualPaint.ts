@@ -22,7 +22,7 @@ import { VISUAL_CHROME } from "./visual";
 export type PaintBox = { top: number; bottom: number; left: number; right: number };
 
 /** Blocks that scroll sideways: what lies past their sides is clipped, and so is a box over it. */
-const SCROLLERS = ".code-block, .table-scroll, .permission-card-diff";
+const SCROLLERS = ".code-block, .diagram-scroll, .table-scroll, .permission-card-diff";
 /** Elements whose own children are boxes, never text: white space directly inside them is not laid out. */
 const STRUCTURE = "table, thead, tbody, tfoot, tr, ul, ol";
 /** Text that is not the selection's: VISUAL's chrome (`visual.ts`, what `y` leaves out: row signs, buttons, fold

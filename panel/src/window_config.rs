@@ -57,6 +57,8 @@ pub struct WindowConfig {
     pub review: ReviewConfig,
     /// `agent.editor.follow`: following for new tabs, off by default.
     pub editor_follow: bool,
+    /// `agent.diagrams`: draw closed Mermaid fences in replies.
+    pub diagrams: bool,
     /// `agent.thinking`: how the agent panel shows the agent's thinking.
     pub thinking_display: eitri_core::agent_prefs::ThinkingDisplay,
     /// `agent.editor.tools` and `agent.editor.tool.<name>`: which editor tools a session is given.
@@ -379,6 +381,8 @@ fn read_with_alt_mod(
 
     // How the panel shows the agent's thinking (`agent.thinking`: "collapsed", the default, "preview",
     // "expanded" or "hidden"). Anything else is a startup failure naming the key, like the keys above.
+    let diagrams =
+        eitri_core::agent_prefs::parse_diagrams(kernel.config.borrow().get(eitri_core::agent_prefs::DIAGRAMS_KEY))?;
     let thinking_display = eitri_core::agent_prefs::parse_thinking_display(
         kernel.config.borrow().get(eitri_core::agent_prefs::THINKING_KEY),
     )?;
@@ -426,6 +430,7 @@ fn read_with_alt_mod(
         tiling,
         review,
         editor_follow,
+        diagrams,
         thinking_display,
         editor_tools,
         nvim_prefix,
@@ -449,6 +454,7 @@ impl WindowConfig {
             live: self.review.live,
         });
         panel.set_editor_follow(self.editor_follow);
+        panel.set_diagrams_enabled(self.diagrams);
         panel.set_thinking_display(self.thinking_display);
         panel.set_editor_tools(self.editor_tools.clone());
     }
@@ -1146,5 +1152,31 @@ mod tests {
             claims.command_keybindings,
             [("hello".to_string(), "<primary>g".to_string())]
         );
+    }
+    #[test]
+    fn diagram_setting_defaults_on_settles_and_reaches_the_panel() {
+        let source = eitri_core::source_scan::read_required("panel/src/window_config.rs");
+        let words: Vec<_> = source.text.split_whitespace().collect();
+        for (field, key) in [("diagrams:", "agent.diagrams"), ("thinking_display:", "agent.thinking")] {
+            let at = words
+                .windows(2)
+                .position(|pair| pair == ["pub", field])
+                .expect("configuration field");
+            let doc = words[..at]
+                .iter()
+                .rposition(|word| *word == "///")
+                .expect("field documentation");
+            assert!(words[doc..at].join(" ").contains(key), "{key} documents its own field");
+        }
+        assert!(load_from("", &[]).unwrap().diagrams);
+        assert!(
+            !load_from(r#"eitri.config.set("agent.diagrams", "off")"#, &[])
+                .unwrap()
+                .diagrams
+        );
+        assert!(load_from(r#"eitri.config.set("agent.diagrams", "bad")"#, &[]).is_err());
+        let (config, problems) = settled_from(r#"eitri.config.set("agent.diagrams", "bad")"#);
+        assert!(config.diagrams);
+        assert!(problems.iter().any(|problem| problem.contains("agent.diagrams")));
     }
 }

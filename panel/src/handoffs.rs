@@ -282,6 +282,8 @@ pub(super) fn panel_tab_handoff(state: &AgentPanelState, tab: TabId) -> Result<P
         spawner: _,
         // The window's own questions about remote control, asked in its base page.
         remote_desk: _,
+        diagrams: _,
+        diagram_generation: _,
     } = state;
     if tabs.get(tab).is_none() {
         return Err(format!("no tab {}", tab.0));

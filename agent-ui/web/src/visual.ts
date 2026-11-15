@@ -13,6 +13,8 @@
 import type { VisualMotion } from "./keymap";
 import { conversationRows, rowOf } from "./nav";
 import { effectiveTop } from "./promptHeader";
+import { codeBlockText } from "./markdown";
+import { fenced } from "./paths";
 
 /** One boundary point: a DOM position "before" `offset` inside `node`, the same shape
  *  `Selection.collapse`/`setBaseAndExtent` take. Plain data, not a live `Range` -- the DOM selection is rebuilt FROM this on every key, never carried forward as a `Range`. */
@@ -55,7 +57,7 @@ export interface SelectionLike {
  *  cannot drift apart. `.row-sign` and `[aria-hidden="true"]` (the diff gutter, `EditDiff.tsx`)
  *  exclude the row sign and diff gutter from selection. `.fold-marker` is the run row's own `▸`
  *  (`components/MessageList.tsx`). */
-export const VISUAL_CHROME: string[] = [".row-sign", '[aria-hidden="true"]', "button", "input", "textarea", "[data-nav-action]", ".fold-marker"];
+export const VISUAL_CHROME: string[] = [".row-sign", '[aria-hidden="true"]', "button", "input", "textarea", "[data-nav-action]", ".fold-marker", ".diagram-error"];
 
 const CHROME_SELECTOR = VISUAL_CHROME.join(", ");
 
@@ -969,7 +971,9 @@ export function selectionMatchesBuild(sel: SelectionLike, built: BuiltSelection,
  *  the first row, and `k` can move a selection end into that notice. Mark every direct child the
  *  range intersects so its button never reaches `toString()` unshielded by the copy rule; WebKit's
  *  handling of `user-select: none` is unverified. A reply's HTML is inside a row and cannot add a
- *  direct child, so model output cannot steer this marking. */
+ *  direct child, so model output cannot steer this marking. Drawings crossed by the live range
+ *  expose their fenced source for that same read, then restore their image without moving the
+ *  selection's ends. */
 export function copySelectionText(sel: SelectionLike, root: HTMLElement, model: VisualModel): string {
   const rows = conversationRows(root);
   const anchorRow = rowOf(root, elementOf(model.anchor.node) ?? root);
@@ -979,16 +983,39 @@ export function copySelectionText(sel: SelectionLike, root: HTMLElement, model: 
   // A copy either way: `rows` is the lookup's shared list (`./nav`), and blocks are added below.
   const touched: Element[] = ai === -1 || ci === -1 ? rows.slice() : rows.slice(Math.min(ai, ci), Math.max(ai, ci) + 1);
   const list = root.classList.contains("message-list") ? root : root.querySelector(".message-list");
-  const range = list === null ? null : selectedRange(sel, model);
+  const range = selectedRange(sel, model);
   if (list !== null && range !== null) {
     for (const block of Array.from(list.children)) {
       if (!touched.includes(block) && range.intersectsNode(block)) touched.push(block);
     }
   }
   for (const block of touched) block.setAttribute("data-visual-copying", "true");
-  const text = sel.toString();
-  for (const block of touched) block.removeAttribute("data-visual-copying");
-  return text;
+  const restore: (() => void)[] = [];
+  try {
+    if (range !== null) {
+      for (const block of root.querySelectorAll<HTMLElement>("pre.diagram-drawn")) {
+        const drawing = block.querySelector<HTMLElement>(".diagram-scroll");
+        if (drawing === null || !range.intersectsNode(drawing) || isUnrenderedNode(block, root) || isChromeNode(block, root)) {
+          continue;
+        }
+        const source = document.createElement("span");
+        source.style.whiteSpace = "pre";
+        source.textContent = fenced(codeBlockText(block), "mermaid");
+        const style = drawing.getAttribute("style");
+        restore.push(() => {
+          source.remove();
+          if (style === null) drawing.removeAttribute("style");
+          else drawing.setAttribute("style", style);
+        });
+        drawing.before(source);
+        drawing.style.display = "none";
+      }
+    }
+    return sel.toString();
+  } finally {
+    for (const undo of restore) undo();
+    for (const block of touched) block.removeAttribute("data-visual-copying");
+  }
 }
 
 /** The range `toString()` is about to serialise: the live selection's own when it has one, else

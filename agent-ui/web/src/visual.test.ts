@@ -194,7 +194,8 @@ describe("visual.ts: chrome is skipped, never rested in", () => {
     root.innerHTML =
       '<span class="row-sign" aria-hidden="true">›</span><button>Approve</button>' +
       '<input /><textarea></textarea><span data-nav-action="allow"></span>' +
-      '<span class="fold-marker">▸</span><span class="prose">real text</span>';
+      '<span class="fold-marker">▸</span><span class="diagram-error">Diagram not drawn: parse error</span>' +
+      '<span class="prose">real text</span>';
     for (const selector of VISUAL_CHROME) {
       const el = root.querySelector(selector);
       expect(el, `no element matched VISUAL_CHROME selector ${selector}`).not.toBeNull();

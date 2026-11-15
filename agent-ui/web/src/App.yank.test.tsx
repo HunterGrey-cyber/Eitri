@@ -1,6 +1,7 @@
 // @vitest-environment jsdom
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import { act, cleanup, fireEvent, render } from "@testing-library/react";
+import { panelDiagrams } from "./diagrams";
 import App from "./App";
 import { initialState } from "./reducer";
 import { hintTargets } from "./nav";
@@ -304,4 +305,73 @@ it.each(["yi`", "gy", "ya`"])("%s takes the current HINT-landed block among seve
   keys(command);
   expect(container.querySelector(".path-pick")).toBeNull();
   expect(writeText).toHaveBeenLastCalledWith(command === "ya`" ? "```rust\nsecond\n```" : "second");
+});
+
+it("drawing code objects and HINT copy source, while row yank puts fenced source in place", () => {
+  const source = "flowchart LR; Source-->Destination";
+  const { root, container, keys, key } = started({ transcript: [{ seq: 1, text: `before\n\n\`\`\`mermaid\n${source}\n\`\`\`\n\nafter` }] });
+  dispatch({ kind: "theme", vars: {}, diagramGeneration: 777 });
+  dispatch({ kind: "display", thinking: "collapsed", diagrams: true });
+  const request = posted.find((m) => m.type === "render_diagram")!;
+  expect(request.source).toBe(source);
+  dispatch({ kind: "diagram", id: request.id, svg: '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 200 100"><text>drawing</text></svg>' });
+  expect(container.querySelector("pre.diagram-drawn img")).not.toBeNull();
+  keys("gy"); expect(writeText).toHaveBeenLastCalledWith(source);
+  keys("yi`"); expect(writeText).toHaveBeenLastCalledWith(source);
+  keys("yy");
+  const copied = writeText.mock.calls.at(-1)![0];
+  expect(copied).toContain("before"); expect(copied).toContain("```mermaid\n" + source + "\n```"); expect(copied).toContain("after");
+  for (const el of [root, ...root.querySelectorAll<HTMLElement>(".message-list, .row, pre")])
+    el.getBoundingClientRect = () => ({ top: 0, bottom: 100, left: 0, right: 100, width: 100, height: 100, x: 0, y: 0 }) as DOMRect;
+  const block = container.querySelector<HTMLElement>("pre.code-block")!;
+  const index = hintTargets(root).findIndex((target) => target.el === block);
+  dispatch({ kind: "hint_collect", sessionId: 901 }); dispatch({ kind: "hint_land", sessionId: 901, index });
+  key("y"); key("y"); expect(writeText).toHaveBeenLastCalledWith(source);
+});
+
+it.each(["v", "vv", "V"])("%s holds an arriving drawing until the selection mode ends", (selectionKey) => {
+  const selection = window.getSelection()!;
+  Object.defineProperty(selection, "modify", { value: vi.fn(), configurable: true });
+  try {
+    const source = "flowchart LR; Read-->Hold" + selectionKey;
+    const { container, key } = started({ transcript: [{ seq: 1, text: `before\n\n\`\`\`mermaid\n${source}\n\`\`\`\n\nafter` }] });
+    dispatch({ kind: "display", thinking: "collapsed", diagrams: true });
+    const request = posted.find((m) => m.type === "render_diagram")!;
+    for (const char of selectionKey) key(char);
+    dispatch({ kind: "diagram", id: request.id, svg: '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 200 100"><text>held</text></svg>' });
+    expect(container.querySelector("pre img")).toBeNull();
+    key("Escape");
+    if (selectionKey !== "v") expect(container.querySelector("pre img")).toBeNull();
+    key("Escape");
+    expect(container.querySelector("pre img")).not.toBeNull();
+  } finally {
+    delete (selection as unknown as { modify?: unknown }).modify;
+  }
+});
+
+it.each([true, false])("an unchanged App render with 300 replies does no diagram attach work (enabled=%s), including a plan transcript fence", (enabled) => {
+  const source = "flowchart LR; Plan-->Code";
+  const { container, key } = started({
+    transcript: Array.from({ length: 300 }, (_, seq) => ({ seq: seq + 2, text: "reply " + seq })),
+    plans: [{ seq: 1, interactionId: "plan1", toolUseId: null, turnId: null, plan: "```mermaid\n" + source + "\n```\n", planSha256: "hash", allowedPrompts: [], state: { kind: "settled", outcome: "approved", modeAfter: null, feedback: null, reason: null }, unsupportedReason: null }],
+  });
+  dispatch({ kind: "display", thinking: "collapsed", diagrams: enabled });
+  key("g"); key("g"); key("z"); key("o");
+  expect(container.querySelector(".plan-row-body pre")?.textContent).toContain(source);
+  expect(container.querySelector(".plan-row-body [data-code-diagram]")).toBeNull();
+  const attach = vi.spyOn(panelDiagrams, "attach");
+  const freeze = vi.spyOn(panelDiagrams, "freeze");
+  dispatch({ kind: "pane_focus", focused: true });
+  expect(freeze).not.toHaveBeenCalled();
+  expect(attach).not.toHaveBeenCalled();
+});
+
+it("hidden-character diagram notes never enter gy, code y or row yy", () => {
+  const source = "flowchart LR; A-->B\u202e";
+  const { container, keys } = started({ transcript: [{ seq: 1, text: "```mermaid\n" + source + "\n```\n" }] });
+  dispatch({ kind: "display", thinking: "collapsed", diagrams: true });
+  expect(container.querySelector(".diagram-error")).not.toBeNull();
+  keys("gy"); expect(writeText).toHaveBeenLastCalledWith(source);
+  keys("yi`"); expect(writeText).toHaveBeenLastCalledWith(source);
+  keys("yy"); expect(writeText.mock.calls.at(-1)![0]).not.toContain("Diagram not drawn:");
 });

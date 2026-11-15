@@ -1,3 +1,4 @@
+import { panelDiagrams } from "./diagrams";
 import type { Cited } from "./gdTarget";
 import type { DraftImage, PageLine, PlanningState, AppliedSettings, EffortChoice, ModelOption, AgentDomainEvent, AgentUiSnapshot, ChooserEnvelope, ContextSummary, DetailRow, EditorCardWire, EditorLinkState, HandoffCommand, Hello, QueueItem, ReviewDiffEnvelope, ReviewDraftEnvelope, ReviewEnvelope, ReviewHintEnvelope, ReviewHintLevel, ReviewRecoveryEnvelope, ReviewScope, ReviewSendPreviewEnvelope, TabId, TabsEnvelope, ThinkingDisplay, TurnTimeWire } from "./types";
 import type { KeymapHelp, PaneDirection, PluginKeysHelp } from "./keymap";
@@ -41,6 +42,7 @@ export type QuestionAnswerWire = { question_index: number; option_indexes: numbe
 import type { HistoryEnvelope } from "./historyPage";
 
 export type OutboundMessage =
+  | import("./diagrams").DiagramRequest
   | { type: "history_request"; request_id: string; tab: TabId; action: "older" | "latest" }
   | { type: "editor_symbol"; request_id: string; tab: TabId; name: string; cited?: Cited }
   | { type: "ready"; request_id: string }
@@ -412,11 +414,11 @@ type InboundHandler = (
      *  set changes, empty included; the page keeps them only for the tab it shows. */
     | { kind: "editor_cards"; tab: TabId; cards: EditorCardWire[] }
     | ({ kind: "handoff"; tab: TabId } & HandoffCommand)
-    | { kind: "theme"; vars: Record<string, string> }
+    | { kind: "theme"; vars: Record<string, string>; diagramGeneration?: number }
     /** How the panel shows the agent's thinking (`init.lua`'s `agent.thinking`;
      *  `serialize_display_for_js`, `core/src/agent_bridge.rs`). Window-level, sent on every `ready`
      *  before the tabs. */
-    | { kind: "display"; thinking: ThinkingDisplay }
+    | { kind: "display"; thinking: ThinkingDisplay; diagrams?: boolean }
     /** Why the project folder is no boundary (`serialize_root_note_for_js`, `core/src/agent_bridge.rs`).
      *  Window-level, sent right after `hello` on every `ready`; the page shows it until its own Dismiss. With
      *  `tab`, one tab's own note (`serialize_tab_root_note_for_js`: a remote tab's), sent when that tab is shown
@@ -797,6 +799,7 @@ function isWellFormedDraftImages(value: unknown): boolean {
 }
 
 export function installDispatch(handler: InboundHandler): void {
+  panelDiagrams.send = postToRust;
   activeTransport().listen((json: string) => {
     let parsed: unknown;
     try {
@@ -807,6 +810,17 @@ export function installDispatch(handler: InboundHandler): void {
     }
     if (parsed && typeof parsed === "object" && "kind" in parsed) {
       const obj = parsed as { kind: string };
+      if (obj.kind === "diagram") {
+        const reply = parsed as unknown as import("./diagrams").DiagramReply;
+        if (typeof reply.id === "string") panelDiagrams.receive(reply);
+        return;
+      }
+      if (obj.kind === "display") panelDiagrams.configure((parsed as { diagrams?: boolean }).diagrams === true);
+      if (obj.kind === "theme") {
+        const generation = (parsed as { diagramGeneration?: number }).diagramGeneration;
+        if (typeof generation === "number") panelDiagrams.configureDiagramTheme(generation);
+      }
+
       // The remote-control questions are drawn by their own component; one that cannot be answered as shown is
       // dropped like any malformed question.
       if (

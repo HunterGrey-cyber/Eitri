@@ -414,6 +414,7 @@ pub(super) fn needs_polling(state: &AgentPanelState) -> bool {
     state.wake.is_none()
         || state.chat_moves.is_waiting()
         || state.hand_overs.is_waiting()
+        || state.diagrams.needs_polling()
         || state.tabs.needs_polling()
         || state.tabs.attachments_pending()
         || super::inbound::owes_gone_imports(state)

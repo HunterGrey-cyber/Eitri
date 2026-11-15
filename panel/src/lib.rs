@@ -5,6 +5,7 @@
 
 pub mod agent_panel;
 pub mod agents_glue;
+pub mod diagrams;
 pub mod keys_help;
 pub mod panel_csp;
 pub mod panel_document;

@@ -1,3 +1,4 @@
+import { fenced } from "./paths";
 import { marked, Renderer, type Token, type Tokens } from "marked";
 import DOMPurify from "dompurify";
 import hljs from "highlight.js/lib/core";
@@ -64,7 +65,7 @@ export const CODE_TEXT_ATTR = "data-code-text";
 export const CODE_LANGUAGE_ATTR = "data-code-language";
 const CODE_NONCE = Array.from(crypto.getRandomValues(new Uint8Array(16)), (b) => b.toString(16).padStart(2, "0")).join("");
 const CODE_MARKER = new RegExp(`^cb-${CODE_NONCE}-(\\d+)$`);
-let fencedTexts: { text: string; lang: string | null }[] = [];
+let fencedTexts: { text: string; lang: string | null; diagram: boolean }[] = [];
 
 /* marked's own `cleanUrl` (not exported; `marked.esm.js`, used by its default `link` and `image`
    renderers): `encodeURI`, then un-double the `%` it encoded, and `null` for a destination
@@ -101,7 +102,8 @@ function resolvedHref(href: string): string | null {
 marked.use({
   useNewRenderer: true,
   renderer: {
-    code({ text, lang }: { text: string; lang?: string }) {
+    code(token: Tokens.Code) {
+      const { text, lang, raw } = token;
       const language = (lang ?? "").trim().split(/\s+/)[0];
       /* No `highlightAuto`: guessing a language on a fragment produces confidently wrong colours,
          and an unrecognised block as plain monospace is the honest rendering. */
@@ -109,7 +111,7 @@ marked.use({
         language && hljs.getLanguage(language)
           ? hljs.highlight(text, { language, ignoreIllegals: true }).value
           : escapeHtml(text);
-      fencedTexts.push({ text, lang: language || null });
+      fencedTexts.push({ text, lang: language || null, diagram: language === "mermaid" && fenceClosed(raw, drawingEnded || token !== lastDrawnToken || drawingEndsInNewline) });
       return `<pre class="cb-${CODE_NONCE}-${fencedTexts.length - 1}"><code>${markHiddenInCode(body)}</code></pre>`;
     },
     link(token: Tokens.Link) {
@@ -209,6 +211,7 @@ function installSanitizeHooks(): void {
           kept.push("code-block");
           node.setAttribute(CODE_TEXT_ATTR, JSON.stringify(block.text));
           node.setAttribute(CODE_LANGUAGE_ATTR, JSON.stringify(block.lang));
+          if (block.diagram) node.setAttribute("data-code-diagram", "1");
         }
       } else if (token === "code-escape") {
         if (node instanceof Element && node.tagName === "SPAN" && ESCAPE_TEXT.test(node.textContent ?? "")) {
@@ -381,12 +384,30 @@ function evictDownTo(chars: number): void {
   while (cacheChars > chars) forgetMarkdown(cache.keys().next().value as string);
 }
 
-function draw(text: string): string {
+let drawingEnded = true;
+let lastDrawnToken: Token | null = null;
+let drawingEndsInNewline = false;
+
+/** A closing line still being written may gain more characters; only a newline or stream end settles it. */
+export function fenceClosed(raw: string, ended: boolean): boolean {
+  const opener = /^ {0,3}(`{3,}|~{3,})[^\n]*\n/.exec(raw);
+  if (!opener) return false;
+  const close = new RegExp(`(?:^|\\n) {0,3}${opener[1][0]}{${opener[1].length},}[ \t]*(\\n[ \t\\n]*)?$`).exec(raw.slice(opener[0].length));
+  return close !== null && (ended || close[1] !== undefined);
+}
+
+function draw(text: string, ended = true): string {
   parses += 1;
   installSanitizeHooks();
   fencedTexts = [];
+  drawingEnded = ended;
   try {
-    const html = wrapTables(marked.parse(text) as string);
+    const tokens = marked.lexer(text);
+    lastDrawnToken = null;
+    drawingEndsInNewline = text.endsWith("\n");
+    // Marked leaves a separator newline to the following token. A non-final block's closing line is settled too.
+    marked.walkTokens(tokens, (token) => { if (token.type !== "space") lastDrawnToken = token; });
+    const html = wrapTables(marked.parser(tokens));
     if (!/<(code|pre|kbd|samp|tt)\b/i.test(html)) return DOMPurify.sanitize(html, SANITIZE_CONFIG);
     const fragment = DOMPurify.sanitize(html, {
       ...SANITIZE_CONFIG, RETURN_DOM_FRAGMENT: true,
@@ -482,10 +503,11 @@ export function renderMarkdownRevealed(text: string): string | null {
   let html: string | null = renderMarkdown(text);
   const template = document.createElement("template");
   template.innerHTML = html;
+  template.content.querySelectorAll("[data-code-diagram]").forEach((el) => el.removeAttribute("data-code-diagram"));
   const drawn = template.content.querySelectorAll(".code-escape").length;
   const count = revealCodeText(template.content, true, MAX_PROSE_ESCAPES - drawn);
   if (drawn + count > MAX_PROSE_ESCAPES) html = null;
-  else if (count > 0) html = template.innerHTML;
+  else html = template.innerHTML;
   if (revealed.size >= 8) revealed.delete(revealed.keys().next().value as string);
   revealed.set(text, html);
   return html;
@@ -573,13 +595,13 @@ export function streamMarkdown(held: StreamedMarkdown | null, text: string): Str
   const from = goesOn ? held.settled : 0;
   const open = text.slice(from);
   const end = held !== null && held.whole && text.startsWith(held.text) ? null : settledEnd(open);
-  if (end === null) return { text, settled: 0, whole: true, added: "", tail: draw(text), restarted: true };
+  if (end === null) return { text, settled: 0, whole: true, added: "", tail: draw(text, false), restarted: true };
   return {
     text,
     settled: from + end,
     whole: false,
-    added: end === 0 ? "" : draw(open.slice(0, end)),
-    tail: draw(open.slice(end)),
+    added: end === 0 ? "" : draw(open.slice(0, end), false),
+    tail: draw(open.slice(end), false),
     restarted: !goesOn,
   };
 }
@@ -593,6 +615,24 @@ export function isMarkdownCached(text: string): boolean {
  *  `display: none`, a collapsed `<details>`), `textContent` does not. `innerText` is absent only
  *  where nothing is laid out (jsdom), where the two coincide for the markup the sanitizer allows. */
 export function renderedText(el: HTMLElement): string {
+  if (el.matches(".diagram-drawn, .diagram-error") || el.querySelector(".diagram-drawn, .diagram-error")) {
+    const copy = el.cloneNode(true) as HTMLElement;
+    copy.querySelectorAll(".diagram-error").forEach((note) => note.remove());
+    copy.querySelectorAll<HTMLElement>("pre.diagram-drawn").forEach((block) => {
+      const source = document.createElement("pre");
+      source.style.whiteSpace = "pre";
+      source.textContent = fenced(codeBlockText(block), "mermaid");
+      block.replaceWith(source);
+    });
+    // Read in the document so innerText preserves the row's normal line breaks and hidden text rules.
+    copy.style.position = "absolute";
+    copy.style.left = "-100000px";
+    copy.style.opacity = "0";
+    document.body.append(copy);
+    const text = copy.innerText ?? copy.textContent ?? "";
+    copy.remove();
+    return text;
+  }
   return el.innerText ?? el.textContent ?? "";
 }
 

@@ -833,3 +833,13 @@ mod tests {
         assert!(path.exists(), "asking never moves the file");
     }
 }
+
+/// Drawing closed Mermaid fences in replies; hosts without a renderer still show source.
+pub const DIAGRAMS_KEY: &str = "agent.diagrams";
+pub fn parse_diagrams(value: Option<&str>) -> Result<bool, String> {
+    match value.map(str::trim) {
+        None | Some("on") => Ok(true),
+        Some("off") => Ok(false),
+        Some(_) => Err(format!("{DIAGRAMS_KEY}: must be \"on\" or \"off\"")),
+    }
+}

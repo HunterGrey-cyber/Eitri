@@ -2384,7 +2384,8 @@ button,
 input,
 textarea,
 [data-nav-action],
-.fold-marker {
+.fold-marker,
+.diagram-error {
   user-select: none;
 }
 /* `copySelectionText` in `visual.ts` marks every selected row and crossed list block, including
@@ -2399,7 +2400,8 @@ textarea,
 [data-visual-copying] input,
 [data-visual-copying] textarea,
 [data-visual-copying] [data-nav-action],
-[data-visual-copying] .fold-marker {
+[data-visual-copying] .fold-marker,
+[data-visual-copying] .diagram-error {
   display: none;
 }
 
@@ -2638,3 +2640,9 @@ button.band-background {
   overflow-wrap: anywhere;
   user-select: text;
 }
+
+/* Drawings keep the fence as their code-copy target. */
+pre.code-block.diagram-drawn > code { display: none; }
+.diagram-scroll { display: block; overflow-x: auto; white-space: normal; }
+.diagram-scroll img { display: block; max-width: 100%; height: auto; }
+.diagram-error { display: block; white-space: normal; color: var(--nv-muted); font-family: var(--nv-font-prose); }

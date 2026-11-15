@@ -14,7 +14,7 @@
 // with `--test`).
 //
 // The rule: a sha256 fingerprint over every build input -- each file under `src/` by relative path
-// and content (so a deletion changes it), `package.json`, `package-lock.json`, `index.html`, and
+// and content (so a deletion changes it), `package.json`, `package-lock.json`, `index.html`, `diagram-renderer.html`, and
 // every top-level `vite.config.*`/`tsconfig*.json` -- is written beside the bundle
 // (`dist/.inputs-sha256`) after a successful build; missing or differing forces a rebuild. `npm ci`
 // runs only when `node_modules` is missing or the lockfile's own sha256 differs from the one
@@ -78,7 +78,7 @@ fn decide_web_build(
 
 /// Every file the fingerprint (and `cargo:rerun-if-changed`) covers, relative to nothing --
 /// absolute paths under `web_dir` -- in a stable order: `src/` walked depth-first with each
-/// directory's entries sorted, then `package.json`, `package-lock.json`, `index.html` and `build.mjs`
+/// directory's entries sorted, then `package.json`, `package-lock.json`, `index.html`, `diagram-renderer.html` and `build.mjs`
 /// (a project that bundles with its own script, as the keyboard kit does, is rebuilt when that script
 /// changes) if present, then every top-level `vite.config.*`/`tsconfig*.json`, sorted. A name that does not
 /// exist is simply absent from this list, not an error -- a minimal test fixture need not carry
@@ -86,7 +86,7 @@ fn decide_web_build(
 fn web_build_inputs(web_dir: &Path) -> Vec<PathBuf> {
     let mut inputs = Vec::new();
     walk_sorted(&web_dir.join("src"), &mut inputs);
-    for name in ["package.json", "package-lock.json", "index.html", "build.mjs"] {
+    for name in ["package.json", "package-lock.json", "index.html", "diagram-renderer.html", "build.mjs"] {
         let path = web_dir.join(name);
         if path.is_file() {
             inputs.push(path);

@@ -1,3 +1,4 @@
+import { attachDiagrams, detachDiagrams } from "../diagrams";
 /// <reference types="vite/client" />
 import { rowCardLine, rowAgentCard, agentCard, isAgentCall } from "../display";
 import { Fragment, memo, useContext, useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactElement, type ReactNode } from "react";
@@ -1452,6 +1453,12 @@ function ThinkingBody({
  *  whole reply per batch behind it. */
 const MarkdownBody = memo(function MarkdownBody({ text }: { text: string }) {
   const html = useMemo(() => renderMarkdown(text), [text]);
+  const boxRef = useRef<HTMLDivElement>(null);
+  useLayoutEffect(() => {
+    const box = boxRef.current;
+    if (box) attachDiagrams(box);
+    return () => { if (box) detachDiagrams(box); };
+  }, [html]);
   // The text this row last put on screen, and the dropping of the one before it, happen in an effect:
   // effects run only for a render React committed, so a render it threw away cannot drop a text that
   // is still shown. Not dropped when the row unmounts: a tab switch unmounts every row, and coming
@@ -1462,7 +1469,7 @@ const MarkdownBody = memo(function MarkdownBody({ text }: { text: string }) {
     shownRef.current = text;
     if (before !== null && before !== text) forgetMarkdown(before);
   }, [text]);
-  return <div dangerouslySetInnerHTML={{ __html: html }} />;
+  return <div ref={boxRef} dangerouslySetInnerHTML={{ __html: html }} />;
 });
 
 /** A drawing of a reply's open end that took longer than this leaves the page alone for a while afterwards. */
@@ -1517,6 +1524,7 @@ const StreamingMarkdown = memo(function StreamingMarkdown({ text, streaming, sel
       held.lastSettled = box.lastChild;
     }
     if (next.tail !== "") box.insertAdjacentHTML("beforeend", next.tail);
+    attachDiagrams(box);
     const now = performance.now();
     const spent = now - started;
     held.restUntil = spent > SLOW_TAIL_MS ? now + spent * SLOW_TAIL_REST : 0;
@@ -1539,6 +1547,7 @@ const StreamingMarkdown = memo(function StreamingMarkdown({ text, streaming, sel
       const whole = renderMarkdown(text);
       const box = boxRef.current;
       if (box !== null && (held.stream?.text !== text || held.settled + held.stream.tail !== whole)) box.innerHTML = whole;
+      if (box !== null) attachDiagrams(box);
       held.stream = null;
       held.settled = "";
       held.lastSettled = null;
@@ -1553,6 +1562,10 @@ const StreamingMarkdown = memo(function StreamingMarkdown({ text, streaming, sel
         drawRef.current();
       }, rest);
   }, [text, streaming, selecting]);
+  useLayoutEffect(() => {
+    const box = boxRef.current;
+    return () => { if (box) detachDiagrams(box); };
+  }, []);
   useEffect(() => stopResting, []);
   return <div ref={boxRef} />;
 });

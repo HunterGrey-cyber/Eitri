@@ -69,6 +69,7 @@ fn checks<'a>(agents: &'a [&'a str]) -> Vec<(&'static str, Check<'a>)> {
         (prefs::REVIEW_HINT_KEY, check(prefs::parse_review_hint)),
         (prefs::REVIEW_LIVE_KEY, check(prefs::parse_review_live)),
         (prefs::THINKING_KEY, check(prefs::parse_thinking_display)),
+        (prefs::DIAGRAMS_KEY, check(prefs::parse_diagrams)),
         (
             eitri_core::editor_tools::switches::TOOLS_KEY,
             Box::new(|value| eitri_core::editor_tools::switches::Switches::parse(Some(value), &[]).map(|_| ())),

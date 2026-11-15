@@ -244,7 +244,8 @@ pub(super) fn admission(
             }
         }
         // None of these answers a card or a question, or loosens a permission.
-        InboundMessage::Ready { .. }
+        InboundMessage::RenderDiagram { .. }
+        | InboundMessage::Ready { .. }
         | InboundMessage::PathComplete { .. }
         | InboundMessage::SendMessage { .. }
         | InboundMessage::RunShell { .. }
