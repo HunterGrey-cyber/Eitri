@@ -1,5 +1,5 @@
 [English](permissions.md) | 简体中文
-<!-- translated-from: permissions.md sha256=593ae621be65344725bf69158b3746d31fc70df1ce179794936142b2e2a77a1b -->
+<!-- translated-from: permissions.md sha256=5567f5165f6ea0c2d386d7ec82dcc32f3abd7d49c444cfc2e92c84d520ca1024 -->
 
 # 权限与信任
 
@@ -13,7 +13,7 @@ agent 的[编辑器工具](editor-tools.zh-CN.md)（`mcp__eitri__open_file` 等�
 
 ## 谁来决定一次工具调用
 
-Claude Code 想运行的每一次工具调用，在运行之前都会先发给 Eitri，每种模式下都是如此。接下来发生什么，取决于标签页的模式以及 Claude Code 是怎样在运行的。一个标签页处在三种模式之一，`Shift+Tab`（或 `<leader>m`）按 Claude Code 的顺序轮换它们：manual、auto、bypass，然后再回到 manual。新标签页以 auto 开始，除非你设置了 `agent.default_mode`（[一次启动怎样开始](configuration.zh-CN.md#how-a-launch-starts)）。Claude Code 做计划时，[plan 模式](#plan-mode)会改变下面的一部分回答。
+Claude Code 想运行的每一次工具调用，在运行之前都会先发给 Eitri，每种模式下都是如此。你自己的 Claude Code hook 也会看到它，并且可能决定它（[你自己的 hook 和规则](#your-own-hooks-and-rules)）。接下来发生什么，取决于标签页的模式以及 Claude Code 是怎样在运行的。一个标签页处在三种模式之一，`Shift+Tab`（或 `<leader>m`）按 Claude Code 的顺序轮换它们：manual、auto、bypass，然后再回到 manual。新标签页以 auto 开始，除非你设置了 `agent.default_mode`（[一次启动怎样开始](configuration.zh-CN.md#how-a-launch-starts)）。Claude Code 做计划时，[plan 模式](#plan-mode)会改变下面的一部分回答。
 
 <a id="manual"></a>
 ### Manual
@@ -215,6 +215,24 @@ eitri.config.set("agent.user_settings", false)    -- true (the default) or false
 
 回合审阅，也就是面板在一个回合之后能显示的另一样东西，在[审阅一个回合](turn-review.zh-CN.md)里讲。
 
+<a id="your-own-hooks-and-rules"></a>
+## 你自己的 hook 和规则
+
+你自己的 Claude Code hook 在每个会话里都会运行，和 Eitri 自己的检查并排，由 Claude Code 把两边的答案合起来：任何一边拒绝，就是拒绝。在 **Manual 标签页**里，你的 hook 可以拒绝你批准了的调用，但不能运行你没有批准的调用（改写命令的 hook 确实会改变实际运行的内容，见下表）。在 **Auto 标签页**里，没有被 Eitri 保存的规则允许的调用交给 Claude Code，所以在那里，你的 hook 的答案、或者你自己的某条 allow 规则，会在 Claude Code 的分类器之前就决定它。
+
+2026-11-15 用 Claude Code 2.1.311 测量（另注明 2.1.322 的地方除外），每次都是一次 `Bash` 调用：
+
+| 你有的 | Manual 标签页 | Auto 标签页 |
+|---|---|---|
+| 一个允许的 `PreToolUse` hook | 卡片照样出现，只有你批准了，调用才运行 | 没有卡片；调用不经 Claude Code 的分类器就运行，它那一行看起来和任何运行过的调用一样 |
+| 一个拒绝的 `PreToolUse` hook，或者以 2 退出的 | 卡片照样出现，即使你批准，调用也被拒绝；那一行写着 `PreToolUse:Bash hook error:` 和 hook 给的理由 | 没有卡片；被拒绝，那一行写着 `PreToolUse:Bash hook error:`，而不是 `blocked by auto` |
+| 一个只改写命令、不做决定的 `PreToolUse` hook（`rtk` 就是这样） | 卡片和那一行显示 agent 写的命令；你批准后，真正运行的是改写后的命令 | 2.1.311：改写后的命令经过审查后运行。Claude Code 2.1.322 在服务器上审查，在那里（在终端里看到的，还没有在 Eitri 里测量）它会先拒绝一次，“a hook changed this call's input after auto mode reviewed it”，并让 agent 把改写后的命令再发一次，这一次才会被审查 |
+| 你用户设置里的一条 `permissions.allow` 规则 | 未测量 | 没有卡片；调用不经 Claude Code 的分类器就运行 |
+| 一条 `permissions.ask` 规则 | 你批准 Eitri 的卡片之后，Claude Code 也会问：第二张卡片 | Claude Code 会问：一张卡片 |
+| 对这样的问题回答允许的 `PermissionRequest` hook | 它片刻之内就回答了问题，卡片消失，调用运行 | 一样 |
+
+这些都不会显示成是你的 hook 做的：你的 hook 允许的调用看起来和别的调用一样，你的 `PermissionRequest` hook 回答了的问题就这样消失了。Auto 那一列里由 Claude Code 的分类器放行的几行，用的是分类器的替身，所以它们说明的是 Claude Code 怎样处理分类器的答案，而不是分类器本身会怎么说。
+
 <a id="known-limits"></a>
 ## 已知限制
 
@@ -222,6 +240,7 @@ eitri.config.set("agent.user_settings", false)    -- true (the default) or false
 
 - **命令可以不点名就到达 Eitri 自己的配置。** Eitri 读的是 shell 命令的文字，所以通过脚本、先 `cd`，或者自己拼出路径往那里写的命令，不会因此成为卡片（[Eitri 自己的配置](#eitris-own-configuration)）。在 Auto 标签页里，由 Claude Code 的 auto 模式来决定它，就像它决定一次对 `~/.bashrc` 的写入一样。
 - **一个 hook 可以在调用被批准之后改动它。** 你自己的 Claude Code 设置里的 hook，或者被信任的项目里的 hook，可以在 Eitri 看到原始调用之后改写一次工具调用的输入。这时 Claude Code 再询问，它的卡片显示的是改写后的输入，而工具那一行显示的是原来的。在终端里 hook 也是这样工作的。
+- **经过网关时，Claude Code 2.1.322 会拒绝 Auto 标签页的大部分工作。** 它的 auto 模式检查在 Anthropic 的服务器上运行。当你的请求经过另一个地址（`ANTHROPIC_BASE_URL`、公司网关），而那里不把这项检查转过去时，Claude Code 会说 “Auto mode can't check actions in this session”，并拒绝每一个需要这项检查的调用；那些行写着 `blocked by auto: Classifier unavailable`。你自己的 hook 或 allow 规则允许的调用照样运行，Manual 标签页也不受影响：Eitri 的批准不等那项检查。
 - **在 Auto 标签页里，Claude Code 的 auto 模式可以不询问就写入 `.git/` 下**，新的 git hook 也包括在内。Manual 标签页把每一次 `Write`、`Edit` 和 `NotebookEdit` 调用都放到卡片上，但不是每一次写入：shell 命令按它的文字判断，所以像 `Bash(cp *)` 这样保存的规则仍然会让 `cp x .git/hooks/pre-commit` 运行。回合审阅不显示 `.git/` 下的改动，信任问题盯着 `.claude/`、`.mcp.json` 和 `CLAUDE.md`，不盯 `.git/`。在一个你在意的仓库里完成一个回合之后，值得看一眼 `ls .git/hooks`。对 `.claude/` 下的编辑，Eitri 确实会在下一个会话之前再问一次信任问题。
 - **被信任的项目自己的 `permissions.allow` 规则，只有在你也在终端 `claude` 里信任了那个目录时，才会到达 Auto 标签页。** 这是 Claude Code 自己的规则。你的用户设置里的规则始终适用。
 - **信任一个项目，就意味着信任它的代码会运行。** hook 从 `.claude/` 之外调用的脚本，只通过 hook 的命令文本被覆盖，就像构建这个项目一样。

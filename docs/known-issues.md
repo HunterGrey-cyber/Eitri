@@ -116,6 +116,9 @@ distinguish real refresh-period feedback from the fallback clock.
 
 ## The window
 
+- **In immersive mode a card can wait unseen.** When a card arrives in a chat that is not on screen, Eitri shows a
+  toast and `agent ⚑N` in the top bar. Immersive mode (`<prefix> F11`) hides the top bar, so once the toast has faded
+  nothing on screen says a card waits; `Ctrl+k` shows the bar with its `agent ⚑N` again.
 - **A second Eitri window on the same project keeps its own layout and saved tabs.** It starts from the first
   window's layout, then saves only its own, so the first window always opens with what you left in it.
 - **Under a light colourscheme the window starts dark for a moment**, then turns light: the top bar, the panel,

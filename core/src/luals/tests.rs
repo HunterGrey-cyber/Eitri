@@ -536,3 +536,139 @@ fn meta_is_valid_lua_and_each_function_has_a_description_and_types() {
         }
     }
 }
+
+fn meta_functions(meta: &str) -> BTreeSet<String> {
+    meta.split_whitespace()
+        .collect::<Vec<_>>()
+        .windows(2)
+        .filter(|words| words[0] == "function" && words[1].starts_with("eitri."))
+        .map(|words| words[1].split('(').next().unwrap().to_owned())
+        .collect()
+}
+
+/// The `eitri.<a>.<b>` names followed by `(` in `text`: a name starts where no letter, digit, `_` or `.` comes
+/// before it, so `require("eitri.nvim")` and `myeitri.x(` are not names of the API.
+fn called_functions(text: &str) -> Vec<String> {
+    let mut names = Vec::new();
+    for (at, _) in text.match_indices("eitri.") {
+        let before = text[..at].chars().next_back();
+        if before.is_some_and(|c| c.is_alphanumeric() || c == '_' || c == '.') {
+            continue;
+        }
+        let name: String = text[at..]
+            .chars()
+            .take_while(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '.')
+            .collect();
+        if text[at + name.len()..].starts_with('(') && !name.ends_with('.') {
+            names.push(name);
+        }
+    }
+    names
+}
+
+/// The keys a text hands to `eitri.config.set("…"` or `eitri.config.get("…"`.
+fn configured_keys(text: &str) -> Vec<String> {
+    let mut keys = Vec::new();
+    for call in ["eitri.config.set(", "eitri.config.get("] {
+        for (at, _) in text.match_indices(call) {
+            if let Some(rest) = text[at + call.len()..].trim_start().strip_prefix('"') {
+                keys.push(rest[..rest.find('"').expect("a closed key")].to_owned());
+            }
+        }
+    }
+    keys
+}
+
+/// The settings tables' header: the guide lists every setting in a table that starts with it.
+const SETTINGS_TABLE_HEADER: &str = "| key | value | default | what it does |";
+
+/// The first column of every settings table in a page.
+fn settings_table_keys(page: &str) -> Vec<String> {
+    let mut keys = Vec::new();
+    let mut lines = page.lines();
+    while let Some(line) = lines.next() {
+        if line.trim_end() != SETTINGS_TABLE_HEADER {
+            continue;
+        }
+        for row in lines.by_ref().skip(1).take_while(|row| row.starts_with('|')) {
+            let key = row
+                .strip_prefix("| `")
+                .expect("a settings row starts with its key in backticks");
+            keys.push(key.split('`').next().unwrap().to_owned());
+        }
+    }
+    keys
+}
+
+#[test]
+fn the_guide_names_only_settings_and_functions_this_build_declares() {
+    // The guide promises that what it documents stays through 0.x; that promise is about names that exist.
+    let settings = meta_settings(META);
+    let functions = meta_functions(META);
+    let tool_prefix = crate::editor_tools::switches::TOOL_KEY_PREFIX;
+    let guide = crate::guide_files::this_trees_guide();
+    let mut pages: Vec<_> = std::fs::read_dir(&guide)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .filter(|path| path.extension().is_some_and(|e| e == "md"))
+        .collect();
+    pages.sort();
+    assert!(pages.len() > 20, "the guide must be read: {}", guide.display());
+    let (mut keys_seen, mut calls_seen, mut wrong) = (BTreeSet::new(), BTreeSet::new(), Vec::new());
+    for page in &pages {
+        let text = std::fs::read_to_string(page).unwrap();
+        let name = page.file_name().unwrap().to_string_lossy().into_owned();
+        let mut keys = configured_keys(&text);
+        let table = settings_table_keys(&text);
+        if name == "configuration.md" {
+            assert!(table.len() > 30, "the settings tables must be read: {table:?}");
+        }
+        keys.extend(table);
+        for key in keys {
+            let known = match key.strip_prefix(tool_prefix) {
+                Some("<name>") => settings.iter().any(|s| s.starts_with(tool_prefix)),
+                _ => settings.contains(&key),
+            };
+            if !known {
+                wrong.push(format!("{name}: setting {key}"));
+            }
+            keys_seen.insert(key);
+        }
+        for call in called_functions(&text) {
+            if !functions.contains(&call) {
+                wrong.push(format!("{name}: function {call}"));
+            }
+            calls_seen.insert(call);
+        }
+    }
+    assert!(
+        wrong.is_empty(),
+        "the guide names what this build does not declare:\n{}",
+        wrong.join("\n")
+    );
+    assert!(
+        keys_seen.len() > 25 && calls_seen.len() > 15,
+        "{keys_seen:?} {calls_seen:?}"
+    );
+}
+
+#[test]
+fn the_guide_scan_reads_calls_and_keys_and_nothing_else() {
+    let text = r#"eitri.config.set("a.b", 1) require("eitri.nvim") x.eitri.layout.run("y")
+`eitri.layout.focus(id)` myeitri.on("e") eitri.config.get( "c.d" ) eitri.config.set(key, value)"#;
+    assert_eq!(
+        called_functions(text),
+        [
+            "eitri.config.set",
+            "eitri.layout.focus",
+            "eitri.config.get",
+            "eitri.config.set"
+        ]
+    );
+    assert_eq!(configured_keys(text), ["a.b", "c.d"]);
+    let page = format!(
+        "intro\n{SETTINGS_TABLE_HEADER}\n|---|---|---|---|\n| `a.b` | x | 1 | y |\n| `c.<name>` | y | 2 | z |\n\n\
+         | key | what it does |\n|---|---|\n| `d.e` | no |\n\n{SETTINGS_TABLE_HEADER}\n|---|---|---|---|\n| `f.g` | 1 | 2 | 3 |\n"
+    );
+    assert_eq!(settings_table_keys(&page), ["a.b", "c.<name>", "f.g"]);
+}

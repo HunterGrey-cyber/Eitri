@@ -19,8 +19,9 @@ own table for them is [on their page](editor-tools.md#cards), and so are the way
 
 ## Who decides a tool call
 
-Every tool call Claude Code wants to run is sent to Eitri first, in every mode, before it runs. What happens
-next depends on the tab's mode and on how Claude Code is running. A tab is in one of three modes, and
+Every tool call Claude Code wants to run is sent to Eitri first, in every mode, before it runs. Your own Claude Code
+hooks see it too, and may decide it ([Your own hooks and rules](#your-own-hooks-and-rules)). What happens next
+depends on the tab's mode and on how Claude Code is running. A tab is in one of three modes, and
 `Shift+Tab` (or `<leader>m`) cycles them in Claude Code's order: manual, auto, bypass, then manual again. A new
 tab starts in auto unless you set `agent.default_mode`
 ([How a launch starts](configuration.md#how-a-launch-starts)). While Claude Code plans, [plan mode](#plan-mode) changes
@@ -430,6 +431,28 @@ it also trusts that directory in a terminal; see [Known limits](#known-limits).
 
 Turn review, the other thing the panel can show after a turn, is described in [Reviewing a turn](turn-review.md).
 
+## Your own hooks and rules
+
+Your own Claude Code hooks run in every session, beside Eitri's own check, and Claude Code combines the answers: a
+refusal from either side wins. In a **Manual tab** a hook of yours can refuse a call you approve, but it cannot run
+one you have not approved (a hook that rewrites the command does change what runs, below). In an **Auto tab**, a call no saved rule of Eitri's allows is left to Claude Code, so there
+your hook's answer, or one of your own allow rules, decides it before Claude Code's classifier would.
+
+Measured on 2026-11-15 with Claude Code 2.1.311 (and 2.1.322 where it says so), a `Bash` call each time:
+
+| what you have | Manual tab | Auto tab |
+|---|---|---|
+| a `PreToolUse` hook that allows | the card is still drawn, and the call runs only when you approve it | no card; the call runs without Claude Code's classifier, and its row looks like any call that ran |
+| a `PreToolUse` hook that denies, or exits with 2 | the card is still drawn, and the call is refused even when you approve it; the row says `PreToolUse:Bash hook error:` and the hook's reason | no card; refused, and the row says `PreToolUse:Bash hook error:`, not `blocked by auto` |
+| a `PreToolUse` hook that rewrites the command without deciding (as `rtk` does) | the card and the row show the command the agent wrote; the rewritten one is what runs when you approve | 2.1.311: the rewritten command is reviewed and runs. Claude Code 2.1.322 reviews on the server, and there (seen in a terminal, not yet measured in Eitri) it refuses the call once, "a hook changed this call's input after auto mode reviewed it", and tells the agent to send the rewritten command again, which is then reviewed |
+| a `permissions.allow` rule in your user settings | not measured | no card; the call runs without Claude Code's classifier |
+| a `permissions.ask` rule | after you approve Eitri's card, Claude Code asks too: a second card | Claude Code asks: a card |
+| a `PermissionRequest` hook that allows, on such a question | it answers the question within a moment, the card goes away and the call runs | the same |
+
+None of these is shown as your hook's doing: a call your hook allowed reads like any other, and a question your
+`PermissionRequest` hook answered is simply gone. The Auto rows where Claude Code's classifier allowed a call used a
+stand-in for the classifier, so they show what Claude Code does with its answer, not what the classifier would say.
+
 ## Known limits
 
 Most of these are also in the [known issues](../known-issues.md#security), and they are the places where the behaviour
@@ -442,6 +465,11 @@ above is weaker than it may sound.
 - **A hook can change a call after it was approved.** A hook in your own Claude Code settings, or in a trusted
   project's, can rewrite a tool call's input after Eitri has seen the original. When Claude Code then asks, its
   card shows the rewritten input and the tool's row shows the original. Hooks work this way in a terminal too.
+- **Behind a gateway, Claude Code 2.1.322 refuses most of an Auto tab's work.** Its auto-mode check runs on
+  Anthropic's servers. When your requests go through another address (`ANTHROPIC_BASE_URL`, a company gateway) that
+  does not pass the check through, Claude Code says "Auto mode can't check actions in this session" and refuses every
+  call that needs the check; the rows read `blocked by auto: Classifier unavailable`. Calls your own hooks or allow
+  rules allow still run, and a Manual tab is not affected: Eitri's approval does not wait for that check.
 - **In an Auto tab, Claude Code's auto mode can write under `.git/` without asking**, a new git hook included.
   A Manual tab puts every `Write`, `Edit` and `NotebookEdit` call on a card, but not every write: a shell command
   is judged by its words, so a saved rule such as `Bash(cp *)` still lets `cp x .git/hooks/pre-commit` run.

@@ -54,6 +54,41 @@ changes to `package.path` or `package.cpath` have no effect.
 
 Both windows read the same file: the one-window mode and the [companion window](companion.md).
 
+## What stays stable
+
+Through 0.x, an `init.lua` that works in one release keeps working in the next. The promise covers what this guide
+documents, and nothing else:
+
+- every setting this guide lists ([Settings](#settings), [Keys in a plugin page](#keys-in-a-plugin-page)) or gives to
+  `eitri.config.set`, with the values each accepts, and `eitri.config.set` and `eitri.config.get` themselves;
+- `eitri.keymap.prefix`, `set`, `del` and `use`, the tables they name (`prefix`, `root`, `panel`, `plugin:<id>`) and
+  the action names [Keys](keys.md) lists;
+- `eitri.layout.default`, `workspace`, `rule`, `open`, `switch`, `focus`, `split`, `run`, `float`, `mark`, `get`
+  and `export` ([Layout from Lua](#layout-from-lua)), and the layout tables they take and return;
+- `eitri.command.register`, `eitri.agent.register` and `eitri.plugin.load`, with the fields their tables take.
+
+These change only by addition. A release may add settings, values, functions, optional arguments, fields and
+actions. It does not take one away or change what one means. If one ever has to go or change, the release note says
+so, and for one release the old form still works and Eitri lists it at startup as deprecated, the way it lists a
+problem in the file, before it stops working.
+
+Not promised:
+
+- Anything this guide does not document. A function, setting or event you find in the source or in the completion
+  file (below) may change without notice; `eitri.on` and its one event are such a case.
+- Defaults. A release may change what a setting does when you leave it unset, and its release note says so. Set it
+  if you depend on it.
+- The wording of Eitri's messages and of the startup problem list, and the files Eitri writes for itself (the saved
+  layout, the API file for `lua_ls`).
+- What Lua's `io` and `os` may do outside the run of `init.lua` itself. A command's function runs on the window's own
+  thread, and a later release may refuse calls there that can block it, such as `os.execute` and `io.popen`.
+- Lua panels (`eitri.panel.register`) and plugin pages. Both are experimental ([Pages](pages.md)); the plugin format
+  has its own promise in [Write a plugin](write-a-plugin.md#what-stays-stable).
+
+An `init.lua` written for a newer Eitri still opens on an older one. A setting the older one does not know does nothing
+there (it is listed at startup when it looks like one of Eitri's own). To call a newer function only where it exists, test for it first
+(`if eitri.layout.float then ... end`).
+
 ## Completion and checks in your editor (lua_ls)
 
 When the first-start screen writes your `init.lua`, it also creates `.luarc.json` beside it so Neovim's

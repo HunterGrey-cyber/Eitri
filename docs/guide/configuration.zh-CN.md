@@ -1,5 +1,5 @@
 [English](configuration.md) | 简体中文
-<!-- translated-from: configuration.md sha256=bd40df8fe1eafd1547cf5539d91cad3be3632fb3b8b47a7b47b7a4f981d79f9c -->
+<!-- translated-from: configuration.md sha256=ba8164d38525199c9f21a08680374885872c735ee05d79e226bd73fe92759e1b -->
 
 # 配置
 
@@ -27,6 +27,28 @@ Eitri 说的方式是右上角的一条提示：有几个问题，以及前五�
 `require` 只在 `init.lua` 旁边的 `lua/` 目录下找模块：`require("mine")` 加载该配置目录下的 `lua/mine.lua` 或 `lua/mine/init.lua`，`require("a.b")` 加载 `lua/a/b.lua` 或 `lua/a/b/init.lua`。它从不在你打开的项目或当前目录里找，改动 `package.path` 或 `package.cpath` 也没有效果。
 
 两种窗口读的是同一个文件：单窗口模式和 [companion 窗口](companion.zh-CN.md)。
+
+<a id="what-stays-stable"></a>
+## 什么保持稳定
+
+在 0.x 期间，在一个版本里能用的 `init.lua`，到下一个版本照样能用。承诺的范围就是这份指南写明的内容，别的都不算：
+
+- 这份指南列出（[设置](#settings)、[插件页面里的按键](#keys-in-a-plugin-page)）或交给 `eitri.config.set` 的每一个设置，连同每个设置接受的值；还有 `eitri.config.set` 和 `eitri.config.get` 本身；
+- `eitri.keymap.prefix`、`set`、`del` 和 `use`，它们所指的表（`prefix`、`root`、`panel`、`plugin:<id>`），以及[按键](keys.zh-CN.md)列出的动作名；
+- `eitri.layout.default`、`workspace`、`rule`、`open`、`switch`、`focus`、`split`、`run`、`float`、`mark`、`get` 和 `export`（[用 Lua 调整布局](#layout-from-lua)），以及它们接受和返回的布局表；
+- `eitri.command.register`、`eitri.agent.register` 和 `eitri.plugin.load`，连同它们的表所接受的字段。
+
+这些只做增加。一个版本可以增加设置、值、函数、可选参数、字段和动作，但不会拿掉其中任何一个，也不会改变它的含义。如果哪一个真的要去掉或改变，发布说明会写明；并且有一个版本里旧写法仍然能用，Eitri 在启动时把它列为已弃用（就像列出文件里的问题那样），之后才停止支持。
+
+不承诺的：
+
+- 这份指南没写的一切。你在源码或补全文件（见下文）里找到的函数、设置或事件，可能不经通知就改变；`eitri.on` 和它唯一的事件就是这种情况。
+- 默认值。一个版本可以改变某个设置在你不设它时的行为，发布说明会写明。如果你依赖它，就把它设上。
+- Eitri 消息的措辞、启动问题清单的措辞，以及 Eitri 为自己写的文件（保存的布局、给 `lua_ls` 的 API 文件）。
+- `init.lua` 本身运行之外，Lua 的 `io` 和 `os` 能做什么。命令的函数在窗口自己的线程上运行，以后的版本可能在那里拒绝会让它卡住的调用，比如 `os.execute` 和 `io.popen`。
+- Lua 面板（`eitri.panel.register`）和插件页面。两者都是实验性的（[页面](pages.zh-CN.md)）；插件格式有它自己的承诺，见[编写插件](write-a-plugin.zh-CN.md#what-stays-stable)。
+
+为较新的 Eitri 写的 `init.lua`，在较旧的 Eitri 上照样能打开。较旧的版本不认识的设置在那里什么也不做（看起来像 Eitri 自己的键时，启动时会列出来）。要只在新函数存在时才调用它，先检查一下（`if eitri.layout.float then ... end`）。
 
 <a id="completion-and-checks-in-your-editor-lua_ls"></a>
 ## 编辑器中的补全与检查（lua_ls）
