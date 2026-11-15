@@ -85,7 +85,7 @@ protocol-level cooperation from Mutter/wlroots or forking winit itself to speak
 `wl_subsurface` directly against GTK's own `wl_surface`/`wl_display` connection.
 
 **Implication for the real fork**: because neovibe's actual plan is to fork
-Neovide's renderer/surface code anyway (with a
+Neovide's renderer/surface code anyway (a
 `SurfaceHost` trait, `NeovideSurface` not touching a whole `Window`), true
 in-process embedding is *not* actually blocked for the real product the same
 way it is for this spike. The fork would not create its own `winit::Window` /
@@ -102,7 +102,7 @@ while `pump_app_events` (or an even more minimal internal loop) only pumps
 Neovim/keyboard/animation state, not window-system events. This spike doesn't
 prove that part works (no Skia, no real Neovide here) — it only proves the
 event-loop-ownership half of the problem is solvable. The GtkGLArea/Skia
-integration is P0/P1 in the feasibility doc, a separate, already-planned
+integration is P0/P1, a separate, already-planned
 validation stage.
 
 ## Finding: pump timer mechanics work; blocking vsync does not
@@ -177,7 +177,7 @@ through the pump loop rather than executed inline.
   it's normal window-manager-level focus switching between two toplevels,
   which is out of scope for what this spike was built to test. For the real
   fork (GtkGLArea-hosted, single toplevel), focus routing is a real open
-  question and is correctly already called out as needing
+  question and needs
   `NeovideInputAdapter` work — this spike does
   not resolve it, it just confirms it's a live-window-embedding-topology
   question, not an event-loop-ownership one.
@@ -267,8 +267,8 @@ ownership conflict — with caveats, not a plain "yes."**
    block the shared GTK main loop; either force non-blocking presentation and
    self-pace redraws (as this spike does), or move presentation off the main
    thread with a handoff back into the pump loop. This should become an
-   explicit item in the P1 (Neovide-renderer-in-GtkGLArea) validation stage
-   in the feasibility doc, since P1 is exactly where this would first bite.
+   explicit item in the P1 (Neovide-renderer-in-GtkGLArea) validation stage,
+   since P1 is exactly where this would first bite.
 3. **Correction (2026-09-06):** the original wording here said "budget for a
    timer-driven poll unless/until winit exposes the connection publicly" —
    that's backwards. winit *already* exposes the connection publicly, via
@@ -292,10 +292,10 @@ ownership conflict — with caveats, not a plain "yes."**
    real fork renders into `GtkGLArea`'s own surface directly and only uses
    `pump_app_events` (or a further-simplified internal loop) to keep runtime/
    input processing alive, never to own window/surface creation. Re-scope any
-   remaining "embedding" risk in the architecture doc/feasibility doc away
+   remaining "embedding" risk away
    from "can winit's window live inside GTK's" (answered: no, and doesn't
    need to be) and toward "can Neovide's renderer be made to draw into a
    GtkGLArea-provided GL surface/context instead of one it creates itself" —
-   which is precisely what P0/P1 in `neovibe_feasibility_validation.md` are
+   which is precisely what the P0/P1 validation stages are
    already scoped to test, and remains the real open question this spike
    does not touch.

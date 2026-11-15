@@ -5793,7 +5793,7 @@ mod tests {
             let decided = classify_with_rules("Bash", &input, ws.path(), &rules_for(command));
             assert_eq!(decided.verdict, PermissionVerdict::AllowWithoutAsking, "`{command}`");
             assert_eq!(decided.reason, REASON_ALLOWED_BY_A_PROJECT_RULE);
-            // F18: the rule that did it is named, first match first (`rules_for` adds the one-word
+            // The rule that did it is named, first match first (`rules_for` adds the one-word
             // rule before the two-word one).
             let first = command.split_whitespace().next().unwrap();
             assert_eq!(

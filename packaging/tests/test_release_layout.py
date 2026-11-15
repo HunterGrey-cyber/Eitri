@@ -476,7 +476,7 @@ class TarGzScanTests(unittest.TestCase):
         self.assertTrue(any("/home/someuser" in m for m in hits["lib/eitri/shell"]))
 
     def test_a_home_path_inside_a_non_elf_file_is_not_reported(self):
-        """M3's own narrowing: the check runs over extracted ELF files, not every extracted
+        """The narrowing: the check runs over extracted ELF files, not every extracted
         shipped file -- a text file (a doc, install.sh itself) legitimately mentions such paths in
         prose and examples."""
         files = self._extract([("lib/eitri/README.txt", b"see /home/someuser/project for an example")])
@@ -515,7 +515,7 @@ class TarGzScanTests(unittest.TestCase):
 
 
 class DebExtractionTests(unittest.TestCase):
-    """The ar-writer fixture + the host's real dpkg-deb -x (M8's tool list)."""
+    """The ar-writer fixture + the host's real dpkg-deb -x."""
 
     def test_a_real_deb_shaped_archive_extracts_and_scans(self):
         dest = _scratch_dir()
@@ -2245,10 +2245,9 @@ class CheckReleaseSignersCliIsByteExact(unittest.TestCase):
         self.assertIn("differ", err)
 
 
-def _this_tasks_files():
+def _packaging_files():
     """Packaging files covered by these checks: only the ones that already
-    exist are checked, so this test does not depend on other in-flight work landing
-    first."""
+    exist are checked, so this test passes in a checkout that lacks some of them."""
     candidates = [
         os.path.join(_PACKAGING, "release_check.py"),
         os.path.join(_HERE, "test_release_layout.py"),
@@ -2265,8 +2264,8 @@ def _this_tasks_files():
 
 
 class RewritesNoOpTests(unittest.TestCase):
-    def test_at_least_this_tasks_own_two_files_are_present(self):
-        files = _this_tasks_files()
+    def test_at_least_the_two_layout_files_are_present(self):
+        files = _packaging_files()
         basenames = {os.path.basename(p) for p in files}
         self.assertIn("release_check.py", basenames)
         self.assertIn("test_release_layout.py", basenames)
@@ -2275,7 +2274,7 @@ class RewritesNoOpTests(unittest.TestCase):
         rewrites = os.path.join(os.path.dirname(_PACKAGING), "publish", "rewrites.sed")
         if not os.path.isfile(rewrites):
             self.skipTest("publish/rewrites.sed not present in this checkout")
-        for path in _this_tasks_files():
+        for path in _packaging_files():
             with open(path, "rb") as f:
                 original = f.read()
             out = subprocess.run(["sed", "-f", rewrites, path], check=True, capture_output=True)
@@ -2285,7 +2284,7 @@ class RewritesNoOpTests(unittest.TestCase):
             )
 
     def test_the_joined_sea_sentinel_literal_appears_in_neither_file(self):
-        for path in _this_tasks_files():
+        for path in _packaging_files():
             with open(path, "rb") as f:
                 content = f.read()
             self.assertNotIn(

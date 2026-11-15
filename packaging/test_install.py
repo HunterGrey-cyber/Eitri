@@ -237,8 +237,8 @@ def test_harness_under_dash_in_ubuntu():
 
 
 def test_root_wrapper_under_bash():
-    """packaging/tests/install/test_root_wrapper.sh (the repository root install.sh's own tests,
-    implemented in shell) is standalone -- it stubs packaging/install.sh itself and needs no fixture
+    """packaging/tests/install/test_root_wrapper.sh (the repository root install.sh's own tests)
+    is standalone -- it stubs packaging/install.sh itself and needs no fixture
     machinery, so unlike harness.sh it is not sourced by anything else. It used to be run only by
     hand; wired in here so both shell halves this file already holds every other installer test to
     actually cover it too. Its own scratch dir lives under a fresh HOME so its

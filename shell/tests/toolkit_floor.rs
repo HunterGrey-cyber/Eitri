@@ -280,8 +280,7 @@ fn gtk_webkit_feature_unification_never_exceeds_the_floor() {
     }
     assert!(
         violations.is_empty(),
-        "gtk4/gdk4/gsk4 must not be unified above v4_{GTK_FLOOR}, webkit6 not above v2_{WEBKIT_FLOOR}\
-         , but:\n{}",
+        "gtk4/gdk4/gsk4 must not be unified above v4_{GTK_FLOOR}, webkit6 not above v2_{WEBKIT_FLOOR}, but:\n{}",
         violations.join("\n")
     );
 }

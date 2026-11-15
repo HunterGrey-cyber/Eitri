@@ -185,7 +185,7 @@ const LIVE_COMMAND: &str =
 /// An earlier `Read` of a path with no space in it -- a real absolute path in this repository is
 /// often this long. Outside the harness's own project root (`/nonexistent/panel-stream-scroll`,
 /// 2026-09-29): `projectPath.ts` draws a path under the root
-/// relative to it, so the token search below, which looks for this exact text, found nothing and
+/// relative to it, so while this path sat under the root the token search below, which looks for this exact text, found nothing and
 /// every scenario read "the long path was not found". A path outside the root is drawn as sent, and
 /// this one is exactly as long as the old one.
 const LONG_PATH: &str =

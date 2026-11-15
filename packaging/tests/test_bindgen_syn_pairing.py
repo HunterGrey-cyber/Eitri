@@ -1,8 +1,7 @@
-"""Cargo.lock pairs bindgen with syn 2 by hand (the rule: "`bindgen` is paired with syn 2 in
-`Cargo.lock` by hand"). skia-bindings needs bindgen 0.73, built with prettyplease, which Cargo keeps at 0.2 (prost-build
-needs it) and which speaks syn 2; given the choice Cargo resolves bindgen's own syn to 3, which does not compile. bindgen is
-a build dependency of skia-bindings, so with syn 3 back cargo fails before any Rust test can run: this reads the lock with
-Python instead, and says how to set the entry again.
+"""Cargo.lock pairs bindgen with syn 2 by hand. skia-bindings needs bindgen 0.73, built with prettyplease, which Cargo
+keeps at 0.2 (prost-build needs it) and which speaks syn 2; given the choice Cargo resolves bindgen's own syn to 3,
+which does not compile. bindgen is a build dependency of skia-bindings, so with syn 3 back cargo fails before any Rust
+test can run: this reads the lock with Python instead, and says how to set the entry again.
 """
 import os
 import re
@@ -10,7 +9,7 @@ import tomllib
 import unittest
 
 REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-RULE = '"`bindgen` is paired with syn 2 in `Cargo.lock` by hand"'
+RULE = "`bindgen` is paired with syn 2 in `Cargo.lock` by hand"
 
 
 def bindgen_syn_problems(lock_text):
@@ -57,7 +56,7 @@ class BindgenSynPairing(unittest.TestCase):
     def test_a_lock_pairing_bindgen_with_syn_3_is_refused_naming_the_rule(self):
         (problem,) = bindgen_syn_problems(self.LOCK)
         self.assertIn("3.0.5", problem)
-        self.assertIn("`bindgen` is paired with syn 2", problem)
+        self.assertIn(RULE, problem)
         self.assertEqual(bindgen_syn_problems(self.LOCK.replace('"syn 3.0.5",', '"syn 2.0.119",')), [])
 
     def test_a_bare_syn_is_resolved_against_the_locks_only_syn(self):

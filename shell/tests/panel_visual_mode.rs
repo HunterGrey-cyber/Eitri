@@ -1266,7 +1266,7 @@ fn w2_english_and_chinese_words(h: &Harness) -> Result<(), String> {
     let chinese = h
         .read_fresh_clipboard(2000)
         .ok_or("vvey on the Chinese paragraph copied nothing")?;
-    println!("[panel_visual_mode] W2: vvey on the Chinese paragraph copied {chinese:?} (recorded, R7)");
+    println!("[panel_visual_mode] W2: vvey on the Chinese paragraph copied {chinese:?} (recorded)");
     Ok(())
 }
 
@@ -1631,7 +1631,7 @@ fn w7_permission_card(h: &Harness) -> Result<(), String> {
     }
     if !text.contains("$ cat build.log") {
         return Err(format!(
-            "W7: the walk never crossed the card's controls into the next row (R1: j over a form control or buttons) -- \
+            "W7: the walk never crossed the card's controls into the next row (j over a form control or buttons) -- \
              the chrome checks below would say nothing: {text:?}"
         ));
     }
@@ -2083,9 +2083,7 @@ fn w11_caret_motions(h: &Harness) -> Result<(), String> {
     // `v` then `y` after `G` copies only the list's last selectable character, with nothing outside the list.
     h.clear_clipboard();
     h.xdotool_keys(&["v", "y"]);
-    let copied = h
-        .read_fresh_clipboard(2000)
-        .ok_or("W11: G v y copied nothing")?;
+    let copied = h.read_fresh_clipboard(2000).ok_or("W11: G v y copied nothing")?;
     if copied != last {
         return Err(format!(
             "W11: G v y should copy the last character {last:?}, copied {copied:?}"
@@ -2171,7 +2169,9 @@ fn w11_caret_view(h: &Harness) -> Result<(), String> {
     h.xdotool_key("j");
     let after_j = view_info(h)?;
     if num(&after_j, "top") != num(&start, "top") {
-        return Err(format!("W11 view: a j on a line already in view moved the list (the least that shows it): {start} -> {after_j}"));
+        return Err(format!(
+            "W11 view: a j on a line already in view moved the list (the least that shows it): {start} -> {after_j}"
+        ));
     }
     if after_j
         .get("said")
@@ -2386,10 +2386,7 @@ fn w12_quote(h: &Harness) -> Result<(), String> {
     }
     h.xdotool_keys(&["v", "v", "g", "g", "greater"]);
     if h.mode()?.as_str() != Some("input") {
-        return Err(format!(
-            "W12: v v gg > did not enter INPUT: data-mode={}",
-            h.mode()?
-        ));
+        return Err(format!("W12: v v gg > did not enter INPUT: data-mode={}", h.mode()?));
     }
     let landed_on_prompt = h.eval(
         "JSON.stringify(document.querySelector('.row-current')?.className.includes('row-prompt') ?? false)",

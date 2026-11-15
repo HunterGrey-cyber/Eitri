@@ -5,8 +5,8 @@
 //! `shell/src/plugin_page.rs` embeds. Builds the Markdown preview plugin's page
 //! (`plugins/markdown/web`), the Strips sidebar's (`plugins/agents-strips/web`) and the agents table's
 //! (`plugins/agents-top/web`) into their `dist/` directories the same way; `shell` embeds none of it -- each plugin
-//! directory is served from disk. Node.js/npm is a hard build-time prerequisite for `shell` -- see
-//! the npm invocations below.
+//! directory is served from disk. Node.js/npm is a hard build-time prerequisite for `shell`: each web project's
+//! package.json names its build script.
 //!
 //! Also bakes `shell --version`'s three build identities into the
 //! binary as compile-time env vars, read back by `shell/src/version.rs` through `env!`.

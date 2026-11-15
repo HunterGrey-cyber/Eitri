@@ -24,7 +24,7 @@ import {
 // The design doc is not in the public tree, so it is looked up by glob: an absent file gives an empty
 // map (no import error) and the row-by-row check below is skipped.
 const slashCommandsDoc = Object.values(
-  import.meta.glob("../../../docs/canonical/2026-09-27-slash-commands.md", {
+  import.meta.glob("../../../docs/*/2026-09-27-slash-commands.md", {
     query: "?raw",
     import: "default",
     eager: true,

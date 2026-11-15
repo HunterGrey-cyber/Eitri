@@ -600,8 +600,8 @@ window.editor-hole, window.editor-hole .shell-root, window.editor-hole .content-
     font-size: 12px;
 }}
 
-/* The global f HINT's GTK labels -- top bar items, the editor pane, a bottom plugin pane
-   -- are styled here. The panel draws its own, in the same pair. They sit
+/* The global f HINT's GTK labels (top bar items, the editor pane, a bottom plugin pane)
+   carry `hint_fg` on `hint_bg`. The panel draws its own, in the same pair. They sit
    in the window's hint overlay and never take a click (`can_target(false)`). The fill is in this
    same rule because `hint_fg` is only guarded against `hint_bg`. */
 .hint-label {{

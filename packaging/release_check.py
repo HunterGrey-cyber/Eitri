@@ -308,7 +308,7 @@ def find_verdandi_sidecar_filenames(files: Iterable[tuple[str, str]]) -> list[st
 
 
 def find_agent_hook_binaries(files: Iterable[tuple[str, str]]) -> list[str]:
-    """relpaths whose basename is EXACTLY 'agent-hook' (M16) -- the compiled legacy-gate relay
+    """relpaths whose basename is EXACTLY 'agent-hook' -- the compiled legacy-gate relay
     binary, which no release build compiles (no --features anywhere) and no asset may carry.
     A source file such as agent/src/bin/agent-hook.rs, legitimately present in the Eitri source
     asset, has a different basename ('agent-hook.rs') and is not a hit."""
@@ -335,7 +335,7 @@ def strings_a(data: bytes) -> list[str]:
 
 def find_home_paths_in_elves(files: Iterable[tuple[str, str]]) -> dict[str, list[str]]:
     """{relpath: [matched substrings]} for every extracted ELF file whose strings contain a
-    /home/.../Users/.../root/... path (M3). A non-ELF file carrying the identical text is
+    /home/.../Users/.../root/... path. A non-ELF file carrying the identical text is
     deliberately not reported here -- that is why this checks every extracted ELF rather than
     every extracted shipped file, since a text file (a doc, a licence, this
     project's own install.sh) legitimately mentions such paths in prose and examples."""
@@ -1023,7 +1023,7 @@ def _content_problems(label: str, files: list[tuple[str, str]], sdk_allowed: Cal
 
 
 def check_binary_asset(label: str, root: str, roles: dict[str, str], trees: Sequence[str] = ()) -> list[str]:
-    """One extracted tarball/.deb/.rpm: exactly the files `roles` names (M6's layout; anything else
+    """One extracted tarball/.deb/.rpm: exactly the files `roles` names (the package layout; anything else
     -- an agent-hook, a sidecar, a stray build product -- is a problem), apart from the files under one of `trees`
     (plugin directories, which plugin_tree_problems checks as wholes), and the content rules over every file. The
     SDK's name is allowed only in eitri-setup (the installer, which prints the SDK line)."""
@@ -1087,7 +1087,7 @@ def _check_web_bundle(root: str, web_rel: str, output: str) -> list[str]:
 
 def check_eitri_source_tree(root: str, src_repo: str, verdandi_repo: str, verdandi_rev: str,
                               skia_archive: str, skia_sha256: str) -> list[str]:
-    """The extracted Eitri source asset's top directory (M2): `git archive HEAD` of src_repo byte
+    """The extracted Eitri source asset's top directory: `git archive HEAD` of src_repo byte
     for byte plus only the known additions; neovide/ equal to the submodule's own `git archive HEAD`;
     proto/ equal to the public Verdandi's; skia/ exactly the pinned archive; .cargo/config.toml
     pointing at vendor/; the shipped `dist/.inputs-sha256` matches a fresh fingerprint over the

@@ -89,7 +89,7 @@ This is a real, reproducible finding worth flagging explicitly: continuous resiz
 the editor pane — every tick also resizes the WebView's allocated width, forcing WebKitGTK to
 reflow/repaint its (large, ever-growing, see P6) DOM at ~60Hz, which **pegs a full CPU core**
 sustained for the duration of the sweep. Compare to the no-sweep baseline's `WebKitWebProcess`
-usage of ~22–31% (below) — roughly a 4x increase. The feasibility doc's Go condition explicitly
+usage of ~22–31% (below) — roughly a 4x increase. The Go condition for this work explicitly
 calls out watching for a "CPU spike" during resize: by this measure there is one, and it's on the
 WebKitGTK side rather than the editor side. **It did not, in this environment, translate into
 measurable editor-frame degradation** (the dt distribution above already excludes it as a cause) —
@@ -165,7 +165,7 @@ fps (via `[webview-poll]`) visibly degrades over the same window: 163→165→16
 151(t=37.7s)→**137(t=39.7s)→124(t=41.7s)→140(t=43.7s)→125(t=45.7s)**. So in this run: the WebView's
 own render rate genuinely drops by ~25% as its DOM grows (expected — `PAYLOAD_HTML` never clears
 old messages, and re-runs its highlight regex over the full revealed text on every 16ms tick,
-exactly the "large conversation" cost the feasibility doc's test-content list calls out), **but the
+exactly the "large conversation" cost the test-content list for this work calls out), **but the
 editor pane's own frame pacing does not measurably follow it down**.
 
 ### An anomaly that did not reproduce

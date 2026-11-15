@@ -224,8 +224,8 @@ class NvimRsSymbolCheck(unittest.TestCase):
         self.assertEqual(hit, ["other", "shell"])
 
     def test_real_shell_binary_carries_nvim_rs_and_no_other_shipped_binary_does(self):
-        """Against this workspace's actual release build, if one exists -- the same real measurement
-        the review that asked for this check made by hand (245 hits in `shell`, 0 elsewhere)."""
+        """Against this workspace's actual release build, if one exists -- the same measurement
+        made by hand when this check was added (245 hits in `shell`, 0 elsewhere)."""
         shipped = {b: os.path.join(cl.REPO, "target", "release", b) for b in cl.SHIPPED_BINARIES}
         if not all(os.path.isfile(p) for p in shipped.values()):
             self.skipTest("no real target/release build in this checkout")
@@ -329,7 +329,7 @@ class BlankLicenceFiles(unittest.TestCase):
 
 
 class NoScratchDiskPathShipsInPinsEnv(unittest.TestCase):
-    """The scratch-disk mount point is
+    """A scratch-disk mount point of the maintainer's machine is
     not something a public reader needs -- packaging/pins.env's own comment used to name it
     literally. The private paths are publish/scan.sh's to know, not this file's: a test that spelled
     one out (even in pieces) would ship it. So pins.env goes through the leak scan itself, every rule
@@ -514,8 +514,8 @@ class SkiaArchiveComponents(unittest.TestCase):
         separate .a files -- which the table did not count).
 
         Extracted into this test's own scratch directory, never beside the cached archive itself
-        (review found the previous version of _skia_archive_root() doing exactly that, mutating
-        another lane's shared cargo build cache in place on every run of this test), and removed
+        (an earlier _skia_archive_root() extracted beside the cached archive, mutating a shared
+        cargo build cache in place on every run of this test), and removed
         again afterwards: the extraction is 63 MB, and a scratch directory with no cleanup piled one
         more copy into ~/.cache on every run."""
         archive = _find_pinned_skia_archive()
@@ -651,7 +651,7 @@ class SkiaArchiveNoticeEntries(unittest.TestCase):
         self.assertTrue(os.path.isfile(archive))
 
     def test_extract_dir_is_required_for_a_tar_gz_archive(self):
-        """Fail closed (review important 1/2): without an extract_dir, this must refuse rather than
+        """Fail closed: without an extract_dir, this must refuse rather than
         fall back to writing beside the archive (which is what the previous version did)."""
         archive = os.path.join(self.dir, "skia-binaries-fixture.tar.gz")
         with tarfile.open(archive, "w:gz"):

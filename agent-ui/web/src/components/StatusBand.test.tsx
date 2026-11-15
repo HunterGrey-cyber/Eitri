@@ -201,23 +201,23 @@ function renderNarrow(facts: BandFacts) {
 }
 
 it("a bypass prompt too wide for the band goes whole onto its own lines above the row, (y/n) intact", () => {
-  const R06_PROMPT = "Switch to bypass and approve the 1 waiting card? (y/n)";
-  const { container } = renderNarrow({ ...RUNNING, prompt: R06_PROMPT, message: null });
+  const BYPASS_CARD_PROMPT = "Switch to bypass and approve the 1 waiting card? (y/n)";
+  const { container } = renderNarrow({ ...RUNNING, prompt: BYPASS_CARD_PROMPT, message: null });
   expect(container.querySelector(".status-band .band-prompt")).toBeNull();
   expect(container.querySelector(".status-band .band-mode")).not.toBeNull();
   const prompt = container.querySelector(".status-band-above .band-prompt")!;
-  expect(prompt.textContent).toBe(R06_PROMPT);
+  expect(prompt.textContent).toBe(BYPASS_CARD_PROMPT);
   expect(prompt.textContent).not.toContain("…");
 });
 
 it("a flash too wide for the band never wraps it: one row, cut, the whole sentence as its title", () => {
-  const D11_FLASH = "y must be pressed on its own to enter bypass — Shift+Tab to ask again";
-  const { container } = renderNarrow({ ...RUNNING, prompt: null, message: D11_FLASH });
+  const BYPASS_ENTER_FLASH = "y must be pressed on its own to enter bypass — Shift+Tab to ask again";
+  const { container } = renderNarrow({ ...RUNNING, prompt: null, message: BYPASS_ENTER_FLASH });
   expect(container.querySelector(".status-band-above")).toBeNull();
   const message = container.querySelector<HTMLElement>(".status-band .band-message")!;
   // Whole in the markup: `.band-message`'s ellipsis ends it where the row ends.
-  expect(message.textContent).toBe(D11_FLASH);
-  expect(message.title).toBe(D11_FLASH);
+  expect(message.textContent).toBe(BYPASS_ENTER_FLASH);
+  expect(message.title).toBe(BYPASS_ENTER_FLASH);
 });
 
 it("a short prompt does not switch the band into wrap mode -- it still fits one row", () => {

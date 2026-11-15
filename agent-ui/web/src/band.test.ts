@@ -341,17 +341,17 @@ describe("the band degrades by priority", () => {
  *  character. A y/n prompt must keep what `y` does and its own `(y/n)`, so it wraps; a flash is one row, cut. */
 describe("a y/n prompt is never truncated; a flash is one row", () => {
   const NARROW_BUDGET_WIDTH = 340; // floor(340 / 7.2) === 47
-  const R06_PROMPT = "Switch to bypass and approve the 1 waiting card? (y/n)";
+  const BYPASS_CARD_PROMPT = "Switch to bypass and approve the 1 waiting card? (y/n)";
   const EMPTY_TAB_PROMPT = "Switch to bypass? New sessions in this window start in bypass too (y/n)";
-  const D11_FLASH = "y must be pressed on its own to enter bypass — Shift+Tab to ask again";
+  const BYPASS_ENTER_FLASH = "y must be pressed on its own to enter bypass — Shift+Tab to ask again";
   /** Cells the laid-out band takes, as `bandLayout` counts them (text, one cell of padding each side, the mode's arrow). */
   const cellsOf = (segs: ReturnType<typeof bandLayout>) =>
     segs.reduce((n, x) => n + Math.max(textWidth(x.text), x.cells ?? 0) + 2 + (x.id === "mode" ? 1 : 0), 0);
 
   it("keeps the bypass prompt whole, (y/n) included, at a 47-column budget", () => {
-    const segs = bandLayout({ ...idle, prompt: R06_PROMPT }, NARROW_BUDGET_WIDTH, 7.2);
+    const segs = bandLayout({ ...idle, prompt: BYPASS_CARD_PROMPT }, NARROW_BUDGET_WIDTH, 7.2);
     const prompt = segs.find((s) => s.id === "prompt")!;
-    expect(prompt.text).toBe(R06_PROMPT);
+    expect(prompt.text).toBe(BYPASS_CARD_PROMPT);
     expect(prompt.text).not.toContain("…");
     expect(prompt.text).toContain("(y/n)");
     expect(prompt.wraps).toBe(true); // it did not fit whole -- StatusBand must wrap it
@@ -366,12 +366,12 @@ describe("a y/n prompt is never truncated; a flash is one row", () => {
   });
 
   it("no flash ever wraps: too wide for the row, it is cut at the row's end, its start kept", () => {
-    const segs = bandLayout({ ...idle, message: D11_FLASH }, NARROW_BUDGET_WIDTH, 7.2);
+    const segs = bandLayout({ ...idle, message: BYPASS_ENTER_FLASH }, NARROW_BUDGET_WIDTH, 7.2);
     const message = segs.find((s) => s.id === "message")!;
     expect(message.wraps).toBeFalsy();
     expect(message.cut).toBe(true);
-    expect(message.text).toBe(D11_FLASH); // the engine's ellipsis ends it where the row ends
-    expect(message.full).toBe(D11_FLASH);
+    expect(message.text).toBe(BYPASS_ENTER_FLASH); // the engine's ellipsis ends it where the row ends
+    expect(message.full).toBe(BYPASS_ENTER_FLASH);
     // Nothing else had to give way to it: mode and pill keep their words.
     expect(segs.map((s) => s.id)).toEqual(["mode", "pill", "message"]);
   });
@@ -396,7 +396,7 @@ describe("a y/n prompt is never truncated; a flash is one row", () => {
   it("every width from 12 to 120 columns keeps every flash on one row: it fits, or it is marked cut", () => {
     const path = "gf: 2 of 5: src/components/very/deep/directory/StatusBand.tsx";
     for (let cols = 12; cols <= 120; cols++) {
-      for (const message of [D11_FLASH, A_ELSEWHERE_FLASH, A_ON_CARD_FLASH, path]) {
+      for (const message of [BYPASS_ENTER_FLASH, A_ELSEWHERE_FLASH, A_ON_CARD_FLASH, path]) {
         const segs = bandLayout({ ...idle, pill: "⏵⏵ manual", unread: "↓3", message }, cols * 7.2, 7.2);
         const shown = segs.find((s) => s.id === "message")!;
         expect(segs.some((s) => s.wraps === true), `${cols} columns: ${message}`).toBe(false);
@@ -445,7 +445,7 @@ describe("a y/n prompt is never truncated; a flash is one row", () => {
   });
 
   it("a flash that is cut leaves the mode its word: the letter would not make it fit", () => {
-    const segs = bandLayout({ ...idle, message: D11_FLASH }, NARROW_BUDGET_WIDTH, 7.2);
+    const segs = bandLayout({ ...idle, message: BYPASS_ENTER_FLASH }, NARROW_BUDGET_WIDTH, 7.2);
     expect(segs.find((s) => s.id === "mode")!.text).toBe("BROWSE");
     // ...while a band with no message still shortens the mode when nothing else is left to drop.
     expect(bandLayout({ ...idle, warn: "skew" }, 120, 7.2).find((s) => s.id === "mode")!.text).toBe("B");
@@ -526,8 +526,8 @@ describe("a y/n prompt is never truncated; a flash is one row", () => {
     expect(message.cut).toBe(true);
     expect(message.full).toBe(notice);
     // A question too long for the row goes above it; the flash stays on the row, still one row.
-    const long = bandLayout({ ...idle, prompt: R06_PROMPT, message: notice }, NARROW_BUDGET_WIDTH, 7.2);
-    expect(long.find((s) => s.id === "prompt")).toMatchObject({ text: R06_PROMPT, wraps: true });
+    const long = bandLayout({ ...idle, prompt: BYPASS_CARD_PROMPT, message: notice }, NARROW_BUDGET_WIDTH, 7.2);
+    expect(long.find((s) => s.id === "prompt")).toMatchObject({ text: BYPASS_CARD_PROMPT, wraps: true });
     expect(long.find((s) => s.id === "message")!.wraps).toBeFalsy();
   });
 

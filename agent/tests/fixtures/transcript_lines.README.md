@@ -7,9 +7,8 @@ itself one of the structural facts these fixtures pin).
 
 They are the on-disk shape, which is **not** the wire shape. The wire fixtures in this same
 directory (`assistant_text.json`, `user_tool_result.json`, `v2_*.json`, ...) stay where they are:
-the two sets pin two different formats and neither replaces the other. This set exists instead of
-*assembling* on-disk lines
-out of wire fixtures, which would have tested an invention rather than the CLI's real storage.
+the two sets pin two different formats and neither replaces the other. This set exists because *assembling* on-disk lines
+out of wire fixtures would have tested an invention rather than the CLI's real storage.
 
 ## What was redacted, and what was deliberately not
 

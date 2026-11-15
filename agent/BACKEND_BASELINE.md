@@ -130,7 +130,7 @@ case still needs its post-repair rerun; unit checks alone do not complete that c
   `claude`/`nvim`/WebKit processes, by a `/proc` before/after diff): sandbox verification in `shell/MANUAL_VERIFICATION.md`
   ("agent-ui verification"). Not repeated on 2.1.292.
 - **WebView reload** (a snapshot rehydrates the panel after a reload): sandbox verification in
-  `shell/MANUAL_VERIFICATION.md` ("agent-ui verification, protocol v2", check 4).
+  `shell/MANUAL_VERIFICATION.md` ("agent-ui verification, protocol v2", check 4, through a temporary debug reload); the `prefix r` reload has its own sandbox check.
   Not repeated on 2.1.292.
 
 ## Not measured on 2.1.292

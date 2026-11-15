@@ -1,11 +1,14 @@
 """The retired dashboard is absent from current sources and package contents."""
 
 from pathlib import Path
+import re
 import subprocess
 
 import pytest
 
 ROOT = Path(__file__).resolve().parents[2]
+# Private working documents; a public checkout has none of them.
+PRIVATE_WORKING_DOCS = re.compile(r"docs/(?:canonical/|superpowers/|rules/distribution\.md$)")
 
 
 def no_source_names_the_supervisor():
@@ -21,14 +24,13 @@ def no_source_names_the_supervisor():
     hits = []
     for hit in result.stdout.splitlines():
         path, _, line = hit.split(":", 2)
-        if path.startswith(("docs/canonical/", "docs/superpowers/")):
+        if PRIVATE_WORKING_DOCS.match(path):
             continue
         if path in (
             "packaging/tests/install/fixtures/install-0.2.0.sh",
             "packaging/release-notes.md.in",
             # The placeholder 0.2.0's installer wants in the tarball (packaging/legacy/README.md).
             "packaging/legacy/README.md",
-            "docs/rules/distribution.md",
             "packaging/release.sh",
             "packaging/release_check.py",
             "packaging/tests/install/harness.sh",
