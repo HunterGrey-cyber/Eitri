@@ -317,8 +317,10 @@ one-window mode.
   After 16 MB of images a tab says once that the conversation is heavy and suggests `/compact` or a new tab.
 - **Plan mode and images have been on a screen only in a test session, against a scripted model service with Claude
   Code 2.1.311.** The plan box, its buttons and the image chips were driven by keys in an isolated desktop session, in
-  dark and light, at a normal and a narrow width. No real model has planned or read an image through Eitri yet, and
-  nobody has used them on a real desktop. Reports of what you see are welcome.
+  dark and light, at a normal and a narrow width. Against a real model they have run only in automated tests without
+  a window (Claude Code 2.1.311): the model planned, a plan was revised and approved, an edit after a Manual approval
+  waited for an answer, and the model read an attached image. Nobody has used them on a real desktop yet. Reports of
+  what you see are welcome.
 - **In a narrow chat pane (about 320 pixels) the status line is cut short.** The panel's mode shows as a single
   letter (`I`, `B`), the permission mode's name is cut off (`bypass permission`), and the activity line's spinner
   sits on a line of its own.

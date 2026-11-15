@@ -361,8 +361,9 @@ behind a running turn. The plan box and the image chips were then driven by keys
 in dark and light, at a normal width, at a 320-pixel chat pane and in a full-width companion panel: all three
 approvals, keep planning, a plan waiting through an interrupt, a closed tab, a stopped agent backend and a page reload,
 a hostile plan drawn inert, pasted and dropped images, their errors, and images queued, taken back and carried across a
-tab switch and a reload. Nobody has looked at those screens on a real desktop, no real model has planned or read an
-image on this backend, and no other version of Claude Code was tried.
+tab switch and a reload. Nobody has looked at those screens on a real desktop. Against a real model, automated tests
+without a window had the model plan, revise a plan and carry it out after an approval, an edit after a Manual approval
+wait for an answer, and the model read an attached image; no other version of Claude Code was tried.
 
 None of 0.3.0 has been through real hardware and a person's hands yet, so it is not yet stable enough for everyday
 use. That waits for real hardware and a week of daily use, not for a version number; reports from real desktops
