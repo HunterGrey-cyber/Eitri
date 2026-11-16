@@ -229,6 +229,7 @@ What the installer says, abridged:
   user`**: the installer keeps its downloads in `~/.cache/eitri` and refuses a cache that other users could
   write to. Run `chmod g-w ~/.cache`, or set `XDG_CACHE_HOME` to a directory of your own.
 
+<!-- ubuntu-userns: revisit if the maintainer chooses the automatic sandbox-off option -->
 ### Ubuntu 23.10 and later
 
 Ubuntu (24.04 included) lets a program create user namespaces only under an AppArmor profile that allows

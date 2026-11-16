@@ -54,8 +54,8 @@ pub struct VerifyReport {
     pub altered: Vec<String>,
     /// Entries not sent by the Eitri binary, or that are not records.
     pub forged: usize,
-    /// Those entries by the `_EXE` the journal gave them (empty for an entry without one), so another Eitri build of
-    /// the user's own can be told apart from a stranger.
+    /// Those entries by the `_EXE` the journal gave them (empty for an entry without one), so another Eitri build the
+    /// same user runs can be told apart from a stranger's.
     pub forged_senders: BTreeMap<String, usize>,
     /// `("<writer> <run>", seq, next seq)` where a run's journal copies skip numbers: messages the journal dropped.
     pub journal_gaps: Vec<(String, u64, u64)>,

@@ -1,5 +1,5 @@
 // @vitest-environment jsdom
-import { existsSync, readFileSync } from "node:fs";
+import { readFileSync } from "node:fs";
 import { URL as NodeURL } from "node:url";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { DiagramController, MAX_DRAWINGS, MAX_DOCUMENT_SVG_BYTES, MAX_SVG_BYTES } from "./diagrams";
@@ -362,18 +362,6 @@ it("settles disabled requests as plain code and waits for the next display hello
   expect(send).toHaveBeenCalledTimes(1);
   controller.configure(true, 2);
   expect(send).toHaveBeenCalledTimes(2);
-});
-
-const bundleRules = new NodeURL("../../../docs/rules/build-and-command-line.md", import.meta.url);
-const bundleRecord = new NodeURL("../../../docs/canonical/dated_record.md", import.meta.url);
-// The exported tree omits its private documentation.
-it.skipIf(!existsSync(bundleRules) && !existsSync(bundleRecord))("records the diagram bundle measurements and ceiling in the rules and their dated entry", () => {
-  const rules = readFileSync(bundleRules, "utf8");
-  const record = readFileSync(bundleRecord, "utf8").split("### ")
-    .find((entry) => entry.startsWith("2026-11-16 (reply diagrams: attachment, copy and renderer lifecycle)"));
-  expect(record).toBeDefined();
-  for (const text of [rules, record]) for (const number of ["273,625", "276,210", "289,000", "4.6 %"])
-    expect(text).toContain(number);
 });
 
 it("holds a disabled outcome during selection and then restores plain source until display hello", () => {

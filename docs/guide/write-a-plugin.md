@@ -446,7 +446,7 @@ one away or change what one means. A page written for one release keeps working 
 - **Read the release notes.** The format is experimental during 0.x. If a release has to change it in a way that is
   not an addition, its release note says so.
 
-<!-- Change the paragraph below here and in the Chinese twin together. -->
+<!-- The paragraph below is the maintainer's to word; change it here and in the Chinese twin together. -->
 **The kits and the tokens are not under that promise yet.** `window.eitriKeys`, `window.eitriAgents` and the `--nv-*`
 token set are experimental in 0.x, separately from the protocol: a release may change them in a way that is not an
 addition, and its release note will say so. What holds today: each kit has a `version` that rises when its interface

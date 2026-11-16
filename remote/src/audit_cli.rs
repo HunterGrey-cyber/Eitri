@@ -291,7 +291,7 @@ fn verify_at(dir: &Path, journal: &dyn JournalSource, our_exe: &str, out: &mut d
             "journal entries not sent by this binary or not records: {}",
             report.forged
         ));
-        // Who sent them, as the journal names the executable: another Eitri build reads as its path.
+        // Who sent them, as the journal names the executable: another Eitri build of the user's own reads as its path.
         for (exe, n) in report.forged_senders.iter().take(FORGED_SENDERS_SHOWN) {
             match exe.as_str() {
                 "" => lines.push(format!("  from no executable the journal named: {n}")),

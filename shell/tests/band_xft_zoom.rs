@@ -1,7 +1,7 @@
 //! The agent panel's bottom band is one editor row high at any `gtk-xft-dpi`, in real WebKitGTK.
 //!
-//! **What this holds.** `--nv-editor-row` is
-//! the editor's cell height, which `neovide-editor` reports in GTK logical px. WebKitGTK zooms the
+//! **What this holds.** `--nv-editor-row` is the editor's cell height, which
+//! `neovide-editor` reports in GTK logical px. WebKitGTK zooms the
 //! page by `gtk-xft-dpi / 1024 / 96` (`shell/src/webkit_zoom.rs`'s module doc cites the source), so
 //! at 144 dpi one CSS px is 1.5 logical px: the 22px row, sent as `22px`, drew a band
 //! 33px high whose top reached 11px into the editor's statusline. This loads a page into a real
@@ -42,7 +42,7 @@ mod own_x_server;
 #[path = "../src/webkit_zoom.rs"]
 mod webkit_zoom;
 
-/// The editor row the v1-scale pass measured, in GTK logical px.
+/// The editor row in a sandbox measurement, in GTK logical px.
 const ROW: f32 = 22.0;
 
 /// What `neovide-editor` would have, and `main.rs` hands the panel.

@@ -294,14 +294,14 @@ mod tests {
 
     /// The shipped keymap snippet must load through real Lua and apply its advertised bindings.
     #[test]
-    fn the_owners_snippet_applies_cleanly_and_reproduces_his_tmux() {
+    fn the_sample_snippet_applies_cleanly_and_reproduces_the_sample_tmux_config() {
         let map = Keymap::apply_user(&run(SNIPPET), &[]).unwrap_or_else(|e| panic!("{e}"));
-        reproduces_his_tmux(&map);
+        reproduces_the_sample_tmux(&map);
     }
 
     /// What the fixture user's `~/.config/tmux/base.conf` binds, as Eitri has it: the snippet's result,
     /// and since the import, also what reading that tmux config itself gives.
-    fn reproduces_his_tmux(map: &Keymap) {
+    fn reproduces_the_sample_tmux(map: &Keymap) {
         let k = |s: &str| KeySpec::parse(s).unwrap();
         let action = |s: &str| map.lookup(&k(s)).map(|b| (b.action.clone(), b.repeatable));
         assert_eq!(map.prefix(), &k("C-a"));
@@ -380,8 +380,8 @@ mod tests {
     /// (`~/.config/tmux/tmux.conf`, which sources `~/.config/tmux/base.conf`). The copies in
     /// `core/tests/fixtures/tmux/` are those files with every comment emptied and one script name changed,
     /// line for line, so the snippet's `base.conf:NN` references still point at the right lines.
-    fn his_tmux_home() -> crate::test_scratch_dir::ScratchDir {
-        let home = crate::test_scratch_dir::ScratchDir::new("eitri-tmux", "owner");
+    fn sample_tmux_home() -> crate::test_scratch_dir::ScratchDir {
+        let home = crate::test_scratch_dir::ScratchDir::new("eitri-tmux", "sample");
         let dir = home.join(".config/tmux");
         std::fs::create_dir_all(&dir).unwrap();
         let fixtures = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/tmux");
@@ -391,7 +391,7 @@ mod tests {
         home
     }
 
-    fn import_his_tmux(home: &std::path::Path) -> (Keymap, crate::keymap::TmuxImport) {
+    fn import_sample_tmux(home: &std::path::Path) -> (Keymap, crate::keymap::TmuxImport) {
         let env = crate::keymap::tmux::tests::env_for(home);
         let read = crate::keymap::tmux::read(&env);
         Keymap::with_tmux(&read, &crate::keymap::LuaClaims::default())
@@ -410,10 +410,10 @@ mod tests {
     }
 
     #[test]
-    fn importing_his_tmux_config_gives_what_his_snippet_gives() {
-        let home = his_tmux_home();
-        let (map, import) = import_his_tmux(&home);
-        reproduces_his_tmux(&map);
+    fn importing_the_sample_tmux_config_gives_what_the_snippet_gives() {
+        let home = sample_tmux_home();
+        let (map, import) = import_sample_tmux(&home);
+        reproduces_the_sample_tmux(&map);
         let snippet = Keymap::apply_user(&run(SNIPPET), &[]).unwrap();
         assert_eq!(map.prefix(), snippet.prefix());
         assert_eq!(
@@ -458,10 +458,10 @@ mod tests {
     /// import of the same file without a single error, and the keymap is the same.
     #[test]
     fn the_snippet_on_top_of_the_import_starts_and_gives_the_same_map() {
-        let home = his_tmux_home();
-        let (imported, _) = import_his_tmux(&home);
+        let home = sample_tmux_home();
+        let (imported, _) = import_sample_tmux(&home);
         let layered = imported.then_user(&run(SNIPPET), &[]).unwrap_or_else(|e| panic!("{e}"));
-        reproduces_his_tmux(&layered);
+        reproduces_the_sample_tmux(&layered);
         let snippet = Keymap::apply_user(&run(SNIPPET), &[]).unwrap();
         assert_eq!(layered.prefix(), snippet.prefix());
         assert_eq!(effect(&layered), effect(&snippet));

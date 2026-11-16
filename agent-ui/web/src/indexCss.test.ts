@@ -2556,7 +2556,7 @@ it("draws no scrollbar on the tab bar, so a click anywhere on a tab reaches it",
  *  fg, the body's pair can be white on white. Render the real boxes, find each text's nearest
  *  fill, and require surface-guarded text or the deliberate syntax-colour exemption. Compare
  *  declarations, not pixels: jsdom inherits `color` but does not resolve `var()`. */
-describe("text on a --nv-surface fill (sw-theme-2)", () => {
+describe("text on a --nv-surface fill", () => {
   afterEach(() => {
     document.head.innerHTML = "";
     document.body.innerHTML = "";

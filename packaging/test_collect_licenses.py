@@ -913,7 +913,7 @@ class BuildHeaderProfiles(unittest.TestCase):
 
 class ArtworkNotice(unittest.TestCase):
     """Eitri's icon is its own artwork under CC BY 4.0 (its colours from the Neovim logo, CC BY 3.0):
-    the collector prints the artwork notice into THIRD-PARTY-LICENSES, and fails -- rather than ships a
+    the collector prints the maintainer's notice into THIRD-PARTY-LICENSES, and fails -- rather than ships a
     credit that is missing or no longer covers what is there -- when the notice or the file list is
     wrong. The dependency classification is not loosened to make that pass."""
 

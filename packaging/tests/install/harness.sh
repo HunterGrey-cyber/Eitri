@@ -44,7 +44,7 @@ fi
 # key's own behaviour use it. INSTALLER, which every other test runs, copies into a fixture release
 # or compares with an installed eitri-setup, is REAL_INSTALLER with the key lines taken out of its
 # signers block (setup_keys), so a test that means "an installer with no key" does not depend on
-# which key is listed. Until setup_keys has run it is the real file.
+# which key release-signers lists. Until setup_keys has run it is the real file.
 REAL_INSTALLER=$PKG/install.sh
 INSTALLER=$REAL_INSTALLER
 WRAP=$HERE/run-in-env.sh

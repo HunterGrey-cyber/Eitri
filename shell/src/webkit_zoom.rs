@@ -6,8 +6,8 @@
 //! `gtk-xft-dpi / 1024`, read from the default `GtkSettings` and re-read on `notify::gtk-xft-dpi`
 //! (`Source/WebKit/UIProcess/gtk/SystemSettingsManagerProxyGtk.cpp`). It is a *page* zoom
 //! (`setPageZoomFactor`), so one CSS px is `page scale` GTK logical px, and `devicePixelRatio` is the
-//! widget's integer scale factor times it (`LocalDOMWindow::devicePixelRatio`). That is what the
-//! v1-scale sandbox pass measured (2026-09-27): `gtk-xft-dpi=147456` (144 dpi, a common
+//! widget's integer scale factor times it (`LocalDOMWindow::devicePixelRatio`). That is what a
+//! sandbox measurement showed: `gtk-xft-dpi=147456` (144 dpi, a common
 //! HiDPI value) gave 1.5 at scale 1 and 3 at scale 2, and 98304 gave 1 and 2. The monitor's scale does
 //! not enter the page zoom: `refreshInternalScaling` also runs on a scale or monitor change, but
 //! with the same `fontDPI()`, and `xft_dpi::ensure_xft_dpi` never leaves the setting unset -- the
@@ -169,7 +169,7 @@ mod tests {
         (a - b).abs() < 1e-4
     }
 
-    /// The v1-scale pass's defect A: at 144 dpi a 22 logical px row is 22 / 1.5 CSS px, so the band
+    /// At 144 dpi a 22 logical px row is 22 / 1.5 CSS px, so the band
     /// is 22 logical px high rather than 33.
     #[test]
     fn at_144_dpi_the_row_is_two_thirds_as_many_css_px() {

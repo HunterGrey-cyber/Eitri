@@ -71,9 +71,8 @@ eitri.command.register({
 -- no tabs, no arbitrary panel count per slot, no general docking system. Registering to a slot
 -- that's already occupied *replaces* whatever was there, including a built-in panel: built-in
 -- panels are registered through this exact same code path before this file ever runs, so there
--- is no special protection for them. That's a deliberate v1 choice for a personal tool, not an
--- oversight -- see the plan's Global Constraints if you're wondering why there's no "protected
--- slot" concept.
+-- is no special protection for them. That is deliberate, not an oversight: there is no
+-- "protected slot" concept.
 --
 -- `content` must currently be `{ type = "webview", url = "..." }` -- the only supported panel
 -- content model in this version is a WebKitGTK WebView pointed at a URL. `url` can be:

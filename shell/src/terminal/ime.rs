@@ -399,8 +399,8 @@ mod tests {
     }
 
     /// With an input method attached -- any GTK module, fcitx5 running or not -- every printable key it
-    /// does not compose arrives as a commit, never as `key-pressed`. fcitx5-gtk 5.1.7 (when it is the
-    /// `GTK_IM_MODULE`) hands a key its server does not take, and every key while no server runs, to
+    /// does not compose arrives as a commit, never as `key-pressed`. fcitx5-gtk 5.1.7, when it is the
+    /// `GTK_IM_MODULE`, hands a key its server does not take, and every key while no server runs, to
     /// GTK's simple context (`fcitximcontext.cpp:485-525`, sync mode or not), which commits any
     /// printable character (`gtkimcontextsimple.c:745-750`, GTK 4.22.5); GTK's Wayland context commits
     /// it itself (`gtkimcontextwayland.c:621-645`), and so does the multicontext with no module at all,

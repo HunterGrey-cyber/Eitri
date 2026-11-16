@@ -1020,9 +1020,9 @@ describe("visual.ts: w/e/b follow vim's word rules", () => {
     return seen;
   }
 
-  const OWNER_LINE = "let has_flag = |flag: &str| flag_given(..., flag);";
+  const SAMPLE_LINE = "let has_flag = |flag: &str| flag_given(..., flag);";
   // As highlight.js renders it inside a fenced code block: the keyword and the type in spans.
-  const OWNER_HTML =
+  const SAMPLE_HTML =
     '<div class="row"><span class="row-sign" aria-hidden="true">›</span><div class="row-body">' +
     '<pre><code class="hljs language-rust"><span class="hljs-keyword">let</span> has_flag = |flag: &amp;' +
     '<span class="hljs-type">str</span>| flag_given(..., flag);</code></pre></div></div>';
@@ -1030,20 +1030,20 @@ describe("visual.ts: w/e/b follow vim's word rules", () => {
   const code = (root: Element) => root.querySelector("code")!;
 
   it("w from `let` visits every vim word, then clamps on the last character", () => {
-    const root = listOf(OWNER_HTML);
-    expect(root.querySelector("code")?.textContent).toBe(OWNER_LINE);
-    expect(landings(root, 0, "w", code(root))).toEqual(fromVim([OWNER_LINE], "", "1:4 1:13 1:15 1:16 1:20 1:22 1:23 1:26 1:28 1:38 1:44 1:48 1:49"));
+    const root = listOf(SAMPLE_HTML);
+    expect(root.querySelector("code")?.textContent).toBe(SAMPLE_LINE);
+    expect(landings(root, 0, "w", code(root))).toEqual(fromVim([SAMPLE_LINE], "", "1:4 1:13 1:15 1:16 1:20 1:22 1:23 1:26 1:28 1:38 1:44 1:48 1:49"));
   });
 
   it("e from `let` lands on every vim word's last character", () => {
-    const root = listOf(OWNER_HTML);
-    expect(landings(root, 0, "e", code(root))).toEqual(fromVim([OWNER_LINE], "", "1:2 1:11 1:13 1:15 1:19 1:20 1:22 1:25 1:26 1:37 1:42 1:47 1:49"));
+    const root = listOf(SAMPLE_HTML);
+    expect(landings(root, 0, "e", code(root))).toEqual(fromVim([SAMPLE_LINE], "", "1:2 1:11 1:13 1:15 1:19 1:20 1:22 1:25 1:26 1:37 1:42 1:47 1:49"));
   });
 
   it("b from the last character walks back to `let`", () => {
-    const root = listOf(OWNER_HTML);
-    expect(landings(root, OWNER_LINE.length - 1, "b", code(root))).toEqual(
-      fromVim([OWNER_LINE], "", "1:48 1:44 1:38 1:28 1:26 1:23 1:22 1:20 1:16 1:15 1:13 1:4 1:0"),
+    const root = listOf(SAMPLE_HTML);
+    expect(landings(root, SAMPLE_LINE.length - 1, "b", code(root))).toEqual(
+      fromVim([SAMPLE_LINE], "", "1:48 1:44 1:38 1:28 1:26 1:23 1:22 1:20 1:16 1:15 1:13 1:4 1:0"),
     );
   });
 
@@ -1204,13 +1204,13 @@ describe("visual.ts: w/e/b follow vim's word rules", () => {
   });
 
   it("VISUAL extends only the cursor end, and a count repeats w", () => {
-    const root = listOf(OWNER_HTML);
+    const root = listOf(SAMPLE_HTML);
     const start = caretAt(code(root), 0);
     const model: VisualModel = { anchor: start, cursor: start, kind: "char", goalX: null };
     const after = repeatMotion(fakeSelection([start]), model, "w", 3, root);
     expect(after.anchor).toEqual(start);
     expect(globalOffset(code(root), after.cursor)).toBe(15); // let -> has_flag -> = -> |
     const toEnd = repeatMotion(fakeSelection([start]), model, "w", 999, root);
-    expect(globalOffset(code(root), toEnd.cursor)).toBe(OWNER_LINE.length - 1);
+    expect(globalOffset(code(root), toEnd.cursor)).toBe(SAMPLE_LINE.length - 1);
   });
 });

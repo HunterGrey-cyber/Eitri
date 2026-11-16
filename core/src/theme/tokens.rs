@@ -1113,7 +1113,7 @@ mod tests {
     }
 
     /// Schemes chosen to be hard on the tints and on `chrome_accent`: nvim's own default both ways,
-    /// the shipped ones the earlier sw-theme probes used (zaibatsu's inverted float, pablo's grey
+    /// the shipped ones that stress them (zaibatsu's inverted float, pablo's grey
     /// Visual, lunaperche's and quiet's reversed StatusLine), rose-pine dawn's pale Comment and
     /// mid-luminance accents, a mid-grey background with its Comment across it, a dim low-contrast
     /// scheme whose own `fg` misses 4.5:1, and the preview's four palettes.

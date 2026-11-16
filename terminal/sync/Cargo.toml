@@ -5,7 +5,7 @@ edition = "2024"
 publish = false
 license = "MIT"
 # Eitri is this library's only product consumer.
-# Verdandi stated no licence for it; it is MIT with the rest of Eitri from here.
+# Verdandi stated no licence for it; it is the maintainer's own code, MIT with the rest of Eitri from here.
 description = "DECSET 2026 synchronized-output publication barrier for Eitri's terminal runtime engine."
 
 # NOTE: vte is deliberately NOT a direct dependency. `alacritty_terminal` re-exports the exact

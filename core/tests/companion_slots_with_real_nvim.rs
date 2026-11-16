@@ -634,7 +634,7 @@ fn the_adopted_teardown_leaves_a_state_another_holder_installed() {
 
 #[test]
 #[ignore = "needs nvim on PATH; uses stdio and no display"]
-fn his_own_command_of_the_same_name_survives_the_slot() {
+fn a_users_own_command_of_the_same_name_survives_the_slot() {
     let nvim = EmbedNvim::start();
     nvim.manual_timers();
     nvim.exec_lua("vim.api.nvim_create_user_command('EitriMarkdown', function() _G.own_command_ran = true end, {desc='my preview'})", vec![]);

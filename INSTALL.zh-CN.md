@@ -1,5 +1,5 @@
 [English](INSTALL.md) | 简体中文
-<!-- translated-from: INSTALL.md sha256=4ff5bb46e667a1cc1f91923967e62ddec5f95d95dff13331a7fd9d12d18bcece -->
+<!-- translated-from: INSTALL.md sha256=3a12682e916e37fe51097f1e8c72974842359a11d161654282b265bad899747a -->
 
 # 安装 Eitri
 
@@ -165,6 +165,7 @@ Linux 上，不管哪种方式，若 `XDG_CONFIG_HOME` 非空且为绝对路径�
 - **`~/.local/bin` is not on your `PATH`**，或者 **`eitri` on this PATH runs /usr/bin/eitri**：把 `~/.local/bin` 放到 `PATH` 的最前面。
 - **`… is writable by its group or by anyone, and not sticky`** 或 **`… is a symlink owned by another user`**：安装脚本把下载的文件放在 `~/.cache/eitri`，如果别的用户能写这个缓存，它就拒绝。运行 `chmod g-w ~/.cache`，或者把 `XDG_CACHE_HOME` 设成一个只属于你的目录。
 
+<!-- ubuntu-userns: revisit if the maintainer chooses the automatic sandbox-off option -->
 <a id="ubuntu-2310-and-later"></a>
 ### Ubuntu 23.10 及以后版本
 

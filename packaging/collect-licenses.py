@@ -22,7 +22,7 @@ It FAILS -- exit 1, and no output file -- rather than warn, on:
   * an object member inside the Skia prebuilt archive (--no-sidecar's --skia-archive-path) that
     belongs to no component it has a licence text for;
   * Eitri's own artwork (<repo>/packaging/icons, the application icon) when its LICENSE is not the
-    expected CC BY 4.0 notice word for word, or the directory holds a file ARTWORK_FILES does not list.
+    maintainer's CC BY 4.0 notice word for word, or the directory holds a file ARTWORK_FILES does not list.
 
 Deterministic by construction: every list is sorted, nothing reads the clock, and identical texts
 are printed once and referred to afterwards. Running it twice gives byte-identical output.
@@ -1545,7 +1545,7 @@ def own_notice(repo=REPO):
 
 def artwork_entries(repo=REPO):
     """The one entry for Eitri's own artwork (ARTWORK_DIR under `repo`), or a Fail: the directory must
-    hold exactly ARTWORK_FILES, its LICENSE must be the notice (ARTWORK_NOTICE) word for word,
+    hold exactly ARTWORK_FILES, its LICENSE must be the maintainer's notice (ARTWORK_NOTICE) word for word,
     and the licences it names must be ones ARTWORK_LICENSES classifies. The files themselves are not
     read: a package ships them byte for byte (release_check.py's role table holds that)."""
     root = os.path.join(repo, ARTWORK_DIR)
@@ -1562,7 +1562,7 @@ def artwork_entries(repo=REPO):
         raise Fail(f"{ARTWORK_DIR} lacks {sorted(ARTWORK_FILES - found)}: restore it, or drop it from ARTWORK_FILES")
     notice = read_text(os.path.join(root, "LICENSE"))
     if notice.strip() != ARTWORK_NOTICE:
-        raise Fail(f"{os.path.join(ARTWORK_DIR, 'LICENSE')} is not the logo's licence notice: it "
+        raise Fail(f"{os.path.join(ARTWORK_DIR, 'LICENSE')} is not the logo's licence notice the maintainer gave: it "
                    f"must read exactly: {ARTWORK_NOTICE}")
     for lic in (ARTWORK_LICENSE, "CC-BY-3.0"):
         if lic not in ARTWORK_LICENSES:
@@ -1761,7 +1761,7 @@ def collect(repo, binaries_dir, no_sidecar, source_url, sidecar_artifact=None, v
     # Last in both profiles, so publish.sh's byte-equality of parts 1-3 is not touched by it.
     L += ["", RULE, "Eitri's own artwork -- the icon files this package installs", RULE, ""]
     L += ["The application icon (hicolor/<size>/apps/cn.huntergrey.eitri.png and the scalable .svg) is not",
-          "code and is not under the MIT licence of LICENSE. Its licence notice:", ""]
+          "code and is not under the MIT licence of LICENSE. Its licence notice, as the maintainer gave it:", ""]
     render_entries(artwork, printed, L)
     nvim_rs = next((e for e in copyleft if e["name"] == "nvim-rs"), None)
     if nvim_rs is None:

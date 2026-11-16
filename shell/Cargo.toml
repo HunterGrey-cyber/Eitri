@@ -180,9 +180,8 @@ name = "editor_hole_pixels"
 harness = false
 
 # A plain `main`, because GTK must own the main thread; opt-in with `-- --ignored`. Starts its own
-# `Xvfb` (`tests/support/own_x_server.rs`, 2026-09-29; see the file's header). Holds the v1-scale GUI
-# pass's defect A (2026-09-27): the
-# band one editor row high in GTK logical px while WebKitGTK zooms the page for `gtk-xft-dpi`.
+# `Xvfb` (`tests/support/own_x_server.rs`; see the file's header). Holds that the band stays one editor row high in GTK logical px
+# while WebKitGTK zooms the page for `gtk-xft-dpi`.
 [[test]]
 name = "band_xft_zoom"
 harness = false

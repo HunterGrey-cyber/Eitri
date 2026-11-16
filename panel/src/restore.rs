@@ -386,8 +386,8 @@ pub(super) fn take_given_tabs(state: &mut AgentPanelState, screen: &Screen, tabs
     }
 }
 
-/// The tabs a restore still holds that the user has said nothing about. A source a user session passed by is out:
-/// the window's next write leaves those tabs out, as `eitri` mode's does.
+/// The tabs a restore still holds that the user has said nothing about. A source a session of the user's passed by is
+/// out: the window's next write leaves those tabs out, as `eitri` mode's does.
 pub(super) fn unopened_tabs(state: &AgentPanelState) -> Option<SavedTabs> {
     let waiting = restore_is_on_offer(state) || launch_restore_waits(state) || state.group_tabs.holds_unopened;
     state.restore_source.clone().filter(|_| waiting)

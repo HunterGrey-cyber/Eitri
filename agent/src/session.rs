@@ -320,7 +320,7 @@ impl AgentSession {
 ///   call clears it), read and written, so a text block of a different message starts a new transcript
 ///   entry and one of the same message starts a new paragraph.
 ///
-/// Global Constraint: an `AgentEvent` with no domain-event mapping (`ControlResponse`,
+/// An `AgentEvent` with no domain-event mapping (`ControlResponse`,
 /// `ProcessStderr`, `RateLimit`, `Unknown`) always returns an empty `Vec` -- never a fabricated
 /// event, never a panic.
 pub(crate) fn translate_wire_event(

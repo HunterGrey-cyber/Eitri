@@ -1,5 +1,5 @@
 [English](write-a-plugin.md) | 简体中文
-<!-- translated-from: write-a-plugin.md sha256=8c51fef0a0dadb1e61ae29ebcc707257f247ad010c4d771eb294dc88098e607e -->
+<!-- translated-from: write-a-plugin.md sha256=19c9cfd77c63e1cee939bb4c1db2af3b9daa4adce2737cc2b072132817a52f06 -->
 
 # 写一个插件
 
@@ -341,7 +341,7 @@ try {
 - **在给出版本的地方检查版本。** 视图和 `eitri agents --json` 与 `--watch` 的每一行都带有 `"v": 1`；`eitri agents --schema 1` 宁可拒绝运行，也不打印更新的版本。两个工具包在 `window.eitriKeys.version` 和 `window.eitriAgents.version` 里说出各自的版本；对后来的版本加的东西做功能检测（工具包本身的状态见下文）。
 - **读发布说明。** 0.x 期间这个格式是实验性的。如果某个发布必须以不是增加的方式改变它，它的发布说明会写出来。
 
-<!-- Change the paragraph below here and in the English page together. -->
+<!-- The paragraph below is the maintainer's to word; change it here and in the English page together. -->
 **这两个工具包和这些变量还不在这条承诺之内。** `window.eitriKeys`、`window.eitriAgents` 和 `--nv-*` 变量这一套，在 0.x 里是实验性的，和协议分开：某个发布可能以不是增加的方式改变它们，发布说明会写出来。目前成立的是：每个工具包都有一个 `version`，接口扩展时它会升高（按键工具包是 5，agents 工具包是 1），而且按键工具包到目前为止只靠增加来扩展；Eitri 在页面看到每个变量之前，会检查它的名字和值的格式。用到什么就对什么做功能检测，并给每个 `var(--nv-...)` 一个后备值。
 
 要求 `protocol = 2` 的清单，或者要求这个 Eitri 不认识的能力的清单，在加载时会被拒绝，并给出点名它的信息，所以更旧的 Eitri 永远不会只加载一半更新的插件。
