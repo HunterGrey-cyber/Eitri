@@ -26,7 +26,8 @@ runner; pytest itself must still be importable.)
 No container, no network: `VerifyRecipeRefusesTamperedInstallShTests` and `PublicTreeLayoutTests`
 build their fixtures under pytest's own `tmp_path` fixture (an autouse fixture, since they are
 `unittest.TestCase`s; pytest puts it under `$TMPDIR`, else `/tmp`, unless `--basetemp` is given), or,
-under plain unittest, in a fresh directory under `~/.cache/eitri-public-docs-tests` removed after
+under plain unittest, in a fresh directory under `$XDG_CACHE_HOME/eitri-public-docs-tests`
+(default `~/.cache/eitri-public-docs-tests`) removed after
 each test -- never a bare `tempfile.mkdtemp()`. The required flags are parsed out of the real
 packaging/install.sh -- never hardcoded a second time here -- so a future change to net_get()'s own
 flags is what this test tracks, not a copy that could drift from it. The "catches a regression" tests
@@ -43,11 +44,14 @@ import subprocess
 import sys
 import tempfile
 import unittest
+import unicodedata
+from urllib.parse import unquote, urlsplit
 
 import pytest
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
-_SCRATCH_ROOT = os.path.expanduser("~/.cache/eitri-public-docs-tests")
+_SCRATCH_ROOT = os.path.join(os.environ.get("XDG_CACHE_HOME") or os.path.expanduser("~/.cache"),
+                             "eitri-public-docs-tests")
 _PACKAGING = os.path.dirname(_HERE)
 _REPO_ROOT = os.path.dirname(_PACKAGING)
 _INSTALL_SH = os.path.join(_PACKAGING, "install.sh")
@@ -556,6 +560,86 @@ class GuideCompleteTests(unittest.TestCase):
         for name in _GUIDE_PAGE_NAMES:
             for file in (f"{name}.md", f"{name}.zh-CN.md"):
                 self.assertTrue(os.path.isfile(os.path.join(_GUIDE_DIR, file)), file)
+
+
+def _heading_slug(heading):
+    heading = re.sub(r"<[^>]*>", "", heading).lower()
+    return "".join(
+        char for char in heading
+        if char in "-_ " or unicodedata.category(char)[0] not in "PS"
+    ).replace(" ", "-")
+
+
+def _markdown_anchors(text):
+    anchors = set()
+    counts = {}
+    for _, line in _outside_fences(text):
+        anchors.update(re.findall(r'<a\s+(?:id|name)=[\"\']([^\"\']+)[\"\']', line))
+        heading = re.match(r"^ {0,3}#{1,6}\s+(.+?)(?:\s+#+)?\s*$", line)
+        if heading:
+            slug = _heading_slug(heading.group(1))
+            count = counts.get(slug, 0)
+            counts[slug] = count + 1
+            anchors.add(f"{slug}-{count}" if count else slug)
+    return anchors
+
+
+def _chinese_link_errors(page, text):
+    errors = []
+    for number, line in _outside_fences(text):
+        for target in _LINK_RE.findall(line):
+            url = urlsplit(target)
+            if url.scheme or url.netloc or target.startswith("/") or not url.path.endswith(".md"):
+                continue
+            path = os.path.normpath(os.path.join(os.path.dirname(page), unquote(url.path)))
+            # The language switch deliberately links to the English original.
+            language_switch = number == 1 and line.startswith("[English](")
+            twin = path[:-3] + ".zh-CN.md"
+            if not language_switch and not path.endswith(".zh-CN.md") and os.path.isfile(twin):
+                errors.append(f"{page}:{number}: {target}: use the Chinese twin")
+            if url.fragment:
+                if not os.path.isfile(path):
+                    errors.append(f"{page}:{number}: {target}: missing target")
+                    continue
+                with open(path, encoding="utf-8") as stream:
+                    anchors = _markdown_anchors(stream.read())
+                if unquote(url.fragment) not in anchors:
+                    errors.append(f"{page}:{number}: {target}: unknown anchor")
+    return errors
+
+
+class ChineseDocsLinksTests(unittest.TestCase):
+    def test_every_chinese_page_uses_twins_and_existing_anchors(self):
+        pages = []
+        for directory, _, names in os.walk(_PUBLISH_FILES):
+            pages.extend(os.path.join(directory, name) for name in sorted(names) if name.endswith(".zh-CN.md"))
+        self.assertTrue(pages)
+        errors = []
+        for page in sorted(pages):
+            with open(page, encoding="utf-8") as stream:
+                errors.extend(_chinese_link_errors(page, stream.read()))
+        self.assertEqual(errors, [], "\n" + "\n".join(errors))
+
+    def test_heading_slugs_keep_chinese_and_drop_punctuation(self):
+        for heading, slug in (("打开一个项目", "打开一个项目"), ("前缀", "前缀"), ("设置", "设置"),
+                              ("Eitri 自己崩溃时", "eitri-自己崩溃时"),
+                              ("浮动窗口、便笺板和工作区", "浮动窗口便笺板和工作区")):
+            self.assertEqual(_heading_slug(heading), slug)
+        self.assertEqual(_markdown_anchors("## 设置\n## 设置\n<a id=\"stable\"></a>\n```md\n## hidden\n```"),
+                         {"设置", "设置-1", "stable"})
+        for name, slug in (("getting-started", "打开一个项目"), ("keys", "前缀"), ("configuration", "设置")):
+            with open(os.path.join(_GUIDE_DIR, name + ".zh-CN.md"), encoding="utf-8") as stream:
+                self.assertIn(slug, _markdown_anchors(stream.read()))
+
+    def test_external_links_no_twin_and_fenced_examples_are_ignored(self):
+        page = os.path.join(_GUIDE_DIR, "getting-started.zh-CN.md")
+        text = ('[English](getting-started.md) | 简体中文\n'
+                '[external](https://example.invalid/keys.md#missing)\n'
+                '[external](//example.invalid/keys.md#missing)\n'
+                '[no twin](../../CONTRIBUTING.md)\n'
+                '```md\n[example](keys.md#missing)\n```\n'
+                '~~~md\n[example](keys.md#missing)\n~~~\n')
+        self.assertEqual(_chinese_link_errors(page, text), [])
 
 
 class KnownIssuesAnchorsTests(unittest.TestCase):
