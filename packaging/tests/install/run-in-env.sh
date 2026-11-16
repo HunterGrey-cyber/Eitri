@@ -14,7 +14,8 @@
 #   whatever --set names, which must be EITRI_INSTALL_TEST or an EITRI_INSTALL_TEST_* variable,
 #              an XDG_*_HOME, LANG, EITRI_CONFIG_DIR (the purge test's), the two variables that
 #              name a sidecar (`eitri sidecar status`'s), CARGO_TARGET_DIR, EITRI_SERVER_SHA256, or
-#              npm's two retry settings (a user's own values must reach the npm stub).
+#              the six EITRI_{RELEASE,SIDECAR,NVIM,NODE,GRPC,SKIA}_BASE_URL mirror variables, or
+#              npm's registry and two retry settings (a user's own values must reach the npm stub).
 #              The helper hash must reach the installer so source-build tests can check its removal.
 #              A caller's CARGO_TARGET_DIR must not move the --from-source build, since staging
 #              always reads <src>/target/release.
@@ -66,6 +67,8 @@ while [ $# -gt 0 ]; do
 			EITRI_INSTALL_TEST=* | EITRI_INSTALL_TEST_*=* | XDG_DATA_HOME=* | XDG_CACHE_HOME=* | \
 				XDG_STATE_HOME=* | XDG_CONFIG_HOME=* | LANG=* | EITRI_CONFIG_DIR=* | CARGO_TARGET_DIR=* | \
 				EITRI_SIDECAR_BINARY=* | EITRI_VERDANDI_CHECKOUT=* | EITRI_SERVER_SHA256=* | \
+				EITRI_RELEASE_BASE_URL=* | EITRI_SIDECAR_BASE_URL=* | EITRI_NVIM_BASE_URL=* | \
+				EITRI_NODE_BASE_URL=* | EITRI_GRPC_BASE_URL=* | EITRI_SKIA_BASE_URL=* | npm_config_registry=* | \
 				npm_config_fetch_retries=* | npm_config_fetch_retry_mintimeout=*) ;;
 			*) die "--set $2: not an allowlisted variable" ;;
 			esac

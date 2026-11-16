@@ -41,8 +41,8 @@ read `https_proxy`.
 export https_proxy=http://127.0.0.1:7890    # your proxy's address
 ```
 
-`--base-url URL` takes Eitri's own release files from a mirror laid out like the GitHub release page; Node, npm,
-the compiler and nvim still come from their usual hosts.
+`--base-url URL` takes Eitri's own release files from a mirror laid out like the GitHub release page. Node, npm,
+the compiler and nvim can come from mirrors too: see [Download addresses](#download-addresses).
 
 **If `install.sh` itself does not arrive in full**, `sh` runs none of it: a cut-off script ends in a syntax error and
 a non-zero exit status. A download that breaks before its first byte, though, hands `sh` an empty script, and the
@@ -208,6 +208,39 @@ prompt history, permission rules, trust answers, turn review snapshots) is in `$
 `$XDG_DATA_HOME` and `$XDG_STATE_HOME` default to `~/.local/share` and `~/.local/state`. The private nvim
 is never put on your `PATH`.
 
+## Download addresses
+
+The installer, `eitri setup` and `eitri sidecar update` download from the places below. Each one can point at a
+mirror you or your organisation run, through the variable beside it. Whatever the address, every file is checked
+the same way: Eitri's release files against the signature of the key built into the installer, and everything
+else against hashes from that signed release. A mirror can make a download fail, but it cannot change what gets
+installed, unless you pass `--insecure-skip-signature`: then the mirror serves the checksums too.
+
+| What | Default | Variable | Path under it |
+|---|---|---|---|
+| Eitri's release files | `https://github.com/HunterGrey-cyber/eitri` | `EITRI_RELEASE_BASE_URL`, or `--base-url` | `releases/latest/download/<file>`, `releases/download/v<version>/<file>` |
+| sidecar releases (`eitri sidecar check`, `eitri sidecar update`) | `https://github.com/HunterGrey-cyber/verdandi` | `EITRI_SIDECAR_BASE_URL`, or `--base-url` with those commands | `releases/latest/download/<file>`, `releases/download/claude-sidecar-v<version>/<file>` |
+| the private nvim, if you accept it | `https://github.com/neovim/neovim/releases/download` | `EITRI_NVIM_BASE_URL` | `v<version>/nvim-linux-x86_64.tar.gz` |
+| Node, to build the sidecar | `https://nodejs.org/dist` | `EITRI_NODE_BASE_URL` | `<version>/node-<version>-linux-<arch>.tar.xz` (the usual Node mirror layout) |
+| the sidecar's protocol compiler | `https://node-precompiled-binaries.grpc.io` | `EITRI_GRPC_BASE_URL` | `grpc-tools/v<version>/linux-<arch>.tar.gz` |
+| Skia, for `--from-source` only | `https://github.com/rust-skia/skia-binaries/releases/download` | `EITRI_SKIA_BASE_URL` | `<tag>/<file>` |
+| npm packages for the sidecar | your npm registry | npm's own `registry` setting (`~/.npmrc` or `npm_config_registry`) | as npm expects |
+
+Set a variable for the `sh` that runs the installer, or for `eitri setup`:
+
+```sh
+curl --proto '=https' --proto-redir '=https' --tlsv1.2 -sSfL https://github.com/HunterGrey-cyber/eitri/releases/latest/download/install.sh | EITRI_NODE_BASE_URL=https://mirror.example.com/node sh
+EITRI_NODE_BASE_URL=https://mirror.example.com/node eitri setup
+```
+
+An address must start with `https://` (plain `http://` is accepted only for `127.0.0.1` and `localhost`), and one
+holding a user name, a password, `?` or `#` is refused. If your mirror needs a login, put it in curl's own
+configuration instead, for example a `~/.netrc` entry with `netrc-optional` in `~/.curlrc`. `--base-url` on the
+command line wins over `EITRI_RELEASE_BASE_URL` (or `EITRI_SIDECAR_BASE_URL`). npm checks every package against the
+hash in the sidecar's lockfile, which comes with the signed release, whichever registry serves it. With
+`--from-source`, `git clone` and `cargo` follow your own git and Cargo configuration (for example
+`url.<base>.insteadOf` and Cargo's source replacement).
+
 ## Troubleshooting
 
 What the installer says, abridged:
@@ -218,8 +251,8 @@ What the installer says, abridged:
   **`Eitri's prebuilt binaries need glibc 2.39 or newer`**: the distribution is too old (Ubuntu 22.04 and
   Debian 12 are) or a runtime package is missing; the message names the package for your distribution.
 - **`could not download … from …: curl: (NN) …; N attempts over N s to <host>`**: the network kept breaking that
-  download. Set `https_proxy` if that host is reachable only through a proxy, or use `--base-url` for Eitri's own
-  release files ([On a slow or filtered network](#on-a-slow-or-filtered-network)).
+  download. Set `https_proxy` if that host is reachable only through a proxy, or point that download at a mirror
+  ([Download addresses](#download-addresses)); the message names the variable for it.
 - **`checksum mismatch for …`**: the download is corrupt. Run the installer again.
 - **`the signature on SHA256SUMS does not verify`**: stop, and do not install this release.
 - **`ssh-keygen was not found, so the release signature cannot be checked`**: install the OpenSSH client

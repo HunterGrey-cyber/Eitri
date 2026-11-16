@@ -334,7 +334,8 @@ t_release_older_than_the_layout_is_refused_before_download() {
 	srv_mark
 	inst_net --version 0.3.0
 	expect_fail "--version 0.3.0"
-	expect_out "eitri: error: Eitri 0.3.0 is older than this installer installs: it lays out releases from 0.3.1 on"
+	expect_out "eitri: error: Eitri 0.3.0 is older than this installer installs: it installs 0.4.0 and later; it refuses 0.3.0 and older, which lack the page window's desktop entry"
+	expect_no_out '0.3.1'
 	expect_out "then install 0.3.0 with its own install.sh: the release asset http://127.0.0.1:$PORT/releases/download/v0.3.0/install.sh"
 	expect_out 'Nothing was changed.'
 	expect_no_out 'raw.githubusercontent.com'

@@ -521,12 +521,12 @@ t_npm_retry_settings() {
 	sc_setup_release 1.0.0 "$REV_A"
 	sc_inst_setup --set "EITRI_INSTALL_TEST_NPM_ENV_LOG=$T/npm-env.log" -- --sidecar-only
 	expect_rc 0
-	expect_eq "$(cat "$T/npm-env.log")" 'fetch_retries=5 fetch_retry_mintimeout=2000' "npm's retry settings"
+	expect_eq "$(cat "$T/npm-env.log")" 'fetch_retries=5 fetch_retry_mintimeout=2000 registry=unset' "npm's retry settings"
 	rm -r "$(data_of)/eitri/sidecar"
 	sc_inst_setup --set "EITRI_INSTALL_TEST_NPM_ENV_LOG=$T/npm-env2.log" --set npm_config_fetch_retries=9 \
 		--set npm_config_fetch_retry_mintimeout=15000 -- --sidecar-only
 	expect_rc 0
-	expect_eq "$(cat "$T/npm-env2.log")" 'fetch_retries=9 fetch_retry_mintimeout=15000' "the user's own npm retry settings"
+	expect_eq "$(cat "$T/npm-env2.log")" 'fetch_retries=9 fetch_retry_mintimeout=15000 registry=unset' "the user's own npm retry settings"
 }
 
 TESTS="$TESTS t_upd_pinned_setup_ignores_scripts"

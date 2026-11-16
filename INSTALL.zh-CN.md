@@ -1,5 +1,5 @@
 [English](INSTALL.md) | 简体中文
-<!-- translated-from: INSTALL.md sha256=2c103036ed3484fea86c1618288d0b7fd9e8fd8731793ce932452bceb78ea3ca -->
+<!-- translated-from: INSTALL.md sha256=18f55df4fac2580edb050ef993dfa4042c1c57fc486d593ff80eaf42bdd2dff3 -->
 
 # 安装 Eitri
 
@@ -36,7 +36,7 @@ curl --proto '=https' --proto-redir '=https' --tlsv1.2 -sSfL https://github.com/
 export https_proxy=http://127.0.0.1:7890    # 换成你的代理地址
 ```
 
-`--base-url URL` 让 Eitri 自己的发布文件改从一个和 GitHub 发布页面结构相同的镜像下载；Node、npm、编译器和 nvim 仍然从原来的主机下载。
+`--base-url URL` 让 Eitri 自己的发布文件改从一个和 GitHub 发布页面结构相同的镜像下载。Node、npm、编译器和 nvim 也可以改从镜像下载，见[下载地址](#download-addresses)。
 
 **如果 `install.sh` 本身没有完整下载下来**，`sh` 一行也不会执行：被截断的脚本会以语法错误结束，退出状态不为 0。但如果下载在收到第一个字节之前就断了，`sh` 拿到的是一个空脚本，这一行的退出状态就是 0，只有 curl 打印的 `curl: (NN) …` 那一行能看出出了问题。在脚本里，或者需要靠退出状态判断时，先下载再运行：
 
@@ -160,6 +160,30 @@ sh install.sh --uninstall --purge    # 这两个也删掉
 
 Linux 上，不管哪种方式，若 `XDG_CONFIG_HOME` 非空且为绝对路径，你的配置是 `$XDG_CONFIG_HOME/eitri/init.lua`，否则是 `~/.config/eitri/init.lua`。Mac 使用 `~/.config/eitri/init.lua`。非空的 `EITRI_CONFIG_DIR` 会覆盖配置目录，且必须是绝对路径；相对路径会拒绝启动。各项目的状态（布局、已打开的标签页、提示词历史、权限规则、信任回答、回合审阅快照）都在 `$XDG_STATE_HOME/eitri/`。`$XDG_DATA_HOME` 和 `$XDG_STATE_HOME` 默认是 `~/.local/share` 和 `~/.local/state`。私有 nvim 永远不会被放上你的 `PATH`。
 
+<a id="download-addresses"></a>
+## 下载地址
+
+安装脚本、`eitri setup` 和 `eitri sidecar update` 从下表这些地方下载。每一项都可以通过旁边的变量，改为指向你自己或你所在组织的镜像。不管地址是什么，每个文件的校验方式都一样：Eitri 的发布文件对照安装脚本内置密钥的签名校验，其他文件对照这份已签名发布里的哈希校验。镜像能让下载失败，但改变不了装上的东西；只有加了 `--insecure-skip-signature` 时例外，那时校验和也由镜像提供。
+
+| 内容 | 默认地址 | 变量 | 其下的路径 |
+|---|---|---|---|
+| Eitri 的发布文件 | `https://github.com/HunterGrey-cyber/eitri` | `EITRI_RELEASE_BASE_URL`，或 `--base-url` | `releases/latest/download/<file>`、`releases/download/v<version>/<file>` |
+| sidecar 发布（`eitri sidecar check`、`eitri sidecar update`） | `https://github.com/HunterGrey-cyber/verdandi` | `EITRI_SIDECAR_BASE_URL`，或在这两个命令后加 `--base-url` | `releases/latest/download/<file>`、`releases/download/claude-sidecar-v<version>/<file>` |
+| 私有 nvim（仅在你接受时） | `https://github.com/neovim/neovim/releases/download` | `EITRI_NVIM_BASE_URL` | `v<version>/nvim-linux-x86_64.tar.gz` |
+| 构建 sidecar 用的 Node | `https://nodejs.org/dist` | `EITRI_NODE_BASE_URL` | `<version>/node-<version>-linux-<arch>.tar.xz`（Node 镜像的通常结构） |
+| sidecar 的协议编译器 | `https://node-precompiled-binaries.grpc.io` | `EITRI_GRPC_BASE_URL` | `grpc-tools/v<version>/linux-<arch>.tar.gz` |
+| Skia，仅 `--from-source` 用 | `https://github.com/rust-skia/skia-binaries/releases/download` | `EITRI_SKIA_BASE_URL` | `<tag>/<file>` |
+| sidecar 用的 npm 包 | 你的 npm 源 | npm 自己的 `registry` 设置（`~/.npmrc` 或 `npm_config_registry`） | 按 npm 的规则 |
+
+把变量设给运行安装脚本的 `sh`，或者设给 `eitri setup`：
+
+```sh
+curl --proto '=https' --proto-redir '=https' --tlsv1.2 -sSfL https://github.com/HunterGrey-cyber/eitri/releases/latest/download/install.sh | EITRI_NODE_BASE_URL=https://mirror.example.com/node sh
+EITRI_NODE_BASE_URL=https://mirror.example.com/node eitri setup
+```
+
+地址必须以 `https://` 开头（明文 `http://` 只接受 `127.0.0.1` 和 `localhost`），带用户名、密码、`?` 或 `#` 的地址会被拒绝。镜像需要登录时，把登录信息写进 curl 自己的配置，例如在 `~/.netrc` 里加一条，并在 `~/.curlrc` 里写 `netrc-optional`。命令行上的 `--base-url` 优先于 `EITRI_RELEASE_BASE_URL`（或 `EITRI_SIDECAR_BASE_URL`）。不管由哪个源提供，npm 都会对照 sidecar 的 lockfile 里的哈希校验每个包，而这个 lockfile 随已签名的发布一起来。使用 `--from-source` 时，`git clone` 和 `cargo` 按你自己的 git 和 Cargo 配置下载（例如 `url.<base>.insteadOf` 和 Cargo 的源替换）。
+
 <a id="troubleshooting"></a>
 ## 疑难排解
 
@@ -167,7 +191,7 @@ Linux 上，不管哪种方式，若 `XDG_CONFIG_HOME` 非空且为绝对路径�
 
 - **`run this as the user who will run Eitri`**：不要以 root 身份运行；sidecar 是按用户构建的。`--allow-root` 只是给容器用的。
 - **`this system has GTK 4.N, and Eitri needs GTK 4.14 or newer`**、**`WebKitGTK 6.0 … was not found`** 或 **`Eitri's prebuilt binaries need glibc 2.39 or newer`**：发行版太旧（Ubuntu 22.04 和 Debian 12 就是），或者缺运行时的包；错误信息里会给出你这个发行版对应的包名。
-- **`could not download … from …: curl: (NN) …; N attempts over N s to <host>`**：网络反复中断了这个下载。如果那台主机只能通过代理访问，设好 `https_proxy`；Eitri 自己的发布文件也可以用 `--base-url`（见[网络慢或受限时](#on-a-slow-or-filtered-network)）。
+- **`could not download … from …: curl: (NN) …; N attempts over N s to <host>`**：网络反复中断了这个下载。如果那台主机只能通过代理访问，设好 `https_proxy`，或者让这个下载改从镜像下载（见[下载地址](#download-addresses)）；错误信息里会写明对应的变量。
 - **`checksum mismatch for …`**：下载损坏了。重新运行一次安装脚本。
 - **`the signature on SHA256SUMS does not verify`**：停下，不要安装这个版本。
 - **`ssh-keygen was not found, so the release signature cannot be checked`**：装上 OpenSSH 客户端（Debian 和 Ubuntu 上是 `openssh-client`，Fedora 上是 `openssh-clients`，Arch 上是 `openssh`）。`--insecure-skip-signature` 不校验签名直接安装，这时只校验 checksum。

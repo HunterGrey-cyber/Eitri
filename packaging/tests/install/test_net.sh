@@ -24,7 +24,11 @@ t_http_tricky_hosts_refused() {
 		"http://localhost.$EVIL:8080/" "http://127.0.0.1:$PORT@$EVIL/" "http://x@127.0.0.1:$PORT/"; do
 		inst --stubs "$S/stubs-net" -- --base-url "$u" --release-signers "$SIGNERS"
 		expect_fail "--base-url $u"
-		expect_out "eitri: error: --base-url $u: "
+		case $u in
+		*@*) shown="http://***@${u##*@}" ;;
+		*) shown=$u ;;
+		esac
+		expect_out "eitri: error: --base-url $shown: "
 		# The rule: no `@` anywhere in an http authority, checked before the host.
 		case $u in *@*) expect_out "may not carry a user part ('@')" ;; esac
 	done

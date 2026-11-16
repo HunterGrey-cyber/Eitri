@@ -273,7 +273,7 @@ t_net_https_failure_names_host_proxy_and_base_url() {
 	expect_fail "an https SHA256SUMS that never arrives"
 	expect_eq "$(grep -c -F 'https://mirror.example/releases/latest/download/SHA256SUMS' "$S/logs/curl.log")" 8 "SHA256SUMS attempts"
 	expect_out "eitri: error: could not download SHA256SUMS from https://mirror.example/releases/latest/download/SHA256SUMS: curl: (56) Recv failure: Connection reset by peer; 8 attempts over "
-	expect_out " s to mirror.example. If this network reaches mirror.example only through a proxy, set https_proxy (for example https_proxy=http://127.0.0.1:7890) and re-run; --base-url URL downloads the release files from a mirror of the release page instead"
+	expect_out " s to mirror.example. If this network reaches mirror.example only through a proxy, set https_proxy (for example https_proxy=http://127.0.0.1:7890) and re-run; --base-url URL or EITRI_RELEASE_BASE_URL=URL downloads the release files from a mirror instead"
 	expect_absent "$TH/.local/lib/eitri"
 }
 

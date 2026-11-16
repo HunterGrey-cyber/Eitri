@@ -61,6 +61,10 @@ NV_BRIDGE_SINCE=0.3.1
 # them. An older version is refused before its tarball is fetched (refuse_older_layout), with the way to
 # install it with its own installer.
 NV_LAYOUT_SINCE=0.3.1
+# What a refusal tells the user. 0.3.1 and 0.3.2 were release candidates that were never published: the
+# published lines are 0.3.0 (refused) and 0.4.0 (the first this installer takes), so the messages name those,
+# as the install guide does, rather than the internal threshold above.
+NV_LAYOUT_SAYS='it installs 0.4.0 and later; it refuses 0.3.0 and older'
 NV_LICENCE_FILES='LICENSE THIRD-PARTY-LICENSES SOURCE'
 # The desktop entry is named by the application id (the compositor matches a window to <id>.desktop;
 # the icon theme's icon name and the window's class, shell/src/main.rs's APP_ID, are the same string).
@@ -116,20 +120,20 @@ console.log("executables=" + JSON.stringify(r.executables));
 '
 # The sidecar build. The protocol major matches Verdandi's own
 # apps/claude-sidecar/src/runtimeServiceImpl.ts PROTOCOL_MAJOR, checked against a built artifact's
-# own --version rather than assumed. Node's dist base is fixed in production; test mode replaces it
-# (node_dist_base) so a sandboxed run can never reach the real nodejs.org by accident.
+# own --version rather than assumed. Node's default dist base can be replaced by a user mirror.
+# Without a user override, test mode uses only its fixture server or a refused loopback port.
 NV_SIDECAR_PROTOCOL_MAJOR=3
 NV_NODE_DIST_BASE=https://nodejs.org/dist
 # Where a sidecar update takes the protoc that grpc-tools' install script would otherwise fetch with
-# no hash. Fixed in production; test mode replaces it (grpc_dist_base), as it does Node's.
+# no hash. A user mirror can replace this default; test mode otherwise uses its own fixture base.
 NV_GRPC_DIST_BASE=https://node-precompiled-binaries.grpc.io
 NV_SIDECAR_BUILD_MIN_KIB=1468006
 NV_SIDECAR_UPDATE_MIN_KIB=1258291
-# The nvim offer. Never Eitri's own release server -- this is neovim's own GitHub
-# releases. nvim_dist_base's own test-mode default (a refused loopback port) keeps every test that
-# forgets to redirect it from reaching the real host, the same discipline as node_dist_base.
+# The nvim offer's default is neovim's GitHub releases; a user mirror can replace it. Without
+# a user override, test mode uses its fixture base or a refused loopback port, as for Node.
 NV_NVIM_DIST_BASE=https://github.com/neovim/neovim/releases/download
-# --from-source: the public repositories it clones. Overridable only in test mode
+NV_SKIA_DIST_BASE=https://github.com/rust-skia/skia-binaries/releases/download
+# --from-source: the repositories it clones, independent of the download mirrors. Overridable only in test mode
 # (EITRI_INSTALL_TEST_REPO_URL / EITRI_INSTALL_TEST_VERDANDI_REPO_URL), which the
 # EITRI_INSTALL_TEST_* pattern in run-in-env.sh's allowlist already covers -- no new entry there.
 NV_EITRI_REPO_URL=https://github.com/HunterGrey-cyber/eitri.git
@@ -162,6 +166,7 @@ NV_APPARMOR_D=/etc/apparmor.d
 # --release-signers replaces it, with a warning). At worst they make a system check pass or keep
 # one more sidecar. The URL overrides further down (EITRI_INSTALL_TEST_*_BASE_URL, *_REPO_URL) are
 # refused unless they name a loopback http server or an absolute local path (set_paths).
+# User EITRI_*_BASE_URL mirrors take precedence and obey the same URL rule in every mode.
 NV_TEST_MODE=0
 
 OPT_MODE=install
@@ -310,6 +315,17 @@ usage: sh install.sh [options]
                                build the sidecar from files already on disk and install it into DIR
                                instead of the per-user path (the eitri-bin AUR package's build())
   -h, --help                   this text
+
+Download mirrors (empty means unset; --base-url takes precedence for release files):
+  HTTPS only, or plain HTTP to 127.0.0.1/localhost with an optional numeric port;
+  checked against the signed release either way (not with --insecure-skip-signature, where the
+  mirror serves the checksums too). Credentials go in curl's own configuration.
+  EITRI_RELEASE_BASE_URL  replaces github.com/HunterGrey-cyber/eitri (GitHub release layout)
+  EITRI_SIDECAR_BASE_URL  replaces github.com/HunterGrey-cyber/verdandi (sidecar releases)
+  EITRI_NVIM_BASE_URL     replaces github.com/neovim/neovim/releases/download
+  EITRI_NODE_BASE_URL     replaces nodejs.org/dist (standard Node mirror layout)
+  EITRI_GRPC_BASE_URL     replaces node-precompiled-binaries.grpc.io (pinned protoc only)
+  EITRI_SKIA_BASE_URL     replaces github.com/rust-skia/skia-binaries/releases/download (--from-source)
 EOF
 }
 
@@ -534,12 +550,14 @@ set_paths() {
 			esac
 			if [ "$_sp_v" = bad ]; then die "EITRI_INSTALL_TEST_NET_DELAY and EITRI_INSTALL_TEST_NET_STALL are whole seconds without a leading zero"; fi
 		done
-		# The download overrides lead only to a loopback server and the repository overrides only to a
-		# local path: a test mode left switched on in an environment can then send no download, clone
-		# or build anywhere else.
+		# The test-only download overrides lead only to a loopback server and the repository overrides
+		# only to a local path, so a test mode left switched on sends nothing elsewhere by itself. A user's
+		# EITRI_*_BASE_URL still applies in test mode, under the same rule as outside it.
 		for _sp_v in NODE NVIM SKIA GRPC; do
 			eval "_sp_u=\${EITRI_INSTALL_TEST_${_sp_v}_BASE_URL-}"
 			if [ -n "$_sp_u" ]; then
+				check_base_url "$_sp_u" "EITRI_INSTALL_TEST_${_sp_v}_BASE_URL"
+				_sp_u=$NV_BASE
 				loopback_http "$_sp_u"
 				if [ "$LH" != 1 ]; then die "EITRI_INSTALL_TEST_${_sp_v}_BASE_URL=$_sp_u: test mode downloads only from http://127.0.0.1[:port] or http://localhost[:port]"; fi
 			fi
@@ -552,6 +570,7 @@ set_paths() {
 			esac
 		done
 	fi
+	set_download_bases
 }
 
 # loopback_http URL: sets LH=1 when URL is plain http to exactly 127.0.0.1 or localhost, with an
@@ -1015,17 +1034,10 @@ nvim_check() {
 	fi
 }
 
-# nvim_dist_base: where the pinned nvim release tarball is fetched from -- neovim's own GitHub
-# releases, never Eitri's release server. Fixed in production; test mode redirects it to
-# a fixture server, and -- deliberately, the same discipline as node_dist_base -- an unset override
-# does NOT fall back to the real github.com: a test that forgets to set it must fail fast against a
-# refused loopback port, never spend real time downloading a real nvim release.
+# nvim_dist_base: the validated user mirror, else the test fixture base or production default.
+# Test mode without either override fails against a refused loopback port.
 nvim_dist_base() {
-	if [ "$NV_TEST_MODE" = 1 ]; then
-		printf '%s\n' "${EITRI_INSTALL_TEST_NVIM_BASE_URL:-http://127.0.0.1:1}"
-	else
-		printf '%s\n' "$NV_NVIM_DIST_BASE"
-	fi
+	printf '%s\n' "$NV_NVIM_BASE"
 }
 
 # nvim_private_state VERSION: sets NV_NVIM_PRIVATE_PRESENT=1 when
@@ -1115,7 +1127,7 @@ install_nvim_version() {
 	rm -rf -- "$_inv_workdir" || die "cannot remove the stale nvim build directory $_inv_workdir"
 	mkdir -p -- "$_inv_workdir" || die "cannot create $_inv_workdir"
 	_inv_tar=$_inv_workdir/nvim-linux-x86_64.tar.gz
-	curl_get "$(nvim_dist_base)/v$_inv_version/nvim-linux-x86_64.tar.gz" "$_inv_tar.part" "$NV_MAX_DOWNLOAD_BYTES"
+	curl_get "$(nvim_dist_base)/v$_inv_version/nvim-linux-x86_64.tar.gz" "$_inv_tar.part" "$NV_MAX_DOWNLOAD_BYTES" NVIM
 	if [ "$CG_OK" != 1 ]; then
 		if [ "$_inv_tolerant" = 1 ]; then
 			warn "could not download nvim $_inv_version ($CG_ERR): Eitri is installed without a private copy; run \"eitri setup --nvim-only\" once you have network access"
@@ -1242,36 +1254,115 @@ report_claude() {
 # ---------------------------------------------------------------------------------------------
 # Downloads
 
-# check_base_url URL: sets NV_BASE. https only; plain http only for exactly
-# 127.0.0.1 or localhost with an optional numeric port, and no `@` anywhere in the authority -- so
-# http://localhost@<host>/ and http://127.0.0.1.<host>/ are both refused.
+# check_base_url URL [SOURCE]: sets NV_BASE after validating and trimming trailing slashes.
+# Every user download base has the same rule, independent of mode. An `@` is refused anywhere in
+# the URL, not only in what looks like its authority: a password holding `/` would otherwise end the
+# authority early and pass, and every later message prints the base. A refused URL is printed with
+# everything up to its last `@` replaced and everything from its first `?` or `#` replaced, so no part
+# of a credential or token is ever shown; credentials belong in curl's own configuration.
 check_base_url() {
 	_bu=$1
+	_bu_prefix=
+	# Only a real scheme is kept in front of a redaction: with none, `://` may sit inside a password.
+	case $_bu in https://* | http://*) _bu_prefix=${_bu%%://*}:// ;; esac
+	_bu_auth=${_bu#*://}
+	_bu_auth=${_bu_auth%%/*}
+	# A query or fragment is where a token rides: one is refused below, and is not printed either. It is
+	# cut first, so an `@` inside it cannot leave part of it after the user part's redaction.
+	_bu_show=$_bu
+	case $_bu_show in *[?#]*) _bu_show="${_bu_show%%[?#]*}?***" ;; esac
+	case $_bu_show in
+	*@*)
+		_bu_show="${_bu_prefix}***@${_bu_show##*@}"
+		;;
+	esac
+	case $_bu_show in *[[:cntrl:]]*) _bu_show='(not shown: it holds control characters)' ;; esac
+	case ${2:---base-url} in
+	--base-url) _bu_source="--base-url $_bu_show" ;;
+	*) _bu_source="$2=$_bu_show" ;;
+	esac
+	case $_bu in
+	*@*) die "$_bu_source: a URL may not carry a user part ('@'); put credentials in curl's own configuration (~/.netrc via ~/.curlrc)" ;;
+	esac
+	case $_bu in
+	*[\?\#\\]* | *[[:space:][:cntrl:]]*) die "$_bu_source: the URL may not contain ?, #, whitespace, control characters or backslashes" ;;
+	esac
+	case $_bu in
+	https://*)
+		if [ -z "$_bu_auth" ]; then die "$_bu_source: https:// needs a non-empty host"; fi
+		case $_bu_auth in :*) die "$_bu_source: https:// needs a non-empty host" ;; esac
+		;;
+	http://*)
+		loopback_http "$_bu"
+		if [ "$LH" != 1 ]; then die "$_bu_source: plain http is accepted only for http://127.0.0.1[:port] or http://localhost[:port] with a numeric port; use https://"; fi
+		;;
+	*) die "$_bu_source: the URL must start with https://" ;;
+	esac
 	while :; do
 		case $_bu in
 		*/) _bu=${_bu%/} ;;
 		*) break ;;
 		esac
 	done
-	case $_bu in
-	https://?*) ;;
-	http://*)
-		_bu_auth=${_bu#http://}
-		_bu_auth=${_bu_auth%%/*}
-		case $_bu_auth in
-		*@*) die "--base-url $1: an http:// URL may not carry a user part ('@'); use https://" ;;
-		127.0.0.1 | localhost) ;;
-		127.0.0.1:* | localhost:*)
-			case ${_bu_auth#*:} in
-			'' | *[!0-9]*) die "--base-url $1: plain http is accepted only for 127.0.0.1 or localhost with a numeric port; use https://" ;;
-			esac
-			;;
-		*) die "--base-url $1: plain http is accepted only for http://127.0.0.1[:port] or http://localhost[:port]; use https://" ;;
-		esac
-		;;
-	*) die "--base-url $1: the URL must start with https://" ;;
-	esac
 	NV_BASE=$_bu
+}
+
+# Validate all user bases before a mode can download, lock or write, even ones that mode will
+# never use. Eval sees only fixed variable names; URL values are expanded as assignment values.
+set_download_bases() {
+	for _sdb_kind in RELEASE SIDECAR NVIM NODE GRPC SKIA; do
+		_sdb_name=EITRI_${_sdb_kind}_BASE_URL
+		eval "_sdb_value=\${$_sdb_name-}"
+		if [ -n "$_sdb_value" ]; then
+			check_base_url "$_sdb_value" "$_sdb_name"
+			eval "$_sdb_name=\$NV_BASE"
+		fi
+	done
+	if [ -n "$OPT_BASE_URL" ]; then
+		check_base_url "$OPT_BASE_URL"
+		OPT_BASE_URL=$NV_BASE
+	fi
+	NV_RELEASE_BASE=${EITRI_RELEASE_BASE_URL:-$NV_DEFAULT_BASE_URL}
+	NV_SIDECAR_BASE=${EITRI_SIDECAR_BASE_URL:-$NV_SIDECAR_REPO_BASE}
+	NV_NODE_BASE=$NV_NODE_DIST_BASE
+	NV_GRPC_BASE=$NV_GRPC_DIST_BASE
+	NV_NVIM_BASE=$NV_NVIM_DIST_BASE
+	NV_SKIA_BASE=$NV_SKIA_DIST_BASE
+	if [ "$NV_TEST_MODE" = 1 ]; then
+		NV_NODE_BASE=${EITRI_INSTALL_TEST_NODE_BASE_URL:-http://127.0.0.1:1}
+		NV_GRPC_BASE=${EITRI_INSTALL_TEST_GRPC_BASE_URL:-http://127.0.0.1:1}
+		NV_NVIM_BASE=${EITRI_INSTALL_TEST_NVIM_BASE_URL:-http://127.0.0.1:1}
+		NV_SKIA_BASE=${EITRI_INSTALL_TEST_SKIA_BASE_URL:-http://127.0.0.1:1}
+	fi
+	NV_NODE_BASE=${EITRI_NODE_BASE_URL:-$NV_NODE_BASE}
+	NV_GRPC_BASE=${EITRI_GRPC_BASE_URL:-$NV_GRPC_BASE}
+	NV_NVIM_BASE=${EITRI_NVIM_BASE_URL:-$NV_NVIM_BASE}
+	NV_SKIA_BASE=${EITRI_SKIA_BASE_URL:-$NV_SKIA_BASE}
+	case $OPT_MODE in
+	sidecar-check | sidecar-update) NV_SIDECAR_BASE=${OPT_BASE_URL:-$NV_SIDECAR_BASE} ;;
+	*) NV_RELEASE_BASE=${OPT_BASE_URL:-$NV_RELEASE_BASE} ;;
+	esac
+	NV_BASE=$NV_RELEASE_BASE
+}
+
+# download_setting KIND: identify the upstream and whether a user selected its address. Callers
+# name dependencies explicitly so mirrors sharing a host or path still get the correct hint.
+download_setting() {
+	_ds_kind=$1
+	if [ -z "$_ds_kind" ]; then
+		case $OPT_MODE in
+		sidecar-check | sidecar-update) _ds_kind=SIDECAR ;;
+		*) _ds_kind=RELEASE ;;
+		esac
+	fi
+	NG_SETTING=EITRI_${_ds_kind}_BASE_URL
+	NG_FROM=
+	eval "_ds_value=\${$NG_SETTING-}"
+	case $_ds_kind:$OPT_MODE in
+	RELEASE:install | RELEASE:sidecar-only | RELEASE:from-source | SIDECAR:sidecar-check | SIDECAR:sidecar-update)
+		if [ -n "$OPT_BASE_URL" ]; then NG_FROM=' (from --base-url)'; fi ;;
+	esac
+	if [ -z "$NG_FROM" ] && [ -n "$_ds_value" ]; then NG_FROM=" (from $NG_SETTING)"; fi
 }
 
 # require_curl: every download goes through curl. The design also calls for `wget --https-only` for a
@@ -1321,7 +1412,7 @@ net_retryable() {
 	esac
 }
 
-# net_get URL DEST LIMIT: download URL into the file DEST, or with DEST '-' into NG_TEXT (byte for
+# net_get URL DEST LIMIT [KIND]: download URL into the file DEST, or with DEST '-' into NG_TEXT (byte for
 # byte), refusing more than LIMIT bytes. HTTPS-only for every non-loopback URL, on every redirect
 # too (--proto/--proto-redir); a loopback URL reads no curl config and follows no redirect. An
 # attempt the network broke is made again (NV_NET_* above); a file download resumes its partial
@@ -1336,6 +1427,7 @@ net_get() {
 	NG_HINT=
 	NG_TEXT=
 	_ng_url=$1
+	download_setting "${4:-}"
 	_ng_dest=$2
 	_ng_lim=$3
 	case $_ng_url in
@@ -1369,7 +1461,7 @@ net_get() {
 			# A resumed attempt may add only what the limit leaves: --max-filesize sees one response.
 			if [ "$_ng_before" -ge "$_ng_lim" ]; then
 				rm -f -- "$_ng_dest" || :
-				NG_ERR="it reached the $_ng_lim bytes it can be over $((_ng_n - 1)) attempts: refusing it"
+				NG_ERR="it reached the $_ng_lim bytes it can be over $((_ng_n - 1)) attempts: refusing it$NG_FROM"
 				return 0
 			fi
 			_ng_max=$((_ng_lim - _ng_before))
@@ -1457,6 +1549,7 @@ net_get() {
 			_ng_eff=${_ng_eff%%"$NV_NL"*}
 			_ng_eff=${_ng_eff#*://}
 			_ng_eff=${_ng_eff%%/*}
+			_ng_eff=${_ng_eff##*@}
 			if [ -n "$_ng_eff" ]; then _ng_at=$_ng_eff; fi
 			if [ -n "$_ng_eff" ] && [ "$_ng_eff" != "$_ng_host" ]; then _ng_via=$_ng_eff; fi
 			;;
@@ -1476,7 +1569,7 @@ net_get() {
 		fi
 		net_retryable "$_ng_rc" "$_ng_msg"
 		if [ "$NR_RETRY" != 1 ]; then
-			NG_ERR=$_ng_msg
+			NG_ERR=$_ng_msg$NG_FROM
 			return 0
 		fi
 		_ng_after=0
@@ -1485,7 +1578,7 @@ net_get() {
 		# is held to the limit after every one.
 		if [ "$_ng_after" -gt "$_ng_lim" ]; then
 			rm -f -- "$_ng_dest" || :
-			NG_ERR="it grew past the $_ng_lim bytes it can be over $_ng_n attempts: refusing it"
+			NG_ERR="it grew past the $_ng_lim bytes it can be over $_ng_n attempts: refusing it$NG_FROM"
 			return 0
 		fi
 		if [ "$_ng_after" -gt "$_ng_before" ]; then
@@ -1512,28 +1605,29 @@ net_get() {
 	if [ -n "$_ng_via" ]; then NG_ERR="$NG_ERR (redirected to $_ng_via)"; fi
 	if [ "$_ng_resumed" = 1 ]; then NG_ERR="$NG_ERR, resuming the partial file"; fi
 	if [ "$_ng_lb" = 1 ]; then
-		NG_HINT="; check that the server at $_ng_host is running"
+		NG_HINT="; check that the server at $_ng_host is running$NG_FROM"
 		return 0
 	fi
 	NG_HINT=". If this network reaches $_ng_at only through a proxy, set https_proxy (for example https_proxy=http://127.0.0.1:7890) and re-run"
-	case $_ng_url in
-	"${NV_BASE-}"/*)
-		if [ -n "${NV_BASE-}" ]; then NG_HINT="$NG_HINT; --base-url URL downloads the release files from a mirror of the release page instead"; fi
-		;;
+	case $NG_SETTING in
+	EITRI_RELEASE_BASE_URL) NG_HINT="$NG_HINT; --base-url URL or EITRI_RELEASE_BASE_URL=URL downloads the release files from a mirror instead" ;;
+	EITRI_SIDECAR_BASE_URL) NG_HINT="$NG_HINT; --base-url URL or EITRI_SIDECAR_BASE_URL=URL downloads the sidecar release files from a mirror instead" ;;
+	?*) NG_HINT="$NG_HINT; $NG_SETTING=URL downloads this upstream from a mirror instead" ;;
 	esac
+	NG_HINT=$NG_HINT$NG_FROM
 }
 
-# fetch URL DEST WHAT LIMIT: download URL to DEST ('-' = stdout, byte for byte) through net_get, and
+# fetch URL DEST WHAT LIMIT [KIND]: download URL to DEST ('-' = stdout, byte for byte) through net_get, and
 # die naming WHAT when that fails.
 fetch() {
-	net_get "$1" "$2" "$4"
+	net_get "$1" "$2" "$4" "${5:-}"
 	if [ "$NG_OK" != 1 ]; then die "could not download $3 from $1: $NG_ERR$NG_HINT"; fi
 	if [ "$2" = - ]; then
 		printf '%s' "$NG_TEXT"
 		return 0
 	fi
 	size_within "$2" "$4"
-	if [ "$SW_OK" != 1 ]; then die "$3 from $1 is more than the $4 bytes it can be: refusing it"; fi
+	if [ "$SW_OK" != 1 ]; then die "$3 from $1 is more than the $4 bytes it can be: refusing it$NG_FROM"; fi
 }
 
 # sums_hash NAME: the hash of the unique SHA256SUMS line whose second field equals NAME.
@@ -1582,7 +1676,7 @@ download_verified() {
 	mv -- "$NV_DL/$1.part" "$NV_DL/$1" || die "cannot rename $NV_DL/$1.part"
 }
 
-# curl_get URL DEST LIMIT: like fetch, but reports failure through CG_OK/CG_ERR instead of dying (rule 2:
+# curl_get URL DEST LIMIT [KIND]: like fetch, but reports failure through CG_OK/CG_ERR instead of dying (rule 2:
 # a predicate reports through a variable), because the sidecar build's own first download (Node) is
 # the one place in this installer where "the network is not reachable" is not fatal (a
 # release with no sidecar still installs; the panel says how to get one). The same net_get, so the
@@ -1590,7 +1684,7 @@ download_verified() {
 curl_get() {
 	CG_OK=0
 	CG_ERR=
-	net_get "$1" "$2" "$3"
+	net_get "$1" "$2" "$3" "${4:-}"
 	if [ "$NG_OK" != 1 ]; then
 		CG_ERR=$NG_ERR$NG_HINT
 		return 0
@@ -1599,7 +1693,7 @@ curl_get() {
 	size_within "$2" "$3"
 	if [ "$SW_OK" != 1 ]; then
 		CG_OK=0
-		CG_ERR="it is more than the $3 bytes it can be"
+		CG_ERR="it is more than the $3 bytes it can be$NG_FROM"
 	fi
 }
 
@@ -1615,27 +1709,16 @@ node_arch() {
 	esac
 }
 
-# node_dist_base: where the pinned Node tarball is fetched from. Fixed in production
-# (NV_NODE_DIST_BASE); in test mode, EITRI_INSTALL_TEST_NODE_BASE_URL redirects it to a fixture
-# server, and -- deliberately -- an unset override does NOT fall back to the real nodejs.org: this
-# host (like the harness's own) can reach the real internet, and a test suite that forgets to set
-# the override must fail fast against a refused loopback port, never spend real time downloading a
-# real Node tarball from every test that reaches this point.
+# node_dist_base: the validated user mirror, else the test fixture base or production default.
+# Test mode without either override fails against a refused loopback port.
 node_dist_base() {
-	if [ "$NV_TEST_MODE" = 1 ]; then
-		printf '%s\n' "${EITRI_INSTALL_TEST_NODE_BASE_URL:-http://127.0.0.1:1}"
-	else
-		printf '%s\n' "$NV_NODE_DIST_BASE"
-	fi
+	printf '%s\n' "$NV_NODE_BASE"
 }
 
-# grpc_dist_base: where the pinned protoc tarball is fetched from, on the terms of node_dist_base.
+# grpc_dist_base: the validated user mirror, else the test fixture base or production default.
+# Test mode without either override fails against a refused loopback port.
 grpc_dist_base() {
-	if [ "$NV_TEST_MODE" = 1 ]; then
-		printf '%s\n' "${EITRI_INSTALL_TEST_GRPC_BASE_URL:-http://127.0.0.1:1}"
-	else
-		printf '%s\n' "$NV_GRPC_DIST_BASE"
-	fi
+	printf '%s\n' "$NV_GRPC_BASE"
 }
 
 # check_free_space DIR MIN_KIB NEEDS: MIN_KIB free in DIR's filesystem before a build starts; NEEDS says
@@ -1822,10 +1905,10 @@ obtain_release() {
 			die "--tarball must be the file named $NV_TARBALL_NAME that SHA256SUMS lists (it is ${OPT_TARBALL##*/})"
 		fi
 		# Set NV_REL_URL for the sidecar's source-download fallback under set -u. --base-url and
-		# --tarball are mutually exclusive, so the fallback uses GitHub. do_install first checks for
+		# --tarball are mutually exclusive, so the fallback uses the release base. do_install first checks for
 		# the source tarball beside --tarball after reading RELEASE; an offline install with that
 		# file present never reaches this URL.
-		NV_REL_URL=$NV_DEFAULT_BASE_URL/releases/download/v$NV_VERSION
+		NV_REL_URL=$NV_RELEASE_BASE/releases/download/v$NV_VERSION
 		return 0
 	fi
 
@@ -2371,7 +2454,7 @@ sidecar_download_node() {
 	_sdn_base=$(node_dist_base)
 	_sdn_url=$_sdn_base/$REL_NODE_VERSION/$_sdn_name
 	_sdn_out=$1/$_sdn_name
-	curl_get "$_sdn_url" "$_sdn_out.part" "$NV_MAX_DOWNLOAD_BYTES"
+	curl_get "$_sdn_url" "$_sdn_out.part" "$NV_MAX_DOWNLOAD_BYTES" NODE
 	if [ "$CG_OK" != 1 ]; then
 		if [ "$2" = 1 ]; then
 			warn "could not download the pinned Node runtime ($_sdn_url), needed to build the sidecar: $CG_ERR. Eitri is installed without one; run \"eitri setup\" once you have network access to nodejs.org"
@@ -2699,7 +2782,7 @@ do_sidecar_only() {
 		return 0
 	fi
 	require_curl
-	check_base_url "${OPT_BASE_URL:-$NV_DEFAULT_BASE_URL}"
+	NV_BASE=$NV_RELEASE_BASE
 	NV_REL_URL=$NV_BASE/releases/download/v$REL_VERSION
 	acquire_lock
 	install_sidecar_for_rev "$REL_REV7" 0
@@ -3035,7 +3118,7 @@ parse_sidecar_release() {
 # signature good, SIDECAR-RELEASE checked against it and parsed. `latest` is GitHub's pointer to the
 # newest non-prerelease; sidecar_decide is what keeps a served older one from lowering what runs.
 sidecar_fetch_manifest() {
-	check_base_url "${OPT_BASE_URL:-$NV_SIDECAR_REPO_BASE}"
+	NV_BASE=$NV_SIDECAR_BASE
 	if [ -n "$OPT_VERSION" ]; then
 		_sfm_url=$NV_BASE/releases/download/claude-sidecar-v$OPT_VERSION
 	else
@@ -3046,8 +3129,8 @@ sidecar_fetch_manifest() {
 	if [ "$CG_OK" != 1 ]; then
 		case $CG_ERR in
 		*'returned error: 404'*)
-			if [ -n "$OPT_VERSION" ]; then die "no release claude-sidecar-v$OPT_VERSION at $NV_BASE: eitri sidecar check names the newest"; fi
-			die "no sidecar release is published at $NV_BASE, so there is nothing to update to"
+			if [ -n "$OPT_VERSION" ]; then die "no release claude-sidecar-v$OPT_VERSION at $NV_BASE$NG_FROM: eitri sidecar check names the newest"; fi
+			die "no sidecar release is published at $NV_BASE$NG_FROM, so there is nothing to update to"
 			;;
 		esac
 		die "could not download SHA256SUMS from $_sfm_url/SHA256SUMS: $CG_ERR"
@@ -3155,7 +3238,7 @@ sidecar_download_protoc() {
 	_sdp_base=$(grpc_dist_base)
 	_sdp_url=$_sdp_base/grpc-tools/v$SR_GRPC_TOOLS_VERSION/$_sdp_name
 	_sdp_out=$1/$_sdp_name
-	curl_get "$_sdp_url" "$_sdp_out.part" "$NV_SIDECAR_ARCHIVE_MAX_BYTES"
+	curl_get "$_sdp_url" "$_sdp_out.part" "$NV_SIDECAR_ARCHIVE_MAX_BYTES" GRPC
 	if [ "$CG_OK" != 1 ]; then die "could not download the pinned protoc ($_sdp_url): $CG_ERR"; fi
 	_sdp_have=$(file_sha256 "$_sdp_out.part")
 	if [ "$_sdp_have" != "$_sdp_sha" ]; then
@@ -4215,16 +4298,20 @@ fetch_skia_binaries() {
 		die "$_fsb_pins names no SKIA_BINARIES_URL_UPSTREAM/SKIA_BINARIES_SHA256: not an Eitri checkout's pins.env. Report it at $NV_ISSUES"
 	fi
 	_fsb_name=${_fsb_url##*/}
-	# In test mode, redirected to a fixture server the same way node_dist_base is -- deliberately
-	# never falling back to the real GitHub URL when the override is unset, so a test that forgets
-	# to set it fails fast against a refused loopback port instead of downloading the real archive.
-	if [ "$NV_TEST_MODE" = 1 ]; then
-		_fsb_get=${EITRI_INSTALL_TEST_SKIA_BASE_URL:-http://127.0.0.1:1}/$_fsb_name
+	# A user mirror keeps the pinned tag and filename. Refuse unfamiliar upstream layouts rather
+	# than guess a suffix; the hash still comes from this checkout's pins.env.
+	if [ -n "${EITRI_SKIA_BASE_URL-}" ]; then
+		case $_fsb_url in
+		"$NV_SKIA_DIST_BASE"/*) _fsb_get=$NV_SKIA_BASE/${_fsb_url#"$NV_SKIA_DIST_BASE"/} ;;
+		*) die "EITRI_SKIA_BASE_URL: the pinned SKIA_BINARIES_URL_UPSTREAM must start with $NV_SKIA_DIST_BASE/" ;;
+		esac
+	elif [ "$NV_TEST_MODE" = 1 ]; then
+		_fsb_get=$NV_SKIA_BASE/$_fsb_name
 	else
 		_fsb_get=$_fsb_url
 	fi
 	_fsb_out=$_fsb_workdir/$_fsb_name
-	curl_get "$_fsb_get" "$_fsb_out.part" "$NV_MAX_DOWNLOAD_BYTES"
+	curl_get "$_fsb_get" "$_fsb_out.part" "$NV_MAX_DOWNLOAD_BYTES" SKIA
 	if [ "$CG_OK" != 1 ]; then die "could not download the pinned Skia binaries ($_fsb_get): $CG_ERR"; fi
 	_fsb_have=$(file_sha256 "$_fsb_out.part")
 	if [ "$_fsb_have" != "$_fsb_sha" ]; then
@@ -4253,7 +4340,7 @@ do_from_source() {
 	# confusing linker error. ARM builds remain unsupported until an architecture-selected Skia
 	# archive is pinned and can be tested.
 	if [ -z "$OPT_CHECKOUT" ]; then
-		check_base_url "${OPT_BASE_URL:-$NV_DEFAULT_BASE_URL}"
+		NV_BASE=$NV_RELEASE_BASE
 		refuse_older_layout_early
 	fi
 	_dfs_arch=$(uname -m) || die "uname failed"
@@ -4285,7 +4372,7 @@ do_from_source() {
 		# synthesize_release_from_checkout already requires OPT_CHECKOUT/.git to exist.
 		NV_FROM_SOURCE_DIR=$(CDPATH='' cd -P -- "$OPT_CHECKOUT" && pwd -P) || die "cannot resolve --checkout $OPT_CHECKOUT to an absolute path"
 	else
-		check_base_url "${OPT_BASE_URL:-$NV_DEFAULT_BASE_URL}"
+		NV_BASE=$NV_RELEASE_BASE
 		obtain_release
 		# Apply the downgrade refusal to source downloads too: a valid signature does not prevent
 		# a mirror serving an older signed release. --checkout has no release server to roll back from.
@@ -4433,7 +4520,7 @@ unpack_new() {
 	older_layout "$NV_VERSION"
 	if [ "$OL_OLDER" = 1 ]; then
 		_un_how=$(older_layout_how "$NV_VERSION")
-		_un_why="Eitri $NV_VERSION is older than this installer installs (it lays out releases from $NV_LAYOUT_SINCE on). Nothing was changed; install $_un_how"
+		_un_why="Eitri $NV_VERSION is older than this installer installs ($NV_LAYOUT_SAYS). Nothing was changed; install $_un_how"
 	fi
 	for _un_f in $NV_DESKTOP; do
 		if [ ! -f "$_un_top/share/applications/$_un_f" ]; then die "$NV_TARBALL_NAME has no share/applications/$_un_f: $_un_why"; fi
@@ -4514,10 +4601,15 @@ older_layout() {
 # older_layout_how VERSION: how to install VERSION with its own installer: the release asset from the base
 # URL in use, and, for the public repository, the file at the tag.
 older_layout_how() {
-	_olh_base=${NV_BASE:-$NV_DEFAULT_BASE_URL}
+	# unpack_new reaches this through refuse_older_layout without set_paths having run (its own tests call
+	# it alone), so the default stands in for an unsettled release base.
+	_olh_base=${NV_RELEASE_BASE:-$NV_DEFAULT_BASE_URL}
 	_olh_how="$1 with its own install.sh: the release asset $_olh_base/releases/download/v$1/install.sh"
 	if [ "$_olh_base" = "$NV_DEFAULT_BASE_URL" ]; then
 		_olh_how="$_olh_how, or the file at the tag, https://raw.githubusercontent.com/HunterGrey-cyber/eitri/v$1/packaging/install.sh"
+	else
+		# That install.sh carries the release key it will trust, and nothing here checks a mirror's copy of it.
+		_olh_how="$_olh_how; a mirror's copy of install.sh is checked by nothing, so compare it with the official $NV_DEFAULT_BASE_URL/releases/download/v$1/install.sh first"
 	fi
 	if [ "$OPT_MODE" = from-source ]; then _olh_how="$_olh_how (with --from-source --version $1)"; fi
 	printf '%s\n' "$_olh_how"
@@ -4529,7 +4621,7 @@ refuse_older_layout() {
 	older_layout "$1"
 	if [ "$OL_OLDER" != 1 ]; then return 0; fi
 	_rol_how=$(older_layout_how "$1")
-	die "Eitri $1 is older than this installer installs: it lays out releases from $NV_LAYOUT_SINCE on, which carry the page window's desktop entry, the nvim plugin's health check and the agents plugins that $1 does not. $(before_icon_advice "$_rol_how")"
+	die "Eitri $1 is older than this installer installs: $NV_LAYOUT_SAYS, which lack the page window's desktop entry, the nvim plugin's health check and the agents plugins. $(before_icon_advice "$_rol_how")"
 }
 
 # refuse_older_layout_early: what the command line alone says about the version (--version, or the version in
@@ -4935,7 +5027,7 @@ do_install() {
 	nvim_check
 	if [ -z "$OPT_TARBALL" ]; then
 		require_curl
-		check_base_url "${OPT_BASE_URL:-$NV_DEFAULT_BASE_URL}"
+		NV_BASE=$NV_RELEASE_BASE
 	fi
 	refuse_older_layout_early
 	acquire_lock

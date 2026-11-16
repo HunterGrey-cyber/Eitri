@@ -785,6 +785,7 @@ TESTS=
 . "$HERE/test_sidecar_commands.sh"
 . "$HERE/test_nvim.sh"
 . "$HERE/test_from_source.sh"
+. "$HERE/test_mirrors.sh"
 . "$HERE/test_apparmor.sh"
 . "$HERE/test_icon.sh"
 . "$HERE/test_panel.sh"
