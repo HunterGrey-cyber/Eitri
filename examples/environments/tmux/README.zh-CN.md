@@ -1,9 +1,10 @@
 [English](README.md) | 简体中文
-<!-- translated-from: README.md sha256=5c9ad790c0ce77fa6992e8eb4483210f56d62674aa1ff1d0ba82e09264bb683c -->
+<!-- translated-from: README.md sha256=2df1e091514fd1a9d159e607b0da4c14a4a66c6e2ce5887f5015f6e9de4fa72e -->
 
 # tmux 用户
 
 适合你，如果你整天待在 tmux 里：有一个前缀，用键盘分割和调整窗格，在窗口之间切换。
+[从 tmux 迁过来](../../../docs/guide/migrate-from-tmux.zh-CN.md)说明了哪些能从 tmux 带过来，哪些带不过来。
 
 Eitri 启动时会读你的 tmux 配置（`keymap.from_tmux`），所以你的前缀和你在它后面绑定的键在 Eitri 里已经像在 tmux 里一样能用。[`init.lua`](init.lua) 另外加了：
 

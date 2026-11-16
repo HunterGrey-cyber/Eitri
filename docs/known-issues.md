@@ -30,9 +30,9 @@ bug, and tell us if something here is wrong or has changed. The requirements are
   `Ctrl+j` and `Ctrl+k` on the first start to its notification windows, and AstroNvim now and then keeps its own
   `Ctrl+j` (seen once on 0.12.6 as well, so not tied to the version). The same LazyVim and kickstart checks pass on 0.12.6. If you
   use one of them, keep 0.12 on `PATH` or point `EITRI_NVIM` at it.
-- **Claude Code**, installed and logged in, 2.1.252 or newer and below 3.0. Without it Eitri still opens and
+- **Claude Code**, installed and set up, 2.1.252 or newer and below 3.0. Without it Eitri still opens and
   the editor works; the agent panel cannot run turns.
-- **Codex and other agents are optional.** A Codex tab needs `codex` 0.160.0 or newer, installed and signed in
+- **Codex and other agents are optional.** A Codex tab needs `codex` 0.160.0 or newer, installed and set up
   (tested with every release from 0.160.0 to 0.166.0); a tab for any other agent needs an agent that speaks ACP version 1 over standard
   input and output. See [Codex and other agents](guide/agents.md).
 

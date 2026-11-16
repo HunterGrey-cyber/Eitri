@@ -1,9 +1,9 @@
 [English](companion.md) | 简体中文
-<!-- translated-from: companion.md sha256=9d93648fffde3e62f5c4aac2b54e9c2b090e98565416d47d4c8cd77b4d804c59 -->
+<!-- translated-from: companion.md sha256=4bd6d37f8f36d5954cef3e794c99f2654f40e2a613dc15a441ec8287522d3f81 -->
 
 # 配合你自己的 Neovim 使用
 
-Eitri 也可以只运行 agent 面板：一个独立的窗口，放在你平时用的 Neovim 旁边，可以是在终端里（在 tmux 里或不在都行），也可以是上游 Neovide 或其他任何 Neovim 图形前端。这一页讲怎样启动它、焦点怎样在两个窗口之间移动，Markdown 预览这样的插件页面怎样单独开在你的 Neovim 旁边，以及每种桌面需要什么。直接运行 `eitri` 得到的窗口在[快速上手](getting-started.zh-CN.md)里讲；面板自己的按键在两种方式下是一样的，[按键](keys.zh-CN.md)里列出了它们。
+Eitri 也可以只运行 agent 面板：一个独立的窗口，放在你平时用的 Neovim 旁边，可以是在终端里（在 tmux 里或不在都行），也可以是上游 Neovide 或其他任何 Neovim 图形前端。这一页讲怎样启动它、焦点怎样在两个窗口之间移动，Markdown 预览这样的插件页面怎样单独开在你的 Neovim 旁边，以及每种桌面需要什么。直接运行 `eitri` 得到的窗口在[快速上手](getting-started.zh-CN.md)里讲；面板自己的按键在两种方式下是一样的，[按键](keys.zh-CN.md)里列出了它们。如果你现在在 tmux 里工作，[从 tmux 迁过来](migrate-from-tmux.zh-CN.md)讲了整个迁移过程，也包括这种用法。
 
 面板通过 RPC socket 附着到你的 Neovim 上，并在里面装一小段胶水代码：你打开的文件和 Visual 选区会送给 agent；面板取用你的配色方案并显示你的 which-key 按键；agent 工作期间缓冲区会重新加载（见[缓冲区重新加载](#buffers-reload)）；可以从面板里按行号打开文件；`Ctrl+g` 在 Neovim 里编辑草稿；Visual 模式里按 `<leader>ae`，带着选区把你送到面板的输入框，里面已有 `Edit the selection: ` 等你接着写（窗口管理器能被要求把面板带到前面的地方才行；其它地方用桌面自己的窗口键）。面板一消失就把这些全部撤掉。你的 Neovim 配置里不会被写入任何东西。编辑器保持它自己的速度和按键，两个窗口怎么摆由你的窗口管理器决定。
 

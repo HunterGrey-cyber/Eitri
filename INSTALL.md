@@ -4,7 +4,7 @@ English | [简体中文](INSTALL.zh-CN.md)
 
 **You need:** x86_64 Linux with GTK ≥ 4.14, WebKitGTK 6.0 and glibc ≥ 2.39 (Ubuntu 24.04, Debian 13,
 Fedora 40+, RHEL 10, Arch); **nvim ≥ 0.11** (the installer can fetch a private copy for Eitri if yours is
-older); and **Claude Code**, installed and logged in.
+older); and **Claude Code** (the `claude` command), installed and set up.
 
 ## Quick install
 
@@ -220,7 +220,7 @@ What the installer says, abridged:
 - **`ssh-keygen was not found, so the release signature cannot be checked`**: install the OpenSSH client
   (`openssh-client` on Debian and Ubuntu, `openssh-clients` on Fedora, `openssh` on Arch).
   `--insecure-skip-signature` installs without checking the signature; only the checksums are checked then.
-- **`claude` was not found on `PATH`**: a warning only. The panel needs Claude Code installed and logged in
+- **`claude` was not found on `PATH`**: a warning only. The panel needs the `claude` you installed and set up
   to run turns. Get it at <https://code.claude.com/docs/en/quickstart>. Until Eitri finds `claude`, the first-start
   screen and a Claude tab's failure row say so and give the same address.
 - **`~/.local/bin` is not on your `PATH`**, or **`eitri` on this PATH runs /usr/bin/eitri**: put

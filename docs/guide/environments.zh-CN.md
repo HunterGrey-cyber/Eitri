@@ -1,5 +1,5 @@
 [English](environments.md) | 简体中文
-<!-- translated-from: environments.md sha256=2d9b6959ce4b7bc3f34c8b815172929ed07664261e2aebe75278c97718ecbf87 -->
+<!-- translated-from: environments.md sha256=69da87f6a939e368c413e50b4331e1fa02cfe32dae85535147a39db73e6cf33d -->
 
 # 工作环境
 
@@ -7,7 +7,7 @@ Eitri 自己做的事不多，直到你告诉它你怎么工作。这里是几�
 
 | 配方 | 适合你，如果 | 它设置了什么 |
 |---|---|---|
-| [`tmux`](../../examples/environments/tmux/README.zh-CN.md) | 你整天待在 tmux 里 | 在窗格所在目录启动的分割、开在下方的新终端、一个 shell 工作区、停顿之后出现的键列表；你的 tmux 键自己就会带过来 |
+| [`tmux`](../../examples/environments/tmux/README.zh-CN.md) | 你整天待在 tmux 里 | 在窗格所在目录启动的分割、开在下方的新终端、一个 shell 工作区、停顿之后出现的键列表；你的 tmux 键自己就会带过来（哪些能带过来，见[从 tmux 迁过来](migrate-from-tmux.zh-CN.md)） |
 | [`i3`](../../examples/environments/i3/README.zh-CN.md) | 你用 i3 或 sway，并把 Alt 当作 `$mod` | 在 `Ctrl+Alt` 上的容器键、Eitri 里的所有东西都平铺、标签式容器、一个下拉终端 |
 | [`markdown-writer`](../../examples/environments/markdown-writer/README.zh-CN.md) | 你用 Markdown 写作 | 只要当前是 Markdown 文件，预览就在编辑器旁边，聊天在下面 |
 | [`many-agents`](../../examples/environments/many-agents/README.zh-CN.md) | 有好几个 agent 同时为你工作 | Strips 栏、The pass 和表格；新的聊天视图开在拿着按键的模块右边；一张卡片把它的聊天带回来 |

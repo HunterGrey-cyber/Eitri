@@ -1,9 +1,9 @@
 [English](getting-started.md) | 简体中文
-<!-- translated-from: getting-started.md sha256=86aec69ade0eaa908e2aaabf8d87e1136effe571604565020e664b65e7823d7d -->
+<!-- translated-from: getting-started.md sha256=74da78273cfa32f0b173808fca9eb25ec3a9c4fbeb15c99028c1ece5c7e19437 -->
 
 # 快速上手
 
-这一页带你从命令走到第一个完成的回合：打开一个项目、发送提示、回应 Eitri 弹出的卡片、同时使用多个会话，以及某个回合没有顺利结束时面板会说什么。它假定 Eitri 已经[安装好](../../INSTALL.zh-CN.md)，并且 `claude` 命令已经登录到你的账号。Eitri 运行它的 `PATH` 上的 `claude`；那里没有的时候（从桌面启动器或菜单而不是终端打开的窗口常常如此），它会按这个顺序去 Claude Code 的安装程序放它的地方找：`~/.local/bin/claude`（快速上手页面里的安装程序）、`~/.claude/local/claude`（较早的本地安装），以及你自己设过的 npm 全局前缀下的 `bin` 目录（`NPM_CONFIG_PREFIX`，或 `~/.npmrc` 里的 `prefix`）。它取第一个满足条件的：一个你能运行的普通文件，属于你或 root，而且它本身和通往它的每一个目录（链接会跟过去）都不能被其他用户写入；不满足的会被跳过，窗口的日志会写明原因。把 `VERDANDI_CLAUDE_CLI_PATH` 设成一个路径就是自己指定程序，这时 Eitri 不再去别处找。如果 Eitri 找不到 `claude`，首次启动界面和 Claude 标签页的失败提示都会说明，列出它找过的地方，并给出获取地址 <https://code.claude.com/docs/en/quickstart>；装好后在该标签页里按 `r`。
+这一页带你从命令走到第一个完成的回合：打开一个项目、发送提示、回应 Eitri 弹出的卡片、同时使用多个会话，以及某个回合没有顺利结束时面板会说什么。它假定 Eitri 已经[安装好](../../INSTALL.zh-CN.md)，并且 `claude` 命令已经安装并配置好。Eitri 运行它的 `PATH` 上的 `claude`；那里没有的时候（从桌面启动器或菜单而不是终端打开的窗口常常如此），它会按这个顺序去 Claude Code 的安装程序放它的地方找：`~/.local/bin/claude`（快速上手页面里的安装程序）、`~/.claude/local/claude`（较早的本地安装），以及你自己设过的 npm 全局前缀下的 `bin` 目录（`NPM_CONFIG_PREFIX`，或 `~/.npmrc` 里的 `prefix`）。它取第一个满足条件的：一个你能运行的普通文件，属于你或 root，而且它本身和通往它的每一个目录（链接会跟过去）都不能被其他用户写入；不满足的会被跳过，窗口的日志会写明原因。把 `VERDANDI_CLAUDE_CLI_PATH` 设成一个路径就是自己指定程序，这时 Eitri 不再去别处找。如果 Eitri 找不到 `claude`，首次启动界面和 Claude 标签页的失败提示都会说明，列出它找过的地方，并给出获取地址 <https://code.claude.com/docs/en/quickstart>；装好后在该标签页里按 `r`。
 
 文中的按键按默认设置来写：前缀是 `Ctrl+b`，“leader”是 `Space`，除非你的 Neovim 配置设了别的、面板能用的单个键的 `mapleader`（更长的或被保留的会退回到 `Space`）。完整的按键列表在[按键](keys.zh-CN.md)里，在面板里按 `F1` 也能看到。
 
@@ -109,7 +109,7 @@ Claude 回答时，回复会作为渲染好的 markdown 边流式输出边显示
 
 ## 排布窗口
 
-第一个回合之后，试着排一排模块。这里的 `<prefix>` 是先按 `Ctrl+b`，松开，再按后面的键或组合键，和 tmux 一样。这些都是默认键；如果 Eitri 拿到了你的 tmux 绑定，见[你的 tmux 键位](keys.zh-CN.md#your-tmux-keys)。
+第一个回合之后，试着排一排模块。这里的 `<prefix>` 是先按 `Ctrl+b`，松开，再按后面的键或组合键，和 tmux 一样。这些都是默认键；如果 Eitri 拿到了你的 tmux 绑定，见[你的 tmux 键位](keys.zh-CN.md#your-tmux-keys)；从 tmux 整体迁过来，见[从 tmux 迁过来](migrate-from-tmux.zh-CN.md)。
 
 1. 按键在 agent 面板里时，按 `<prefix> "`，再按 `t`：底部终端会在它下面打开，并拿到按键。`<prefix> %` 则向右分割；两种分割都会等你选一个模块，把它打开或移到那里。
 2. 按 `<prefix> o` 把按键交给屏幕上的下一个模块，一直按到按键回到终端。`<prefix> Left`、`Right`、`Up` 和 `Down` 则去那一侧的模块。

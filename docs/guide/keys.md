@@ -21,6 +21,7 @@ including anything you changed in [your configuration](configuration.md) or took
 >   `eitri.config.set("keymap.which_key_delay", 200)` in your `init.lua` ([The hint panel](#the-hint-panel)).
 > - If you use tmux, your prefix and prefix-table bindings come from your tmux configuration
 >   ([Your tmux keys](#your-tmux-keys)), and `Ctrl+b ?` (or your own prefix and `?`) lists what did not come across.
+>   [Coming from tmux](migrate-from-tmux.md) walks through the whole move.
 > - For a `Ctrl+a` prefix, start from [`docs/keymap/tmux-ctrl-a.lua`](../keymap/tmux-ctrl-a.lua). On i3 or sway with
 >   Alt as `$mod`, Eitri moves its Alt keys after the prefix to Ctrl+Alt by itself and says so once
 >   ([below](#containers-and-terminals)); [`docs/keymap/i3-alt-mod.lua`](../keymap/i3-alt-mod.lua) is the same moves as a file.
@@ -1157,6 +1158,9 @@ What trusting means is in [Permissions](permissions.md), and the other agents ar
 [Codex and other agents](agents.md).
 
 ## Your tmux keys
+
+For the whole move from tmux (your Neovim, your agent, what does not come over), see
+[Coming from tmux](migrate-from-tmux.md).
 
 If you use tmux, Eitri picks up your prefix and your prefix-table bindings from the same files tmux
 reads (`/etc/tmux.conf`, `~/.tmux.conf`, `$XDG_CONFIG_HOME/tmux/tmux.conf`,

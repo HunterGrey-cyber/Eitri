@@ -3,6 +3,7 @@ English | [简体中文](README.zh-CN.md)
 # A tmux person
 
 For you if you live in tmux: a prefix, panes you split and resize from the keyboard, windows you switch between.
+[Coming from tmux](../../../docs/guide/migrate-from-tmux.md) says what comes over from tmux and what does not.
 
 Eitri reads your tmux configuration when it starts (`keymap.from_tmux`), so your prefix and the keys you bound after
 it already work in Eitri as they do in tmux. [`init.lua`](init.lua) adds:

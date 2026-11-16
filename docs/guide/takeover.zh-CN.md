@@ -1,9 +1,9 @@
 [English](takeover.md) | 简体中文
-<!-- translated-from: takeover.md sha256=4c0270d0169f671b9a11f92abcf9364881dae00e463e319820325d1a931b0841 -->
+<!-- translated-from: takeover.md sha256=0050743dc56bebda2d5572cefe8d60f6eae2eb87de04e9d5b3b3cd0cc074e4f1 -->
 
 # 接管终端里的 nvim
 
-如果你有一个 Neovim 正在终端里运行，里面开着文件、有没保存的修改、跑着任务或者开着 `:terminal`，Eitri 可以把这个 Neovim 原样搬进它自己的窗口，窗口结束时再还给终端。什么都不会重启。你接管的这个 Neovim 就是窗口里的编辑器，旁边是 agent 面板，下面是底部终端；它原来所在的终端停在一个小小的等候画面上，直到 Neovim 被还回来。
+如果你有一个 Neovim 正在终端里运行，里面开着文件、有没保存的修改、跑着任务或者开着 `:terminal`，Eitri 可以把这个 Neovim 原样搬进它自己的窗口，窗口结束时再还给终端。什么都不会重启。你接管的这个 Neovim 就是窗口里的编辑器，旁边是 agent 面板，下面是底部终端；它原来所在的终端停在一个小小的等候画面上，直到 Neovim 被还回来。如果你现在在 tmux 里工作，[从 tmux 迁过来](migrate-from-tmux.zh-CN.md)讲了整个迁移过程，也包括这种用法。
 
 ## 面板放在 nvim 旁边，还是把 nvim 搬进来
 

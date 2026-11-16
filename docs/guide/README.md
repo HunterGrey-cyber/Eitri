@@ -39,6 +39,7 @@ you register, and you supervise each of them yourself, in a window you control.
 
 - [Install](../../INSTALL.md): packages, the install script, building from source, and verifying a download.
 - [Getting started](getting-started.md): open a project, send your first prompt, and find your way around.
+- [Coming from tmux](migrate-from-tmux.md): what Eitri takes from your tmux, Neovim and agent setup, what works differently, what does not come over, and how to go back.
 - [Keys](keys.md): the prefix, the panel's keys and moving between panes.
 - [Configuration](configuration.md): `$XDG_CONFIG_HOME/eitri/init.lua` (default `~/.config/eitri/init.lua`), the settings it reads and the keymap.
 - [How the editor reaches the screen](editor-presentation.md): the editor's own Wayland surface, `editor.presentation` and its fallback.

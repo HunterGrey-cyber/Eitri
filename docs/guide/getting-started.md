@@ -4,8 +4,8 @@ English | [简体中文](getting-started.zh-CN.md)
 
 This page takes you from the command to a first finished turn: opening a project, sending a prompt,
 answering the cards Eitri shows, working with several sessions, and what the panel says when a turn does not
-end well. It assumes Eitri is [installed](../../INSTALL.md) and the `claude` command is signed in to your
-account. Eitri runs the `claude` on its `PATH`; when that has none, which is common for a window started from
+end well. It assumes Eitri is [installed](../../INSTALL.md) and the `claude` command is
+installed and set up. Eitri runs the `claude` on its `PATH`; when that has none, which is common for a window started from
 a desktop launcher or a menu rather than a terminal, it looks where Claude Code's installers put it, in this
 order: `~/.local/bin/claude` (the installer from the quickstart page), `~/.claude/local/claude` (older local
 installs), and the `bin` directory of npm's global prefix when you set one yourself (`NPM_CONFIG_PREFIX`, or
@@ -222,7 +222,8 @@ After a turn that edited files, `c` in browsing shows what changed on disk durin
 
 Try arranging the modules after your first turn. Here `<prefix>` means press `Ctrl+b`, let go, then press
 the next key or chord, as in tmux. These are the defaults; if Eitri has picked up your tmux bindings, see
-[Your tmux keys](keys.md#your-tmux-keys).
+[Your tmux keys](keys.md#your-tmux-keys), and for the whole move from tmux,
+[Coming from tmux](migrate-from-tmux.md).
 
 1. With the keys in the agent panel, press `<prefix> "`, then `t`: the bottom terminal opens below it and
    takes the keys. `<prefix> %` splits to the right instead; either split waits for a module to open or move there.

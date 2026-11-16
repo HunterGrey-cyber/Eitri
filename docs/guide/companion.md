@@ -7,7 +7,8 @@ terminal (inside tmux or not), in upstream Neovide, or in any other Neovim GUI. 
 it, how focus moves between the two windows, how a plugin page such as the Markdown preview opens beside your Neovim on
 its own, and what each desktop needs. The window you get from plain
 `eitri` is described in [Getting started](getting-started.md); the panel's own keys are the same in both, and
-[Keys](keys.md) lists them.
+[Keys](keys.md) lists them. If you work in tmux today, [Coming from tmux](migrate-from-tmux.md) covers the whole
+move, this way of working included.
 
 The panel attaches to your Neovim over its RPC socket and installs a little glue inside it: the file you have
 open and your Visual selection go to the agent, the panel takes your colorscheme and shows your which-key keys,

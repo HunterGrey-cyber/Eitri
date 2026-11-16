@@ -5,7 +5,8 @@ English | [简体中文](takeover.zh-CN.md)
 If you have a Neovim running in a terminal, with files open, unsaved changes, a job running or a `:terminal` in it,
 Eitri can move that very Neovim into a window of its own, and give it back to the terminal when the window ends.
 Nothing is restarted. The Neovim you took over is the editor in the window, with the agent panel beside it and the
-bottom terminal under it, and the terminal it came from waits at a small screen until it is returned.
+bottom terminal under it, and the terminal it came from waits at a small screen until it is returned. If you work in tmux today,
+[Coming from tmux](migrate-from-tmux.md) covers the whole move, this way of working included.
 
 ## The panel beside nvim, or nvim moved in
 

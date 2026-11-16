@@ -1,5 +1,5 @@
 [English](keys.md) | 简体中文
-<!-- translated-from: keys.md sha256=c1f3e352b0b59c62852fe46f73afdf74dd999f60b5c5cff35f552b9351f5ce33 -->
+<!-- translated-from: keys.md sha256=355fba5ec61ac2e1db75738686d18ac8ca26e408862fc528d61d4e6d6eadc9ae -->
 
 # 按键
 
@@ -14,8 +14,9 @@ Eitri 的按键来自三个地方，它们互不冲突：用于窗口本身（�
 >   （readline 的 `Ctrl+k` 是 `Ctrl+b Ctrl+k`）。在 agent 面板里，浏览时按 `Ctrl+j` 开始输入，输入时按 `Ctrl+k`
 >   回到浏览；其余情况下它们离开面板（[在窗格之间移动](#moving-between-panes)）。
 > - 想让 Eitri 在你按下前缀后停一下就列出接下来的键，在 `init.lua` 里写 `eitri.config.set("keymap.which_key_delay", 200)`（[提示面板](#the-hint-panel)）。
-> - 如果你用 tmux，你的前缀和前缀表里的绑定来自你的 tmux 配置（[你的 tmux 按键](#your-tmux-keys)），
+> - 如果你用 tmux，你的前缀和前缀表里的绑定来自你的 tmux 配置（[你的 tmux 键位](#your-tmux-keys)），
 >   `Ctrl+b ?`（或者你自己的前缀加 `?`）会列出没拿过来的那些。
+>   从 tmux 整体迁过来的步骤见[从 tmux 迁过来](migrate-from-tmux.zh-CN.md)。
 > - 想用 `Ctrl+a` 当前缀，从 [`docs/keymap/tmux-ctrl-a.lua`](../keymap/tmux-ctrl-a.lua) 开始。i3 或 sway 把 Alt
 >   当 `$mod` 时，Eitri 会自己把前缀之后的 Alt 键改到 Ctrl+Alt，并说一次（[见下文](#containers-and-terminals)）；
 >   [`docs/keymap/i3-alt-mod.lua`](../keymap/i3-alt-mod.lua) 是写成文件的同一组改动。
@@ -761,6 +762,8 @@ BROWSE 里的 `:`（或任何地方的 `<prefix> :`）在面板底部打开一�
 
 <a id="your-tmux-keys"></a>
 ## 你的 tmux 键位
+
+从 tmux 整体迁过来（你的 Neovim、你的 agent、带不过来的东西），见[从 tmux 迁过来](migrate-from-tmux.zh-CN.md)。
 
 如果你用 tmux，Eitri 会从 tmux 自己读的那几个文件（`/etc/tmux.conf`、`~/.tmux.conf`、`$XDG_CONFIG_HOME/tmux/tmux.conf`、`~/.config/tmux/tmux.conf`，以及它们 `source-file` 进来的文件）里读出你的前缀键和前缀表绑定，凡是有对应 Eitri 动作的 tmux 命令都会照搬过来。它只读这些文件，从不启动或询问 tmux。一条提示会说明拿到了什么（每次导入内容有变化时出现一次），`<prefix> ?` 会逐行列出没能拿过来的那些行和原因。Eitri 没有对应物的东西，以及任何需要 tmux 去运行什么的东西，都会被跳过。
 前缀之后的 `v` 绑定会被跳过：Eitri 为一个尚未实现的模块保留了这个键。请把该动作绑定到另一个键。

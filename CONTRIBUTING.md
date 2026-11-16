@@ -64,8 +64,8 @@ third-party build script with an error that never names this project:
 - **A C toolchain**: Lua 5.4 is built from source and statically linked.
 - **Network access on the first build**: `skia-safe` downloads a prebuilt Skia, and Cargo fetches
   the Verdandi protocol crate from GitHub.
-- At run time: **`nvim` ≥ 0.11** on `PATH`, a working OpenGL driver, a Wayland session, and Claude
-  Code installed and logged in — Eitri spends whatever account it runs under.
+- At run time: **`nvim` ≥ 0.11** on `PATH`, a working OpenGL driver, a Wayland session, and the
+  `claude` you installed and set up.
 
 ## Building
 
@@ -175,7 +175,7 @@ is still in the tree behind a cargo feature, `legacy-backend`, off by default: p
 build`/`cargo test` never compile it, and no release build can select it (`eitri --legacy` on a
 release exits 1, naming why). Build it in for local testing with `cargo build --features
 shell/legacy-backend` (or `cargo run -p shell --features shell/legacy-backend -- ...`), then select
-it with `--legacy` or `EITRI_AGENT_BACKEND=legacy`. It needs Claude Code installed and logged in,
+it with `--legacy` or `EITRI_AGENT_BACKEND=legacy`. It needs the `claude` you installed and set up,
 same as the sidecar.
 
 ## Submitting a change

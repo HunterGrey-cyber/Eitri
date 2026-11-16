@@ -1,11 +1,11 @@
 [English](agents.md) | 简体中文
-<!-- translated-from: agents.md sha256=ba218b7adbce0294b09dc655bc64dd7263eb798e97c90e00b905deed1ec70299 -->
+<!-- translated-from: agents.md sha256=820a585793f1411c4bbbb09f0e5754dfc2a01e5e059b512d0ede36f34ceaafba -->
 
 # Codex 与其他 agent
 
 agent 面板里的每个标签页都运行一个 agent，创建标签页时选定。在 Hyprland、sway 和 niri 上，面板默认是一个独立的窗口（[合成器窗口](compositor-windows.zh-CN.md)）。默认的 agent 是 Claude Code。一个标签页也可以运行 Codex，或者任何你注册的、通过标准输入输出说 Agent Client Protocol（ACP）的 agent。这一页讲这两种需要准备什么、怎样打开这样的标签页、Eitri 在启动之前会问你什么、谁来回答 agent 的请求，以及和 Claude 标签页相比，哪些地方更弱或者没有。
 
-Eitri 运行的是你自己安装并登录好的 agent；它不附带其中任何一个。面板、按键、队列、[回合审阅](turn-review.zh-CN.md)以及[快速上手](getting-started.zh-CN.md)的其余内容，在每个标签页里都一样。关于[权限](permissions.zh-CN.md)和 [Claude 账号](configuration.zh-CN.md#accounts)的页面只描述 Claude 标签页，除非这一页另有说明。
+Eitri 运行的是你自己安装并配置好的 agent；它不附带其中任何一个。面板、按键、队列、[回合审阅](turn-review.zh-CN.md)以及[快速上手](getting-started.zh-CN.md)的其余内容，在每个标签页里都一样。关于[权限](permissions.zh-CN.md)和 [Claude 账号](configuration.zh-CN.md#accounts)的页面只描述 Claude 标签页，除非这一页另有说明。
 
 Claude 标签页还能看到 Claude Code 自己在做的事：后台任务、动态工作流、子 agent、它自己发起的回合，以及它问你的问题。这部分放在最前面，因为 Codex 和 ACP 标签页都没有。
 
@@ -142,7 +142,7 @@ Claude Code 终端里把正在运行的前台命令移到后台的 `Ctrl+B`，�
 <a id="what-you-need"></a>
 ### 需要什么
 
-- `codex` 命令，已经安装，并用 `codex login` 登录。没有登录时，标签页会说 “Codex is not signed in: run `codex login` in a terminal”。
+- `codex` 命令，已经安装并配置好（`codex login`）。没配置好时，标签页会说 “Codex is not signed in: run `codex login` in a terminal”。
 - Codex 0.160.0 或更新。Eitri 的 Codex 测试跑过从 0.160.0 到 0.166.0 的每个版本；标签页的 `agent` 一行会这么写。更新的 Codex 仍然能运行，这一行会写 “untested Codex”，后面跟着它的版本和试过的最新版本。更旧的会被拒绝，并提示 “update Codex”。
 
 Eitri 按这个顺序挑选程序：环境变量 `EITRI_CODEX`（一个文件的绝对路径），然后是 `init.lua` 里的 `agent.codex.command`（绝对路径，或在 `PATH` 里查找的裸命令名），然后是 `PATH` 上的 `codex`，`PATH` 上没有时再去 Codex 的安装程序放它的地方找（从桌面启动器打开的窗口常常没有 `~/.local/bin`）：先是 `~/.local/bin/codex`（独立安装程序），再是你自己设过的 npm 全局前缀下的 `bin` 目录（`NPM_CONFIG_PREFIX`，或 `~/.npmrc` 里的 `prefix`）；每一个都只在它是你能运行的普通文件、属于你或 root、而且它本身和通往它的每一个目录都不能被其他用户写入时才会用。`EITRI_CODEX` 不是一个现有文件的绝对路径，Eitri 会在启动时停下并点出这个变量；`agent.codex.command` 是带目录部分的相对路径时也一样。其他找不到 `codex` 的情况只让 Codex 标签页的启动失败：哪里都没找到时，消息是 “codex not found in PATH, ~/.local/bin, npm's global bin: install it and run `codex login`, or set EITRI_CODEX”，而 `agent.codex.command` 指向的文件不存在时，消息会点出它的名字。`PATH` 里为空或相对的条目会被跳过，因为 agent 是在你的项目目录里运行的，这样的条目会指向项目自己放的文件。

@@ -8,7 +8,7 @@ the `init.lua` and a short README saying who it is for and what it sets up.
 
 | recipe | for you if | what it sets up |
 |---|---|---|
-| [`tmux`](../../examples/environments/tmux/README.md) | you live in tmux | splits that start in the pane's directory, new terminals below, a workspace of shells, the key list after a pause; your tmux keys come across by themselves |
+| [`tmux`](../../examples/environments/tmux/README.md) | you live in tmux | splits that start in the pane's directory, new terminals below, a workspace of shells, the key list after a pause; your tmux keys come across by themselves ([Coming from tmux](migrate-from-tmux.md) says which) |
 | [`i3`](../../examples/environments/i3/README.md) | you use i3 or sway with Alt as `$mod` | the container keys on `Ctrl+Alt`, everything tiled inside Eitri, tabbed containers, a drop-down terminal |
 | [`markdown-writer`](../../examples/environments/markdown-writer/README.md) | you write in Markdown | the preview beside the editor whenever a Markdown file is current, the chat below |
 | [`many-agents`](../../examples/environments/many-agents/README.md) | several agents work for you at once | the Strips rail, The pass and the table; new chat views to the right of the module with the keys; a card brings its chat back |

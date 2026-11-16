@@ -8,7 +8,7 @@ also run Codex, or any agent you register that speaks the Agent Client Protocol 
 output. This page covers what you need for those two, how to open such a tab, what Eitri asks you before it
 starts one, who answers an agent's requests, and what is weaker or missing compared with a Claude tab.
 
-Eitri runs the agents you installed and signed in to; it ships none of them. The panel, the keys, the queue,
+Eitri runs the agents you installed and set up; it ships none of them. The panel, the keys, the queue,
 [turn review](turn-review.md) and the rest of [Getting started](getting-started.md) work the same in every
 tab. The pages on [permissions](permissions.md) and the [Claude account](configuration.md#accounts) describe
 Claude tabs only, except where this page says otherwise.
@@ -268,7 +268,7 @@ including `runs without asking` and `mode lag`.
 
 ### What you need
 
-- The `codex` command, installed, and signed in with `codex login`. Without a login the tab says "Codex is not
+- The `codex` command, installed and set up (`codex login`). Until it is, the tab says "Codex is not
   signed in: run `codex login` in a terminal".
 - Codex 0.160.0 or newer. Eitri's Codex tests have been run against every release from 0.160.0 to 0.166.0; the tab's `agent` row says so. A newer
   Codex still runs, and the row then reads "untested Codex" with its version and the newest one tried. An older one is
