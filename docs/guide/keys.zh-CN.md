@@ -1,5 +1,5 @@
 [English](keys.md) | 简体中文
-<!-- translated-from: keys.md sha256=7cb4a62130ba706d4b4f0ae497d2f1d60249f87781790b7aba286ce7ae5e0992 -->
+<!-- translated-from: keys.md sha256=c1f3e352b0b59c62852fe46f73afdf74dd999f60b5c5cff35f552b9351f5ce33 -->
 
 # 按键
 
@@ -223,14 +223,20 @@ companion 窗口（见 [Companion 模式](companion.zh-CN.md)）没有自己的�
 
 **选中一个容器。** `<prefix> Alt+a` 选中拿着按键的模块周围的容器，顶栏会这样显示：`selected: column (editor, terminal)`，即容器的种类和它里面显示着的模块的标题。再按一次会再往上一层（最外层是窗口自己的容器），`<prefix> Alt+d` 往下回去。选中一个容器时，用来排布的那些键（`Alt+H`、`Alt+J`、`Alt+K`、`Alt+L`、`Alt+w`、`Alt+s`、`Alt+e`、`z`、`H`、`J`、`K`、`E` 和翻转）作用于整个容器。必须针对单个模块的那些（`x`、隐藏模块、交换和标记）会拒绝，并闪一下 `acts on one module`。把按键交给别的模块、用分割键打开一个模块，以及前缀之后的 `Esc`，都会结束选中。选中的容器周围不画任何东西；顶栏的文字就是全部。
 
-**终端。** 一个窗口里最多可以有九个终端，`terminal` 和 `terminal 2` 到 `terminal 9`，各有各的 shell。新的终端来自 `<prefix> Alt+Enter`，或者按键在终端里时的分割键：`<prefix> %` 或 `"` 再按 `t`，会在那一侧打开一个新的终端，而在别的模块里 `t` 打开的是那唯一的终端。这时前缀的提示读作 `t new terminal`，开着好几个时读作 `t terminal ×3`。单独的 `<prefix> t` 到达拿着按键的那个终端，否则到你最近用过的那个。带 `cwd = "pane"` 的分割绑定会让新的 shell 在你分割的那个终端所在的目录里启动（见[配置](configuration.zh-CN.md#layout-from-lua)）。对编号的终端按 `<prefix> x` 会结束它的 shell 并把它移除，先问通常的 `y/n`；`terminal` 本身只是关闭，会在编辑器下面重新打开。编号终端的 shell 结束（`exit`）时，它不问任何问题就被移除。按键在终端里时，`<prefix> n` / `<prefix> p` 在它处于标签页式或堆叠式容器中时去下一个 / 上一个标签页，否则去屏幕上的下一个 / 上一个终端，只有一个时什么都不做。终端没有调整文字大小的键。`Alt+Enter` 只打开终端；新的聊天视图来自按键在聊天视图里时的分割键再按 `a`，或者 `<prefix> !`（见[聊天视图](#chat-views)）。
+**终端。** 一个窗口里最多可以有九个终端，`terminal` 和 `terminal 2` 到 `terminal 9`，各有各的 shell。新的终端来自 `<prefix> Alt+Enter`，或者按键在终端里时的分割键：`<prefix> %` 或 `"` 再按 `t`，会在那一侧打开一个新的终端，而在别的模块里 `t` 打开的是那唯一的终端。这时前缀的提示读作 `t new terminal`，开着好几个时读作 `t terminal ×3`。单独的 `<prefix> t` 到达拿着按键的那个终端，否则到你最近用过的那个。带 `cwd = "pane"` 的分割绑定会让新的 shell 在你分割的那个终端所在的目录里启动（见[配置](configuration.zh-CN.md#layout-from-lua)）。对编号的终端按 `<prefix> x` 会结束它的 shell 并把它移除，先问通常的 `y/n`；`terminal` 本身只是关闭，会在编辑器下面重新打开。编号终端的 shell 结束（`exit`）时，它不问任何问题就被移除。按键在终端里时，`<prefix> n` / `<prefix> p` 在它处于标签页式或堆叠式容器中时去下一个 / 上一个标签页，否则去屏幕上的下一个 / 上一个终端，只有一个时什么都不做。上面的文字大小键在终端里也有效。`Alt+Enter` 只打开终端；新的聊天视图来自按键在聊天视图里时的分割键再按 `a`，或者 `<prefix> !`（见[聊天视图](#chat-views)）。
+
+**选择和粘贴。** 用鼠标左键拖动选择文字，双击选择一个词，三击选择一行。松开鼠标时，选中的文字同时复制到剪贴板和主选择区（PRIMARY）。`Ctrl+Shift+C` 再复制一次上次完成的选择（没有选择时不做任何事）；`Ctrl+Shift+V` 粘贴剪贴板文字，中键粘贴主选择区。程序请求鼠标事件时，按住 `Shift` 就能在终端本地选择或用中键粘贴。程序请求括号粘贴时，粘贴会带上对应的边界标记。
+
+**复制模式只能滚动。** 按键在终端里时，`<prefix> [` 进入复制模式；`<prefix> PageUp` 进入后还会向上滚动一页。`k` / `Up` 和 `j` / `Down` 滚动一行，`Ctrl+u` / `Ctrl+d` 滚动半屏，`PageUp` / `PageDown` 滚动一屏，`g` 到保留的最早一行，`G` 到实时输出的底部。`q` 或 `Esc` 离开复制模式。这里没有键盘选择或搜索；其他键会被吞掉，不会发给 shell。
+
+**关闭窗口或重启之后。** 终端的 shell 和滚动历史不会保留。保存的布局和工作区可以回来（`window.restore`），但终端打开时启动的是新的 shell。编辑器可以重新打开文件，恢复分割、标签页和光标位置（`editor.restore`，除非交给会话插件处理）；保存的 agent 标签页默认以 `Restore last session` 提供恢复（`agent.restore` 可以改成自动恢复或关闭）。保存的是排布和可恢复的对话，不会让终端进程一直运行。见[快速上手](getting-started.zh-CN.md)。
 
 <a id="chat-views"></a>
 ### 聊天视图
 
 **聊天视图**是 agent 面板的另一个页面，作为一个单独的模块显示，里面只放一个会话标签页。你一开始用的 agent 面板是**基础视图**（`agent`）；其余的是 `agent#2` 到 `agent#9`，一共最多九个（第十个会被拒绝，提示 `at most 9 chat views`）。每个视图都和终端一样是一个模块：它在布局里，可以移动、放大、浮动或隐藏，在每个工作区里都有，并且有自己的芯片（`agent 2`，有卡片等着时读作 `agent 2 ⚑1`）。它们的标签页属于窗口，所以视图被隐藏时标签页照常运行，所有视图用的都是窗口那一个[账号](configuration.zh-CN.md#accounts)。
 
-- **`<prefix> !` 把标签页拆出来。** 按键在基础视图里时，你正在用的标签页移进基础视图右边的一个新视图，并且这个视图拿到按键。基础视图只有一个标签页时它会拒绝（提示 `can't break with only one tab`）：基础视图永远留着一个标签页。按键在额外的视图里时，`!` 做相反的事：这个视图不再显示，它的标签页回到基础视图成为正在用的标签页，按键也回到那里。按键在编辑器或终端里时它会拒绝（提示 `tab.break: the keys are in no chat view`）。你的 `init.lua` 里要 `set` `!` 的话，要像其他默认键一样，在前面放 `k.del("prefix", "!")`（见上面）。
+- **`<prefix> !` 把标签页拆出来。** 按键在基础视图里时，你正在用的标签页移进基础视图右边的一个新视图，并且这个视图拿到按键。基础视图只有一个标签页时它会拒绝（提示 `can't break with only one tab`）：基础视图永远留着一个标签页。按键在额外的视图里时，`!` 做相反的事：这个视图不再显示，它的标签页回到基础视图成为正在用的标签页，按键也回到那里。按键在编辑器或终端里时它会拒绝（提示 `tab.break: the keys are in no chat view`）。你的 `init.lua` 里对 `!` 的 `set` 会替换默认动作，和其他默认键一样（见上面）。
 - **带一个空标签页的新视图。** `eitri.layout.run("instance.new", { kind = "agent" })`、`eitri.layout.open("agent")`，以及按键在聊天视图里时的分割键再按 `a`，都会建出一个新视图，里面是默认 agent 的一个新的空标签页（它的第一条消息要先在那个视图里过一遍通常的[信任问题](permissions.zh-CN.md#trusting-a-project)）。它开在哪里由你的[打开规则](configuration.zh-CN.md#where-a-new-module-opens)决定；默认是在拿着按键的模块右边。
 - **`<prefix> a`** 去你想要的那个聊天：按键在某个聊天视图里时，它隐藏这个视图，和现在隐藏基础视图一样；在别处时，它去有最早一张等待中的卡片的视图，否则去你最近用过的聊天视图，再否则去基础视图。视图默认没有自己的键；`eitri.keymap.set("prefix", "F4", "module.agent#2")` 能给那个视图配一个同样行为的键。
 - **关闭。** 在视图里按 `<prefix> x` 会问 `kill-pane agent 2? closes tab 3 <name> (y/n)`，按 `y` 就关闭那个标签页并移除这个视图。标签页被关掉或并回去之后，没有标签页的视图会自己消失。
@@ -292,7 +298,7 @@ k.set("prefix", "F2", "scratchpad.show", { module = "terminal#2" })   -- F2 上�
 
 **没有键的动作。** `focus.mode-toggle` 把按键交给另一层上你上次用过的模块（从平铺到浮动窗口，或者从浮动窗口到平铺；`Alt+Space` 是 GNOME 的，所以它没有键）。`workspace.new` 用下一个空闲编号建出并进入一份复制，`workspace.switch` 带一个 `name`（`eitri.keymap.set("prefix", "F3", "workspace.switch", { name = "study" })`），没有这个名字的工作区时先建出来。两者都没有默认键；像上面那样绑定即可。
 
-**每个新默认键需要的 `del`。** `F`、`S`、`_`、`W`、`Alt+Shift+Space`、`Alt+-`、`Alt+_`、`(`、`)`、`L`、`s` 和 `$` 现在是默认键，`!`（`tab.break`，tmux 的 `break-pane`）也是，所以已经对其中任何一个调用 `set` 的 `init.lua`，要在那个 `set` 之前放一行 `k.del("prefix", "<key>")`，否则启动会停下（写法是 `eitri.keymap` 接受的那种：`F`、`S`、`_`、`W`、`M-S-Space`、`M--`、`M-_`、`(`、`)`、`L`、`s`、`$`、`!`；`!` 就是 `k.del("prefix", "!")`）。规则和上面“给已经有动作的键再 `set`”一样，tmux 导入也包括在内。
+**新版本增加默认键时。** `F`、`S`、`_`、`W`、`Alt+Shift+Space`、`Alt+-`、`Alt+_`、`(`、`)`、`L`、`s` 和 `$` 是默认键，`!`（`tab.break`，tmux 的 `break-pane`）也是。已经对其中一个键调用 `set` 的 `init.lua` 会保留自己的动作：`set` 替换默认动作，Eitri 记录这次占用，并在启动时提示一次。不需要先 `del`。在 `set` 前先 `del` 仍然有效，而且不会出现这条占用提示。规则就是上面“给已经有动作的键再 `set`”说的；你的调用也会替换从 tmux 导入的绑定。
 
 <a id="the-hint-panel"></a>
 ### 提示面板
@@ -757,6 +763,9 @@ BROWSE 里的 `:`（或任何地方的 `<prefix> :`）在面板底部打开一�
 ## 你的 tmux 键位
 
 如果你用 tmux，Eitri 会从 tmux 自己读的那几个文件（`/etc/tmux.conf`、`~/.tmux.conf`、`$XDG_CONFIG_HOME/tmux/tmux.conf`、`~/.config/tmux/tmux.conf`，以及它们 `source-file` 进来的文件）里读出你的前缀键和前缀表绑定，凡是有对应 Eitri 动作的 tmux 命令都会照搬过来。它只读这些文件，从不启动或询问 tmux。一条提示会说明拿到了什么（每次导入内容有变化时出现一次），`<prefix> ?` 会逐行列出没能拿过来的那些行和原因。Eitri 没有对应物的东西，以及任何需要 tmux 去运行什么的东西，都会被跳过。
+前缀之后的 `v` 绑定会被跳过：Eitri 为一个尚未实现的模块保留了这个键。请把该动作绑定到另一个键。
+
+`new-window` 打开一个新标签页，导入提示会说明一次；tmux 的会话导航映射到 Eitri 工作区。`split-window` 的 `-b`（放在当前窗格之前）和 `-f`（占满窗口）会让该绑定被跳过，并说明原因。`-l` / `-p`（大小）和 `-d`（保留焦点）仍然导入绑定，提示会逐个点出绑定和丢掉的选项。同样的损失也会保留在 `<prefix> ?` 的 “Imported from tmux with changes”（导入时有改动）部分，紧邻 “Skipped from tmux”（从 tmux 跳过的绑定）：每个绑定一行，列出文件和行号、原始 tmux 行以及丢失的效果。在 `init.lua` 中删除或替换的绑定不再显示损失行。`-c '#{pane_current_path}'` 使用窗格所在目录；没有 `-c` 时使用启动目录。其他 `-c` 值也使用启动目录，提示会点出该绑定及其目录回退。
 
 你 tmux 配置里的 `unbind -a` 也会去掉 Eitri 那些类似 tmux 的默认键，但 Eitri 自己的键（HINT、模块键、`?`、面板重新加载、沉浸模式，以及 tmux 里没有对应命令的标签页键）会保留。
 

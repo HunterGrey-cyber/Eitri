@@ -1057,6 +1057,7 @@ export function resolveKey(mode: PanelMode, event: KeyLike, ctx: KeyContext): Pa
 
 /** One line of the keymap: the key as a person types it, and what it does. */
 export type KeyHelp = { keys: string; what: string; motion?: PanelMotionName };
+export type TmuxHelpRow = KeyHelp & { changed?: boolean };
 
 /** The `?` sheet's section for the plugin page that held the keys when `prefix ?` was pressed: the plugin's
  *  title, whether the page has declared its keys, and its effective keys (`eitri_core::plugin::keys::plugin_help`).
@@ -1330,6 +1331,6 @@ export type KeymapHelp = {
   prefixKeys: KeyHelp[];
   panel: PanelTable;
   newTabChord: string;
-  /** The lines of the user's tmux config the import skipped, for the overlay's last section. */
-  tmuxSkipped?: KeyHelp[];
+  /** Skipped lines and imported bindings with losses, grouped by `changed` in the overlay. */
+  tmuxSkipped?: TmuxHelpRow[];
 };

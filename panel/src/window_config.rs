@@ -44,7 +44,7 @@ pub struct WindowConfig {
     /// The automatic prefix-key moves this window applied, if the startup probe had answered in time.
     pub alt_mod: Option<eitri_core::keymap::alt_mod::Applied>,
     pub tmux_import: Option<eitri_core::keymap::TmuxImport>,
-    pub tmux_skipped: Vec<eitri_core::keymap::HelpRow>,
+    pub tmux_skipped: Vec<eitri_core::keymap::tmux::notice::ImportHelpRow>,
     /// `keymap.which_key_delay`: how long the prefix waits for a key before the hint panel shows; `None` (the
     /// default) never shows it.
     pub which_key_delay: Option<std::time::Duration>,
@@ -325,7 +325,7 @@ fn read_with_alt_mod(
         "{}",
         eitri_core::keymap::tmux::notice::log_line(tmux_import.as_ref(), home_dir.as_deref())
     );
-    let tmux_skipped: Vec<eitri_core::keymap::HelpRow> = tmux_import
+    let tmux_skipped: Vec<eitri_core::keymap::tmux::notice::ImportHelpRow> = tmux_import
         .as_ref()
         .map(|import| eitri_core::keymap::tmux::notice::skipped_rows(import, home_dir.as_deref()))
         .unwrap_or_default();

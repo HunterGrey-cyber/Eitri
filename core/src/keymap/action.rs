@@ -1121,9 +1121,7 @@ impl Action {
     /// `module_keys` the module keys a split key takes (`e / a / t`).
     pub fn describe(&self, prefix: &str, module_keys: &str) -> String {
         match self {
-            Action::TabBreak => {
-                "Break this session tab out into a chat view of its own; in that view, join it back".into()
-            }
+            Action::TabBreak => "Break this tab out into a chat view of its own; in that view, join it back".into(),
             Action::WindowNew => "Open this project's second window, or raise it".into(),
             Action::WindowOther => "Give the keys to the other window".into(),
             Action::MoveToWindow { module: None, .. } => "Move this module to the other window".into(),
@@ -1230,14 +1228,14 @@ impl Action {
                 ),
             },
             Action::Tab(tab) => match tab {
-                TabAction::New => "New session tab",
-                TabAction::Next => "Next session tab",
-                TabAction::Prev => "Previous session tab",
-                TabAction::Last => "The session tab you were on last",
-                TabAction::Select(_) => "Select that session tab",
-                TabAction::Rename => "Rename this session tab",
-                TabAction::Close => "Close this session tab, after y/n",
-                TabAction::CloseOthers => "Close every other session tab, after y/n",
+                TabAction::New => "New tab",
+                TabAction::Next => "Next tab",
+                TabAction::Prev => "Previous tab",
+                TabAction::Last => "The tab you were on last",
+                TabAction::Select(_) => "Select that tab",
+                TabAction::Rename => "Rename this tab",
+                TabAction::Close => "Close this tab, after y/n",
+                TabAction::CloseOthers => "Close every other tab, after y/n",
                 TabAction::Choose => "Choose a session: open tabs, then ones to resume",
                 TabAction::Info => "This session's details",
             }
@@ -1810,7 +1808,7 @@ mod tests {
         assert_eq!(Action::TabBreak.on_a_float(), FloatRule::Acts);
         assert_eq!(
             Action::TabBreak.describe("Ctrl+b", "e / a / t"),
-            "Break this session tab out into a chat view of its own; in that view, join it back"
+            "Break this tab out into a chat view of its own; in that view, join it back"
         );
         let err = parse("tab.break", &[("n".into(), OptValue::Int(2))], &[])
             .unwrap_err()

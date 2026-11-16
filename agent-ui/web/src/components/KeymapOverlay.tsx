@@ -1,7 +1,7 @@
 import { forwardRef, useLayoutEffect, useRef } from "react";
 import type { Ref } from "react";
 import { isPanelCommand, browseKeys, CARD_KEYS, CARET_KEYS, INPUT_KEYS, PLAN_KEYS, QUESTION_KEYS, REVIEW_KEYS, TASKS_KEYS, VISUAL_KEYS } from "../keymap";
-import type { KeyHelp, PanelBinding, PanelTable, PluginKeysHelp } from "../keymap";
+import type { KeyHelp, PanelBinding, PanelTable, PluginKeysHelp, TmuxHelpRow } from "../keymap";
 import { sequenceTitle } from "../leader";
 import { listedSlashCommands } from "../slashCommands";
 import type { PageLine, PermissionModeChoice } from "../types";
@@ -24,9 +24,9 @@ type Props = {
   /** The panel's own which-key table, for the "Leader and tab
    *  keys" section -- the same table the leader engine (`../leader`) and `resolveKey` read. */
   panel: PanelTable;
-  /** The lines of the user's tmux config the import did not take (`shell`'s `keymap` envelope,
-   *  `tmuxSkipped`): where each is, what it says and why. No section when there are none. */
-  tmuxSkipped?: KeyHelp[];
+  /** Import skips and losses: where each is, what was written and why it differs.
+   *  `changed` rows imported with losses; the others were skipped. Empty sections stay hidden. */
+  tmuxSkipped?: TmuxHelpRow[];
   /** A companion window (`App.tsx`: the editor link is set): its prefix section lists only the tab and
    *  panel keys, and says why the layout keys are missing. */
   companion?: boolean;
@@ -440,11 +440,17 @@ export const KeymapOverlay = forwardRef<HTMLDivElement, Props>(function KeymapOv
         rows={prefixKeys}
         note={companion ? "A companion window has no layout keys: your window manager arranges windows." : undefined}
       />
-      {tmuxSkipped !== undefined && tmuxSkipped.length > 0 && (
+      {tmuxSkipped?.some((row) => !row.changed) && (
         <Section
           title="Skipped from tmux"
-          rows={tmuxSkipped}
+          rows={tmuxSkipped.filter((row) => !row.changed)}
           note={'The rows marked (tmux) above came from your tmux config; these lines did not. keymap.from_tmux = "off" in init.lua turns the import off.'}
+        />
+      )}
+      {tmuxSkipped?.some((row) => row.changed) && (
+        <Section
+          title="Imported from tmux with changes"
+          rows={tmuxSkipped.filter((row) => row.changed)}
         />
       )}
     </div>

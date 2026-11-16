@@ -26,6 +26,7 @@ describe("TabBar", () => {
   it("is one nav stop of tab buttons, labels and markers, the active one selected", () => {
     const { container } = renderBar();
     const bar = container.querySelector('[data-nav-stop="tabs"]')!;
+    expect(bar.getAttribute("aria-label")).toBe("Tabs");
     const buttons = bar.querySelectorAll<HTMLButtonElement>('[role="tab"]');
     expect(Array.from(buttons).map((b) => b.textContent)).toEqual(["1 fix-parser ⚑", "2 docs •", "3 new ✕"]);
     expect(buttons[1].getAttribute("aria-selected")).toBe("true");

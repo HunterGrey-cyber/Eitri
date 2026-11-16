@@ -426,6 +426,27 @@ describe("KeymapOverlay: the lines of the user's tmux config the import skipped"
     }
   });
 
+  it("lists imported losses beside skipped lines, including when no binding was skipped", () => {
+    const changed = [{ keys: "~/.tmux.conf:3", what: "bind y split-window -l 30% — size -l 30% is not preserved", changed: true }];
+    for (const skipped of [SKIPPED, []]) {
+      const { container } = render(
+        <KeymapOverlay onClose={() => {}} windowKeys={WINDOW} prefixKeys={PREFIX}
+          prefixLabel="Ctrl+a" panel={EMPTY_PANEL_TABLE} tmuxSkipped={[...skipped, ...changed]} />,
+      );
+      const section = sectionTitled(container, "Imported from tmux with changes");
+      expect(section).toBeDefined();
+      expect(section.textContent).toContain(changed[0].keys);
+      expect(section.textContent).toContain(changed[0].what);
+      const skippedSection = sectionTitled(container, "Skipped from tmux");
+      if (skipped.length > 0) {
+        expect(skippedSection.textContent).not.toContain(changed[0].what);
+      } else {
+        expect(skippedSection).toBeUndefined();
+      }
+      cleanup();
+    }
+  });
+
   it("draws no such section when nothing was skipped or the import is off", () => {
     for (const tmuxSkipped of [[], undefined]) {
       const { container } = render(
@@ -439,6 +460,7 @@ describe("KeymapOverlay: the lines of the user's tmux config the import skipped"
         />,
       );
       expect(sectionTitled(container, "Skipped from tmux")).toBeUndefined();
+      expect(sectionTitled(container, "Imported from tmux with changes")).toBeUndefined();
       cleanup();
     }
   });
@@ -467,7 +489,7 @@ describe("KeymapOverlay: the PageUp row follows the configured prefix", () => {
 describe("KeymapOverlay: a companion window", () => {
   const NOTE = "A companion window has no layout keys: your window manager arranges windows.";
   const COMPANION_ROOT: KeyHelp[] = [{ keys: "Ctrl+h / Ctrl+l", what: "leave the panel (your window manager moves focus)" }];
-  const COMPANION_PREFIX: KeyHelp[] = [{ keys: "Ctrl+b c", what: "New session tab" }];
+  const COMPANION_PREFIX: KeyHelp[] = [{ keys: "Ctrl+b c", what: "New tab" }];
 
   it("companion note shown and module rows absent", () => {
     const { container } = render(
@@ -482,7 +504,7 @@ describe("KeymapOverlay: a companion window", () => {
     );
     const prefix = sectionTitled(container, "After Ctrl+b");
     expect(prefix.querySelector("p")!.textContent).toBe(NOTE);
-    expect(prefix.textContent).toContain("New session tab");
+    expect(prefix.textContent).toContain("New tab");
     // Only what the shell sent is listed: no module, split or layout row is added here.
     expect(prefix.textContent).not.toContain("module");
     expect(sectionTitled(container, "Anywhere in the window").textContent).toContain("leave the panel");

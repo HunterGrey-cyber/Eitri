@@ -1,5 +1,5 @@
 //! Telling the user the import happened: a one-time toast, a line on stderr every launch, and the
-//! skipped lines for the `?` overlay.
+//! skipped lines and binding losses for the `?` overlay.
 //!
 //! The toast is shown once, the first time the import changes anything, and again only when what it
 //! imports changes: its fingerprint -- a SHA-256 over the result, not over the files, so a comment
@@ -11,7 +11,13 @@ use std::path::{Path, PathBuf};
 
 use sha2::{Digest, Sha256};
 
-use crate::keymap::{Action, HelpRow, Keymap, OptValue, TmuxImport};
+use crate::keymap::{Action, Keymap, OptValue, TabAction, TmuxImport};
+
+const NEW_WINDOW_NOTICE: &str = "new-window opens a new tab";
+
+fn has_new_window(import: &TmuxImport) -> bool {
+    import.bindings.iter().any(|b| b.action == Action::Tab(TabAction::New))
+}
 
 /// The file the last notice's fingerprint is kept in, from `XDG_STATE_HOME`/`HOME` by the same rule
 /// as every other state file of Eitri's (`crate::state_paths::state_subdir`).
@@ -36,7 +42,7 @@ fn signature(action: &Action) -> String {
 }
 
 /// SHA-256, hex, over the import's result: its prefix, its bindings as sorted `(key, action with
-/// its options, repeatable)`, and the keys it unbound, sorted.
+/// its options, repeatable)`, the keys it unbound and the binding losses it reports, sorted.
 pub fn fingerprint(import: &TmuxImport) -> String {
     let mut text = format!("prefix {}\n", import.prefix.map(|p| p.to_string()).unwrap_or_default());
     let mut bindings: Vec<String> = import
@@ -49,6 +55,18 @@ pub fn fingerprint(import: &TmuxImport) -> String {
     removed.sort();
     for line in bindings.iter().chain(&removed) {
         text.push_str(line);
+    }
+    let mut notices: Vec<String> = import
+        .notices
+        .iter()
+        .map(|note| format!("notice {}\t{}\n", note.key, note.text))
+        .collect();
+    notices.sort();
+    for line in notices {
+        text.push_str(&line);
+    }
+    if has_new_window(import) {
+        text.push_str(NEW_WINDOW_NOTICE);
     }
     Sha256::digest(text.as_bytes())
         .iter()
@@ -118,9 +136,10 @@ fn plural(n: usize, one: &str) -> String {
 }
 
 /// The toast, one line: where the keys came from, the prefix and how many keys came across, how
-/// to see them and how to turn the import off. `None` when the import changes nothing.
+/// to see them and how to turn the import off, with binding losses and the new-window mapping.
+/// `None` when there are neither changed keys nor command differences to announce.
 pub fn toast_text(import: &TmuxImport, keymap: &Keymap, home: Option<&Path>) -> Option<String> {
-    if !import.changes_anything() {
+    if !import.changes_anything() && import.notices.is_empty() && !has_new_window(import) {
         return None;
     }
     let prefix = keymap.prefix().human();
@@ -132,6 +151,12 @@ pub fn toast_text(import: &TmuxImport, keymap: &Keymap, home: Option<&Path>) -> 
     );
     if let Some(key) = keymap.keys_for(&Action::PanelKeymap).first() {
         text.push_str(&format!(" {prefix} {} lists them;", key.human()));
+    }
+    for note in &import.notices {
+        text.push_str(&format!(" prefix {}: {}.", note.key.human(), note.text));
+    }
+    if has_new_window(import) {
+        text.push_str(&format!(" {NEW_WINDOW_NOTICE}."));
     }
     text.push_str(&format!(" {} = \"off\" turns this off.", super::SETTING));
     Some(text)
@@ -156,24 +181,44 @@ pub fn log_line(import: Option<&TmuxImport>, home: Option<&Path>) -> String {
     }
 }
 
-/// The `?` overlay's "Skipped from tmux" rows: `<file>:<line>` and what was written, with why.
-pub fn skipped_rows(import: &TmuxImport, home: Option<&Path>) -> Vec<HelpRow> {
-    import
+/// A tmux import row for the `?` overlay. Changed bindings and skipped lines get separate sections.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ImportHelpRow {
+    pub keys: String,
+    pub what: String,
+    pub changed: bool,
+}
+
+/// The import exceptions in the help model: skipped statements, then one row per binding with losses.
+/// Each row gives `<file>:<line>`, the statement as written and the same loss text as the toast.
+pub fn skipped_rows(import: &TmuxImport, home: Option<&Path>) -> Vec<ImportHelpRow> {
+    let row = |origin: &super::Origin, reason: String, changed| {
+        let file = tilde(&origin.file, home);
+        let keys = if origin.line == 0 {
+            file
+        } else {
+            format!("{file}:{}", origin.line)
+        };
+        let what = if origin.text.is_empty() {
+            reason
+        } else {
+            format!("{} — {reason}", origin.text)
+        };
+        ImportHelpRow { keys, what, changed }
+    };
+    let mut rows: Vec<_> = import
         .skipped
         .iter()
-        .map(|s| {
-            let file = tilde(&s.origin.file, home);
-            let keys = if s.origin.line == 0 {
-                file
-            } else {
-                format!("{file}:{}", s.origin.line)
-            };
-            let what = if s.origin.text.is_empty() {
-                s.reason.clone()
-            } else {
-                format!("{} \u{2014} {}", s.origin.text, s.reason)
-            };
-            HelpRow { keys, what }
-        })
-        .collect()
+        .map(|s| row(&s.origin, s.reason.clone(), false))
+        .collect();
+    // Each binding's losses stay adjacent: a rebind removes the old group before appending its own.
+    for losses in import.notices.chunk_by(|a, b| a.key == b.key) {
+        let reason = losses
+            .iter()
+            .map(|note| note.text.as_str())
+            .collect::<Vec<_>>()
+            .join("; ");
+        rows.push(row(&losses[0].origin, reason, true));
+    }
+    rows
 }

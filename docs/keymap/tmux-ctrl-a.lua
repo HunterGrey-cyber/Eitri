@@ -5,8 +5,8 @@
 -- place with the import on, it still applies cleanly on top of it and changes nothing.
 -- `m`, `q`, `H`, `J`, `K` and `L` are Eitri defaults from this version on (mark, select by number,
 -- the far-edge moves and the last workspace), so each is deleted before it is set below.
--- A `del` of a key that is not bound stops startup, so those lines need this version or later,
--- or the tmux import on with these keys bound in tmux.
+-- At startup a `del` of an unbound key is left out and reported; the remaining calls still apply.
+-- A `set` can replace a default directly; deleting it first avoids the default-takeover notice.
 -- The split cwd option needs this version or later.
 local k = eitri.keymap
 k.prefix("C-a")                                             -- base.conf:11

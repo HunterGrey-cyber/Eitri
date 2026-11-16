@@ -440,9 +440,10 @@ The record is plain text: the version, the build, the kernel, the thread, where 
 the last lines the window printed. It holds no prompt, conversation or tool output, and a crash's own message is
 left out when it could quote one. Paths are there, with your home shown as `~`, so read it before you attach it.
 
-A window started from the desktop, or from the project list, keeps what it prints in `main-<16 hex>.log` in the
-same directory, one name per project; at 2 MiB the file moves to `.log.1`, and so does the last run's when a new one
-starts. A window started from a terminal prints to that terminal instead, and keeps no log. When the disk is full the lines are dropped and the window goes on.
+A window started from the desktop, from the project list, or normally from a terminal keeps what it prints in
+`main-<16 hex>.log` in the same directory, one name per project; at 2 MiB the file moves to `.log.1`, and so does
+the last run's when a new one starts. Only `eitri --no-fork` keeps the window in the foreground, printing to that terminal instead of keeping a
+window log. When the disk is full the lines are dropped and the window goes on.
 `EITRI_WINDOW_LOG=off` turns the log and the records off.
 
 A crash inside a native library (GTK, WebKit, a graphics driver) writes no record. What the window printed up to

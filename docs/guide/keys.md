@@ -322,8 +322,26 @@ on its own reaches the terminal that has the keys, or else the one you used last
 it, after the usual `y/n`; the `terminal` itself is only closed and reopens below the editor. A numbered terminal
 whose shell ends (`exit`) is removed with no question. `<prefix> n` / `<prefix> p` with the keys in a terminal go to
 the next / the previous tab when it is in a tabbed or stacked container, otherwise to the next / the previous
-terminal on screen, and do nothing with only one. Terminals have no text-size keys. `Alt+Enter` opens terminals only; a new chat view
+terminal on screen, and do nothing with only one. The text-size keys above work here too. `Alt+Enter` opens terminals only; a new chat view
 comes from a split key then `a` with the keys in a chat view, or from `<prefix> !` (see [Chat views](#chat-views)).
+
+**Selection and paste.** Drag with the left mouse button to select text, double-click a word, or triple-click a
+line. Releasing the selection copies it to both the clipboard and the primary selection. `Ctrl+Shift+C` copies the
+last finished selection again (with none, it does nothing); `Ctrl+Shift+V` pastes clipboard text, and middle-click
+pastes the primary selection. When a program requests mouse events, hold `Shift` to select or middle-click paste
+locally instead. Paste uses bracketed paste when the program requests it.
+
+**Copy mode scrolls only.** With the keys in a terminal, `<prefix> [` enters copy mode; `<prefix> PageUp` enters
+and scrolls up one page. `k` / `Up` and `j` / `Down` scroll one line, `Ctrl+u` / `Ctrl+d` half a screen,
+`PageUp` / `PageDown` a whole screen, `g` the oldest retained line, and `G` the live bottom. `q` or `Esc` leaves
+copy mode. It has no keyboard selection or search; other keys are swallowed rather than sent to the shell.
+
+**After closing the window or restarting.** A terminal's shell and scrollback do not survive.
+The saved layout and workspaces can come back (`window.restore`), but a terminal starts a fresh shell when opened.
+The editor can reopen files with their splits, tab pages and cursor positions (`editor.restore`, unless a session
+plugin handles it), and saved agent tabs are offered as `Restore last session` by default (`agent.restore` can
+restore them automatically or turn this off). These are saved arrangements and resumable conversations;
+they do not keep terminal processes running. See [Getting started](getting-started.md).
 
 ### Chat views
 
@@ -338,8 +356,8 @@ hidden, and every view spends the window's one [account](configuration.md#accoun
   right of the base view, and the view takes the keys. With only one tab in the base view it refuses (the toast reads
   `can't break with only one tab`): the base view always keeps a tab. With the keys in an extra view, `!` does the
   opposite: the view is shown no more, its tab returns to the base view as the tab you are on, and the keys go there.
-  With the keys in the editor or a terminal it refuses (the toast reads `tab.break: the keys are in no chat view`). A `set` of `!` in your `init.lua` needs
-  `k.del("prefix", "!")` before it, as for any default key (above).
+  With the keys in the editor or a terminal it refuses (the toast reads `tab.break: the keys are in no chat view`).
+  A `set` of `!` in your `init.lua` replaces the default, as for any default key (above).
 - **A new view with an empty tab.** `eitri.layout.run("instance.new", { kind = "agent" })`, `eitri.layout.open("agent")`
   and a split key then `a` with the keys in a chat view each make a new view holding a new, empty tab of the default
   agent (its first message goes through the usual [trust question](permissions.md#trusting-a-project) in that view).
@@ -437,11 +455,11 @@ from a tile, a tile from a float; `Alt+Space` is GNOME's, so it has no key). `wo
 free number, and `workspace.switch` takes a `name` (`eitri.keymap.set("prefix", "F3", "workspace.switch", { name =
 "study" })`), making the workspace first when none has that name. Neither has a key; bind them as above.
 
-**The `del` each new default needs.** `F`, `S`, `_`, `W`, `Alt+Shift+Space`, `Alt+-`, `Alt+_`, `(`, `)`, `L`, `s` and `$` are
-defaults now, and so is `!` (`tab.break`, tmux's `break-pane`), so an `init.lua` that already sets any of them stops at
-startup until it puts `k.del("prefix", "<key>")` before that `set` (the spelling is the one `eitri.keymap` takes:
-`F`, `S`, `_`, `W`, `M-S-Space`, `M--`, `M-_`, `(`, `)`, `L`, `s`, `$`, `!`; for `!` that is `k.del("prefix", "!")`). The rule is the one under "Setting a key that already has an action" above,
-tmux import included.
+**When a release adds a default.** `F`, `S`, `_`, `W`, `Alt+Shift+Space`, `Alt+-`, `Alt+_`, `(`, `)`, `L`, `s` and `$` are
+defaults, as is `!` (`tab.break`, tmux's `break-pane`). An `init.lua` that already sets one of these keys keeps its
+action: the `set` replaces the default, and Eitri records the takeover and says so once at startup. No `del` is
+required. A `del` before the `set` still works and avoids that notice. This is the rule under "Setting a key that
+already has an action" above; your calls also replace tmux imports.
 
 ### The hint panel
 
@@ -1146,6 +1164,15 @@ reads (`/etc/tmux.conf`, `~/.tmux.conf`, `$XDG_CONFIG_HOME/tmux/tmux.conf`,
 command. It only reads them; it never starts or asks tmux. A notice says what was taken (it appears
 once for each change to what is imported), and `<prefix> ?` lists each line that was not, with the reason.
 Things Eitri has no equivalent of, and anything that would need tmux to run something, are skipped.
+A binding on `v` after the prefix is skipped: Eitri keeps it free for a future module. Bind it to another key.
+
+`new-window` opens a new tab, and the import notice says so once; tmux session navigation maps to Eitri
+workspaces. For `split-window`, `-b` (before this pane) and `-f` (full window) skip the binding with a reason.
+`-l` / `-p` (size) and `-d` (keep focus) still import the binding, and the notice names each binding and the options
+it lost. The same losses stay in `<prefix> ?` under "Imported from tmux with changes", beside "Skipped from tmux":
+one row per binding, with file and line, the tmux line and what it lost. A binding deleted or replaced in `init.lua`
+has no loss row. `-c '#{pane_current_path}'` uses the pane's directory; without `-c` the split uses the start directory.
+Any other `-c` also uses the start directory, and the notice names that binding and its directory fallback.
 
 An `unbind -a` in your tmux configuration removes Eitri's tmux-like defaults too, but Eitri's own keys (HINT,
 the module keys, `?`, the panel reload, immersive and the tab keys tmux has no command for) stay.

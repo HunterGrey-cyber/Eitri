@@ -31,7 +31,7 @@ export function TabBar({ tabs, active, renaming, focusRequest, onSelect, onRenam
     activeRef.current?.scrollIntoView({ block: "nearest", inline: "nearest" });
   }, [active, tabs.length]);
   return (
-    <div className="tab-bar" data-nav-stop="tabs" role="tablist" aria-label="Session tabs">
+    <div className="tab-bar" data-nav-stop="tabs" role="tablist" aria-label="Tabs">
       {tabs.map((tab) => {
         const isActive = tab.id === active;
         const classes = ["tab", isActive ? "tab-active" : "", tab.marker === "ended" ? "tab-ended" : ""].filter(Boolean).join(" ");

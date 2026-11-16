@@ -97,6 +97,188 @@ impl Imported {
 // --- What maps to what: one test per row of the mapping. -------------------------------------
 
 #[test]
+fn split_before_is_skipped_with_its_placement_reason() {
+    let got = import("bind g split-window -hb\n");
+    assert_eq!(got.bound("g"), None);
+    let reason = got.only_reason();
+    assert!(reason.contains("-b") && reason.contains("before"), "{reason}");
+}
+
+#[test]
+fn split_full_window_is_skipped_with_its_reason() {
+    let got = import("bind g split-window -f\n");
+    assert_eq!(got.bound("g"), None);
+    let reason = got.only_reason();
+    assert!(reason.contains("-f") && reason.contains("full"), "{reason}");
+}
+
+fn split_notice(conf: &str, key: &str) -> String {
+    let got = import(conf);
+    assert!(matches!(got.bound(key), Some((Action::Split { .. }, false))));
+    assert!(got.import.skipped.is_empty(), "{:?}", got.import.skipped);
+    notice::toast_text(&got.import, &got.map, Some(&got.home)).expect("the import needs a notice")
+}
+
+#[test]
+fn split_length_is_imported_and_its_lost_size_is_in_the_notice() {
+    let text = split_notice("bind g split-window -l 30%\nbind G split-window -l 12\n", "g");
+    for expected in ["prefix g", "-l 30%", "prefix G", "-l 12", "size"] {
+        assert!(text.contains(expected), "{expected}: {text}");
+    }
+}
+
+#[test]
+fn split_percentage_is_imported_and_its_lost_size_is_in_the_notice() {
+    let text = split_notice("bind g split-window -p 30\n", "g");
+    assert!(
+        text.contains("prefix g") && text.contains("-p 30") && text.contains("size"),
+        "{text}"
+    );
+}
+
+#[test]
+fn split_detached_is_imported_and_its_focus_change_is_in_the_notice() {
+    let text = split_notice("bind g split-window -d\n", "g");
+    assert!(
+        text.contains("prefix g") && text.contains("-d") && text.contains("focus"),
+        "{text}"
+    );
+}
+
+#[test]
+fn split_other_directory_is_imported_and_its_fallback_is_in_the_notice() {
+    let got = import("bind g split-window -c ~\n");
+    assert_eq!(
+        got.bound("g"),
+        Some((
+            Action::Split {
+                axis: Axis::Column,
+                cwd: crate::keymap::action::SplitCwd::Start,
+            },
+            false,
+        ))
+    );
+    let text = split_notice("bind g split-window -c ~\n", "g");
+    assert!(
+        text.contains("prefix g") && text.contains("-c ") && text.contains("start directory"),
+        "{text}"
+    );
+}
+
+#[test]
+fn new_window_notice_and_help_use_the_guides_word_tab_even_on_the_default_key() {
+    for conf in ["bind c new-window\n", "bind g neww\nbind G new-window\n"] {
+        let got = import(conf);
+        assert!(got
+            .import
+            .bindings
+            .iter()
+            .all(|b| b.action == Action::Tab(TabAction::New)));
+        let text = notice::toast_text(&got.import, &got.map, Some(&got.home)).expect("explain the imported command");
+        assert_eq!(text.matches("new-window opens a new tab").count(), 1, "{text}");
+        let rows = got.map.help(&crate::layout::ModuleKeys::built_in());
+        let key = if conf.starts_with("bind c") {
+            "Ctrl+b c"
+        } else {
+            "Ctrl+b g"
+        };
+        assert!(
+            rows.iter()
+                .any(|row| row.keys.contains(key) && row.what == "New tab (tmux)"),
+            "{rows:?}"
+        );
+    }
+}
+
+#[test]
+fn a_changed_split_loss_renews_the_notice_even_when_the_action_is_unchanged() {
+    let plain = import("bind g split-window\n");
+    let sized = import("bind g split-window -l 30%\n");
+    let resized = import("bind g split-window -l 40%\n");
+    assert_ne!(notice::fingerprint(&plain.import), notice::fingerprint(&sized.import));
+    assert_ne!(notice::fingerprint(&sized.import), notice::fingerprint(&resized.import));
+    let rebound = import("bind g split-window -l 30%\nbind g split-window\n");
+    assert_eq!(notice::fingerprint(&plain.import), notice::fingerprint(&rebound.import));
+    assert!(notice::skipped_rows(&rebound.import, None).is_empty());
+    for conf in [
+        "bind g split-window -l 30%\nunbind g\n",
+        "bind g split-window -l 30%\nunbind -a\n",
+    ] {
+        let got = import(conf);
+        let text = notice::toast_text(&got.import, &got.map, Some(&got.home)).unwrap();
+        assert!(!text.contains("-l 30%"), "{text}");
+        assert!(notice::skipped_rows(&got.import, None).is_empty());
+    }
+}
+
+fn assert_split_loss_in_help(option: &str) {
+    let line = format!("bind y split-window -v {option}");
+    let got = import(&format!("# imported keys\n{line}\n"));
+    let rows = notice::skipped_rows(&got.import, Some(&got.home));
+    assert_eq!(rows.len(), 1, "{option}: {rows:?}");
+    assert_eq!(rows[0].keys, "~/.tmux.conf:2");
+    assert!(rows[0].changed);
+    let loss = rows[0]
+        .what
+        .strip_prefix(&format!("{line} — "))
+        .expect("the original tmux line");
+    assert!(!loss.is_empty());
+    let toast = notice::toast_text(&got.import, &got.map, Some(&got.home)).unwrap();
+    assert!(toast.contains(&format!("prefix y: {loss}.")), "{toast}");
+}
+
+#[test]
+fn split_length_loss_is_in_help() {
+    assert_split_loss_in_help("-l 30%");
+}
+
+#[test]
+fn split_percentage_loss_is_in_help() {
+    assert_split_loss_in_help("-p 30");
+}
+
+#[test]
+fn split_focus_loss_is_in_help() {
+    assert_split_loss_in_help("-d");
+}
+
+#[test]
+fn split_directory_loss_is_in_help() {
+    assert_split_loss_in_help("-c ~");
+}
+
+#[test]
+fn help_groups_all_losses_for_one_binding_in_one_row() {
+    let line = "bind y split-window -l 30% -p 30 -d -c ~";
+    let got = import(&format!("{line}\n"));
+    let rows = notice::skipped_rows(&got.import, Some(&got.home));
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(rows[0].keys, "~/.tmux.conf:1");
+    assert!(rows[0].what.starts_with(&format!("{line} — ")));
+    for expected in ["-l 30%", "-p 30", "-d", "start directory"] {
+        assert!(rows[0].what.contains(expected), "{rows:?}");
+    }
+}
+
+#[test]
+fn help_losses_keep_the_source_of_the_last_binding_in_an_included_file() {
+    let home = ScratchDir::new("eitri-tmux", "help-source");
+    write(
+        &home.join(".tmux.conf"),
+        "bind y split-window -l 30%\nsource-file ~/keys.conf\n",
+    );
+    let line = "bind y split-window -d";
+    write(&home.join("keys.conf"), &format!("# overrides\n{line}\n"));
+    let (_, import) = Keymap::with_tmux(&read(&env_for(&home)), &LuaClaims::default());
+    let rows = notice::skipped_rows(&import, Some(&home));
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(rows[0].keys, "~/keys.conf:2");
+    assert!(rows[0].changed);
+    assert!(rows[0].what.starts_with(&format!("{line} — ")), "{rows:?}");
+    assert!(!rows[0].what.contains("30%"));
+}
+
+#[test]
 fn set_g_prefix_sets_the_prefix() {
     let got = import("set -g prefix C-a\n");
     assert_eq!(got.map.prefix(), &k("C-a"));
@@ -248,7 +430,7 @@ fn split_window() {
             false
         ))
     );
-    let got = import("bind | split-window -h -b -d -f -l 30% -p 20\n");
+    let got = import("bind | split-window -h -d -l 30% -p 20\n");
     assert_eq!(
         got.bound("|"),
         Some((
@@ -741,9 +923,12 @@ fn a_bad_prefix_keeps_the_last_good_one_and_the_bindings_still_come() {
 }
 
 #[test]
-fn the_canvas_key_is_never_imported() {
+fn the_reserved_v_key_explains_how_to_import_the_binding() {
     let got = import("bind v copy-mode\n");
-    assert!(got.only_reason().contains("reserved for the canvas"));
+    assert_eq!(
+        got.only_reason(),
+        "v after the prefix is kept free for a future module; bind this to another key"
+    );
     assert_eq!(got.bound("v"), None);
 }
 
@@ -822,6 +1007,87 @@ fn del(key: &str) -> KeymapOp {
     }
 }
 
+fn assert_startup_drops_replaced_import_notice(command: &str, ops: &[KeymapOp]) {
+    let kept = "bind G split-window -d\n";
+    let expected = import(kept);
+    let home = ScratchDir::new("eitri-tmux", "startup-notices");
+    write(&home.join(".tmux.conf"), &format!("bind g {command}\n{kept}"));
+    for settled in [false, true] {
+        let env = || env_for(&home);
+        let claims = LuaClaims::default();
+        let (map, import) = if settled {
+            let startup = Keymap::for_startup_settled(ops, &[], &[], None, env, &claims);
+            assert!(startup.problems.is_empty(), "{:?}", startup.problems);
+            (startup.keymap, startup.import)
+        } else {
+            Keymap::for_startup(ops, &[], None, env, &claims).unwrap()
+        };
+        let import = import.unwrap();
+        assert_eq!(
+            notice::toast_text(&import, &map, Some(&home)),
+            notice::toast_text(&expected.import, &expected.map, Some(&expected.home)),
+            "{command}, {ops:?}, settled={settled}"
+        );
+        let rows = notice::skipped_rows(&import, Some(&home));
+        assert_eq!(rows.len(), 1, "only the untouched binding keeps a loss row: {rows:?}");
+        assert_eq!(rows[0].keys, "~/.tmux.conf:2");
+        assert!(rows[0].what.starts_with("bind G split-window -d — "), "{rows:?}");
+        assert_eq!(
+            import
+                .notices
+                .iter()
+                .map(|note| (note.key, &note.text))
+                .collect::<Vec<_>>(),
+            expected
+                .import
+                .notices
+                .iter()
+                .map(|note| (note.key, &note.text))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(import.bindings, expected.import.bindings);
+        assert_eq!(notice::fingerprint(&import), notice::fingerprint(&expected.import));
+    }
+}
+
+#[test]
+fn startup_drops_split_notices_when_init_lua_deletes_the_binding() {
+    for command in [
+        "split-window -d",
+        "split-window -l 30%",
+        "split-window -p 30",
+        "split-window -c ~",
+    ] {
+        assert_startup_drops_replaced_import_notice(command, &[del("g")]);
+    }
+}
+
+#[test]
+fn startup_drops_split_notices_when_init_lua_replaces_the_binding() {
+    for action in ["module.terminal", "split.below"] {
+        for command in [
+            "split-window -d",
+            "split-window -l 30%",
+            "split-window -p 30",
+            "split-window -c ~",
+        ] {
+            assert_startup_drops_replaced_import_notice(command, &[set("g", action)]);
+        }
+    }
+}
+
+#[test]
+fn startup_drops_new_window_notice_when_init_lua_deletes_the_binding() {
+    assert_startup_drops_replaced_import_notice("new-window", &[del("g")]);
+}
+
+#[test]
+fn startup_drops_new_window_notice_when_init_lua_replaces_the_binding() {
+    for action in ["module.terminal", "tab.new"] {
+        assert_startup_drops_replaced_import_notice("new-window", &[set("g", action)]);
+    }
+}
+
 #[test]
 fn init_lua_overwrites_and_deletes_imported_keys_without_error() {
     let got = import("unbind C-b\nbind m kill-pane\n");
@@ -858,6 +1124,7 @@ fn the_overlay_marks_imported_rows_and_lists_the_skipped_lines() {
     assert!(!x.what.contains("(tmux)"), "{x:?}");
     let skipped = notice::skipped_rows(&got.import, Some(&got.home));
     assert_eq!(skipped.len(), 1);
+    assert!(!skipped[0].changed);
     assert_eq!(skipped[0].keys, "~/.tmux.conf:2");
     assert_eq!(
         skipped[0].what,

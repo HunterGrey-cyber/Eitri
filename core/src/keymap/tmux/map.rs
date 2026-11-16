@@ -1,9 +1,10 @@
 //! What one tmux command means for Eitri: a step of the import, a source-file to follow, nothing
 //! (an option or anything else that is not a key), or a skip with its reason.
 //!
-//! Only commands with a known Eitri action are imported, and only with the flags listed for each:
-//! a flag outside that list skips the binding rather than being ignored, because a flag can turn a
-//! command into its opposite (`kill-window -a` closes every window but this one).
+//! Only commands with a known Eitri action and flags in that command's list are imported: an unlisted
+//! flag skips the binding, since it can reverse a command (`kill-window -a` closes every other window).
+//! Split options are honoured or reported: size, keep-focus and unsupported cwd options import with
+//! a loss notice; before and full-window splits skip the binding with a reason. None is silently dropped.
 
 use super::lex::{self, Arg, Command, Vars};
 use super::Step;
@@ -459,15 +460,17 @@ fn bind(args: &[Arg], vars: &Vars) -> Result<Step, String> {
     table_of(&parsed)?;
     let key = key_of(parsed.rest.first())?;
     let commands = commands_of(&parsed.rest[1..], vars)?;
+    let mut notices = Vec::new();
     let action = match commands.as_slice() {
         [] => return Err("binds the key to no command".to_string()),
-        [one] => action(one, vars)?,
+        [one] => action(one, vars, &mut notices)?,
         _ => return Err("more than one command, which one Eitri key cannot run".to_string()),
     };
     Ok(Step::Bind {
         key,
         action,
         repeatable: parsed.has('r'),
+        notices,
     })
 }
 
@@ -539,7 +542,7 @@ fn direction_flag(parsed: &Parsed, order: &str) -> Option<Direction> {
 }
 
 /// The Eitri action one bound command maps to, or why it does not.
-fn action(command: &Command, vars: &Vars) -> Result<Action, String> {
+fn action(command: &Command, vars: &Vars, notices: &mut Vec<String>) -> Result<Action, String> {
     let name = resolve(command_name(command)?)?;
     let args = &command[1..];
     let parsed = match template(name) {
@@ -574,6 +577,23 @@ fn action(command: &Command, vars: &Vars) -> Result<Action, String> {
         "split-window" => {
             parsed.only("hvcplbdf")?;
             parsed.at_most(0)?;
+            if parsed.has('b') {
+                return Err("split-window -b: placing the new pane before this one is not imported".into());
+            }
+            if parsed.has('f') {
+                return Err("split-window -f: a full-window split is not imported".into());
+            }
+            for flag in ['l', 'p'] {
+                if let Some(size) = parsed.value(flag) {
+                    notices.push(format!("split-window -{flag} {size}: size ignored"));
+                }
+            }
+            if parsed.has('d') {
+                notices.push("split-window -d: keeping focus on the old pane is ignored".into());
+            }
+            if let Some(cwd) = parsed.value('c').filter(|cwd| *cwd != "#{pane_current_path}") {
+                notices.push(format!("split-window -c {cwd}: using the start directory"));
+            }
             // tmux: -h splits left/right whatever else is given.
             Ok(Action::Split {
                 axis: if parsed.has('h') { Axis::Row } else { Axis::Column },
@@ -780,7 +800,7 @@ fn action(command: &Command, vars: &Vars) -> Result<Action, String> {
             let inner_name = resolve(command_name(&inner)?)?;
             match inner_name {
                 // Eitri asks y/n itself before either.
-                "kill-pane" | "kill-window" => action(&inner, vars),
+                "kill-pane" | "kill-window" => action(&inner, vars, notices),
                 other => Err(no_equivalent(&format!("confirm-before {other}"))),
             }
         }

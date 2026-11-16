@@ -1724,16 +1724,16 @@ pub fn serialize_focus_permission_for_js(tab: crate::tabs::TabId) -> String {
 /// out for the chooser's `New session` row (`Ctrl+b c`, from the effective prefix
 /// table). Sent again whenever `effective()`'s result changes, same as before.
 ///
-/// `tmuxSkipped`: the lines of the user's tmux config the import did not take, each as
-/// `<file>:<line>` and what was written with why, for the overlay's "Skipped from tmux" section;
-/// empty when nothing was skipped or the import is off.
+/// `tmuxSkipped`: import exceptions, each with `<file>:<line>`, the statement and its reason.
+/// Rows with `changed` imported with losses; the others were skipped. The overlay groups them
+/// into separate sections. Empty when the import has no exceptions or is off.
 pub fn serialize_keymap_for_js(
     prefix: &str,
     window: &[crate::keymap::HelpRow],
     prefix_keys: &[crate::keymap::HelpRow],
     panel: &crate::keymap::panel::PanelKeymap,
     new_tab_chord: &str,
-    tmux_skipped: &[crate::keymap::HelpRow],
+    tmux_skipped: &[crate::keymap::tmux::notice::ImportHelpRow],
 ) -> String {
     use crate::keymap::panel::{LeaderSource, PanelKey, PanelSource};
 

@@ -211,6 +211,14 @@ pub struct Skipped {
     pub reason: String,
 }
 
+/// An imported binding's lost effect, with the statement that requested it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BindingNotice {
+    pub key: KeySpec,
+    pub origin: Origin,
+    pub text: String,
+}
+
 /// One thing the config does to the prefix table, in Eitri's terms.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Step {
@@ -219,6 +227,8 @@ pub enum Step {
         key: KeySpec,
         action: Action,
         repeatable: bool,
+        /// Options the imported action cannot preserve, said for this binding.
+        notices: Vec<String>,
     },
     Unbind(KeySpec),
     /// `unbind -a`: the whole prefix table.

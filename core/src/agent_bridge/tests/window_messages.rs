@@ -183,10 +183,18 @@ fn serializes_the_keymap_help() {
         &[row("Ctrl+b f", "HINT")],
         &panel,
         "Ctrl+b c",
-        &[row(
-            "~/.tmux.conf:3",
-            "bind P paste-buffer \u{2014} no Eitri equivalent: paste-buffer",
-        )],
+        &[
+            crate::keymap::tmux::notice::ImportHelpRow {
+                keys: "~/.tmux.conf:3".into(),
+                what: "bind P paste-buffer — no Eitri equivalent: paste-buffer".into(),
+                changed: false,
+            },
+            crate::keymap::tmux::notice::ImportHelpRow {
+                keys: "~/.tmux.conf:4".into(),
+                what: "bind y split-window -d — -d keep-focus is not preserved".into(),
+                changed: true,
+            },
+        ],
     ))
     .unwrap();
     assert_eq!(value["kind"], "keymap");
@@ -203,7 +211,10 @@ fn serializes_the_keymap_help() {
     assert!(value["panel"]["bindings"].is_array(), "the panel table travels too");
     assert_eq!(
         value["tmuxSkipped"],
-        serde_json::json!([{ "keys": "~/.tmux.conf:3", "what": "bind P paste-buffer \u{2014} no Eitri equivalent: paste-buffer" }])
+        serde_json::json!([
+            { "keys": "~/.tmux.conf:3", "what": "bind P paste-buffer — no Eitri equivalent: paste-buffer", "changed": false },
+            { "keys": "~/.tmux.conf:4", "what": "bind y split-window -d — -d keep-focus is not preserved", "changed": true },
+        ])
     );
 }
 

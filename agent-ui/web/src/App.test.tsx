@@ -8360,7 +8360,7 @@ describe("App: the ? keymap overlay", () => {
     expect(overlay(container)!.textContent).toContain("Ctrl+b f");
   });
 
-  it("lists the tmux lines shell says the import skipped, last", () => {
+  it("lists the tmux skips and imported losses shell sent, in separate sections", () => {
     const { container } = started();
     act(() =>
       dispatch({
@@ -8370,12 +8370,17 @@ describe("App: the ? keymap overlay", () => {
         prefixKeys: [{ keys: "Ctrl+a m", what: "Zoom (tmux)" }],
         panel: TABLE,
         newTabChord: "Ctrl+a c",
-        tmuxSkipped: [{ keys: "~/.tmux.conf:4", what: "bind P paste-buffer — no Eitri equivalent: paste-buffer" }],
+        tmuxSkipped: [
+          { keys: "~/.tmux.conf:4", what: "bind P paste-buffer — no Eitri equivalent: paste-buffer", changed: false },
+          { keys: "~/.tmux.conf:5", what: "bind y split-window -d — split-window -d: keeping focus on the old pane is ignored", changed: true },
+        ],
       }),
     );
     act(() => dispatch({ kind: "open_keymap" }));
     const titles = Array.from(overlay(container)!.querySelectorAll("h2")).map((h) => h.textContent);
-    expect(titles[titles.length - 1]).toBe("Skipped from tmux");
+    expect(titles.slice(-2)).toEqual(["Skipped from tmux", "Imported from tmux with changes"]);
+    expect(overlay(container)!.textContent).toContain("~/.tmux.conf:5");
+    expect(overlay(container)!.textContent).toContain("split-window -d: keeping focus on the old pane is ignored");
     expect(overlay(container)!.textContent).toContain("~/.tmux.conf:4");
     expect(overlay(container)!.textContent).toContain("Zoom (tmux)");
   });

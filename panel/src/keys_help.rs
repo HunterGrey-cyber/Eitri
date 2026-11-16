@@ -145,7 +145,7 @@ pub struct KeysHelp {
     /// The chord for `Action::Tab(TabAction::New)`: the prefix as a person reads it, then the first
     /// key bound to the action.
     new_tab_chord: String,
-    skipped: Vec<HelpRow>,
+    skipped: Vec<eitri_core::keymap::tmux::notice::ImportHelpRow>,
 }
 
 impl KeysHelp {
@@ -153,7 +153,7 @@ impl KeysHelp {
         keymap: Rc<Keymap>,
         module_keys: Rc<ModuleKeys>,
         panel: AgentPanelHandle,
-        tmux_skipped: Vec<HelpRow>,
+        tmux_skipped: Vec<eitri_core::keymap::tmux::notice::ImportHelpRow>,
         scope: HelpScope,
     ) -> Rc<Self> {
         let new_tab_chord = keymap
@@ -270,8 +270,8 @@ mod tests {
         );
         let whats: Vec<&str> = prefix.iter().map(|row| row.what.as_str()).collect();
         // Tab verbs and the panel's own actions stay.
-        assert!(whats.iter().any(|w| w.contains("New session tab")), "{whats:?}");
-        assert!(whats.iter().any(|w| w.contains("Next session tab")), "{whats:?}");
+        assert!(whats.iter().any(|w| w.contains("New tab")), "{whats:?}");
+        assert!(whats.iter().any(|w| w.contains("Next tab")), "{whats:?}");
         // Nothing about modules, splits, zoom, resizing, swapping or moving between modules.
         for gone in [
             "module",

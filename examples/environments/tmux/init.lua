@@ -1,7 +1,7 @@
 -- Eitri for someone who lives in tmux. Your prefix and your prefix-table keys come from your own tmux
 -- configuration (keymap.from_tmux is on unless you turn it off), so this file adds only what tmux has and
--- Eitri does not do by default: splits that start in the pane's directory, new panes below, and a few windows
--- kept as workspaces. Copy it to ~/.config/eitri/init.lua, or paste the parts you want into yours.
+-- Eitri does not do by default: splits that start in the pane's directory, new panes below, and a workspace
+-- of shells. Copy it to ~/.config/eitri/init.lua, or paste the parts you want into yours.
 
 local k = eitri.keymap
 
@@ -22,7 +22,8 @@ eitri.layout.default({
   { "terminal" },
 })
 
--- tmux windows as workspaces: <prefix> ( and ) step through them, <prefix> L goes back to the last one,
+-- tmux sessions map to workspaces; tmux windows map to chat tabs. <prefix> ( and ) step through workspaces,
+-- and <prefix> L goes back to the last one;
 -- <prefix> s chooses one. "shells" puts two terminals one above the other in the middle; a workspace always
 -- holds the editor and the chat, so they stay at the sides.
 eitri.layout.workspace("shells", {

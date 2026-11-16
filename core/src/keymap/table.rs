@@ -452,7 +452,8 @@ pub struct LuaClaims {
 
 /// What the tmux import did: the files tmux would load that were read, the prefix it set (`None`
 /// when the config sets none Eitri could take), its bindings as they stood once the import was
-/// done, the keys it unbound and left unbound, and every line that did not come across.
+/// done, the keys it unbound and left unbound, every line that did not come across, and the losses
+/// in bindings that did.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct TmuxImport {
     pub files: Vec<std::path::PathBuf>,
@@ -460,9 +461,23 @@ pub struct TmuxImport {
     pub bindings: Vec<Binding>,
     pub removed: Vec<KeySpec>,
     pub skipped: Vec<super::tmux::Skipped>,
+    /// Losses attached to bindings that remain imported, each with its key and original statement.
+    /// A binding's losses stay adjacent so help can group them into one row.
+    pub notices: Vec<super::tmux::BindingNotice>,
 }
 
 impl TmuxImport {
+    /// Keeps the import record and its notices tied to bindings still in force after `init.lua`.
+    fn retain_effective_bindings(&mut self, keymap: &Keymap) {
+        if self.prefix.is_some_and(|p| *keymap.prefix() != p) {
+            self.prefix = None;
+        }
+        self.bindings
+            .retain(|binding| keymap.lookup(&binding.key) == Some(binding));
+        self.notices
+            .retain(|note| self.bindings.iter().any(|binding| binding.key == note.key));
+    }
+
     /// Whether the window's keys differ from the defaults because of it -- not merely whether a
     /// config was read: one that only sets options, or rebinds a default key to what it already
     /// does, changes nothing a notice would need to announce.
@@ -569,9 +584,12 @@ impl Keymap {
                     key,
                     action,
                     repeatable,
+                    notices,
                 } => {
                     if key.as_char() == Some(crate::layout::keys::RESERVED_FOR_CANVAS) {
-                        skip("reserved for the canvas".to_string());
+                        skip(
+                            "v after the prefix is kept free for a future module; bind this to another key".to_string(),
+                        );
                         continue;
                     }
                     if let Some((id, _)) = claims
@@ -593,8 +611,17 @@ impl Keymap {
                         None => map.bindings.push(binding),
                     }
                     removed.retain(|k| k != key);
+                    import.notices.retain(|note| note.key != *key);
+                    import
+                        .notices
+                        .extend(notices.iter().map(|note| super::tmux::BindingNotice {
+                            key: *key,
+                            origin: origin.clone(),
+                            text: note.clone(),
+                        }));
                 }
                 Step::Unbind(key) => {
+                    import.notices.retain(|note| note.key != *key);
                     if let Some(at) = map.bindings.iter().position(|b| b.key == *key) {
                         map.bindings.remove(at);
                         if !removed.contains(key) {
@@ -603,6 +630,7 @@ impl Keymap {
                     }
                 }
                 Step::UnbindAll => {
+                    import.notices.clear();
                     map.bindings.retain(|b| {
                         let goes = b.source == Source::Tmux || is_tmux_action(&b.action);
                         if goes && !removed.contains(&b.key) {
@@ -643,13 +671,8 @@ impl Keymap {
             (Keymap::defaults(), None)
         };
         let map = base.then_user(ops, lua_panels).map_err(|e| e.to_string())?;
-        // What a root key took over is no longer what the import set, so the import (and the notice made from it)
-        // does not claim it.
         let import = import.map(|mut import| {
-            if import.prefix.is_some_and(|p| *map.prefix() != p) {
-                import.prefix = None;
-            }
-            import.bindings.retain(|b| map.root_lookup(&b.key).is_none());
+            import.retain_effective_bindings(&map);
             import
         });
         Ok((map, import))
@@ -675,10 +698,7 @@ impl Keymap {
         };
         let (keymap, problems) = base.then_user_settled(ops, origins, lua_panels);
         let import = import.map(|mut import| {
-            if import.prefix.is_some_and(|p| *keymap.prefix() != p) {
-                import.prefix = None;
-            }
-            import.bindings.retain(|b| keymap.root_lookup(&b.key).is_none());
+            import.retain_effective_bindings(&keymap);
             import
         });
         StartupKeymap {
@@ -1833,10 +1853,7 @@ mod tests {
         assert!(find("Ctrl+b Up / Down / Left / Right")
             .what
             .contains("repeats within 500 ms"));
-        assert_eq!(
-            find("Ctrl+b 1 / 2 / 3 / 4 / 5 / 6 / 7 / 8 / 9").what,
-            "Select that session tab"
-        );
+        assert_eq!(find("Ctrl+b 1 / 2 / 3 / 4 / 5 / 6 / 7 / 8 / 9").what, "Select that tab");
         assert!(find("Ctrl+b %").what.contains("(e / a / t)"));
         for (key, action) in [
             ("F", Action::FloatToggle),
