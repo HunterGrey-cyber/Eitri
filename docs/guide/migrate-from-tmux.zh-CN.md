@@ -1,5 +1,5 @@
 [English](migrate-from-tmux.md) | 简体中文
-<!-- translated-from: migrate-from-tmux.md sha256=3ad74bbd8b48a5801a8cc720f79098565c5043ec9770d446635caa3d131a2339 -->
+<!-- translated-from: migrate-from-tmux.md sha256=2f9876799c2fe2ea62027074e0e5b66591446ecea04255c6f15d54a74db54c34 -->
 
 # 从 tmux 迁过来
 
@@ -84,7 +84,6 @@ Using your tmux keys from ~/.tmux.conf: prefix Ctrl+a, 8 keys (18 skipped). Ctrl
 - **复制模式的键表**（`bind -T copy-mode-vi ...`），以及 `prefix` 以外的所有键表。
 - **Eitri 没有对应功能的命令**：`display-popup`、`display-menu`、`paste-buffer`、`choose-buffer`、绑定里的 `source-file` 等。
 - **要运行 shell 的**：`run-shell` 和 `if-shell`。Eitri 从不执行 tmux 配置里的命令，所以 TPM、它加载的插件以及这些插件绑的键都带不过来。
-- **前缀后面绑在 `v` 上的键。** Eitri 把 `v` 留给以后的一个模块，请把那个动作绑到别的键上。
 - **一个键绑了多条命令的**、`send-keys` 发 `C-a` 以外的任何键、`select-window`（Eitri 的 `<prefix> 1` 到 `9` 已经用来选标签页，从 1 开始数）、`prefix2`、不带 `-g` 的 `set prefix`，以及用相对路径的 `source-file`（tmux 会按一个 Eitri 无从得知的目录去解析它）。
 - 和按键无关的选项，比如 `mouse`、`status`、颜色和 `base-index`，直接忽略，也不会列出来。
 

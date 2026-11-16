@@ -1,5 +1,5 @@
 [English](keys.md) | 简体中文
-<!-- translated-from: keys.md sha256=355fba5ec61ac2e1db75738686d18ac8ca26e408862fc528d61d4e6d6eadc9ae -->
+<!-- translated-from: keys.md sha256=bf471bda6efae78061b3c8acd2d423c0278992f97a45d2818454c840478d2cc0 -->
 
 # 按键
 
@@ -766,7 +766,7 @@ BROWSE 里的 `:`（或任何地方的 `<prefix> :`）在面板底部打开一�
 从 tmux 整体迁过来（你的 Neovim、你的 agent、带不过来的东西），见[从 tmux 迁过来](migrate-from-tmux.zh-CN.md)。
 
 如果你用 tmux，Eitri 会从 tmux 自己读的那几个文件（`/etc/tmux.conf`、`~/.tmux.conf`、`$XDG_CONFIG_HOME/tmux/tmux.conf`、`~/.config/tmux/tmux.conf`，以及它们 `source-file` 进来的文件）里读出你的前缀键和前缀表绑定，凡是有对应 Eitri 动作的 tmux 命令都会照搬过来。它只读这些文件，从不启动或询问 tmux。一条提示会说明拿到了什么（每次导入内容有变化时出现一次），`<prefix> ?` 会逐行列出没能拿过来的那些行和原因。Eitri 没有对应物的东西，以及任何需要 tmux 去运行什么的东西，都会被跳过。
-前缀之后的 `v` 绑定会被跳过：Eitri 为一个尚未实现的模块保留了这个键。请把该动作绑定到另一个键。
+tmux 中绑在 `v` 上的键会和其他键一样导入。Eitri 默认不绑定 `v`，也不允许将它用作 Lua 面板的按键。
 
 `new-window` 打开一个新标签页，导入提示会说明一次；tmux 的会话导航映射到 Eitri 工作区。`split-window` 的 `-b`（放在当前窗格之前）和 `-f`（占满窗口）会让该绑定被跳过，并说明原因。`-l` / `-p`（大小）和 `-d`（保留焦点）仍然导入绑定，提示会逐个点出绑定和丢掉的选项。同样的损失也会保留在 `<prefix> ?` 的 “Imported from tmux with changes”（导入时有改动）部分，紧邻 “Skipped from tmux”（从 tmux 跳过的绑定）：每个绑定一行，列出文件和行号、原始 tmux 行以及丢失的效果。在 `init.lua` 中删除或替换的绑定不再显示损失行。`-c '#{pane_current_path}'` 使用窗格所在目录；没有 `-c` 时使用启动目录。其他 `-c` 值也使用启动目录，提示会点出该绑定及其目录回退。
 

@@ -430,8 +430,7 @@ fn default_bindings() -> Vec<Binding> {
     bind("e", Action::Module(ModuleId::editor()), false);
     bind("a", Action::Module(ModuleId::agent()), false);
     bind("t", Action::Module(ModuleId::terminal()), false);
-    // tmux `copy-mode` / `copy-mode -u`: `v` is deliberately not bound here --
-    // reserved for the canvas (`crate::layout::keys::RESERVED_FOR_CANVAS`), not this table.
+    // tmux `copy-mode` / `copy-mode -u`: `v` stays unbound by default; a tmux import may bind it.
     bind("[", Action::CopyMode { up: false }, false);
     bind("PPage", Action::CopyMode { up: true }, false);
     // The round over the agents that wait, across windows: keys stock tmux leaves free after its prefix.
@@ -586,12 +585,6 @@ impl Keymap {
                     repeatable,
                     notices,
                 } => {
-                    if key.as_char() == Some(crate::layout::keys::RESERVED_FOR_CANVAS) {
-                        skip(
-                            "v after the prefix is kept free for a future module; bind this to another key".to_string(),
-                        );
-                        continue;
-                    }
                     if let Some((id, _)) = claims
                         .panel_keys
                         .iter()

@@ -923,13 +923,20 @@ fn a_bad_prefix_keeps_the_last_good_one_and_the_bindings_still_come() {
 }
 
 #[test]
-fn the_reserved_v_key_explains_how_to_import_the_binding() {
-    let got = import("bind v copy-mode\n");
+fn v_imports_like_any_other_key_and_stays_unbound_by_default() {
+    assert!(Keymap::defaults().bindings().iter().all(|b| b.key != k("v")));
+    let got = import("bind v split-window -h\n");
     assert_eq!(
-        got.only_reason(),
-        "v after the prefix is kept free for a future module; bind this to another key"
+        got.bound("v"),
+        Some((
+            Action::Split {
+                axis: Axis::Row,
+                cwd: crate::keymap::action::SplitCwd::Start
+            },
+            false
+        ))
     );
-    assert_eq!(got.bound("v"), None);
+    assert!(got.import.skipped.is_empty(), "{:?}", got.import.skipped);
 }
 
 #[test]

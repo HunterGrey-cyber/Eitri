@@ -113,7 +113,6 @@ What is skipped, with the reason in `<prefix> ?`:
   `source-file` inside a binding, and others.
 - **Anything that runs a shell**: `run-shell` and `if-shell`. Eitri never runs your tmux configuration's commands, so
   TPM, the plugins it loads and the keys they bind do not come across.
-- **A binding on `v` after the prefix.** Eitri keeps `v` free for a future module; bind that action to another key.
 - **A binding that runs more than one command**, `send-keys` of any key but `C-a`, `select-window` (Eitri's
   `<prefix> 1` to `9` already pick tabs, counted from 1), `prefix2`, `set prefix` without `-g`, and `source-file` with a
   relative path (tmux resolves it against a directory Eitri cannot know).

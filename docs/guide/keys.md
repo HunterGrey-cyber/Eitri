@@ -1168,7 +1168,7 @@ reads (`/etc/tmux.conf`, `~/.tmux.conf`, `$XDG_CONFIG_HOME/tmux/tmux.conf`,
 command. It only reads them; it never starts or asks tmux. A notice says what was taken (it appears
 once for each change to what is imported), and `<prefix> ?` lists each line that was not, with the reason.
 Things Eitri has no equivalent of, and anything that would need tmux to run something, are skipped.
-A binding on `v` after the prefix is skipped: Eitri keeps it free for a future module. Bind it to another key.
+A tmux binding on `v` imports like any other key. Eitri leaves `v` unbound by default and refuses it for Lua panel keys.
 
 `new-window` opens a new tab, and the import notice says so once; tmux session navigation maps to Eitri
 workspaces. For `split-window`, `-b` (before this pane) and `-f` (full window) skip the binding with a reason.
