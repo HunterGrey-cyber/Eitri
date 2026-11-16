@@ -196,7 +196,7 @@ report, and any proof of concept, doesn't sit in public before a fix ships.
 Eitri was called neovibe until September 2026. Some names keep the old one, such as the Neovide
 fork's branch `neovibe-integration`.
 
-Before 0.3.1, the history of `main` was rewritten into one commit per change. This was done once;
+Before 0.4.0, the history of `main` was rewritten into one commit per change. This was done once;
 later releases add commits on top of it. Commits from before late September 2026 carry a short
 placeholder README, written when the history was published, and the MIT licence file, which was
 added two days into development, is present from the first commit. In each snapshot commit the
@@ -213,9 +213,9 @@ history of `main` is still reachable through these tags: `git log v0.3.0`.
 | `v0.2.1` | the commit named on the [0.2.1 release page](https://github.com/HunterGrey-cyber/eitri/releases/tag/v0.2.1) |
 | `v0.2.2` | the commit named on the [0.2.2 release page](https://github.com/HunterGrey-cyber/eitri/releases/tag/v0.2.2) |
 | `v0.3.0` | the commit named on the [0.3.0 release page](https://github.com/HunterGrey-cyber/eitri/releases/tag/v0.3.0) |
-| `v0.3.1` and later | the tagged commit, which is on `main` |
+| `v0.4.0` and later | the tagged commit, which is on `main` |
 
-A tagged release commit builds with `cargo build --locked`: the four old tags, and `v0.3.1` and
+A tagged release commit builds with `cargo build --locked`: the four old tags, and `v0.4.0` and
 later on `main`. Every other commit on `main`, including the ones the old release pages name, is a
 snapshot: its `neovide` submodule points at the nearest commit of the public fork, and it may not
 build.

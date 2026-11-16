@@ -37,7 +37,7 @@ _spec.loader.exec_module(rc)
 
 _SCRATCH_ROOT = os.path.expanduser("~/.cache/eitri-release-sh-tests")
 # The tagline, as the README, the desktop entry, the package description and the release notes give it.
-TAGLINE = "Your Neovim, tiled with your agents, terminals and the web pages you build."
+TAGLINE = "Sick of reading agent replies and Markdown in a terminal? Run your own Neovim in a GUI that renders them."
 _VERDANDI_REV = "0123456789abcdef0123456789abcdef01234567"
 _NVIM_PIN = "NVIM_VERSION=0.11.4\nNVIM_SHA256_linux_x86_64=" + "ab" * 32 + "\n"
 _DOCKER_EXIT = 97

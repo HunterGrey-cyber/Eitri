@@ -284,8 +284,9 @@ one-window mode.
   files, and has no system-call filter. It needs Linux 5.11 or newer; in a container or sandbox that forbids the calls it uses, no
   image can be decoded and the image's chip says why.
 - **The bottom terminal can write to your clipboard, by design.** A program running there can set the clipboard
-  or the primary selection with an OSC 52 escape sequence (the same default as Alacritty); Eitri shows no notice
-  when it happens, so what you paste next may not be what you copied. Reading the clipboard is refused.
+  or the primary selection with an OSC 52 escape sequence (the same default as Alacritty). Eitri asks nothing first, but
+  the pane shows a notice for three seconds after the write (`Terminal 3: OSC 52 wrote clipboard: 9 bytes`), naming
+  the terminal, the target and the size, never the text. Reading the clipboard is refused.
 - **The agent panel's script policy is new and was checked in tests, not yet on a screen on every setup.** The
   panel now allows only its own script by hash instead of any inline script. If the agent panel stays blank
   after an update, please report it with your WebKitGTK version.
@@ -403,13 +404,16 @@ file in your nvim.
 
 ## Stability
 
-0.3.0 is the tiling release. Eitri is not yet stable enough for everyday use: that waits for real hardware, a
-person's hands and a week of daily use, not for a version number. Almost all of it has been seen working only in an
-isolated, headless test session, with a scripted stand-in behind Claude Code instead of a real account (the tiling
-window, chat views, the redesigned chat page, steering a running turn and the queued messages, typing through an
-input method, the Markdown preview, companion mode, `eitri split`, the GNOME extension, turn review, the trust
-question). None of it has run for a recorded week on real hardware: a real wheel and touchpad, two monitors of
-different scale, a real account's day. Reports from real desktops are especially welcome. The `init.lua` API and the default keys may change during 0.x.
+Eitri is not yet stable enough for everyday use: that waits for real hardware, a person's hands and a week of daily
+use, not for a version number. Almost all of 0.4.0 has been seen working only in an isolated, headless test session,
+with scripted stand-ins behind the agents instead of a real account (the tiling windows, chat views, the chat page and
+its keys, steering a running turn and the queued messages, plan mode and images, taking over a terminal Neovim,
+reopening your files, the project list, the agents pages, typing through an input method, the Markdown preview,
+companion mode, `eitri split`, the GNOME extension, turn review, live review, the trust question). The exceptions are
+virtual-machine runs on Hyprland 0.57.0 and 0.56.2 and automated runs against the real Claude Code 2.1.302 and 2.1.311.
+None of it has run for a recorded week on real hardware: a real wheel and touchpad, two monitors of different scale, a
+real account's day. Not seen at all: GNOME's raise, KDE, a scaled output and any other Claude Code version. Reports
+from real desktops are especially welcome. The `init.lua` API and the default keys may change during 0.x.
 
 ## Not on this list?
 

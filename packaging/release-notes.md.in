@@ -1,20 +1,24 @@
-Eitri @VERSION@ -- Your Neovim, tiled with your agents, terminals and the web pages you build.
+Eitri @VERSION@ -- Sick of reading agent replies and Markdown in a terminal? Run your own Neovim in a GUI that renders them.
 Built from commit @COMMIT@ in the Ubuntu 24.04 release container. It runs on glibc 2.39, GTK 4.14
 and WebKitGTK 2.40 (the webkitgtk-6.0 API) or newer.
 
-0.3.0 is the tiling release. The window becomes a keyboard-driven tiling manager, Codex and any agent that speaks
-ACP join Claude Code, and you can put web pages of your own in the window. A Claude Code tab now also shows what
-Claude Code does on its own: background tasks, workflows, the turns it starts by itself and the questions it asks
-you. Your Neovim stays the editor: a real `nvim --embed` with your own `init.lua`, plugins, LSP and keymaps.
+0.4.0 is for running several agents next to your own Neovim. Every window shares what its agents are doing, so you can
+see which one waits for you and go to it with one key. Claude tabs get plan mode, pasted images, your open buffers as
+context and vim-style keys in the panel, and permission cards are answered in a mode of their own. On Hyprland, sway
+and niri, chats and pages become windows your compositor tiles. A Neovim already running in a terminal can be moved
+into an Eitri window, and Eitri reopens your files where you left them. Your Neovim stays the editor: a real
+`nvim --embed` with your own `init.lua`, plugins, LSP and keymaps.
 
 ## What's new since 0.3.0
 
 **Many agents at once**
 
 - Every Eitri window now shares one row per agent tab (who it is, its state, since when, whether it waits for you), and
-  three bundled pages read them: Strips (`agents-strips`), a sidebar of who needs you; The pass (`agents-pass`), one
-  line that shows only while an agent waits; and a `top`-style table (`agents-top`). They are off until `init.lua`
-  loads them, for example `eitri.plugin.load("agents-top", { key = "A" })`.
+  three bundled pages read them: Strips (`agents-strips`), a sidebar of who needs you that stays hidden until
+  `<prefix> U` opens it; The pass (`agents-pass`), one line that shows only while an agent waits; and a `top`-style
+  table (`agents-top`). They are off until `init.lua` loads them, for example `eitri.plugin.load("agents-strips")` or
+  `eitri.plugin.load("agents-top", { key = "A" })`. If something of yours already uses `U`, it keeps the key and Strips
+  has none.
 - `<prefix> u` goes to the agent that has waited longest for you, in whichever window it is, and on to the next;
   `<prefix> B` goes back to where you started. Neither answers anything: you answer in the chat, as before.
 - `eitri agents` prints the same rows in a terminal (`--json`, `--watch` for a status bar), and a page you write can
@@ -43,6 +47,121 @@ you. Your Neovim stays the editor: a real `nvim --embed` with your own `init.lua
   the same chat as a tile with four projects open (release build, medians). The page's "Known gaps" lists what does not
   work yet.
 
+**Your Neovim, moved in, reopened or kept beside**
+
+- `:EitriOpen` in a Neovim running in a terminal moves that same Neovim into an Eitri window, with the agent panel
+  beside it and the bottom terminal under it. Nothing restarts: buffers, unsaved changes, jobs and `:terminal` stay.
+  The terminal waits at a short screen, and the Neovim goes back to it when you close the window, press `Enter` in the
+  terminal, log out, or Eitri dies. Eitri never signals your Neovim and never quits it. `eitri open --nvim <address>`
+  does the same from a shell.
+- It needs Neovim 0.12 or newer in that terminal and the eitri.nvim plugin for the command. It refuses with one line,
+  and leaves the terminal as it was, when another UI is attached to that Neovim, when it is waiting for a key or busy,
+  or when its address is not a local socket of yours (no remote servers). `editor.takeover = false` turns it off.
+- The Markdown preview, or any page, can open as a window of its own beside your own Neovim: `:EitriPage markdown`, or
+  `eitri page markdown --nvim <address>`. It follows that Neovim's buffer; `Enter` on a block moves Neovim's cursor
+  there.
+- Starting a project again brings back what you had open: the files in their splits and tab pages, each window at its
+  line and scroll position, the listed buffers, and which window held the cursor. Eitri keeps a small record of file
+  names and positions (never text), updated every 30 seconds, when the window loses focus and when the editor exits, so
+  a crash costs about the last 30 seconds. It stands aside when a session plugin is installed (persistence.nvim,
+  auto-session, resession.nvim and the others the guide lists), with `eitri FILE`, with `--clean`, in the second
+  window and beside your own Neovim. `editor.restore = false` turns it off.
+- If Neovim itself is killed or crashes, the window stays and says so, and `<prefix> e` starts it again. A start that
+  finds unsaved changes in swap files says so and recovers nothing until you ask.
+- A crash of Eitri leaves `crash-<time>-<pid>.log` under `~/.local/state/eitri/log/`, readable by you only, and the
+  next start says so once with the path. It holds the version, the build, where the code stopped, a backtrace and the
+  last lines the window printed, with no prompt, conversation or tool output. Eitri sends nothing: you attach it to a
+  bug report if you want to. A crash inside GTK, WebKit or a graphics driver writes no record.
+
+**Opening a project**
+
+- `<prefix> O` lays a list of your other projects over the window, the one you used last first, with a line to filter
+  it or to type a path (`~/src/app`, `Tab` completes it). `Enter` takes you there: a project that has a window comes
+  forward, any other opens in a new window. The same list opens from `:Eitri project.choose`, a click on the project's
+  name in the top bar, and `p` on an empty chat tab, in the chat and page windows of compositor mode too.
+- The list takes the keys of the session list: `j` and `k`, `gg` and `G`, `Enter`, `/` for the line, `~` to browse
+  from home, `Esc` or `q` to close.
+- You can walk to a project Eitri has not opened before: `h` on a project shows the folder that holds it, `l` or
+  `Enter` goes into a folder, `h` goes up, and `Enter` on the `.` row opens the folder you are in. Git repositories,
+  links and mount points are marked, and a network share that does not answer says so within two seconds while the
+  rest of the disk stays browsable.
+- Starting Eitri from the desktop with no file or folder no longer opens your home folder: it shows the same list in a
+  small window first, with no Neovim and no trust question. `window.desktop_start = "last"` opens the project you used
+  most recently instead, and `"cwd"` brings back the old behaviour.
+- A window started from a launcher or a key binding asks your login shell once (at most 2 seconds) for its `PATH`, so
+  the editor, the bottom terminal and the agents find what your shell configuration adds, and it finds `claude` and
+  `codex` where their installers put them. `EITRI_LOGIN_PATH=off` skips the shell.
+- `eitri` in a terminal gives the prompt back as soon as the window is up and prints nothing; the window keeps running
+  when you close that terminal, and its output goes to a log under `~/.local/state/eitri/log/`. `eitri --no-fork`
+  keeps the window in the foreground.
+
+**Your editor and your agent**
+
+- An agent in any tab (Claude Code, Codex or one you registered) gets editor tools: `open_file`, `read_buffer`,
+  `editor_state`, `diagnostics`, `usages`, `hover`, `symbols`, `lsp_rename`, `format`, `lsp_code_actions`,
+  `apply_code_action` and `apply_proposal`. They show a file beside your window without taking your cursor, read
+  buffers as your editor holds them (unsaved changes included), and ask the language servers already running there.
+  A rename, a format or a code action only makes a proposal; `apply_proposal` writes it, and in a Manual or an Auto
+  tab that is a card. Asking about a file outside the project is a card too, and so is loading a file that is not open
+  in Manual. `nvim_exec` stays off until you turn it on and is always a card. `agent.editor.tools = false` turns the
+  set off, and `agent.editor.tool.<name>` turns one off.
+- Turning on `agent.editor.follow`, or `<leader>e` in a tab, shows each completed edit in the editor at its first
+  changed line. It is off by default and never moves your cursor.
+- In Visual mode, `<leader>ae` puts the selection in the chat's box with `Edit the selection: ` ready, so the change
+  comes back as an ordinary edit card.
+- In a Claude tab, three names beyond files work after the same at-sign that completes file names: `buffers` gives
+  Claude the project's open files as they are on screen, `quickfix` the quickfix list and `diagnostics` what your
+  language servers said at that moment. Long ones stop at a bound (1000 lines and 32 KiB per file, 96 KiB for all
+  buffers, 200 list entries), and the message says where. `!` at the start of the box runs the rest as your own shell
+  command in the project, and its output goes to Claude, as in the terminal.
+- With `review.live = true` (off by default), a file the agent edits is drawn in your editor as the edit lands and again
+  when the turn ends: added lines highlighted, removed lines shown as virtual text. `<localleader>a` keeps the drawing
+  and `<localleader>d` undoes it in that buffer as one step, `]h` and `[h` move between hunks. It draws only over a
+  buffer you have not modified and never moves your cursor. In turn review, a changed line now also marks the words
+  that changed in it.
+- `terminal.claude_ide = true` (off by default) lets a `claude` you run in the bottom terminal attach to the window's
+  editor for diffs, diagnostics and selections. It was built against Claude Code 2.1.311's protocol and tested with a
+  stand-in client, not with a real interactive `claude`.
+
+**Day to day in a Claude tab**
+
+- `<leader>M` chooses the model and `<leader>E` the effort (also a click on the band, or a bare `/model` or `/effort`),
+  also while a turn runs: the running response finishes on the old model and the next request uses the new one.
+  `/model <name>` and `/effort <level>` set one at once and are never sent as text. A registered ACP agent's tab offers
+  the models and efforts that agent lists; a Codex tab offers neither.
+- During a turn, a message you send steers it as before, a slash command waits for the turn's end, and `Ctrl+x` then
+  `Enter` sends the draft after the turn.
+- When `claude` is not found, the panel and the first-start screen say where to get Claude Code.
+- Agent replies draw closed `mermaid` fences as diagrams in the panel (up to 20,000 characters and 500 lines, each in
+  a hidden renderer view with a four-second limit). Copying gives the fence's source, and a fence that fails to draw or
+  is too large stays as code. Nobody has looked at these drawings on a real desktop yet.
+- A reply's separate text blocks keep their paragraph break instead of running together.
+- A tab keeps about 200 settled turns in the panel (`agent.history_turns`, 10 to 2000). Older turns are unloaded, a line
+  says `N earlier turns not loaded.`, `Enter` on it (or `:history older`) loads an older page, and `:history latest`
+  goes back. This changes only what the panel holds: Claude Code's own session file is never touched. Resuming an ACP
+  session keeps its last 200 turns and says how many it left out.
+- The trust question shows what changed in `CLAUDE.md`, `.claude/rules/` and the other instruction files since you
+  last answered, and covers `CLAUDE.md`, `.mcp.json` and rules in the directories above the repository.
+- A Codex or ACP tab shows its own activity mark (a softly pulsing bullet) and the agent's name, and says it is waiting
+  for its agent after 10 seconds, not that a sidecar is building.
+
+**The panel with vim keys**
+
+- Answering a card moved to **card mode**: `Alt-n` or `Enter` on a waiting card takes the keys, then `1`, `2` or `3`
+  answer in Claude Code's order (1 Approve, 2 Always allow where a rule can be saved, 3 Deny), or `h`/`l` and `Enter`.
+  A digit answers only after a short arming time, and a letter never answers.
+- `y` is an operator: `yy` the row, `yim` the message's Markdown, `yio` a tool's whole output, `yic` its input, `yih`
+  a hunk, and `y` with a motion copies several rows. `?` searches backward, `Ctrl+o` and `Ctrl+i` walk the places you
+  jumped from, and `]t`, `]d`, `]m`, `]c` (with `[`) step between tool calls, errors, edits and hunks.
+- `gf` opens the path under the caret or in a selection and puts labels on every path when there are several. `gd`
+  goes to a definition or to the line a path cites, and lands on the definition's column.
+
+**The Markdown preview**
+
+- The preview's text is the editor's size by default (`font_size` overrides it), `{` and `}` jump by block, and a
+  selection can take whole table rows. `o` on a diagram or image opens it in a viewer with zathura-like keys (`h j k
+  l`, `+` and `-`, `=`, `a` to fit, `Enter` to edit); a diagram stays sharp at any size and redraws while you edit it.
+
 **Keys you can find without the guide**
 
 - `review.hint` takes a third value, `"key"`: after a turn that changed files the status band says only
@@ -57,6 +176,68 @@ you. Your Neovim stays the editor: a real `nvim --embed` with your own `init.lua
 - The bundled pages (Strips, The pass, the table, the Markdown preview) are listed on the empty tab under "Pages":
   `Enter` loads one into this window for this run, and `o` opens its `init.lua` line in a scratch buffer so you can
   keep it. `:Eitri plugin load <name>` does the same from Neovim. Eitri does not write your `init.lua`.
+- After the prefix, Eitri can show a panel of the keys that may follow (`keymap.which_key_delay`, off by default,
+  `eitri.config.set("keymap.which_key_delay", 200)` for 200 ms).
+- `:Eitri` runs Eitri's window and layout actions from Neovim, and `keymap.nvim_prefix` binds them under your leader.
+  `eitri.keymap.set("root", ...)` binds Ctrl and Alt chords of your choice with no prefix; Eitri warns when your input
+  method or desktop uses one.
+- Text size: `<prefix> Ctrl+=` stays on the pane for as long as Ctrl is down, `Ctrl+0` on the editor returns to the
+  `g:neovide_scale_factor` your configuration sets, `Ctrl++` works where `+` is a key of its own (German, Nordic,
+  Spanish, Italian), and `text.all.larger`, `.smaller` and `.reset` name the whole-window actions so the two text size
+  keys can change places.
+- The tmux import reports the split flags it cannot honour, in its notice and in the `?` sheet, and a new guide page,
+  Coming from tmux, covers the whole move. A tmux `bind v ...` after the prefix now imports like any other key; `v`
+  stays unbound by default.
+- The first launch without an `init.lua` offers a key setup and writes a short `init.lua`; it never changes an existing
+  one. `Esc` twice, or `d`, and it stops asking; `:Eitri setup` brings it back, and `EITRI_FIRST_START=off` keeps it
+  from opening by itself. The screen says which plugin in your Neovim owns, or probably owns, `Ctrl+b` and
+  `Ctrl+h/j/k/l`, what `$mod` is under i3 and sway, and whether an input method is running.
+- `Ctrl+Space` can be the prefix: a press test checks that it reaches Eitri, and a tmux `prefix C-space` is now read.
+  `:EitriTutor` teaches your own prefix.
+
+**The editor**
+
+- The editor is now Neovide 0.17.1 (it was a snapshot from September, just after 0.16.2). Among the fixes that reach
+  Eitri's editor: on Neovim 0.12, rows no longer stay blank after a `:split`, `:update` or `:close` under
+  `'lazyredraw'`; a `guifont` that names a font you do not have no longer stops the editor from starting; a plugin that
+  replays exit autocommands no longer freezes the quit; and wheel notches that arrive while Neovim is busy queue up,
+  each still reaching Neovim as its own scroll.
+- Eitri now needs Neovim 0.11 or newer (it was 0.10). `install.sh` and `eitri setup` offer a private copy of 0.12.6
+  when the Neovim on your `PATH` is older. `:NeovideHelp`, which Neovide adds to every Neovim it runs, opens Neovide's
+  online documentation, not Eitri's.
+- A yank in the editor reaches the system clipboard even when no clipboard tool (wl-clipboard, xclip) is installed.
+  Eitri no longer obeys `NEOVIDE_*` variables from your environment in the Linux window, and `Super+q` no longer quits
+  the editor.
+- A program in the bottom terminal that sets the clipboard with an OSC 52 escape now makes the pane show a notice with
+  the terminal's number, which clipboard it set and how many bytes it wrote.
+
+**Permissions**
+
+- An agent's write into Eitri's own configuration is a card in Manual and Auto, also where Claude Code runs its own
+  auto mode, and no saved rule allows it: `~/.config/eitri` (`init.lua`, `lua/`, `neovide.toml`), Eitri's data and
+  state directories (your plugins, the saved rules, trusted projects, remembered modes) and the directory the program
+  runs from. Until now Claude Code's auto mode decided these writes, and what was written took effect at the next
+  start. Bypass still allows them. A shell command that reaches them without naming them is not caught
+  (`docs/guide/permissions.md`, "Eitri's own configuration").
+
+**Installing**
+
+- The installer tries a download again when the connection breaks or stalls, and a file download picks up where it
+  stopped: up to eight attempts in a row that receive nothing (20 in all), waiting 2 to 16 seconds between them. Every
+  file is still checked against the signature or its pinned hash afterwards. npm is asked for five tries as well,
+  unless your environment sets `npm_config_fetch_retries`. A download that still fails names the file, the host and what
+  was tried, and points at `https_proxy` and `--base-url`. An attempt now gives up after a minute under 1 KiB/s (it was
+  five minutes, with no second attempt), and a connection after 30 seconds.
+- A cut-off `install.sh` runs nothing and exits non-zero wherever the cut falls after its first line; until now a cut
+  inside its opening comment exited 0. A download that breaks before its first byte still exits 0 through the pipe:
+  INSTALL.md shows a download-first line for scripts (`On a slow or filtered network`).
+- On Ubuntu, the end of an install now says plainly that the agent panel stays off until the two printed `sudo`
+  commands are run, and why. The installer still never runs `sudo`.
+- This installer does not install 0.3.0 or older. Asked for one (`--version 0.3.0`, say), it stops before
+  downloading anything and says to use that release's own `install.sh` (its release asset, or the file at its tag);
+  until now it downloaded the release and then called it "not a valid Eitri release". `--from-source --checkout` is not
+  affected.
+- X11: GNOME on Xorg (Ubuntu 24.04) has been tried and works; other X11 sessions are untested (`docs/known-issues.md`).
 
 **Sidecar updates, without a new Eitri**
 
@@ -95,9 +276,26 @@ you. Your Neovim stays the editor: a real `nvim --embed` with your own `init.lua
 **Fixed**
 
 - An idle Claude session's sidecar no longer grows. In 0.3.0 each one grew 30 to 47 MB an hour for as long as the tab
-  stayed open. This release bundles sidecar 0.3.0: in the same 25-minute test of one idle session, its memory held at
-  102.6 MB from the fifth minute, where Eitri 0.3.0's grew 22 MB an hour (the JavaScript heap 44 MB an hour, against
-  0.3).
+  stayed open. This release bundles sidecar 0.5.0, which carries the fix from sidecar 0.3.0: in the same 25-minute test
+  of one idle session on sidecar 0.3.0, its memory held at 102.6 MB from the fifth minute, where Eitri 0.3.0's grew
+  22 MB an hour (the JavaScript heap 44 MB an hour, against 0.3). That test was not repeated on 0.5.0.
+- Answering a permission card no longer freezes the window while the reply is sent, and a mode that could not be saved
+  says so. A key you hold down never answers a card or follows a link hint.
+- Fewer freezes and crashes: opening a path, reading a scratch draft and closing a window no longer wait on the disk on
+  the GTK thread; terminal output can no longer exhaust memory or kill the shell, and a paste that times out is
+  cancelled; a malformed subagent chain, clipboard text with a NUL and a cyclic layout no longer crash; and a stale
+  instance sweep never deletes a live window's files.
+- Turn review's revert never deletes a file that existed before the turn, and reverting one hunk follows later edits
+  to the file. A removed line's tabs line up with the buffer in the drawing, and the editor's reload timer no longer
+  opens a swap dialog or an E211 stall in your Neovim.
+- A Codex or ACP agent whose stream breaks is stopped and a cancel is never lost; a Claude tab's steered messages keep
+  their order; `!` commands no longer leave reader threads behind and say when their output is partial.
+- Long conversations stream without the page's work growing with their length, and zooming the agent panel keeps your
+  place. The status band stays one row, and a link opens on one click only when all of it is on screen.
+- On Hyprland the editor no longer shows shifted up, and on a compositor that rounds window corners the editor's
+  inner corners show its own colour instead of the desktop. In compositor mode, a burst of window closes keeps a
+  group's tabs.
+- Neovim's snippet and socket directories live only where no other user can swap them.
 
 **What this can break:**
 
@@ -107,9 +305,10 @@ you. Your Neovim stays the editor: a real `nvim --embed` with your own `init.lua
   kept for it either way.
 - **In that mode, closing a chat window forgets its tabs,** with no question when it is idle. Closing the editor's
   window keeps them.
-- **New default keys after the prefix: `F`, `S`, `_` and `W`.** An `init.lua` that sets one of them stops at start until
-  it puts `eitri.keymap.del("prefix", "<key>")` first, and a page loaded with `key = "F"` (or `S`, `W`, `_`) is refused;
-  the startup message names the key and what holds it.
+- **New default keys after the prefix: `F`, `S`, `_`, `W`, `O`, `u` and `B`.** If your `init.lua` already binds one
+  with `eitri.keymap.set`, your binding wins and Eitri says so once at start, naming the key and the action it
+  replaced; the new default is not on that key. A Lua panel or a plugin page whose module key is one of them
+  loses the key, and the startup message names the key and what holds it.
 - **On sway or i3 with Alt as `$mod`, the Alt keys after the prefix move to Ctrl+Alt** unless your `init.lua` touches
   any of them.
 - **In a Bypass tab, the calls of a dynamic workflow's agents are now cards.** Claude Code does not show Eitri those
@@ -122,6 +321,11 @@ you. Your Neovim stays the editor: a real `nvim --embed` with your own `init.lua
   nothing lies that way, so `Ctrl+k` and `Ctrl+j` could leave for the panel. Windows that overlap are still left to it.
 
 ## What's new in 0.3.0
+
+0.3.0 is the tiling release. The window becomes a keyboard-driven tiling manager, Codex and any agent that speaks
+ACP join Claude Code, and you can put web pages of your own in the window. A Claude Code tab now also shows what
+Claude Code does on its own: background tasks, workflows, the turns it starts by itself and the questions it asks
+you. Your Neovim stays the editor: a real `nvim --embed` with your own `init.lua`, plugins, LSP and keymaps.
 
 **Your Neovim**
 
@@ -254,13 +458,13 @@ The agents guide's first section describes all of this.
 
 **What this can break:**
 
-- **Your `init.lua` may stop Eitri at startup** if it `set`s one of the new prefix keys, as every `set` over a
-  default does; the message names the key. The new keys, in the spelling `eitri.keymap` takes: `m`, `M`, `q`, `E`,
-  `H`, `J`, `K`, `L`, `s`, `Space`, `(`, `)`, `$`, `!`, `C-o`, `C-=`, `C-+`, `C--`, `C-0`, `M-3`, `M-4`, `M-5`,
-  `M-e`, `M-o`, `M-w`, `M-s`, `M-a`, `M-d`, `M-H`, `M-J`, `M-K`, `M-L`, `M-Enter`, `M-S-Space`, `M--` and `M-_`. Put
-  `k.del("prefix", "<key>")` before that `set`. With the tmux import on and your tmux configuration binding the
-  key, no `del` is needed. A `del` of a key that is not bound also stops startup, so add these lines when you
-  upgrade, not before. A Lua panel or plugin keyed `H`, `J` or `K` now stops startup too.
+- **A key of yours over one of the new prefix keys takes it, and the new action is not on that key.** Eitri says so
+  once at start, naming the key and the action it replaced. The new keys, in the spelling `eitri.keymap` takes: `m`,
+  `M`, `q`, `E`, `H`, `J`, `K`, `L`, `s`, `Space`, `(`, `)`, `$`, `!`, `C-o`, `C-=`, `C-+`, `C--`, `C-0`, `M-3`, `M-4`,
+  `M-5`, `M-e`, `M-o`, `M-w`, `M-s`, `M-a`, `M-d`, `M-H`, `M-J`, `M-K`, `M-L`, `M-Enter`, `M-S-Space`, `M--` and `M-_`.
+  A `eitri.keymap.del("prefix", "<key>")` before your `set` still works and says nothing, and with the tmux import on
+  and your tmux configuration binding the key you need no `del`. A `del` of a key that nothing is bound to is left out
+  and listed at start; the rest of your keys apply. A Lua panel or plugin keyed `H`, `J` or `K` loses its key.
 - **`init.lua` is read from `$XDG_CONFIG_HOME/eitri`** when that variable is set to an absolute path, and from
   `~/.config/eitri` otherwise (`EITRI_CONFIG_DIR` still comes first); 0.2.2 read `~/.config/eitri` whatever
   `XDG_CONFIG_HOME` said. If your `XDG_CONFIG_HOME` points elsewhere, move your configuration there.
@@ -295,6 +499,23 @@ The agents guide's first section describes all of this.
   its own rules unless its registration names the new `read_only_mode`.
 - **`eitri FILE` when a window of the project is open hands the file to that window** instead of starting one;
   `--new-window` is the way to get a new window.
+- **Cards are answered in card mode.** `a`, `d` and `D` in BROWSE, `]p` and `[p`, and `Ctrl+y` in the box answer nothing
+  now; they say where the card keys are. Enter card mode with `Alt-n` or `Enter` on the card, then answer with `1`, `2`
+  or `3`, or `h`/`l` and `Enter`. A click on a button still answers. The `y/n` questions Eitri asks (entering Bypass,
+  stopping a turn, closing a tab) keep `y` and `n`.
+- **`Ctrl+o` in BROWSE goes back through your jumps** and no longer shows the detailed view: that is `zi`. The message
+  box keeps `Ctrl+o` for it.
+- **`eitri` in a terminal returns the prompt at once and prints nothing.** The window runs on its own, so closing the
+  terminal no longer ends it, and its output goes to a log. `eitri --no-fork` is the old way.
+- **Starting Eitri from the desktop shows the project list** instead of opening your home folder; set
+  `window.desktop_start = "cwd"` for the old behaviour.
+- **Agents get editor tools by default,** in every kind of tab, and can read your open buffers with unsaved changes;
+  `agent.editor.tools = false` turns them off. Writes through them are cards in Manual and Auto.
+- **A Neovim older than 0.11 no longer runs as Eitri's editor.** The installer and `eitri setup` offer a private 0.12.6.
+  Moving a terminal Neovim in with `:EitriOpen` needs 0.12 on that Neovim.
+- **Eitri reopens your files, splits and tabs** at the next start in a project. `editor.restore = false` turns it off,
+  and a session plugin you use makes Eitri stand aside.
+- **A tmux `bind v ...` after the prefix now takes effect** when `keymap.from_tmux` is on. It used to be skipped.
 - **A mistyped path can open a window.** `eitri typo` used to stop with `no such directory`. In a folder that exists
   it now opens an empty buffer named `typo`, with the project found from that folder, and `:w` creates the file. A
   path in a folder that does not exist still stops the launch.
@@ -365,10 +586,25 @@ tab switch and a reload. Nobody has looked at those screens on a real desktop. A
 without a window had the model plan, revise a plan and carry it out after an approval, an edit after a Manual approval
 wait for an answer, and the model read an attached image; no other version of Claude Code was tried.
 
-None of 0.3.0 has been through real hardware and a person's hands yet, so it is not yet stable enough for everyday
-use. That waits for real hardware and a week of daily use, not for a version number; reports from real desktops
-are especially welcome. What you may run into is listed in the known issues (`docs/known-issues.md` in the
-repository).
+The other work since 0.3.0 was tried in the same isolated, headless session, with Neovim 0.12.6 and scripted agents,
+and by a person only on screenshots from it. Taking over a terminal Neovim passed all 17 of its rows, each of the five
+ways of closing the window among them. Pages beside your own Neovim passed 60 of 60 checks. Reopening your files passed
+its seven window rows, and its record was run on Neovim 0.10.4, 0.11.2 and 0.12.6 and with six starter configurations.
+The project list and the folder browser, the agents pages (after one fix a first pass found), crash records (60 of 60
+rows) and the Markdown diagram viewer (16 of 16) passed their rows too. Live review passed the machine checks of its 14
+rows; one check was marked failed by a host-wide test in four runs in a row, and its cause is not established. The
+launcher change (the prompt back at once, the login shell's `PATH`) was seen in the sandbox and not from a desktop
+launcher. Mermaid drawings in replies are tested without having been looked at on a real desktop. The editor tools ran
+against a fake language server and a scripted model, and the `claude` in your terminal against a stand-in client, not a
+real interactive Claude Code.
+
+None of 0.4.0 has been through real hardware and a person's hands, so it is not yet stable enough for everyday use.
+The verification record counts no run on real hardware and no recorded week of daily use. What ran was scripts, a
+headless session and scripted stand-ins, the virtual-machine runs on Hyprland 0.57.0 and 0.56.2 named above, and the
+real Claude Code runs named above (2.1.302 and 2.1.311). Still not seen: GNOME's raise, KDE, a scaled output, a person
+at a real desktop with a real account, and any other Claude Code version. That waits for real hardware and a week of daily
+use, not for a version number; reports from real desktops are especially welcome. What you may run into is listed in
+the known issues (`docs/known-issues.md` in the repository).
 
 ## Performance, against native Neovide
 

@@ -16,7 +16,7 @@ This is the recommended way, on every distribution; on Arch, the [AUR package](#
 It installs into `~/.local`, without `sudo`, and builds the agent sidecar on your machine
 ([why](#why-the-sidecar-is-built-on-your-machine)), which takes a few minutes, network access and about
 1.4 GiB of free disk space while it builds. Options go after `sh -s --`, for example `… | sh -s -- --version 0.4.0 --yes`;
-`sh install.sh --help` lists them all. This installer installs 0.3.1 and later; to install an older release, use that
+`sh install.sh --help` lists them all. This installer does not install 0.3.0 or older; to install one of those, use that
 release's own `install.sh` (its release asset, for example
 `https://github.com/HunterGrey-cyber/eitri/releases/download/v0.3.0/install.sh`).
 
