@@ -1,9 +1,10 @@
 [English](keys.md) | 简体中文
-<!-- translated-from: keys.md sha256=bf471bda6efae78061b3c8acd2d423c0278992f97a45d2818454c840478d2cc0 -->
+<!-- translated-from: keys.md sha256=aaf574350e1dfdf3c22b7695bd41f9a3deb54c46eb43ede2315dc3a9a6cab88b -->
 
 # 按键
 
 Eitri 的按键来自三个地方，它们互不冲突：用于窗口本身（标签页、模块、布局）的**前缀**；在窗口里**任何地方**都有效的几个键；以及**agent 面板自己的按键**，那些是 vim 的。下面写的都是默认设置。在面板里按 `F1` 会列出你自己这套设置下的按键，包括你在[自己的配置](configuration.zh-CN.md)里改过的，或者从 tmux 拿过来的。
+没用过 tmux 的话，先看[这 6 个键](tmux-6-keys.zh-CN.md)，其余的用到再查。
 
 > **第一次用前缀键？**
 >
@@ -28,6 +29,53 @@ Eitri 的按键来自三个地方，它们互不冲突：用于窗口本身（�
 > - **在 Hyprland、sway 和 niri 上，这一页的布局键默认关闭**，因为窗口由你的窗口管理器排布：`Ctrl+b %` 只显示一条提示，不做别的。
 >   [合成器窗口](compositor-windows.zh-CN.md#keys)说明哪些键在那里仍然有效，`window.tiling = "eitri"` 把其余的键带回来。在那种模式下，`:EitriTutor` 教的是那种模式的键。
 
+## 最常用的键
+
+把散在下面各节的常用键收成几张表，每一行都能在对应的小节找到完整说明。
+
+**在模块之间**
+
+| 按键 | 作用 | 详见 |
+|---|---|---|
+| `Ctrl+h` / `j` / `k` / `l` | 按键焦点移到左 / 下 / 上 / 右边的模块；在编辑器里先在 Neovim 自己的窗口之间走，走到头才跨出去 | [在窗格之间移动](#moving-between-panes) |
+| `<prefix> e` / `a` / `t` | 显示并聚焦编辑器 / agent / 终端；它已经有焦点时就隐藏它 | [前缀](#the-prefix) |
+| `<prefix> z` | 把当前模块放大到整个窗口，再按一次还原 | [前缀](#the-prefix) |
+| `<prefix> %` / `<prefix> "`，再按 `e`、`a` 或 `t` | 在右边 / 下面打开那个模块，或把它移过去 | [前缀](#the-prefix) |
+| `<prefix> Alt+Enter` | 在右边开一个新终端，shell 从项目根目录启动 | [容器和终端](#containers-and-terminals) |
+| `<prefix> x` | 关掉当前模块，先问 `y/n` | [前缀](#the-prefix) |
+| `<prefix> ?` | 列出所有键 | [前缀](#the-prefix) |
+
+**对话标签页**
+
+| 按键 | 作用 |
+|---|---|
+| `<prefix> c` | 新标签页 |
+| `<prefix> n` / `<prefix> p` | 下一个 / 上一个标签页 |
+| `<prefix> 1` ... `9` | 按编号去某个标签页 |
+| `<prefix> w` | 列出开着的标签页和保存的会话，用来切换或接着聊 |
+| `<prefix> !` | 把当前标签页拆成单独的对话视图；在那个视图里再按一次就合回去 |
+| `<prefix> u` | 跳到等你最久的那个 agent，不管它在哪个窗口 |
+
+**在 agent 面板里**
+
+| 按键 | 作用 | 详见 |
+|---|---|---|
+| `i` / `Esc` | 进入输入框 / 回到浏览对话 | [面板的模式](#the-panels-modes) |
+| `Enter`（输入时） | 发送；回合进行中按，就是插话，回合不停 | [在 INSERT 里](#in-insert) |
+| `Ctrl+c` | 打断正在跑的回合 | [在 INSERT 里](#in-insert) |
+| `Alt-n`，然后 `1` / `2` / `3` | 接过下一张在等的卡片，按数字回答；`1` 是允许，最后一个数字总是拒绝 | [回答一张卡片](#answering-a-card) |
+| `c`（浏览时） | 看这个标签页最近一个回合期间磁盘上改了什么 | [在 BROWSE 里](#in-browse) |
+| `Shift+Tab` | 在 manual、auto、bypass 之间切换（切进 bypass 前会先问） | [面板的模式](#the-panels-modes) |
+| `f`（浏览时） | HINT：给能跳过去的地方都标上字母，输入字母就过去 | [HINT](#hint) |
+| `F1` | 列出面板的键 | |
+
+**从编辑器发起**
+
+| 按键 | 作用 | 详见 |
+|---|---|---|
+| Visual 选中后 `<leader>ae` | 焦点跳到面板，输入框里写好 `Edit the selection: ` | [从 Neovim 编辑选区](#editing-the-selection-from-neovim) |
+
+<a id="the-prefix"></a>
 ## 前缀
 
 前缀就是原版 tmux 的：按下 `Ctrl+b`，松开，再按一个键。它在编辑器、面板和底部终端看到任何东西之前就被读走，所以不管按键焦点在哪里它都有效。`Esc` 取消它，按下表里没绑定的键会结束等待而不做任何事。要把 `Ctrl+b` 本身发给当前拿着按键的东西，连按两次。`<prefix> ?` 打开完整按键表，并滚到“After `<prefix>`”一节。等待前缀后续按键时，提示条以 `? keys` 结尾；这里使用 `panel.keymap` 的实际绑定，未绑定时不显示这一项。
@@ -447,6 +495,7 @@ end
 
 每个冲突每次启动记一行日志，只有冲突的集合和上次弹出时不同才弹一次提示。KDE 和 niri 没有来源，来自它们的冲突、来自 sway 的 include、或来自你重新配置过的输入法的冲突，Eitri 都看不见：根键没反应时，去那里找。这项检查只在 Eitri 自己的窗口里运行：companion 窗口和 Mac 主机不运行它。
 
+<a id="the-panels-modes"></a>
 ## 面板的模式
 
 面板有两种模式，显示在它底部状态条的左边，样式、颜色和位置都和编辑器自己的状态栏显示模式的那一块一样（用 lualine 时就是 lualine 的模式块）。
@@ -509,6 +558,7 @@ end
 
 前四个操作会清空草稿。这些词都不会给 Claude 发送消息。其他斜杠命令的行为不变：`/clear`、`/compact`、`/cost`、`/context`、`/usage`、`/model`、`/mcp`、`/agents`、`/doctor` 和 `/output-style` 会产生效果；单独的 `/model` 或 `/effort` 会打开选择器，回合运行时也可以，`/model <名称>` 作为消息发送（ACP 标签页里它设置 agent 列出的模型）。`/login` 和 `/config`，以及带参数的 `/resume`，需要完整终端，会被拒绝并显示消息。其他词，包括提示词模板和你自己的命令，按输入的原样发出。`?` 列出能用的 CLI 命令。在 Codex 标签页中，这八个词都作为文字发出，没有 Claude 命令的拦截或选择器。在你注册的 agent 的标签页中，`/model` 和 `/effort` 从 agent 列出的选项里选（见[agents](agents.zh-CN.md#model-and-effort)），其余的作为文字发出。
 
+<a id="in-browse"></a>
 ### 在 BROWSE 里
 
 | 按键 | 作用 |

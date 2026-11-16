@@ -6,6 +6,7 @@ Eitri's keys come from three places, and they do not collide: a **prefix** for t
 modules, layout), a few keys that work **everywhere** in the window, and the **agent panel's own keys**,
 which are vim's. Everything below is the default setup. `F1` in the panel lists the keys of your own setup,
 including anything you changed in [your configuration](configuration.md) or took over from tmux.
+If you have never used tmux, start with [these 6 keys](tmux-6-keys.md) and look up the rest when you need it.
 
 > **First time with prefix keys?**
 >
@@ -35,6 +36,52 @@ including anything you changed in [your configuration](configuration.md) or took
 >   the windows: `Ctrl+b %` shows one hint and does nothing else. [Compositor windows](compositor-windows.md#keys) says
 >   which keys still work there, and `window.tiling = "eitri"` brings the rest back. There `:EitriTutor` teaches that
 >   mode's keys instead.
+
+## The most used keys
+
+The keys you will press most, gathered from the sections below; each row points to where it is described in full.
+
+**Between modules**
+
+| keys | what they do | details |
+|---|---|---|
+| `Ctrl+h` / `j` / `k` / `l` | move the keys to the module on the left / below / above / right; in the editor Neovim's own windows come first, and the key crosses only at the edge | [Moving between panes](#moving-between-panes) |
+| `<prefix> e` / `a` / `t` | show and focus the editor / the agent / the terminal, or hide it when it already has the keys | [The prefix](#the-prefix) |
+| `<prefix> z` | zoom this module to fill the window, or restore it | [The prefix](#the-prefix) |
+| `<prefix> %` / `<prefix> "`, then `e`, `a` or `t` | open that module to the right of / below this one, or move it there | [The prefix](#the-prefix) |
+| `<prefix> Alt+Enter` | open a new terminal to the right, with its shell in the project root | [Containers and terminals](#containers-and-terminals) |
+| `<prefix> x` | close this module, after a `y/n` question | [The prefix](#the-prefix) |
+| `<prefix> ?` | list every key | [The prefix](#the-prefix) |
+
+**Chat tabs**
+
+| keys | what they do |
+|---|---|
+| `<prefix> c` | a new tab |
+| `<prefix> n` / `<prefix> p` | the next / the previous tab |
+| `<prefix> 1` ... `9` | that tab by number |
+| `<prefix> w` | the open tabs and the saved sessions, to switch or resume |
+| `<prefix> !` | break the active tab out into a chat view of its own; in that view, join it back |
+| `<prefix> u` | go to the agent that has waited longest for you, in whichever window it is |
+
+**In the agent panel**
+
+| keys | what they do | details |
+|---|---|---|
+| `i` / `Esc` | into the message box / back to browsing the conversation | [The panel's modes](#the-panels-modes) |
+| `Enter` (typing) | send; while a turn runs it goes into that turn without stopping it | [In INSERT](#in-insert) |
+| `Ctrl+c` | interrupt the running turn | [In INSERT](#in-insert) |
+| `Alt-n`, then `1` / `2` / `3` | take the next waiting card and answer it with a digit; `1` approves, and the last digit always denies | [Answering a card](#answering-a-card) |
+| `c` (browsing) | what changed on disk during the tab's latest turn | [In BROWSE](#in-browse) |
+| `Shift+Tab` | cycle manual, auto and bypass (entering bypass asks first) | [The panel's modes](#the-panels-modes) |
+| `f` (browsing) | HINT: label everything you can jump to, and type a label to go there | [HINT](#hint) |
+| `F1` | list the panel's keys | |
+
+**From the editor**
+
+| keys | what they do | details |
+|---|---|---|
+| `<leader>ae` in Visual mode | put the keys in the panel with `Edit the selection: ` already in the box | [Editing the selection from Neovim](#editing-the-selection-from-neovim) |
 
 ## The prefix
 

@@ -2,9 +2,12 @@ English | [简体中文](INSTALL.zh-CN.md)
 
 # Installing Eitri
 
-**You need:** x86_64 Linux with GTK ≥ 4.14, WebKitGTK 6.0 and glibc ≥ 2.39 (Ubuntu 24.04, Debian 13,
-Fedora 40+, RHEL 10, Arch); **nvim ≥ 0.11** (the installer can fetch a private copy for Eitri if yours is
-older); and **Claude Code** (the `claude` command), installed and set up.
+Check these first:
+
+- **System:** x86_64 Linux with GTK ≥ 4.14, WebKitGTK 6.0 and glibc ≥ 2.39. Ubuntu 24.04, Debian 13, Fedora 40+,
+  RHEL 10 and Arch qualify; Ubuntu 22.04 and Debian 12 are too old.
+- **Neovim ≥ 0.11.** If yours is older, the installer can fetch a private copy for Eitri and leave your own nvim alone.
+- **Claude Code** (the `claude` command), installed and set up.
 
 ## Quick install
 
@@ -12,13 +15,14 @@ older); and **Claude Code** (the `claude` command), installed and set up.
 curl --proto '=https' --proto-redir '=https' --tlsv1.2 -sSfL https://github.com/HunterGrey-cyber/eitri/releases/latest/download/install.sh | sh
 ```
 
-This is the recommended way, on every distribution; on Arch, the [AUR package](#aur-arch) fits better.
-It installs into `~/.local`, without `sudo`, and builds the agent sidecar on your machine
-([why](#why-the-sidecar-is-built-on-your-machine)), which takes a few minutes, network access and about
-1.4 GiB of free disk space while it builds. Options go after `sh -s --`, for example `… | sh -s -- --version 0.4.0 --yes`;
-`sh install.sh --help` lists them all. This installer does not install 0.3.0 or older; to install one of those, use that
-release's own `install.sh` (its release asset, for example
-`https://github.com/HunterGrey-cyber/eitri/releases/download/v0.3.0/install.sh`).
+This is the recommended way on every distribution; on Arch, the [AUR package](#aur-arch) fits better.
+
+- It installs into `~/.local`, without `sudo`.
+- It builds the agent sidecar on your machine ([why](#why-the-sidecar-is-built-on-your-machine)), which takes a few
+  minutes, network access and about 1.4 GiB of free disk space while it builds.
+- Options go after `sh -s --`, for example `… | sh -s -- --version 0.4.0 --yes`; `sh install.sh --help` lists them all.
+- This installer installs 0.4.0 and later; it refuses 0.3.0 and older. To install an older release, use that release's
+  own `install.sh` (its release asset, for example `https://github.com/HunterGrey-cyber/eitri/releases/download/v0.3.0/install.sh`).
 
 To check the download's signature before running it, see [Verify before running](#verify-before-running).
 
@@ -110,12 +114,13 @@ source, so it puts nothing of Anthropic's into any release file either.
 
 ## Updating
 
-Run the same route again. `sh install.sh` does nothing if you already have the latest release. Otherwise
-it builds the new sidecar first and switches only when that worked, so a failed update leaves your install
-as it was. Restart open Eitri windows afterwards.
+Run the same route again.
 
-For a `.deb` or `.rpm`, upgrade with your package manager, then run `eitri setup` again (it does nothing
-when the sidecar is already built).
+- `sh install.sh` does nothing if you already have the latest release. Otherwise it builds the new sidecar first and
+  switches only when that worked, so a failed update leaves your install as it was. Restart open Eitri windows
+  afterwards.
+- For a `.deb` or `.rpm`, upgrade with your package manager, then run `eitri setup` again (it does nothing when the
+  sidecar is already built).
 
 Coming from 0.2.2: the update builds the agent sidecar again, since 0.3.0 pins a newer one, and Eitri now reads
 its settings from `$XDG_CONFIG_HOME/eitri` when `XDG_CONFIG_HOME` is set to an absolute path (0.2.2 always read

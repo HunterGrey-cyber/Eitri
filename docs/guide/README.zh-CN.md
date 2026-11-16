@@ -1,5 +1,5 @@
 [English](README.md) | 简体中文
-<!-- translated-from: README.md sha256=f67efe57c9ecb487ede29377467a5ea49d1f0e21defe9166081c50599257e80f -->
+<!-- translated-from: README.md sha256=4b5a43a5548d44c6fd8f787480cdd354c2f914f8cb932e0e9208f2bc924b3cfb -->
 
 # Eitri 文档
 
@@ -31,6 +31,7 @@ Eitri 不取代 Neovim：缓冲区、动作、LSP 和补全仍然是 Neovim 自�
 - [安装](../../INSTALL.zh-CN.md)：软件包、安装脚本、从源码构建，以及验证下载的文件。
 - [快速上手](getting-started.zh-CN.md)：打开一个项目、发送你的第一个提示，并熟悉各处。
 - [从 tmux 迁过来](migrate-from-tmux.zh-CN.md)：Eitri 会接过你 tmux、Neovim 和 agent 配置里的哪些东西，哪些用法会变，哪些带不过来，以及怎么退回去。
+- [没用过 tmux？先记这 6 个键](tmux-6-keys.zh-CN.md)：没用过 tmux 的人，头一天要会的 6 个键。
 - [按键](keys.zh-CN.md)：前缀、面板的按键，以及在窗格之间移动。
 - [配置](configuration.zh-CN.md)：`$XDG_CONFIG_HOME/eitri/init.lua`（默认 `~/.config/eitri/init.lua`）、它读取的设置和按键映射。
 - [编辑器怎样把画面送上屏幕](editor-presentation.zh-CN.md)：编辑器自己的 Wayland surface、`editor.presentation` 和退回。

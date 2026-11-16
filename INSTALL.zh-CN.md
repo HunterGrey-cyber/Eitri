@@ -1,9 +1,13 @@
 [English](INSTALL.md) | 简体中文
-<!-- translated-from: INSTALL.md sha256=38db6c93508490cdbccaf33da64a5da5a998491c396949cd4779cb77abfa7aaa -->
+<!-- translated-from: INSTALL.md sha256=2c103036ed3484fea86c1618288d0b7fd9e8fd8731793ce932452bceb78ea3ca -->
 
 # 安装 Eitri
 
-**你需要：** x86_64 Linux，带 GTK ≥ 4.14、WebKitGTK 6.0 和 glibc ≥ 2.39（Ubuntu 24.04、Debian 13、Fedora 40+、RHEL 10、Arch 都满足）；**nvim ≥ 0.11**（你的版本更旧时，安装脚本可以给 Eitri 单独下载一份私有副本）；以及已经安装并配置好的 **Claude Code**（`claude` 命令）。
+先确认这几样：
+
+- **系统**：x86_64 Linux，GTK ≥ 4.14、WebKitGTK 6.0、glibc ≥ 2.39。Ubuntu 24.04、Debian 13、Fedora 40+、RHEL 10、Arch 都满足；Ubuntu 22.04 和 Debian 12 太旧。
+- **Neovim ≥ 0.11**。你的版本更旧也没关系，安装脚本可以给 Eitri 单独下一份私有副本，不动你自己的 nvim。
+- **Claude Code**（`claude` 命令），已经装好并设置好。
 
 <a id="quick-install"></a>
 ## 快速安装
@@ -12,7 +16,12 @@
 curl --proto '=https' --proto-redir '=https' --tlsv1.2 -sSfL https://github.com/HunterGrey-cyber/eitri/releases/latest/download/install.sh | sh
 ```
 
-这是推荐的安装方式，适用于所有发行版；Arch 上用 [AUR 包](#aur-arch)更合适。装到 `~/.local`，不需要 `sudo`。安装时还会在你的机器上构建 agent sidecar（[原因](#why-the-sidecar-is-built-on-your-machine)），要几分钟，需要联网，构建时需要大约 1.4 GiB 的可用磁盘空间。选项写在 `sh -s --` 后面，例如 `… | sh -s -- --version 0.4.0 --yes`；全部选项见 `sh install.sh --help`。这个安装脚本不安装 0.3.0 及更早的版本；要安装这些版本，请用那个版本自己的 `install.sh`（它的发布文件，例如 `https://github.com/HunterGrey-cyber/eitri/releases/download/v0.3.0/install.sh`）。
+所有发行版都推荐这样装；Arch 用户用 [AUR 包](#aur-arch)更顺手。
+
+- 装到 `~/.local`，不需要 `sudo`。
+- 会在你机器上构建 agent sidecar（[为什么](#why-the-sidecar-is-built-on-your-machine)）：要几分钟，需要联网，构建时大约占 1.4 GiB 磁盘。
+- 选项写在 `sh -s --` 后面，例如 `… | sh -s -- --version 0.4.0 --yes`；全部选项见 `sh install.sh --help`。
+- 这个安装脚本安装 0.4.0 及以后的版本，0.3.0 及更早的会被拒绝。要安装更早的版本，请用那个版本自己的 `install.sh`（它的发布文件，例如 `https://github.com/HunterGrey-cyber/eitri/releases/download/v0.3.0/install.sh`）。
 
 想在运行前先校验下载的签名，见[运行前先验证](#verify-before-running)。
 
@@ -88,9 +97,10 @@ sidecar 打包了 Anthropic 的 `@anthropic-ai/claude-agent-sdk`（"© Anthropic
 <a id="updating"></a>
 ## 更新
 
-再走一遍同样的安装方式就行。如果已经是最新版本，`sh install.sh` 什么都不做；否则它先构建新的 sidecar，成功了才切换，所以更新失败不会动到你现有的安装。更新之后，重启已经打开的 Eitri 窗口。
+再走一遍同样的安装方式就行。
 
-`.deb` 或 `.rpm` 用包管理器升级，然后再运行一次 `eitri setup`（sidecar 已经构建好时，它什么都不做）。
+- `sh install.sh`：已经是最新版就什么都不做。否则先把新的 sidecar 构建好，成功了才切过去，所以更新失败时原来的安装保持原样。更新完重启已经打开的 Eitri 窗口。
+- `.deb` / `.rpm`：用包管理器升级，然后再运行一次 `eitri setup`（sidecar 已经构建好时它什么都不做）。
 
 从 0.2.2 升级上来：这次更新会重新构建 agent sidecar，因为 0.3.0 固定了一个更新的版本；另外，`XDG_CONFIG_HOME` 设为绝对路径时，Eitri 现在从 `$XDG_CONFIG_HOME/eitri` 读取设置（0.2.2 总是读 `~/.config/eitri`），两者不同时请把设置挪过去。
 

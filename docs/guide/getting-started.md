@@ -2,24 +2,23 @@ English | [简体中文](getting-started.zh-CN.md)
 
 # Getting started
 
+
 This page takes you from the command to a first finished turn: opening a project, sending a prompt,
 answering the cards Eitri shows, working with several sessions, and what the panel says when a turn does not
-end well. It assumes Eitri is [installed](../../INSTALL.md) and the `claude` command is
-installed and set up. Eitri runs the `claude` on its `PATH`; when that has none, which is common for a window started from
-a desktop launcher or a menu rather than a terminal, it looks where Claude Code's installers put it, in this
-order: `~/.local/bin/claude` (the installer from the quickstart page), `~/.claude/local/claude` (older local
-installs), and the `bin` directory of npm's global prefix when you set one yourself (`NPM_CONFIG_PREFIX`, or
-`prefix` in `~/.npmrc`). It takes the first that is a regular file you may run, owned by you or by root, which
-neither it nor any directory on the way to it (links followed) can be written by other users; anything else there
-is skipped and the window's log says why. Setting `VERDANDI_CLAUDE_CLI_PATH` to a path chooses the program
-yourself, and Eitri then looks nowhere else. If Eitri cannot find `claude`, the first-start screen and a Claude
-tab's failure row say so, name the places it looked, and give the address to get it from,
-<https://code.claude.com/docs/en/quickstart>; install it, then press `r` in the tab.
+end well.
 
-Keys are written for the default setup: the prefix is `Ctrl+b`, and "the leader" is `Space` unless your
-Neovim configuration sets another `mapleader` of a single key the panel can use (a longer or reserved one falls
-back to `Space`). The full list is in [Keys](keys.md); `F1` in the panel shows it
-too.
+Before you start, [install](../../INSTALL.md) Eitri and set up the `claude` command. Eitri does not ship Claude Code;
+it runs the one you installed. If it cannot find it, see [Where Eitri looks for `claude`](#where-eitri-looks-for-claude)
+at the end of this page.
+
+Keys are written for the default setup:
+
+- The **prefix** is `Ctrl+b`. `<prefix> x` means press `Ctrl+b`, let go, then press `x`, as in tmux.
+- The **leader** is `Space`, unless your Neovim configuration sets another `mapleader` of a single key the panel can use
+  (a longer or reserved one falls back to `Space`).
+
+The full list is in [Keys](keys.md), and `F1` in the panel shows it too. If you have never used tmux, start with
+[these 6 keys](tmux-6-keys.md).
 
 ## The first launch
 
@@ -45,11 +44,8 @@ eitri [DIR]
 ```
 
 `DIR` is the project directory. Without it Eitri uses `$EITRI_PROJECT_DIR` when that is set, and otherwise the
-directory you ran the command in. A path in a folder that does not exist, or an option Eitri does not know, stops
-the launch with a message instead of opening some other directory; to open a directory whose name starts with
-`-`, put `--` before it (`eitri -- -notes`). A name that does not exist in a folder that does is a new file, so a
-mistyped directory name opens an empty buffer of that name. To open a file instead of a directory, see
-[Open a file](#open-a-file).
+directory you ran the command in. A mistyped path stops the launch with a message; the rules for odd names are in
+[Directory arguments](#directory-arguments). To open a file instead of a directory, see [Open a file](#open-a-file).
 
 Started from a terminal, `eitri` gives you the prompt back as soon as the window is up and prints nothing: the
 window runs on its own, so closing that terminal, `exit`, a tmux pane you kill or an ssh session that drops leave it
@@ -58,16 +54,6 @@ command says so, shows what it printed and exits with its code. `eitri --no-fork
 in the foreground, its output in the terminal, and it ends with the terminal. Commands that are not a window
 (`eitri agents`, `eitri sidecar ...`, `eitri setup`, `eitri panel`, `eitri page`, `eitri split`, `eitri open`)
 always stay in the terminal.
-
-A window started from a desktop launcher, a menu or your compositor's key binding has the `PATH` your session gave
-it, which often lacks what your shell configuration adds (`~/.local/bin`, `~/.cargo/bin`, a version manager's
-directory). So such a start asks your login shell once (`$SHELL -i -l -c`, at most 2 seconds) for its `PATH` and
-uses that for the window, its Neovim, the bottom terminal and the agents; with a heavy shell configuration that
-adds its run time to the start (about 0.3 s for a zsh with a banner). Your configuration sees
-`EITRI_RESOLVING_ENVIRONMENT=1` then, if it wants to skip something. If the shell takes too long or fails, the
-window keeps the `PATH` it was given and its log says why. To skip this, set `EITRI_LOGIN_PATH=off`; the other way
-to give every program you start from the desktop the same `PATH` is a file in `~/.config/environment.d/` (for
-example `PATH=$HOME/.local/bin:$PATH` in `10-path.conf`), which systemd's user session reads at login.
 
 Each directory you open is its own window with its own Neovim, its own sessions and its own project root, so you can
 have several projects open at once. The window's title names the project (`myproject — Eitri`, and with two workspaces
@@ -100,16 +86,8 @@ to tell whether a problem comes from your own setup.
 
 **Another project.** Press `<prefix> O` in any window (or `p` on an empty tab, or click the project's name in the top bar) to
 see the projects you opened before, newest first, and go to one: a project that already has a window comes forward, any
-other opens in a new window. You can filter the list or type a path (`~/src/app`; `Tab` completes it).
-
-To look for a project that is not in the list, press `h` on one to see the folder that holds it, and its sibling folders,
-with the project selected. `l` or `Enter` goes into a folder, `h` goes back up, and `Enter` on the `.` row opens the
-folder you are in as a project. A path typed in the line shows that folder's subfolders the same way, and a folder on a
-network share that does not answer says so instead of making the window wait. The keys are in
-[Keys](keys.md#the-prefix). A window that comes forward stays as it was, on the Claude account it started with, even when
-you chose it from a window or a desktop entry on another account; `eitri --account <name> --new-window <dir>` gives the
-project a second window on that account. When a new window cannot start, a short message says the folder is not there, or
-sends you to that project's window log, described in [When Eitri itself crashes](#when-eitri-itself-crashes).
+other opens in a new window. You can filter the list or type a path (`~/src/app`; `Tab` completes it). To look for a
+project that is not in the list, and what the keys do there, see [More on projects](#more-on-projects).
 
 **From the desktop icon.** Starting Eitri from the desktop with no file or folder does not open your home folder. It shows
 the same list in a small window of its own before anything starts: no Neovim, no question about trusting a folder.
@@ -119,82 +97,24 @@ opens in the window you chose. [`window.desktop_start`](configuration.md#setting
 you used most recently without showing the list, and `"cwd"` brings back the old behaviour, the directory the launcher ran
 in. Running `eitri` in a terminal is unchanged.
 
-## Open a file
-
-```sh
-eitri src/lib.rs
-eitri +42 src/lib.rs
-eitri src/lib.rs:42:7
-eitri a.rs b.rs
-eitri DIR FILE
-```
-
-`eitri FILE` opens the file in the editor and finds the project from it: the project is the git repository the file
-sits in, or the file's own folder when there is none, except that your current directory is used instead when it
-holds the file, is itself a usable folder and, with a repository, lies inside it (`cd crate; eitri src/x.rs` opens
-the project `crate`, as `eitri .` there would). A repository counts only when it is a usable folder too (see
-[A folder that is no boundary](permissions.md#a-folder-that-is-no-boundary)); one that is not is skipped, and the
-search goes on above it. From your home directory, `eitri code/scratch/a.py` with no repository opens the project
-`~/code/scratch`, not `~`. A project found this way behaves like one named with `eitri DIR`, including the
-[trust question](permissions.md#trusting-a-project) at the first session. The file does not have to exist yet: its
-folder must, and `:w` creates the file.
-
-- With several files, the first one is shown and all of them are open, as in `nvim a b c`. A file outside the
-  project prints a note and still opens.
-- `+N` before the first file starts on line N, and a bare `+` on its last line. `FILE:LINE` and `FILE:LINE:COL` do
-  the same, but only when no file with that literal name exists. A line applies to the first file only. A word
-  after `+` that is not a number, such as `+page.svelte` or `+/pattern`, is refused because it would be an nvim
-  command; for a file with that name write `./+page.svelte` or `eitri -- +page.svelte`.
-- After `--` every word is a path.
-- `eitri DIR FILE...` keeps `DIR` as the project and shows the files first.
-- A folder that does not exist, a pipe, a socket or a device, and a name that is not valid UTF-8 are refused with a
-  message. `eitri panel` and `eitri split` still take a directory only, and `EITRI_PROJECT_DIR` stays a directory.
-
-**A window for that project is already open.** Then `eitri FILE` does not start another window: the running editor
-opens the file, the window comes to the front with the keys on the editor, and the command returns at once. If that
-window's editor was hidden or has not started yet, it is shown and the file opens when it is ready. Typed in an Eitri
-window's own bottom terminal, `eitri FILE` opens in that window, even after a `cd` into a subfolder, as long as the
-file is inside the window's project. `eitri DIR` and a bare `eitri` always start a new window, and so does
-`eitri --new-window FILE` (`--clean` and `--account` imply it). An account set in `VERDANDI_CLAUDE_ACCOUNT` does not
-imply it: the running window keeps the account it has. Outside a bottom terminal a window on a folder above the
-project worked out here also counts, up to the file's repository, nearest first: `cd repo/crate; eitri src/x.rs` works
-out `crate`, and opens in a window on `repo` when none is open on `crate`. A window that cannot hold every file you
-named is passed over, and with no repository only the project itself is asked. With no such window a new one starts,
-and so it does when the window cannot take the file just now, for instance one sitting in a quit prompt with an
-unsaved buffer.
-When the buffer in the editor has unsaved changes, the file opens in a split and that buffer stays.
-
-On GNOME a window can be raised only by a launch that carries an activation token, which a command typed in a
-terminal does not have: there GNOME may show a "window is ready" notice instead of raising the window. Sway, Hyprland
-and niri are expected to focus the window through the compositor. Only sway has been tried.
-
-**A file with no project of its own.** `eitri ~/notes.md`, `eitri /etc/hosts` and `eitri /tmp/x.py` open too, in the
-file's folder. When that folder cannot serve as a boundary for the agent (your home directory, a folder you do not
-own, a folder other users can write to, the filesystem root), the panel shows a note on every tab page:
-`No project boundary here (<why>): a Claude tab asks before every file and command, and a Codex tab starts read-only,
-without the folder's configuration. Other agents keep their own rules.` It stays until you dismiss it. What that means for each mode is in
-[Permissions](permissions.md#a-folder-that-is-no-boundary).
-
-**From a file manager.** Eitri's desktop entry lists plain text, Markdown, C, C++, Python, Rust, JSON, TOML and shell
-scripts, so it appears under Open With for them (it does not become the default). Such a launch usually starts in your
-home directory, so the project comes from the file as described above. Several files selected together open as
-`eitri a.rs b.rs` does, and several folders open one window each.
-
 ## Your first turn
 
-Press `Ctrl+l` to focus the panel, then `i` (or `Ctrl+j`) to type your prompt. If your module-focus
-key is remapped, use that key instead of `Ctrl+l`. `Enter` sends it; `Shift+Enter` starts a new line, and
-so do `Alt+Enter` and a backslash followed by `Enter`. The session starts when you send the first
-message, not before, and in a project that ships its own Claude Code configuration (`.claude/`, `.mcp.json` or
-`CLAUDE.md`) not before you have answered a question: Eitri holds the start and asks whether to trust that
-configuration. `y` loads it, `n` starts the session without it, and `Esc` puts the start off and gives your
-text back. Until you answer, the panel says "Waiting for your answer to the trust question — nothing has
-started". What the question shows and what each answer means is in
-[Trusting a project](permissions.md#trusting-a-project). Each message also carries the name of the file open in the editor, or the lines you had
-selected there in Visual mode. A selection is what points the agent at a particular piece of code, so select
-the function in the editor first when you say "fix this function"; a cursor position alone is not sent. With lines selected,
-`<leader>ae` in the editor does the first step for you: the keys go to the panel with the box open and `Edit the selection: `
-in it, and what you type after it is an ordinary message ([Keys](keys.md#editing-the-selection-from-neovim) has the details).
+Press `Ctrl+l` to focus the panel, then `i` (or `Ctrl+j`) to type your prompt. If your module-focus key is remapped,
+use that key instead of `Ctrl+l`.
+
+- `Enter` sends the prompt; `Shift+Enter` starts a new line, and so do `Alt+Enter` and a backslash followed by `Enter`.
+- The session starts when you send the first message, not before.
+- In a project that ships its own Claude Code configuration (`.claude/`, `.mcp.json` or `CLAUDE.md`), the session also
+  waits until you have answered a question: Eitri holds the start and asks whether to trust that configuration. `y`
+  loads it, `n` starts the session without it, and `Esc` puts the start off and gives your text back. Until you
+  answer, the panel says "Waiting for your answer to the trust question — nothing has started". What the question shows
+  and what each answer means is in [Trusting a project](permissions.md#trusting-a-project).
+
+Each message also carries the name of the file open in the editor, or the lines you had selected there in Visual mode.
+A selection is what points the agent at a particular piece of code, so select the function in the editor first when you
+say "fix this function"; a cursor position alone is not sent. With lines selected, `<leader>ae` in the editor does the
+first step for you: the keys go to the panel with the box open and `Edit the selection: ` in it, and what you type after
+it is an ordinary message ([Keys](keys.md#editing-the-selection-from-neovim) has the details).
 
 While Claude answers, the reply appears as rendered markdown as it streams in. Each tool the agent runs is a
 quiet line of its own, with a mark in front saying whether it finished (`✓`), failed (`✗`) or is still running
@@ -451,3 +371,117 @@ A crash inside a native library (GTK, WebKit, a graphics driver) writes no recor
 that point is in the log.
 
 Known rough edges are listed in [Known issues](../known-issues.md).
+
+---
+
+## Details
+
+The longer passages that the main line above leaves out.
+
+### Where Eitri looks for `claude`
+
+Eitri runs the `claude` on its `PATH`. A window started from a desktop launcher or a menu rather than a terminal often
+has none there, so Eitri then looks where Claude Code's installers put it, in this order:
+
+1. `~/.local/bin/claude` (the installer from the quickstart page)
+2. `~/.claude/local/claude` (older local installs)
+3. the `bin` directory of npm's global prefix, when you set one yourself (`NPM_CONFIG_PREFIX`, or `prefix` in `~/.npmrc`)
+
+It takes the first that is a regular file you may run, owned by you or by root, which neither it nor any directory on
+the way to it (links followed) can be written by other users; anything else there is skipped and the window's log says
+why. Setting `VERDANDI_CLAUDE_CLI_PATH` to a path chooses the program yourself, and Eitri then looks nowhere else.
+
+If Eitri cannot find `claude`, the first-start screen and a Claude tab's failure row say so, name the places it looked,
+and give the address to get it from, <https://code.claude.com/docs/en/quickstart>; install it, then press `r` in the tab.
+
+### The PATH of a window started from the desktop
+
+A window started from a desktop launcher, a menu or your compositor's key binding has the `PATH` your session gave
+it, which often lacks what your shell configuration adds (`~/.local/bin`, `~/.cargo/bin`, a version manager's
+directory). So such a start asks your login shell once (`$SHELL -i -l -c`, at most 2 seconds) for its `PATH` and
+uses that for the window, its Neovim, the bottom terminal and the agents; with a heavy shell configuration that
+adds its run time to the start (about 0.3 s for a zsh with a banner). Your configuration sees
+`EITRI_RESOLVING_ENVIRONMENT=1` then, if it wants to skip something. If the shell takes too long or fails, the
+window keeps the `PATH` it was given and its log says why. To skip this, set `EITRI_LOGIN_PATH=off`; the other way
+to give every program you start from the desktop the same `PATH` is a file in `~/.config/environment.d/` (for
+example `PATH=$HOME/.local/bin:$PATH` in `10-path.conf`), which systemd's user session reads at login.
+
+### Directory arguments
+
+A path in a folder that does not exist, or an option Eitri does not know, stops the launch with a message instead of
+opening some other directory; to open a directory whose name starts with `-`, put `--` before it (`eitri -- -notes`).
+A name that does not exist in a folder that does is a new file, so a mistyped directory name opens an empty buffer of
+that name.
+
+
+### Open a file
+
+```sh
+eitri src/lib.rs
+eitri +42 src/lib.rs
+eitri src/lib.rs:42:7
+eitri a.rs b.rs
+eitri DIR FILE
+```
+
+`eitri FILE` opens the file in the editor and finds the project from it: the project is the git repository the file
+sits in, or the file's own folder when there is none, except that your current directory is used instead when it
+holds the file, is itself a usable folder and, with a repository, lies inside it (`cd crate; eitri src/x.rs` opens
+the project `crate`, as `eitri .` there would). A repository counts only when it is a usable folder too (see
+[A folder that is no boundary](permissions.md#a-folder-that-is-no-boundary)); one that is not is skipped, and the
+search goes on above it. From your home directory, `eitri code/scratch/a.py` with no repository opens the project
+`~/code/scratch`, not `~`. A project found this way behaves like one named with `eitri DIR`, including the
+[trust question](permissions.md#trusting-a-project) at the first session. The file does not have to exist yet: its
+folder must, and `:w` creates the file.
+
+- With several files, the first one is shown and all of them are open, as in `nvim a b c`. A file outside the
+  project prints a note and still opens.
+- `+N` before the first file starts on line N, and a bare `+` on its last line. `FILE:LINE` and `FILE:LINE:COL` do
+  the same, but only when no file with that literal name exists. A line applies to the first file only. A word
+  after `+` that is not a number, such as `+page.svelte` or `+/pattern`, is refused because it would be an nvim
+  command; for a file with that name write `./+page.svelte` or `eitri -- +page.svelte`.
+- After `--` every word is a path.
+- `eitri DIR FILE...` keeps `DIR` as the project and shows the files first.
+- A folder that does not exist, a pipe, a socket or a device, and a name that is not valid UTF-8 are refused with a
+  message. `eitri panel` and `eitri split` still take a directory only, and `EITRI_PROJECT_DIR` stays a directory.
+
+**A window for that project is already open.** Then `eitri FILE` does not start another window: the running editor
+opens the file, the window comes to the front with the keys on the editor, and the command returns at once. If that
+window's editor was hidden or has not started yet, it is shown and the file opens when it is ready. Typed in an Eitri
+window's own bottom terminal, `eitri FILE` opens in that window, even after a `cd` into a subfolder, as long as the
+file is inside the window's project. `eitri DIR` and a bare `eitri` always start a new window, and so does
+`eitri --new-window FILE` (`--clean` and `--account` imply it). An account set in `VERDANDI_CLAUDE_ACCOUNT` does not
+imply it: the running window keeps the account it has. Outside a bottom terminal a window on a folder above the
+project worked out here also counts, up to the file's repository, nearest first: `cd repo/crate; eitri src/x.rs` works
+out `crate`, and opens in a window on `repo` when none is open on `crate`. A window that cannot hold every file you
+named is passed over, and with no repository only the project itself is asked. With no such window a new one starts,
+and so it does when the window cannot take the file just now, for instance one sitting in a quit prompt with an
+unsaved buffer.
+When the buffer in the editor has unsaved changes, the file opens in a split and that buffer stays.
+
+On GNOME a window can be raised only by a launch that carries an activation token, which a command typed in a
+terminal does not have: there GNOME may show a "window is ready" notice instead of raising the window. Sway, Hyprland
+and niri are expected to focus the window through the compositor. Only sway has been tried.
+
+**A file with no project of its own.** `eitri ~/notes.md`, `eitri /etc/hosts` and `eitri /tmp/x.py` open too, in the
+file's folder. When that folder cannot serve as a boundary for the agent (your home directory, a folder you do not
+own, a folder other users can write to, the filesystem root), the panel shows a note on every tab page:
+`No project boundary here (<why>): a Claude tab asks before every file and command, and a Codex tab starts read-only,
+without the folder's configuration. Other agents keep their own rules.` It stays until you dismiss it. What that means for each mode is in
+[Permissions](permissions.md#a-folder-that-is-no-boundary).
+
+**From a file manager.** Eitri's desktop entry lists plain text, Markdown, C, C++, Python, Rust, JSON, TOML and shell
+scripts, so it appears under Open With for them (it does not become the default). Such a launch usually starts in your
+home directory, so the project comes from the file as described above. Several files selected together open as
+`eitri a.rs b.rs` does, and several folders open one window each.
+
+### More on projects
+
+To look for a project that is not in the list, press `h` on one to see the folder that holds it, and its sibling folders,
+with the project selected. `l` or `Enter` goes into a folder, `h` goes back up, and `Enter` on the `.` row opens the
+folder you are in as a project. A path typed in the line shows that folder's subfolders the same way, and a folder on a
+network share that does not answer says so instead of making the window wait. The keys are in
+[Keys](keys.md#the-prefix). A window that comes forward stays as it was, on the Claude account it started with, even when
+you chose it from a window or a desktop entry on another account; `eitri --account <name> --new-window <dir>` gives the
+project a second window on that account. When a new window cannot start, a short message says the folder is not there, or
+sends you to that project's window log, described in [When Eitri itself crashes](#when-eitri-itself-crashes).
