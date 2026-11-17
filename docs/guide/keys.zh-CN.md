@@ -1,5 +1,5 @@
 [English](keys.md) | 简体中文
-<!-- translated-from: keys.md sha256=aaf574350e1dfdf3c22b7695bd41f9a3deb54c46eb43ede2315dc3a9a6cab88b -->
+<!-- translated-from: keys.md sha256=4b71572c2fc1a8601f5ded6604e4efc3f410eb97f3a154468a508d8afabb1862 -->
 
 # 按键
 
@@ -40,6 +40,7 @@ Eitri 的按键来自三个地方，它们互不冲突：用于窗口本身（�
 | `Ctrl+h` / `j` / `k` / `l` | 按键焦点移到左 / 下 / 上 / 右边的模块；在编辑器里先在 Neovim 自己的窗口之间走，走到头才跨出去 | [在窗格之间移动](#moving-between-panes) |
 | `<prefix> e` / `a` / `t` | 显示并聚焦编辑器 / agent / 终端；它已经有焦点时就隐藏它 | [前缀](#the-prefix) |
 | `<prefix> z` | 把当前模块放大到整个窗口，再按一次还原 | [前缀](#the-prefix) |
+| `<prefix> Ctrl+Left` / `Ctrl+Right` / `Ctrl+Up` / `Ctrl+Down`；`Alt+` 是五格 | 调整这个模块的大小：把它右（下）边的分隔线朝那个方向移，它没有时移左（上）边的；可以连按 | [调整模块大小](#resizing-modules) |
 | `<prefix> %` / `<prefix> "`，再按 `e`、`a` 或 `t` | 在右边 / 下面打开那个模块，或把它移过去 | [前缀](#the-prefix) |
 | `<prefix> Alt+Enter` | 在右边开一个新终端，shell 从项目根目录启动 | [容器和终端](#containers-and-terminals) |
 | `<prefix> x` | 关掉当前模块，先问 `y/n` | [前缀](#the-prefix) |
@@ -375,6 +376,30 @@ k.set("prefix", "C-Space", "send-prefix")
 先确认三件事。fcitx5 的默认触发键就是 `Ctrl+Space`，fcitx5 在运行时，这个键可能根本到不了 Eitri（[不带前缀的键](#keys-without-the-prefix)里的冲突警告只管根键，不管前缀：按一下，看提示条出不出来）。macOS 用它切换输入源。nvim-cmp、blink.cmp 和 kickstart.nvim 在 Insert 模式里把 `<C-Space>` 映射成补全：前缀设成 `Ctrl+Space` 后，要连按两次才能碰到那个映射，就像现在的 `Ctrl+b Ctrl+b`。`send-prefix`（和 `send-keys`）对底部终端也能发出每一个组合键，`Ctrl+Space` 也不例外，shell 里它是 `Ctrl+@`（NUL）。
 
 [首次启动界面](configuration.zh-CN.md#first-start)把 `Ctrl+Space` 列在可选前缀里，也替你做第一次检查：它的按键测试请你按一下这个键，并说明它到没到 Eitri；有输入法在运行时还会事先提醒。没到的话，是输入法或桌面把它拿走了；换一个前缀，或者你就是要改这一点的话，仍然写入。tmux 配置里的 `set -g prefix C-space` 和别的前缀一样会被读取。
+
+<a id="resizing-modules"></a>
+## 调整模块大小
+
+平铺的模块沿分隔线分享窗口，调整大小就是移动一条分隔线。按键焦点在某个模块上时：
+
+| 按键 | 作用 |
+|---|---|
+| `<prefix> Ctrl+Left`、`Ctrl+Right`、`Ctrl+Up`、`Ctrl+Down` | 把分隔线朝那个方向移一格（repeats） |
+| `<prefix> Alt+Left`、`Alt+Right`、`Alt+Up`、`Alt+Down` | 同上，五格（repeats） |
+| 拖动分隔线 | 用鼠标 |
+| `:Eitri resize.left cells=5` | 在 Neovim 里，`resize.left`、`resize.right`、`resize.up`、`resize.down` 都行，`cells=<n>` 给格数 |
+| `eitri.layout.run("resize.left", { cells = 5 })` | 在 `init.lua` 或插件里 |
+
+移动的是模块右边的那条分隔线（`Up`、`Down` 是下边的）；右边没有分隔线时，移左（上）边的那条。所以方向是分隔线的，
+不是模块的：窗口里是编辑器加面板时，编辑器有焦点，`Right` 让编辑器变大；面板有焦点，`Right` 让面板变小。一排三个模块时，
+中间那个移的是它右边的分隔线。一格就是编辑器的一个字符格。模块缩到最小就停住，放大着的模块先回到原位。那个方向没有分隔线时什么也不做。
+
+`<prefix> h` 默认没有绑定，`<prefix> l` 是上一个标签页（`j`、`k` 也空着），默认键里也没有哪个长得像它们的键在交换模块：交换是 `<prefix> Alt+H` ... `Alt+L`（移一步）和
+`<prefix> H`、`J`、`K`（移到最远的边），`<prefix> L` 是上一个工作区。tmux 配置里把 `h`、`j`、`k`、`l` 绑到 `resize-pane` 的，
+会连它的格数和 `-r` 连按一起带过来（`bind -r h resize-pane -L 5` 就是 `<prefix> h`，向左五格，可连按），
+`bind H swap-pane -t '{left-of}'` 则是 `<prefix> H` 上的交换，见[从 tmux 过来](migrate-from-tmux.zh-CN.md)。你在
+`init.lua` 里写的 `eitri.keymap.set` 排在导入之后，会盖过导入的键，所以本想调整大小的键却在交换时，多半是 `init.lua` 里有一条
+`set` 成了 `swap.*`：`<prefix> ?` 会列出每个键现在跑什么，并标出哪些来自 tmux。
 
 <a id="moving-between-panes"></a>
 ## 在窗格之间移动

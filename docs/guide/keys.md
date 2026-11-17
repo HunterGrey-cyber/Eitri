@@ -48,6 +48,7 @@ The keys you will press most, gathered from the sections below; each row points 
 | `Ctrl+h` / `j` / `k` / `l` | move the keys to the module on the left / below / above / right; in the editor Neovim's own windows come first, and the key crosses only at the edge | [Moving between panes](#moving-between-panes) |
 | `<prefix> e` / `a` / `t` | show and focus the editor / the agent / the terminal, or hide it when it already has the keys | [The prefix](#the-prefix) |
 | `<prefix> z` | zoom this module to fill the window, or restore it | [The prefix](#the-prefix) |
+| `<prefix> Ctrl+Left` / `Ctrl+Right` / `Ctrl+Up` / `Ctrl+Down`; `Alt+` for five cells | resize this module: move the divider on its right (bottom) edge that way, or on its left (top) edge when it has none; repeats | [Resizing modules](#resizing-modules) |
 | `<prefix> %` / `<prefix> "`, then `e`, `a` or `t` | open that module to the right of / below this one, or move it there | [The prefix](#the-prefix) |
 | `<prefix> Alt+Enter` | open a new terminal to the right, with its shell in the project root | [Containers and terminals](#containers-and-terminals) |
 | `<prefix> x` | close this module, after a `y/n` question | [The prefix](#the-prefix) |
@@ -557,6 +558,33 @@ check for you: its press test asks for the key once and says whether it reached 
 input method is running. If it did not arrive, an input method or your desktop took it; choose another prefix, or
 write it anyway if you mean to change that. A tmux configuration with `set -g prefix C-space` is read like any
 other prefix.
+
+## Resizing modules
+
+The tiled modules share the window along dividers, and a resize moves one divider. With the keys on a module:
+
+| keys | what they do |
+|---|---|
+| `<prefix> Ctrl+Left`, `Ctrl+Right`, `Ctrl+Up`, `Ctrl+Down` | move the divider one cell that way (repeats) |
+| `<prefix> Alt+Left`, `Alt+Right`, `Alt+Up`, `Alt+Down` | the same, five cells (repeats) |
+| drag a divider | with the mouse |
+| `:Eitri resize.left cells=5` | from Neovim, any of `resize.left`, `resize.right`, `resize.up`, `resize.down`, with `cells=<n>` |
+| `eitri.layout.run("resize.left", { cells = 5 })` | from `init.lua` or a plugin |
+
+The divider that moves is the one on the module's right edge for `Left` and `Right` (its bottom edge for `Up` and
+`Down`), and the one on its left (top) edge when it has none there, so the direction is the divider's, not the
+module's: in a window of editor and panel, `Right` grows the editor when the editor has the keys and shrinks the panel
+when the panel has them. With three modules in a row the middle one moves its right divider. A cell is the editor's
+character cell. A module stops at its minimum size, and a zoomed module comes back to its place first. A key with no
+divider that way does nothing.
+
+`<prefix> h` is not bound by default and `<prefix> l` is the previous tab (`j` and `k` are free too), and none of the default keys that look like these swaps modules: swaps are
+`<prefix> Alt+H` ... `Alt+L` (one step) and `<prefix> H`, `J`, `K` (to the far edge), and `<prefix> L` is the last
+workspace. A tmux config that binds `h`, `j`, `k`, `l` to `resize-pane` gets them with its own count and its `-r`
+repeat (`bind -r h resize-pane -L 5` is `<prefix> h`, five cells left, repeating), and `bind H swap-pane -t
+'{left-of}'` is a swap on `<prefix> H`; see [Coming from tmux](migrate-from-tmux.md). Your own `eitri.keymap.set` in
+`init.lua` comes after the import and wins over it, so a key that swaps when you expected a resize usually has a `set`
+to `swap.*` in `init.lua`: `<prefix> ?` lists what each key runs now, and marks the ones that came from tmux.
 
 ## Moving between panes
 

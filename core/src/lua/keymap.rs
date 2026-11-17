@@ -467,6 +467,54 @@ mod tests {
         assert_eq!(effect(&layered), effect(&snippet));
     }
 
+    /// An `init.lua` that sets `h/j/k/l` to resize and then, further down, to `swap.*` (the swap loop
+    /// iterating over lowercase keys, where the snippet's iterates over `H J K L`): the later call wins
+    /// over both the import and the earlier one, so `prefix h`/`l` swap and nothing resizes, while the
+    /// import's own `H`/`L` (`swap-pane -t {left-of}`) swap too. The snippet itself has the capitals.
+    #[test]
+    fn a_swap_loop_over_lowercase_keys_in_init_lua_overrides_the_imported_resize() {
+        let home = sample_tmux_home();
+        let (imported, _) = import_sample_tmux(&home);
+        let key = |text: &str| KeySpec::parse(text).unwrap();
+        let swap = |dir| Action::Swap(SwapTarget::Toward(dir));
+        let broken = SNIPPET.replace(
+            "for key, dir in pairs({ H = \"left\", J = \"down\", K = \"up\", L = \"right\" }) do",
+            "for key, dir in pairs({ h = \"left\", j = \"down\", k = \"up\", l = \"right\" }) do",
+        );
+        assert_ne!(broken, SNIPPET, "the premise: the swap loop is the one rewritten");
+        let mut broken = broken;
+        for (up, low) in [("H", "h"), ("J", "j"), ("K", "k"), ("L", "l")] {
+            broken = broken.replace(
+                &format!("k.del(\"prefix\", \"{up}\")"),
+                &format!("k.del(\"prefix\", \"{low}\")"),
+            );
+        }
+        let map = imported.then_user_settled(&run(&broken), &[], &[]).0;
+        for (lower, upper, dir) in [("h", "H", Direction::Left), ("l", "L", Direction::Right)] {
+            assert_eq!(
+                map.lookup(&key(lower)).unwrap().action,
+                Action::Swap(SwapTarget::Toward(dir)),
+                "{lower}"
+            );
+            assert_eq!(
+                map.lookup(&key(upper)).unwrap().action,
+                swap(dir),
+                "{upper} comes from the import"
+            );
+        }
+        // The snippet as shipped, and the import alone: lowercase resizes by five and repeats.
+        for map in [imported.clone(), imported.then_user(&run(SNIPPET), &[]).unwrap()] {
+            for (lower, dir) in [("h", Direction::Left), ("l", Direction::Right)] {
+                let b = map.lookup(&key(lower)).unwrap();
+                assert_eq!(
+                    (b.action.clone(), b.repeatable),
+                    (Action::Resize { dir, cells: 5 }, true),
+                    "{lower}"
+                );
+            }
+        }
+    }
+
     #[test]
     fn use_i3_alt_keeps_the_default_scratchpad_key_without_an_override() {
         let map = Keymap::apply_user(&run(r#"eitri.keymap.use("i3-alt")"#), &[]).unwrap();

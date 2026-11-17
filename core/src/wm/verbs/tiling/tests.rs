@@ -253,6 +253,41 @@ fn a_resize_steps_by_the_editors_cell_or_the_fallback_cell() {
     assert_eq!(at(Some((10.0, 20.0))) - before, 50);
 }
 
+/// `prefix h/l` bound to tmux's `resize-pane -L/-R 5`: in two and three columns the keys move the focused
+/// module's divider and never change the order of the modules.
+#[test]
+fn a_resize_in_two_and_three_columns_moves_a_divider_and_keeps_the_order() {
+    let frame = Frame::new(UNALLOCATED, 1);
+    let order = |layout: &Layout| {
+        let mut placed: Vec<_> = crate::layout::arrange(layout, &frame)
+            .modules
+            .into_iter()
+            .map(|(id, rect)| (rect.x, id))
+            .collect();
+        placed.sort_by_key(|(x, _)| *x);
+        placed.into_iter().map(|(_, id)| id).collect::<Vec<_>>()
+    };
+    let width = |layout: &Layout, id: &ModuleId| crate::layout::arrange(layout, &frame).rect_of(id).unwrap().w;
+    for (src, focus) in [
+        ("row(editor focus, agent)", ModuleId::editor()),
+        ("row(editor, agent focus)", ModuleId::agent()),
+        ("row(editor, agent focus, terminal)", ModuleId::agent()),
+    ] {
+        for dir in [Direction::Left, Direction::Right] {
+            let before = fixture(src);
+            let mut r = rig(before.clone());
+            r.run(Action::Resize { dir, cells: 5 });
+            let after = r.layout.borrow().clone();
+            assert_eq!(
+                order(&before),
+                order(&after),
+                "{src} {dir:?}: the modules keep their places"
+            );
+            assert_ne!(width(&before, &focus), width(&after, &focus), "{src} {dir:?}");
+        }
+    }
+}
+
 #[test]
 fn a_container_verb_with_no_container_flashes_without_a_toast() {
     let mut r = rig(fixture("row(editor, agent hidden)"));
