@@ -2661,3 +2661,99 @@ fn a_child_of_a_read_only_thread_writes_nothing() {
     assert_eq!(model.steps_left(), 0, "the child never ran its command");
     assert!(!project.join("child-plain").exists(), "the child wrote");
 }
+
+// ------------------------------------------------------------------------------------ developer instructions
+
+/// A `config.toml` whose top-level `extra` lines come before the provider table, as TOML needs, with `tables`
+/// after it.
+fn write_home_with_top_level(home: &Path, model: &ScriptedModel, extra: &str, tables: &str) {
+    let toml = model.provider_toml(agent::providers::codex::self_check::SCRIPTED_MODEL_SLUG);
+    write_file(
+        &home.join("config.toml"),
+        &format!("{extra}{toml}{tables}\n[features]\n{QUIET_FEATURES}"),
+    );
+}
+
+/// What the model was sent as developer-role text, in order, for the requests from `from` on.
+fn developer_texts(model: &ScriptedModel, from: usize) -> Vec<String> {
+    let mut out = Vec::new();
+    for body in &model.requests()[from..] {
+        for item in body.get("input").and_then(Value::as_array).into_iter().flatten() {
+            if item.get("role").and_then(Value::as_str) == Some("developer") {
+                out.push(item.to_string());
+            }
+        }
+    }
+    out
+}
+
+/// A user's own `developer_instructions` (the top level of `config.toml`) reach the
+/// model on the start and the resume Eitri sends, because Eitri sends no `developerInstructions` of its own. The
+/// control is why: a start that names the field reaches the model with that text and without the user's, so the field
+/// replaces the user's text (Codex takes the start's field before `config.toml`'s); Eitri would have to carry it itself.
+#[test]
+#[ignore = "runs the real codex (on PATH) against the scripted model; no login, no network"]
+fn developer_instructions_are_the_users_own_unless_a_start_replaces_them() {
+    const REPLACER: &str = "EITRI-PROBE-REPLACER-5d2b";
+    let codex = real_codex();
+    // 0.163.0 refuses a `profile = ...` key in `config.toml` ("use `--profile` with `<name>.config.toml`"), and Eitri
+    // starts the server with no `--profile`, so the user's own text is the top-level key.
+    for (case, extra, tables, user_text) in [(
+        "top",
+        "developer_instructions = \"USER-DEV-TOP-7f3a\"\n",
+        "",
+        "USER-DEV-TOP-7f3a",
+    )] {
+        let s = Scratch::new(&format!("devi-{case}"));
+        let model = ScriptedModel::start(vec![]).expect("model");
+        let home = s.dir("home");
+        write_home_with_top_level(&home, &model, extra, tables);
+        let project = s.dir("proj");
+
+        // The start and the resume Eitri sends: the user's text, and no field of ours on the wire.
+        let params = start_params(&project, DirTrust::Trusted);
+        assert!(params.get("developerInstructions").is_none() && params.get("baseInstructions").is_none());
+        let mut peer = Peer::start(&codex, &home, &project, decline_all());
+        let thread = start_thread(&mut peer, params);
+        assert_eq!(run_turn(&mut peer, &thread.id, "probe"), "completed");
+        let seen = developer_texts(&model, 0).join("\n");
+        assert!(
+            seen.contains(user_text),
+            "{case}: the start dropped the user's text: {seen}"
+        );
+        let after_start = model.requests().len();
+        peer.close();
+
+        let mut peer = Peer::start(&codex, &home, &project, decline_all());
+        peer.call(
+            method::THREAD_RESUME,
+            resume_params(&thread.id, &project, DirTrust::Trusted),
+        )
+        .expect("thread/resume");
+        assert_eq!(run_turn(&mut peer, &thread.id, "probe again"), "completed");
+        let seen = developer_texts(&model, after_start).join("\n");
+        assert!(
+            seen.contains(user_text),
+            "{case}: the resume dropped the user's text: {seen}"
+        );
+        let after_resume = model.requests().len();
+        peer.close();
+
+        // The control: the same start naming the field replaces the user's text.
+        let mut named = start_params(&project, DirTrust::Trusted);
+        named["developerInstructions"] = json!(REPLACER);
+        let mut peer = Peer::start(&codex, &home, &project, decline_all());
+        let control = start_thread(&mut peer, named);
+        assert_eq!(run_turn(&mut peer, &control.id, "probe"), "completed");
+        let seen = developer_texts(&model, after_resume).join("\n");
+        assert!(
+            seen.contains(REPLACER),
+            "{case}: the control's text did not reach the model: {seen}"
+        );
+        assert!(
+            !seen.contains(user_text),
+            "{case}: the field no longer replaces the user's text; Eitri could add one"
+        );
+        peer.close();
+    }
+}

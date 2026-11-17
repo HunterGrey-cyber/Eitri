@@ -306,6 +306,33 @@ fn turning_tool_servers_off_keeps_the_editor_server() {
     assert_eq!(servers["eitri"]["enabled"], true);
 }
 
+/// A start and a resume add no instructions of Eitri's: Codex takes the start's field in place of the user's own
+/// `developer_instructions`, so any text Eitri sent there would drop the user's.
+#[test]
+fn start_and_resume_carry_no_instructions() {
+    let config = session_config(&plan(&[("/p", DirTrust::Trusted)], false), None).expect("config");
+    let start = serde_json::to_value(ThreadStartParams::new(
+        "/p".into(),
+        Reviewer::User,
+        Sandbox::Project,
+        config.clone(),
+    ))
+    .unwrap();
+    let resume = serde_json::to_value(ThreadResumeParams::new(
+        "t1".into(),
+        "/p".into(),
+        Reviewer::User,
+        Sandbox::Project,
+        config,
+    ))
+    .unwrap();
+    for params in [start, resume] {
+        for key in ["developerInstructions", "baseInstructions"] {
+            assert!(params.get(key).is_none(), "{key} is on the wire");
+        }
+    }
+}
+
 #[test]
 fn params_carry_the_allowlisted_policy() {
     let config = session_config(&plan(&[("/p", DirTrust::Untrusted)], true), None).expect("config");

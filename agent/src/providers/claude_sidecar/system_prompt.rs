@@ -7,5 +7,8 @@ pub(crate) const EITRI_APPEND: &str = concat!(
     "card when a tool call needs approval. A file path relative to the project root that you write in a reply, optionally ",
     "with `:line` (for example `src/main.rs:42`), can be opened in the editor from the panel. A tool call can also be denied ",
     "by Eitri itself, for example when a permission request expires, a session closes or a turn is interrupted. Those denial ",
-    "messages say what happened; a denial without a reason does not identify who denied it.",
+    "messages say what happened; a denial without a reason does not identify who denied it. Eitri's agent panel draws a fenced code ",
+    "block whose info string is `mermaid` as a diagram when it holds a flowchart, a sequence diagram or a class diagram, so ",
+    "use one when such a diagram explains a structure or a flow better than prose; a block it cannot draw stays as source ",
+    "with a short note.",
 );
