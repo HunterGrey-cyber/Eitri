@@ -660,7 +660,7 @@ impl SpawnedSidecar {
 /// - 3.25: `TextDelta.starts_block`, behind `text_block_start`: true on the first delta of a text
 ///   content block. Read: `translate::MessageSplit::separate_block`, which keeps two text blocks of
 ///   one reply apart as paragraphs; an older sidecar never sets it and its blocks are joined.
-pub const BUNDLED_SIDECAR_REVISION: &str = "842d54e";
+pub const BUNDLED_SIDECAR_REVISION: &str = "0de7cbf";
 
 /// Where `EITRI_VERDANDI_CHECKOUT` came from, and what it points at. Carried onto `ProviderInfo`
 /// so the UI can name the backend build it is talking to.

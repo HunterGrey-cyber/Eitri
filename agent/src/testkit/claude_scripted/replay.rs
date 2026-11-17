@@ -47,6 +47,27 @@ pub fn pinned_cli_version(cli_toml: &str) -> Option<String> {
     })
 }
 
+/// Verdandi revisions whose recordings stay valid under a later pin, as `(pinned, recorded, why)`: the
+/// pinned revision's tree differs from the recorded one only in files no build or test reads, so a sidecar built
+/// from either is the same program and a fixture recorded on `recorded` is exactly what `pinned` would record.
+/// Both revisions are full 40-hex names, and the pair is directional: only a fixture recorded on `recorded`
+/// is accepted under `pinned`. An entry is added only with the Verdandi diff between the two shown in the dated
+/// record; any other pin move re-records.
+pub const DOCS_ONLY_SUCCESSORS: &[(&str, &str, &str)] = &[(
+    "ed8e058de696f2c13cc2dc4491af2a0d58d83964",
+    "beb58449479f876cdac6f841943aae4b689a8217",
+    "one line of crates/claude-runtime-protocol/COMPATIBILITY.md, no code",
+)];
+
+/// Whether `recorded` was recorded on a revision that `DOCS_ONLY_SUCCESSORS` lists as the code-identical
+/// predecessor of `pin` (`pin` may be the 7-character prefix the constant carries, never shorter).
+fn is_docs_only_predecessor(recorded: &str, pin: &str) -> bool {
+    pin.len() >= 7
+        && DOCS_ONLY_SUCCESSORS
+            .iter()
+            .any(|(pinned, predecessor, _)| pinned.starts_with(pin) && *predecessor == recorded)
+}
+
 /// The fixture's pins against the checkout's: `Err` names both and says how to record again.
 pub fn check_pins(manifest: &Value, cli_version: &str, verdandi_revision: &str) -> Result<(), String> {
     let recorded_cli = manifest["cli_version"].as_str().unwrap_or("");
@@ -64,7 +85,7 @@ pub fn check_pins(manifest: &Value, cli_version: &str, verdandi_revision: &str) 
     let same = !recorded.is_empty()
         && !verdandi_revision.is_empty()
         && (recorded.starts_with(verdandi_revision) || verdandi_revision.starts_with(recorded));
-    if !same {
+    if !same && !is_docs_only_predecessor(recorded, verdandi_revision) {
         return Err(format!(
             "fixture recorded on {}, pin is {verdandi_revision}: re-record with run.py --record",
             if recorded.is_empty() {
@@ -222,6 +243,40 @@ mod tests {
         assert!(
             check_pins(&manifest, "2.1.311", "30d1838ab12").is_ok(),
             "a short pin names the same revision"
+        );
+    }
+
+    #[test]
+    fn a_listed_docs_only_successor_accepts_the_predecessors_recordings_in_that_direction_only() {
+        let (pinned, predecessor, _) = DOCS_ONLY_SUCCESSORS[0];
+        let on = |rev: &str| json!({"cli_version": "2.1.311", "verdandi_revision": rev});
+        assert!(
+            check_pins(&on(predecessor), "2.1.311", pinned).is_ok(),
+            "the listed pair"
+        );
+        assert!(
+            check_pins(&on(predecessor), "2.1.311", &pinned[..7]).is_ok(),
+            "the pin's 7-character prefix"
+        );
+        let err = check_pins(&on(pinned), "2.1.311", predecessor).unwrap_err();
+        assert_eq!(
+            err,
+            format!("fixture recorded on {pinned}, pin is {predecessor}: re-record with run.py --record"),
+            "the wrong direction"
+        );
+        let other = "30d1838ab12c0b6f3d6e0f6d9b8a7c5e4d3b2a19";
+        assert!(check_pins(&on(other), "2.1.311", pinned).is_err(), "an unlisted pair");
+        assert!(
+            check_pins(&on(&predecessor[..7]), "2.1.311", pinned).is_err(),
+            "the listing names full revisions"
+        );
+        assert!(
+            check_pins(&on(predecessor), "2.1.311", "ed8e0").is_err(),
+            "a prefix shorter than seven"
+        );
+        assert!(
+            check_pins(&on(predecessor), "2.1.400", pinned).is_err(),
+            "the CLI check is unchanged"
         );
     }
 
