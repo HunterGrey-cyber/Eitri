@@ -7,6 +7,7 @@ import { currentBlock, noteClick } from "./current";
 import { installFakeLayout, type FakeLayout } from "./fakelayout";
 import { editHere, installKeys } from "./keys";
 import { Preview } from "./preview";
+import { HELD_REVEAL_QUIET_MS } from "./sync";
 
 /* The fake layout (fakelayout.ts): paragraph p<i> (line 2i) at 30i, 20 px a row. The page's text is 20 px a line
    unless a test says otherwise, so the reserve (the margins) is 100 px in the 768 px view. */
@@ -29,8 +30,8 @@ const kit = { version: 3, install: vi.fn(async (o: InstallOptions) => { installe
 const reveals = () => calls.filter((c) => c.verb === "editor.reveal").map((c) => c.args as Record<string, number>);
 const jumps = () => calls.filter((c) => c.verb === "editor.jump").map((c) => c.args as Record<string, number>);
 const top = () => p.cursorBand()!.top;
-const press = (action: string, times = 1) => {
-  for (let i = 0; i < times; i++) installed!.run(action, new KeyboardEvent("keydown"));
+const press = (action: string, times = 1, repeat = false) => {
+  for (let i = 0; i < times; i++) installed!.run(action, new KeyboardEvent("keydown", { repeat }));
 };
 
 beforeEach(() => {
@@ -60,6 +61,29 @@ function show(body: string, v: Partial<EditorView> = {}): void {
   vi.advanceTimersByTime(0);
 }
 async function keys(): Promise<void> { removers.push(await installKeys(p, { run: () => false })); }
+
+describe("a key's repeats", () => {
+  it("move the cursor through the keys' own row, and reach nvim once they stop", async () => {
+    show(paragraphs(80));
+    await keys();
+    p.onFocus(true);
+    press("cursor.down");
+    vi.advanceTimersByTime(HELD_REVEAL_QUIET_MS);
+    const sent = reveals().length;
+    expect(reveals().at(-1)).toMatchObject({ cursor: 3 });
+    for (let i = 0; i < 10; i++) { press("cursor.down", 1, true); vi.advanceTimersByTime(33); }
+    expect(top()).toBe(330);
+    expect(reveals().length).toBe(sent);
+    vi.advanceTimersByTime(HELD_REVEAL_QUIET_MS);
+    expect(reveals().length).toBe(sent + 1);
+    expect(reveals().at(-1)).toMatchObject({ cursor: 23 });
+    // <C-d> held is a key's repeat too.
+    press("cursor.half_down", 2, true);
+    expect(reveals().length).toBe(sent + 1);
+    vi.advanceTimersByTime(HELD_REVEAL_QUIET_MS);
+    expect(reveals().length).toBe(sent + 2);
+  });
+});
 
 describe("]] and [[ (1)", () => {
   it("step through every heading when the cursor's band reaches past the heading's own box", async () => {

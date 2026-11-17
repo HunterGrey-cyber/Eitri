@@ -294,12 +294,13 @@ export async function installKeys(
       return true;
     }
     switch (action) {
-      case "cursor.down": p.moveRows(1); return true;
-      case "cursor.up": p.moveRows(-1); return true;
-      case "cursor.half_down": p.halfPage(1); return true;
-      case "cursor.half_up": p.halfPage(-1); return true;
-      case "cursor.page_down": p.fullPage(1); return true;
-      case "cursor.page_up": p.fullPage(-1); return true;
+      // A held key's repeats move at once and tell nvim when they stop (`Preview.moveCursor`).
+      case "cursor.down": p.moveRows(1, ev.repeat); return true;
+      case "cursor.up": p.moveRows(-1, ev.repeat); return true;
+      case "cursor.half_down": p.halfPage(1, ev.repeat); return true;
+      case "cursor.half_up": p.halfPage(-1, ev.repeat); return true;
+      case "cursor.page_down": p.fullPage(1, ev.repeat); return true;
+      case "cursor.page_up": p.fullPage(-1, ev.repeat); return true;
       // gg and G are jumps, as in vim; a held key's repeats move nothing more.
       case "cursor.first": if (!ev.repeat) jumping(p, () => p.cursorFirst()); return true;
       case "cursor.last": if (!ev.repeat) jumping(p, () => p.cursorLast()); return true;

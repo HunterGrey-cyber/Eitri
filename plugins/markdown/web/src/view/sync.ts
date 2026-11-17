@@ -4,6 +4,13 @@ import { lastLineAtOrBefore, lastTopAtOrBefore, type Box } from "./lineindex";
 /** How often the preview may move nvim while the reader scrolls: often enough to feel attached, rarely enough that
  *  nvim's redraws do not pile up behind a fast scroll. */
 export const REVEAL_THROTTLE_MS = 40;
+/** While a held key repeats the cursor's move, nvim hears of the cursor only once the repeats have stopped for this
+ *  long: more than the slowest repeat interval a keyboard is set to (10 a second), so a hold is one stream. Each reveal
+ *  scrolls nvim, which redraws and animates the editor on the window's GTK thread, the thread that also hands the
+ *  preview its keys: one per repeat would keep both busy for as long as the key is held. */
+export const HELD_REVEAL_QUIET_MS = 150;
+/** And at most this long after the first move it has not told nvim of, so a long hold still brings nvim along. */
+export const HELD_REVEAL_MAX_MS = 1000;
 /** How many of the page's own reveal tokens are remembered: nvim answers each reveal with a view carrying its token,
  *  and a fast scroll can have several in flight. */
 export const OWN_TOKENS = 8;
@@ -119,5 +126,29 @@ export function createThrottle(ms: number, fn: () => void): { request(): void; c
   return {
     request() { if (timer === undefined) { fn(); timer = setTimeout(tick, ms); } else again = true; },
     cancel() { if (timer !== undefined) clearTimeout(timer); timer = undefined; again = false; },
+  };
+}
+
+/** Calls `fn(true)` once requests have stopped for `quiet` ms; while they keep coming, `fn(false)` at most `max` ms
+ *  after the first request not yet answered. The quiet wait outlives a `fn(false)`: the stream still ends with
+ *  `fn(true)`. */
+export function createSettle(quiet: number, max: number, fn: (stopped: boolean) => void): {
+  request(): void; cancel(): void;
+} {
+  let quietTimer: ReturnType<typeof setTimeout> | undefined;
+  let maxTimer: ReturnType<typeof setTimeout> | undefined;
+  const cancel = () => {
+    if (quietTimer !== undefined) clearTimeout(quietTimer);
+    if (maxTimer !== undefined) clearTimeout(maxTimer);
+    quietTimer = undefined;
+    maxTimer = undefined;
+  };
+  return {
+    request() {
+      if (quietTimer !== undefined) clearTimeout(quietTimer);
+      quietTimer = setTimeout(() => { cancel(); fn(true); }, quiet);
+      if (maxTimer === undefined) maxTimer = setTimeout(() => { maxTimer = undefined; fn(false); }, max);
+    },
+    cancel,
   };
 }

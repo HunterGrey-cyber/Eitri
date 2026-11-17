@@ -5,6 +5,7 @@ import { currentBlock } from "./current";
 import { installFakeLayout, type FakeLayout } from "./fakelayout";
 import { installKeys } from "./keys";
 import { Preview } from "./preview";
+import { HELD_REVEAL_MAX_MS, HELD_REVEAL_QUIET_MS } from "./sync";
 
 /* The fake layout: paragraph p<i> (line 2i) at 30i, 20 px high, one row; a TALL paragraph wraps onto six rows; a
    HUGE image is 1020 px. The page's text is 20 px a line, so the reserve (the margins) is 100 px and the space
@@ -101,6 +102,101 @@ describe("the cursor's rows", () => {
     expect(top()).toBe(1060);
     p.moveRows(-1);
     expect(top()).toBe(1030);
+  });
+});
+
+describe("a held j or k", () => {
+  /* The kit's glide, as the page sees it: `scrollTo` starts one (here it records the target and moves nothing),
+     `settle` ends it. */
+  let glides: number[];
+  let settle: ReturnType<typeof vi.fn>;
+  beforeEach(() => {
+    glides = [];
+    settle = vi.fn();
+    (window as unknown as { eitriKeys: unknown }).eitriKeys = {
+      version: 5, scrollTo: (y: number) => { glides.push(y); }, destination: () => window.scrollY, settle,
+    };
+  });
+  afterEach(() => { delete (window as unknown as { eitriKeys?: unknown }).eitriKeys; });
+  /** The window position that puts the cursor's band on the bottom margin (768 - 100). */
+  const atBottomMargin = () => top() + 20 - 668;
+  /** The cursor at the bottom margin, by single presses, with every reveal of them sent. */
+  function toBottomMargin(): number {
+    show(paragraphs(120));
+    p.onFocus(true);
+    press(() => p.moveRows(1), 21);
+    vi.advanceTimersByTime(HELD_REVEAL_MAX_MS);
+    return reveals().length;
+  }
+
+  it("scrolls the page with each repeat at once, no glide, and tells nvim once, when the repeats stop", () => {
+    const sent = toBottomMargin();
+    for (let i = 0; i < 20; i++) {
+      p.moveRows(1, true);
+      expect(window.scrollY).toBe(atBottomMargin());
+      vi.advanceTimersByTime(33);
+    }
+    expect(glides).toEqual([]);
+    expect(settle).toHaveBeenCalled();
+    expect(reveals().length).toBe(sent);
+    vi.advanceTimersByTime(HELD_REVEAL_QUIET_MS);
+    expect(reveals().length).toBe(sent + 1);
+    // p41 is at 1230: source line 83.
+    expect(top()).toBe(1230);
+    expect(reveals().at(-1)).toMatchObject({ cursor: 83, line: Math.floor(window.scrollY / 30) * 2 + 1 });
+    // The next single press glides again and tells nvim at once.
+    p.moveRows(1);
+    expect(glides.length).toBe(1);
+    expect(reveals().length).toBe(sent + 2);
+  });
+
+  it("moves nvim once a second while the key stays down", () => {
+    const sent = toBottomMargin();
+    for (let i = 0; i < 40; i++) { p.moveRows(1, true); vi.advanceTimersByTime(33); }
+    expect(reveals().length).toBe(sent + 1);
+    vi.advanceTimersByTime(HELD_REVEAL_QUIET_MS);
+    expect(reveals().length).toBe(sent + 2);
+    expect(reveals().at(-1)).toMatchObject({ cursor: 2 * (21 + 40) + 1 });
+  });
+
+  it("ends the hold when the repeats stop just after a once-a-second reveal: a wheel scroll then reveals at once", () => {
+    const sent = toBottomMargin();
+    // The last repeat 990 ms after the first, then nothing: the max interval's reveal comes first, then the stop.
+    for (let i = 0; i < 31; i++) { p.moveRows(1, true); if (i < 30) vi.advanceTimersByTime(33); }
+    vi.advanceTimersByTime(HELD_REVEAL_MAX_MS - 990);
+    expect(reveals().length).toBe(sent + 1);
+    vi.advanceTimersByTime(HELD_REVEAL_QUIET_MS);
+    // Nothing moved since: the stop sends nothing more.
+    expect(reveals().length).toBe(sent + 1);
+    window.dispatchEvent(new Event("wheel"));
+    layout.setScroll(window.scrollY + 300);
+    expect(reveals().length).toBe(sent + 2);
+  });
+
+  it("tells nvim where it stopped at once when the keys leave mid-hold, and nothing after", () => {
+    const sent = toBottomMargin();
+    for (let i = 0; i < 5; i++) { p.moveRows(1, true); vi.advanceTimersByTime(33); }
+    p.onFocus(false);
+    expect(reveals().length).toBe(sent + 1);
+    expect(reveals().at(-1)).toMatchObject({ cursor: 2 * (21 + 5) + 1 });
+    vi.advanceTimersByTime(HELD_REVEAL_MAX_MS * 2);
+    expect(reveals().length).toBe(sent + 1);
+  });
+
+  it("goes up as it goes down: k held scrolls at once and tells nvim when it stops", () => {
+    toBottomMargin();
+    for (let i = 0; i < 30; i++) { p.moveRows(1, true); vi.advanceTimersByTime(33); }
+    vi.advanceTimersByTime(HELD_REVEAL_QUIET_MS);
+    const sent = reveals().length;
+    const y = window.scrollY;
+    // Up to the top margin first (the window stays), then a row of scroll per repeat.
+    for (let i = 0; i < 30; i++) { p.moveRows(-1, true); vi.advanceTimersByTime(33); }
+    expect(window.scrollY).toBeLessThan(y);
+    expect(window.scrollY).toBe(top() - 100);
+    expect(reveals().length).toBe(sent);
+    vi.advanceTimersByTime(HELD_REVEAL_QUIET_MS);
+    expect(reveals().length).toBe(sent + 1);
+    expect(glides).toEqual([]);
   });
 });
 

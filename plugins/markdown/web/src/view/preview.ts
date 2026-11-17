@@ -11,8 +11,8 @@ import { selectionBoxes, selectionSpan } from "./selection";
 import { buildIndex, lastLineAtOrBefore, lastTopAtOrBefore, measure, type Box } from "./lineindex";
 import { blockedText, BUFFER_CLOSED_TEXT, EDITOR_CLOSED_TEXT, EMPTY_TEXT, tooLargeText } from "./notices";
 import {
-  createThrottle, leader, lineToY, OwnTokens, placeLine, REVEAL_THROTTLE_MS, rowAt, rowShare, scrollTarget, yToLine,
-  type Leader,
+  createSettle, createThrottle, HELD_REVEAL_MAX_MS, HELD_REVEAL_QUIET_MS, leader, lineToY, OwnTokens, placeLine,
+  REVEAL_THROTTLE_MS, rowAt, rowShare, scrollTarget, yToLine, type Leader,
 } from "./sync";
 import { applyUpdate } from "./update";
 
@@ -198,6 +198,13 @@ export class Preview {
   private readonly tokens = new OwnTokens();
   private readonly guard = new ScrollGuard();
   private readonly revealer = createThrottle(REVEAL_THROTTLE_MS, () => this.sendReveal());
+  /** A held key is repeating the cursor's moves: until its repeats stop, the moves and the scrolls they make reach
+   *  nvim through `heldRevealer`, not one reveal per repeat. */
+  private held = false;
+  private readonly heldRevealer = createSettle(HELD_REVEAL_QUIET_MS, HELD_REVEAL_MAX_MS, (stopped) => {
+    if (stopped) this.held = false;
+    this.sendReveal();
+  });
   private readonly listeners = new Set<(why: UpdateReason) => void>();
   private readonly disposers: (() => void)[] = [];
 
@@ -264,6 +271,7 @@ export class Preview {
       root.removeEventListener("scroll", nestedScroll, true);
       observer?.disconnect();
       this.revealer.cancel();
+      this.endHeld();
       this.endEngineScroll();
       this.cursorBar.remove();
       this.cursorLine.remove();
@@ -291,6 +299,7 @@ export class Preview {
     if (switched) {
       this.target = null; this.anchor = null; this.pointer = false; this.lastReveal = null; this.lastCursor = null;
       this.revealedTop = null; this.asked = null; this.placed = null; this.unsent = false; this.revealer.cancel();
+      this.endHeld();
       this.lastRow = undefined;
     }
     const echo = v.cause === "reveal" && v.token !== undefined && this.tokens.has(v.token);
@@ -522,6 +531,7 @@ export class Preview {
     const gliding = Math.abs(this.destination() - window.scrollY) >= 1;
     kit()?.settle?.();
     this.revealer.cancel();
+    this.endHeld();
     if (this.rendered && this.lead() === "preview" && (this.unsent || gliding)) this.sendReveal(true, false);
     this.unsent = false;
   }
@@ -601,17 +611,18 @@ export class Preview {
   cursorPlace(): number | null { return this.cursorBand() ? this.cursorAt : null; }
 
   /** `j` / `k`: the cursor one row down (1) or up (-1), as nvim's `gj` / `gk` under 'wrap'. A move that would cross
-   *  a margin scrolls the page by just enough instead; on the document's first or last row nothing moves. */
-  moveRows(dir: 1 | -1): void {
+   *  a margin scrolls the page by just enough instead; on the document's first or last row nothing moves. `held`: the
+   *  key's repeat (see `moveCursor`). */
+  moveRows(dir: 1 | -1, held = false): void {
     const b = this.cursorBand();
     const next = b ? this.stepBand(b, dir) : null;
-    if (next) this.moveCursor(next, this.scrollFor(next, this.destination()));
+    if (next) this.moveCursor(next, this.scrollFor(next, this.destination()), held);
   }
 
   /** `<C-d>` / `<C-u>`: the page half a view down or up and the cursor the same distance, so it keeps its height on
    *  the screen; where the page cannot go further (the document's start, or its last row at the bottom) the cursor
    *  moves alone. */
-  halfPage(dir: 1 | -1): void {
+  halfPage(dir: 1 | -1, held = false): void {
     const b = this.cursorBand();
     if (!b) return;
     const s = this.destination();
@@ -619,13 +630,13 @@ export class Preview {
     const t = dir > 0 ? Math.min(s + d, Math.max(s, this.endY())) : Math.max(s - d, 0);
     const moved = this.bandAt((b.top + b.bottom) / 2 + dir * d);
     const next = moved ? this.insideMargins(moved, t) : null;
-    if (next) this.moveCursor(next, this.scrollFor(next, t));
+    if (next) this.moveCursor(next, this.scrollFor(next, t), held);
   }
 
   /** `<C-f>` / `<C-b>`: the page a view less two lines down or up, and the cursor to the margin the text came in
    *  from (the top one going down, the bottom one going up), as nvim's; where the page cannot scroll, the cursor goes
    *  to the last or the first row. */
-  fullPage(dir: 1 | -1): void {
+  fullPage(dir: 1 | -1, held = false): void {
     if (!this.cursorBand()) return;
     const s = this.destination();
     const line = this.lineHeight();
@@ -633,7 +644,7 @@ export class Preview {
     const t = dir > 0 ? Math.min(s + p, Math.max(s, this.scrollMax())) : Math.max(s - p, 0);
     const next = Math.abs(t - s) < 0.5 ? (dir > 0 ? this.lastBand() : this.firstBand())
       : dir > 0 ? this.firstBandFrom(this.topLimit(t)) : this.lastBandTo(this.bottomLimit(t));
-    if (next) this.moveCursor(next, this.scrollFor(next, t));
+    if (next) this.moveCursor(next, this.scrollFor(next, t), held);
   }
 
   /** `gg` / `G`: the cursor to the document's first or last row, placed as a jump. False when there is none. */
@@ -885,12 +896,27 @@ export class Preview {
   }
 
   /* The cursor goes to `b`; the window to `to` (null: it stays) through the kit's glide, as the reader's scroll;
-     nvim hears of the move as it hears of a scroll. */
-  private moveCursor(b: Band, to: number | null): void {
+     nvim hears of the move as it hears of a scroll. A `held` move (a key's repeat) goes there at once instead: a glide
+     restarted by every repeat trails the cursor and keeps the page drawing a frame of it each refresh, after the key
+     is let go too; and nvim hears of it when the repeats stop (`heldRevealer`). */
+  private moveCursor(b: Band, to: number | null, held = false): void {
+    // Before the window moves: its scroll is part of the same move.
+    if (held) this.held = true;
+    else this.endHeld();
     this.setCursor(b);
     const from = this.destination();
-    if (to !== null && Math.abs(to - from) >= 0.5) this.glideTo(this.onEditorRow(b, to, from));
+    if (to !== null && Math.abs(to - from) >= 0.5) {
+      const y = this.onEditorRow(b, to, from);
+      if (held) this.jumpWindow(y);
+      else this.glideTo(y);
+    }
     this.cursorMoved();
+  }
+  /** Moves the window to `y` at once, as the reader's scroll: a glide still running ends first, where it was heading. */
+  private jumpWindow(y: number): void {
+    kit()?.settle?.();
+    this.endEngineScroll();
+    if (Math.abs(y - window.scrollY) >= 0.5) window.scrollTo({ top: y, behavior: INSTANT });
   }
   /* A scroll the cursor makes, from `from` to `to`, carried on by less than one of nvim's rows so that the first row
      of the cursor's line lands where one of nvim's rows starts (`rowShare`): nvim can then start that line level with
@@ -927,9 +953,19 @@ export class Preview {
     this.moves++;
   }
   private cursorMoved(): void {
-    if (this.lead() === "preview" && !this.editJumping()) { this.unsent = true; this.revealer.request(); }
+    if (this.lead() === "preview" && !this.editJumping()) { this.unsent = true; this.requestReveal(); }
     this.placeBars();
     this.notify("cursor");
+  }
+  /** A reveal of where the preview is now: through the throttle, or, while a held key repeats, once it stops. */
+  private requestReveal(): void {
+    if (this.held) this.heldRevealer.request();
+    else this.revealer.request();
+  }
+  /** The repeats are over (another key, the lead or the buffer changed): nothing waits for them to stop. */
+  private endHeld(): void {
+    this.held = false;
+    this.heldRevealer.cancel();
   }
 
   /* The rows around document y `y`. Where none is within a view of it (below the document's end, or a gap taller
@@ -1302,7 +1338,7 @@ export class Preview {
     if (this.guard.onScroll(window.scrollY)) return;
     this.anchor = yToLine(this.index(), window.scrollY);
     this.pushCursor();
-    if (this.lead() === "preview" && !this.editJumping()) { this.unsent = true; this.revealer.request(); }
+    if (this.lead() === "preview" && !this.editJumping()) { this.unsent = true; this.requestReveal(); }
     else this.traceTop();
     this.placeBars();
     this.notify("scroll");
@@ -1380,6 +1416,7 @@ export class Preview {
     if (!this.rendered) return;
     this.anchor = yToLine(this.index(), window.scrollY);
     this.revealer.cancel();
+    this.endHeld();
     const jumped = this.editJumping();
     this.editJumpUntil = 0;
     if (jumped) { this.unsent = false; return; }

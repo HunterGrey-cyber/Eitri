@@ -1,7 +1,8 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { Box } from "./lineindex";
 import {
-  createThrottle, leader, lineToY, OWN_TOKENS, OwnTokens, placeLine, REVEAL_THROTTLE_MS, rowAt, rowShare, scrollTarget, yToLine,
+  createSettle, createThrottle, HELD_REVEAL_MAX_MS, HELD_REVEAL_QUIET_MS, leader, lineToY, OWN_TOKENS, OwnTokens, placeLine,
+  REVEAL_THROTTLE_MS, rowAt, rowShare, scrollTarget, yToLine,
 } from "./sync";
 
 const el = document.createElement("div");
@@ -143,5 +144,40 @@ describe("the loop guards", () => {
     t.request();
     expect(fn).toHaveBeenCalledTimes(3);
     t.cancel();
+  });
+  it("settles a stream of requests: once when it stops, and at most once a max interval while it goes on", () => {
+    vi.useFakeTimers();
+    const fn = vi.fn();
+    const t = createSettle(HELD_REVEAL_QUIET_MS, HELD_REVEAL_MAX_MS, fn);
+    // A key repeating 30 times a second for half a second: nothing until it stops.
+    for (let i = 0; i < 15; i++) { t.request(); vi.advanceTimersByTime(33); }
+    expect(fn).not.toHaveBeenCalled();
+    vi.advanceTimersByTime(HELD_REVEAL_QUIET_MS);
+    expect(fn.mock.calls).toEqual([[true]]);
+    vi.advanceTimersByTime(HELD_REVEAL_MAX_MS * 2);
+    expect(fn).toHaveBeenCalledTimes(1);
+    // A stream that never pauses is answered once a max interval, then once more when it stops.
+    fn.mockClear();
+    for (let i = 0; i < 40; i++) { t.request(); vi.advanceTimersByTime(33); }
+    expect(fn.mock.calls).toEqual([[false]]);
+    vi.advanceTimersByTime(HELD_REVEAL_QUIET_MS);
+    expect(fn.mock.calls).toEqual([[false], [true]]);
+    // A stream that stops just before its max interval: the max's call, then the stop's.
+    fn.mockClear();
+    for (let i = 0; i < 31; i++) { t.request(); if (i < 30) vi.advanceTimersByTime(33); }
+    vi.advanceTimersByTime(HELD_REVEAL_MAX_MS - 990);
+    expect(fn.mock.calls).toEqual([[false]]);
+    vi.advanceTimersByTime(HELD_REVEAL_QUIET_MS);
+    expect(fn.mock.calls).toEqual([[false], [true]]);
+    // Cancelled, nothing is left to fire.
+    fn.mockClear();
+    t.request();
+    t.cancel();
+    vi.advanceTimersByTime(HELD_REVEAL_MAX_MS * 2);
+    expect(fn).not.toHaveBeenCalled();
+  });
+  it("waits longer than the slowest key repeat before it calls a hold over", () => {
+    // MAX_REPEAT_MS of the keyboard kit: the slowest repeat interval it believes.
+    expect(HELD_REVEAL_QUIET_MS).toBeGreaterThan(100);
   });
 });
