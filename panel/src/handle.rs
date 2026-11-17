@@ -84,6 +84,12 @@ impl AgentPanelHandle {
         self.state.borrow().ticks_run
     }
 
+    /// Whether `view`'s document has said `ready`: until it has, nothing that can wait is sent to it, and its
+    /// `ready` is itself what wakes the tick.
+    pub fn document_is_ready(&self, view: ViewId) -> bool {
+        self.state.borrow().ready(view)
+    }
+
     /// The tools a session started now with `project` trust would be declared.
     pub fn editor_tools_declared(&self, project: agent::setting_sources::ProjectTrust) -> Option<agent::ClientToolSet> {
         super::editor_glue::tools_for_start(&self.state.borrow(), project)

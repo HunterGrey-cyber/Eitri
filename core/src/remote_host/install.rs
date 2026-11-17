@@ -859,6 +859,8 @@ mod tests {
     use agent::ssh::LocalExec;
     use std::os::unix::fs::PermissionsExt;
 
+    // Runs the Linux server scripts here as the server; macOS lacks flock(1) and GNU stat.
+    #[cfg(target_os = "linux")]
     #[test]
     fn stop_recovery_checks_recorded_sidecar_hashes_before_adopting() {
         let root = crate::test_scratch_dir::ScratchDir::new("remote", "recover-hashes");
@@ -1092,6 +1094,8 @@ mod tests {
         });
     }
 
+    // Runs the Linux server scripts here as the server; macOS lacks flock(1) and GNU stat.
+    #[cfg(target_os = "linux")]
     #[test]
     fn uploads_release_the_restart_lock_between_spawn_and_progress() {
         let root = ScratchDir::new("remote", "upload-restart-lock");
@@ -1107,6 +1111,8 @@ mod tests {
         .unwrap();
     }
 
+    // Runs the Linux server scripts here as the server; macOS lacks flock(1) and GNU stat.
+    #[cfg(target_os = "linux")]
     #[test]
     fn an_upload_keeps_the_restart_lock_until_its_delayed_attachment() {
         let root = ScratchDir::new("remote", "upload-attach");
@@ -1213,6 +1219,8 @@ mod tests {
         assert_ne!(one.manifest.lines[1].1, two.manifest.lines[1].1);
     }
 
+    // Runs the Linux server scripts here as the server; macOS lacks flock(1) and GNU stat.
+    #[cfg(target_os = "linux")]
     #[test]
     fn changed_server_directories_reuse_consent_and_replace_installation_records() {
         let root = ScratchDir::new("remote", "relocate");
@@ -1261,6 +1269,8 @@ mod tests {
         }
     }
 
+    // Runs the Linux server scripts here as the server; macOS lacks flock(1) and GNU stat.
+    #[cfg(target_os = "linux")]
     #[test]
     fn concurrent_installs_leave_one_complete_tree() {
         let root = ScratchDir::new("remote", "concurrent");
@@ -1310,6 +1320,8 @@ mod tests {
             .starts_with(".install-")));
     }
 
+    // Runs the Linux server scripts here as the server; macOS lacks flock(1) and GNU stat.
+    #[cfg(target_os = "linux")]
     #[test]
     fn failed_upload_leaves_no_temporary_file() {
         let root = ScratchDir::new("remote", "failure");
@@ -1335,6 +1347,7 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "linux")]
     fn changed_file_refuses(relative: &str) {
         let root = ScratchDir::new("remote", "changed");
         let (mut plan, launcher) = fixture(&root, "one", true);
@@ -1368,15 +1381,21 @@ mod tests {
         );
     }
 
+    // Runs the Linux server scripts here as the server; macOS lacks flock(1) and GNU stat.
+    #[cfg(target_os = "linux")]
     #[test]
     fn changed_helper_refuses_to_start() {
         changed_file_refuses("bin/eitri-server");
     }
+    // Runs the Linux server scripts here as the server; macOS lacks flock(1) and GNU stat.
+    #[cfg(target_os = "linux")]
     #[test]
     fn changed_sidecar_refuses_to_start() {
         changed_file_refuses("sidecar");
     }
 
+    // Runs the Linux server scripts here as the server; macOS lacks flock(1) and GNU stat.
+    #[cfg(target_os = "linux")]
     #[test]
     fn older_version_start_checks_its_own_recorded_hash() {
         let root = ScratchDir::new("remote", "older");
@@ -1405,6 +1424,8 @@ mod tests {
         assert!(start_recorded_with(&launcher, &host, &old.version, &old.sidecar.revision).is_err());
     }
 
+    // Runs the Linux server scripts here as the server; macOS lacks flock(1) and GNU stat.
+    #[cfg(target_os = "linux")]
     #[test]
     fn consent_and_hashes_merge_without_dropping_older_installs() {
         let root = ScratchDir::new("remote", "records");
@@ -1457,6 +1478,8 @@ mod tests {
         start_recorded_with(&launcher, &saved, &plan.version, &plan.sidecar.revision).unwrap();
     }
 
+    // Runs the Linux server scripts here as the server; macOS lacks flock(1) and GNU stat.
+    #[cfg(target_os = "linux")]
     #[test]
     fn sidecar_only_rebuilds_and_full_revision_prefix_collisions_remain_separate() {
         let root = ScratchDir::new("remote", "sidecar-identities");
@@ -1502,6 +1525,8 @@ mod tests {
         }
     }
 
+    // Runs the Linux server scripts here as the server; macOS lacks flock(1) and GNU stat.
+    #[cfg(target_os = "linux")]
     #[test]
     fn reverse_recording_order_preserves_both_builds_of_one_revision() {
         let root = ScratchDir::new("remote", "record-order");
@@ -1530,6 +1555,8 @@ mod tests {
         }
     }
 
+    // Runs the Linux server scripts here as the server; macOS lacks flock(1) and GNU stat.
+    #[cfg(target_os = "linux")]
     #[test]
     fn publication_sweeps_only_stale_unlocked_staging_directories() {
         use std::os::fd::AsRawFd;
@@ -1564,6 +1591,8 @@ mod tests {
         assert!(!active.exists());
     }
 
+    // Runs the Linux server scripts here as the server; macOS lacks flock(1) and GNU stat.
+    #[cfg(target_os = "linux")]
     #[test]
     fn upload_and_manifest_steps_lock_their_staging_tree_while_writing() {
         use std::os::fd::AsRawFd;
@@ -1619,6 +1648,8 @@ mod tests {
         }
     }
 
+    // Runs the Linux server scripts here as the server; macOS lacks flock(1) and GNU stat.
+    #[cfg(target_os = "linux")]
     #[test]
     fn sidecar_progress_excludes_short_and_full_revision_headers() {
         for gzip in [false, true] {
@@ -1840,6 +1871,8 @@ mod tests {
             );
         }
     }
+    // Runs the Linux server scripts here as the server; macOS lacks flock(1) and GNU stat.
+    #[cfg(target_os = "linux")]
     #[test]
     fn starting_existing_files_needs_no_upload_space_and_only_missing_files_reinstall() {
         let root = ScratchDir::new("remote", "start-no-space");

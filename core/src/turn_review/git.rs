@@ -544,6 +544,10 @@ mod tests {
 
     /// A run that floods standard error keeps its start and still ends: the rest is read and dropped, never held. Run
     /// in a child process, whose memory is capped far below the flood.
+    #[cfg_attr(
+        target_os = "macos",
+        ignore = "macOS refuses setrlimit(RLIMIT_DATA), the cap this test sets"
+    )]
     #[test]
     fn a_capped_run_keeps_only_the_start_of_a_flood_on_stderr() {
         const CHILD: &str = "EITRI_GIT_STDERR_FLOOD_CHILD";

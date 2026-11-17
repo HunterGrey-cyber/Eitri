@@ -1001,6 +1001,9 @@ mod tests {
         assert_eq!(stream.read(&mut byte).unwrap(), 0);
         assert_eq!(peer.read(&mut byte).unwrap(), 0);
         assert!(stream.write_all(b"x").is_err());
+        // macOS accepts a write to a peer that shut its reading side and fails only once that end is closed; the peer's
+        // reader sees the end either way (checked above).
+        #[cfg(not(target_os = "macos"))]
         assert!(peer.write_all(b"x").is_err());
     }
 

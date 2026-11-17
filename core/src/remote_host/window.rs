@@ -200,7 +200,9 @@ pub fn open_window(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(target_os = "linux")]
     use crate::test_scratch_dir::ScratchDir;
+    #[cfg(target_os = "linux")]
     use std::cell::RefCell;
 
     #[test]
@@ -210,6 +212,7 @@ mod tests {
         assert!(hint.contains("all servers and their agents"));
     }
 
+    #[cfg(target_os = "linux")]
     fn project() -> RemoteProject {
         RemoteProject {
             version: 1,
@@ -226,6 +229,8 @@ mod tests {
     /// A host the person consented to that has only an older helper gets this build's with no question: the band
     /// counts the upload up in order, says it is installed, and only then that the host is ready; the record keeps
     /// the older installation beside the new one.
+    // Runs the Linux server scripts here as the server; macOS lacks flock(1) and GNU stat.
+    #[cfg(target_os = "linux")]
     #[test]
     fn window_installs_a_newer_helper_with_progress() {
         let root = ScratchDir::new("remote", "window-upgrade");
@@ -277,6 +282,8 @@ mod tests {
     /// The record says this build is installed, but the server has none of it (removed from another machine, or a
     /// server reinstalled with its host keys kept): the start finds out, and this build's files go up again with no
     /// question, the band saying so, before the host is ready.
+    // Runs the Linux server scripts here as the server; macOS lacks flock(1) and GNU stat.
+    #[cfg(target_os = "linux")]
     #[test]
     fn a_recorded_installation_missing_on_the_server_is_installed_again() {
         let root = ScratchDir::new("remote", "window-missing");
@@ -296,6 +303,8 @@ mod tests {
 
     /// The server's data directory moved (another `XDG_DATA_HOME` there): the record's installation is somewhere else,
     /// so this build is installed where the probe found the directory, and the record follows.
+    // Runs the Linux server scripts here as the server; macOS lacks flock(1) and GNU stat.
+    #[cfg(target_os = "linux")]
     #[test]
     fn a_moved_data_directory_is_installed_into() {
         let root = ScratchDir::new("remote", "window-moved");
@@ -314,6 +323,8 @@ mod tests {
     }
 
     /// An installed helper is only started; a host never consented to installs and starts nothing.
+    // Runs the Linux server scripts here as the server; macOS lacks flock(1) and GNU stat.
+    #[cfg(target_os = "linux")]
     #[test]
     fn an_installed_helper_is_started_and_an_unconsented_host_refused() {
         let root = ScratchDir::new("remote", "window-start");

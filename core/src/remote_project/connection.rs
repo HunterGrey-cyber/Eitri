@@ -486,6 +486,8 @@ mod tests {
         }
     }
 
+    // Runs the Linux server scripts here as the server; macOS lacks flock(1) and GNU stat.
+    #[cfg(target_os = "linux")]
     #[test]
     fn reconnect_rechecks_the_recorded_manifest_and_restarts_the_same_installation() {
         let root = crate::test_scratch_dir::ScratchDir::new("remote", "restart-installation");
@@ -518,6 +520,8 @@ mod tests {
         assert_eq!(delegated.stdout, b"delegated");
     }
 
+    // Runs the Linux server scripts here as the server; macOS lacks flock(1) and GNU stat.
+    #[cfg(target_os = "linux")]
     #[test]
     fn a_collected_older_installation_is_definitely_missing_but_current_damage_needs_reinstall() {
         let root = crate::test_scratch_dir::ScratchDir::new("remote", "collected-installation");

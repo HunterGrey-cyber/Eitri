@@ -96,6 +96,8 @@ mod tests {
         assert!(validate(&report).unwrap()[0].contains("loginctl enable-linger"));
     }
 
+    // Runs the Linux server scripts here as the server; macOS lacks flock(1) and GNU stat.
+    #[cfg(target_os = "linux")]
     #[test]
     fn bootstrap_probe_reports_facts_without_writes_or_a_bus_connection() {
         super::super::tests::isolated(

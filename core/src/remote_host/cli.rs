@@ -356,7 +356,7 @@ pub fn agent_lines(host: &str, agents: &[Agent]) -> Vec<String> {
 const UNINSTALL_WAIT: Duration = Duration::from_secs(30);
 
 /// What the `UNINSTALL` step says when a daemon still holds its lifetime lock, and so removes nothing.
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 const DAEMON_STILL_RUNS: &str = "an Eitri server daemon still runs";
 
 /// One recorded host as `list`, `stop` and `uninstall` reach it: the key the connection verified, its installation
@@ -1006,6 +1006,7 @@ impl Reach for SshReach {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(target_os = "linux")]
     use super::super::window::installed;
     use super::*;
     use crate::remote_project::RemoteHost;
@@ -1117,6 +1118,8 @@ mod tests {
         )
     }
 
+    // Runs the Linux server scripts here as the server; macOS lacks flock(1) and GNU stat.
+    #[cfg(target_os = "linux")]
     #[test]
     fn idle_recorded_installations_are_never_started_by_stop_or_uninstall() {
         for installation in ["99.0.0-abcdef0", "0.0.1-abcdef0"] {
@@ -1171,6 +1174,8 @@ mod tests {
         }
     }
 
+    // Runs the Linux server scripts here as the server; macOS lacks flock(1) and GNU stat.
+    #[cfg(target_os = "linux")]
     #[test]
     fn skipped_survivors_are_named_and_keep_inventory_diagnostics() {
         for mode in ["newer", "unrecorded", "legacy", "stale-identity", "running"] {
@@ -1264,6 +1269,8 @@ mod tests {
         }
     }
 
+    // Runs the Linux server scripts here as the server; macOS lacks flock(1) and GNU stat.
+    #[cfg(target_os = "linux")]
     #[test]
     fn recovery_errors_survive_a_later_daemon_list_failure() {
         let root = ScratchDir::new("remote", "recovery-list-error");
@@ -1312,6 +1319,8 @@ mod tests {
         );
     }
 
+    // Runs the Linux server scripts here as the server; macOS lacks flock(1) and GNU stat.
+    #[cfg(target_os = "linux")]
     #[test]
     fn uninstall_checks_only_recorded_hashes_and_closes_the_child_lock() {
         use std::io::Write;
@@ -1371,11 +1380,15 @@ mod tests {
         }
     }
 
+    // Runs the Linux server scripts here as the server; macOS lacks flock(1) and GNU stat.
+    #[cfg(target_os = "linux")]
     #[test]
     fn crashed_daemons_are_recovered_before_stop_and_uninstall() {
         crashed_recovery("inventory", agent::ssh::PROTOCOL_MAJOR);
     }
 
+    // Runs the Linux server scripts here as the server; macOS lacks flock(1) and GNU stat.
+    #[cfg(target_os = "linux")]
     #[test]
     fn unavailable_inventory_still_recovers_and_stops_orphans() {
         for mode in ["reject-flag", "inventory-failure"] {
@@ -1383,11 +1396,15 @@ mod tests {
         }
     }
 
+    // Runs the Linux server scripts here as the server; macOS lacks flock(1) and GNU stat.
+    #[cfg(target_os = "linux")]
     #[test]
     fn older_other_protocol_installations_are_recovered_and_stopped() {
         crashed_recovery("inventory", agent::ssh::PROTOCOL_MAJOR + 1);
     }
 
+    // Runs the Linux server scripts here as the server; macOS lacks flock(1) and GNU stat.
+    #[cfg(target_os = "linux")]
     #[test]
     fn inventory_refusal_and_held_daemon_lock_never_start_recovery() {
         for mode in ["refusal", "held-lock"] {
@@ -1395,6 +1412,7 @@ mod tests {
         }
     }
 
+    #[cfg(target_os = "linux")]
     fn crashed_recovery(mode: &str, major: u32) {
         use std::process::{Command, Stdio};
         struct ChildGuard(std::process::Child);
@@ -1527,6 +1545,8 @@ mod tests {
         }
     }
 
+    // Runs the Linux server scripts here as the server; macOS lacks flock(1) and GNU stat.
+    #[cfg(target_os = "linux")]
     #[test]
     fn uninstall_preserves_sidecar_records_without_a_daemon_or_a_checking_helper() {
         let root = ScratchDir::new("remote", "surviving-sidecar");
@@ -1690,6 +1710,8 @@ mod tests {
     /// The record is written only after both questions were answered yes: the host key ssh did not know, then the
     /// installation. A no to either writes no project record, installs nothing, and adds no key after a no to the
     /// first.
+    // Runs the Linux server scripts here as the server; macOS lacks flock(1) and GNU stat.
+    #[cfg(target_os = "linux")]
     #[test]
     fn host_open_writes_the_record_after_both_yeses() {
         let root = ScratchDir::new("remote", "host-open");
@@ -1902,6 +1924,8 @@ mod tests {
 
     /// `stop` reaches a daemon of an older Eitri through the current installation's own `stop-daemon` (its hash
     /// checked first); `uninstall` stops it too, then removes the helper's directories and this machine's records.
+    // Runs the Linux server scripts here as the server; macOS lacks flock(1) and GNU stat.
+    #[cfg(target_os = "linux")]
     #[test]
     fn stop_and_uninstall_reach_an_older_daemon() {
         let root = ScratchDir::new("remote", "host-stop");
@@ -1997,6 +2021,7 @@ mod tests {
 
     /// A helper whose `list-daemons` reports one daemon of `version`, and goes on reporting it for two more lists
     /// after `<root>/stopped` appears, as a daemon stopping its agents after SIGTERM still shows.
+    #[cfg(target_os = "linux")]
     fn lingering_daemon_helper(root: &Path, version: &str) -> PathBuf {
         let path = root.join(format!("lingering-{version}"));
         std::fs::write(
@@ -2051,6 +2076,8 @@ mod tests {
         (data, state)
     }
 
+    // Runs the Linux server scripts here as the server; macOS lacks flock(1) and GNU stat.
+    #[cfg(target_os = "linux")]
     #[test]
     fn uninstall_keeps_the_restart_lock_until_its_delayed_attachment() {
         let root = ScratchDir::new("remote", "uninstall-attach");
@@ -2085,6 +2112,8 @@ mod tests {
 
     /// A daemon keeps its lifetime lock until it has stopped its agents and ended: `uninstall` waits for it after
     /// sending the stop, removes nothing while it is held, and refuses once its wait is over.
+    // Runs the Linux server scripts here as the server; macOS lacks flock(1) and GNU stat.
+    #[cfg(target_os = "linux")]
     #[test]
     fn uninstall_never_removes_under_a_daemon_still_running() {
         use std::sync::atomic::{AtomicBool, Ordering};
@@ -2196,6 +2225,8 @@ mod tests {
     }
 
     /// The UNINSTALL step itself refuses while a daemon holds its lifetime lock, with the sentence `uninstall` waits on.
+    // Runs the Linux server scripts here as the server; macOS lacks flock(1) and GNU stat.
+    #[cfg(target_os = "linux")]
     #[test]
     fn the_uninstall_step_refuses_under_a_lifetime_lock() {
         let root = ScratchDir::new("remote", "host-uninstall-step");
@@ -2225,6 +2256,8 @@ mod tests {
 
     /// The same root recorded on another host is that host's record: `open` asks before replacing it, and a no
     /// changes nothing.
+    // Runs the Linux server scripts here as the server; macOS lacks flock(1) and GNU stat.
+    #[cfg(target_os = "linux")]
     #[test]
     fn open_asks_before_replacing_another_hosts_record() {
         let root = ScratchDir::new("remote", "host-open-other");
@@ -2277,6 +2310,8 @@ mod tests {
 
     /// A record of the same host under a key that changed keeps its queued stops and its creation time, and the
     /// sentence says what goes with it.
+    // Runs the Linux server scripts here as the server; macOS lacks flock(1) and GNU stat.
+    #[cfg(target_os = "linux")]
     #[test]
     fn open_after_a_key_change_keeps_the_queued_stops() {
         let root = ScratchDir::new("remote", "host-open-rekey");
@@ -2362,6 +2397,8 @@ mod tests {
         );
     }
 
+    // Runs the Linux server scripts here as the server; macOS lacks flock(1) and GNU stat.
+    #[cfg(target_os = "linux")]
     #[test]
     fn open_commits_the_latest_stop_queue_and_moves_tabs_only_after_success() {
         use crate::saved_tabs::{self, SavedTabs};
@@ -2410,6 +2447,8 @@ mod tests {
         ));
     }
 
+    // Runs the Linux server scripts here as the server; macOS lacks flock(1) and GNU stat.
+    #[cfg(target_os = "linux")]
     #[test]
     fn management_reaches_an_installation_with_no_successful_project_open() {
         let root = ScratchDir::new("remote", "host-no-project");
@@ -2438,6 +2477,8 @@ mod tests {
         assert!(store.host("SHA256:example").unwrap().is_none());
     }
 
+    // Runs the Linux server scripts here as the server; macOS lacks flock(1) and GNU stat.
+    #[cfg(target_os = "linux")]
     #[test]
     fn uninstall_removes_only_its_own_temporary_run_directories() {
         let root = ScratchDir::new("remote", "uninstall-sockets");
@@ -2470,6 +2511,8 @@ mod tests {
         );
         std::fs::remove_dir_all(other_tmp).unwrap();
     }
+    // Runs the Linux server scripts here as the server; macOS lacks flock(1) and GNU stat.
+    #[cfg(target_os = "linux")]
     #[test]
     fn stop_tries_remaining_daemons_after_one_refuses() {
         let root = ScratchDir::new("remote", "stop-remaining");
@@ -2531,6 +2574,8 @@ mod tests {
             format!("{bad}\n{good}\n")
         );
     }
+    // Runs the Linux server scripts here as the server; macOS lacks flock(1) and GNU stat.
+    #[cfg(target_os = "linux")]
     #[test]
     fn a_failed_start_commits_no_key_or_tab_move_and_its_installation_remains_manageable() {
         use crate::saved_tabs::{self, SavedTabs};

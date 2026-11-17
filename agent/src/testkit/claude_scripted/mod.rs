@@ -878,6 +878,10 @@ fn route(
 }
 
 fn serve(mut stream: TcpStream, index: usize, shared: Arc<Shared>) {
+    // The listener is non-blocking, and a socket accepted from it stays non-blocking on macOS (it does not on Linux). A
+    // read that found the request still arriving then failed with EAGAIN, the answer went out and the close, with the
+    // rest of the request unread, reset the connection under the client's read. The reads below wait (up to the timeout).
+    let _ = stream.set_nonblocking(false);
     let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
     let _ = stream.set_write_timeout(Some(Duration::from_secs(5)));
     let time = SystemTime::now()

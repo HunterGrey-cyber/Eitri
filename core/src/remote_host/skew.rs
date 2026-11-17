@@ -293,6 +293,8 @@ mod tests {
             assert!(matches!(decide(&[daemon(bad, 0)])[0].1, Attach::Newer { .. }));
         }
     }
+    // Runs the Linux server scripts here as the server; macOS lacks flock(1) and GNU stat.
+    #[cfg(target_os = "linux")]
     #[test]
     fn stop_checks_the_helper_and_executes_under_one_publication_lock() {
         use std::os::unix::fs::PermissionsExt;

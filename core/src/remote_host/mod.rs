@@ -198,6 +198,12 @@ echo start >> "$state/starts"
 touch "$state/live"
 "##).unwrap();
         std::fs::set_permissions(&ssh, std::fs::Permissions::from_mode(0o700)).unwrap();
+        // The first run of a new script can take seconds on macOS under load (the system checks it first), and
+        // `check_openssh` gives `ssh -V` two: run it once here, against a scratch state, so the child's runs are fast.
+        let warm = dir.join("warm");
+        std::fs::create_dir(&warm).unwrap();
+        let _ = Command::new(&ssh).arg("-V").env("EITRI_SSH_FIXTURE", &warm).output();
+        std::fs::remove_dir_all(&warm).unwrap();
         let mut paths = vec![bin];
         paths.extend(std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()));
         let output = Command::new(std::env::current_exe().unwrap())

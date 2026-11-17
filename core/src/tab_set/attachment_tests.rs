@@ -1,3 +1,5 @@
+// Five tests below carry `#[cfg(target_os = "linux")]`: they run the real attachment desk, `crate::attachments`, whose
+// image decoder exists only on Linux (the macOS host has none yet).
 //! Composer images in the tab set: imported through the window's desk, kept per tab and per draft, sent as a turn
 //! of their own and never put into a running turn, given back with their text, and never shown to the page as
 //! bytes.
@@ -187,6 +189,7 @@ fn last_state(set: &mut TabSet) -> serde_json::Value {
 
 /// The whole path through the window's real desk: staged in a private directory, decoded in a child process,
 /// read back; the page is told of it with a thumbnail and never its bytes.
+#[cfg(target_os = "linux")]
 #[test]
 fn begin_chunk_end_makes_a_ready_attachment_with_a_thumbnail() {
     let base = crate::test_scratch_dir::ScratchDir::new("attach", "desk");
@@ -330,6 +333,7 @@ fn an_id_from_another_tab_or_an_old_generation_is_refused() {
 
 /// The window's 64 MB is reserved when an import begins, before any byte is kept: the third begin past it is
 /// refused and leaves no file.
+#[cfg(target_os = "linux")]
 #[test]
 fn the_window_quota_refuses_before_any_byte_is_kept() {
     let base = crate::test_scratch_dir::ScratchDir::new("attach", "quota");
@@ -935,6 +939,7 @@ fn a_tab_whose_sent_message_may_come_back_with_images_does_not_move() {
 }
 
 /// The real desk keeps a prepared image in memory only: its file goes once read, and its room stays counted.
+#[cfg(target_os = "linux")]
 #[test]
 fn a_prepared_image_is_not_kept_twice() {
     let base = crate::test_scratch_dir::ScratchDir::new("attach", "once");
@@ -1075,6 +1080,7 @@ fn a_drop_the_tab_cannot_take_is_refused_before_any_file_is_read() {
 }
 
 /// A PNG dropped from disk goes through the window's real desk: read, staged, decoded in a child, ready.
+#[cfg(target_os = "linux")]
 #[test]
 fn a_dropped_png_is_read_and_prepared_by_the_real_desk() {
     let base = crate::test_scratch_dir::ScratchDir::new("attach", "drop-desk");
@@ -1415,6 +1421,7 @@ fn taking_back_a_returned_sent_image_keeps_only_attachments_still_reserved() {
     shut_down(&mut set);
 }
 
+#[cfg(target_os = "linux")]
 #[test]
 fn resetting_a_failed_tab_restores_queued_images_and_closing_releases_all_quota() {
     let scratch = crate::test_scratch_dir::ScratchDir::new("attach", "reset-quota");

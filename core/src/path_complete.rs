@@ -714,6 +714,10 @@ mod tests {
         );
     }
 
+    #[cfg_attr(
+        target_os = "macos",
+        ignore = "macOS refuses setrlimit(RLIMIT_DATA), the cap this test sets"
+    )]
     #[test]
     fn an_endless_git_listing_is_read_to_its_byte_cap_and_git_is_stopped() {
         with_fake_git(

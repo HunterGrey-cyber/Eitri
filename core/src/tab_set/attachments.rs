@@ -148,7 +148,7 @@ impl AttachmentDesk {
         )
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, target_os = "linux"))]
     pub(super) fn reserved_bytes(&self) -> u64 {
         let (tx, rx) = mpsc::channel();
         self.ask(DeskRequest::ReservedBytes(tx)).unwrap();
@@ -429,7 +429,7 @@ impl Desk {
 }
 
 impl TabSet {
-    #[cfg(test)]
+    #[cfg(all(test, target_os = "linux"))]
     pub(super) fn reserved_image_bytes(&self) -> u64 {
         self.attach.desk.as_ref().unwrap().reserved_bytes()
     }

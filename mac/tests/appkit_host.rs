@@ -26,6 +26,7 @@ mod macos {
     use eitri_mac::assembly::{assemble, HostActions};
     use eitri_mac::editor::{AttachWait, Editor};
     use eitri_mac::quit::QuitSource;
+    use eitri_panel::agent_panel::ViewId;
     use eitri_panel::panel_page::PanelHost;
     use std::cell::{Cell, RefCell};
 
@@ -184,18 +185,49 @@ mod macos {
             ticked,
             format!("{} ticks", panel.ticks_run()),
         );
+        // Idle starts once the document has loaded AND said `ready` (its message arrives after the load finishes, and
+        // the panel's answer to it is the tick's legitimate work), and the tick has been quiet for 250 ms with no
+        // timer armed.
+        let (seen, quiet_since) = (Cell::new(panel.ticks_run()), Cell::new(Instant::now()));
         let idle = spin_until(Duration::from_secs(60), || {
-            !host.page().document_loading() && !host.panel_timer_armed()
+            if panel.ticks_run() != seen.get() {
+                seen.set(panel.ticks_run());
+                quiet_since.set(Instant::now());
+            }
+            !host.panel_view().document_loading()
+                && panel.document_is_ready(ViewId::BASE)
+                && !host.panel_timer_armed()
+                && quiet_since.get().elapsed() >= Duration::from_millis(250)
         });
         let before = panel.ticks_run();
-        for _ in 0..64 {
+        // When each tick of the window ran (the turn of the loop, and milliseconds since it began), for the failure line.
+        let (began, mut seen, mut when) = (Instant::now(), before, Vec::new());
+        // Half a second of loop turns: a tick on the steady cadence (a few dozen milliseconds) would show many times.
+        let mut turn = 0;
+        while began.elapsed() < Duration::from_millis(500) {
+            turn += 1;
             spin_once();
+            if panel.ticks_run() != seen {
+                seen = panel.ticks_run();
+                when.push(format!(
+                    "turn {turn} at {} ms, timer armed {}",
+                    began.elapsed().as_millis(),
+                    host.panel_timer_armed()
+                ));
+            }
         }
         let ticks = panel.ticks_run() - before;
+        // One tick is allowed: a page message or a worker's report can still arrive after the settle (seen once in ten
+        // runs, a single tick with no timer armed), and each raises the wake on purpose. A tick on a cadence, or a timer
+        // armed while idle, is what this is here to catch.
         check(
             "an idle panel is not ticked",
-            idle && ticks == 0,
-            format!("{ticks} ticks"),
+            idle && ticks <= 1 && !host.panel_timer_armed(),
+            format!(
+                "{ticks} ticks {when:?}; settled {idle}, document ready {}, loading {}",
+                panel.document_is_ready(ViewId::BASE),
+                host.panel_view().document_loading()
+            ),
         );
         let before = panel.ticks_run();
         panel.new_tab();

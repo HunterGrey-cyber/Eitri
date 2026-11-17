@@ -980,14 +980,20 @@ fn ceiling_keeps_reload_valid_during_write_and_on_abandoned_cut() {
         );
         *ingest.state.lock().unwrap() = filled(12).into_inner().unwrap();
         let slot = Mutex::new(Some("session".into()));
-        assert!(flush_in(
-            &ingest.state,
-            &slot,
-            &context(),
-            10,
-            Ok(scratch.0.clone()),
-            || {}
-        ));
+        let flushed = flush_in(&ingest.state, &slot, &context(), 10, Ok(scratch.0.clone()), || {});
+        assert!(flushed, "{}", {
+            // Which step refused: a write that failed counts in `lost_history_turns`; the rest are the gate's own flags.
+            let st = ingest.state.lock().unwrap();
+            format!(
+                "due {} retry {} archive id {} lost turns {} scratch {:?} entries {:?}",
+                st.eviction_due,
+                st.eviction_retry,
+                st.archive_id.is_some(),
+                st.stats.lost_history_turns,
+                scratch.0,
+                std::fs::read_dir(&scratch.0).map(|dir| dir.count())
+            )
+        });
         let first = ingest.begin_reload(None).unwrap();
         {
             let mut st = ingest.state.lock().unwrap();
