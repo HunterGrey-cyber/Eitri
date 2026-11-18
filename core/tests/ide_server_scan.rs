@@ -6,7 +6,9 @@
 //! searching the tree for it finds no false hit in this file.
 
 use eitri_core::ide_server::PORT_VAR;
-use eitri_core::source_scan::{code_only, read_required, require_anchors, rust_sources, sources, Source};
+use eitri_core::source_scan::{
+    code_only, product_dirs_except, product_sources, read_required, require_anchors, rust_sources, sources, Source,
+};
 
 /// An answer the terminal client reads as "allow the proposal unchanged": closing a view must never mean that.
 const APPROVING_CLOSE: &str = concat!("TAB_", "CLOSED");
@@ -23,7 +25,7 @@ fn listener_sources() -> Vec<Source> {
         "the view's Lua is read too"
     );
     read.extend(
-        sources(&["shell/src"], &["rs"])
+        sources(&product_dirs_except(&["core/src"]), &["rs"])
             .into_iter()
             .filter(|source| source.text.contains("ide_server")),
     );
@@ -80,7 +82,7 @@ fn before_tests(text: &str) -> &str {
 /// code setting it somewhere else: on the sidecar, or on the nvim child.
 #[test]
 fn the_port_variable_is_named_only_in_its_module() {
-    let read = rust_sources(&["agent/src", "core/src", "shell/src", "panel/src", "terminal/engine/src"]);
+    let read = product_sources();
     require_anchors(
         &read,
         &["fn build_ui(", "fn sidecar_command_for", "fn child_environment_with"],

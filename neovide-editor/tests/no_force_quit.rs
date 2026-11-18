@@ -445,6 +445,7 @@ fn the_matcher_sees_every_spelling_and_nothing_else() {
 /// The product crates' source directories this scan reads.
 const SCANNED: &[&str] = &[
     "shell/src",
+    "desk/src",
     "panel/src",
     "mac/src",
     "core/src",

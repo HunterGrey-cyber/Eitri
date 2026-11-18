@@ -1,6 +1,7 @@
 //! CLI records are read for display; display retention cannot mutate a provider's session store.
 use eitri_core::source_scan::{
-    braced, calls, code_only, read_required, require_anchors, rust_sources, test_only_files, word_ends, Source,
+    braced, calls, code_only, product_sources, read_required, require_anchors, rust_sources, test_only_files,
+    word_ends, Source,
 };
 use std::collections::BTreeSet;
 
@@ -195,20 +196,7 @@ fn scan_readers(sources: &[Source]) -> Result<BTreeSet<&str>, String> {
 
 #[test]
 fn cli_record_paths_have_only_the_allowlisted_readers_and_no_mutators() {
-    let sources = rust_sources(&[
-        "agent/src",
-        "core/src",
-        "panel/src",
-        "shell/src",
-        "mac/src",
-        "remote/src",
-        "neovide-editor/src",
-        "terminal/engine/src",
-        "terminal/frame/src",
-        "terminal/input/src",
-        "terminal/render/src",
-        "terminal/sync/src",
-    ]);
+    let sources = product_sources();
     require_anchors(
         &sources,
         &[

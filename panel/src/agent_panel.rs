@@ -2092,11 +2092,10 @@ mod tests {
     #[test]
     fn companion_mode_builds_the_same_gate() {
         use eitri_core::source_scan as scan;
-        const SCANNED: &[&str] = &["shell/src", "panel/src"];
         let companion = scan::code_only(&scan::read_required("shell/src/companion/window.rs").text);
         let flat: String = companion.split_whitespace().collect();
         assert!(flat.contains("crate::agent_panel::build_agent_panel("));
-        let read = scan::rust_sources(SCANNED);
+        let read = scan::product_sources();
         let panel = production_code(&panel_sources());
         let builder = scan::code_only(&scan::file_with(&read, "fn build_agent_panel(").text);
         let build = scan::functions(&builder, "build_agent_panel");

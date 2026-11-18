@@ -960,6 +960,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "eitri-desk"
+version = "0.3.0"
+dependencies = [
+ "agent",
+ "eitri-core",
+ "eitri-panel",
+]
+
+[[package]]
 name = "eitri-mac"
 version = "0.3.0"
 dependencies = [
@@ -4274,6 +4283,7 @@ dependencies = [
  "agent",
  "alacritty_terminal",
  "eitri-core",
+ "eitri-desk",
  "eitri-panel",
  "eitri-remote",
  "eitri-terminal",

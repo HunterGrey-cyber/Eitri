@@ -697,7 +697,7 @@ mod tests {
     /// the shell or core fails here too.
     #[test]
     fn lua_dispatch_text_is_written_only_by_the_builder() {
-        let sources = rust_sources(&["core/src", "shell/src"]);
+        let sources = rust_sources(&crate::source_scan::host_dirs_except(&["mac/src", "panel/src"]));
         let here = rust_sources(&["core/src/compositor"]);
         crate::source_scan::require_anchors(
             &here,

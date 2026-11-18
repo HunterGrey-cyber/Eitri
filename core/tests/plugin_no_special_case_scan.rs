@@ -26,20 +26,43 @@ fn hits(path: &str, text: &str) -> Vec<String> {
         .collect()
 }
 
+fn in_tests(path: &str) -> bool {
+    path.split('/').any(|part| part == "tests" || part == "tests.rs")
+}
+
+fn plugin_source(path: &str) -> bool {
+    let Some((_, relative)) = path.split_once("/src/") else {
+        return false;
+    };
+    !in_tests(relative)
+        && relative
+            .split('/')
+            .any(|part| part == "plugin" || part == "plugin.rs" || part.starts_with("plugin_"))
+}
+
 fn host_sources() -> Vec<Source> {
     let mut sources = scan::rust_sources(&["core/src/plugin", "core/src/wm", "core/src/layout"])
         .into_iter()
-        .filter(|source| !source.path.split('/').any(|part| part == "tests" || part == "tests.rs"))
+        .filter(|source| !in_tests(&source.path))
         .collect::<Vec<_>>();
     sources.push(scan::read_required("core/src/lua/plugin.rs"));
-    sources.extend(scan::rust_sources(&["shell/src"]).into_iter().filter(|s| {
-        s.path
-            .rsplit('/')
-            .next()
-            .is_some_and(|name| name.starts_with("plugin_"))
-    }));
+    sources.extend(
+        scan::rust_sources(&scan::product_dirs_except(&["core/src"]))
+            .into_iter()
+            .filter(|source| plugin_source(&source.path)),
+    );
     sources.extend(scan::sources(&["core/src/plugin"], &["lua", "js"]));
     sources
+}
+
+#[test]
+fn a_new_plugin_module_under_desk_is_scanned() {
+    let path = "desk/src/plugin/mod.rs";
+    assert!(plugin_source(path));
+    assert_eq!(hits(path, "fn route() { if id == \"Markdown\" {} } ").len(), 1);
+    assert!(plugin_source("desk/src/plugin_routes/dispatch.rs"));
+    assert!(!plugin_source("desk/src/plugin/tests/routes.rs"));
+    assert!(!plugin_source("desk/src/non_plugin/routes.rs"));
 }
 
 #[test]

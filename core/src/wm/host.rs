@@ -2773,8 +2773,8 @@ mod tests {
 
     #[test]
     fn owned_editor_is_built_only_by_owned() {
-        use crate::source_scan::{require_anchors, rust_sources, Source};
-        let sources = rust_sources(&["core/src", "shell/src", "panel/src", "agent/src"]);
+        use crate::source_scan::{product_sources, require_anchors, Source};
+        let sources = product_sources();
         require_anchors(&sources, &["pub struct OwnedEditor(", "pub fn owned("]);
         assert_eq!(tokens_built_outside_owned(&sources), Vec::<String>::new());
         // The scan sees a token built anywhere else in product code, and leaves test modules and comments alone.

@@ -280,11 +280,12 @@ fn offences(src: &str) -> Vec<(usize, Form, String)> {
 }
 
 /// Directories scanned, relative to the workspace root.
-const SCANNED: &[&str] = &["shell/src", "panel/src", "mac/src", "core/src/plugin"];
 
 #[test]
 fn no_scrutinee_holds_a_state_borrow() {
-    let read = scan::rust_sources(SCANNED);
+    let mut dirs = scan::host_dirs_except(&["core/src"]);
+    dirs.push("core/src/plugin");
+    let read = scan::rust_sources(&dirs);
     // The panel's state, its message handler, and the terminal pane's own `state`.
     scan::require_anchors(
         &read,

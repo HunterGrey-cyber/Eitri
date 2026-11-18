@@ -30,7 +30,7 @@ const LINUX_CALLS: &[&str] = &[
 ];
 
 /// The directories whose modules must be portable unless listed above.
-const PORTABLE_DIRS: &[&str] = &["core/src/window_link"];
+const PORTABLE_DIRS: &[&str] = &["core/src/window_link", "desk/src"];
 
 fn squeezed(text: &str) -> String {
     text.split_whitespace().collect::<Vec<_>>().join(" ")

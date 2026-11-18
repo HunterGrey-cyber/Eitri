@@ -2,18 +2,8 @@
 //! holds. A print that needs to speak of such a value says its length. `crash_trace::scrub` is the second pass, for
 //! what no scan can see: a library's words, a child's stderr, an error that quotes.
 
-use eitri_core::source_scan::{code_only, modules, rust_sources, without, word_ends, Source};
+use eitri_core::source_scan::{code_only, modules, product_sources, without, word_ends, Source};
 
-const DIRS: [&str; 8] = [
-    "core/src",
-    "agent/src",
-    "panel/src",
-    "shell/src",
-    "neovide-editor/src",
-    "terminal/engine/src",
-    "remote/src",
-    "mac/src",
-];
 const PRINTS: [&str; 4] = ["println", "eprintln", "print", "eprint"];
 /// A variable of one of these names holds what the person or the agent said, or a credential.
 const HOLDS_CONTENT: [&str; 20] = [
@@ -153,7 +143,7 @@ fn violations(source: &Source) -> Vec<String> {
 
 #[test]
 fn no_print_in_the_product_names_what_a_conversation_holds() {
-    let sources = rust_sources(&DIRS);
+    let sources = product_sources();
     assert!(sources.len() > 100, "the scan read {} files", sources.len());
     let found: Vec<String> = sources
         .iter()

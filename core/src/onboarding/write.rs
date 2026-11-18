@@ -86,7 +86,7 @@ mod tests {
     use std::path::PathBuf;
 
     use super::*;
-    use crate::source_scan::{code_only, rust_sources, without, word_ends, Source};
+    use crate::source_scan::{code_only, without, word_ends, Source};
 
     fn write_init(config_dir: &Path, text: &str, lang: Lang) -> WriteOutcome {
         super::write_init_with_data(config_dir, &config_dir.parent().unwrap().join("data"), text, lang)
@@ -363,7 +363,7 @@ mod tests {
     /// call of the list above, so nothing here needs excepting.
     #[test]
     fn only_the_writer_creates_init_lua() {
-        let sources: Vec<Source> = rust_sources(&["core/src", "shell/src", "panel/src", "agent/src", "mac/src"])
+        let sources: Vec<Source> = crate::source_scan::product_sources()
             .into_iter()
             .filter(|s| !s.path.contains("/tests/") && !s.path.ends_with("tests.rs"))
             .collect();

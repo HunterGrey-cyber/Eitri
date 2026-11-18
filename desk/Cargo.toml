@@ -1,0 +1,20 @@
+[package]
+name = "eitri-desk"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+# The toolkit-free half of a desktop window, shared by the hosts (`shell` on Linux, `eitri-mac` later). It sits above
+# `eitri-panel` and below the hosts. No GTK, GLib, WebKitGTK, AppKit or windowing crate may appear here, directly or
+# transitively (`src/manifest_guard.rs`, `core/tests/f1_no_toolkit_below_shell.rs`), and `core`, `panel`, `remote` and
+# `terminal/*` never depend on this crate (`src/direction_guard.rs`). `eitri-terminal` joins when the terminal model
+# arrives and `eitri-remote` when the remote wiring does, each after it builds and tests on macOS.
+
+[dependencies]
+agent = { path = "../agent" }
+eitri-core = { path = "../core" }
+eitri-panel = { path = "../panel" }
+
+[dev-dependencies]
+# `source_scan`, which the guards read the sources and manifests through.
+eitri-core = { path = "../core", features = ["test-support"] }

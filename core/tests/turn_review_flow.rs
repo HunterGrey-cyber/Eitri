@@ -2312,7 +2312,7 @@ fn a_new_owner_is_a_new_editor() {
 fn review_editor_never_types_keys() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
     let files = [root.join("src/review_editor.rs"), root.join("src/turn_review/flow.rs")];
-    let shell_sources = eitri_core::source_scan::rust_sources(&["shell/src", "panel/src"]);
+    let shell_sources = eitri_core::source_scan::product_sources();
     let shell_editor = eitri_core::source_scan::file_with(&shell_sources, "struct ReviewEditor");
     // Spelled in pieces so this file never contains what it looks for.
     let needles = [["send", "_keys"].concat(), ["input", "_keys"].concat()];

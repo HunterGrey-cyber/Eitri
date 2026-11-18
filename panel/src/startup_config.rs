@@ -667,6 +667,16 @@ mod tests {
     /// own: each `const ...: &str = "family.key"` and `config.get("family.key")` outside a test.
     #[test]
     fn every_setting_the_sources_read_is_known() {
+        assert_settings_known(eitri_core::source_scan::PRODUCT_SOURCES);
+    }
+
+    #[test]
+    #[should_panic(expected = "cannot read")]
+    fn the_settings_scan_fails_if_a_source_directory_cannot_be_read() {
+        assert_settings_known(&["desk/missing-source-directory"]);
+    }
+
+    fn assert_settings_known(dirs: &[&str]) {
         let known = known_keys(&[]);
         let families = [
             "agent",
@@ -679,40 +689,25 @@ mod tests {
             "plugins",
             "modules",
         ];
-        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
         let mut unknown = Vec::new();
-        for dir in ["core/src", "panel/src", "shell/src", "agent/src", "mac/src"] {
-            let mut stack = vec![root.join(dir)];
-            while let Some(path) = stack.pop() {
-                let Ok(entries) = std::fs::read_dir(&path) else {
+        for source in eitri_core::source_scan::rust_sources(dirs) {
+            let production = source.text.split("#[cfg(test)]").next().unwrap_or_default();
+            for line in production.lines() {
+                let declared = line.contains("const ") && line.contains("&str = \"");
+                let read = line.contains("config.get(\"") || line.contains(".get(\"agent.");
+                if !(declared || read) {
                     continue;
-                };
-                for entry in entries.flatten() {
-                    let path = entry.path();
-                    if path.is_dir() {
-                        stack.push(path);
-                    } else if path.extension().is_some_and(|e| e == "rs") {
-                        let text = std::fs::read_to_string(&path).unwrap_or_default();
-                        let production = text.split("#[cfg(test)]").next().unwrap_or_default();
-                        for line in production.lines() {
-                            let declared = line.contains("const ") && line.contains("&str = \"");
-                            let read = line.contains("config.get(\"") || line.contains(".get(\"agent.");
-                            if !(declared || read) {
-                                continue;
-                            }
-                            for literal in line.split('"').skip(1).step_by(2) {
-                                let family = literal.split('.').next().unwrap_or_default();
-                                let key_like = literal.contains('.')
-                                    && literal.chars().all(|c| c.is_ascii_lowercase() || c == '_' || c == '.');
-                                if key_like
-                                    && families.contains(&family)
-                                    && !known.contains(&literal)
-                                    && !literal.starts_with(eitri_core::editor_tools::switches::TOOL_KEY_PREFIX)
-                                {
-                                    unknown.push(format!("{}: {literal}", path.display()));
-                                }
-                            }
-                        }
+                }
+                for literal in line.split('"').skip(1).step_by(2) {
+                    let family = literal.split('.').next().unwrap_or_default();
+                    let key_like = literal.contains('.')
+                        && literal.chars().all(|c| c.is_ascii_lowercase() || c == '_' || c == '.');
+                    if key_like
+                        && families.contains(&family)
+                        && !known.contains(&literal)
+                        && !literal.starts_with(eitri_core::editor_tools::switches::TOOL_KEY_PREFIX)
+                    {
+                        unknown.push(format!("{}: {literal}", source.path));
                     }
                 }
             }

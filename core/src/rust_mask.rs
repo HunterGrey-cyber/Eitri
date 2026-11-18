@@ -4,9 +4,25 @@
 /// `text` with every comment, string literal and character literal replaced by spaces (line
 /// breaks and byte offsets kept), so neither a brace nor a word inside one counts.
 pub fn code_only(text: &str) -> String {
+    mask(text, false)
+}
+
+/// Blank Rust line comments, retaining literals, block comments, and byte offsets.
+#[cfg(any(test, feature = "test-support"))]
+pub fn without_line_comments(text: &str) -> String {
+    mask(text, true)
+}
+
+fn mask(text: &str, keep_literals_and_block_comments: bool) -> String {
     let chars: Vec<char> = text.chars().collect();
     let mut out: Vec<char> = Vec::with_capacity(chars.len());
-    let blank = |c: char| if c == '\n' { '\n' } else { ' ' };
+    let blank = |c: char| {
+        if keep_literals_and_block_comments || c == '\n' {
+            c
+        } else {
+            ' '
+        }
+    };
     let ident = |c: char| c.is_alphanumeric() || c == '_';
     let mut i = 0;
     while i < chars.len() {
@@ -24,11 +40,11 @@ pub fn code_only(text: &str) -> String {
             while i < chars.len() {
                 if chars[i] == '/' && chars.get(i + 1) == Some(&'*') {
                     depth += 1;
-                    out.extend([' ', ' ']);
+                    out.extend(['/', '*'].map(blank));
                     i += 2;
                 } else if chars[i] == '*' && chars.get(i + 1) == Some(&'/') {
                     depth -= 1;
-                    out.extend([' ', ' ']);
+                    out.extend(['*', '/'].map(blank));
                     i += 2;
                     if depth == 0 {
                         break;
@@ -48,11 +64,11 @@ pub fn code_only(text: &str) -> String {
             }
             if chars.get(j) == Some(&'"') {
                 let hashes = j - i - 1;
-                out.extend(std::iter::repeat_n(' ', j - i + 1));
+                out.extend(chars[i..=j].iter().copied().map(blank));
                 i = j + 1;
                 while i < chars.len() {
                     if chars[i] == '"' && (1..=hashes).all(|k| chars.get(i + k) == Some(&'#')) {
-                        out.extend(std::iter::repeat_n(' ', hashes + 1));
+                        out.extend(chars[i..=i + hashes].iter().copied().map(blank));
                         i += hashes + 1;
                         break;
                     }
@@ -63,11 +79,11 @@ pub fn code_only(text: &str) -> String {
             }
         }
         if c == '"' {
-            out.push(' ');
+            out.push(blank(c));
             i += 1;
             while i < chars.len() && chars[i] != '"' {
                 if chars[i] == '\\' {
-                    out.push(' ');
+                    out.push(blank(chars[i]));
                     i += 1;
                 }
                 if i < chars.len() {
@@ -75,8 +91,10 @@ pub fn code_only(text: &str) -> String {
                     i += 1;
                 }
             }
-            out.push(' ');
-            i += 1;
+            if i < chars.len() {
+                out.push(blank(chars[i]));
+                i += 1;
+            }
             continue;
         }
         if c == '\'' {
@@ -85,12 +103,12 @@ pub fn code_only(text: &str) -> String {
                 while j < chars.len() && chars[j] != '\'' {
                     j += 1;
                 }
-                out.extend(std::iter::repeat_n(' ', j + 1 - i));
+                out.extend(chars[i..(j + 1).min(chars.len())].iter().copied().map(blank));
                 i = j + 1;
                 continue;
             }
             if chars.get(i + 2) == Some(&'\'') {
-                out.extend([' ', ' ', ' ']);
+                out.extend(chars[i..i + 3].iter().copied().map(blank));
                 i += 3;
                 continue;
             }

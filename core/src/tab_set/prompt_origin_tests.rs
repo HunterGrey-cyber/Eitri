@@ -658,8 +658,8 @@ fn send_calls(code: &str) -> Vec<String> {
 
 #[test]
 fn every_send_caller_names_its_origin() {
-    use crate::source_scan::{code_only, modules, require_anchors, rust_sources, without, word_ends};
-    let sources = rust_sources(&["core/src", "panel/src", "shell/src"]);
+    use crate::source_scan::{code_only, host_dirs_except, modules, require_anchors, rust_sources, without, word_ends};
+    let sources = rust_sources(&host_dirs_except(&["mac/src"]));
     require_anchors(
         &sources,
         &[

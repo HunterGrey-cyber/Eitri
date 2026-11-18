@@ -124,7 +124,7 @@ fn the_agents_layer_never_reaches_an_answer_path() {
     }
 
     // A new file of the layer is scanned or says why not: a file added later cannot slip past by not being listed.
-    for path in agents_named(&["core/src", "panel/src", "shell/src", "remote/src"]) {
+    for path in agents_named(&scan::product_dirs()) {
         assert!(
             FILES.iter().any(|(listed, _)| *listed == path) || NOT_SCANNED.iter().any(|(listed, _)| *listed == path),
             "{path} is named for the agents layer but this scan does not list it: add it to FILES with a token it holds"

@@ -450,7 +450,7 @@ fn scan_calls(rel: &str, text: &str, names: &[&str]) -> Report {
 
 #[test]
 fn editor_rpc_callers_pass_only_constant_lua() {
-    let read = eitri_core::source_scan::rust_sources(&["core/src", "shell/src", "panel/src", "mac/src"]);
+    let read = eitri_core::source_scan::rust_sources(&eitri_core::source_scan::host_dirs_except(&[]));
     eitri_core::source_scan::require_anchors(
         &read,
         &[
@@ -1504,7 +1504,7 @@ fn exec_op_wrong(text: &str) -> Vec<String> {
 
 #[test]
 fn exec_chunk_is_named_only_in_its_module() {
-    let read = source_scan::rust_sources(&["core/src", "shell/src", "panel/src", "mac/src"]);
+    let read = source_scan::product_sources();
     assert!(
         read.iter().any(|source| source.path == EXEC_MODULE),
         "the walk missed the exec module"
@@ -1525,7 +1525,7 @@ fn exec_code_comes_only_from_the_record() {
 #[test]
 fn only_the_exec_chunk_evaluates_an_argument() {
     // Rust as well: only `core/src` holds Lua today, and a directory with no file of the kind asked for is refused.
-    let read = source_scan::sources(&["core/src", "shell/src", "panel/src", "mac/src"], &["lua", "rs"]);
+    let read = source_scan::sources(&source_scan::product_dirs(), &["lua", "rs"]);
     assert_eq!(unlisted(&read), Vec::<String>::new());
     for (path, word) in EVALUATORS {
         let source = read.iter().find(|source| source.path == *path);
@@ -1550,7 +1550,7 @@ fn no_other_tool_chunk_builds_source() {
 
 #[test]
 fn only_the_card_path_answers_a_broker_card() {
-    let all = source_scan::rust_sources(&["core/src", "panel/src", "shell/src"]);
+    let all = source_scan::rust_sources(&source_scan::host_dirs_except(&["mac/src"]));
     let test_only = source_scan::test_only_files(&all);
     for file in [TAB_SET_TESTS, "core/src/tab_set/tests/bypass.rs"] {
         assert!(
@@ -2364,7 +2364,7 @@ fn literals_are_read_with_and_without_the_tests() {
 #[cfg(target_os = "linux")]
 #[test]
 fn every_exec_lua_code_argument_is_in_the_chunk_table() {
-    let sources = source_scan::rust_sources(&["core/src", "shell/src"]);
+    let sources = source_scan::rust_sources(&source_scan::host_dirs_except(&["mac/src", "panel/src"]));
     let mut seen = BTreeSet::new();
     let mut watched = 0;
     for source in &sources {

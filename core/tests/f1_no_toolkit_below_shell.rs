@@ -1,11 +1,12 @@
-//! The normal dependency graphs of the toolkit-free crates must contain no GTK, GDK, GLib or
-//! WebKit packages. This checks `eitri-core`, `eitri-remote`, `eitri-panel`, `eitri-mac`, `agent`,
-//! `eitri-terminal`, `terminal-render`, `terminal-frame`, `terminal-sync` and `terminal-input`.
+//! The normal dependency graphs of the toolkit-free crates must contain no GTK, WebKit, AppKit
+//! or windowing packages. The macOS host may use AppKit and windowing crates, but not GTK or WebKitGTK.
 //!
 //! Each crate gets its own `cargo tree -p <crate> -e normal --offline --locked --prefix none`.
-//! A package name containing gtk, gdk, glib, gio, gobject, webkit, javascriptcore, gsk, pango or
+//! A package name containing gtk, gdk, glib, gobject, webkit, javascriptcore, gsk, pango or
 //! cairo fails, case-insensitively. Substring matching catches the corresponding `*-sys`
-//! packages without listing each. Normal edges exclude build and dev dependencies; offline
+//! packages without listing each. GIO matches as a whole word or as `gio_sys`. AppKit and
+//! windowing families match by name or hyphenated prefix.
+//! Normal edges exclude build and dev dependencies; offline
 //! uses cached sources, and locked refuses lockfile changes.
 //!
 //! Per-crate queries also work with a cache populated only for a toolkit-free target, as on
@@ -23,6 +24,7 @@
 //! If Cargo runs and reports a violation or an error, such as a stale lockfile or missing
 //! target crate, the test fails.
 
+use eitri_core::source_scan::word_ends;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
@@ -31,7 +33,6 @@ const BANNED_SUBSTRINGS: &[&str] = &[
     "gtk",
     "gdk",
     "glib",
-    "gio",
     "gobject",
     "webkit",
     "javascriptcore",
@@ -40,12 +41,25 @@ const BANNED_SUBSTRINGS: &[&str] = &[
     "cairo",
 ];
 
+const BANNED_FAMILIES: &[&str] = &[
+    "appkit",
+    "objc",
+    "objc2",
+    "block2",
+    "dispatch2",
+    "cocoa",
+    "winit",
+    "wry",
+    "tao",
+];
+
 const TARGET_CRATES: &[&str] = &[
     "eitri-core",
     "eitri-remote",
     "eitri-server",
     "eitri-server-proto",
     "eitri-panel",
+    "eitri-desk",
     "eitri-mac",
     "agent",
     "eitri-terminal",
@@ -69,9 +83,15 @@ fn workspace_manifest() -> PathBuf {
         .join("Cargo.toml")
 }
 
-fn is_banned(name: &str) -> bool {
+fn is_banned_for(crate_name: &str, name: &str) -> bool {
     let lower = name.to_ascii_lowercase();
     BANNED_SUBSTRINGS.iter().any(|s| lower.contains(s))
+        || !word_ends(&lower, "gio").is_empty()
+        || !word_ends(&lower, "gio_sys").is_empty()
+        || crate_name != "eitri-mac"
+            && BANNED_FAMILIES
+                .iter()
+                .any(|family| lower == *family || lower.strip_prefix(family).is_some_and(|rest| rest.starts_with('-')))
 }
 
 fn run_cargo_tree(manifest: &Path, crate_name: &str) -> std::io::Result<Output> {
@@ -129,7 +149,7 @@ fn no_toolkit_in_the_normal_dependency_closure_of_the_toolkit_free_crates() {
             let Some(name) = line.split_whitespace().next() else {
                 continue;
             };
-            if is_banned(name) {
+            if is_banned_for(target, name) {
                 failures.insert(format!("{target} -> {name}"));
             }
         }
@@ -138,9 +158,7 @@ fn no_toolkit_in_the_normal_dependency_closure_of_the_toolkit_free_crates() {
     assert!(
         failures.is_empty(),
         "no toolkit below the shell: the normal-dependency closure of a toolkit-free crate \
-         reaches a GTK/GDK/GLib/WebKit package:\n{}\n\
-         eitri-core, agent, eitri-terminal and the four terminal-{{render,frame,sync,input}} \
-         crates must build and link on a host with no GTK (the macOS host depends on this).",
+         reaches a toolkit or windowing package:\n{}",
         {
             let mut sorted: Vec<&String> = failures.iter().collect();
             sorted.sort();
@@ -171,7 +189,10 @@ fn the_banned_substring_matcher_is_neither_empty_nor_too_broad() {
         "pango-sys",
         "cairo-sys-rs",
     ] {
-        assert!(is_banned(name), "{name} should match BANNED_SUBSTRINGS but did not");
+        assert!(
+            is_banned_for("eitri-desk", name),
+            "{name} should match BANNED_SUBSTRINGS but did not"
+        );
     }
     for name in [
         "tokio",
@@ -185,6 +206,39 @@ fn the_banned_substring_matcher_is_neither_empty_nor_too_broad() {
         "sha2",
         "alacritty_terminal",
     ] {
-        assert!(!is_banned(name), "{name} should not match BANNED_SUBSTRINGS but did");
+        assert!(
+            !is_banned_for("eitri-desk", name),
+            "{name} should not match BANNED_SUBSTRINGS but did"
+        );
     }
+}
+
+#[test]
+fn gio_package_matching_uses_word_boundaries() {
+    for name in ["gio", "gio-sys", "gio_sys"] {
+        assert!(is_banned_for("eitri-desk", name), "{name}");
+    }
+    assert!(!is_banned_for("eitri-desk", "region"));
+}
+
+#[test]
+fn appkit_and_windowing_dependency_families_are_banned() {
+    for name in [
+        "objc2-app-kit",
+        "objc",
+        "objc2",
+        "appkit",
+        "cocoa-foundation",
+        "winit",
+        "wry",
+        "tao",
+    ] {
+        assert!(
+            is_banned_for("eitri-desk", name),
+            "toolkit dependency not caught: {name}"
+        );
+    }
+    assert!(!is_banned_for("eitri-desk", "taocp"));
+    assert!(!is_banned_for("eitri-mac", "objc2-app-kit"));
+    assert!(is_banned_for("eitri-mac", "webkit6"));
 }

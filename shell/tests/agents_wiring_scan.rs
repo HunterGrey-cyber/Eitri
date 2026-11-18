@@ -87,7 +87,7 @@ fn offers_with_rows(code: &str) -> usize {
 
 #[test]
 fn no_agents_io_on_the_gtk_thread() {
-    let sources = scan::rust_sources(&["shell/src", "panel/src"]);
+    let sources = scan::rust_sources(&scan::host_dirs_except(&["core/src", "mac/src"]));
     scan::require_anchors(
         &sources,
         &[

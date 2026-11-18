@@ -319,15 +319,13 @@ fn is_accel(literal: &str) -> bool {
     );
 }
 
-/// Directories scanned, relative to the workspace root.
-const SCANNED: &[&str] = &["shell/src", "panel/src"];
-
-/// Every `.rs` file of [`SCANNED`], with its `#[cfg(test)]` module and its line comments cut
-/// off -- so this test's own copies of the accelerators cannot satisfy it. Fails when a
-/// directory is missing or the code the scan exists to cover is not in what it read.
+/// Every `.rs` file of the window crates `shell` and `panel` and whatever joins them
+/// (`eitri_core::source_scan::host_dirs_except` without `core` and `mac`), with its `#[cfg(test)]`
+/// module and its line comments cut off -- so this test's own copies of the accelerators cannot satisfy it.
+/// Fails when a directory is missing or the code the scan exists to cover is not in what it read.
 fn sources() -> Vec<(String, String)> {
     use eitri_core::source_scan as scan;
-    let read = scan::rust_sources(SCANNED);
+    let read = scan::rust_sources(&scan::host_dirs_except(&["core/src", "mac/src"]));
     scan::require_anchors(
         &read,
         &["fn build_ui(", "fn handle_inbound_message(", "struct TrustGate"],

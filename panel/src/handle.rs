@@ -4231,7 +4231,6 @@ mod tests {
     #[test]
     fn no_script_src_unsafe_inline_anywhere() {
         use eitri_core::source_scan as scan;
-        const SCANNED: &[&str] = &["shell/src", "panel/src"];
         const WEB: &[&str] = &["agent-ui/web/src"];
         const PAGES: &[&str] = &[
             "agent-ui/web/index.html",
@@ -4257,7 +4256,7 @@ mod tests {
         ] {
             assert!(!allows_inline_script(&allowed), "caught wrongly: {allowed}");
         }
-        let rust = scan::rust_sources(SCANNED);
+        let rust = scan::product_sources();
         scan::require_anchors(&rust, &["fn content_security_policy_for(", "impl PanelDocument"]);
         let web = scan::sources(WEB, &["ts", "tsx", "js", "jsx", "css", "html"]);
         let pages: Vec<_> = PAGES.iter().map(|path| scan::read_required(path)).collect();

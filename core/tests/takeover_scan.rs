@@ -1,5 +1,5 @@
 //! A forced UI move is safe only in the disposable waiting room.
-use eitri_core::source_scan::{code_only, modules, sources, test_only_files, without, word_ends};
+use eitri_core::source_scan::{code_only, modules, product_dirs_except, sources, test_only_files, without, word_ends};
 
 fn forced_connect(text: &str) -> bool {
     let compact: String = text.chars().filter(|c| !c.is_whitespace()).collect();
@@ -32,23 +32,23 @@ fn handle_method(compact: &str, end: usize) -> bool {
 
 #[test]
 fn connect_bang_only_in_the_waiting_room() {
-    let mut files = sources(
-        &[
-            "core/src",
-            "agent/src",
-            "panel/src",
-            "shell/src",
-            "mac/src",
-            "neovide-editor/src",
-            "terminal",
-            "plugin-kit/agents/src",
-            "nvim",
-            "plugins",
-            "plugin-kit/keys/src",
-            "agent-ui/web/src",
-        ],
-        &["rs", "lua", "ts", "tsx", "js"],
-    );
+    // Every product crate's `src`; the terminal crates are read whole (tests and fixtures stay out below).
+    let mut dirs = product_dirs_except(&[
+        "terminal/engine/src",
+        "terminal/frame/src",
+        "terminal/input/src",
+        "terminal/render/src",
+        "terminal/sync/src",
+    ]);
+    dirs.extend([
+        "terminal",
+        "plugin-kit/agents/src",
+        "nvim",
+        "plugins",
+        "plugin-kit/keys/src",
+        "agent-ui/web/src",
+    ]);
+    let mut files = sources(&dirs, &["rs", "lua", "ts", "tsx", "js"]);
     files.retain(|file| {
         !file.path.contains("/node_modules/")
             && !file.path.contains("/dist/")

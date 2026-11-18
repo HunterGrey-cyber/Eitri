@@ -8,6 +8,187 @@
 
 use std::path::{Path, PathBuf};
 
+/// The `src` directory of every product crate: what a scan that guards "the whole product" reads.
+///
+/// Every workspace member except `poc/` has its entry here, and a test fails when one does not
+/// ([`product_crates_missing_from`]), so code that moves into a new crate stays under every whole-tree scan.
+/// A scan that deliberately skips a crate names the skipped entry in [`product_dirs_except`] rather than
+/// listing the directories it keeps.
+pub const PRODUCT_SOURCES: &[&str] = &[
+    "agent/src",
+    "core/src",
+    "desk/src",
+    "mac/src",
+    "neovide-editor/src",
+    "panel/src",
+    "remote/src",
+    "server-proto/src",
+    "server/src",
+    "shell/src",
+    "terminal/engine/src",
+    "terminal/frame/src",
+    "terminal/input/src",
+    "terminal/render/src",
+    "terminal/sync/src",
+];
+
+const NON_HOST_SOURCES: &[&str] = &[
+    "agent/src",
+    "neovide-editor/src",
+    "remote/src",
+    "server-proto/src",
+    "server/src",
+    "terminal/engine/src",
+    "terminal/frame/src",
+    "terminal/input/src",
+    "terminal/render/src",
+    "terminal/sync/src",
+];
+
+/// Product sources other than known non-host crates and the entries in `excluded`.
+/// New product crates are scanned unless explicitly excluded.
+///
+/// # Panics
+/// When an excluded entry is not on the list.
+pub fn host_dirs_except(excluded: &[&str]) -> Vec<&'static str> {
+    host_dirs_from(PRODUCT_SOURCES, excluded)
+}
+
+fn host_dirs_from<'a>(product: &[&'a str], excluded: &[&str]) -> Vec<&'a str> {
+    for entry in NON_HOST_SOURCES {
+        assert!(product.contains(entry), "{entry} is not a product source directory");
+    }
+    for entry in excluded {
+        assert!(
+            product.contains(entry) && !NON_HOST_SOURCES.contains(entry),
+            "{entry} is not a host source directory"
+        );
+    }
+    product
+        .iter()
+        .copied()
+        .filter(|dir| !NON_HOST_SOURCES.contains(dir) && !excluded.contains(dir))
+        .collect()
+}
+
+/// [`PRODUCT_SOURCES`], for a scan that reads all of the product.
+pub fn product_dirs() -> Vec<&'static str> {
+    PRODUCT_SOURCES.to_vec()
+}
+
+/// [`PRODUCT_SOURCES`] without the entries in `excluded`.
+///
+/// # Panics
+/// When an excluded entry is not on the list (a typo, or a crate that was renamed).
+pub fn product_dirs_except(excluded: &[&str]) -> Vec<&'static str> {
+    for entry in excluded {
+        assert!(
+            PRODUCT_SOURCES.contains(entry),
+            "{entry} is not a product source directory ({PRODUCT_SOURCES:?})"
+        );
+    }
+    PRODUCT_SOURCES
+        .iter()
+        .copied()
+        .filter(|dir| !excluded.contains(dir))
+        .collect()
+}
+
+/// Every `.rs` file of the product, [`PRODUCT_SOURCES`] read through [`rust_sources`].
+pub fn product_sources() -> Vec<Source> {
+    rust_sources(PRODUCT_SOURCES)
+}
+
+/// The `members` of a workspace manifest's `[workspace]` table, in order.
+///
+/// # Panics
+/// When the manifest has no `members = [ ... ]` list.
+pub fn workspace_members(manifest: &str) -> Vec<String> {
+    let manifest = manifest.parse::<toml::Table>().expect("valid workspace manifest TOML");
+    manifest
+        .get("workspace")
+        .and_then(|workspace| workspace.get("members"))
+        .and_then(toml::Value::as_array)
+        .expect("the workspace manifest has a members array")
+        .iter()
+        .map(|member| member.as_str().expect("each workspace member is a path").to_owned())
+        .collect()
+}
+
+fn dependency_tables(manifest: &toml::Table) -> impl Iterator<Item = (String, &toml::Table)> {
+    // Cargo also accepts the underscore spellings in manifests before edition 2024.
+    const KINDS: &[&str] = &[
+        "dependencies",
+        "dev-dependencies",
+        "dev_dependencies",
+        "build-dependencies",
+        "build_dependencies",
+    ];
+    let targets = manifest
+        .get("target")
+        .map(|targets| targets.as_table().expect("targets are a table"))
+        .into_iter()
+        .flatten()
+        .map(|(target, tables)| {
+            (
+                format!("target.{target:?}."),
+                tables.as_table().expect("target settings are a table"),
+            )
+        });
+    std::iter::once((String::new(), manifest))
+        .chain(targets)
+        .flat_map(|(scope, tables)| {
+            KINDS.iter().filter_map(move |kind| {
+                let deps = tables.get(*kind)?.as_table().expect("dependencies are a table");
+                Some((format!("{scope}{kind}"), deps))
+            })
+        })
+}
+
+/// The table and key of each forbidden dependency name or renamed package in a crate manifest.
+pub fn manifest_dependency_offenders(manifest: &str, forbidden: impl Fn(&str) -> bool) -> Vec<String> {
+    let manifest = manifest.parse::<toml::Table>().expect("valid crate manifest TOML");
+    let mut offenders = Vec::new();
+    for (table, deps) in dependency_tables(&manifest) {
+        for (name, spec) in deps {
+            let package = spec.get("package").and_then(toml::Value::as_str);
+            if forbidden(name) || package.is_some_and(&forbidden) {
+                let package = package.map_or_else(String::new, |name| format!(" (package {name})"));
+                offenders.push(format!("[{table}] {name}{package}"));
+            }
+        }
+    }
+    offenders
+}
+
+/// The local dependency directories of a workspace member, based at the workspace root.
+pub fn manifest_path_dependencies(manifest: &str, workspace: &str, member: &Path) -> Vec<PathBuf> {
+    let manifest = manifest.parse::<toml::Table>().expect("valid crate manifest TOML");
+    let workspace = workspace.parse::<toml::Table>().expect("valid workspace manifest TOML");
+    let inherited = workspace.get("workspace").and_then(|table| table.get("dependencies"));
+    dependency_tables(&manifest)
+        .flat_map(|(_, deps)| deps.iter())
+        .filter_map(|(name, spec)| {
+            if spec.get("workspace").and_then(toml::Value::as_bool) == Some(true) {
+                let spec = inherited?.get(name)?;
+                Some(PathBuf::from(spec.get("path")?.as_str()?))
+            } else {
+                Some(member.join(spec.get("path")?.as_str()?))
+            }
+        })
+        .collect()
+}
+
+/// The `src` of each product crate (a workspace member outside `poc/`) that `list` does not hold.
+pub fn product_crates_missing_from(manifest: &str, list: &[&str]) -> Vec<String> {
+    workspace_members(manifest)
+        .into_iter()
+        .filter(|member| !member.starts_with("poc/"))
+        .map(|member| format!("{member}/src"))
+        .filter(|dir| !list.contains(&dir.as_str()))
+        .collect()
+}
+
 /// One file a scan read: its path relative to the workspace root (`/`-separated) and its text.
 #[derive(Debug, Clone)]
 pub struct Source {
@@ -57,7 +238,7 @@ pub fn rust_sources(dirs: &[&str]) -> Vec<Source> {
 ///
 /// # Panics
 /// When it cannot be read.
-pub fn read_required(path: &str) -> Source {
+pub fn read_required(path: impl AsRef<Path>) -> Source {
     let root = workspace_root();
     read_at(&root, &root.join(path))
 }
@@ -141,7 +322,8 @@ fn collect(dir: &Path, extensions: &[&str], into: &mut Vec<PathBuf>) {
         let path = entry
             .unwrap_or_else(|e| panic!("cannot list {}: {e}", dir.display()))
             .path();
-        if path.is_dir() {
+        let metadata = std::fs::metadata(&path).unwrap_or_else(|e| panic!("cannot inspect {}: {e}", path.display()));
+        if metadata.is_dir() {
             collect(&path, extensions, into);
         } else if path
             .extension()
@@ -173,6 +355,7 @@ fn read_dirs(sources: &[Source]) -> String {
 }
 
 pub use crate::rust_mask::code_only;
+pub use crate::rust_mask::without_line_comments;
 
 /// The byte positions just after every whole-word occurrence of `word`.
 pub fn word_ends(code: &str, word: &str) -> Vec<usize> {
@@ -647,5 +830,90 @@ mod walker_tests {
         }];
         let result = std::panic::catch_unwind(|| require_anchors(&read, &["fn hidden("]));
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn every_product_crate_is_on_the_product_list() {
+        let manifest = read_required("Cargo.toml").text;
+        let missing = product_crates_missing_from(&manifest, PRODUCT_SOURCES);
+        assert!(missing.is_empty(), "add to PRODUCT_SOURCES: {missing:?}");
+        let members = workspace_members(&manifest);
+        for dir in PRODUCT_SOURCES {
+            let krate = dir.strip_suffix("/src").unwrap();
+            assert!(
+                members.iter().any(|m| m == krate),
+                "{dir} is on the list but {krate} is not a member"
+            );
+        }
+        assert!(
+            members.iter().any(|m| m.starts_with("poc/")) && !PRODUCT_SOURCES.iter().any(|d| d.starts_with("poc/")),
+            "poc/ stays off the list"
+        );
+    }
+
+    #[test]
+    fn an_unlisted_product_crate_is_reported_and_poc_is_not() {
+        let manifest = "[workspace]\nmembers = [\n    \"poc/spike\",\n    \"shell\",\n    \"desk\",  # new\n    \"terminal/engine\",\n]\n";
+        assert_eq!(
+            workspace_members(manifest),
+            ["poc/spike", "shell", "desk", "terminal/engine"]
+        );
+        let list = ["shell/src", "terminal/engine/src"];
+        assert_eq!(product_crates_missing_from(manifest, &list), ["desk/src"]);
+        assert!(product_crates_missing_from(manifest, &["desk/src", "shell/src", "terminal/engine/src"]).is_empty());
+    }
+
+    #[test]
+    fn adjacent_workspace_members_are_checked_individually() {
+        let manifest = "[workspace] # crates\nmembers = [\"poc/spike\", 'new-product',] # members\n";
+        assert_eq!(product_crates_missing_from(manifest, &[]), ["new-product/src"]);
+    }
+
+    #[test]
+    fn product_dirs_except_drops_named_entries_and_refuses_unknown_ones() {
+        assert_eq!(product_dirs().len(), PRODUCT_SOURCES.len());
+        let kept = product_dirs_except(&["mac/src", "remote/src"]);
+        assert_eq!(kept.len(), PRODUCT_SOURCES.len() - 2);
+        assert!(!kept.contains(&"mac/src") && kept.contains(&"shell/src"));
+        assert!(std::panic::catch_unwind(|| product_dirs_except(&["no/such/src"])).is_err());
+    }
+
+    #[test]
+    fn host_scans_follow_new_product_directories() {
+        let excluded = ["core/src", "mac/src"];
+        let manifest = read_required("Cargo.toml").text;
+        let mut expected: std::collections::BTreeSet<_> = workspace_members(&manifest)
+            .into_iter()
+            .map(|member| format!("{member}/src"))
+            .collect();
+        expected.retain(|dir| PRODUCT_SOURCES.contains(&dir.as_str()));
+        for dir in NON_HOST_SOURCES.iter().chain(&excluded) {
+            expected.remove(*dir);
+        }
+        let mut actual = host_dirs_except(&excluded);
+        actual.sort_unstable();
+        assert_eq!(actual, expected.into_iter().collect::<Vec<_>>());
+        let mut product = product_dirs();
+        product.push("new-window/src");
+        assert!(host_dirs_from(&product, &["core/src"]).contains(&"new-window/src"));
+        assert!(std::panic::catch_unwind(|| host_dirs_except(&["agent/src"])).is_err());
+    }
+
+    #[test]
+    fn the_product_list_reads_every_listed_directory() {
+        let read = product_sources();
+        for dir in PRODUCT_SOURCES {
+            assert!(
+                read.iter().any(|s| s.path.starts_with(&format!("{dir}/"))),
+                "{dir} contributed no file"
+            );
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "holds no")]
+    fn an_empty_product_directory_fails() {
+        // `docs/keymap` exists and holds no `.rs` file: a listed directory that emptied out fails the scan.
+        rust_sources(&["core/src/theme", "docs/keymap"]);
     }
 }
