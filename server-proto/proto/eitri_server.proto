@@ -10,6 +10,18 @@ service Helper {
   rpc ListSidecars(ListSidecarsRequest) returns (ListSidecarsResponse);
   rpc Pending(PendingRequest) returns (PendingResponse);
   rpc TrustScan(TrustScanRequest) returns (TrustScanResponse);
+
+  rpc SyncIgnores(SyncIgnoresRequest) returns (SyncIgnoresResponse);
+  rpc GitConfig(GitConfigRequest) returns (GitConfigResponse);
+  rpc ListTree(ListTreeRequest) returns (stream ListTreeEntry);
+  rpc ReadFile(ReadFileRequest) returns (stream ReadFileChunk);
+  rpc ReplaceFileIf(ReplaceFileIfRequest) returns (ReplaceFileIfResponse);
+  rpc RemoveFileIf(RemoveFileIfRequest) returns (RemoveFileIfResponse);
+  rpc WaitFileHash(WaitFileHashRequest) returns (WaitFileHashResponse);
+  rpc PathSizes(PathSizesRequest) returns (PathSizesResponse);
+  rpc ProjectActivity(ProjectActivityRequest) returns (ProjectActivityResponse);
+  rpc WatchModes(WatchModesRequest) returns (WatchModesResponse);
+  rpc Exec(stream ExecInput) returns (stream ExecOutput);
 }
 message HelloRequest { uint32 protocol_major = 1; uint32 protocol_minor = 2; string client_version = 3; }
 enum LoginEnvState {
@@ -48,3 +60,42 @@ message PendingPermission { uint64 sequence = 1; bytes event = 2; }
 message PendingResponse { repeated PendingPermission requests = 1; }
 message TrustScanRequest { string root = 1; string profile_key = 2; }
 message TrustScanResponse { bytes discovery_json = 1; string refusal = 2; }
+
+// Remote sync (M2)
+message SyncIgnoresRequest { string root = 1; }
+message SyncIgnoresResponse {
+  repeated string patterns = 1; repeated string tracked_ignored = 2; string digest = 3;
+  repeated string problems = 4; string refusal = 5;
+}
+message GitConfigRequest { string root = 1; }
+// In file order; a key may repeat (remote.<name>.fetch often does).
+message GitConfigEntry { string key = 1; string value = 2; }
+message GitConfigResponse { repeated GitConfigEntry entries = 1; string digest = 2; string refusal = 3; }
+message ListTreeRequest { string root = 1; repeated string patterns = 2; uint64 budget = 3; }
+message ListTreeEntry { string rel = 1; string kind = 2; uint64 size = 3; bool truncated = 4; string refusal = 5; }
+message ReadFileRequest { string root = 1; string rel = 2; uint64 limit = 3; }
+// Data chunks are at most 64 KiB; the final chunk carries the digest and kind.
+message ReadFileChunk { bytes data = 1; string sha256 = 2; string kind = 3; string refusal = 4; }
+// File reads are capped at 256 MiB, compare-and-replace contents at 8 MiB.
+message ReplaceFileIfRequest { string root = 1; string rel = 2; string expected_sha256 = 3; bytes data = 4; }
+message ReplaceFileIfResponse { bool replaced = 1; string refusal = 2; }
+message RemoveFileIfRequest { string root = 1; string rel = 2; string expected_sha256 = 3; }
+message RemoveFileIfResponse { bool removed = 1; string refusal = 2; }
+message WaitFileHashRequest { string root = 1; string rel = 2; string sha256 = 3; uint64 timeout_ms = 4; }
+message WaitFileHashResponse { bool matched = 1; string observed = 2; string refusal = 3; }
+message PathSizesRequest { string root = 1; repeated string rels = 2; repeated string patterns = 3; uint64 budget = 4; }
+message PathSize { string rel = 1; uint64 bytes = 2; }
+message PathSizesResponse { repeated PathSize sizes = 1; bool truncated = 2; string refusal = 3; }
+message ProjectActivityRequest { string root = 1; }
+message ProjectActivityResponse { uint32 turns_running = 1; bool unknown = 2; string refusal = 3; }
+message WatchModesRequest { string root = 1; repeated string patterns = 2; bool on = 3; }
+message WatchModesResponse { string refusal = 1; }
+enum ExecPurpose {
+  EXEC_PURPOSE_UNSPECIFIED = 0;
+  EXEC_PURPOSE_GIT = 1;
+  EXEC_PURPOSE_COMMAND = 2;
+}
+message ExecStart { string cwd = 1; repeated string argv = 2; ExecPurpose purpose = 3; }
+message ExecInput { oneof input { ExecStart start = 1; bytes stdin = 2; bool close = 3; } }
+message ExecExit { int32 code = 1; int32 signal = 2; string refusal = 3; }
+message ExecOutput { oneof output { bytes stdout = 1; bytes stderr = 2; ExecExit exit = 3; } }

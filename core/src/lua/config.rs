@@ -183,6 +183,50 @@ pub fn parse_remote_dev_enabled(value: Option<&str>) -> Result<bool, String> {
     crate::config_switch::parse_switch(REMOTE_DEV_ENABLED_KEY, value, false)
 }
 
+/// Maximum seconds a send waits for the tree session to flush.
+pub const REMOTE_DEV_FLUSH_CAP_KEY: &str = "remote_dev.flush_cap";
+pub const REMOTE_DEV_SEND_WAITS_FOR_FLUSH_KEY: &str = "remote_dev.send_waits_for_flush";
+pub const REMOTE_DEV_MUTAGEN_KEY: &str = "remote_dev.mutagen";
+pub const REMOTE_DEV_TRIPWIRE_MIB_KEY: &str = "remote_dev.tripwire_mib";
+
+pub fn parse_remote_dev_flush_cap(value: Option<&str>) -> Result<f64, String> {
+    let Some(value) = value else {
+        return Ok(3.0);
+    };
+    value
+        .trim()
+        .parse::<f64>()
+        .ok()
+        .filter(|n| n.is_finite() && (0.5..=30.0).contains(n))
+        .ok_or_else(|| format!("{REMOTE_DEV_FLUSH_CAP_KEY:?} must be seconds from 0.5 to 30 (got {value:?})"))
+}
+
+pub fn parse_remote_dev_send_waits_for_flush(value: Option<&str>) -> Result<bool, String> {
+    crate::config_switch::parse_switch(REMOTE_DEV_SEND_WAITS_FOR_FLUSH_KEY, value, true)
+}
+
+pub fn parse_remote_dev_mutagen(value: Option<&str>) -> Result<Option<std::path::PathBuf>, String> {
+    match value {
+        None => Ok(None),
+        Some(value) if std::path::Path::new(value).is_absolute() && !value.contains('\0') => Ok(Some(value.into())),
+        Some(value) => Err(format!(
+            "{REMOTE_DEV_MUTAGEN_KEY:?} must be an absolute path (got {value:?})"
+        )),
+    }
+}
+
+pub fn parse_remote_dev_tripwire_mib(value: Option<&str>) -> Result<u32, String> {
+    let Some(value) = value else {
+        return Ok(64);
+    };
+    value
+        .trim()
+        .parse::<u32>()
+        .ok()
+        .filter(|n| (8..=4096).contains(n))
+        .ok_or_else(|| format!("{REMOTE_DEV_TRIPWIRE_MIB_KEY:?} must be an integer from 8 to 4096 (got {value:?})"))
+}
+
 /// The `init.lua` key: `eitri.config.set("remote.enabled", true | false)`. Whether this window starts remote control
 /// (the `rv-` socket and `eitri remote serve`).
 pub const REMOTE_ENABLED_KEY: &str = "remote.enabled";
@@ -493,6 +537,60 @@ mod tests {
         lua.globals().set("eitri", eitri).unwrap();
         lua.load(init).exec().unwrap();
         store
+    }
+
+    #[test]
+    fn config_keys_have_their_defaults_and_ranges() {
+        assert_eq!(parse_remote_dev_flush_cap(None), Ok(3.0));
+        assert_eq!(parse_remote_dev_send_waits_for_flush(None), Ok(true));
+        assert_eq!(parse_remote_dev_mutagen(None), Ok(None));
+        assert_eq!(parse_remote_dev_tripwire_mib(None), Ok(64));
+        for (value, expected) in [("0.5", 0.5), ("30", 30.0), ("3", 3.0)] {
+            assert_eq!(parse_remote_dev_flush_cap(Some(value)), Ok(expected));
+        }
+        for bad in ["0.49", "30.01", "NaN", "inf", "-inf", "true", ""] {
+            assert!(parse_remote_dev_flush_cap(Some(bad))
+                .unwrap_err()
+                .contains(REMOTE_DEV_FLUSH_CAP_KEY));
+        }
+        for (value, expected) in [("8", 8), ("4096", 4096), ("64", 64)] {
+            assert_eq!(parse_remote_dev_tripwire_mib(Some(value)), Ok(expected));
+        }
+        for bad in ["7", "4097", "64.5", "-1", "true", "", "999999999999999"] {
+            assert!(parse_remote_dev_tripwire_mib(Some(bad))
+                .unwrap_err()
+                .contains(REMOTE_DEV_TRIPWIRE_MIB_KEY));
+        }
+        for (value, expected) in [("true", true), ("on", true), ("false", false), ("off", false)] {
+            assert_eq!(parse_remote_dev_send_waits_for_flush(Some(value)), Ok(expected));
+        }
+        assert!(parse_remote_dev_send_waits_for_flush(Some("maybe"))
+            .unwrap_err()
+            .contains(REMOTE_DEV_SEND_WAITS_FOR_FLUSH_KEY));
+        assert_eq!(
+            parse_remote_dev_mutagen(Some("/usr/bin/mutagen")),
+            Ok(Some("/usr/bin/mutagen".into()))
+        );
+        for bad in ["", "mutagen", "./mutagen", "~/bin/mutagen", "/bin/mutagen\0"] {
+            assert!(parse_remote_dev_mutagen(Some(bad))
+                .unwrap_err()
+                .contains(REMOTE_DEV_MUTAGEN_KEY));
+        }
+        let store = store_with("eitri.config.set('remote_dev.flush_cap', 0.5)\neitri.config.set('remote_dev.send_waits_for_flush', false)\neitri.config.set('remote_dev.mutagen', '/usr/bin/mutagen')\neitri.config.set('remote_dev.tripwire_mib', 4096)");
+        let store = store.borrow();
+        assert_eq!(parse_remote_dev_flush_cap(store.get(REMOTE_DEV_FLUSH_CAP_KEY)), Ok(0.5));
+        assert_eq!(
+            parse_remote_dev_send_waits_for_flush(store.get(REMOTE_DEV_SEND_WAITS_FOR_FLUSH_KEY)),
+            Ok(false)
+        );
+        assert_eq!(
+            parse_remote_dev_mutagen(store.get(REMOTE_DEV_MUTAGEN_KEY)),
+            Ok(Some("/usr/bin/mutagen".into()))
+        );
+        assert_eq!(
+            parse_remote_dev_tripwire_mib(store.get(REMOTE_DEV_TRIPWIRE_MIB_KEY)),
+            Ok(4096)
+        );
     }
 
     #[test]

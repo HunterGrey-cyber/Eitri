@@ -85,6 +85,16 @@ fn checks<'a>(agents: &'a [&'a str]) -> Vec<(&'static str, Check<'a>)> {
         (cfg::TERMINAL_FONT_KEY, check(cfg::parse_terminal_font)),
         (cfg::TERMINAL_CLAUDE_IDE_KEY, check(cfg::parse_terminal_claude_ide)),
         (cfg::REMOTE_DEV_ENABLED_KEY, check(cfg::parse_remote_dev_enabled)),
+        (cfg::REMOTE_DEV_FLUSH_CAP_KEY, check(cfg::parse_remote_dev_flush_cap)),
+        (
+            cfg::REMOTE_DEV_SEND_WAITS_FOR_FLUSH_KEY,
+            check(cfg::parse_remote_dev_send_waits_for_flush),
+        ),
+        (cfg::REMOTE_DEV_MUTAGEN_KEY, check(cfg::parse_remote_dev_mutagen)),
+        (
+            cfg::REMOTE_DEV_TRIPWIRE_MIB_KEY,
+            check(cfg::parse_remote_dev_tripwire_mib),
+        ),
         (cfg::WINDOW_RESTORE_KEY, check(cfg::parse_window_restore)),
         (cfg::EDITOR_RESTORE_KEY, check(cfg::parse_editor_restore)),
         (cfg::EDITOR_TAKEOVER_KEY, check(cfg::parse_editor_takeover)),
@@ -344,6 +354,31 @@ mod tests {
         let (_, problems) = settled("eitri.config.set('remote_dev.enable', true)");
         assert_eq!(problems.len(), 1, "{problems:?}");
         assert!(problems[0].contains("remote_dev.enabled"), "{problems:?}");
+    }
+
+    #[test]
+    fn remote_sync_values_and_typos_are_checked_at_startup() {
+        let (_, problems) = settled(
+            "eitri.config.set('remote_dev.flush_cap', 2.5)\n\
+             eitri.config.set('remote_dev.send_waits_for_flush', false)\n\
+             eitri.config.set('remote_dev.mutagen', '/opt/mutagen/bin/mutagen')\n\
+             eitri.config.set('remote_dev.tripwire_mib', 128)\n",
+        );
+        assert!(problems.is_empty(), "{problems:?}");
+        for (key, value) in [
+            ("remote_dev.flush_cap", "60"),
+            ("remote_dev.send_waits_for_flush", "'maybe'"),
+            ("remote_dev.mutagen", "'mutagen'"),
+            ("remote_dev.tripwire_mib", "4"),
+        ] {
+            let (kernel, problems) = settled(&format!("eitri.config.set('{key}', {value})"));
+            assert_eq!(problems.len(), 1, "{key}: {problems:?}");
+            assert!(problems[0].contains(key), "{key}: {problems:?}");
+            assert_eq!(kernel.config.borrow().get(key), None, "{key}");
+        }
+        let (_, problems) = settled("eitri.config.set('remote_dev.flushcap', 2)");
+        assert_eq!(problems.len(), 1, "{problems:?}");
+        assert!(problems[0].contains("remote_dev.flush_cap"), "{problems:?}");
     }
 
     #[test]

@@ -73,6 +73,7 @@ pub mod remote_pairing;
 pub mod remote_project;
 pub mod remote_runtime;
 pub mod remote_rv;
+pub mod remote_sync;
 pub mod remote_wire;
 pub mod review_editor;
 #[cfg(target_os = "linux")]

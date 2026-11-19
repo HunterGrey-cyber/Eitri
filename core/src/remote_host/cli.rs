@@ -94,6 +94,11 @@ pub struct Context<'a> {
 
 /// Runs `eitri host <args>` and returns its exit code: 0, 1 when it failed, 64 for a command line it does not take.
 pub fn run(args: &[String], cx: &mut Context<'_>) -> i32 {
+    match args.first().map(String::as_str) {
+        Some("sync") => return super::cli_sync::run_sync(&args[1..], cx),
+        Some("git") => return super::cli_sync::run_git(&args[1..], cx),
+        _ => {}
+    }
     let args: Vec<&str> = args.iter().map(String::as_str).collect();
     let done = match args.as_slice() {
         ["open", spec] => open(cx, spec),
@@ -1120,6 +1125,20 @@ mod tests {
 
     // Runs the Linux server scripts here as the server; macOS lacks flock(1) and GNU stat.
     #[cfg(target_os = "linux")]
+    #[test]
+    fn host_sync_and_git_verbs_exit_64_until_built() {
+        let root = ScratchDir::new("remote", "sync-cli");
+        let store = RemoteProjects::new(Some(root.as_os_str()), None);
+        let mut reach = fixture(&root, true);
+        let mut term = Scripted::default();
+        for args in [vec!["sync"], vec!["sync", "status"], vec!["git"], vec!["git", "status"]] {
+            assert_eq!(run_with(&store, &mut reach, &mut term, &args), 64);
+        }
+        assert_eq!(reach.connects, 0);
+        assert!(term.asked.is_empty());
+        assert!(term.said.is_empty(), "the stubs report on stderr");
+    }
+
     #[test]
     fn idle_recorded_installations_are_never_started_by_stop_or_uninstall() {
         for installation in ["99.0.0-abcdef0", "0.0.1-abcdef0"] {

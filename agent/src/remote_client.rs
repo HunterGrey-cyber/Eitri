@@ -81,7 +81,13 @@ pub struct SidecarStart {
     pub sidecar_sha256: String,
 }
 
-pub use eitri_server_proto::CAP_INSTALLATION_ARGS;
+pub use eitri_server_proto::{
+    ExecInput, ExecOutput, GitConfigRequest, GitConfigResponse, ListTreeEntry, ListTreeRequest, PathSizesRequest,
+    PathSizesResponse, ProjectActivityRequest, ProjectActivityResponse, ReadFileChunk, ReadFileRequest,
+    RemoveFileIfRequest, RemoveFileIfResponse, ReplaceFileIfRequest, ReplaceFileIfResponse, SyncIgnoresRequest,
+    SyncIgnoresResponse, WaitFileHashRequest, WaitFileHashResponse, WatchModesRequest, WatchModesResponse, CAP_EXEC,
+    CAP_GIT_CONFIG, CAP_INSTALLATION_ARGS, CAP_SYNC_FILES, CAP_SYNC_IGNORES, CAP_SYNC_MODES,
+};
 
 /// A checked START proved that an older installation was collected with no surviving agents.
 pub const MISSING_INSTALLATION: &str = "the owning helper installation is gone";
@@ -101,6 +107,7 @@ pub struct HelperClient {
 }
 
 struct Inner {
+    hello: Mutex<Option<HelloResponse>>,
     host: String,
     daemon: String,
     routes: Routes,
@@ -202,6 +209,7 @@ impl HelperClient {
         })?;
         let client = HelperClient {
             inner: Arc::new(Inner {
+                hello: Mutex::new(None),
                 host: host.to_string(),
                 daemon: daemon.to_string(),
                 routes: Default::default(),
@@ -275,6 +283,7 @@ impl HelperClient {
             }));
         let client = Self {
             inner: Arc::new(Inner {
+                hello: Mutex::new(None),
                 host: self.inner.host.clone(),
                 daemon: daemon.into(),
                 routes: self.inner.routes.clone(),
@@ -570,6 +579,7 @@ impl HelperClient {
         })?;
         check_hello(&response, self.host())?;
         self.inner.launcher.helper_hello(self.daemon(), &response.capabilities);
+        *self.inner.hello.lock().expect("helper hello") = Some(response.clone());
         Ok(response)
     }
 
@@ -708,6 +718,134 @@ impl HelperClient {
         };
         self.call(TRUST_SCAN_TIMEOUT, async move { service.trust_scan(request).await })
     }
+    /// The capabilities from the last checked Hello, obtaining it once if the caller has not asked yet.
+    pub fn hello_capabilities(&self) -> Result<Vec<String>, Status> {
+        let cached = self.inner.hello.lock().expect("helper hello").clone();
+        Ok(match cached {
+            Some(hello) => hello,
+            None => self.hello()?,
+        }
+        .capabilities)
+    }
+
+    pub fn sync_ignores(&self, request: SyncIgnoresRequest) -> Result<SyncIgnoresResponse, Status> {
+        self.require_pin()?;
+        let mut service = self.service();
+        self.call(HELPER_RPC_TIMEOUT, async move { service.sync_ignores(request).await })
+    }
+
+    pub fn git_config(&self, request: GitConfigRequest) -> Result<GitConfigResponse, Status> {
+        self.require_pin()?;
+        let mut service = self.service();
+        self.call(HELPER_RPC_TIMEOUT, async move { service.git_config(request).await })
+    }
+
+    pub fn list_tree(&self, request: ListTreeRequest) -> Result<tonic::Streaming<ListTreeEntry>, Status> {
+        self.require_pin()?;
+        let mut service = self.service();
+        self.call(HELPER_RPC_TIMEOUT, async move { service.list_tree(request).await })
+    }
+
+    pub fn read_file(&self, request: ReadFileRequest) -> Result<tonic::Streaming<ReadFileChunk>, Status> {
+        self.require_pin()?;
+        let mut service = self.service();
+        self.call(HELPER_RPC_TIMEOUT, async move { service.read_file(request).await })
+    }
+
+    pub fn replace_file_if(&self, request: ReplaceFileIfRequest) -> Result<ReplaceFileIfResponse, Status> {
+        self.require_pin()?;
+        let mut service = self.service();
+        self.call(
+            HELPER_RPC_TIMEOUT,
+            async move { service.replace_file_if(request).await },
+        )
+    }
+
+    pub fn remove_file_if(&self, request: RemoveFileIfRequest) -> Result<RemoveFileIfResponse, Status> {
+        self.require_pin()?;
+        let mut service = self.service();
+        self.call(HELPER_RPC_TIMEOUT, async move { service.remove_file_if(request).await })
+    }
+
+    pub fn wait_file_hash(&self, request: WaitFileHashRequest) -> Result<WaitFileHashResponse, Status> {
+        self.require_pin()?;
+        let mut service = self.service();
+        self.call(HELPER_RPC_TIMEOUT, async move { service.wait_file_hash(request).await })
+    }
+
+    pub fn path_sizes(&self, request: PathSizesRequest) -> Result<PathSizesResponse, Status> {
+        self.require_pin()?;
+        let mut service = self.service();
+        self.call(HELPER_RPC_TIMEOUT, async move { service.path_sizes(request).await })
+    }
+
+    pub fn project_activity(&self, request: ProjectActivityRequest) -> Result<ProjectActivityResponse, Status> {
+        self.require_pin()?;
+        let mut service = self.service();
+        self.call(
+            HELPER_RPC_TIMEOUT,
+            async move { service.project_activity(request).await },
+        )
+    }
+
+    pub fn watch_modes(&self, request: WatchModesRequest) -> Result<WatchModesResponse, Status> {
+        self.require_pin()?;
+        let mut service = self.service();
+        self.call(HELPER_RPC_TIMEOUT, async move { service.watch_modes(request).await })
+    }
+
+    pub fn exec(
+        &self,
+        input: impl tonic::codegen::tokio_stream::Stream<Item = ExecInput> + Send + 'static,
+    ) -> Result<tonic::Streaming<ExecOutput>, Status> {
+        self.require_pin()?;
+        let mut service = self.service();
+        self.call(HELPER_RPC_TIMEOUT, async move { service.exec(input).await })
+    }
+
+    /// Collects a sync response on this connection's runtime with caller-owned memory bounds.
+    /// A stream is dropped on overflow or timeout, so an unfinished response is never returned as complete.
+    pub fn collect_sync_stream<T: Send + 'static>(
+        &self,
+        stream: tonic::Streaming<T>,
+        entry_limit: usize,
+        byte_limit: usize,
+        item_bytes: fn(&T) -> usize,
+    ) -> Result<Vec<T>, Status> {
+        self.call(TRUST_SCAN_TIMEOUT, async move {
+            collect_sync_items(stream, entry_limit, byte_limit, item_bytes)
+                .await
+                .map(tonic::Response::new)
+        })
+    }
+}
+
+async fn collect_sync_items<T, S>(
+    mut stream: S,
+    entry_limit: usize,
+    byte_limit: usize,
+    item_bytes: fn(&T) -> usize,
+) -> Result<Vec<T>, Status>
+where
+    S: tonic::codegen::tokio_stream::Stream<Item = Result<T, Status>> + Unpin,
+{
+    use tonic::codegen::tokio_stream::StreamExt;
+    let mut items = Vec::new();
+    let mut bytes = 0usize;
+    while let Some(item) = stream.next().await {
+        let item = item?;
+        bytes = bytes
+            .checked_add(item_bytes(&item))
+            .filter(|bytes| *bytes <= byte_limit)
+            .ok_or_else(|| Status::resource_exhausted("sync stream exceeds the caller's byte bound"))?;
+        if items.len() >= entry_limit {
+            return Err(Status::resource_exhausted(
+                "sync stream exceeds the caller's entry bound",
+            ));
+        }
+        items.push(item);
+    }
+    Ok(items)
 }
 
 /// The helper connections a window holds, one per recorded host key. Asked where a moved remote chat is
@@ -1393,6 +1531,32 @@ impl Drop for ChildPipe {
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn remote_client_sync_streams_enforce_bounds_and_preserve_errors() {
+        use tonic::codegen::tokio_stream::iter;
+        let values = || iter([Ok(vec![1u8, 2]), Ok(vec![3u8])]);
+        assert_eq!(
+            collect_sync_items(values(), 2, 3, Vec::len).await.unwrap(),
+            vec![vec![1, 2], vec![3]]
+        );
+        let error = collect_sync_items(values(), 1, 3, Vec::len).await.unwrap_err();
+        assert_eq!(error.code(), tonic::Code::ResourceExhausted);
+        assert!(error.message().contains("entry bound"));
+        let error = collect_sync_items(values(), 2, 2, Vec::len).await.unwrap_err();
+        assert_eq!(error.code(), tonic::Code::ResourceExhausted);
+        assert!(error.message().contains("byte bound"));
+        let items = iter([Ok(vec![1u8]), Err(Status::data_loss("incomplete file"))]);
+        let error = collect_sync_items(items, 2, 3, Vec::len).await.unwrap_err();
+        assert_eq!(error.code(), tonic::Code::DataLoss);
+        assert_eq!(error.message(), "incomplete file");
+        assert!(
+            collect_sync_items(iter(Vec::<Result<Vec<u8>, Status>>::new()), 0, 0, Vec::len)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
     #[test]
     fn opening_a_replacement_keeps_the_failure_until_that_replacement_answers() {
         let capture = |script| {
@@ -1501,6 +1665,7 @@ mod tests {
         };
         HelperClient {
             inner: Arc::new(Inner {
+                hello: Mutex::new(None),
                 host: "example-host".into(),
                 daemon: "current-installation".into(),
                 routes: Default::default(),

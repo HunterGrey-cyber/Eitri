@@ -1,9 +1,13 @@
+#[path = "exec/mod.rs"]
+pub mod exec;
 #[path = "login_env.rs"]
 pub mod login_env;
 #[path = "serve/mod.rs"]
 pub mod serve;
 #[path = "sidecars.rs"]
 pub mod sidecars;
+#[path = "sync/mod.rs"]
+pub mod sync;
 #[path = "test_exec.rs"]
 #[cfg(test)]
 #[allow(dead_code)]
@@ -197,6 +201,67 @@ impl Helper for Service {
                 refusal,
             },
         }))
+    }
+    async fn sync_ignores(
+        &self,
+        _request: Request<SyncIgnoresRequest>,
+    ) -> Result<Response<SyncIgnoresResponse>, Status> {
+        Err(Status::unimplemented("SyncIgnores is not built yet"))
+    }
+
+    async fn git_config(&self, _request: Request<GitConfigRequest>) -> Result<Response<GitConfigResponse>, Status> {
+        Err(Status::unimplemented("GitConfig is not built yet"))
+    }
+
+    type ListTreeStream = Pin<Box<dyn tokio_stream::Stream<Item = Result<ListTreeEntry, Status>> + Send>>;
+    async fn list_tree(&self, _request: Request<ListTreeRequest>) -> Result<Response<Self::ListTreeStream>, Status> {
+        Err(Status::unimplemented("ListTree is not built yet"))
+    }
+
+    type ReadFileStream = Pin<Box<dyn tokio_stream::Stream<Item = Result<ReadFileChunk, Status>> + Send>>;
+    async fn read_file(&self, _request: Request<ReadFileRequest>) -> Result<Response<Self::ReadFileStream>, Status> {
+        Err(Status::unimplemented("ReadFile is not built yet"))
+    }
+
+    async fn replace_file_if(
+        &self,
+        _request: Request<ReplaceFileIfRequest>,
+    ) -> Result<Response<ReplaceFileIfResponse>, Status> {
+        Err(Status::unimplemented("ReplaceFileIf is not built yet"))
+    }
+
+    async fn remove_file_if(
+        &self,
+        _request: Request<RemoveFileIfRequest>,
+    ) -> Result<Response<RemoveFileIfResponse>, Status> {
+        Err(Status::unimplemented("RemoveFileIf is not built yet"))
+    }
+
+    async fn wait_file_hash(
+        &self,
+        _request: Request<WaitFileHashRequest>,
+    ) -> Result<Response<WaitFileHashResponse>, Status> {
+        Err(Status::unimplemented("WaitFileHash is not built yet"))
+    }
+
+    async fn path_sizes(&self, _request: Request<PathSizesRequest>) -> Result<Response<PathSizesResponse>, Status> {
+        Err(Status::unimplemented("PathSizes is not built yet"))
+    }
+
+    async fn project_activity(
+        &self,
+        _request: Request<ProjectActivityRequest>,
+    ) -> Result<Response<ProjectActivityResponse>, Status> {
+        Err(Status::unimplemented("ProjectActivity is not built yet"))
+    }
+
+    async fn watch_modes(&self, _request: Request<WatchModesRequest>) -> Result<Response<WatchModesResponse>, Status> {
+        Err(Status::unimplemented("WatchModes is not built yet"))
+    }
+
+    type ExecStream = Pin<Box<dyn tokio_stream::Stream<Item = Result<ExecOutput, Status>> + Send>>;
+    async fn exec(&self, _request: Request<tonic::Streaming<ExecInput>>) -> Result<Response<Self::ExecStream>, Status> {
+        Err(Status::unimplemented("Exec is not built yet"))
     }
 }
 
@@ -419,6 +484,78 @@ impl AsyncWrite for Connection {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    struct Scratch(std::path::PathBuf);
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn contract_service() -> (Service, Scratch) {
+        static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        // Keep the socket names short even when the runner's TMPDIR is long.
+        let root = std::path::PathBuf::from(format!(
+            "/tmp/m2-contracts-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        let scratch = Scratch(root.clone());
+        agent::private_fs::create_private_dir_all(&root, &root).unwrap();
+        let paths = Paths::new(crate::VERSION, &root.join("data"), &root.join("state"), &root).unwrap();
+        paths.prepare().unwrap();
+        let sidecars = Arc::new(sidecars::Sidecars::new(paths.clone()).unwrap());
+        let serving = serve::Serving::new(paths, sidecars.clone());
+        (Service { sidecars, serving }, scratch)
+    }
+
+    #[tokio::test]
+    async fn hello_lists_no_m2_capability_until_its_handler_is_built() {
+        let (service, _scratch) = contract_service();
+        let hello = service
+            .hello(Request::new(HelloRequest {
+                protocol_major: PROTOCOL_MAJOR,
+                ..Default::default()
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        for capability in [
+            CAP_SYNC_IGNORES,
+            CAP_GIT_CONFIG,
+            CAP_SYNC_FILES,
+            CAP_SYNC_MODES,
+            CAP_EXEC,
+        ] {
+            assert!(!hello.capabilities.iter().any(|cap| cap == capability), "{capability}");
+        }
+        assert_eq!(hello.protocol_minor, 2);
+    }
+
+    #[tokio::test]
+    async fn new_rpcs_answer_unimplemented_with_their_name() {
+        let (service, _scratch) = contract_service();
+        let unary = service
+            .sync_ignores(Request::new(SyncIgnoresRequest {
+                root: "/srv/project".into(),
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(unary.code(), tonic::Code::Unimplemented);
+        assert_eq!(unary.message(), "SyncIgnores is not built yet");
+        let streaming = service
+            .list_tree(Request::new(ListTreeRequest {
+                root: "/srv/project".into(),
+                ..Default::default()
+            }))
+            .await
+            .err()
+            .unwrap();
+        assert_eq!(streaming.code(), tonic::Code::Unimplemented);
+        assert_eq!(streaming.message(), "ListTree is not built yet");
+    }
+
     #[tokio::test]
     async fn sigterm_stops_owned_sidecars_then_the_daemon() {
         let mut child = tokio::process::Command::new("/bin/sleep")

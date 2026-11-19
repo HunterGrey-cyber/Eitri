@@ -1,6 +1,7 @@
 //! Worker-side remote host connection and resume operations.
 
 pub mod cli;
+pub mod cli_sync;
 pub mod first_contact;
 pub mod install;
 pub mod manifest;

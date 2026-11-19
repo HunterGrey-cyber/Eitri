@@ -35,10 +35,12 @@ const HOST_KEY: &str = "SHA256:example-host-key";
 const SIDECAR_REVISION: &str = "test-rev";
 
 fn helper_binary() -> PathBuf {
-    // `<target>/debug/deps/<this test>` -> `<target>/debug/eitri-server`.
+    // Cargo may keep test executables in its build directory rather than beside the product binaries.
     let exe = std::env::current_exe().unwrap();
     let debug = exe.parent().and_then(Path::parent).unwrap();
-    let helper = debug.join("eitri-server");
+    let helper = std::env::var_os("CARGO_TARGET_DIR")
+        .map(|target| PathBuf::from(target).join("debug/eitri-server"))
+        .unwrap_or_else(|| debug.join("eitri-server"));
     assert!(
         helper.is_file(),
         "the server helper is not built: run `cargo build -p eitri-server --bins` first ({})",
@@ -82,8 +84,9 @@ impl Server {
     /// server's root directory.
     fn new(conf: &[&str]) -> Self {
         let root = loop {
+            // Leave room for the helper's socket suffix under the shared Unix socket path cap.
             let candidate =
-                std::env::temp_dir().join(format!("rt-{}", &uuid::Uuid::new_v4().simple().to_string()[..8]));
+                PathBuf::from("/tmp").join(format!("rt-{}", &uuid::Uuid::new_v4().simple().to_string()[..8]));
             if !candidate.exists() {
                 break candidate;
             }
@@ -865,6 +868,92 @@ impl eitri_server_proto::helper_server::Helper for ScriptedHelper {
         _: tonic::Request<eitri_server_proto::TrustScanRequest>,
     ) -> Result<tonic::Response<eitri_server_proto::TrustScanResponse>, tonic::Status> {
         Err(tonic::Status::unimplemented("not here"))
+    }
+    async fn sync_ignores(
+        &self,
+        _: tonic::Request<eitri_server_proto::SyncIgnoresRequest>,
+    ) -> Result<tonic::Response<eitri_server_proto::SyncIgnoresResponse>, tonic::Status> {
+        Err(tonic::Status::unimplemented("SyncIgnores is not built yet"))
+    }
+    async fn git_config(
+        &self,
+        _: tonic::Request<eitri_server_proto::GitConfigRequest>,
+    ) -> Result<tonic::Response<eitri_server_proto::GitConfigResponse>, tonic::Status> {
+        Err(tonic::Status::unimplemented("GitConfig is not built yet"))
+    }
+
+    type ListTreeStream = std::pin::Pin<
+        Box<
+            dyn tonic::codegen::tokio_stream::Stream<Item = Result<eitri_server_proto::ListTreeEntry, tonic::Status>>
+                + Send,
+        >,
+    >;
+    async fn list_tree(
+        &self,
+        _: tonic::Request<eitri_server_proto::ListTreeRequest>,
+    ) -> Result<tonic::Response<Self::ListTreeStream>, tonic::Status> {
+        Err(tonic::Status::unimplemented("ListTree is not built yet"))
+    }
+
+    type ReadFileStream = std::pin::Pin<
+        Box<
+            dyn tonic::codegen::tokio_stream::Stream<Item = Result<eitri_server_proto::ReadFileChunk, tonic::Status>>
+                + Send,
+        >,
+    >;
+    async fn read_file(
+        &self,
+        _: tonic::Request<eitri_server_proto::ReadFileRequest>,
+    ) -> Result<tonic::Response<Self::ReadFileStream>, tonic::Status> {
+        Err(tonic::Status::unimplemented("ReadFile is not built yet"))
+    }
+    async fn replace_file_if(
+        &self,
+        _: tonic::Request<eitri_server_proto::ReplaceFileIfRequest>,
+    ) -> Result<tonic::Response<eitri_server_proto::ReplaceFileIfResponse>, tonic::Status> {
+        Err(tonic::Status::unimplemented("ReplaceFileIf is not built yet"))
+    }
+    async fn remove_file_if(
+        &self,
+        _: tonic::Request<eitri_server_proto::RemoveFileIfRequest>,
+    ) -> Result<tonic::Response<eitri_server_proto::RemoveFileIfResponse>, tonic::Status> {
+        Err(tonic::Status::unimplemented("RemoveFileIf is not built yet"))
+    }
+    async fn wait_file_hash(
+        &self,
+        _: tonic::Request<eitri_server_proto::WaitFileHashRequest>,
+    ) -> Result<tonic::Response<eitri_server_proto::WaitFileHashResponse>, tonic::Status> {
+        Err(tonic::Status::unimplemented("WaitFileHash is not built yet"))
+    }
+    async fn path_sizes(
+        &self,
+        _: tonic::Request<eitri_server_proto::PathSizesRequest>,
+    ) -> Result<tonic::Response<eitri_server_proto::PathSizesResponse>, tonic::Status> {
+        Err(tonic::Status::unimplemented("PathSizes is not built yet"))
+    }
+    async fn project_activity(
+        &self,
+        _: tonic::Request<eitri_server_proto::ProjectActivityRequest>,
+    ) -> Result<tonic::Response<eitri_server_proto::ProjectActivityResponse>, tonic::Status> {
+        Err(tonic::Status::unimplemented("ProjectActivity is not built yet"))
+    }
+    async fn watch_modes(
+        &self,
+        _: tonic::Request<eitri_server_proto::WatchModesRequest>,
+    ) -> Result<tonic::Response<eitri_server_proto::WatchModesResponse>, tonic::Status> {
+        Err(tonic::Status::unimplemented("WatchModes is not built yet"))
+    }
+    type ExecStream = std::pin::Pin<
+        Box<
+            dyn tonic::codegen::tokio_stream::Stream<Item = Result<eitri_server_proto::ExecOutput, tonic::Status>>
+                + Send,
+        >,
+    >;
+    async fn exec(
+        &self,
+        _: tonic::Request<tonic::Streaming<eitri_server_proto::ExecInput>>,
+    ) -> Result<tonic::Response<Self::ExecStream>, tonic::Status> {
+        Err(tonic::Status::unimplemented("Exec is not built yet"))
     }
 }
 

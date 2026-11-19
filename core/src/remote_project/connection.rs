@@ -7,7 +7,7 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use agent::remote_client::{HelperClient, HelperConnections, SidecarStart};
+use agent::remote_client::{self as wire, HelperClient, HelperConnections, SidecarStart};
 use agent::setting_sources::ProjectTrust;
 use agent::ssh::{ChannelLauncher, ControlMaster, SshLauncher};
 
@@ -187,12 +187,96 @@ impl RemoteConnection {
         })
     }
 
+    fn require_capability(&self, capability: &str) -> Result<(), String> {
+        let capabilities = self.client.hello_capabilities().map_err(|error| error.to_string())?;
+        check_capability(self.host(), &capabilities, capability)
+    }
+
+    pub fn sync_ignores(&self, request: wire::SyncIgnoresRequest) -> Result<wire::SyncIgnoresResponse, String> {
+        self.require_capability(wire::CAP_SYNC_IGNORES)?;
+        self.client.sync_ignores(request).map_err(|error| error.to_string())
+    }
+
+    pub fn git_config(&self, request: wire::GitConfigRequest) -> Result<wire::GitConfigResponse, String> {
+        self.require_capability(wire::CAP_GIT_CONFIG)?;
+        self.client.git_config(request).map_err(|error| error.to_string())
+    }
+
+    pub fn replace_file_if(&self, request: wire::ReplaceFileIfRequest) -> Result<wire::ReplaceFileIfResponse, String> {
+        self.require_capability(wire::CAP_SYNC_FILES)?;
+        self.client.replace_file_if(request).map_err(|error| error.to_string())
+    }
+
+    pub fn remove_file_if(&self, request: wire::RemoveFileIfRequest) -> Result<wire::RemoveFileIfResponse, String> {
+        self.require_capability(wire::CAP_SYNC_FILES)?;
+        self.client.remove_file_if(request).map_err(|error| error.to_string())
+    }
+
+    pub fn wait_file_hash(&self, request: wire::WaitFileHashRequest) -> Result<wire::WaitFileHashResponse, String> {
+        self.require_capability(wire::CAP_SYNC_FILES)?;
+        self.client.wait_file_hash(request).map_err(|error| error.to_string())
+    }
+
+    pub fn path_sizes(&self, request: wire::PathSizesRequest) -> Result<wire::PathSizesResponse, String> {
+        self.require_capability(wire::CAP_SYNC_FILES)?;
+        self.client.path_sizes(request).map_err(|error| error.to_string())
+    }
+
+    pub fn project_activity(
+        &self,
+        request: wire::ProjectActivityRequest,
+    ) -> Result<wire::ProjectActivityResponse, String> {
+        self.require_capability(wire::CAP_SYNC_FILES)?;
+        self.client.project_activity(request).map_err(|error| error.to_string())
+    }
+
+    pub fn watch_modes(&self, request: wire::WatchModesRequest) -> Result<wire::WatchModesResponse, String> {
+        self.require_capability(wire::CAP_SYNC_MODES)?;
+        self.client.watch_modes(request).map_err(|error| error.to_string())
+    }
+
+    pub fn list_tree(
+        &self,
+        request: wire::ListTreeRequest,
+        entry_limit: usize,
+    ) -> Result<Vec<wire::ListTreeEntry>, String> {
+        self.require_capability(wire::CAP_SYNC_FILES)?;
+        let stream = self.client.list_tree(request).map_err(|error| error.to_string())?;
+        self.client
+            .collect_sync_stream(stream, entry_limit, usize::MAX, |_| 0)
+            .map_err(|error| error.to_string())
+    }
+
+    pub fn read_file(
+        &self,
+        request: wire::ReadFileRequest,
+        byte_limit: usize,
+    ) -> Result<Vec<wire::ReadFileChunk>, String> {
+        self.require_capability(wire::CAP_SYNC_FILES)?;
+        let stream = self.client.read_file(request).map_err(|error| error.to_string())?;
+        // Even empty chunks cost an entry; bound them as well as the file's data bytes.
+        self.client
+            .collect_sync_stream(stream, byte_limit.saturating_add(1), byte_limit, |chunk| {
+                chunk.data.len()
+            })
+            .map_err(|error| error.to_string())
+    }
+
     fn check_handoff(&self, handoff: &agent::HelperHandoff) -> Result<(), BackendError> {
         match handoff_refusal(&self.project, handoff) {
             Some(message) => Err(BackendError { message, benign: false }),
             None => Ok(()),
         }
     }
+}
+
+fn check_capability(host: &str, capabilities: &[String], capability: &str) -> Result<(), String> {
+    if capabilities.iter().any(|offered| offered == capability) {
+        return Ok(());
+    }
+    Err(format!(
+        "the server's Eitri helper on {host} does not offer {capability}"
+    ))
 }
 
 /// Why a saved tab's agent is not taken up through `project`'s connection: it was saved under another host key,
@@ -422,6 +506,23 @@ impl HelperConnections for RemoteConnection {
 mod tests {
     use super::*;
     use std::collections::BTreeMap;
+
+    #[test]
+    fn missing_capability_names_it_in_the_client_error() {
+        let capabilities = vec![wire::CAP_SYNC_FILES.to_string()];
+        for capability in [
+            wire::CAP_SYNC_IGNORES,
+            wire::CAP_GIT_CONFIG,
+            wire::CAP_SYNC_MODES,
+            wire::CAP_EXEC,
+        ] {
+            assert_eq!(
+                check_capability("example-host", &capabilities, capability).unwrap_err(),
+                format!("the server's Eitri helper on example-host does not offer {capability}")
+            );
+        }
+        check_capability("example-host", &capabilities, wire::CAP_SYNC_FILES).unwrap();
+    }
 
     #[test]
     fn queued_stops_belong_to_the_host_key_user_and_port_that_queued_them() {

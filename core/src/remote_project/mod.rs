@@ -39,7 +39,59 @@ pub struct RemoteProject {
     pub queued_stops: Vec<String>,
 }
 
+/// The sync engine's durable session identities and decisions awaiting the person.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SyncRecord {
+    pub engine: String,
+    #[serde(default)]
+    pub tree_session: Option<String>,
+    #[serde(default)]
+    pub git_session: Option<String>,
+    pub host_key_sha256: String,
+    #[serde(default)]
+    pub ignore_digest: String,
+    #[serde(default)]
+    pub excludes_added: Vec<String>,
+    #[serde(default)]
+    pub excludes_removed: Vec<String>,
+    #[serde(default)]
+    pub tripwire_allowed: Vec<String>,
+    #[serde(default)]
+    pub paused: Option<PauseRecord>,
+    #[serde(default)]
+    pub copied_back: Vec<String>,
+    #[serde(default)]
+    pub git_ready: bool,
+}
+
+/// A pause remains visible across restarts until the person settles it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PauseRecord {
+    pub reason: String,
+    pub detail: String,
+    pub since_unix_ms: u64,
+}
+
 impl RemoteProject {
+    pub fn sync_record(&self) -> Result<Option<SyncRecord>, String> {
+        self.sync
+            .as_ref()
+            .map(|value| {
+                serde_json::from_value(value.clone()).map_err(|error| {
+                    format!(
+                        "the sync record for {} on {} is unreadable: {error}",
+                        self.root.display(),
+                        self.host
+                    )
+                })
+            })
+            .transpose()
+    }
+
+    pub fn set_sync_record(&mut self, record: &SyncRecord) {
+        self.sync = Some(serde_json::to_value(record).expect("sync records contain only JSON values"));
+    }
+
     pub fn same_identity(&self, other: &Self) -> bool {
         self.root == other.root && self.host == other.host && self.host_key_sha256 == other.host_key_sha256
     }
@@ -393,6 +445,88 @@ mod tests {
     fn store() -> RemoteProjects {
         let state = agent::state_dirs::test_workspace_dir("remote-project");
         RemoteProjects::new(Some(state.as_os_str()), None)
+    }
+
+    fn sync_record() -> SyncRecord {
+        SyncRecord {
+            engine: "mutagen".into(),
+            tree_session: Some("eitri-example-tree".into()),
+            git_session: Some("eitri-example-git".into()),
+            host_key_sha256: "SHA256:example".into(),
+            ignore_digest: "digest".into(),
+            excludes_added: vec!["build".into()],
+            excludes_removed: vec!["keep".into()],
+            tripwire_allowed: vec!["large".into()],
+            paused: Some(PauseRecord {
+                reason: "tripwire".into(),
+                detail: "large batch".into(),
+                since_unix_ms: 123,
+            }),
+            copied_back: vec!["restored".into()],
+            git_ready: true,
+        }
+    }
+
+    #[test]
+    fn sync_record_round_trips_and_older_records_read_without_it() {
+        let store = store();
+        let mut project = record();
+        assert_eq!(project.sync_record().unwrap(), None);
+        let mut old = serde_json::to_value(&project).unwrap();
+        old.as_object_mut().unwrap().remove("sync");
+        let old: RemoteProject = serde_json::from_value(old).unwrap();
+        assert_eq!(old.sync_record().unwrap(), None);
+        let sync = sync_record();
+        project.set_sync_record(&sync);
+        store.save(&project).unwrap();
+        assert_eq!(
+            store.find(&project.root).unwrap().unwrap().sync_record().unwrap(),
+            Some(sync)
+        );
+        project.sync = Some(serde_json::json!({ "engine": "mutagen", "host_key_sha256": "SHA256:example" }));
+        let minimal = project.sync_record().unwrap().unwrap();
+        assert_eq!(minimal.tree_session, None);
+        assert_eq!(minimal.git_session, None);
+        assert!(minimal.ignore_digest.is_empty());
+        assert!(minimal.excludes_added.is_empty());
+        assert!(minimal.excludes_removed.is_empty());
+        assert!(minimal.tripwire_allowed.is_empty());
+        assert_eq!(minimal.paused, None);
+        assert!(minimal.copied_back.is_empty());
+        assert!(!minimal.git_ready);
+    }
+
+    #[test]
+    fn a_record_with_an_unknown_sync_field_still_opens() {
+        let store = store();
+        let mut project = record();
+        let sync = sync_record();
+        project.set_sync_record(&sync);
+        project.sync.as_mut().unwrap()["future_field"] = serde_json::json!({"nested": true});
+        store.save(&project).unwrap();
+        assert_eq!(
+            store.find(&project.root).unwrap().unwrap().sync_record().unwrap(),
+            Some(sync)
+        );
+    }
+
+    #[test]
+    fn an_unreadable_sync_value_is_an_error() {
+        let mut project = record();
+        for value in [
+            serde_json::json!("wrong"),
+            serde_json::json!({}),
+            serde_json::json!({"engine": "mutagen"}),
+            serde_json::json!({"host_key_sha256": "SHA256:example"}),
+            serde_json::json!({"engine": "mutagen", "host_key_sha256": "SHA256:example", "git_ready": "yes"}),
+        ] {
+            project.sync = Some(value);
+            let error = project.sync_record().unwrap_err();
+            assert!(
+                error.contains("sync record") && error.contains("example-host"),
+                "{error}"
+            );
+        }
     }
 
     /// A forget waits for the store lock an update holds, so it cannot slip between that update's read and its write.
