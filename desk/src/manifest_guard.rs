@@ -7,7 +7,9 @@
 //! dev-dependencies included. What it cannot see is a toolkit arriving transitively through another dependency;
 //! `core/tests/f1_no_toolkit_below_shell.rs` checks that with `cargo tree`.
 //!
-use eitri_core::source_scan::manifest_dependency_offenders;
+use eitri_core::source_scan::{is_package_in_family, manifest_dependency_offenders};
+#[cfg(test)]
+use eitri_core::source_scan::{AWKWARD_DEPENDENCY_SPELLINGS, NAMES_INSIDE_OTHER_WORDS};
 
 const MANIFEST: &str = include_str!("../Cargo.toml");
 
@@ -42,10 +44,7 @@ const FORBIDDEN: &[&str] = &[
 ];
 
 fn forbidden(name: &str) -> bool {
-    name == "shell"
-        || FORBIDDEN
-            .iter()
-            .any(|family| name == *family || name.strip_prefix(family).is_some_and(|rest| rest.starts_with('-')))
+    name == "shell" || is_package_in_family(name, FORBIDDEN)
 }
 
 fn offenders(manifest: &str) -> Vec<String> {
@@ -56,7 +55,7 @@ fn offenders(manifest: &str) -> Vec<String> {
 fn manifest_declares_no_toolkit_or_host_dependency() {
     let offenders: Vec<String> = offenders(MANIFEST)
         .into_iter()
-        .map(|o| format!("desk/Cargo.toml:{o}"))
+        .map(|o| format!("desk/Cargo.toml: {o}"))
         .collect();
     assert!(
         offenders.is_empty(),
@@ -83,8 +82,6 @@ fn every_shape_of_a_toolkit_dependency_is_caught() {
         "[dev-dependencies]\npango = \"0.22\"\n",
         // A rename via the sub-table header form rather than the inline-table form: the same
         // `ui = { package = "gtk4" }` rename, spelled as `[dependencies.ui]` / `package = "gtk4"`.
-        // `header.ends_with("dependencies")` is false for "dependencies.ui" (it ends in "ui"), so
-        // without the sub-table branch the `package = "gtk4"` line inside it would be skipped.
         "[dependencies.ui]\npackage = \"gtk4\"\nversion = \"0.11\"\n",
     ] {
         assert_eq!(offenders(manifest).len(), 1, "not caught:\n{manifest}");
@@ -136,4 +133,35 @@ fn legacy_bindings_are_banned_but_shell_words_is_not_a_host() {
         offenders("[dependencies]\nobjc = '0.2'\nshell-words = '1'\n"),
         ["[dependencies] objc"]
     );
+}
+
+/// A rename after other keys, in a dotted key or in a sub-table with a trailing comment is still a rename, and a
+/// forbidden name inside another word is not that dependency.
+#[test]
+fn awkward_spellings_are_read_as_what_they_are() {
+    let missed: Vec<&str> = [
+        "[dependencies.ui]\npackage = \"winit\" # renamed\n",
+        "[dependencies]\nui = { features = [\"package\"], package = \"winit\" } # renamed\n",
+        "[dependencies]\nui = { git = \"https://example.org/package\", package = 'winit' }\n",
+        "[dependencies]\nui.package = \"winit\"\n",
+        "[dependencies]\n\"winit\" = \"0.30\" # windowing\n",
+    ]
+    .into_iter()
+    .filter(|manifest| offenders(manifest).len() != 1)
+    .collect();
+    assert!(missed.is_empty(), "not caught:\n{}", missed.join("\n--\n"));
+    let manifest = "[dependencies]\nglibc-version = '1'\nshellexpand = '3'\nsupertao = '1'\ncocoa-foundation-x = '1'\n";
+    assert_eq!(offenders(manifest), ["[dependencies] cocoa-foundation-x"]);
+}
+
+/// [`AWKWARD_DEPENDENCY_SPELLINGS`]: each read through this crate's own list as the one dependency it is.
+#[test]
+fn the_shared_awkward_spellings_are_caught() {
+    let missed: Vec<&str> = AWKWARD_DEPENDENCY_SPELLINGS
+        .iter()
+        .copied()
+        .filter(|manifest| offenders(manifest).len() != 1)
+        .collect();
+    assert!(missed.is_empty(), "not caught:\n{}", missed.join("\n--\n"));
+    assert_eq!(offenders(NAMES_INSIDE_OTHER_WORDS), Vec::<String>::new());
 }

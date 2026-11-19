@@ -1,9 +1,17 @@
 //! Asserts this crate's own `Cargo.toml` never grows a GTK/WebKit dependency.
 //!
-//! `cargo tree -p eitri-core | grep -ci gtk` checks the dependency tree, but the compiler alone
-//! cannot reject an unused toolkit dependency added to the manifest. A GTK dependency, used or
-//! not, prevents the macOS host from building on this crate. This scan makes that boundary a
-//! test failure without a crate-parsing dependency; it lives apart from the code it checks.
+//! `cargo tree -p eitri-core | grep -ci gtk` checks the dependency tree, but the compiler alone cannot reject an unused
+//! toolkit dependency added to the manifest. A GTK dependency, used or not, prevents the macOS host from building on
+//! this crate. This scan makes that boundary a test failure; it lives apart from the code it checks. The manifest is
+//! read as TOML through `source_scan::manifest_dependency_offenders`, so a dependency in any table of either spelling,
+//! a `[dependencies.gtk4]` sub-table, a dotted key and a rename (`ui = { package = "gtk4" }`) are caught. A rename
+//! inherited from the root's `[workspace.dependencies]` is not: this manifest names only the key. `cargo tree -p
+//! eitri-core -e normal | grep -E 'gtk|gdk|glib|webkit'` is the check for a toolkit arriving transitively through
+//! another dependency.
+
+use crate::source_scan::{is_package_in_family, manifest_dependency_offenders};
+#[cfg(test)]
+use crate::source_scan::{AWKWARD_DEPENDENCY_SPELLINGS, NAMES_INSIDE_OTHER_WORDS};
 
 const MANIFEST: &str = include_str!("../Cargo.toml");
 
@@ -11,92 +19,17 @@ const MANIFEST: &str = include_str!("../Cargo.toml");
 /// as a dependency of this crate. `gdk4` needs its own entry: neither `gdk` nor `gdk-` matches it.
 const FORBIDDEN: &[&str] = &["gtk4", "webkit6", "glib", "gio", "gdk", "gdk4", "gsk4"];
 
-fn is_forbidden(package: &str) -> bool {
-    FORBIDDEN
-        .iter()
-        .any(|forbidden| package == *forbidden || package.starts_with(&format!("{forbidden}-")))
-}
-
-/// The value of `package = "..."` inside `text`, if there is one: a renamed dependency's real
-/// package name.
-fn package_rename(text: &str) -> Option<&str> {
-    let at = text.find("package")?;
-    let rest = text[at + "package".len()..].trim_start().strip_prefix('=')?;
-    let rest = rest.trim_start().strip_prefix('"')?;
-    rest.split('"').next()
-}
-
-/// What a table header says about the lines under it.
-enum Table {
-    /// `[dependencies]`, `[dev-dependencies]`, `[build-dependencies]`, `[target.'cfg(..)'.dependencies]`:
-    /// every key is a dependency.
-    Dependencies,
-    /// `[dependencies.<name>]` (or its dev/build/target forms): one dependency, whose own
-    /// `package = "..."` line may rename it.
-    OneDependency,
-    Other,
-}
-
-/// Every line declaring a forbidden dependency, as `core/Cargo.toml:<line>: <text>`.
-/// Covers a key in a dependency table (`gtk4 = "0.11"`,
-/// `gtk4.version = "0.11"`), a `[dependencies.gtk4]` sub-table (with or without a trailing
-/// `# comment` on the header), and a rename (`ui = { package = "gtk4", ... }`, or
-/// `package = "gtk4"` in a sub-table).
-///
-/// **Known gaps, not covered here:** a dotted-key rename (`[dependencies]\nui.package = "gtk4"`)
-/// and a `package = "..."` whose value contains the substring `"package"` earlier in the same line
-/// (this scan's `package_rename` finds the first `package` token, not necessarily the key). Both
-/// are TOML-legal and neither trips this scan. `cargo tree -p eitri-core -e normal | grep -E
-/// 'gtk|gdk|glib|webkit'` is the backstop that catches what this text scan does not: it asks Cargo
-/// itself, after it has resolved every rename and dotted key, rather than parsing TOML by hand.
+/// Every dependency of `manifest` that is, or renames, a forbidden package, as `[table] name`.
 fn forbidden_dependencies(manifest: &str) -> Vec<String> {
-    let mut table = Table::Other;
-    let mut offenders = Vec::new();
-    for (n, line) in manifest.lines().enumerate() {
-        let trimmed = line.trim();
-        let mut offend = || offenders.push(format!("core/Cargo.toml:{}: {trimmed}", n + 1));
-        if let Some(name) = trimmed.strip_prefix('[') {
-            // A header may carry a trailing `# comment` after its closing `]`
-            // (`[dependencies.gtk4] # comment`); take only up to the first `]`, not the end of
-            // the line, before trimming the leading `[` a `[[...]]` array-of-tables would leave.
-            let name = name.split(']').next().unwrap_or("").trim_start_matches('[').trim();
-            table = if name.ends_with("dependencies") {
-                Table::Dependencies
-            } else if let Some(at) = name.rfind("dependencies.") {
-                let package = name[at + "dependencies.".len()..].trim_matches(|c| c == '"' || c == '\'');
-                if is_forbidden(package) {
-                    offend();
-                }
-                Table::OneDependency
-            } else {
-                Table::Other
-            };
-            continue;
-        }
-        if trimmed.is_empty() || trimmed.starts_with('#') {
-            continue;
-        }
-        let Some((key, value)) = trimmed.split_once('=') else {
-            continue;
-        };
-        let key = key.trim().trim_matches(|c| c == '"' || c == '\'');
-        let forbidden = match table {
-            Table::Dependencies => {
-                is_forbidden(key.split('.').next().unwrap_or(key)) || package_rename(value).is_some_and(is_forbidden)
-            }
-            Table::OneDependency => key == "package" && package_rename(trimmed).is_some_and(is_forbidden),
-            Table::Other => false,
-        };
-        if forbidden {
-            offend();
-        }
-    }
-    offenders
+    manifest_dependency_offenders(manifest, |name| is_package_in_family(name, FORBIDDEN))
 }
 
 #[test]
 fn manifest_declares_no_gtk_or_webkit_dependency() {
-    let offenders = forbidden_dependencies(MANIFEST);
+    let offenders: Vec<String> = forbidden_dependencies(MANIFEST)
+        .into_iter()
+        .map(|o| format!("core/Cargo.toml: {o}"))
+        .collect();
     assert!(
         offenders.is_empty(),
         "eitri-core's whole reason to exist is having no GTK/WebKit dependency -- this crate \
@@ -138,4 +71,20 @@ fn every_way_a_manifest_can_declare_a_dependency_is_seen() {
     for manifest in clean {
         assert!(forbidden_dependencies(manifest).is_empty(), "flagged:\n{manifest}");
     }
+}
+
+/// [`AWKWARD_DEPENDENCY_SPELLINGS`]: each read through this crate's own list as the one dependency it is.
+#[test]
+fn awkward_spellings_are_still_caught() {
+    let missed: Vec<&str> = AWKWARD_DEPENDENCY_SPELLINGS
+        .iter()
+        .copied()
+        .filter(|manifest| forbidden_dependencies(manifest).len() != 1)
+        .collect();
+    assert!(missed.is_empty(), "not caught:\n{}", missed.join("\n--\n"));
+}
+
+#[test]
+fn a_forbidden_name_inside_another_word_is_not_flagged() {
+    assert_eq!(forbidden_dependencies(NAMES_INSIDE_OTHER_WORDS), Vec::<String>::new());
 }

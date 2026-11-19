@@ -5,6 +5,10 @@
 //! asked for, a named file that cannot be read, and an anchor -- a definition the scan exists to cover --
 //! that none of the files read contains. Paths are relative to the workspace root, so a test in any crate
 //! names the same directories, and moving code between crates means editing one list, not a path per test.
+//!
+//! The guards of the crates share two scans: a crate manifest read as TOML ([`manifest_dependency_offenders`], with a
+//! per-crate predicate and [`is_package_in_family`]) and the socket names built outside `socket_path::in_dir`
+//! ([`unchecked_socket_offsets`], [`unrouted_socket_sites`] and [`stale_never_bound`] for an allowlist).
 
 use std::path::{Path, PathBuf};
 
@@ -629,6 +633,116 @@ pub fn calls(code: &str, name: &str) -> usize {
         .count()
 }
 
+/// Spellings of one dependency on `gtk4` a manifest reader must each report once: a comment after a header or an
+/// entry, single quotes, a rename in a sub-table, after other keys (one of them holding the word `package`) or in a
+/// dotted key, and a quoted key. Every manifest guard runs them through its own list.
+pub const AWKWARD_DEPENDENCY_SPELLINGS: &[&str] = &[
+    "[dependencies] # desktop tests\ngtk4 = '0.11'\n",
+    "[dependencies]\ngtk4 = '0.11' # toolkit\n",
+    "[dependencies.ui] # renamed\npackage = 'gtk4'\n",
+    "[dependencies.ui]\npackage = \"gtk4\" # renamed\n",
+    "[dependencies]\nui = { package = 'gtk4' } # renamed\n",
+    "[dependencies]\nui = { features = [\"package\"], package = \"gtk4\" }\n",
+    "[dependencies]\nui = { git = \"https://example.org/package\", package = \"gtk4\" }\n",
+    "[dependencies]\nui = { version = \"1\", package = 'gtk4' }\n",
+    "[dependencies]\nui.package = \"gtk4\"\n",
+    "[dependencies]\n\"gtk4\" = \"0.11\"\n",
+];
+
+/// A manifest whose names hold a gtk-rs family name inside another word, and a rename to one: none of them is that
+/// dependency.
+pub const NAMES_INSIDE_OTHER_WORDS: &str = "[dependencies]\nglibc-version = '1'\ngtkish = '1'\ngiobuf = '1'\n\
+                                                gdkx = '1'\nsupergtk4 = '1'\n[dependencies.ui]\npackage = 'glibc'\n";
+
+/// Whether `name` is `family` or a crate of it (`family-...`: `gio` holds `gio`, `gio-sys`, never `giobuf`).
+pub fn is_package_in_family(name: &str, families: &[&str]) -> bool {
+    families
+        .iter()
+        .any(|family| name == *family || name.strip_prefix(family).is_some_and(|rest| rest.starts_with('-')))
+}
+
+/// The byte ranges of the argument lists of every `socket_path::in_dir(...)` call in `code`.
+fn in_dir_arguments(code: &str) -> Vec<std::ops::Range<usize>> {
+    let mut arguments = Vec::new();
+    for end in word_ends(code, "socket_path") {
+        let call = code[end..]
+            .trim_start()
+            .strip_prefix("::")
+            .and_then(|tail| tail.trim_start().strip_prefix("in_dir"))
+            .and_then(|tail| tail.trim_start().strip_prefix('('));
+        let Some(body) = call else {
+            continue;
+        };
+        let start = code.len() - body.len();
+        let mut depth = 1;
+        for (offset, byte) in body.bytes().enumerate() {
+            match byte {
+                b'(' => depth += 1,
+                b')' => depth -= 1,
+                _ => continue,
+            }
+            if depth == 0 {
+                arguments.push(start..start + offset);
+                break;
+            }
+        }
+    }
+    arguments
+}
+
+/// The offsets of every socket name (`.sock` that does not go on as an identifier) in the code of `text` that sits
+/// outside the argument list of a `socket_path::in_dir(...)` call: a path built any other way escapes the length cap
+/// `in_dir` owns. A line comment names nothing (a block comment is read as code, so a name in one is reported); a call
+/// is read from its parentheses, so a name on the same line as a call but outside its arguments is found, and a name
+/// below a call that has closed is too.
+pub fn unchecked_socket_offsets(text: &str) -> Vec<usize> {
+    let text = without_line_comments(text);
+    let code = code_only(&text);
+    let arguments = in_dir_arguments(&code);
+    text.match_indices(".sock")
+        .filter(|(offset, suffix)| {
+            !text[offset + suffix.len()..]
+                .chars()
+                .next()
+                .is_some_and(|c| c.is_ascii_alphanumeric() || c == '_')
+                && !arguments.iter().any(|range| range.contains(offset))
+        })
+        .map(|(offset, _)| offset)
+        .collect()
+}
+
+/// The socket names of `sources` that [`unchecked_socket_offsets`] finds and no `never_bound` entry excuses, as
+/// `path:line: text`. An entry is `(file, a substring of the line)`: a `.sock` mention that is never bound or
+/// connected as a path, such as a file name handed to a function or a fixture that is only compared.
+pub fn unrouted_socket_sites(sources: &[Source], never_bound: &[(&str, &str)]) -> Vec<String> {
+    let mut sites = Vec::new();
+    for source in sources {
+        for offset in unchecked_socket_offsets(&source.text) {
+            let start = source.text[..offset].rfind('\n').map_or(0, |at| at + 1);
+            let code = source.text[start..].lines().next().unwrap_or_default().trim_start();
+            if never_bound
+                .iter()
+                .any(|(file, needle)| *file == source.path && code.contains(needle))
+            {
+                continue;
+            }
+            let line = source.text[..start].bytes().filter(|byte| *byte == b'\n').count() + 1;
+            sites.push(format!("{}:{line}: {code}", source.path));
+        }
+    }
+    sites
+}
+
+/// The `never_bound` entries that no file of `sources` still contains, as `file: needle`: an allowlist entry whose
+/// text is gone would let a construction site hide behind it.
+pub fn stale_never_bound(sources: &[Source], never_bound: &[(&str, &str)]) -> Vec<String> {
+    never_bound
+        .iter()
+        .filter(|(file, needle)| !sources.iter().any(|s| s.path == *file && s.text.contains(needle)))
+        .map(|(file, needle)| format!("{file}: {needle:?}"))
+        .collect()
+}
+
 #[cfg(test)]
 mod walker_tests {
     use super::*;
@@ -915,5 +1029,132 @@ mod walker_tests {
     fn an_empty_product_directory_fails() {
         // `docs/keymap` exists and holds no `.rs` file: a listed directory that emptied out fails the scan.
         rust_sources(&["core/src/theme", "docs/keymap"]);
+    }
+}
+
+#[cfg(test)]
+mod socket_scan_tests {
+    use super::*;
+
+    fn found(text: &str) -> usize {
+        unchecked_socket_offsets(text).len()
+    }
+
+    fn source(path: &str, text: &str) -> Source {
+        Source {
+            path: path.into(),
+            text: text.into(),
+        }
+    }
+
+    /// The matcher sees a socket name and does not see a bare identifier, and sees the call that routes one.
+    #[test]
+    fn the_matcher_reads_what_it_should() {
+        assert_eq!(found("let p = dir.join(\"x.sock\");"), 1);
+        assert_eq!(found("let p = self.socket_path;"), 0);
+        assert_eq!(
+            found("let p = agent::socket_path::in_dir(\n &dir,\n \"x.sock\",\n);"),
+            0
+        );
+        assert_eq!(found("let a = 1;\nlet p = dir.join(\"x.sock\");"), 1);
+        assert_eq!(found("// x.sock"), 0);
+    }
+
+    #[test]
+    fn trailing_comments_do_not_hide_or_add_socket_paths() {
+        let checked = r#"let p = socket_path::in_dir(dir, "ok.sock")?; // previously old.sock"#;
+        assert_eq!(found(checked), 0);
+        let hand = "let p = dir.join(name); // was dir.join(\"old.sock\")";
+        assert_eq!(found(hand), 0);
+        for line in [
+            r#"let p = dir.join("é\"//real.sock"); // old.sock"#,
+            r##"let p = dir.join(r#"prefix
+//real.sock"#); // old.sock"##,
+        ] {
+            assert_eq!(unchecked_socket_offsets(line), [line.find(".sock").unwrap()]);
+        }
+    }
+
+    #[test]
+    fn a_checked_call_does_not_exempt_a_fallback_on_the_same_line() {
+        let text =
+            r#"let p = socket_path::in_dir(make_dir(), "a).sock").unwrap_or_else(|_| dir.join("fallback.sock"));"#;
+        assert_eq!(unchecked_socket_offsets(text), [text.find(".sock\"));").unwrap()]);
+        let split = "socket_path ::\n in_dir\n(dir, \"a.sock\")\n.or_else(|_| dir.join(\"fallback.sock\"))";
+        assert_eq!(unchecked_socket_offsets(split), [split.rfind(".sock").unwrap()]);
+        let both = "let both = (socket_path::in_dir(&d, \"a.sock\"), d.join(\"b.sock\"));";
+        assert_eq!(unchecked_socket_offsets(both), [both.rfind(".sock").unwrap()]);
+    }
+
+    /// Only the argument list of a call routes a name: a call that has closed, however few lines above, and a
+    /// comment that names `in_dir` do not.
+    #[test]
+    fn a_name_is_routed_by_the_call_it_sits_in_and_nothing_nearby() {
+        let wrapped = "let p = agent::socket_path::in_dir(\n    &dir,\n    &format!(\"a-{i}.sock\"),\n)?;";
+        assert_eq!(found(wrapped), 0);
+        let nested = "let p = socket_path::in_dir(&dir, &join(&[a, (b)], \"x.sock\"))?;";
+        assert_eq!(found(nested), 0);
+        let closed = "let s = S {\n    a: socket_path::in_dir(&d, \"a.sock\")?,\n    b: 1,\n    c: 2,\n    d: d.join(\"b.sock\"),\n};";
+        assert_eq!(unchecked_socket_offsets(closed), [closed.rfind(".sock").unwrap()]);
+        let commented = "// built through socket_path::in_dir(\nlet p = dir.join(\"x.sock\")";
+        assert_eq!(found(commented), 1);
+        let imported = "use agent::socket_path::in_dir;\nlet p = in_dir(&d, \"x.sock\");";
+        assert_eq!(found(imported), 1);
+        let other_module = "let p = my_socket_path::in_dir(&d, \"x.sock\");";
+        assert_eq!(found(other_module), 1);
+    }
+
+    #[test]
+    fn a_dotted_word_that_only_starts_with_sock_is_not_a_socket_name() {
+        assert_eq!(found("let a = self.socket_path(); let b = x.sockets;"), 0);
+        assert_eq!(found("let a = \"x.sock\"; let b = \"y.sock_x\";"), 1);
+    }
+
+    #[test]
+    fn the_allowlist_excuses_a_line_of_its_own_file_only() {
+        let read = [
+            source("a/src/x.rs", "let n = \"w.sock\";\nlet p = d.join(\"b.sock\");\n"),
+            source("a/src/y.rs", "let n = \"w.sock\";\n"),
+        ];
+        let never = [("a/src/x.rs", "let n = \"w.sock\"")];
+        assert_eq!(
+            unrouted_socket_sites(&read, &never),
+            [
+                "a/src/x.rs:2: let p = d.join(\"b.sock\");",
+                "a/src/y.rs:1: let n = \"w.sock\";"
+            ]
+        );
+        assert!(stale_never_bound(&read, &never).is_empty());
+        let gone = [("a/src/x.rs", "let n = \"v.sock\""), ("a/src/z.rs", "let n")];
+        assert_eq!(
+            stale_never_bound(&read, &gone),
+            ["a/src/x.rs: \"let n = \\\"v.sock\\\"\"", "a/src/z.rs: \"let n\""]
+        );
+    }
+
+    #[test]
+    fn the_awkward_spellings_are_each_one_dependency() {
+        for manifest in AWKWARD_DEPENDENCY_SPELLINGS {
+            assert_eq!(
+                manifest_dependency_offenders(manifest, |name| name == "gtk4").len(),
+                1,
+                "{manifest}"
+            );
+        }
+        let inside = manifest_dependency_offenders(NAMES_INSIDE_OTHER_WORDS, |name| {
+            is_package_in_family(name, &["gtk4", "gtk", "glib", "gio", "gdk"])
+        });
+        assert_eq!(inside, Vec::<String>::new());
+    }
+
+    #[test]
+    fn a_family_holds_its_own_crates_and_no_longer_word() {
+        let families = ["gio", "gtk4"];
+        for name in ["gio", "gio-sys", "gtk4-macros"] {
+            assert!(is_package_in_family(name, &families), "{name}");
+        }
+        for name in ["giobuf", "glibc-version", "supergtk4", "gtk", "shellexpand"] {
+            assert!(!is_package_in_family(name, &families), "{name}");
+        }
     }
 }

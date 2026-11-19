@@ -22,15 +22,12 @@
 //! decision rather than a portability fix. A user whose `TMPDIR` is long enough to hit this gets a
 //! clear error where they used to get std's.
 //!
-//! [`in_dir`] is not `#[doc(hidden)]` (removed 2026-09-17): it started out as test-
-//! only plumbing -- `agent/tests/` binds through it too -- but `eitri-core`'s PRODUCT code
-//! (`pane_switch`, `theme::feed`) now builds every socket path it has through this same function,
-//! so hiding it from the docs would hide the one thing every Mac-bound socket path in this
-//! workspace actually depends on. `tests::every_sock_path_in_this_crate_is_built_here` scans this
-//! crate's own sources so a new construction site here fails a test rather than a Mac;
-//! `eitri-core/src/socket_path_guard.rs` is the reciprocal scanner, over that crate's own
-//! sources, added when L2 T5 put two construction sites there. The two are independent scanners
-//! over two crates, not one shared mechanism -- keep them in step by hand.
+//! [`in_dir`] is public because `eitri-core`'s product code (`pane_switch`, `theme::feed`) builds every socket path
+//! it has through this same function, and `agent/tests/` binds through it too: it is the one thing every
+//! Mac-bound socket path in this workspace depends on. A new construction site that bypasses it fails a test rather
+//! than a Mac: `eitri-core/src/socket_path_guard.rs` scans the sources of `agent` (this crate cannot depend on
+//! `eitri-core` for that) and of `eitri-core`, and `desk` and `mac` scan their own, all through
+//! `eitri_core::source_scan::unrouted_socket_sites`.
 
 use std::io;
 use std::path::{Path, PathBuf};
@@ -419,117 +416,5 @@ mod tests {
             .find("TokioIo::new(stream)")
             .expect("the stream is handed to the channel");
         assert!(connected < checked && checked < handed, "check order in connect");
-    }
-
-    /// The assertion over every construction site. Any line in `agent/src` or `agent/tests` that
-    /// mentions `.sock` outside a comment has to be in this file, passed to `in_dir` (on that line or
-    /// as an argument of the call a line or two above it), or on the list below, and
-    /// every entry on the list says why that path is never bound. A new socket path built anywhere
-    /// else fails here, on Linux, before it fails `bind` on a Mac.
-    ///
-    /// Scoped to this crate only. `eitri-core/src/socket_path_guard.rs` is the same scan over
-    /// that crate's sources instead -- a separate scanner, not a shared one, so keep both in step
-    /// by hand when either crate's set of socket-building files changes.
-    #[test]
-    fn every_sock_path_in_this_crate_is_built_here() {
-        // (file, a substring of the line) -- each one a path that is never bound as written (or, for the
-        // last two, is bound only under a scratch root).
-        const NEVER_BOUND: &[(&str, &str)] = &[
-            // Only formats the hook's argv JSON; asserts on the string.
-            ("src/settings.rs", "\"/tmp/eitri-agent-hook-abc123.sock\""),
-            ("src/settings.rs", "dir.join(\"s.sock\")"),
-            ("src/settings.rs", "\"/tmp/a.sock\""),
-            ("src/settings.rs", "\"/tmp/b.sock\""),
-            // The editor tool server's argv as an ACP session/new request carries it; the strings are
-            // compared against the request JSON and nothing binds them.
-            (
-                "tests/acp_provider.rs",
-                "args: vec![\"/run/user/1000/eitri/bridge.sock\".to_string()",
-            ),
-            (
-                "tests/acp_provider.rs",
-                "\"args\": [\"/run/user/1000/eitri/bridge.sock\"",
-            ),
-            // Probes that the agent-hook binary exists; never bound.
-            ("src/process.rs", "dir.join(\"probe.sock\")"),
-            // Absolute paths of a host that the sandbox self-check's tests re-create inside a scratch
-            // root: each is bound at a short name in that root and renamed to the long one.
-            ("src/testkit/claude_scripted/sandbox.rs", "\"/run/docker.sock\""),
-            (
-                "src/testkit/claude_scripted/sandbox.rs",
-                "\"/var/lib/gssproxy/default.sock\"",
-            ),
-        ];
-
-        let root = Path::new(env!("CARGO_MANIFEST_DIR"));
-        let mut offenders = Vec::new();
-        for sub in ["src", "tests"] {
-            visit(&root.join(sub), &mut |file| {
-                let rel = file.strip_prefix(root).unwrap().to_string_lossy().into_owned();
-                if rel == "src/socket_path.rs" {
-                    return;
-                }
-                let text = std::fs::read_to_string(file).unwrap();
-                let lines: Vec<&str> = text.lines().collect();
-                for (n, line) in lines.iter().enumerate() {
-                    let code = line.trim_start();
-                    // A name that reaches `in_dir` is checked by it, however rustfmt broke the call up.
-                    if code.starts_with("//") || !mentions_a_sock_file(code) || routed_through_in_dir(&lines, n) {
-                        continue;
-                    }
-                    if NEVER_BOUND.iter().any(|(f, s)| *f == rel && code.contains(s)) {
-                        continue;
-                    }
-                    offenders.push(format!("{rel}:{}: {code}", n + 1));
-                }
-            });
-        }
-        assert!(
-            offenders.is_empty(),
-            "socket paths built outside agent::socket_path escape its length check:\n{}",
-            offenders.join("\n")
-        );
-    }
-
-    /// `.sock` as a file extension, not as the start of an identifier like `.socket_path`.
-    /// Whether the `.sock` name on line `n` is an argument of a `socket_path::in_dir(` call.
-    ///
-    /// The check used to be "the same line mentions `in_dir(`", which was true of every call site
-    /// until `rustfmt.toml` landed (2026-09-19) and rustfmt wrapped the longer ones onto their own
-    /// argument lines -- six real, correctly routed sites became offenders at once. The invariant
-    /// was never about one line: it is that the name reaches `in_dir`, which owns the length cap.
-    /// So walk back over the open argument list instead, stopping at the statement boundary a `;`
-    /// or a blank line marks, and never further than a short window.
-    fn routed_through_in_dir(lines: &[&str], n: usize) -> bool {
-        for line in lines[n.saturating_sub(4)..=n].iter().rev() {
-            let code = line.trim();
-            if code.contains("socket_path::in_dir(") || code.contains("in_dir(") && code.contains("socket_path") {
-                return true;
-            }
-            if code.is_empty() || code.ends_with(';') {
-                return false;
-            }
-        }
-        false
-    }
-
-    fn mentions_a_sock_file(code: &str) -> bool {
-        code.match_indices(".sock").any(|(i, m)| {
-            !code[i + m.len()..]
-                .chars()
-                .next()
-                .is_some_and(|c| c.is_ascii_alphanumeric() || c == '_')
-        })
-    }
-
-    fn visit(dir: &Path, f: &mut dyn FnMut(&Path)) {
-        for entry in std::fs::read_dir(dir).unwrap() {
-            let path = entry.unwrap().path();
-            if path.is_dir() {
-                visit(&path, f);
-            } else if path.extension().is_some_and(|e| e == "rs") {
-                f(&path);
-            }
-        }
     }
 }

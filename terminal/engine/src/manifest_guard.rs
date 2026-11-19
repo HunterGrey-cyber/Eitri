@@ -1,17 +1,18 @@
 //! Asserts this crate's own `Cargo.toml` never grows a GTK/WebKit dependency.
 //!
-//! The same guard `eitri-core` has (`core/src/manifest_guard.rs`), for the same reason: the
-//! property that matters is that a non-GTK host can build this crate -- the macOS track's NSView,
-//! or a future right-side terminal backend -- and a toolkit dependency slipping into the manifest,
-//! used or not, would break that silently. The compiler catches a `use gtk4::...` in `src/`; only
-//! this catches the manifest line.
-//!
-//! Stricter than core's in three ways core's could be walked past: the list covers the whole
-//! gtk-rs family (`gdk4`, `gio`, `pango`, `cairo`, ...), not only four names; a
-//! `[dependencies.gtk4]` sub-table is caught as well as a `gtk4 = ...` line; and so are a dotted key
-//! (`gtk4.version = ...`) and a rename (`ui = { package = "gtk4" }`). What it still cannot see is a
-//! toolkit arriving transitively through another dependency; `cargo tree -p eitri-terminal -e
-//! normal` is the check for that.
+//! The property that matters is that a non-GTK host can build this crate -- the macOS track's NSView, or a future
+//! right-side terminal backend -- and a toolkit dependency slipping into the manifest, used or not, would break that
+//! silently. The compiler catches a `use gtk4::...` in `src/`; only this catches the manifest line. The list covers the
+//! whole gtk-rs family (`gdk4`, `gio`, `pango`, `cairo`, ...), and the manifest is read as TOML through
+//! `eitri_core::source_scan::manifest_dependency_offenders` (a dev-dependency of this crate, so it adds nothing to a
+//! build of it): a dependency in any table of either spelling, a `[dependencies.gtk4]` sub-table, a dotted key
+//! (`gtk4.version = ...`) and a rename (`ui = { package = "gtk4" }`) are caught. A rename inherited from the root's
+//! `[workspace.dependencies]` is not: this manifest names only the key. What it cannot see is a toolkit arriving
+//! transitively through another dependency; `cargo tree -p eitri-terminal -e normal` is the check for that.
+
+use eitri_core::source_scan::{is_package_in_family, manifest_dependency_offenders};
+#[cfg(test)]
+use eitri_core::source_scan::{AWKWARD_DEPENDENCY_SPELLINGS, NAMES_INSIDE_OTHER_WORDS};
 
 const MANIFEST: &str = include_str!("../Cargo.toml");
 
@@ -34,76 +35,16 @@ const FORBIDDEN: &[&str] = &[
     "javascriptcore6",
 ];
 
-fn forbidden(name: &str) -> bool {
-    let name = name.trim().trim_matches('"');
-    FORBIDDEN.iter().any(|f| {
-        name == *f
-            || name
-                .strip_prefix(f)
-                .is_some_and(|rest| rest.starts_with('-') || rest.starts_with('.'))
-    })
-}
-
-/// Every line of `manifest` that makes a forbidden package a dependency, as `<line>: <text>`.
+/// Every dependency of `manifest` that is, or renames, a forbidden package, as `[table] name`.
 fn offenders(manifest: &str) -> Vec<String> {
-    let mut in_dependency_table = false;
-    let mut offenders = Vec::new();
-    for (n, line) in manifest.lines().enumerate() {
-        let trimmed = line.trim();
-        if let Some(header) = trimmed.strip_prefix('[') {
-            let header = header.trim_end_matches(']').trim();
-            // `[dependencies]`, `[dev-dependencies]`, `[build-dependencies]` and every
-            // target-specific variant end in "dependencies"; a `[dependencies.<name>]` sub-table
-            // names its package in the header itself. That sub-table's *body* is also a dependency
-            // table -- it is the two-line spelling of the same thing `name = { ... }` says inline,
-            // so `package = "gtk4"` on the line below `[dependencies.ui]` is exactly as much a
-            // rename as `ui = { package = "gtk4" }` is. Scan the body too, or checking only the
-            // header's local name misses the forbidden package in a renamed dependency.
-            if let Some((_, name)) = header.rsplit_once("dependencies.") {
-                in_dependency_table = true;
-                if forbidden(name) {
-                    offenders.push(format!("{}: {trimmed}", n + 1));
-                }
-            } else {
-                in_dependency_table = header.ends_with("dependencies");
-            }
-            continue;
-        }
-        if !in_dependency_table || trimmed.is_empty() || trimmed.starts_with('#') {
-            continue;
-        }
-        let Some((key, value)) = trimmed.split_once('=') else {
-            continue;
-        };
-        // A rename is spelled two ways: inline, as `ui = { package = "gtk4", ... }` (the key is
-        // the dependency's local name and "package" is embedded in the value); or as a sub-table
-        // body line directly under `[dependencies.ui]`, as `package = "gtk4"` (the key itself IS
-        // "package" and the value is the real name, with no `{ }` at all). The first shape has
-        // "package" appear inside `value`; the second has it appear as `key`, so it must be
-        // checked separately or the sub-table form of a rename is missed entirely (a sub-table's
-        // `package = "gtk4"` line has no "package" substring in ITS OWN value to find).
-        let renamed_to = if key.trim() == "package" {
-            Some(value)
-        } else {
-            value
-                .split("package")
-                .nth(1)
-                .and_then(|rest| rest.trim_start().strip_prefix('='))
-                .and_then(|rest| rest.trim_start().strip_prefix('"'))
-                .and_then(|rest| rest.split('"').next())
-        };
-        if forbidden(key) || renamed_to.is_some_and(forbidden) {
-            offenders.push(format!("{}: {trimmed}", n + 1));
-        }
-    }
-    offenders
+    manifest_dependency_offenders(manifest, |name| is_package_in_family(name, FORBIDDEN))
 }
 
 #[test]
 fn manifest_declares_no_gtk_or_webkit_dependency() {
     let offenders: Vec<String> = offenders(MANIFEST)
         .into_iter()
-        .map(|o| format!("terminal/engine/Cargo.toml:{o}"))
+        .map(|o| format!("terminal/engine/Cargo.toml: {o}"))
         .collect();
     assert!(
         offenders.is_empty(),
@@ -127,9 +68,6 @@ fn every_shape_of_a_toolkit_dependency_is_caught() {
         "[dev-dependencies]\npango = \"0.22\"\n",
         // A rename via the sub-table header form rather than the inline-table form: the same
         // `ui = { package = "gtk4" }` rename, spelled as `[dependencies.ui]` / `package = "gtk4"`.
-        // `header.ends_with("dependencies")` is false for
-        // "dependencies.ui" (it ends in "ui"), so `in_dependency_table` never became `true` for
-        // this header and the `package = "gtk4"` line inside it was skipped outright.
         "[dependencies.ui]\npackage = \"gtk4\"\nversion = \"0.11\"\n",
     ] {
         assert_eq!(offenders(manifest).len(), 1, "not caught:\n{manifest}");
@@ -168,4 +106,20 @@ fn skia_is_optional_and_only_behind_paint() {
             assert_eq!(entry, "paint=[\"dep:skia-safe\"", "Skia belongs only to paint");
         }
     }
+}
+
+/// [`AWKWARD_DEPENDENCY_SPELLINGS`]: each read through this crate's own list as the one dependency it is.
+#[test]
+fn awkward_spellings_are_still_caught() {
+    let missed: Vec<&str> = AWKWARD_DEPENDENCY_SPELLINGS
+        .iter()
+        .copied()
+        .filter(|manifest| offenders(manifest).len() != 1)
+        .collect();
+    assert!(missed.is_empty(), "not caught:\n{}", missed.join("\n--\n"));
+}
+
+#[test]
+fn a_forbidden_name_inside_another_word_is_not_flagged() {
+    assert_eq!(offenders(NAMES_INSIDE_OTHER_WORDS), Vec::<String>::new());
 }

@@ -37,6 +37,9 @@ unicode-width = "0.2"
 serde = { version = "1", features = ["derive"] }
 
 [dev-dependencies]
+# `source_scan` reads this crate's manifest in `src/manifest_guard.rs`. Test builds only: `eitri-core` does not
+# depend on this crate, so there is no cycle, and a release build of the engine does not link it.
+eitri-core = { path = "../../core", features = ["test-support"] }
 # The replay test counts vte's own "[unhandled ...]" debug records.
 log = "0.4"
 # A replay's serialisation round trip. Already in the lock through `eitri-core`.

@@ -1069,6 +1069,7 @@ name = "eitri-terminal"
 version = "0.3.0"
 dependencies = [
  "alacritty_terminal",
+ "eitri-core",
  "libc",
  "log",
  "rustix 1.1.4",
