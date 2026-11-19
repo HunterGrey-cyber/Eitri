@@ -7,8 +7,9 @@
 //! names the same directories, and moving code between crates means editing one list, not a path per test.
 //!
 //! The guards of the crates share two scans: a crate manifest read as TOML ([`manifest_dependency_offenders`], with a
-//! per-crate predicate and [`is_package_in_family`]) and the socket names built outside `socket_path::in_dir`
-//! ([`unchecked_socket_offsets`], [`unrouted_socket_sites`] and [`stale_never_bound`] for an allowlist).
+//! per-crate predicate and [`is_package_in_family`]; [`manifest_table`] for a guard that reads more of it) and the
+//! socket names built outside `socket_path::in_dir` ([`unchecked_socket_offsets`], [`unrouted_socket_sites`] and
+//! [`stale_never_bound`] for an allowlist).
 
 use std::path::{Path, PathBuf};
 
@@ -160,7 +161,7 @@ pub fn manifest_table(manifest: &str) -> toml::Table {
 
 /// The table and key of each forbidden dependency name or renamed package in a crate manifest.
 pub fn manifest_dependency_offenders(manifest: &str, forbidden: impl Fn(&str) -> bool) -> Vec<String> {
-    let manifest = manifest.parse::<toml::Table>().expect("valid crate manifest TOML");
+    let manifest = manifest_table(manifest);
     let mut offenders = Vec::new();
     for (table, deps) in dependency_tables(&manifest) {
         for (name, spec) in deps {
@@ -176,7 +177,7 @@ pub fn manifest_dependency_offenders(manifest: &str, forbidden: impl Fn(&str) ->
 
 /// The local dependency directories of a workspace member, based at the workspace root.
 pub fn manifest_path_dependencies(manifest: &str, workspace: &str, member: &Path) -> Vec<PathBuf> {
-    let manifest = manifest.parse::<toml::Table>().expect("valid crate manifest TOML");
+    let manifest = manifest_table(manifest);
     let workspace = workspace.parse::<toml::Table>().expect("valid workspace manifest TOML");
     let inherited = workspace.get("workspace").and_then(|table| table.get("dependencies"));
     dependency_tables(&manifest)

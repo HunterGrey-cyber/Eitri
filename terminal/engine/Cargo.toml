@@ -39,7 +39,7 @@ serde = { version = "1", features = ["derive"] }
 [dev-dependencies]
 # `source_scan` reads this crate's manifest in `src/manifest_guard.rs`. Test builds only, so a release build of the
 # engine does not link it. `eitri-core` depends on this crate without default features; Cargo allows that cycle
-# only because this side is a dev-dependency, and the test build links a second copy of the engine for it.
+# only because this side is a dev-dependency, and the library's unit-test build links a second copy of the engine.
 eitri-core = { path = "../../core", features = ["test-support"] }
 # The replay test counts vte's own "[unhandled ...]" debug records.
 log = "0.4"
