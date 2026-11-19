@@ -223,8 +223,18 @@ pub enum NvimSaid {
 }
 
 /// The 'filetype' values of the start screens of the common plugins: a buffer of one of these is what nvim has
-/// open when a person quits from the dashboard instead of from their work.
-pub const START_SCREEN_FILETYPES: [&str; 5] = ["snacks_dashboard", "dashboard", "alpha", "ministarter", "starter"];
+/// open when a person quits from the dashboard instead of from their work. snacks.nvim's dashboard, dashboard-nvim,
+/// alpha-nvim, mini.starter (and its older name), NvChad's nvdash, vim-startify, and veil.nvim.
+pub const START_SCREEN_FILETYPES: [&str; 8] = [
+    "snacks_dashboard",
+    "dashboard",
+    "alpha",
+    "ministarter",
+    "starter",
+    "nvdash",
+    "startify",
+    "veil",
+];
 
 /// Whether `filetype` is a start screen's.
 pub fn is_start_screen(filetype: &str) -> bool {
@@ -974,3 +984,28 @@ pub struct QueuedOpen {
 /// An opaque native token authorizing presentation.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ActivationToken(pub String);
+
+#[cfg(test)]
+mod start_screen_tests {
+    use super::is_start_screen;
+
+    /// The dashboards a person is likely to quit from; a file's own filetype and no filetype are not.
+    #[test]
+    fn the_common_dashboards_are_start_screens() {
+        for filetype in [
+            "snacks_dashboard",
+            "dashboard",
+            "alpha",
+            "ministarter",
+            "starter",
+            "nvdash",
+            "startify",
+            "veil",
+        ] {
+            assert!(is_start_screen(filetype), "{filetype}");
+        }
+        for filetype in ["", "lua", "markdown", "NvimTree", "lazy", "Alpha", "nvdash2"] {
+            assert!(!is_start_screen(filetype), "{filetype}");
+        }
+    }
+}

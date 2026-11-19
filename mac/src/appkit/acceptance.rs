@@ -263,7 +263,8 @@ fn state(host: &Host) -> Value {
     let pane = host.pane();
     let web = host.panel_view().view();
     let window = host.ns_window();
-    json!({
+    // In two parts, merged: one `json!` with every field is past the macro's recursion limit.
+    let mut state = json!({
         "window_number": window.as_ref().map(|w| w.windowNumber()),
         // The title bar as the window frame's height minus its content layout rect's (points), never assumed.
         "title_bar": window.as_ref().map(|w| w.frame().size.height - w.contentLayoutRect().size.height),
@@ -293,6 +294,8 @@ fn state(host: &Host) -> Value {
         "nvim_listen": host.assembly().map(|a| a.editor.nvim_listen().display().to_string()),
         "links": LINKS.with(|l| l.borrow().clone()),
         "navigations": NAVIGATIONS.with(|n| n.borrow().clone()),
+    });
+    let rest = json!({
         "pid": std::process::id(),
         "editor_link": host.assembly().and_then(|a| a.editor_link()).map(|(state, text)| json!({"state": state, "text": text})),
         "attach": host.life.attach_phase(),
@@ -311,7 +314,11 @@ fn state(host: &Host) -> Value {
         "running": host.assembly().map(|a| a.panel.running_count()),
         "queued": host.assembly().map(|a| a.panel.queued_count()),
         "responder_is_none": responder == Responder::None,
-    })
+    });
+    if let (Some(state), Value::Object(rest)) = (state.as_object_mut(), rest) {
+        state.extend(rest);
+    }
+    state
 }
 
 fn perform_menu_item(host: &Host, title: &str) -> Value {

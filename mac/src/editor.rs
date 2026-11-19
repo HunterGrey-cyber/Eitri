@@ -318,7 +318,13 @@ impl Editor {
                     None => crate::log_line!("[pane_switch] unknown direction {letter:?}, ignoring"),
                 },
                 PaneMessage::EditorWatched => self.said.set(NvimSaid::Watched),
-                PaneMessage::EditorLeaving { .. } => self.said.set(NvimSaid::Leaving),
+                PaneMessage::EditorLeaving { filetype } => {
+                    self.said.set(if eitri_core::wm::window::is_start_screen(&filetype) {
+                        NvimSaid::LeavingStartScreen
+                    } else {
+                        NvimSaid::Leaving
+                    })
+                }
                 PaneMessage::Recoverable { count, newest } => events.push(EditorEvent::Recoverable { count, newest }),
                 _ => {}
             }
@@ -568,6 +574,18 @@ mod tests {
         }
         assert_eq!(editor.take_said(), NvimSaid::Leaving);
         assert_eq!(editor.take_said(), NvimSaid::Nothing);
+        // Leaving from a start screen's buffer is told apart (the window asks first then).
+        let mut stream = UnixStream::connect(&socket).expect("connect");
+        stream.write_all(b"nvim-leaving alpha\n").expect("write");
+        drop(stream);
+        let mut now = start;
+        while editor.said.get() != NvimSaid::LeavingStartScreen {
+            now += TICK;
+            editor.poll(now);
+            assert!(Instant::now() < guard, "the start screen's leaving was never read");
+            std::thread::yield_now();
+        }
+        assert_eq!(editor.take_said(), NvimSaid::LeavingStartScreen);
         editor.shutdown();
     }
 

@@ -3386,7 +3386,16 @@ mod restart_tests {
 
     #[test]
     fn a_quit_from_a_start_screen_asks_before_it_closes_a_window_that_holds_more() {
-        for filetype in ["snacks_dashboard", "dashboard", "alpha", "ministarter", "starter"] {
+        for filetype in [
+            "snacks_dashboard",
+            "dashboard",
+            "alpha",
+            "ministarter",
+            "starter",
+            "nvdash",
+            "startify",
+            "veil",
+        ] {
             let r = Rig::new();
             leaving_on(&r, filetype);
             let ops = exited_on_its_own(&r);

@@ -63,7 +63,14 @@ pub enum NvimSaid {
     Watched,
     /// It is quitting on purpose.
     Leaving,
+    /// It is quitting on purpose from a start screen's buffer (`eitri_core::wm::window::is_start_screen`): the quit may
+    /// have been the second `q` of a plugin's float, which closed the float and then the dashboard behind it.
+    LeavingStartScreen,
 }
+
+/// What the window says it asks when nvim quit from a start screen with nothing at work (the Linux window asks
+/// `eitri_core::wm::quit::START_SCREEN_QUIT_PROMPT`).
+pub const START_SCREEN_QUESTION: &str = "nvim was quit from its start screen";
 
 /// What the window does when nvim has ended and no new nvim took its place.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -72,6 +79,8 @@ pub enum EditorEnded {
     Close,
     /// The window stays, its editor ended, and asks before it closes; `what` says what is at work.
     Ask { what: String },
+    /// The window stays, its editor ended, and asks whether to close: nvim was quit from a start screen.
+    AskFromStartScreen,
     /// The window stays with its editor ended. `crashed`: nvim went without saying it was leaving.
     Keep { crashed: bool },
 }
@@ -126,6 +135,9 @@ pub struct QuitGate {
     /// nvim was started again: an end of the new one that said nothing (it never reached its watch) is no quit of
     /// the user's.
     restarting: bool,
+    /// A quit of the window's that went on with nothing to ask, and until when (`CONFIRMED_FOR`): the end of the nvim
+    /// it went to is the window's own close, which asks nothing more, a start screen's question included.
+    let_through: Option<Instant>,
 }
 
 impl QuitGate {
@@ -133,7 +145,7 @@ impl QuitGate {
         if source == QuitSource::CloseButton {
             if let Some(until) = self.pass_close_until.take() {
                 if now < until {
-                    return self.go_on();
+                    return self.go_on(now);
                 }
             }
         }
@@ -141,7 +153,7 @@ impl QuitGate {
             return QuitDecision::AlreadyAsking;
         }
         match at_work(work) {
-            None => self.go_on(),
+            None => self.go_on(now),
             Some(what) => {
                 self.asking = Some((source, what.clone()));
                 QuitDecision::Ask { what }
@@ -150,10 +162,11 @@ impl QuitGate {
     }
 
     /// A request that may go on: on its own way, or, with the editor ended, to the end of the app.
-    fn go_on(&self) -> QuitDecision {
+    fn go_on(&mut self, now: Instant) -> QuitDecision {
         if self.ended {
             QuitDecision::EndApp
         } else {
+            self.let_through = Some(now + CONFIRMED_FOR);
             QuitDecision::Proceed
         }
     }
@@ -204,6 +217,7 @@ impl QuitGate {
             .take()
             .filter(|(_, until)| now < *until)
             .map(|(what, _)| what);
+        let let_through = self.let_through.take().is_some_and(|until| now < until);
         let restarting = std::mem::take(&mut self.restarting);
         let decided = if said == NvimSaid::Watched {
             EditorEnded::Keep { crashed: true }
@@ -213,6 +227,11 @@ impl QuitGate {
             EditorEnded::Keep { crashed: false }
         } else {
             match at_work(work) {
+                // As the Linux window: a quit from a start screen asks first, unless it was the window's own.
+                None if said == NvimSaid::LeavingStartScreen && confirmed.is_none() && !let_through => {
+                    self.asking = Some((QuitSource::Editor, START_SCREEN_QUESTION.to_owned()));
+                    EditorEnded::AskFromStartScreen
+                }
                 None => EditorEnded::Close,
                 Some(what) if confirmed.as_deref() == Some(what.as_str()) => EditorEnded::Close,
                 Some(what) => {
@@ -707,6 +726,52 @@ mod tests {
             ),
             EditorEnded::Close
         );
+    }
+
+    /// A quit from a start screen with nothing at work asks first, as the Linux window does; Cancel keeps the window and
+    /// Quit ends the app. One typed in a file closes the window, and so does a start screen's when the quit was the
+    /// window's own.
+    #[test]
+    fn a_quit_from_a_start_screen_asks_first_unless_the_window_sent_it() {
+        let now = Instant::now();
+        let mut gate = QuitGate::default();
+        assert_eq!(
+            gate.nvim_ended(NvimSaid::LeavingStartScreen, w(0, 0), now),
+            EditorEnded::AskFromStartScreen
+        );
+        assert!(gate.is_asking() && gate.editor_ended());
+        assert_eq!(gate.answer(false, now), None);
+        assert!(gate.editor_ended());
+        let mut gate = QuitGate::default();
+        let _ = gate.nvim_ended(NvimSaid::LeavingStartScreen, w(0, 0), now);
+        assert_eq!(gate.answer(true, now), Some(QuitAfter::EndApp));
+
+        assert_eq!(
+            QuitGate::default().nvim_ended(NvimSaid::Leaving, w(0, 0), now),
+            EditorEnded::Close
+        );
+
+        for source in [QuitSource::Key, QuitSource::Menu, QuitSource::CloseButton] {
+            let mut gate = QuitGate::default();
+            assert_eq!(gate.request(source, w(0, 0), now), QuitDecision::Proceed);
+            assert_eq!(
+                gate.nvim_ended(NvimSaid::LeavingStartScreen, w(0, 0), now),
+                EditorEnded::Close,
+                "{source:?}"
+            );
+        }
+        // A quit let through long ago is no answer for a later start screen's quit.
+        let mut gate = QuitGate::default();
+        let _ = gate.request(QuitSource::Key, w(0, 0), now);
+        assert_eq!(
+            gate.nvim_ended(NvimSaid::LeavingStartScreen, w(0, 0), now + CONFIRMED_FOR),
+            EditorEnded::AskFromStartScreen
+        );
+        // With work at work the work's own question is asked.
+        assert!(matches!(
+            QuitGate::default().nvim_ended(NvimSaid::LeavingStartScreen, w(1, 0), now),
+            EditorEnded::Ask { .. }
+        ));
     }
 
     /// A question open when nvim ends (the quit chord's, say) decides for both: the window stays until it is answered.

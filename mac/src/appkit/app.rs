@@ -38,7 +38,7 @@ use super::page::{repeat, PANEL_DOCUMENT};
 use super::window::{host_for_later, on_next_turn, Host, MacEmbedder};
 use crate::assembly::{assemble, Assembly};
 use crate::editor::{AttachStep, AttachWait, Editor};
-use crate::quit::{AtWork, EditorEnded, QuitAfter, QuitDecision, QuitGate, QuitSource};
+use crate::quit::{AtWork, EditorEnded, QuitAfter, QuitDecision, QuitGate, QuitSource, START_SCREEN_QUESTION};
 use crate::startup::{self, ProjectStart};
 
 /// What starting and leaving have done, for the log and the acceptance build.
@@ -473,7 +473,11 @@ impl Host {
             let _ = self.life.quit.borrow_mut().answer(false, Instant::now());
             return;
         };
-        let (alert, cancel) = quit_alert(self.mtm(), what);
+        let (alert, cancel) = if what == START_SCREEN_QUESTION {
+            start_screen_alert(self.mtm())
+        } else {
+            quit_alert(self.mtm(), what)
+        };
         *self.life.quit_cancel.borrow_mut() = Some(cancel);
         let weak = Rc::downgrade(self);
         let handler = RcBlock::new(move |response: NSModalResponse| {
@@ -572,6 +576,10 @@ impl Host {
                     assembly.editor_ended(None);
                     host.ask_before_quitting(&what);
                 }
+                EditorEnded::AskFromStartScreen => {
+                    assembly.editor_ended(None);
+                    host.ask_before_quitting(START_SCREEN_QUESTION);
+                }
                 EditorEnded::Keep { crashed } => assembly.editor_ended(Some(crashed)),
             }
             host.update_subtitle();
@@ -659,6 +667,21 @@ pub fn quit_alert(mtm: MainThreadMarker, what: &str) -> (Retained<NSAlert>, Reta
     alert.setInformativeText(&NSString::from_str(&format!(
         "{what}. Quitting ends the running turns and drops the queued messages."
     )));
+    let cancel = alert.addButtonWithTitle(&NSString::from_str("Cancel"));
+    cancel.setKeyEquivalent(&NSString::from_str("\r"));
+    alert.addButtonWithTitle(&NSString::from_str("Quit"));
+    (alert, cancel)
+}
+
+/// The question a quit from nvim's start screen puts while nothing is at work, the Linux window's "close Eitri? (y/n)":
+/// the quit may have been meant for a float over the dashboard. Its buttons are the work question's: Cancel first, the
+/// default, answering Return, then Quit.
+pub fn start_screen_alert(mtm: MainThreadMarker) -> (Retained<NSAlert>, Retained<NSButton>) {
+    let alert = NSAlert::new(mtm);
+    alert.setMessageText(&NSString::from_str("Quit Eitri?"));
+    alert.setInformativeText(&NSString::from_str(
+        "nvim was quit from its start screen. Cancel keeps the window and the chat; the editor's key starts nvim again.",
+    ));
     let cancel = alert.addButtonWithTitle(&NSString::from_str("Cancel"));
     cancel.setKeyEquivalent(&NSString::from_str("\r"));
     alert.addButtonWithTitle(&NSString::from_str("Quit"));
