@@ -96,8 +96,8 @@ mod remote_sync {
                 };
                 Self { base, env }
             }
-            fn invoke(&self, args: &[&str], fake: &mut Fake) -> (i32, String, String) {
-                invoke(&self.env, &os(args), fake, b"")
+            fn invoke(&self, args: &[&str], services: &mut dyn Services) -> (i32, String, String) {
+                invoke(&self.env, &os(args), services, b"")
             }
         }
         impl Drop for Repo {
@@ -248,12 +248,17 @@ mod remote_sync {
                 self.result.clone()
             }
         }
-        fn invoke(env: &ShimEnv, args: &[OsString], fake: &mut Fake, input: &[u8]) -> (i32, String, String) {
+        fn invoke(
+            env: &ShimEnv,
+            args: &[OsString],
+            services: &mut dyn Services,
+            input: &[u8],
+        ) -> (i32, String, String) {
             let (mut out, mut err) = (vec![], vec![]);
             let code = run_with(
                 args,
                 env,
-                fake,
+                services,
                 Box::new(std::io::Cursor::new(input.to_vec())),
                 &mut out,
                 &mut err,
@@ -263,6 +268,80 @@ mod remote_sync {
         fn route(words: &[&str]) -> Route {
             classify(&os(words), Path::new("/srv/project"))
         }
+
+        #[test]
+        fn reflog_dry_run_does_not_consume_an_option() {
+            for mode in ["expire", "delete", "drop"] {
+                assert_eq!(route(&["reflog", mode, "-n", "--future-option"]), Route::RefuseUnknown);
+            }
+            assert_eq!(
+                route(&["reflog", "expire", "-n", "--expire=now", "-n", "--no-dry-run", "--all"]),
+                Route::RefuseUnknown
+            );
+            assert_eq!(route(&["reflog", "drop", "-n", "HEAD"]), Route::RefuseUnknown);
+            for words in [&["reflog", "expire", "-n"][..], &["reflog", "delete", "-n", "HEAD@{0}"]] {
+                assert!(matches!(route(words), Route::Forward { .. }), "{words:?}");
+            }
+            assert!(matches!(route(&["reflog", "show", "-n", "5"]), Route::Local { .. }));
+        }
+
+        #[test]
+        fn config_requires_a_known_operation_or_legacy_key() {
+            for words in [
+                &["config", "future-action", "user.name", "value"][..],
+                &["config", "future.action!", "value"],
+                &["config", "remote.invalid\nname.url", "value"],
+            ] {
+                assert_eq!(route(words), Route::RefuseUnknown, "{words:?}");
+            }
+            for words in [
+                &["config", "set", "user.name", "value"][..],
+                &["config", "remote.origin.url", "https://example.invalid/project"],
+                &["config", "--rename-section", "user", "author"],
+            ] {
+                assert!(matches!(route(words), Route::Forward { .. }), "{words:?}");
+            }
+            assert_eq!(route(&["config", "edit"]), Route::RefuseEditor);
+        }
+
+        #[test]
+        fn remote_options_are_scoped_to_the_operation() {
+            for words in [
+                &["remote", "remove", "--dry-run", "origin"][..],
+                &["remote", "show", "-v", "origin"],
+                &["remote", "-n", "show", "origin"],
+            ] {
+                assert_eq!(route(words), Route::RefuseUnknown, "{words:?}");
+            }
+            for words in [
+                &["remote", "-v", "show", "origin"][..],
+                &["remote", "--verbose", "show", "-n", "origin"],
+                &["remote", "prune", "--dry-run", "origin"],
+                &["remote", "update", "-p", "origin"],
+                &["remote", "remove", "origin"],
+            ] {
+                assert!(matches!(route(words), Route::Forward { .. }), "{words:?}");
+            }
+        }
+
+        #[test]
+        fn shortlog_committer_does_not_take_a_value() {
+            assert_eq!(
+                route(&["shortlog", "--committer", "--future-option", "HEAD"]),
+                Route::RefuseUnknown
+            );
+            assert_eq!(route(&["shortlog", "--committer=Example"]), Route::RefuseUnknown);
+            assert!(matches!(route(&["shortlog", "--committer"]), Route::Local { .. }));
+        }
+
+        #[test]
+        fn describe_abbrev_takes_only_an_attached_value() {
+            assert_eq!(route(&["describe", "--abbrev", "--no-tags"]), Route::RefuseUnknown);
+            for option in ["--abbrev", "--abbrev=7"] {
+                assert!(matches!(route(&["describe", option]), Route::Local { .. }), "{option}");
+            }
+        }
+
         fn conflict(fake: &mut Fake) {
             fake.status.as_mut().unwrap().conflicts.push(ConflictEntry {
                 path: "file".into(),
@@ -396,15 +475,152 @@ mod remote_sync {
             assert!(fake.calls.contains(&"exec".into()));
         }
         #[test]
-        fn unknown_and_alias_route_forward() {
-            for cmd in ["unknown", "my-alias"] {
+        fn unknown_and_alias_route_refuse() {
+            for words in [
+                &["unknown"][..],
+                &["my-alias"],
+                &["-c", "alias.my-alias=status", "my-alias"],
+                &["-calias.my-alias=status", "my-alias"],
+            ] {
+                assert_eq!(route(words), Route::RefuseUnknown, "{words:?}");
+            }
+        }
+        #[test]
+        fn unknown_form_is_refused_with_one_line_naming_the_server() {
+            struct NoServices;
+            impl Services for NoServices {
+                fn connect(&mut self, _: &RemoteProject) -> Result<(), String> {
+                    panic!("unknown form called connect");
+                }
+                fn status(&mut self, _: &ShimEnv, _: &RemoteProject) -> Option<StatusFile> {
+                    panic!("unknown form called status");
+                }
+                fn now(&self) -> std::time::Instant {
+                    panic!("unknown form called now");
+                }
+                fn pause(&mut self, _: Duration) {
+                    panic!("unknown form called pause");
+                }
+                fn flush(&mut self, _: &str, _: Duration) -> FlushOutcome {
+                    panic!("unknown form called flush");
+                }
+                fn conflicts(&mut self, _: &str) -> Result<Conflicts, String> {
+                    panic!("unknown form called conflicts");
+                }
+                fn exec(
+                    &mut self,
+                    _: &RemoteProject,
+                    _: &Path,
+                    _: &[OsString],
+                    _: Box<dyn Read + Send>,
+                    _: &mut dyn Write,
+                    _: &mut dyn Write,
+                ) -> Result<i32, String> {
+                    panic!("unknown form called exec");
+                }
+            }
+
+            let mut repo = Repo::new();
+            repo.env
+                .git_environment
+                .push(("GIT_INDEX_FILE".into(), "other-index".into()));
+            for (words, command) in [
+                (&["clean", "-fd"][..], "clean"),
+                (&["-c", "alias.my-alias=status", "my-alias"][..], "my-alias"),
+            ] {
+                let (code, out, err) = repo.invoke(words, &mut NoServices);
+                assert_eq!(code, 1, "{err}");
+                assert!(out.is_empty());
+                assert_eq!(err.lines().count(), 1, "{err}");
+                assert!(err.contains("ssh example-host"), "{err}");
+                assert!(
+                    err.contains(&format!("cd {}", repo.env.projects[0].root.display())),
+                    "{err}"
+                );
+                assert!(err.contains(&format!("git {command}")), "{err}");
+            }
+        }
+
+        #[test]
+        fn pull_refuses_interactive_rebase_values() {
+            for option in ["--rebase=interactive", "--rebase=i", "-rinteractive", "-ri"] {
+                assert_eq!(route(&["pull", option]), Route::RefuseEditor, "{option}");
+            }
+            for option in ["--rebase", "--rebase=true", "--rebase=merges", "-rm"] {
+                assert!(matches!(route(&["pull", option]), Route::Forward { .. }), "{option}");
+            }
+        }
+
+        #[test]
+        fn option_first_stash_patch_refuses_even_with_read_mode_as_path() {
+            for words in [
+                &["stash", "-p", "show"][..],
+                &["stash", "--patch", "list"],
+                &["stash", "--patch", "--", "show"],
+            ] {
+                assert_eq!(route(words), Route::RefuseEditor, "{words:?}");
+            }
+            for words in [&["stash", "show", "-p"][..], &["stash", "list", "--patch"]] {
+                assert!(matches!(route(words), Route::Local { .. }), "{words:?}");
+            }
+            assert_eq!(route(&["stash", "-q", "show"]), Route::RefuseUnknown);
+            assert!(matches!(route(&["stash", "-q", "--", "show"]), Route::Forward { .. }));
+        }
+
+        #[test]
+        fn reflog_refuses_unmodeled_operations() {
+            for words in [
+                &["reflog", "write"][..],
+                &["reflog", "write", "HEAD", "old", "new", "message"],
+                &["reflog", "future-operation", "HEAD"],
+            ] {
+                assert_eq!(route(words), Route::RefuseUnknown, "{words:?}");
+            }
+            for words in [
+                &["reflog", "topic"][..],
+                &["reflog", "-n5", "HEAD"],
+                &["reflog", "exists", "HEAD"],
+            ] {
+                assert!(matches!(route(words), Route::Forward { .. }), "{words:?}");
+            }
+        }
+
+        #[test]
+        fn namespace_status_classifies_and_runs_as_forwarded() {
+            let repo = Repo::new();
+            for words in [
+                &["--namespace=review", "status"][..],
+                &["--namespace", "review", "status"],
+            ] {
                 assert_eq!(
-                    route(&[cmd]),
+                    classify(&os(words), &repo.env.cwd),
                     Route::Forward {
                         whole_tree: false,
                         paths: vec![],
-                    }
+                    },
+                    "{words:?}"
                 );
+                let mut fake = Fake::default();
+                let (code, out, err) = repo.invoke(words, &mut fake);
+                assert_eq!(code, 0, "{words:?}: {err}");
+                assert_eq!(out, "server stdout\n");
+                assert!(fake.calls.iter().any(|call| call == "exec"));
+            }
+        }
+
+        #[test]
+        fn patch_format_is_an_am_option_only() {
+            for options in [
+                &["--patch-format=mbox", "patch"][..],
+                &["--patch-format", "mbox", "patch"],
+            ] {
+                let mut apply = vec!["apply"];
+                apply.extend_from_slice(options);
+                assert_eq!(route(&apply), Route::RefuseUnknown, "{apply:?}");
+
+                let mut am = vec!["am"];
+                am.extend_from_slice(options);
+                assert!(matches!(route(&am), Route::Forward { .. }), "{am:?}");
             }
         }
         #[test]
@@ -1264,7 +1480,7 @@ mod remote_sync {
                 }
             }
             for words in [
-                &["rev-list", "--file", "--output=report", "HEAD"][..],
+                &["rev-list", "--grep", "--output=report", "HEAD"][..],
                 &["shortlog", "--end-of-options", "--output=report", "HEAD"],
                 &["blame", "--grep", "--", "--output=report", "file"],
             ] {
@@ -1428,6 +1644,15 @@ mod remote_sync {
         }
 
         #[test]
+        fn unmirrored_name_rev_preserves_annotation_input() {
+            for option in ["--annotate-stdin", "--stdin"] {
+                let words = ["name-rev", option];
+                assert_unmirrored_read_forwards_stdin(&words, b"commit 0123456789abcdef0123456789abcdef01234567\n");
+                assert!(!eitri_core::remote_sync::git_shim::reads_stdin(&os(&words), true));
+            }
+        }
+
+        #[test]
         fn forwarded_non_input_forms_close_before_reading_a_never_eof_input() {
             struct NeverEof;
             impl Read for NeverEof {
@@ -1504,14 +1729,19 @@ mod remote_sync {
                 &["reset", "--pathspec-from-file", "-"],
                 &["commit", "-s", "-F", "-"],
                 &["tag", "-s", "-F", "-", "v2"],
-                &["unknown"],
-                &["example-alias"],
             ] {
                 let mut fake = Fake::default();
                 let (code, _, err) = invoke(&repo.env, &os(words), &mut fake, b"file\n");
                 assert_eq!(code, 0, "{words:?}: {err}");
                 assert_eq!(fake.input, b"file\n", "{words:?}");
                 assert_eq!(fake.calls.iter().filter(|c| *c == "exec").count(), 1);
+            }
+            for words in [&["unknown"][..], &["example-alias"]] {
+                let mut fake = Fake::default();
+                let (code, _, err) = invoke(&repo.env, &os(words), &mut fake, b"file\n");
+                assert_eq!(code, 1, "{words:?}: {err}");
+                assert!(fake.input.is_empty());
+                assert!(fake.calls.is_empty());
             }
         }
 
@@ -1728,10 +1958,10 @@ mod remote_sync {
                 &["branch", "--contains", "--delete"],
                 &["cat-file", "--filter", "HEAD:file"],
                 &["cat-file", "--textcon", "HEAD:file"],
-                &["cat-file", "--unknown", "HEAD"],
             ] {
                 assert!(matches!(route(words), Route::Forward { .. }), "{words:?}");
             }
+            assert_eq!(route(&["cat-file", "--unknown", "HEAD"]), Route::RefuseUnknown);
             assert!(
                 matches!(route(&["reflog"]), Route::Local { extra } if extra == ["--no-ext-diff", "--no-textconv"])
             );

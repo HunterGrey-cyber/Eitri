@@ -132,6 +132,18 @@ pub fn run_with(
         }
     }
     match route {
+        Route::RefuseUnknown => {
+            let command = parsed
+                .args
+                .first()
+                .map_or_else(String::new, |arg| format!(" {}", arg.to_string_lossy()));
+            let line = format!(
+                "git{command} is not run from here; run it on the server: ssh {}, cd {}, git{command}",
+                project.host,
+                project.root.display()
+            );
+            refuse(stderr, 1, &line.replace(['\n', '\r'], "\\n"))
+        }
         Route::RefuseEditor if parsed.args.first().is_some_and(|arg| arg == "revert") => refuse(
             stderr,
             1,
