@@ -105,6 +105,7 @@ impl OwnedSidecars {
 struct Service {
     sidecars: Arc<sidecars::Sidecars>,
     serving: Arc<serve::Serving>,
+    sync_ignores: Arc<sync::ignores::SyncIgnores>,
 }
 
 #[tonic::async_trait]
@@ -122,6 +123,7 @@ impl Helper for Service {
                 CAP_PENDING,
                 CAP_TRUST_SCAN,
                 CAP_INSTALLATION_ARGS,
+                CAP_SYNC_IGNORES,
                 CAP_GIT_CONFIG,
             ]
             .map(str::to_owned)
@@ -205,9 +207,12 @@ impl Helper for Service {
     }
     async fn sync_ignores(
         &self,
-        _request: Request<SyncIgnoresRequest>,
+        request: Request<SyncIgnoresRequest>,
     ) -> Result<Response<SyncIgnoresResponse>, Status> {
-        Err(Status::unimplemented("SyncIgnores is not built yet"))
+        mark_activity(&request);
+        Ok(Response::new(
+            self.sync_ignores.response(&request.into_inner().root).await,
+        ))
     }
 
     async fn git_config(&self, request: Request<GitConfigRequest>) -> Result<Response<GitConfigResponse>, Status> {
@@ -326,10 +331,14 @@ pub async fn run_with_environment(
     for pid in sidecars.children.iter().filter_map(tokio::process::Child::id) {
         let _ = crate::audit::record(&paths.state, "sidecar-start", &format!("pid={pid}"));
     }
+    let sync_ignores = Arc::new(sync::ignores::SyncIgnores::default());
     let environment = {
         let managed = managed.clone();
+        let sync_ignores = sync_ignores.clone();
         tokio::spawn(async move {
-            managed.set_environment(capture.await);
+            let captured = capture.await;
+            sync_ignores.set_environment(&captured);
+            managed.set_environment(captured);
         })
     };
     let connections = Arc::new(Mutex::new(Connections {
@@ -372,6 +381,7 @@ pub async fn run_with_environment(
             .add_service(HelperServer::new(Service {
                 sidecars: managed.clone(),
                 serving: serving.clone(),
+                sync_ignores: sync_ignores.clone(),
             }))
             .add_service(serve::Proxy(serving.clone()))
             .serve_with_incoming(incoming);
@@ -510,7 +520,14 @@ mod tests {
         paths.prepare().unwrap();
         let sidecars = Arc::new(sidecars::Sidecars::new(paths.clone()).unwrap());
         let serving = serve::Serving::new(paths, sidecars.clone());
-        (Service { sidecars, serving }, scratch)
+        (
+            Service {
+                sidecars,
+                serving,
+                sync_ignores: Arc::new(sync::ignores::SyncIgnores::default()),
+            },
+            scratch,
+        )
     }
 
     #[tokio::test]
@@ -524,7 +541,8 @@ mod tests {
             .await
             .unwrap()
             .into_inner();
-        for capability in [CAP_SYNC_IGNORES, CAP_SYNC_FILES, CAP_SYNC_MODES, CAP_EXEC] {
+        assert!(hello.capabilities.iter().any(|cap| cap == CAP_SYNC_IGNORES));
+        for capability in [CAP_SYNC_FILES, CAP_SYNC_MODES, CAP_EXEC] {
             assert!(!hello.capabilities.iter().any(|cap| cap == capability), "{capability}");
         }
         assert!(hello.capabilities.iter().any(|cap| cap == CAP_GIT_CONFIG));
@@ -534,14 +552,6 @@ mod tests {
     #[tokio::test]
     async fn new_rpcs_answer_unimplemented_with_their_name() {
         let (service, _scratch) = contract_service();
-        let unary = service
-            .sync_ignores(Request::new(SyncIgnoresRequest {
-                root: "/srv/project".into(),
-            }))
-            .await
-            .unwrap_err();
-        assert_eq!(unary.code(), tonic::Code::Unimplemented);
-        assert_eq!(unary.message(), "SyncIgnores is not built yet");
         let streaming = service
             .list_tree(Request::new(ListTreeRequest {
                 root: "/srv/project".into(),

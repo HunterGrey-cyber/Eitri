@@ -3,6 +3,7 @@
 pub mod daemon;
 pub mod engine;
 pub mod git_replica;
+pub mod ignores;
 pub mod local_git;
 pub mod mutagen;
 pub mod mutagen_json;
