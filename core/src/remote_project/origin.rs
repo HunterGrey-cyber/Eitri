@@ -88,6 +88,13 @@ pub fn host_open_hint(host: &str, root: &Path) -> String {
     format!("run `eitri host open {host}:{}` in a terminal first", root.display())
 }
 
+pub fn missing_mirror_hint(host: &str, root: &Path) -> String {
+    format!(
+        "run `eitri host open {host}:{}` to create this machine's copy",
+        root.display()
+    )
+}
+
 /// The window's origin for `root`: `ssh` is `--ssh <host>`, `local` is `--local`. A root with a record opens as remote
 /// unless `--local` asks for its copy; `--ssh` needs a record of that root on that host. Reads the record: a worker's
 /// or the launch's, before any toolkit starts.
@@ -212,6 +219,27 @@ pub fn carried_text(tabs: usize, stops: usize) -> String {
 mod tests {
     use super::*;
     use std::path::PathBuf;
+
+    #[test]
+    fn missing_mirror_says_to_run_host_open() {
+        let scratch = crate::test_scratch_dir::ScratchDir::new("remote", "missing-mirror");
+        let root = scratch.join("project");
+        let why = crate::project_root::resolve_launch_in(
+            &["--ssh".into(), "example-host".into(), root.as_os_str().into()],
+            None,
+            Ok(scratch.to_owned()),
+            Some(&scratch),
+            &agent::project_boundary::Identity::current(),
+        )
+        .unwrap_err();
+        assert!(
+            why.contains(&format!(
+                "run `eitri host open example-host:{}` to create this machine's copy",
+                root.display()
+            )),
+            "{why}"
+        );
+    }
 
     fn store() -> RemoteProjects {
         let state = agent::state_dirs::test_workspace_dir("remote-origin");
@@ -352,6 +380,7 @@ mod tests {
         store.save(&old).unwrap();
         let base = store.saved_tabs_dir().unwrap();
         let tab = SavedRemoteTab {
+            late_lines: Vec::new(),
             window: None,
             helper: agent::HelperHandoff {
                 daemon: "".into(),

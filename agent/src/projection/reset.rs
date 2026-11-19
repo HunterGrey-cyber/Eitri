@@ -50,7 +50,8 @@ pub(super) fn fold(state: &mut AgentSessionProjection, event: &AgentDomainEvent)
         assistant_message_open,
         thinking,
         thinking_open,
-        last_revision: _,
+        last_revision,
+        last_reset_revision,
         history,
         evicted,
         ungated_cli_mode: _,
@@ -82,6 +83,7 @@ pub(super) fn fold(state: &mut AgentSessionProjection, event: &AgentDomainEvent)
     if !new_conversation_id.is_empty() {
         *provider_session_id = Some(new_conversation_id.clone());
     }
+    *last_reset_revision = *last_revision + 1;
     user_prompts.clear();
     // The prompt row it pointed at is gone with the conversation.
     *opening_prompt = None;

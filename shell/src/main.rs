@@ -156,6 +156,34 @@ std::thread_local! {
     static GIT_SHIM: RefCell<Option<eitri_core::remote_sync::shim_dir::ShimDir>> = const { RefCell::new(None) };
 }
 
+fn dispatch_first_ssh(
+    start: &linked_window::WindowStart,
+    args: &[OsString],
+    store: impl FnOnce() -> eitri_core::remote_project::RemoteProjects,
+    run: impl FnOnce((String, PathBuf), Vec<OsString>) -> glib::ExitCode,
+) -> Option<glib::ExitCode> {
+    if !matches!(start, linked_window::WindowStart::Full)
+        || !args.iter().take_while(|arg| *arg != "--").any(|arg| arg == "--ssh")
+    {
+        return None;
+    }
+    match project_start::remote::first_request(&store(), args) {
+        Ok(Some(seed)) => {
+            let flags = ["--clean", "--legacy", "--new-window", "--raise"]
+                .into_iter()
+                .filter(|flag| eitri_core::project_root::flag_given(args.iter().map(OsString::as_os_str), flag))
+                .map(OsString::from)
+                .collect();
+            Some(run(seed, flags))
+        }
+        Ok(None) => None,
+        Err(message) => {
+            eprintln!("eitri: {message}");
+            Some(glib::ExitCode::FAILURE)
+        }
+    }
+}
+
 fn main() -> glib::ExitCode {
     // `eitri attachment-decoder` is the child one composer image is decoded in (`eitri_core::attachments`): it is
     // started with an empty environment, the request on stdin and its result pipe on descriptor 3, and serves before
@@ -356,6 +384,12 @@ fn main() -> glib::ExitCode {
             return glib::ExitCode::FAILURE;
         }
     };
+
+    if let Some(code) = dispatch_first_ssh(&start, &early_args, project_start::remote::store, |seed, flags| {
+        project_start::remote::run(seed, flags, host_command::init_sync_settings())
+    }) {
+        return code;
+    }
 
     // Before GTK and any child: a pipe, socket or file on stdin would be handed to the
     // embedded nvim by the Neovide fork, which reads it as a buffer and, for a pipe or socket whose
@@ -691,6 +725,11 @@ fn build_application(kind: AppKind) -> Application {
 }
 
 #[allow(clippy::too_many_arguments)]
+/// The unclaimed-terminal offer's sentence: plain text (never markup), already escaped by the caller.
+fn show_terminal_offer(label: &gtk4::Label, text: &str) {
+    label.set_text(text);
+}
+
 fn build_ui(
     app: &Application,
     want_clean: bool,
@@ -1502,8 +1541,17 @@ fn build_ui(
         terminal_font.as_ref(),
     )));
     let terminal_zoom = Rc::new(std::cell::Cell::new(1.0_f32));
+    let remote_terminals = {
+        let panel = agent_panel_handle.clone();
+        terminal::remote::prepare(
+            origin,
+            terminal::remote::terminal_window(pair.is_window_two(), pair.module_window().is_some(), pair.is_alone()),
+            Rc::new(move |text| panel.show_notice(&text)),
+        )
+    };
     let make_terminal_pane: Rc<dyn Fn() -> terminal::TerminalPane> = {
         let root = project_root.to_path_buf();
+        let local = origin.remote().is_none();
         let shell_env = open_requests::shell_env(incoming_opens.as_deref(), project_root, origin);
         #[cfg(target_os = "linux")]
         let env_with_port = (claude_ide || !owns_editor).then(|| shell_port.over(shell_env.clone()));
@@ -1512,10 +1560,12 @@ fn build_ui(
         let zoom = terminal_zoom.clone();
         Rc::new(move || {
             let pane = terminal::TerminalPane::new(root.clone());
-            pane.set_shell_env(shell_env.clone());
-            #[cfg(target_os = "linux")]
-            if let Some(env) = &env_with_port {
-                pane.set_shell_env(env.clone());
+            if local {
+                pane.set_shell_env(shell_env.clone());
+                #[cfg(target_os = "linux")]
+                if let Some(env) = &env_with_port {
+                    pane.set_shell_env(env.clone());
+                }
             }
             // The floor `build_vertical_split` gave the bottom slot on `main`: a terminal dragged to
             // zero reports a 1-row grid to its shell.
@@ -1951,7 +2001,13 @@ fn build_ui(
         Vec::new()
     };
     if remote_prepared {
-        remote_window::start(&agent_panel_handle, origin, incoming_opens.clone(), pair.clone());
+        remote_window::start(
+            &agent_panel_handle,
+            origin,
+            incoming_opens.clone(),
+            pair.clone(),
+            pane.is_some() || pair.beside_link().is_some(),
+        );
     }
     if window2_restored {
         agent_panel_handle.hold_launch_restore();
@@ -3112,6 +3168,11 @@ fn build_ui(
         pane.connect_hole_changed(refresh);
     }
     let toast = toast::Toast::install(&hint_overlay, &top_bar.widget);
+    {
+        // The toast is the window's own, shown whether or not the agent panel is.
+        let toast = toast.clone();
+        remote_terminals.set_warning(Rc::new(move |text| toast.show_warning(&text)));
+    }
     // The first-start screen: above the toast, below the y/n, so a y/n raised over it stays visible and a toast sits
     // under it.
     let onboarding_screen = gtk_host::onboarding::OnboardingScreen::new();
@@ -3136,6 +3197,16 @@ fn build_ui(
             sink.post(eitri_core::wm::HostEvent::Project(event));
         }
     })));
+    let (remote_settings, _) = host_command::sync_settings(&lua_engine.config.borrow());
+    if project_start::remote::available(&remote_settings) {
+        let parent = window.downgrade();
+        let tokens = start_theme.tokens.clone();
+        project_chooser.add_remote(move || {
+            if let Some(parent) = parent.upgrade() {
+                project_start::remote::open(parent.upcast_ref(), Vec::new(), remote_settings.clone(), &tokens, || {});
+            }
+        });
+    }
     hint_overlay.add_overlay(project_chooser.widget());
     {
         let control = eitri_core::panel_control::control_dir(
@@ -4195,22 +4266,26 @@ fn build_ui(
     // really goes. A report from a shell that is no longer the pane's current one (the instance was killed and its
     // number reused since) is not told at all. The hook never asks its pane to close itself: the kill's own hang-up
     // closes the pane.
+    let restoring_terminals = Rc::new(std::cell::Cell::new(true));
     let wire_terminal: Rc<dyn Fn(&ModuleId, &terminal::TerminalPane)> = {
+        let restoring = restoring_terminals.clone();
+        let remote_terminals = remote_terminals.clone();
         let terminals = Rc::downgrade(&terminals);
         // Weak: the registry holds the panes, and the controller's host holds the registry.
         let driver = Rc::downgrade(&driver);
         let toast = toast.clone();
         Rc::new(move |id, pane| {
             pane.set_number(id.number());
+            pane.set_remote(remote_terminals.clone(), id.to_string(), restoring.get());
             {
                 let id = id.clone();
                 let driver = driver.clone();
-                pane.on_shell_start(move |pid| {
+                pane.on_shell_start(move |identity| {
                     if let Some(driver) = driver.upgrade() {
                         driver.post(HostEvent::Terminal(TermEvent::Started {
                             win: WinId::MAIN,
                             module: id.clone(),
-                            pid,
+                            identity,
                         }));
                     }
                 });
@@ -4249,6 +4324,203 @@ fn build_ui(
         for (id, pane) in terminals.live() {
             wire_terminal(&id, &pane);
         }
+    }
+
+    restoring_terminals.set(false);
+
+    // Only a window that owns a slot offers terminals that have no window: a chat or page window owns none.
+    if origin.remote().is_some() && remote_terminals.may_bind_terminals() {
+        let band = gtk4::Box::new(gtk4::Orientation::Horizontal, 8);
+        band.add_css_class("close-prompt");
+        band.set_halign(gtk4::Align::Center);
+        band.set_valign(gtk4::Align::Start);
+        band.set_margin_top(40);
+        let label = gtk4::Label::new(None);
+        let open = gtk4::Button::with_label("Open them here");
+        let stop = gtk4::Button::with_label("Stop them");
+        let later = gtk4::Button::with_label("Later");
+        for widget in [
+            label.upcast_ref::<gtk4::Widget>(),
+            open.upcast_ref(),
+            stop.upcast_ref(),
+            later.upcast_ref(),
+        ] {
+            band.append(widget);
+        }
+        band.set_visible(false);
+        hint_overlay.add_overlay(&band);
+        let offered = Rc::new(RefCell::new(
+            Vec::<eitri_core::remote_project::terminals::TerminalEntry>::new(),
+        ));
+        let scan: Rc<dyn Fn()> = {
+            let registry = Rc::downgrade(&remote_terminals);
+            let terminals = Rc::downgrade(&terminals);
+            let pair = Rc::downgrade(&pair);
+            let band = band.downgrade();
+            let label = label.downgrade();
+            let offered = offered.clone();
+            Rc::new(move || {
+                let (Some(registry), Some(terminals)) = (registry.upgrade(), terminals.upgrade()) else {
+                    return;
+                };
+                if !matches!(
+                    terminal::remote::source_for(&registry.origin()),
+                    terminal::remote::TermSource::Server(_)
+                ) {
+                    return;
+                }
+                // A window whose previous owner has gone by now takes the first slot here too; the wake runs this
+                // offer again with the panes' claims in place.
+                if registry.retry_slot() {
+                    registry.wake();
+                    return;
+                }
+                let Some(owner) = registry.owner(String::new()) else {
+                    return;
+                };
+                let modules: Vec<_> = terminals
+                    .live()
+                    .into_iter()
+                    .filter(|(_, pane)| pane.claims_remote_terminal())
+                    .map(|(id, _)| id.to_string())
+                    .collect();
+                let peer_absent = pair
+                    .upgrade()
+                    .is_some_and(|pair| pair.holds_pair() && !window2_restored && pair.link().is_none());
+                let (tell, mut told) = futures_channel::mpsc::unbounded();
+                std::thread::spawn(move || {
+                    let other = peer_absent.then_some([].as_slice());
+                    let _ = tell.unbounded_send(owner.orphans(&modules, other));
+                });
+                let registry = registry.clone();
+                let band = band.clone();
+                let label = label.clone();
+                let offered = offered.clone();
+                glib::spawn_future_local(async move {
+                    let answer = told.recv().await;
+                    let (Some(band), Some(label)) = (band.upgrade(), label.upgrade()) else {
+                        return;
+                    };
+                    match answer {
+                        Ok(Ok(entries)) if !entries.is_empty() => {
+                            let host = registry
+                                .origin()
+                                .remote()
+                                .map(|p| eitri_core::onboarding::display::display_text(&p.host))
+                                .unwrap_or_default();
+                            let text = eitri_core::remote_project::terminals::orphan_notice(&host, entries.len());
+                            registry.notice(text.clone());
+                            show_terminal_offer(&label, &text);
+                            *offered.borrow_mut() = entries;
+                            band.set_visible(true);
+                        }
+                        Ok(Err(error)) => registry.notice(format!(
+                            "terminal records: {}",
+                            eitri_core::onboarding::display::display_text(&error.to_string())
+                        )),
+                        _ => {}
+                    }
+                });
+            })
+        };
+        remote_terminals.listen(scan.clone());
+        remote_terminals.set_offer(scan.clone());
+        scan();
+        let eligible: Rc<
+            dyn Fn(
+                Vec<eitri_core::remote_project::terminals::TerminalEntry>,
+            ) -> Vec<eitri_core::remote_project::terminals::TerminalEntry>,
+        > = {
+            let registry = remote_terminals.clone();
+            let terminals = Rc::downgrade(&terminals);
+            let pair = Rc::downgrade(&pair);
+            Rc::new(move |entries| {
+                let Some(terminals) = terminals.upgrade() else {
+                    return Vec::new();
+                };
+                let modules: Vec<_> = terminals
+                    .live()
+                    .into_iter()
+                    .filter(|(_, pane)| pane.claims_remote_terminal())
+                    .map(|(id, _)| id.to_string())
+                    .collect();
+                let peer_absent = pair
+                    .upgrade()
+                    .is_some_and(|pair| pair.holds_pair() && !window2_restored && pair.link().is_none());
+                entries
+                    .into_iter()
+                    .filter(|entry| {
+                        if Some(entry.slot) == registry.slot() {
+                            !modules.contains(&entry.module)
+                        } else {
+                            peer_absent
+                        }
+                    })
+                    .collect()
+            })
+        };
+        {
+            let offered = offered.clone();
+            let eligible = eligible.clone();
+            let registry = remote_terminals.clone();
+            let driver = Rc::downgrade(&driver);
+            let band = band.downgrade();
+            open.connect_clicked(move |_| {
+                let entries = eligible(std::mem::take(&mut *offered.borrow_mut()));
+                if let Some(driver) = driver.upgrade() {
+                    for entry in &entries {
+                        registry.adopt(entry, || {
+                            driver.run(
+                                WinId::MAIN,
+                                Action::InstanceNew {
+                                    kind: ModuleKind::Terminal,
+                                },
+                                Origin::Chip,
+                            )
+                        });
+                    }
+                }
+                if let Some(band) = band.upgrade() {
+                    band.set_visible(false);
+                }
+            });
+        }
+        {
+            let registry = remote_terminals.clone();
+            let band = band.downgrade();
+            stop.connect_clicked(move |_| {
+                let Some(owner) = registry.owner(String::new()) else {
+                    return;
+                };
+                let terminal::remote::TermSource::Server(connection) = terminal::remote::source_for(&registry.origin())
+                else {
+                    return;
+                };
+                let entries = eligible(std::mem::take(&mut *offered.borrow_mut()));
+                let (tell, mut told) = futures_channel::mpsc::unbounded();
+                std::thread::spawn(move || {
+                    let mut connection = connection;
+                    let _ = tell.unbounded_send(owner.stop_orphans(&entries, &mut connection));
+                });
+                let registry = registry.clone();
+                let hold = gtk4::gio::Application::default().map(|app| app.hold());
+                glib::spawn_future_local(async move {
+                    let _hold = hold;
+                    if let Ok(answer) = told.recv().await {
+                        registry.report_stops(answer);
+                    }
+                });
+                if let Some(band) = band.upgrade() {
+                    band.set_visible(false);
+                }
+            });
+        }
+        let band = band.downgrade();
+        later.connect_clicked(move |_| {
+            if let Some(band) = band.upgrade() {
+                band.set_visible(false);
+            }
+        });
     }
 
     // What every module host's controllers act through (`wire`): the startup hosts are wired

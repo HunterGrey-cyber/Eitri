@@ -62,6 +62,7 @@ pub struct InstallPlan {
     consented: bool,
     host_key: Option<String>,
     warnings: Vec<String>,
+    probe_summary: String,
     free_bytes: Option<u64>,
 }
 
@@ -104,6 +105,10 @@ impl InstallPlan {
     pub fn state_dir(&self) -> &Path {
         &self.state_dir
     }
+    pub(super) fn probe_summary(&self) -> &str {
+        &self.probe_summary
+    }
+
     pub fn warnings(&self) -> &[String] {
         &self.warnings
     }
@@ -278,6 +283,12 @@ fn make_connection_plan(
     let version = format!("{version}-{}-{}", &provenance.sha256()[..16], &manifest_hash[..16]);
     let helper_bytes = std::fs::metadata(&helper)?.len();
     let sidecar_bytes = std::fs::metadata(&sidecar.path)?.len();
+    let display_path = |path: Option<&Path>| {
+        path.map_or_else(
+            || "missing".into(),
+            |path| crate::onboarding::display::display_name(&path.to_string_lossy()),
+        )
+    };
     Ok(InstallPlan {
         helper_bytes,
         sidecar_bytes,
@@ -292,6 +303,15 @@ fn make_connection_plan(
         consented: false,
         host_key: None,
         warnings,
+        probe_summary: format!(
+            "Server: {}, glibc {}.{}. Helper data: {}. Claude: {}. Git: {}.",
+            probe.uname,
+            probe.glibc.unwrap_or_default().0,
+            probe.glibc.unwrap_or_default().1,
+            probe.data_dir.display(),
+            display_path(probe.claude.as_deref()),
+            display_path(probe.git.as_deref()),
+        ),
         free_bytes: probe.free_bytes,
     })
 }
@@ -643,7 +663,11 @@ pub(crate) fn communicate(child: Child, input: &[u8], progress: &dyn Fn(u64, u64
     communicate_uncapped(child, input, progress, 64 * 1024, None).map(|(out, _)| out)
 }
 
-fn communicate_start(child: Child, input: &[u8], progress: &dyn Fn(u64, u64)) -> Result<Vec<u8>, InstallError> {
+pub(super) fn communicate_start(
+    child: Child,
+    input: &[u8],
+    progress: &dyn Fn(u64, u64),
+) -> Result<Vec<u8>, InstallError> {
     communicate_start_output(child, input, progress).map(|(out, _)| out)
 }
 
@@ -950,9 +974,12 @@ mod tests {
         let local = root.join(format!("local-{flavor}"));
         std::fs::create_dir_all(&local).unwrap();
         let helper = local.join("eitri-server");
+        let mut report = super::super::probe_step::fixture(root);
+        report.root = agent::ssh::RootState::Ok;
+        let report = report.render();
         std::fs::write(
             &helper,
-            format!("#!/bin/sh\ntest \"$1\" = ensure || exit 1\ntest ! -e ensure-fails || {{ echo ensure-refused >&2; exit 1; }}\nprintf {flavor} > started\n"),
+            format!("#!/bin/sh\nif test \"$1\" = probe; then cat <<'REPORT'\n{report}REPORT\nexit 0\nfi\ntest \"$1\" = ensure || exit 1\ntest ! -e ensure-fails || {{ echo ensure-refused >&2; exit 1; }}\nprintf {flavor} > started\n"),
         )
         .unwrap();
         std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o700)).unwrap();
@@ -976,6 +1003,23 @@ mod tests {
                 helper: root.join("fixture-helper"),
             },
         )
+    }
+
+    #[test]
+    fn probe_summary_reveals_hidden_characters_in_server_tool_paths() {
+        let root = ScratchDir::new("remote", "probe-tool-paths");
+        let (plan, _) = fixture(&root, "probe", false);
+        let mut probe = super::super::probe_step::fixture(&root);
+        probe.claude = Some("/bin/claude\x1b[2J".into());
+        probe.git = Some("/bin/git\u{202e}".into());
+        let plan = make_plan(&probe, &plan.provenance, plan.sidecar, plan.helper, "0.3.0".into()).unwrap();
+        assert!(plan
+            .probe_summary()
+            .contains(r"Claude: /bin/claude\u{1b}[2J. Git: /bin/git\u{202e}."));
+        assert!(plan
+            .probe_summary()
+            .chars()
+            .all(|ch| !ch.is_control() && ch != '\u{202e}'));
     }
 
     pub(super) fn record(plan: &InstallPlan) -> RemoteHost {

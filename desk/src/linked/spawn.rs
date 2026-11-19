@@ -829,6 +829,11 @@ impl Pair {
         )
     }
 
+    /// Whether this is the pair's window 2 itself, not a module window window 1 started.
+    pub fn is_window_two(&self) -> bool {
+        matches!(*self.role.borrow(), WindowRole::Second { .. })
+    }
+
     /// The name of the chat or page window this is, a group's or one beside nvim; `None` in every other window,
     /// window 2 included.
     pub fn module_window(&self) -> Option<WindowName> {

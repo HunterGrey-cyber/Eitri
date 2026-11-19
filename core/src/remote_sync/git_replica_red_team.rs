@@ -183,7 +183,7 @@ impl Lab {
         command
     }
 
-    /// Git for building the server's state, with an identity.
+    /// Plain Git with an identity for commands that create commit objects.
     fn setup_command(&self, cwd: &Path, args: &[&str]) -> Command {
         let mut command = self.command(cwd, args);
         command
@@ -398,31 +398,66 @@ impl Replicator {
     }
 }
 
+/// Mutagen's reading of `patterns`, written here apart from the product's `ignores::Matcher` (which also treats
+/// `.git` specially, as only the tree session does): the last matching pattern decides, `!` takes back, a pattern
+/// without `/` matches the last component at any depth, a leading `/` or an inner `/` anchors at the root, a trailing
+/// `/` matches directories only, `*` stays within a component and a `**` component spans any number of them. A path
+/// under an ignored directory is ignored, since Mutagen does not scan it.
 fn model_ignores(patterns: &[&str], rel: &str, is_dir: bool) -> bool {
-    patterns.iter().any(|pattern| {
-        let (pattern, dir_only) = match pattern.strip_suffix('/') {
-            Some(pattern) => (pattern, true),
-            None => (*pattern, false),
-        };
-        if dir_only && !is_dir {
-            return false;
-        }
-        match pattern.strip_prefix('/') {
-            Some(anchored) => glob(anchored, rel),
-            None if pattern.contains('/') => glob(pattern, rel),
-            None => glob(pattern, rel.rsplit('/').next().unwrap_or(rel)),
-        }
-    })
+    let parts: Vec<&str> = rel.split('/').collect();
+    (1..parts.len()).any(|end| model_direct(patterns, &parts[..end].join("/"), true))
+        || model_direct(patterns, rel, is_dir)
 }
 
-/// `*` matches any run of characters other than `/`.
+fn model_direct(patterns: &[&str], path: &str, is_dir: bool) -> bool {
+    let mut ignored = false;
+    for pattern in patterns {
+        let (negated, body) = match pattern.strip_prefix('!') {
+            Some(body) => (true, body),
+            None => (false, *pattern),
+        };
+        let (body, dir_only) = match body.strip_suffix('/') {
+            Some(body) => (body, true),
+            None => (body, false),
+        };
+        if dir_only && !is_dir {
+            continue;
+        }
+        let hit = match body.strip_prefix('/') {
+            Some(anchored) => components_match(anchored, path),
+            None if body.contains('/') => components_match(body, path),
+            None => glob(body, path.rsplit('/').next().unwrap_or(path)),
+        };
+        if hit {
+            ignored = !negated;
+        }
+    }
+    ignored
+}
+
+fn components_match(pattern: &str, path: &str) -> bool {
+    fn walk(pattern: &[&str], path: &[&str]) -> bool {
+        match pattern.split_first() {
+            None => path.is_empty(),
+            Some((&"**", rest)) => (0..=path.len()).any(|skip| walk(rest, &path[skip..])),
+            Some((head, rest)) => path
+                .split_first()
+                .is_some_and(|(first, tail)| glob(head, first) && walk(rest, tail)),
+        }
+    }
+    walk(
+        &pattern.split('/').collect::<Vec<_>>(),
+        &path.split('/').collect::<Vec<_>>(),
+    )
+}
+
+/// `*` matches any run of characters within one component.
 fn glob(pattern: &str, text: &str) -> bool {
     match pattern.split_once('*') {
         None => pattern == text,
         Some((head, tail)) => text.strip_prefix(head).is_some_and(|rest| {
             (0..=rest.len())
                 .filter(|cut| rest.is_char_boundary(*cut))
-                .take_while(|cut| !rest[..*cut].contains('/'))
                 .any(|cut| glob(tail, &rest[cut..]))
         }),
     }
@@ -664,6 +699,107 @@ fn embedded_bare_scenario(replicator: &Replicator) {
     lab.assert_laptop_runs_nothing(&lab.laptop);
 }
 
+/// Branches and tags named like the excluded names are refs, and arrive; the excluded names stay out everywhere else,
+/// and what a server plants below `refs/` is never read as configuration by the laptop's git.
+fn ref_names_scenario(replicator: &Replicator) {
+    let lab = Lab::new("ref-names");
+    let names = [
+        "feature/config",
+        "hooks",
+        "fix/attributes",
+        "gitdir",
+        "commondir",
+        "x/alternates",
+        "config.worktree",
+    ];
+    for name in names {
+        lab.setup_git(&lab.server, &["branch", name]);
+    }
+    lab.setup_git(&lab.server, &["tag", "config"]);
+    let git_dir = lab.server.join(".git");
+    // A bare repository planted where a branch directory would be, with config and attributes that name the payload.
+    let server_path = lab.server.to_str().unwrap().to_owned();
+    lab.setup_git(&lab.base(), &["clone", "-q", "--bare", &server_path, "planted"]);
+    let planted = git_dir.join("refs/heads/evil");
+    std::fs::rename(lab.base().join("planted"), &planted).unwrap();
+    append(&planted.join("config"), &lab.payload_config());
+    std::fs::create_dir_all(planted.join("info")).unwrap();
+    std::fs::write(planted.join("info/attributes"), "* filter=evil diff=evil\n").unwrap();
+    std::fs::write(
+        git_dir.join("refs/heads/main.lock"),
+        "0000000000000000000000000000000000000000\n",
+    )
+    .unwrap();
+    std::fs::create_dir_all(git_dir.join("evil/deep")).unwrap();
+    append(&git_dir.join("evil/deep/config"), &lab.payload_config());
+    // A whole worktree with its repository planted below refs: plain git started in it would read its config, even
+    // with bare discovery off.
+    lab.setup_git(&lab.base(), &["init", "-q", "-b", "main", "plantwt"]);
+    let plant = lab.base().join("plantwt");
+    std::fs::write(plant.join("w.txt"), "w\n").unwrap();
+    lab.setup_git(&plant, &["add", "-A"]);
+    lab.setup_git(&plant, &["commit", "-q", "-m", "w"]);
+    append(&plant.join(".git/config"), &lab.payload_config());
+    let planted_tree = git_dir.join("refs/heads/wt");
+    std::fs::rename(&plant, &planted_tree).unwrap();
+    lab.server_change();
+    lab.control(&planted, &["safe.bareRepository=all"]);
+    lab.control(&planted_tree, &["safe.bareRepository=explicit"]);
+    lab.mirror(replicator);
+    let laptop_git = lab.laptop.join(".git");
+    for name in names {
+        let rev = |at: &Path| {
+            String::from_utf8(
+                lab.plain_git(at, &["rev-parse", "--verify", &format!("refs/heads/{name}")])
+                    .stdout,
+            )
+            .unwrap()
+        };
+        assert!(!rev(&lab.server).is_empty());
+        assert_eq!(rev(&lab.laptop), rev(&lab.server), "branch {name} was not mirrored");
+        let local = lab.local(&["rev-parse", "--verify", &format!("refs/heads/{name}")]);
+        assert!(local.status.success(), "local_git does not see branch {name}");
+        assert!(
+            exists(&laptop_git.join("logs/refs/heads").join(name)),
+            "the reflog of {name} was not mirrored"
+        );
+    }
+    assert!(lab
+        .local(&["rev-parse", "--verify", "refs/tags/config"])
+        .status
+        .success());
+    // Still out: the names where git reads them, and wherever else they appear outside refs.
+    for out in ["hooks", "evil/deep/config", "refs/heads/main.lock"] {
+        assert!(!exists(&laptop_git.join(out)), "{out} reached the laptop");
+    }
+    assert_ne!(
+        std::fs::read(laptop_git.join("config")).unwrap(),
+        std::fs::read(git_dir.join("config")).unwrap(),
+        "the server's config reached the laptop"
+    );
+    // Below refs only what can be a ref arrives: no `.git` and no `HEAD`, so git discovers no repository there.
+    for out in ["refs/heads/wt/.git", "refs/heads/evil/HEAD"] {
+        assert!(!exists(&laptop_git.join(out)), "{out} reached the laptop");
+    }
+    lab.assert_laptop_runs_nothing(&lab.laptop);
+    for planted in ["refs/heads/evil", "refs/heads/wt"] {
+        let inside = laptop_git.join(planted);
+        lab.assert_local_git_runs_nothing(&inside);
+        // Plain git, as a shell prompt or a file manager runs it there, with bare discovery allowed (git's default).
+        lab.save_on_the_laptop();
+        for form in [&["status"][..], &["diff"], &["log", "-p"], &["add", "-A"]] {
+            let mut args = vec!["-c", "safe.bareRepository=all"];
+            args.extend_from_slice(form);
+            let output = lab.plain_git(&inside, &args);
+            assert!(
+                !lab.ran(),
+                "plain git {form:?} in {planted} ran the payload: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+    }
+}
+
 fn tree_attributes_scenario(replicator: &Replicator) {
     let lab = Lab::new("attributes");
     std::fs::write(lab.server.join(".gitattributes"), "* filter=evil diff=evil\n").unwrap();
@@ -882,6 +1018,71 @@ fn a_plain_commit_fetch_or_push_on_the_copy_is_refused() {
     assert!(!lab.ran());
 }
 
+/// Check every ref and HEAD's symbolic target, including after a failed branch switch.
+fn assert_ref_update_refused(lab: &Lab, args: &[&str]) {
+    let snapshot = || {
+        let refs = lab.plain_git(&lab.laptop, &["show-ref", "--head"]);
+        let head = lab.plain_git(&lab.laptop, &["symbolic-ref", "HEAD"]);
+        assert!(refs.status.success() && head.status.success());
+        (refs.stdout, head.stdout)
+    };
+    let before = snapshot();
+    let output = lab.setup_command(&lab.laptop, args).output().unwrap();
+    assert!(!output.status.success(), "git {args:?} succeeded");
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    let messages: Vec<_> = stderr.lines().filter(|line| line.starts_with("eitri:")).collect();
+    assert_eq!(messages.len(), 1, "git {args:?}: {stderr}");
+    assert!(messages[0].contains("on the server"), "{stderr}");
+    assert_eq!(snapshot(), before, "git {args:?} changed refs");
+}
+
+#[test]
+fn plain_stash_is_refused_before_resetting_the_laptop_file() {
+    for existing_stash in [false, true] {
+        let lab = Lab::new("stash");
+        if existing_stash {
+            lab.server_change();
+            lab.setup_git(&lab.server, &["stash"]);
+        }
+        lab.mirror(&Replicator::Model);
+        let text = lab.save_on_the_laptop();
+        assert_ref_update_refused(&lab, &["stash"]);
+        assert_eq!(std::fs::read_to_string(lab.laptop.join("a.txt")).unwrap(), text);
+    }
+}
+
+#[test]
+fn plain_ref_updates_on_the_copy_are_refused() {
+    let lab = Lab::new("refs");
+    lab.setup_git(&lab.server, &["branch", "topic"]);
+    lab.commit_change("second commit");
+    lab.mirror(&Replicator::Model);
+    for args in [
+        &["branch", "-f", "topic", "HEAD"][..],
+        &["update-ref", "refs/heads/x", "HEAD"],
+        &["tag", "t"],
+        &["checkout", "-b", "y"],
+        &["commit", "--no-verify", "--allow-empty", "-m", "on the copy"],
+    ] {
+        assert_ref_update_refused(&lab, args);
+    }
+}
+
+#[test]
+fn local_git_reads_and_updates_refs_with_the_hooks_installed() {
+    let lab = Lab::new("local-refs");
+    lab.mirror(&Replicator::Model);
+    let head = lab.local(&["rev-parse", "HEAD"]);
+    assert!(head.status.success());
+    let args = ["update-ref", "refs/heads/x", "HEAD"];
+    assert_ref_update_refused(&lab, &args);
+    let update = lab.local(&args);
+    assert!(update.status.success(), "{}", String::from_utf8_lossy(&update.stderr));
+    let created = lab.local(&["rev-parse", "--verify", "refs/heads/x"]);
+    assert!(created.status.success());
+    assert_eq!(created.stdout, head.stdout);
+}
+
 #[test]
 fn a_replica_hook_never_runs() {
     hooks_scenario(&Replicator::Model);
@@ -900,6 +1101,11 @@ fn a_submodule_gitdir_config_filter_never_runs() {
 #[test]
 fn an_embedded_bare_repo_config_is_not_read() {
     embedded_bare_scenario(&Replicator::Model);
+}
+
+#[test]
+fn branches_named_like_excluded_files_are_mirrored_and_nothing_planted_under_refs_runs() {
+    ref_names_scenario(&Replicator::Model);
 }
 
 #[test]
@@ -949,6 +1155,55 @@ fn the_model_reads_patterns_as_mutagen_does() {
     assert!(model_ignores(GIT_SESSION_IGNORES, "rebase-merge", true));
     assert!(model_ignores(GIT_SESSION_IGNORES, "sequencer", false));
     assert!(!model_ignores(GIT_SESSION_IGNORES, "refs/heads/sequencer", false));
+    // Below refs/ and logs/refs/ the names are branch and tag names, taken back; locks stay out there too.
+    for rel in [
+        "refs/heads/feature/config",
+        "refs/heads/hooks",
+        "refs/tags/attributes",
+        "refs/remotes/origin/gitdir",
+        "logs/refs/heads/feature/config",
+        "refs/heads/x/commondir",
+    ] {
+        assert!(!model_ignores(GIT_SESSION_IGNORES, rel, false), "{rel}");
+    }
+    assert!(!model_ignores(GIT_SESSION_IGNORES, "refs/heads/hooks", true));
+    assert!(!model_ignores(GIT_SESSION_IGNORES, "refs/heads/hooks/x", false));
+    assert!(model_ignores(
+        GIT_SESSION_IGNORES,
+        "refs/heads/feature/config.lock",
+        false
+    ));
+    assert!(model_ignores(GIT_SESSION_IGNORES, "logs/refs/heads/x.lock", false));
+    // No repository can be discovered below refs: no `.git` (no ref component starts with `.`) and no `HEAD`.
+    for rel in [
+        "refs/heads/wt/.git",
+        "refs/heads/wt/.git/config",
+        "refs/heads/wt/.hidden",
+        "refs/heads/evil/HEAD",
+        "refs/HEAD",
+        "logs/refs/heads/x/HEAD",
+        "logs/refs/heads/x/.git",
+    ] {
+        assert!(model_ignores(GIT_SESSION_IGNORES, rel, false), "{rel}");
+    }
+    // Everywhere else, as before: at the top, at any depth outside refs, and in the excluded gitdirs.
+    for rel in [
+        "config",
+        "config.worktree",
+        "hooks",
+        "commondir",
+        "gitdir",
+        "objects/info/alternates",
+        "info/attributes",
+        "logs/config",
+        "objects/hooks",
+        "refsx/config",
+        "modules/sub/config",
+        "worktrees/w/gitdir",
+        "worktrees/w/refs/heads/x",
+    ] {
+        assert!(model_ignores(GIT_SESSION_IGNORES, rel, false), "{rel}");
+    }
     assert!(!model_ignores(GIT_SESSION_IGNORES, "objects/pack/pack-1.pack", false));
     assert!(!model_ignores(GIT_SESSION_IGNORES, "HEAD", false));
     assert!(
@@ -970,6 +1225,7 @@ fn red_team_holds_on_a_real_mutagen_replica() {
     submodule_scenario(&replicator);
     embedded_bare_scenario(&replicator);
     tree_attributes_scenario(&replicator);
+    ref_names_scenario(&replicator);
     gitfile_scenario(&replicator);
     rebase_exec_scenario(&replicator);
     linked_alternates_scenario(&replicator);

@@ -87,11 +87,13 @@ impl Drop for Home {
 /// starts that installation's sidecar, and the first installation's helper stops both.
 #[test]
 fn an_installed_helper_starts_its_daemon_and_sidecar_and_stops() {
-    let home = Home(std::env::temp_dir().join(format!("is-{}", std::process::id())));
+    // The installation's run key and socket name must fit even when the runner's TMPDIR is long.
+    let home = Home(PathBuf::from(format!("/tmp/is-{}", std::process::id())));
     agent::private_fs::create_private_dir_all(&home.0.join("r"), &home.0).unwrap();
     // The helper and its steps find their directories as a login on the server does: from HOME alone, here.
     std::env::set_var("HOME", &home.0);
     std::env::set_var("XDG_RUNTIME_DIR", home.0.join("r"));
+    std::env::set_var("TMPDIR", home.0.join("r"));
     for key in ["XDG_DATA_HOME", "XDG_STATE_HOME", "DISPLAY", "WAYLAND_DISPLAY"] {
         std::env::remove_var(key);
     }
@@ -116,6 +118,8 @@ fn an_installed_helper_starts_its_daemon_and_sidecar_and_stops() {
         gzip: false,
         root: RootState::Missing,
         sync_marker: None,
+        sync_excluded: None,
+        sync_ignore_line: None,
     };
     let provenance = HelperProvenance::Unsigned {
         sha256: hash(Path::new(BINARY)),

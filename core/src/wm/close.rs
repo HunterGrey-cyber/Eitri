@@ -560,14 +560,18 @@ pub(super) fn ask_last_module(w: &mut Window, cx: &Cx, win: WinId, module: Modul
     }
     let (running, queued, background, _) = window_counts(cx);
     let text = window_prompt(w, cx, win).filter(|_| w.has_peer()).unwrap_or_else(|| {
-        prompt(
-            &module,
-            &chrome::title(w, &module),
-            KillScope::Window,
-            running,
-            queued,
-            cx.reads.terminal_jobs(win),
-            background,
+        with_job_names(
+            prompt(
+                &module,
+                &chrome::title(w, &module),
+                KillScope::Window,
+                running,
+                queued,
+                cx.reads.terminal_jobs(win),
+                background,
+            ),
+            cx,
+            win,
         )
     });
     let confirmed = window_prompt(w, cx, win);
@@ -1296,7 +1300,22 @@ fn move_target(w: &Window) -> bool {
     w.lone_second_peer().is_some()
 }
 
+/// Adds the cached server job names to the existing counts without changing the close decision.
+fn with_job_names(mut text: String, cx: &Cx, win: WinId) -> String {
+    let names = cx.reads.terminal_job_names(win);
+    if !names.is_empty() {
+        if let Some(at) = text.rfind(" (") {
+            text.insert_str(at, &format!("; server jobs: {}", names.join(", ")));
+        }
+    }
+    text
+}
+
 pub(super) fn window_prompt(w: &Window, cx: &Cx, win: WinId) -> Option<String> {
+    window_prompt_counts(w, cx, win).map(|text| with_job_names(text, cx, win))
+}
+
+fn window_prompt_counts(w: &Window, cx: &Cx, win: WinId) -> Option<String> {
     let (running, queued, background, drafts) = window_counts(cx);
     match w.tiling {
         // Idle windows are kept for the group's next start, so only work the close would cut short is asked about.

@@ -2,11 +2,14 @@
 
 mod connection;
 mod origin;
+pub mod terminal_facts;
+pub mod terminal_link;
+pub mod terminals;
 
-pub use connection::{verified_host_key, RemoteConnection};
+pub use connection::{verified_host_key, RemoteConnection, TerminalMaster, TerminalRoute};
 pub use origin::{
     carried_text, carry_tabs_to_key, check_remote_dev, control_dir, decide_origin, host_key_changed, host_open_hint,
-    origin_key, reconcile_host_key, remote_dev_off, tab_origin_key, WindowOrigin,
+    missing_mirror_hint, origin_key, reconcile_host_key, remote_dev_off, tab_origin_key, WindowOrigin,
 };
 
 use std::collections::BTreeMap;
@@ -43,6 +46,9 @@ pub struct RemoteProject {
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SyncRecord {
     pub engine: String,
+    /// First connect checked this root and authorized the actor to create its sessions.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub set_up: bool,
     #[serde(default)]
     pub tree_session: Option<String>,
     #[serde(default)]
@@ -81,6 +87,62 @@ pub struct SyncRecord {
     /// Paths the last ignore change left out of sync while this laptop still holds them.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub kept_here: Vec<String>,
+    /// The laptop directory this record's sessions sync: the root as first connect prepared it (or as it was when
+    /// the first session was reserved). A folder at the same path that is not this one (the mirror moved away and
+    /// another checkout put there, a restore from a backup) is never synced over: its contents are not the ones the
+    /// sessions' history describes. A record written before this field existed has none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub root_identity: Option<DirIdentity>,
+    /// The laptop `.git` Eitri made for the replica. Only this directory is written to or replicated into; a `.git`
+    /// the person made in the mirror is left alone.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub git_identity: Option<DirIdentity>,
+    /// The version of the git session's description the recorded git session was created with; an older one is
+    /// re-created, since Mutagen keeps a session's ignores for its whole life.
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub git_spec_version: u32,
+}
+
+/// A directory as the file system names it: device, inode and birth time. Device and inode alone are not enough: a
+/// file system such as ext4 hands a freed inode number to the next directory made, so a folder deleted and made again
+/// at the same path (`rm -rf` and a fresh clone) often gets the old pair back. Its birth time is new, though. Compare
+/// two identities with `remote_sync::mirror_identity::compare`, never with `==`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DirIdentity {
+    pub dev: u64,
+    pub ino: u64,
+    /// `Unknown` in a record written before birth times were kept.
+    #[serde(default)]
+    pub birth: Birth,
+}
+
+/// A directory's birth time as the file system reported it when its identity was taken.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Birth {
+    /// Not measured: the identity was recorded before birth times were kept.
+    #[default]
+    Unknown,
+    /// The file system reports none.
+    Absent,
+    At {
+        sec: i64,
+        nsec: u32,
+    },
+}
+
+fn is_zero_u32(value: &u32) -> bool {
+    *value == 0
+}
+
+impl SyncRecord {
+    pub(crate) fn has_sessions(&self) -> bool {
+        self.tree_session.is_some() || self.git_session.is_some()
+    }
+
+    pub(crate) fn authorized(&self) -> bool {
+        self.set_up || self.has_sessions()
+    }
 }
 
 fn is_zero(value: &u64) -> bool {
@@ -113,6 +175,15 @@ impl RemoteProject {
                 })
             })
             .transpose()
+    }
+
+    pub fn sync_not_set_up(&self) -> String {
+        format!(
+            "sync is not set up for {}: run eitri host open {}:{} to set up this machine's copy",
+            self.root.display(),
+            self.host,
+            self.root.display()
+        )
     }
 
     pub fn set_sync_record(&mut self, record: &SyncRecord) {
@@ -233,9 +304,15 @@ impl RemoteProjects {
         let _lock = self.lock(&path)?;
         let mut record = opened.clone();
         if let Some(latest) = self.find(&opened.root)?.filter(|latest| latest.host == opened.host) {
-            record.queued_stops = latest.queued_stops;
+            record.queued_stops.clone_from(&latest.queued_stops);
             record.created_at = latest.created_at;
-            record.sync = latest.sync;
+            if latest.host_key_sha256 == opened.host_key_sha256 {
+                if let Some(sync) = latest.sync_record().map_err(io::Error::other)? {
+                    if sync.host_key_sha256 == opened.host_key_sha256 {
+                        record.set_sync_record(&sync);
+                    }
+                }
+            }
         }
         version(&path, record.version)?;
         self.write(&path, &record)?;
@@ -269,7 +346,7 @@ impl RemoteProjects {
         })
     }
 
-    fn update_checked(
+    pub(crate) fn update_checked(
         &self,
         root: &Path,
         update: impl FnOnce(&mut RemoteProject) -> io::Result<()>,
@@ -338,6 +415,20 @@ impl RemoteProjects {
             record.queued_stops.retain(|queued| queued != id);
         }
         self.write(&path, &record)
+    }
+
+    /// Removes `root`'s record under its store lock when `remove` says so of the record as it is then.
+    pub(crate) fn forget_if(&self, root: &Path, remove: impl FnOnce(&RemoteProject) -> bool) -> io::Result<bool> {
+        let path = self.project_path(root)?;
+        let _lock = self.lock(&path)?;
+        match self.find(root)? {
+            Some(record) if remove(&record) => match std::fs::remove_file(&path) {
+                Ok(()) => Ok(true),
+                Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(false),
+                Err(e) => Err(e),
+            },
+            _ => Ok(false),
+        }
     }
 
     /// Removes `root`'s record, under its store lock: an [`Self::update`] that read the record first finishes its
@@ -483,6 +574,7 @@ mod tests {
     fn sync_record() -> SyncRecord {
         SyncRecord {
             engine: "mutagen".into(),
+            set_up: true,
             tree_session: Some("eitri-example-tree".into()),
             git_session: Some("eitri-example-git".into()),
             host_key_sha256: "SHA256:example".into(),
@@ -503,6 +595,17 @@ mod tests {
             tree_synced: true,
             copied_back_more: 3,
             kept_here: vec!["now-ignored".into()],
+            root_identity: Some(DirIdentity {
+                dev: 1,
+                ino: 2,
+                birth: Birth::At { sec: 10, nsec: 7 },
+            }),
+            git_identity: Some(DirIdentity {
+                dev: 1,
+                ino: 3,
+                birth: Birth::Absent,
+            }),
+            git_spec_version: 2,
         }
     }
 

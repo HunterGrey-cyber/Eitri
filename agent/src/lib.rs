@@ -150,14 +150,14 @@ pub use projection::{
     NO_OPEN_TURN_ID, NO_RESULT_REASON, PLAN_FEEDBACK_MAX_BYTES, PLAN_TRANSITION_GUARD_MS,
 };
 pub use provider::{
-    AgentProvider, AppliedSettings, AttachmentMeta, ClientCallRef, ClientToolAnswer, ClientToolCallState,
+    AgentProvider, AppliedSettings, AttachmentMeta, BeforeSend, ClientCallRef, ClientToolAnswer, ClientToolCallState,
     ClientToolDecl, ClientToolSet, CloseSessionRequest, CreateSessionRequest, EffortChoice, EventSignal,
     InteractionReply, InteractionResolution, InteractionSend, InteractionState, InterruptTurnRequest, ModelList,
     ModelOption, PermissionDecision, PlanningReply, PlanningSend, ProviderCapabilities, ProviderError,
     ProviderErrorCode, ProviderInfo, QuestionAnswer, QuestionDeclineKind, RemoteEnding, RemoteLinkState, ReplySend,
     ResolveInteractionRequest, ResolvePermissionRequest, ResumeSessionRequest, SendTurnRequest, SetPlanningRequest,
     SteerTurnRequest, StreamingPreference, TaskOutput, TaskReply, TurnContentLimits, TurnImage, TurnStamp,
-    WaitingRequest,
+    WaitingRequest, SESSION_ENDED_BEFORE_SEND, STOPPED_BEFORE_SEND,
 };
 /// Images on a Claude turn: the sidecar's reason words for a refusal and the composer's words for them.
 pub use providers::claude_sidecar::turn_content;

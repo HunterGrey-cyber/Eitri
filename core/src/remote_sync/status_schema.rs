@@ -86,6 +86,12 @@ impl SyncChip {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LateLine {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub started_at: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seq: Option<u64>,
+    #[serde(default)]
+    pub prompt: String,
     pub message_id: String,
     pub text: String,
 }
@@ -144,6 +150,9 @@ mod tests {
         assert_eq!(value["pausedReason"], "tripwire");
         assert_eq!(serde_json::from_value::<SyncChip>(value).unwrap(), chip);
         let line = LateLine {
+            started_at: None,
+            seq: Some(1),
+            prompt: "go".into(),
             message_id: "m1".into(),
             text: "waiting for sync".into(),
         };

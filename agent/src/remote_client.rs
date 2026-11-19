@@ -28,6 +28,27 @@ use tokio::io::unix::AsyncFd;
 use tonic::transport::{Channel, Endpoint, Uri};
 use tonic::Status;
 
+/// Wire and async types used by a terminal link on this connection's runtime.
+/// Keeping these here lets the toolkit-free core use the transport without a second dependency stack.
+pub mod terminal_transport {
+    pub use eitri_server_proto as wire;
+    pub use tokio;
+    pub use tonic;
+    pub use tonic::codegen::tokio_stream;
+}
+
+/// Reconnect delays shared by remote agents and terminals, repeating the last delay indefinitely.
+pub const REMOTE_RECONNECT_BACKOFF: [Duration; 8] = [
+    Duration::from_millis(500),
+    Duration::from_secs(1),
+    Duration::from_secs(2),
+    Duration::from_secs(4),
+    Duration::from_secs(8),
+    Duration::from_secs(15),
+    Duration::from_secs(30),
+    Duration::from_secs(60),
+];
+
 /// HTTP/2 keepalive on the helper connection: a ping every ten seconds, and a connection whose ping
 /// goes twenty seconds unanswered is dead. A closed lid shows up within half a minute, not when the
 /// kernel gives up on the TCP connection under ssh.
@@ -407,6 +428,46 @@ impl HelperClient {
         self.inner.channel.clone()
     }
 
+    /// The terminal service's channel and the runtime it runs on. The caller keeps this client alive
+    /// outside tasks on that runtime; tasks keep only the channel and handle.
+    pub fn terminal_channel(&self) -> Result<(Channel, tokio::runtime::Handle), Status> {
+        self.require_pin()?;
+        Ok((self.channel(), self.inner.runtime.handle().clone()))
+    }
+
+    /// Opens an independent connection through this connection's launcher and installation routing.
+    /// Blocking: a worker's.
+    pub fn terminal_connection(&self, installation: &str) -> io::Result<Self> {
+        self.terminal_connection_through(installation, || Ok(Arc::clone(&self.inner.launcher)))
+    }
+
+    /// [`Self::terminal_connection`] through the launcher `launcher` gives: a window's terminals go through an ssh
+    /// master of their own, so their output never shares a TCP connection with the agents' channels. The new
+    /// connection keeps this one's host and pinned key, compared before every channel it opens, the first
+    /// included. The pin and the installation's name are checked before `launcher` runs. Blocking: a worker's.
+    pub fn terminal_connection_through(
+        &self,
+        installation: &str,
+        launcher: impl FnOnce() -> io::Result<Arc<dyn ChannelLauncher>>,
+    ) -> io::Result<Self> {
+        self.require_pin().map_err(io::Error::other)?;
+        if !installation
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"._+-".contains(&byte))
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "invalid helper installation",
+            ));
+        }
+        let installation = if installation.is_empty() {
+            self.daemon()
+        } else {
+            installation
+        };
+        Self::connect_daemon(launcher()?, self.host(), self.inner.pinned.as_deref(), installation)
+    }
+
     pub(crate) fn runtime(&self) -> Arc<RuntimeThread> {
         Arc::clone(&self.inner.runtime)
     }
@@ -704,6 +765,14 @@ impl HelperClient {
         )
     }
 
+    /// The key the connection under this client shows now, when it is one other than the pinned key: ssh accepted
+    /// another server's key on a master that started again. `Ok(None)` while it shows the pinned key, when none can
+    /// be read, without a pin, or with no master; `Err` while a master start may be under way (its record can hold
+    /// a key ssh then refuses). Blocking: it waits a moment for the master's lock and reads ssh's record.
+    pub fn shown_other_host_key(&self) -> Result<Option<String>, String> {
+        other_host_key(self.inner.pinned.as_deref(), self.inner.launcher.settled_host_key())
+    }
+
     /// Runs trust discovery of `root` on the server. Refused on a connection opened without a pinned
     /// host key, like [`Self::start_sidecar`]: it carries the project root.
     pub fn trust_scan(&self, root: &Path, profile_key: &str) -> Result<TrustScanResponse, Status> {
@@ -777,7 +846,13 @@ impl HelperClient {
     pub fn path_sizes(&self, request: PathSizesRequest) -> Result<PathSizesResponse, Status> {
         self.require_pin()?;
         let mut service = self.service();
-        self.call(HELPER_RPC_TIMEOUT, async move { service.path_sizes(request).await })
+        // A whole-project walk has five minutes on the helper, plus time to receive its answer.
+        let limit = if request.whole_root {
+            Duration::from_secs(300) + HELPER_RPC_TIMEOUT
+        } else {
+            HELPER_RPC_TIMEOUT
+        };
+        self.call(limit, async move { service.path_sizes(request).await })
     }
 
     pub fn project_activity(&self, request: ProjectActivityRequest) -> Result<ProjectActivityResponse, Status> {
@@ -843,7 +918,8 @@ impl HelperClient {
         byte_limit: usize,
         item_bytes: fn(&T) -> usize,
     ) -> Result<Vec<T>, Status> {
-        self.call(TRUST_SCAN_TIMEOUT, async move {
+        let timeout = eitri_server_proto::SYNC_STREAM_DEADLINE + HELPER_RPC_TIMEOUT;
+        self.call(timeout, async move {
             collect_sync_items(stream, entry_limit, byte_limit, item_bytes)
                 .await
                 .map(tonic::Response::new)
@@ -1003,6 +1079,17 @@ fn shown_host_key(pinned: Option<&str>, shown: Option<io::Result<String>>, host:
             "the connection to {host} shows host key {key}, not the {pinned} this project was recorded with"
         )),
         Some(Err(error)) => Err(format!("the host key of {host} could not be read: {error}")),
+    }
+}
+
+/// [`HelperClient::shown_other_host_key`] for a connection pinned to `pinned` whose master shows `shown`.
+/// `Err` when it could not be looked at (a master start under way); an unreadable record says nothing about the
+/// server and is `Ok(None)`.
+fn other_host_key(pinned: Option<&str>, shown: Option<io::Result<String>>) -> Result<Option<String>, String> {
+    match (pinned, shown) {
+        (Some(pinned), Some(Ok(key))) if key != pinned => Ok(Some(key)),
+        (Some(_), Some(Err(error))) if error.kind() == io::ErrorKind::WouldBlock => Err(error.to_string()),
+        _ => Ok(None),
     }
 }
 
@@ -1967,6 +2054,78 @@ mod tests {
     }
 
     #[test]
+    fn terminal_channels_require_the_connections_pinned_key_before_any_io() {
+        struct Never;
+        impl ChannelLauncher for Never {
+            fn spawn(&self, _: &[OsString]) -> io::Result<Child> {
+                panic!("a terminal capability check must not open a channel")
+            }
+        }
+        let mut client = lazy_test_client(Arc::new(Never));
+        let (_, handle) = client.terminal_channel().unwrap();
+        assert_eq!(handle.runtime_flavor(), tokio::runtime::RuntimeFlavor::CurrentThread);
+        assert!(client.terminal_connection("../other").is_err());
+        Arc::get_mut(&mut client.inner).unwrap().pinned = None;
+        assert_eq!(
+            client.terminal_channel().unwrap_err().code(),
+            tonic::Code::FailedPrecondition
+        );
+        assert!(client.terminal_connection("").is_err());
+    }
+
+    /// A terminal connection through the launcher it is given opens its channels there and never through the
+    /// launcher of the connection it came from; it keeps that connection's pin, compared before its first channel.
+    /// The pin and the installation's name are checked before that launcher is even asked for.
+    #[test]
+    fn a_terminal_connection_goes_through_the_launcher_it_is_given() {
+        use std::sync::atomic::AtomicUsize;
+
+        #[derive(Default)]
+        struct Counting {
+            spawns: AtomicUsize,
+            key: Mutex<String>,
+        }
+        impl ChannelLauncher for Counting {
+            fn spawn(&self, _: &[OsString]) -> io::Result<Child> {
+                self.spawns.fetch_add(1, Ordering::SeqCst);
+                Err(io::Error::other("no helper here"))
+            }
+            fn host_key(&self) -> Option<io::Result<String>> {
+                Some(Ok(self.key.lock().unwrap().clone()))
+            }
+        }
+        let agents = Arc::new(Counting::default());
+        *agents.key.lock().unwrap() = "SHA256:example".into();
+        let mut client = lazy_test_client(agents.clone());
+        let terminals = Arc::new(Counting::default());
+        let asked = AtomicUsize::new(0);
+        let given = || {
+            asked.fetch_add(1, Ordering::SeqCst);
+            Ok(terminals.clone() as Arc<dyn ChannelLauncher>)
+        };
+
+        *terminals.key.lock().unwrap() = "SHA256:other".into();
+        let refused = client.terminal_connection_through("", given).err().unwrap().to_string();
+        assert!(
+            refused.contains("SHA256:other") && refused.contains("SHA256:example"),
+            "{refused}"
+        );
+        assert_eq!(terminals.spawns.load(Ordering::SeqCst), 0);
+
+        *terminals.key.lock().unwrap() = "SHA256:example".into();
+        assert!(client.terminal_connection_through("", given).is_err());
+        assert_eq!(terminals.spawns.load(Ordering::SeqCst), 1);
+        assert_eq!(agents.spawns.load(Ordering::SeqCst), 0);
+        assert_eq!(asked.load(Ordering::SeqCst), 2);
+
+        assert!(client.terminal_connection_through("../other", given).is_err());
+        Arc::get_mut(&mut client.inner).unwrap().pinned = None;
+        assert!(client.terminal_connection_through("", given).is_err());
+        assert_eq!(asked.load(Ordering::SeqCst), 2);
+        assert_eq!(terminals.spawns.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
     fn timed_out_calls_release_their_channels_on_the_shared_route() {
         use std::sync::atomic::AtomicUsize;
         use tonic::codegen::http;
@@ -2569,5 +2728,25 @@ mod tests {
         );
         assert!(shown_host_key(Some("SHA256:a"), Some(Err(io::Error::other("gone"))), host).is_err());
         assert!(shown_host_key(None, Some(Ok("SHA256:a".into())), host).is_err());
+    }
+
+    /// Only a key ssh accepted that is not the pinned one counts as changed: an unreadable key, no master or no pin
+    /// says nothing about the server.
+    #[test]
+    fn another_host_key_is_only_a_readable_key_other_than_the_pin() {
+        assert_eq!(
+            other_host_key(Some("SHA256:a"), Some(Ok("SHA256:b".into()))),
+            Ok(Some("SHA256:b".to_string()))
+        );
+        assert_eq!(other_host_key(Some("SHA256:a"), Some(Ok("SHA256:a".into()))), Ok(None));
+        assert_eq!(other_host_key(Some("SHA256:a"), None), Ok(None));
+        assert_eq!(
+            other_host_key(Some("SHA256:a"), Some(Err(io::Error::other("gone")))),
+            Ok(None)
+        );
+        assert_eq!(other_host_key(None, Some(Ok("SHA256:b".into()))), Ok(None));
+        // A master start under way: the key could not be looked at, which is not "unchanged".
+        let busy = io::Error::new(io::ErrorKind::WouldBlock, "a master start is under way");
+        assert!(other_host_key(Some("SHA256:a"), Some(Err(busy))).is_err());
     }
 }

@@ -88,6 +88,13 @@ pub(super) fn tick_send(
     out: &mut Outbox,
 ) {
     // A message put into a turn was read (its row went out above) or is held again.
+    for tab in state.tabs.tabs() {
+        if let Some(view) = state.page_of(tab.id) {
+            if let Some(payload) = tab.send_sync_payload(true) {
+                out.send(view, payload);
+            }
+        }
+    }
     for tab in pumped.queue_changed {
         send_queue(state, tab, out);
     }
@@ -95,6 +102,16 @@ pub(super) fn tick_send(
     // provider call has answered.
     for sent in state.tabs.poll_turn_sends(std::time::Instant::now()) {
         apply_sent(state, screen, sent, out);
+    }
+    // A Stop that met a send the agent refused as busy put that send's text back in its draft: the page puts it in
+    // its box as it does for a Stop during the wait.
+    for (tab, texts) in state.tabs.take_stopped_sends() {
+        if let Some(view) = state.page_of(tab) {
+            out.send(
+                view,
+                eitri_core::agent_bridge::serialize_queue_taken_for_js(tab, &texts),
+            );
+        }
     }
     // A remote tab's interrupts whose provider call has answered: each owes its command, if its page is there.
     for done in state.tabs.poll_interrupts() {

@@ -26,6 +26,7 @@ pub(crate) mod keys;
 pub(crate) mod moving;
 mod pane;
 pub(crate) mod pointer;
+pub(crate) mod remote;
 // The window's terminals are kept in this registry.
 pub(crate) mod registry;
 

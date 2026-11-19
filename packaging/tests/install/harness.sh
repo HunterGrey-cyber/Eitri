@@ -710,11 +710,11 @@ snap_but_lock() {
 
 # snap_but_staging DIR: snap, except the mtimes of the directories a fresh install or an upgrade
 # that fails creates and removes its own entries in, leaving every file as it was: .local/lib
-# (eitri.new, a swap's renames), the ones the launcher, desktop entries, plugin, icons and licences are staged in
+# (eitri.new, a swap's renames), the ones the launcher, desktop entries, plugin (lua/eitri/remote included), icons and licences are staged in
 # before the swap, and -- for a run against a HOME with no prior install at all -- .local itself,
 # whose mtime changes when unpack_new first creates .local/lib, even if a sidecar-build failure follows.
 snap_but_staging() {
-	snap "$1" | sed -E 's#^(\./\.local(/(lib|bin|share/applications|share/licenses/eitri|share/eitri(/eitri.nvim(/[^/]+(/eitri)?)?)?|share/gnome-shell(/extensions(/eitri@huntergrey.cn)?)?|share/icons(/hicolor(/[^/]+(/apps)?)?)?))? d [0-7]+ [0-9]+) [0-9.]+ #\1 - #'
+	snap "$1" | sed -E 's#^(\./\.local(/(lib|bin|share/applications|share/licenses/eitri|share/eitri(/eitri.nvim(/[^/]+(/eitri(/remote)?)?)?)?|share/gnome-shell(/extensions(/eitri@huntergrey.cn)?)?|share/icons(/hicolor(/[^/]+(/apps)?)?)?))? d [0-7]+ [0-9]+) [0-9.]+ #\1 - #'
 }
 
 # tree DIR: names and types only, excluding the planted editors.

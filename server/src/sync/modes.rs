@@ -50,6 +50,11 @@ pub const MAX_PATTERN_BYTES: usize = 4096;
 pub const MAX_REGISTRATION_BYTES: usize = 8 * 1024 * 1024;
 /// How many of the paths left as they were a line names.
 pub const MAX_NAMED: usize = 20;
+/// How long a WatchModes waits for the root's keeper to settle (a new keeper's first walk), or for another daemon to
+/// let the root go.
+const REGISTER_SETTLE: Duration = Duration::from_secs(5);
+/// How often a WatchModes waiting for another daemon to let the root go tries the keeper lock again.
+const ELSEWHERE_RETRY: Duration = Duration::from_millis(200);
 /// How often a changed record is written out at most while the keeper runs (it is also written after the first walk
 /// and when the keeper stops).
 const WRITE_EVERY: Duration = Duration::from_secs(60);
@@ -119,7 +124,14 @@ pub fn sync_dir(state: &Path, root: &str) -> PathBuf {
 
 /// The line a person reads when a root's modes are not kept.
 pub fn not_kept(host: &str, root: &str, reason: &str) -> String {
-    format!("file modes on {host} are not kept for {root}: {reason}")
+    format!("file modes on {host} are not kept for {}: {reason}", shown(root))
+}
+
+/// A server path as it goes into a line a person reads: control characters, quotes and backslashes escaped as Rust
+/// writes them (as the ignore translation's problem lines do), so a file name an agent or any server process chose
+/// cannot carry a terminal escape (a clipboard write, a title, cursor moves) to the laptop's terminal.
+fn shown(path: &str) -> String {
+    path.escape_debug().to_string()
 }
 
 /// A staging directory name the tree session can have: one name in the root's parent, Mutagen's prefix.
@@ -278,7 +290,8 @@ fn standing_warnings(status: &Status, host: &str, root: &str) -> Vec<ModeWarning
     }
     if let Some(reason) = &status.partial {
         lines.push(line(format!(
-            "file modes on {host} are kept only for part of {root}: {reason}"
+            "file modes on {host} are kept only for part of {}: {reason}",
+            shown(root)
         )));
     }
     lines
@@ -292,9 +305,10 @@ fn counted_warning(status: &Status, host: &str, root: &str) -> Option<ModeWarnin
     }
     let paths: Vec<String> = status.named.iter().map(|(_, path)| path.clone()).collect();
     let mut text = format!(
-        "file modes on {host}: {} sync writes into {root} were left as Mutagen wrote them (not provably Mutagen's, or \
+        "file modes on {host}: {} sync writes into {} were left as Mutagen wrote them (not provably Mutagen's, or \
          changed since)",
-        status.unpaired_in_sync
+        status.unpaired_in_sync,
+        shown(root)
     );
     if !paths.is_empty() {
         text.push_str(if status.unpaired_in_sync > paths.len() as u64 {
@@ -302,7 +316,8 @@ fn counted_warning(status: &Status, host: &str, root: &str) -> Option<ModeWarnin
         } else {
             ": "
         });
-        text.push_str(&paths.join(", "));
+        let named: Vec<String> = paths.iter().map(|path| shown(path)).collect();
+        text.push_str(&named.join(", "));
     }
     Some(ModeWarning {
         host: host.to_owned(),
@@ -329,6 +344,44 @@ pub struct Keeper {
     host: String,
 }
 
+/// Returns once the keeper behind `shared` has looked at every change made before the call (or stopped), or after
+/// `cap`; whether it settled.
+fn settle_within(shared: &Shared, cap: Duration) -> bool {
+    let deadline = Instant::now() + cap;
+    let asked = shared.settle_asked.fetch_add(1, Ordering::SeqCst) + 1;
+    shared.poke();
+    let mut settled = shared.settled.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    while *settled < asked && shared.running.load(Ordering::SeqCst) {
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return false;
+        }
+        settled = shared
+            .settled_signal
+            .wait_timeout(settled, left.min(Duration::from_millis(100)))
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .0;
+    }
+    // A keeper that stopped (replaced, turned off, its root gone) before it got to the changes asked about has not
+    // settled them.
+    *settled >= asked
+}
+
+/// A keeper held from another thread ([`Keeper::paused`]); dropping it lets the keeper go on.
+pub struct Paused {
+    release: Option<std::sync::mpsc::Sender<()>>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Drop for Paused {
+    fn drop(&mut self) {
+        drop(self.release.take());
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
 struct Shared {
     /// The record. The keeper holds it for each round of events, so holding it from outside pauses the keeper.
     records: Mutex<BTreeMap<String, u32>>,
@@ -345,6 +398,8 @@ struct Shared {
     settled_signal: Condvar,
     /// New at every keeper start, so a restarted keeper's count is not taken for an old one.
     epoch: u64,
+    /// A new registered staging name for the running keeper (a re-created session's), taken at its next round.
+    staging: Mutex<Option<Option<Vec<u8>>>>,
 }
 
 impl Shared {
@@ -456,6 +511,7 @@ impl Keeper {
             settled: Mutex::new(0),
             settled_signal: Condvar::new(),
             epoch: next_epoch(),
+            staging: Mutex::new(None),
         });
         let host = options.host.clone();
         let engine = engine::Engine::new(engine::Setup {
@@ -487,6 +543,21 @@ impl Keeper {
         &self.root
     }
 
+    /// Gives the running keeper a new registered staging name (checked as at start): it keeps its record and
+    /// watches, lets the directory kept ready for the old name go and makes the new one ready.
+    pub fn set_staging(&self, staging: Option<String>) -> Result<(), String> {
+        if let Some(name) = &staging {
+            check_staging_name(name)?;
+        }
+        *self
+            .shared
+            .staging
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(staging.map(String::into_bytes));
+        self.shared.poke();
+        Ok(())
+    }
+
     /// Whether the keeper still runs (it stops on its own when its root is moved or removed).
     pub fn running(&self) -> bool {
         self.shared.running.load(Ordering::SeqCst)
@@ -510,6 +581,36 @@ impl Keeper {
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .0;
         }
+    }
+
+    /// What a registration waits on after it let go of the registry's locks.
+    fn settler(&self) -> Arc<Shared> {
+        Arc::clone(&self.shared)
+    }
+
+    /// [`Self::hold`] from another thread, until the returned value is dropped: it borrows nothing, so the keeper can
+    /// be held while it is reached through its registry.
+    #[allow(dead_code)] // for tests
+    pub fn paused(&self) -> Paused {
+        let shared = Arc::clone(&self.shared);
+        let (release, released) = std::sync::mpsc::channel::<()>();
+        let (held, holding) = std::sync::mpsc::channel::<()>();
+        let thread = std::thread::spawn(move || {
+            let _records = shared.records();
+            let _ = held.send(());
+            let _ = released.recv();
+        });
+        let _ = holding.recv();
+        Paused {
+            release: Some(release),
+            thread: Some(thread),
+        }
+    }
+
+    /// How many settles were asked of the keeper so far.
+    #[allow(dead_code)] // for tests
+    pub fn settles_asked(&self) -> u64 {
+        self.shared.settle_asked.load(Ordering::SeqCst)
     }
 
     /// Pauses the keeper until the guard is dropped: changes meanwhile wait in the inotify queue.
@@ -662,7 +763,12 @@ struct Restore {
 enum From {
     /// In a staging directory; `landing` when it was a staged file leaving a `<2 hex>` subdirectory (not a move
     /// inside the staging directory), with its identity when the keeper saw one.
-    Staging { landing: bool, identity: Option<Identity> },
+    Staging {
+        landing: bool,
+        identity: Option<Identity>,
+        /// Seen in the registered staging directory, so the write was this root's.
+        registered: bool,
+    },
     /// A staged file already placed in the tree by its identity.
     Placed,
     /// Mutagen's cross-device copy, seen created and closed in the target directory during a cycle.
@@ -765,6 +871,22 @@ mod engine {
         Ok(())
     }
 
+    /// Whether the directory `dir` holds exactly the 256 `<2 hex>` subdirectories of one kept ready, each empty.
+    fn only_ready_subdirs(dir: RawFd) -> bool {
+        let Ok(names) = all_names(dir) else { return false };
+        names.len() == 256
+            && names.iter().all(|name| {
+                let bytes = name.as_bytes();
+                bytes.len() == 2
+                    && bytes.iter().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(b))
+                    && c_name(bytes)
+                        .ok()
+                        .and_then(|leaf| open_dir_at(dir, &leaf).ok())
+                        .and_then(|sub| all_names(sub.as_raw_fd()).ok())
+                        .is_some_and(|inside| inside.is_empty())
+            })
+    }
+
     pub fn new_inotify() -> io::Result<OwnedFd> {
         // SAFETY: inotify_init1 takes no pointers; a new descriptor that nothing else owns is returned.
         let raw = unsafe { libc::inotify_init1(libc::IN_NONBLOCK | libc::IN_CLOEXEC) };
@@ -807,9 +929,17 @@ mod engine {
         modes_dir: Option<PathBuf>,
         watches: HashMap<i32, Watch>,
         tree_watches: usize,
-        /// This root's staging directories in the parent, by the parent's own events (whether or not a watch on them
-        /// took): Mutagen is in a cycle while one exists.
+        /// The staging directories in the parent, by the parent's own events (whether or not a watch on them took).
         staging_names: HashSet<Vec<u8>>,
+        /// Staging directories in which nothing has been seen since they appeared: the one this keeper keeps ready,
+        /// one an earlier keeper left empty, a neighbouring root's kept ready. None of them is a cycle; Mutagen's first
+        /// act in a cycle (`storage<n>`, or a `<2 hex>` subdirectory) takes its directory out of here. Mutagen is in
+        /// a cycle while a staging directory exists that is not idle.
+        idle: HashSet<Vec<u8>>,
+        /// The staging directory this keeper made ready: its name, device, inode and change time once its
+        /// subdirectories were made. Removed when the keeper stops only while it is that directory, unchanged: Mutagen's
+        /// first `storage<n>` changes it.
+        made: Option<(Vec<u8>, u64, u64, (i64, u32))>,
         /// Source halves of renames still waiting for their destination half, by cookie.
         from: HashMap<u32, From>,
         /// The files seen in a staging directory during the current cycle, by watch and name, and by identity. A file
@@ -839,6 +969,7 @@ mod engine {
     impl Drop for Engine {
         fn drop(&mut self) {
             self.release_tree_watches(self.tree_watches);
+            self.remove_made();
         }
     }
 
@@ -857,6 +988,8 @@ mod engine {
                 watches: HashMap::new(),
                 tree_watches: 0,
                 staging_names: HashSet::new(),
+                idle: HashSet::new(),
+                made: None,
                 from: HashMap::new(),
                 staged: HashMap::new(),
                 staged_ids: HashMap::new(),
@@ -928,6 +1061,14 @@ mod engine {
                     break;
                 }
                 let asked = shared.settle_asked.load(Ordering::SeqCst);
+                let retarget = shared
+                    .staging
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .take();
+                if let Some(staging) = retarget {
+                    self.retarget(staging);
+                }
                 let settling = asked > *shared.settled.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
                 let outcome = {
                     let mut records = shared.records();
@@ -991,6 +1132,7 @@ mod engine {
                 self.watches.clear();
                 self.release_tree_watches(self.tree_watches);
                 self.staging_names.clear();
+                self.idle.clear();
                 self.from.clear();
                 self.forget_staged();
                 self.copies.clear();
@@ -1001,6 +1143,7 @@ mod engine {
                 self.add_watch(&parent, PARENT_EVENTS, Watch::Parent)
                     .map_err(|error| format!("cannot watch the root's parent: {error}"))?;
                 self.scan_for_staging(&parent);
+                self.make_ready();
                 records.clear();
                 let root = self
                     .root
@@ -1113,7 +1256,8 @@ mod engine {
             self.placed.clear();
         }
 
-        /// Whether `name` in the parent is a staging directory of this root's.
+        /// Whether `name` in the parent is a staging directory of this root's: the registered one, or with none
+        /// registered any Mutagen staging directory.
         fn ours(&self, name: &[u8]) -> bool {
             match &self.staging {
                 Some(staging) => name == staging.as_slice(),
@@ -1121,8 +1265,130 @@ mod engine {
             }
         }
 
+        fn registered(&self, top: &[u8]) -> bool {
+            self.staging.as_deref() == Some(top)
+        }
+
         fn in_cycle(&self) -> bool {
-            !self.staging_names.is_empty()
+            self.staging_names.iter().any(|name| !self.idle.contains(name))
+        }
+
+        /// Takes a new registered staging name (a re-created session's) without a new walk: the directory kept ready
+        /// for the old one goes, and the new one is made ready.
+        fn retarget(&mut self, staging: Option<Vec<u8>>) {
+            if staging == self.staging {
+                return;
+            }
+            self.remove_made();
+            // The old name (or, with none, every staging directory) is no longer this root's: their parent events are
+            // not followed from here on.
+            match self.staging.take() {
+                Some(old) => {
+                    self.staging_names.remove(&old);
+                    self.idle.remove(&old);
+                }
+                None => {
+                    self.staging_names.retain(|name| Some(name) == staging.as_ref());
+                    self.idle.retain(|name| Some(name) == staging.as_ref());
+                }
+            }
+            self.staging = staging;
+            // Staging directories followed until now that are not this root's any more: their watches go, and what was
+            // seen staged in them, so none of their files pairs.
+            let gone: Vec<i32> = self
+                .watches
+                .iter()
+                .filter(|(_, watch)| match watch {
+                    Watch::Staging { path } => !self.ours(path.split(|b| *b == b'/').next().unwrap_or(path)),
+                    _ => false,
+                })
+                .map(|(wd, _)| *wd)
+                .collect();
+            for wd in gone {
+                self.watches.remove(&wd);
+                // SAFETY: removing a watch takes no pointers; one already gone is an error that changes nothing.
+                unsafe { libc::inotify_rm_watch(self.inotify.as_raw_fd(), wd) };
+                let keys: Vec<(i32, Vec<u8>)> = self.staged.keys().filter(|(w, _)| *w == wd).cloned().collect();
+                for key in keys {
+                    let identity = self.unstage(&key);
+                    self.drop_staged(identity);
+                }
+            }
+            // One already followed under no name is watched again as the registered one, all of its subdirectories.
+            if let Some(name) = self.staging.clone().filter(|name| self.staging_names.contains(name)) {
+                self.watch_staging(name, 0);
+            }
+            self.make_ready();
+        }
+
+        /// Makes the registered staging directory (0700, as Mutagen makes it) and its 256 `<2 hex>` subdirectories,
+        /// then watches them. One already there is watched as it is: this keeper's own from before (same inode), or
+        /// Mutagen's cycle starting. Without a registered name nothing is made.
+        fn make_ready(&mut self) {
+            let Some(name) = self.staging.clone() else { return };
+            if self.staging_names.contains(&name) || self.shared.stop.load(Ordering::SeqCst) {
+                return;
+            }
+            let (Ok(parent), Ok(c_leaf)) = (self.parent_fd(), c_name(&name)) else {
+                return;
+            };
+            // SAFETY: `c_leaf` is NUL-terminated and outlives the call; the parent descriptor is open.
+            let made_now = unsafe { libc::mkdirat(parent.as_raw_fd(), c_leaf.as_ptr(), 0o700) } == 0;
+            if made_now {
+                let Ok(dir) = open_dir_at(parent.as_raw_fd(), &c_leaf) else {
+                    return;
+                };
+                for byte in 0..=u8::MAX {
+                    let sub = c_name(format!("{byte:02x}").as_bytes()).expect("no NUL");
+                    // SAFETY: `sub` is NUL-terminated and outlives the call; `dir` is open.
+                    unsafe { libc::mkdirat(dir.as_raw_fd(), sub.as_ptr(), 0o700) };
+                }
+                self.made = facts_at(parent.as_raw_fd(), &c_leaf)
+                    .filter(Facts::directory)
+                    .map(|facts| (name.clone(), facts.dev, facts.ino, facts.ctime));
+            } else if !facts_at(parent.as_raw_fd(), &c_leaf).is_some_and(|facts| facts.directory()) {
+                return;
+            }
+            self.staging_names.insert(name.clone());
+            self.idle.insert(name.clone());
+            self.watch_staging(name, 0);
+        }
+
+        /// Removes the staging directory this keeper made ready, while it is still that directory and unchanged: each
+        /// `<2 hex>` subdirectory, then the directory. Anything Mutagen did there leaves it to Mutagen.
+        fn remove_made(&mut self) {
+            let Some((name, dev, ino, ctime)) = self.made.take() else {
+                return;
+            };
+            let (Ok(parent), Ok(c_leaf)) = (self.parent_fd(), c_name(&name)) else {
+                return;
+            };
+            let unchanged = facts_at(parent.as_raw_fd(), &c_leaf)
+                .is_some_and(|facts| facts.directory() && (facts.dev, facts.ino, facts.ctime) == (dev, ino, ctime));
+            if !unchanged {
+                return;
+            }
+            let Ok(dir) = open_dir_at(parent.as_raw_fd(), &c_leaf) else {
+                return;
+            };
+            if !only_ready_subdirs(dir.as_raw_fd()) {
+                return;
+            }
+            {
+                for byte in 0..=u8::MAX {
+                    let sub = c_name(format!("{byte:02x}").as_bytes()).expect("no NUL");
+                    // SAFETY: `sub` is NUL-terminated and outlives the call; `dir` is open.
+                    unsafe { libc::unlinkat(dir.as_raw_fd(), sub.as_ptr(), libc::AT_REMOVEDIR) };
+                }
+            }
+            // SAFETY: `c_leaf` is NUL-terminated and outlives the call; the parent descriptor is open.
+            unsafe { libc::unlinkat(parent.as_raw_fd(), c_leaf.as_ptr(), libc::AT_REMOVEDIR) };
+        }
+
+        /// Something happened in the staging directory at `path`: a cycle runs there.
+        fn staging_used(&mut self, path: &[u8]) {
+            let top = path.split(|b| *b == b'/').next().unwrap_or(path);
+            self.idle.remove(top);
         }
 
         /// Opens the staging directory at `path` (from the root's parent), one name at a time, never through a link.
@@ -1144,6 +1410,8 @@ mod engine {
                 let Ok(c_leaf) = c_name(&name) else { continue };
                 if self.ours(&name) && facts_at(parent.as_raw_fd(), &c_leaf).is_some_and(|f| f.directory()) {
                     self.staging_names.insert(name.clone());
+                    // Idle until the walk below finds a file in it.
+                    self.idle.insert(name.clone());
                     self.watch_staging(name, 0);
                 }
             }
@@ -1166,18 +1434,37 @@ mod engine {
             let Ok(names) = all_names(dir.as_raw_fd()) else {
                 return;
             };
+            // Found empty, or holding exactly the 256 empty subdirectories of a directory kept ready, it is idle;
+            // anything else is what Mutagen leaves mid-cycle (a `<2 hex>` it made, a staged file).
+            if depth == 0 && !names.is_empty() && !only_ready_subdirs(dir.as_raw_fd()) {
+                self.staging_used(&path);
+            }
             for name in names {
                 let Ok(c_leaf) = c_name(name.as_bytes()) else { continue };
                 let Some(facts) = facts_at(dir.as_raw_fd(), &c_leaf) else {
                     continue;
                 };
                 if facts.directory() {
+                    // A neighbouring root's directory kept ready holds 256 empty subdirectories: they are watched
+                    // only once something is in them, or when they are made during a cycle.
+                    let empty = || {
+                        open_dir_at(dir.as_raw_fd(), &c_leaf)
+                            .ok()
+                            .and_then(|sub| all_names(sub.as_raw_fd()).ok())
+                            .is_some_and(|names| names.is_empty())
+                    };
+                    if depth == 0 && !self.registered(&path) && empty() {
+                        continue;
+                    }
                     let mut sub = path.clone();
                     sub.push(b'/');
                     sub.extend_from_slice(name.as_bytes());
                     self.watch_staging(sub, depth + 1);
-                } else if let Some(identity) = facts.regular().then(|| facts.identity()).flatten() {
-                    self.note_staged(wd, name.as_bytes(), identity);
+                } else {
+                    self.staging_used(&path);
+                    if let Some(identity) = facts.regular().then(|| facts.identity()).flatten() {
+                        self.note_staged(wd, name.as_bytes(), identity);
+                    }
                 }
             }
         }
@@ -1406,19 +1693,36 @@ mod engine {
                     if moved_to {
                         self.landed_outside(records, event.cookie);
                     }
+                    // The keeper holds the root open, so a removed root sends its own watch no IN_DELETE_SELF until
+                    // that descriptor closes: the parent's event for the root's name is the one that comes.
+                    let root_name = Path::new(&self.root_text).file_name().map(|name| name.as_bytes());
+                    if is_dir
+                        && root_name == Some(event.name.as_slice())
+                        && event.mask & (libc::IN_DELETE | libc::IN_MOVED_FROM) != 0
+                    {
+                        return Err("the root was moved or removed".to_owned());
+                    }
                     if !(is_dir && self.ours(&event.name)) {
                         return Ok(());
                     }
                     if event.mask & (libc::IN_DELETE | libc::IN_MOVED_FROM) != 0 {
                         self.staging_names.remove(&event.name);
+                        self.idle.remove(&event.name);
+                        if self.made.as_ref().is_some_and(|made| made.0 == event.name) {
+                            self.made = None;
+                        }
                         if !self.in_cycle() {
                             // No cycle runs: what was staged has landed or is gone, and its inodes may be used again.
                             self.forget_staged();
                             self.copies.clear();
                         }
+                        self.make_ready();
                     }
-                    if event.mask & (libc::IN_CREATE | libc::IN_MOVED_TO) != 0 {
-                        self.staging_names.insert(event.name.clone());
+                    // One already known (the keeper's own, made ready) is watched already.
+                    if event.mask & (libc::IN_CREATE | libc::IN_MOVED_TO) != 0
+                        && self.staging_names.insert(event.name.clone())
+                    {
+                        self.idle.insert(event.name.clone());
                         self.watch_staging(event.name.clone(), 0);
                     }
                 }
@@ -1430,13 +1734,36 @@ mod engine {
 
         fn staging_event(&mut self, records: &mut BTreeMap<String, u32>, path: &[u8], event: &Event, is_dir: bool) {
             let key = (event.wd, event.name.clone());
+            // Mutagen's cycle starts with a file (`storage<n>`); a subdirectory made is no cycle by itself (a neighbour
+            // making its ready directory while this keeper watches it).
+            if !is_dir {
+                self.staging_used(path);
+            }
             let landing = path.contains(&b'/');
+            // A neighbour's directory first seen while it was still being made ready looked used; once it holds
+            // exactly the 256 empty subdirectories of one kept ready, it is idle again.
+            if is_dir
+                && !landing
+                && event.mask & libc::IN_CREATE != 0
+                && !self.registered(path)
+                && !self.idle.contains(path)
+                && self
+                    .open_staging(path)
+                    .is_some_and(|dir| only_ready_subdirs(dir.as_raw_fd()))
+            {
+                self.idle.insert(path.to_vec());
+            }
             if event.mask & libc::IN_MOVED_FROM != 0 && !is_dir {
                 let identity = self.unstage(&key);
                 let from = if identity.is_some_and(|identity| self.placed.remove(&identity)) {
                     From::Placed
                 } else {
-                    From::Staging { landing, identity }
+                    let top = path.split(|b| *b == b'/').next().unwrap_or(path);
+                    From::Staging {
+                        landing,
+                        identity,
+                        registered: self.registered(top),
+                    }
                 };
                 self.from.insert(event.cookie, from);
             }
@@ -1452,15 +1779,17 @@ mod engine {
                         ..
                     }) if !is_dir => self.note_staged(event.wd, &event.name, identity),
                     Some(From::Tree { rel, dir }) => self.left_tree(records, &rel, dir),
+                    // Mutagen renames its finished `storage<n>` into a `<2 hex>` subdirectory, often before its
+                    // creation could be looked at: the identity is taken where it landed, while it is still there.
+                    _ if !is_dir => {
+                        if let Some(identity) = self.staged_identity(path, &event.name) {
+                            self.note_staged(event.wd, &event.name, identity);
+                        }
+                    }
                     _ => {}
                 }
             } else if event.mask & libc::IN_CREATE != 0 && !is_dir {
-                let identity = self
-                    .open_staging(path)
-                    .and_then(|dir| facts_at(dir.as_raw_fd(), &c_name(&event.name).ok()?))
-                    .filter(Facts::regular)
-                    .and_then(|facts| facts.identity());
-                if let Some(identity) = identity {
+                if let Some(identity) = self.staged_identity(path, &event.name) {
                     self.note_staged(event.wd, &event.name, identity);
                 }
             }
@@ -1470,6 +1799,14 @@ mod engine {
                 sub.extend_from_slice(&event.name);
                 self.watch_staging(sub, path.split(|b| *b == b'/').count());
             }
+        }
+
+        /// The identity of the regular file `name` in the staging directory at `path`, if it is still there.
+        fn staged_identity(&self, path: &[u8], name: &[u8]) -> Option<Identity> {
+            self.open_staging(path)
+                .and_then(|dir| facts_at(dir.as_raw_fd(), &c_name(name).ok()?))
+                .filter(Facts::regular)
+                .and_then(|facts| facts.identity())
         }
 
         /// A rename's destination half outside the tree: a tree path that went there has left the tree, and a staged
@@ -1758,15 +2095,19 @@ mod engine {
         }
 
         /// Source halves that never met their destination: a tree path moved out of the tree; a staged file that left
-        /// for a directory not watched (a Mutagen write left as it was, counted when the registration names this
-        /// root's staging directory, since otherwise it may have been another root's).
+        /// for a directory not watched (a Mutagen write left as it was, counted when it left the registered staging
+        /// directory, since one in another may have been another root's).
         fn settle_unpaired(&mut self, records: &mut BTreeMap<String, u32>) {
             for (_, from) in std::mem::take(&mut self.from) {
                 match from {
                     From::Tree { rel, dir } => self.left_tree(records, &rel, dir),
-                    From::Staging { landing, identity } => {
+                    From::Staging {
+                        landing,
+                        identity,
+                        registered,
+                    } => {
                         self.drop_staged(identity);
-                        if landing && self.staging.is_some() {
+                        if landing && registered {
                             self.left(true, None);
                         }
                     }
@@ -1920,6 +2261,10 @@ pub struct Keepers {
     /// Held across reading or writing a registration and acting on it, so a registration and a tick never cross.
     registry: Mutex<()>,
     slots: Mutex<BTreeMap<String, Slot>>,
+    /// How long a registration waits for the keeper to settle before it answers.
+    register_settle: Duration,
+    /// Set by [`Self::stop_all`]: no keeper starts afterwards (`apply` checks it).
+    stopped: AtomicBool,
 }
 
 impl Keepers {
@@ -1930,7 +2275,16 @@ impl Keepers {
             run_key: run_key.to_owned(),
             registry: Mutex::new(()),
             slots: Mutex::new(BTreeMap::new()),
+            register_settle: REGISTER_SETTLE,
+            stopped: AtomicBool::new(false),
         }
+    }
+
+    /// The same keepers with another wait for a registration's settle.
+    #[allow(dead_code)] // for tests
+    pub fn with_register_settle(mut self, cap: Duration) -> Keepers {
+        self.register_settle = cap;
+        self
     }
 
     /// The server's name, as the lines use it.
@@ -1959,20 +2313,20 @@ impl Keepers {
 
     /// Registers (`on`) or unregisters a root. A registration is kept on disk and in effect until it is turned off;
     /// the refusal is the line a person reads when the root cannot be kept.
-    pub fn set(&self, root: &str, patterns: Vec<String>, staging_name: &str, on: bool) -> Result<(), String> {
+    pub fn set(&self, root: &str, patterns: Vec<String>, staging_name: &str, on: bool) -> Result<bool, String> {
         if patterns.len() > MAX_PATTERNS || patterns.iter().any(|pattern| pattern.len() > MAX_PATTERN_BYTES) {
             return Err(format!(
                 "at most {MAX_PATTERNS} ignore patterns of at most {MAX_PATTERN_BYTES} bytes each"
             ));
         }
-        let staging_name = match staging_name {
+        let mut staging_name = match staging_name {
             "" => None,
             name => {
                 check_staging_name(name)?;
                 Some(name.to_owned())
             }
         };
-        let _registry = self.registry();
+        let registry = self.registry();
         if !on {
             let canonical = match super::root(root) {
                 Ok(held) => held.canonical,
@@ -2002,9 +2356,14 @@ impl Keepers {
                 "modes-keeper",
                 &format!("root={} off", super::audit_word(&canonical)),
             );
-            return Ok(());
+            return Ok(true);
         }
         let canonical = super::root(root)?.canonical;
+        // A registration naming no staging directory (the laptop does not know the session's yet) keeps the one the
+        // root has: back to no name, the keeper would follow every staging directory beside the root.
+        if staging_name.is_none() {
+            staging_name = self.registered_name(&canonical);
+        }
         let registration = Registration {
             root: canonical.clone(),
             patterns,
@@ -2020,11 +2379,53 @@ impl Keepers {
         let opened = agent::private_fs::open_dir(&dir).map_err(|error| error.to_string())?;
         agent::private_fs::publish_private_file(&opened, std::ffi::OsStr::new("watch"), &bytes)
             .map_err(|error| error.to_string())?;
-        self.apply(&registration);
-        match self.slots().get(&canonical) {
-            Some(Slot::NotKept { warning }) => Err(warning.text.clone()),
-            _ => Ok(()),
-        }
+        // The answer waits, with no lock held while it waits (the daemon's idle check, Hello and resume tick take
+        // them), until the keeper has looked at every change made before it: after a pattern change, its first walk.
+        // The laptop registers changed patterns before it creates the session they are for and asks again while the
+        // answer is "settling", so that walk sees no sync write.
+        let deadline = Instant::now() + self.register_settle;
+        let mut registry = Some(registry);
+        let mut first = true;
+        let settler = loop {
+            // Under the registry lock: a daemon that stopped its keepers starts none; and each try after the first
+            // acts only while the registration on disk is still this one (not turned off, nor replaced by a newer
+            // one, whose own call acts on it). A read that failed for another reason than the file being gone (out
+            // of descriptors) tells nothing, and the wait goes on.
+            if self.stopped.load(Ordering::SeqCst)
+                || !first
+                    && match agent::private_fs::read_private_nofollow_capped(
+                        &dir.join("watch"),
+                        MAX_REGISTRATION_BYTES as u64,
+                    ) {
+                        Ok(text) => text.as_bytes() != bytes.as_slice(),
+                        Err(error) => error.kind() == io::ErrorKind::NotFound,
+                    }
+            {
+                return Ok(false);
+            }
+            first = false;
+            self.apply(&registration);
+            match self.slots().get(&canonical) {
+                Some(Slot::NotKept { warning }) => return Err(warning.text.clone()),
+                Some(Slot::Kept { keeper, .. }) => break keeper.settler(),
+                None => return Ok(true),
+                // Another daemon still holds the root's keeper; it lets the root go at its next tick, when it reads
+                // this registration. The lock is tried again while the wait lasts.
+                Some(Slot::Elsewhere { .. }) => {}
+            }
+            drop(registry.take());
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                return Ok(false);
+            }
+            std::thread::sleep(left.min(ELSEWHERE_RETRY));
+            registry = Some(self.registry());
+        };
+        drop(registry);
+        Ok(settle_within(
+            &settler,
+            deadline.saturating_duration_since(Instant::now()),
+        ))
     }
 
     /// Brings this daemon in line with the registrations on disk: keeps the roots it registered (or that name no
@@ -2054,6 +2455,13 @@ impl Keepers {
         }
     }
 
+    /// The staging name the root's registration on disk carries.
+    fn registered_name(&self, canonical: &str) -> Option<String> {
+        let path = sync_dir(&self.state, canonical).join("watch");
+        let text = agent::private_fs::read_private_nofollow_capped(&path, MAX_REGISTRATION_BYTES as u64).ok()?;
+        serde_json::from_str::<Registration>(&text).ok()?.staging_name
+    }
+
     fn registrations(&self) -> Vec<Registration> {
         let Ok(entries) = std::fs::read_dir(self.state.join("sync")) else {
             return Vec::new();
@@ -2075,6 +2483,11 @@ impl Keepers {
     }
 
     fn apply(&self, registration: &Registration) {
+        // A daemon that stopped its keepers starts none, whether from a registration or a tick that was already on
+        // its way (both act under the registry lock, which `stop_all` takes).
+        if self.stopped.load(Ordering::SeqCst) {
+            return;
+        }
         let root = &registration.root;
         let mut slots = self.slots();
         let previous = slots.remove(root);
@@ -2106,6 +2519,21 @@ impl Keepers {
                 registration: kept,
                 lock,
             }) => {
+                if keeper.running()
+                    && kept.patterns == registration.patterns
+                    && kept.staging_name != registration.staging_name
+                    && keeper.set_staging(registration.staging_name.clone()).is_ok()
+                {
+                    slots.insert(
+                        root.clone(),
+                        Slot::Kept {
+                            keeper,
+                            registration: registration.clone(),
+                            lock,
+                        },
+                    );
+                    return;
+                }
                 if keeper.running() && kept.same_keeping(registration) {
                     slots.insert(
                         root.clone(),
@@ -2290,6 +2718,10 @@ impl Keepers {
 
     /// Stops every keeper and lets their locks go; the registrations stay for the next daemon.
     pub fn stop_all(&self) {
+        // Under the registry lock, as a registration acts: one waiting for another daemon to let a root go sees the
+        // flag before its next try and starts nothing.
+        let _registry = self.registry();
+        self.stopped.store(true, Ordering::SeqCst);
         let stopped = std::mem::take(&mut *self.slots());
         drop(stopped);
     }
@@ -2298,6 +2730,37 @@ impl Keepers {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A keeper that stopped before it looked at the changes asked about has not settled them.
+    #[test]
+    fn a_keeper_that_stopped_before_settling_is_not_settled() {
+        let base = std::env::temp_dir().join(format!("m6-unit-stopped-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(base.join("project")).unwrap();
+        let base = std::fs::canonicalize(&base).unwrap();
+        let options = Options {
+            umask: 0o022,
+            host: "example-host".into(),
+            watch_limit: None,
+            watches: Default::default(),
+        };
+        let keeper = Keeper::start(
+            base.join("project").to_str().unwrap(),
+            None,
+            Box::new(|_: &str, _: bool| false),
+            options,
+            None,
+        )
+        .unwrap();
+        keeper.settle();
+        let paused = keeper.paused();
+        keeper.shared.running.store(false, Ordering::SeqCst);
+        assert!(!settle_within(&keeper.shared, Duration::from_secs(1)));
+        keeper.shared.running.store(true, Ordering::SeqCst);
+        drop(paused);
+        drop(keeper);
+        let _ = std::fs::remove_dir_all(&base);
+    }
 
     fn facts(mode: u32, nlink: u32, btime: Option<(i64, u32)>) -> Facts {
         Facts {
@@ -2308,6 +2771,27 @@ mod tests {
             ctime: (5, 6),
             btime,
         }
+    }
+
+    #[test]
+    fn a_name_with_control_characters_is_escaped_in_the_counted_line() {
+        let mut status = Status::default();
+        status.left(true, Some("plain.txt"));
+        status.left(true, Some("\u{1b}]52;c;Zm9v\u{7}"));
+        status.left(true, Some("bidi\u{202e}txt.exe"));
+        let line = counted_warning(&status, "server", "/srv/p\u{1b}[2J").unwrap();
+        assert!(
+            !line.text.chars().any(|c| c.is_control() || c == '\u{202e}'),
+            "{:?}",
+            line.text
+        );
+        assert!(line.text.contains("plain.txt"), "{}", line.text);
+        assert!(line.text.contains("\\u{1b}]52;c;Zm9v\\u{7}"), "{}", line.text);
+        assert!(line.text.contains("\\u{202e}"), "{}", line.text);
+        // The names themselves go to the laptop unchanged, as data.
+        assert!(line.paths.contains(&"\u{1b}]52;c;Zm9v\u{7}".to_owned()));
+        let refused = not_kept("server", "/srv/\u{1b}x", "gone");
+        assert!(!refused.chars().any(|c| c.is_control()), "{refused:?}");
     }
 
     #[test]

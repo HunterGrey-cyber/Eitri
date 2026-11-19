@@ -161,3 +161,62 @@ fn recovery_inventory_needs_live_sidecars_and_no_daemon_lock() {
     }
     cleanup.sidecar.wait().unwrap();
 }
+
+/// A live terminal host's record needs a checker that knows terminal hosts: an older helper, which ignores `th-*.pid`
+/// and refuses the `--terminals` flag the step then passes, cannot clear it.
+#[test]
+fn uninstall_needs_a_terminal_aware_checker_for_a_live_terminal_host() {
+    let root = std::env::temp_dir().join(format!("uninstall-terminal-{}", std::process::id()));
+    let host = Command::new("sleep").arg("3600").stdin(Stdio::null()).spawn().unwrap();
+    let cleanup = Cleanup { root, sidecar: host };
+    let data = cleanup.root.join("data/eitri-server");
+    let state = cleanup.root.join("state/eitri-server");
+    let run = state.join("run/i-0123456789abcdef");
+    let helper = data.join("0.3.0-abcdef0/bin/eitri-server");
+    agent::private_fs::create_private_dir_all(&run, &cleanup.root).unwrap();
+    agent::private_fs::create_private_dir_all(helper.parent().unwrap(), &cleanup.root).unwrap();
+    let pid = cleanup.sidecar.id();
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).unwrap();
+    let start: u64 = stat[stat.rfind(')').unwrap() + 1..]
+        .split_whitespace()
+        .nth(19)
+        .unwrap()
+        .parse()
+        .unwrap();
+    let id = "0123456789abcdef0123456789abcdef";
+    let record = run.join(format!("th-{id}.pid"));
+    let boot = std::fs::read_to_string("/proc/sys/kernel/random/boot_id").unwrap();
+    agent::private_fs::write_private(
+        &record,
+        &serde_json::to_vec(
+            &serde_json::json!({"pid": pid, "start_time": start, "boot_id": boot.trim(), "socket": ""}),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    // A helper from before terminal hosts: it knows no `--terminals` and sees no terminal records.
+    std::fs::write(
+        &helper,
+        "#!/bin/sh\ntest \"$1\" = check-sidecars && test $# = 2 && exit 0\nexit 1\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&helper, std::os::unix::fs::PermissionsExt::from_mode(0o700)).unwrap();
+    let output = uninstall(&data, &state);
+    assert_eq!(output.status.code(), Some(76), "{:?}", output);
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("recorded sidecars or terminals may still run"),
+        "{output:?}"
+    );
+    assert!(record.exists() && helper.exists());
+    // This helper knows them, and refuses too, naming the terminal.
+    std::fs::remove_file(&helper).unwrap();
+    std::fs::copy(env!("CARGO_BIN_EXE_eitri-server"), &helper).unwrap();
+    let output = uninstall(&data, &state);
+    assert_eq!(output.status.code(), Some(76), "{:?}", output);
+    let diagnostic = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        diagnostic.contains(&format!("run i-0123456789abcdef terminal {id} pid {pid} alive")),
+        "{diagnostic}"
+    );
+    assert!(record.exists());
+}

@@ -30,6 +30,10 @@ const AGENT_UI_HTML: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/.
 static PANEL_DOCUMENT: std::sync::LazyLock<PanelDocument> =
     std::sync::LazyLock::new(|| PanelDocument::new(AGENT_UI_HTML));
 
+pub(crate) fn panel_document() -> &'static PanelDocument {
+    &PANEL_DOCUMENT
+}
+
 /// How opaque a chat page's view is until its page has painted. WebKit's first buffer is drawn before
 /// the page has anything in it, black under any theme. Zero opacity makes GTK skip the widget's
 /// snapshot, which is where WebKit acknowledges a frame to its web process, so the web process would
@@ -759,7 +763,7 @@ fn panel_content_security_policy() -> &'static str {
 /// not absent) whose proxy is the "discard" port on loopback, so any request that gets past the CSP
 /// above and the sanitizer dies at a closed port. **This is a backstop, not the boundary** --
 /// the CSP is.
-const PANEL_NETWORK_PROXY_URI: &str = "http://127.0.0.1:9";
+pub(crate) const PANEL_NETWORK_PROXY_URI: &str = "http://127.0.0.1:9";
 
 /// Installs `app.reload-agent-panel`, which the top bar's `↻` and `prefix r`
 /// fire, for the panel `handle` owns.
@@ -1473,8 +1477,11 @@ for (const first of [new Error('first'), undefined, null, false, 0]) {
     /// Every chat page comes from `build_chat_page`: in the code of `shell/src` (comments, literals and
     /// test modules blanked), outside the exempt page files, a `WebView` is built, a content manager made
     /// and a message handler registered once each inside `build_chat_page`'s body. The private diagram
-    /// renderer has exactly one separate view, content manager and readiness message handler (`ready`/`failed`). Any other
-    /// constructor would be a page without the policy, or with a handler that answers for some other view.
+    /// renderer has exactly one separate view, content manager and readiness message handler (`ready`/`failed`). The
+    /// "Open on a host…" chooser (`project_start/remote.rs`) has one more, built with the panel's own content security
+    /// policy and blackhole proxy on an ephemeral session, its navigation held to its entry page, downloads cancelled
+    /// and no new windows, whose one handler takes only that page's answers. Any other constructor would be a page
+    /// without the policy, or with a handler that answers for some other view.
     #[test]
     fn every_chat_page_is_built_by_the_one_constructor() {
         use eitri_core::source_scan as scan;
@@ -1513,6 +1520,13 @@ for (const first of [new Error('first'), undefined, null, false, 0]) {
             ("shell/src/diagram_renderer.rs", "WebView::builder()", 1),
             ("shell/src/diagram_renderer.rs", "UserContentManager::new()", 1),
             ("shell/src/diagram_renderer.rs", "register_script_message_handler", 1),
+            ("shell/src/project_start/remote.rs", "WebView::builder()", 1),
+            ("shell/src/project_start/remote.rs", "UserContentManager::new()", 1),
+            (
+                "shell/src/project_start/remote.rs",
+                "register_script_message_handler",
+                1,
+            ),
         ]
         .into_iter()
         .map(|(path, maker, count)| (path.to_string(), maker, count))

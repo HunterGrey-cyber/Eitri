@@ -107,6 +107,7 @@ pub(crate) fn refusal_text(refused: DetachRefused) -> String {
         DetachRefused::RawTooLong => "the terminal is in the middle of a long sequence; try again".into(),
         DetachRefused::TooDeep => "terminal state too deep to move".into(),
         DetachRefused::NoDescriptor => "no descriptor was left to hand the terminal over".into(),
+        DetachRefused::ServerTerminal => "a terminal on the server does not move to another window yet".into(),
     }
 }
 

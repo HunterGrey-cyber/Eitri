@@ -9,6 +9,7 @@ import { RESUME_FOLLOW_EVENT, USER_SCROLL_EVENT } from "./follow";
 import type { AgentDomainEvent, AgentUiState, EditorCardWire, Hello, ProviderInfo, UsageInfo } from "./types";
 import { WHICH_KEY_DELAY_MS } from "./leader";
 import { REFUSED_ECHO_MS } from "./tabs";
+import { SESSION_ENDED_BEFORE_SEND } from "./syncChip";
 import { EMPTY_PANEL_TABLE } from "./keymap";
 import type { PanelTable } from "./keymap";
 // A namespace import so `h3b` below can spy on
@@ -7765,6 +7766,19 @@ describe("App refused commands", () => {
     expect(container.querySelector(".command-notice")!.textContent).toContain("no active session");
   });
 
+  it("leaves a message refused because its session ended to the host, which puts it back once", () => {
+    const { container } = startedApp();
+    const box = container.querySelector("textarea")!;
+    fireEvent.change(box, { target: { value: "please keep me" } });
+    fireEvent.keyDown(box, { key: "Enter" });
+    const requestId = lastOfType("send_message")!.request_id;
+    expect(box.value).toBe("");
+    dispatch({ kind: "command_result", requestId, ok: false, error: SESSION_ENDED_BEFORE_SEND });
+    dispatch({ kind: "queue_taken", tab: 1, texts: ["please keep me"] });
+    expect(box.value).toBe("please keep me");
+    expect(container.querySelector(".command-notice")!.textContent).toContain(SESSION_ENDED_BEFORE_SEND);
+  });
+
   it("restores the same text a second time when it is refused again", () => {
     const { container } = startedApp();
     for (const _ of [0, 1]) {
@@ -7783,7 +7797,7 @@ describe("App refused commands", () => {
      mirrored back to Rust in the same `draft` envelope ordinary typing sends, which is what this
      panel needs before a later tab switch can bring it back (`shell::tabs::set_draft` keeps
      whatever it is told regardless of how the send that produced it was refused). */
-  it("mirrors a restored refused send back to Rust when the box was left untouched", () => {
+  it.each([false, true])("mirrors the refused text to its draft when the session fails during sync is %s", (failedDuringSync) => {
     fakeClock();
     try {
       const { container } = startedApp();
@@ -7791,8 +7805,13 @@ describe("App refused commands", () => {
       fireEvent.change(box, { target: { value: "please keep me" } });
       fireEvent.keyDown(box, { key: "Enter" });
       const requestId = lastOfType("send_message")!.request_id;
+      if (failedDuringSync) {
+        dispatch({ kind: "send_sync", tab: 1, waiting: true, lines: [] });
+        dispatch({ kind: "tabs", active: 1, tabs: [{ ...LIVE_TAB, state: "failed", failure: "session lost" }] });
+        dispatch({ kind: "send_sync", tab: 1, waiting: false, lines: [] });
+      }
       dispatch({ kind: "command_result", requestId, ok: false, error: "no active session" });
-      expect(box.value).toBe("please keep me");
+      if (!failedDuringSync) expect(box.value).toBe("please keep me");
       expect(lastOfType("draft")).toBeUndefined();
       act(() => vi.advanceTimersByTime(300));
       expect(lastOfType("draft")).toMatchObject({ tab: 1, text: "please keep me" });

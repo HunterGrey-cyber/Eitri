@@ -41,21 +41,38 @@ local function ended(ok, ...)
   return answer('output', inspected(select('#', ...), { ... }))
 end
 
-if args.kind == 'ex' then
-  local ok, result = pcall(api.nvim_exec2, args.code, { output = true })
-  if not ok then
-    return answer('failed', said(result))
+local function run_approved()
+  if args.kind == 'ex' then
+    local ok, result = pcall(api.nvim_exec2, args.code, { output = true })
+    if not ok then
+      return answer('failed', said(result))
+    end
+    return answer('output', result.output)
   end
-  return answer('output', result.output)
+
+  if args.kind == 'lua' then
+    -- loadstring: an nvim built with PUC Lua 5.1 has no `load` of a string.
+    local run, problem = loadstring(args.code, '=eitri-agent')
+    if not run then
+      return answer('failed', said(problem))
+    end
+    return ended(pcall(run))
+  end
+
+  return { failed = 'unknown kind' }
 end
 
-if args.kind == 'lua' then
-  -- loadstring: an nvim built with PUC Lua 5.1 has no `load` of a string.
-  local run, problem = loadstring(args.code, '=eitri-agent')
-  if not run then
-    return answer('failed', said(problem))
-  end
-  return ended(pcall(run))
-end
-
-return { failed = 'unknown kind' }
+if not args.observe_saves then return run_approved() end
+local paths = {}
+local watch = api.nvim_create_autocmd({ 'BufWritePost', 'FileWritePost', 'FileAppendPost' }, {
+  callback = function(event)
+    local path = vim.uv.fs_realpath(event.match) or vim.fn.fnamemodify(event.match, ':p')
+    paths[path] = true
+  end,
+})
+local ok, result = pcall(run_approved)
+pcall(api.nvim_del_autocmd, watch)
+if not ok then result = answer('failed', said(result)) end
+result.saves = vim.tbl_keys(paths)
+table.sort(result.saves)
+return result

@@ -95,7 +95,14 @@ mod remote_sync {
                     unreadable_records: vec![],
                     enabled: true,
                 };
-                Self { base, env }
+                let repo = Self { base, env };
+                repo.patterns(&[]);
+                repo
+            }
+            fn patterns(&self, patterns: &[String]) {
+                let dir = eitri_core::remote_sync::actor::project_dir(&self.env.state_home, &self.env.projects[0]);
+                agent::private_fs::create_private_dir_all(&dir, &self.env.state_home).unwrap();
+                eitri_core::remote_sync::recreate::write_created_patterns(&dir, patterns).unwrap();
             }
             fn invoke(&self, args: &[&str], services: &mut dyn Services) -> (i32, String, String) {
                 invoke(&self.env, &os(args), services, b"")
@@ -138,6 +145,8 @@ mod remote_sync {
             excluded_conflicts: u64,
             connect_error: Option<String>,
             exec_cwd: Option<PathBuf>,
+            exec_args: Vec<OsString>,
+            problems: Vec<eitri_core::remote_sync::engine::Problem>,
             result: Result<i32, String>,
             input: Vec<u8>,
             pauses: usize,
@@ -159,6 +168,8 @@ mod remote_sync {
                     excluded_conflicts: 0,
                     connect_error: None,
                     exec_cwd: None,
+                    exec_args: vec![],
+                    problems: vec![],
                     result: Ok(0),
                     input: vec![],
                     pauses: 0,
@@ -200,6 +211,7 @@ mod remote_sync {
                         server: EntryKind::File,
                     })
                     .collect();
+                status.problems = self.problems.clone();
                 status.excluded_conflicts = self.excluded_conflicts;
                 Ok(status.into())
             }
@@ -246,6 +258,7 @@ mod remote_sync {
             ) -> Result<i32, String> {
                 assert!(cwd.is_absolute());
                 assert!(!args.is_empty());
+                self.exec_args = args.to_vec();
                 self.exec_cwd = Some(cwd.to_owned());
                 self.calls.push("exec".into());
                 input.read_to_end(&mut self.input).unwrap();
@@ -657,6 +670,35 @@ mod remote_sync {
             assert_eq!(fake.exec_cwd, Some(root));
         }
         #[test]
+        fn forwarded_git_runs_in_the_root_itself_with_no_trailing_separator() {
+            // The helper refuses a working directory that is not in normal form, and "/srv/p/" is not.
+            let repo = Repo::new();
+            let root = repo.env.cwd.clone();
+            let mut fake = Fake::default();
+            let (code, _, err) = repo.invoke(&["add", "file"], &mut fake);
+            assert_eq!(code, 0, "{err}");
+            assert_eq!(
+                fake.exec_cwd.as_ref().map(|cwd| cwd.as_os_str()),
+                Some(root.as_os_str())
+            );
+            let mut fake = Fake::default();
+            let (code, _, err) = repo.invoke(&["commit", "-m", "message"], &mut fake);
+            assert_eq!(code, 0, "{err}");
+            assert_eq!(
+                fake.exec_cwd.as_ref().map(|cwd| cwd.as_os_str()),
+                Some(root.as_os_str())
+            );
+            let mut repo = repo;
+            repo.env.cwd = root.join("sub");
+            let mut fake = Fake::default();
+            let (code, _, err) = repo.invoke(&["add", "../file"], &mut fake);
+            assert_eq!(code, 0, "{err}");
+            assert_eq!(
+                fake.exec_cwd.as_ref().map(|cwd| cwd.as_os_str()),
+                Some(root.join("sub").as_os_str())
+            );
+        }
+        #[test]
         fn global_options_before_dash_c_cannot_hide_a_replica_write() {
             let mut repo = Repo::new();
             let root = std::mem::replace(&mut repo.env.cwd, repo.base.clone());
@@ -968,6 +1010,8 @@ mod remote_sync {
                 &["checkout", "--", "file"],
                 &["restore", "file"],
                 &["apply", "--cached"],
+                // gitsigns' stage_hunk: a zero-context patch on stdin.
+                &["apply", "--whitespace=nowarn", "--cached", "--unidiff-zero", "-"],
             ] {
                 assert!(
                     matches!(route(words), Route::Forward { whole_tree: false, .. }),
@@ -1154,6 +1198,275 @@ mod remote_sync {
                 ]
             );
         }
+        #[test]
+        fn forward_refuses_a_problem_above_the_added_path() {
+            use eitri_core::remote_sync::engine::{Problem, Side};
+            let repo = Repo::new();
+            let mut fake = Fake::default();
+            fake.problems.push(Problem {
+                path: "sub".into(),
+                side: Side::Server,
+                text: "disk full\n[remote] \u{1b}[2J".into(),
+            });
+            let (code, _, reason) = repo.invoke(&["add", "--", "sub/file"], &mut fake);
+            assert_eq!(code, 1);
+            assert!(reason.contains("server sync problem at sub: disk full"));
+            assert_eq!(reason.lines().count(), 1);
+            assert!(!reason.contains('\u{1b}'));
+            assert!(reason.contains("eitri host sync exclude <path>"));
+            assert_eq!(fake.calls, ["flush recorded-tree"]);
+        }
+
+        #[test]
+        fn omitted_sync_problems_refuse_even_unrelated_git_paths() {
+            let repo = Repo::new();
+            for listing in [
+                br#"[{"status":"reconciling","successfulCycles":1,"alpha":{"excludedScanProblems":1}}]"#.as_slice(),
+                br#"[{"status":"reconciling","successfulCycles":1,"beta":{"excludedTransitionProblems":1}}]"#
+                    .as_slice(),
+            ] {
+                let mut fake = Fake {
+                    engine_listing: Some(listing),
+                    ..Default::default()
+                };
+                let (code, _, reason) = repo.invoke(&["add", "file"], &mut fake);
+                assert_eq!(code, 1);
+                assert!(reason.contains("more sync problems than Mutagen lists"));
+                assert!(reason.contains("eitri host sync exclude <path>"));
+                assert_eq!(fake.calls, ["flush recorded-tree"]);
+            }
+        }
+
+        #[test]
+        fn pathspec_environment_controls_forwarded_and_local_arguments() {
+            let mut repo = Repo::new();
+            repo.env.git_environment = vec![("GIT_LITERAL_PATHSPECS".into(), "1".into())];
+            let mut fake = Fake::default();
+            assert_eq!(repo.invoke(&["add", "--", "f*"], &mut fake).0, 0);
+            assert_eq!(fake.exec_args, os(&["--literal-pathspecs", "add", "--", "f*"]));
+            let (code, out, _) = repo.invoke(&["ls-files", "--", "f*"], &mut fake);
+            assert_eq!((code, out.as_str()), (0, ""));
+            for (name, flag) in [
+                ("GIT_GLOB_PATHSPECS", "--glob-pathspecs"),
+                ("GIT_NOGLOB_PATHSPECS", "--noglob-pathspecs"),
+                ("GIT_ICASE_PATHSPECS", "--icase-pathspecs"),
+            ] {
+                repo.env.git_environment = vec![(name.into(), "true".into())];
+                assert_eq!(repo.invoke(&["add", "file"], &mut fake).0, 0);
+                assert_eq!(fake.exec_args, os(&[flag, "add", "file"]));
+            }
+            repo.env.git_environment[0].1 = "0x1".into();
+            conflict(&mut fake);
+            assert_eq!(repo.invoke(&["add", "FILE"], &mut fake).0, 1);
+            repo.env.git_environment[0].1 = "false".into();
+            assert_eq!(repo.invoke(&["add", "FILE"], &mut fake).0, 0);
+        }
+
+        #[test]
+        fn forward_refuses_an_explicitly_ignored_path() {
+            let repo = Repo::new();
+            repo.patterns(&["*.tmp".into(), "server-only/".into()]);
+            let mut fake = Fake::default();
+            let (code, _, reason) = repo.invoke(&["add", "--", "sub/file.tmp"], &mut fake);
+            assert_eq!(code, 1);
+            assert!(reason.contains("sub/file.tmp is excluded from sync; git on example-host uses the server's copy"));
+            assert!(reason.contains("run it in a terminal on example-host"));
+            assert_eq!(repo.invoke(&["add", "server-only"], &mut fake).0, 1);
+            assert!(!fake.calls.contains(&"exec".into()));
+        }
+
+        #[test]
+        fn forwarded_reads_can_inspect_excluded_paths() {
+            let repo = Repo::new();
+            std::fs::rename(repo.env.cwd.join(".git"), repo.base.join("history")).unwrap();
+            repo.patterns(&["/private.txt".into()]);
+            let mut fake = Fake::default();
+            for cmd in ["log", "ls-files", "diff"] {
+                assert_eq!(repo.invoke(&[cmd, "--", "private.txt"], &mut fake).0, 0, "{cmd}");
+                assert_eq!(fake.exec_args, os(&[cmd, "--", "private.txt"]));
+            }
+        }
+
+        #[test]
+        fn named_writes_check_git_pathspec_magic_and_case() {
+            let mut repo = Repo::new();
+            repo.patterns(&["/private.txt".into()]);
+            repo.env.cwd.push("sub");
+            let mut fake = Fake::default();
+            for args in [
+                &["add", "--", ":(top,literal)private.txt"][..],
+                &["add", "--", ":(top,icase)PRIVATE.TXT"],
+                &["--icase-pathspecs", "add", "--", "../PRIVATE.TXT"],
+                &["add", "--", ":(top,glob)*.txt"],
+                &["add", "--", ":/!public.txt"],
+            ] {
+                let (code, _, why) = repo.invoke(args, &mut fake);
+                assert_eq!(code, 1, "{args:?}");
+                assert!(why.contains("terminal on example-host"), "{why}");
+            }
+            assert!(fake.exec_args.is_empty());
+            assert_eq!(repo.invoke(&["add", "--", ":(top,literal)public.txt"], &mut fake).0, 0);
+            assert_eq!(
+                repo.invoke(&["--icase-pathspecs", "add", "--", "../PUBLIC.TXT"], &mut fake)
+                    .0,
+                0
+            );
+        }
+
+        #[test]
+        fn writes_whose_operands_need_option_knowledge_check_exclusions() {
+            let repo = Repo::new();
+            repo.patterns(&["/private.txt".into()]);
+            let mut fake = Fake::default();
+            for args in [
+                &["checkout", "HEAD", "private.txt"][..],
+                &["checkout", "private.txt"],
+                &["reset", "HEAD", "private.txt"],
+                &["reset", "private.txt"],
+                &["add", "--no-all", "private.txt"],
+                &["add", "--renormalize", "private.txt"],
+                &["add", "--refresh", "private.txt"],
+                &["add", "-n", "private.txt"],
+                &["rm", "-rf", "private.txt"],
+                &["rm", "--sparse", "private.txt"],
+                &["mv", "-fv", "private.txt", "other.txt"],
+                &["restore", "-q", "private.txt"],
+                &["restore", "-sHEAD", "private.txt"],
+                &["restore", "--no-overlay", "private.txt"],
+                &["stash", "push", "private.txt"],
+            ] {
+                let (code, _, why) = repo.invoke(args, &mut fake);
+                assert_eq!(code, 1, "{args:?}");
+                assert!(
+                    why.contains("private.txt is excluded from sync; git on example-host uses the server's copy"),
+                    "{args:?}: {why}"
+                );
+            }
+            // Paths read from a file cannot be checked at all.
+            for args in [
+                &["add", "--pathspec-from-file=list"][..],
+                &["commit", "-m", "x", "--pathspec-from-file", "list"],
+                &["reset", "--pathspec-from-file=list"],
+                &["stash", "push", "--pathspec-from-file", "list"],
+            ] {
+                let (code, _, why) = repo.invoke(args, &mut fake);
+                assert_eq!(code, 1, "{args:?}");
+                assert!(why.contains("is not run from here"), "{args:?}: {why}");
+            }
+            assert!(fake.exec_args.is_empty());
+            for args in [
+                &["checkout", "HEAD", "public.txt"][..],
+                &["checkout", "main"],
+                &["reset", "--hard", "HEAD~1"],
+                &["add", "--no-all", "public.txt"],
+                &["rm", "-rf", "public.txt"],
+                &["restore", "-sHEAD", "public.txt"],
+                &["stash", "push", "public.txt"],
+            ] {
+                let (code, _, why) = repo.invoke(args, &mut fake);
+                assert_eq!(code, 0, "{args:?}: {why}");
+            }
+        }
+
+        #[test]
+        fn a_leading_revision_of_checkout_or_reset_is_not_checked_as_a_path() {
+            let repo = Repo::new();
+            for args in [
+                &["commit", "--allow-empty", "-q", "-m", "second"][..],
+                &["branch", "dist"],
+                &["branch", "fix/build"],
+            ] {
+                let made = std::process::Command::new(&repo.env.real_git)
+                    .args(args)
+                    .current_dir(&repo.env.cwd)
+                    .output()
+                    .unwrap();
+                assert!(made.status.success(), "{}", String::from_utf8_lossy(&made.stderr));
+            }
+            repo.patterns(&["*~".into(), "dist/".into(), "build/".into(), "/private.txt".into()]);
+            let mut fake = Fake::default();
+            for args in [
+                &["reset", "HEAD~"][..],
+                &["reset", "--soft", "HEAD~"],
+                &["reset", "--hard", "dist"],
+                &["checkout", "dist"],
+                &["checkout", "fix/build"],
+                &["checkout", "HEAD~", "file"],
+            ] {
+                let (code, _, why) = repo.invoke(args, &mut fake);
+                assert_eq!(code, 0, "{args:?}: {why}");
+                assert_eq!(fake.exec_args, os(args));
+            }
+            // Words after the revision, and a first word that names no revision, are still paths.
+            for args in [
+                &["checkout", "HEAD~", "private.txt"][..],
+                &["reset", "HEAD", "private.txt"],
+                &["checkout", "private.txt"],
+            ] {
+                let (code, _, why) = repo.invoke(args, &mut fake);
+                assert_eq!(code, 1, "{args:?}");
+                assert!(why.contains("private.txt is excluded from sync"), "{args:?}: {why}");
+            }
+            let (_, _, why) = repo.invoke(&["checkout", "private.txt"], &mut fake);
+            assert!(why.contains("add `--` after the revision"), "{why}");
+            // A word that is both a revision and a path on the laptop is ambiguous: it stays checked as a path.
+            std::fs::create_dir(repo.env.cwd.join("dist")).unwrap();
+            let (code, _, why) = repo.invoke(&["checkout", "dist"], &mut fake);
+            assert_eq!(code, 1);
+            assert!(
+                why.contains("dist is excluded from sync") && why.contains("add `--`"),
+                "{why}"
+            );
+        }
+
+        #[test]
+        fn literal_operands_are_checked_as_names_not_pathspecs() {
+            let repo = Repo::new();
+            repo.patterns(&["/server-only/".into()]);
+            let mut fake = Fake::default();
+            for args in [
+                &["mv", "--", "app/[slug]/page.tsx", "app/[id]/page.tsx"][..],
+                &["mv", "notes[2024].md", ":notes.md"],
+                &["log", "--output=report[1].txt"],
+                &["rev-list", "--output", "*report", "HEAD"],
+            ] {
+                let (code, _, why) = repo.invoke(args, &mut fake);
+                assert_eq!(code, 0, "{args:?}: {why}");
+            }
+            for args in [
+                &["mv", "server-only/a[1].txt", "b.txt"][..],
+                &["log", "--output=server-only/r?.txt"],
+            ] {
+                let (code, _, why) = repo.invoke(args, &mut fake);
+                assert_eq!(code, 1, "{args:?}");
+                assert!(why.contains("is excluded from sync"), "{args:?}: {why}");
+            }
+            // Git expands a glob in an add pathspec, so it still cannot be checked as one name.
+            let (code, _, why) = repo.invoke(&["add", "--", "app/[slug]/page.tsx"], &mut fake);
+            assert_eq!(code, 1);
+            assert!(why.contains("cannot check sync exclusions for pathspec"), "{why}");
+        }
+
+        #[test]
+        fn laptop_side_problems_name_a_laptop_fix() {
+            use eitri_core::remote_sync::engine::{Problem, Side};
+            let repo = Repo::new();
+            let mut fake = Fake::default();
+            fake.problems.push(Problem {
+                path: "sub".into(),
+                side: Side::Laptop,
+                text: "permission denied".into(),
+            });
+            let (code, _, reason) = repo.invoke(&["add", "--", "sub/file"], &mut fake);
+            assert_eq!(code, 1);
+            assert!(reason.contains("laptop sync problem at sub"), "{reason}");
+            assert!(reason.contains("fix the entry on this laptop"), "{reason}");
+            assert!(
+                !reason.contains("on the server") && !reason.contains("terminal on"),
+                "{reason}"
+            );
+        }
+
         #[test]
         fn forward_refuses_on_a_named_conflict() {
             let mut repo = Repo::new();
@@ -1727,22 +2040,23 @@ mod remote_sync {
         }
 
         #[test]
-        fn forwarded_pathspec_and_signoff_forms_preserve_stdin() {
+        fn forwarded_message_and_signoff_forms_preserve_stdin() {
             let repo = Repo::new();
-            for words in [
-                &["commit", "-m", "x", "--pathspec-from-file", "-"][..],
-                &["stash", "push", "--pathspec-from-file", "-"],
-                &["reset", "--pathspec-from-file", "-"],
-                &["commit", "-s", "-F", "-"],
-                &["tag", "-s", "-F", "-", "v2"],
-            ] {
+            for words in [&["commit", "-s", "-F", "-"][..], &["tag", "-s", "-F", "-", "v2"]] {
                 let mut fake = Fake::default();
                 let (code, _, err) = invoke(&repo.env, &os(words), &mut fake, b"file\n");
                 assert_eq!(code, 0, "{words:?}: {err}");
                 assert_eq!(fake.input, b"file\n", "{words:?}");
                 assert_eq!(fake.calls.iter().filter(|c| *c == "exec").count(), 1);
             }
-            for words in [&["unknown"][..], &["example-alias"]] {
+            // Paths read from a file cannot be checked, so those forms never reach the server or its input.
+            for words in [
+                &["unknown"][..],
+                &["example-alias"],
+                &["commit", "-m", "x", "--pathspec-from-file", "-"],
+                &["stash", "push", "--pathspec-from-file", "-"],
+                &["reset", "--pathspec-from-file", "-"],
+            ] {
                 let mut fake = Fake::default();
                 let (code, _, err) = invoke(&repo.env, &os(words), &mut fake, b"file\n");
                 assert_eq!(code, 1, "{words:?}: {err}");
@@ -1937,6 +2251,7 @@ mod remote_sync {
             let parent = repo.base.join("linked-parent");
             std::os::unix::fs::symlink(&repo.base, &parent).unwrap();
             repo.env.projects[0].root = parent.join("project");
+            repo.patterns(&[]);
             repo.env.cwd.push("sub");
             let mut fake = Fake::default();
             assert_eq!(repo.invoke(&["add", "other"], &mut fake).0, 0);

@@ -74,7 +74,10 @@ pub fn run(args: Vec<OsString>, mut env: ShimEnv) -> i32 {
         .is_some_and(|project| matches!(project_invocation(&parsed, project).1, Route::Forward { .. }))
     {
         let options = super::shim_dir::ShimOptions::from_process().unwrap_or_else(|error| {
-            eprintln!("Eitri: {error}; using default git shim settings");
+            eprintln!(
+                "Eitri: {}; using default git shim settings",
+                super::terminal_text(&error.to_string())
+            );
             super::shim_dir::ShimOptions::default()
         });
         env.enabled = options.enabled;
@@ -118,7 +121,10 @@ pub fn run_with(
     let Some(project) = select_project(&initial, env) else {
         return plain_git(&env.real_git, args, &env.cwd, stdout, stderr);
     };
-    let (parsed, route) = project_invocation(&initial, project);
+    let (mut parsed, route) = project_invocation(&initial, project);
+    if let Err(reason) = pathspec_environment(&mut parsed, env) {
+        return refuse(stderr, 128, &reason);
+    }
     if matches!(route, Route::Forward { .. }) {
         if let Some(name) = moving_environment(env, project, &initial.cwd) {
             return refuse(
@@ -142,7 +148,7 @@ pub fn run_with(
                 project.host,
                 project.root.display()
             );
-            refuse(stderr, 1, &line.replace(['\n', '\r'], "\\n"))
+            refuse(stderr, 1, &line)
         }
         Route::RefuseEditor if parsed.args.first().is_some_and(|arg| arg == "revert") => refuse(
             stderr,
@@ -229,10 +235,60 @@ pub fn run_with(
     }
 }
 
+fn pathspec_environment(parsed: &mut classify::Invocation, env: &ShimEnv) -> Result<(), String> {
+    let mut flags = Vec::new();
+    for (name, value) in &env.git_environment {
+        let flag = match name.to_str() {
+            Some("GIT_LITERAL_PATHSPECS") => "--literal-pathspecs",
+            Some("GIT_GLOB_PATHSPECS") => "--glob-pathspecs",
+            Some("GIT_NOGLOB_PATHSPECS") => "--noglob-pathspecs",
+            Some("GIT_ICASE_PATHSPECS") => "--icase-pathspecs",
+            _ => continue,
+        };
+        let enabled = match value.to_string_lossy().to_ascii_lowercase().as_str() {
+            "1" | "yes" | "on" | "true" => true,
+            "0" | "" | "no" | "off" | "false" => false,
+            _ => {
+                // Git also accepts integer booleans with its own bases, units and overflow rules.
+                let output = Command::new(&env.real_git)
+                    .current_dir("/")
+                    .env_clear()
+                    .args(["config", "--file", "/dev/null", "--type=bool", "--default"])
+                    .arg(value)
+                    .args(["--get", "eitri.pathspec"])
+                    .output()
+                    .map_err(|error| error.to_string())?;
+                if !output.status.success() {
+                    return Err(format!("invalid boolean for {}", name.to_string_lossy()));
+                }
+                output.stdout == b"true\n"
+            }
+        };
+        if enabled {
+            match flag {
+                "--icase-pathspecs" => parsed.icase_pathspecs = true,
+                "--literal-pathspecs" => {
+                    parsed.literal_pathspecs.get_or_insert(true);
+                }
+                "--noglob-pathspecs" => parsed.noglob_pathspecs = true,
+                _ => {}
+            }
+            flags.push(flag.into());
+        }
+    }
+    // Command-line switches take precedence over the environment.
+    parsed.globals.splice(..0, flags);
+    Ok(())
+}
+
 fn project_invocation(initial: &classify::Invocation, project: &RemoteProject) -> (classify::Invocation, Route) {
     let mut parsed = initial.clone().for_project(&project.root);
-    let relative = relative_to(&parsed.cwd, &project.root).unwrap_or_default();
-    parsed.cwd = project.root.join(relative);
+    // At the root itself `relative` is empty, and joining an empty path would add a trailing separator, which the
+    // helper refuses as a working directory not in normal form.
+    parsed.cwd = match relative_to(&parsed.cwd, &project.root) {
+        Some(relative) if !relative.as_os_str().is_empty() => project.root.join(relative),
+        _ => project.root.clone(),
+    };
     let route = classify::classify_invocation(&parsed.args, !parsed.foreign && has_history(project));
     (parsed, route)
 }
@@ -370,7 +426,7 @@ fn plain_git(git: &Path, args: &[OsString], cwd: &Path, stdout: &mut dyn Write, 
 pub fn exec_real_git(args: &[OsString], git: &Path) -> i32 {
     use std::os::unix::process::CommandExt;
     let error = Command::new(git).args(args).exec();
-    eprintln!("git: {error}");
+    eprintln!("git: {}", super::terminal_text(&error.to_string()));
     128
 }
 
@@ -414,7 +470,7 @@ impl Services for SystemServices<'_> {
             let store = RemoteProjects::new(Some(self.env.state_home.as_os_str()), None);
             let ssh_dir = self.env.state_home.join("eitri/ssh");
             let master = agent::ssh::ControlMaster::ensure(&project.host, &ssh_dir, &self.env.exe)
-                .map_err(|_| offline(project))?;
+                .map_err(|error| format!("{} ({error})", offline(project)))?;
             let connection = RemoteConnection::open_over_ssh(
                 &master,
                 &store,
@@ -559,6 +615,40 @@ fn unreadable_record(parsed: &classify::Invocation, env: &ShimEnv) -> Option<Pat
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_master_that_cannot_start_says_why() {
+        let env = ShimEnv {
+            cwd: "/srv/project".into(),
+            state_home: "/nonexistent/state".into(),
+            real_git: "/usr/bin/git".into(),
+            exe: "/usr/bin/eitri".into(),
+            projects: vec![],
+            flush_cap: Duration::from_millis(500),
+            mutagen: None,
+            git_environment: vec![],
+            unreadable_records: vec![],
+            enabled: true,
+        };
+        let project = RemoteProject {
+            version: 1,
+            host: "-bad host".into(),
+            host_key_sha256: "SHA256:example".into(),
+            root: "/srv/project".into(),
+            helper_version: "0.4.0".into(),
+            sync: None,
+            created_at: 0,
+            queued_stops: vec![],
+        };
+        let mut services = SystemServices {
+            env: &env,
+            engine: None,
+            connection: None,
+        };
+        let error = services.connect(&project).unwrap_err();
+        assert!(error.starts_with(&offline(&project)), "{error}");
+        assert!(error.contains("SSH host must be nonempty"), "{error}");
+    }
     #[test]
     fn grep_preserves_end_of_options_after_the_safety_flags() {
         let args: Vec<_> = ["grep", "-e", "first", "--end-of-options", "file"]

@@ -49,7 +49,7 @@ pub struct RecordingProvider {
     /// Advertises `steer` and takes messages into the running turn.
     steering: bool,
     /// Every message it was sent into a running turn, in order.
-    steers: std::sync::Mutex<Vec<agent::SteerTurnRequest>>,
+    steers: std::sync::Arc<std::sync::Mutex<Vec<agent::SteerTurnRequest>>>,
     /// Every answer to a question that reached it, in order, taken or refused.
     interactions: std::sync::Mutex<Vec<agent::ResolveInteractionRequest>>,
     /// While set, every `resolve_interaction` is refused with this code (what the sidecar does with a
@@ -547,6 +547,20 @@ impl agent::AgentProvider for RecordingProvider {
     ) -> Result<String, agent::ProviderError> {
         self.turn_stamps.lock().unwrap().push(stamp);
         self.send_turn(request)
+    }
+    fn steer_turn_after(
+        &self,
+        request: agent::SteerTurnRequest,
+        _stamp: agent::TurnStamp,
+        wait: agent::BeforeSend,
+    ) -> Result<(), agent::ProviderError> {
+        let steers = self.steers.clone();
+        std::thread::spawn(move || {
+            if wait().is_ok() {
+                steers.lock().unwrap().push(request);
+            }
+        });
+        Ok(())
     }
     fn steer_turn_stamped(
         &self,

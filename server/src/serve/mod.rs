@@ -3,6 +3,7 @@
 mod fake_sidecar;
 mod proxy;
 mod replay;
+mod terminal;
 mod watcher;
 
 use std::collections::HashMap;
@@ -17,11 +18,12 @@ use eitri_server_proto::{PendingPermission, SessionInfo};
 use sha2::{Digest, Sha256};
 use tonic::Status;
 
-use super::sidecars::Sidecars;
+use super::sidecars::{Record as SidecarRecord, Sidecars};
 use super::sync::activity::{Facts, SessionFacts, Tasks, Turn};
 use crate::run_dir::Paths;
 
 pub use proxy::Proxy;
+pub use terminal::TerminalRoutes;
 
 pub(super) struct Session {
     identity: (String, String),
@@ -336,10 +338,10 @@ impl Serving {
         })
     }
 
-    pub(super) fn sidecar(&self, id: &str) -> Result<eitri_server_proto::SidecarInfo, Status> {
-        match self.sidecars.list().sidecars.into_iter().find(|sc| sc.sidecar_id == id) {
-            Some(sc) if sc.alive && sc.handshake => Ok(sc),
-            Some(sc) if sc.alive => Err(Status::unavailable("the helper is adopting this sidecar")),
+    pub(super) fn sidecar(&self, id: &str) -> Result<SidecarRecord, Status> {
+        match self.sidecars.live_record(id) {
+            Some((record, true)) => Ok(record),
+            Some((_, false)) => Err(Status::unavailable("the helper is adopting this sidecar")),
             _ if !self.adopted.load(Ordering::Acquire) => {
                 Err(Status::unavailable("the helper is adopting its sessions"))
             }
@@ -486,7 +488,7 @@ impl Serving {
         }
         if let Some(info) = info.filter(|_| !closed) {
             let live = self.liveness(&info);
-            let task = tokio::spawn(watcher::run(self.paths.clone(), info, session, live));
+            let task = tokio::spawn(watcher::run(self.paths.clone(), info.socket, info.pid, session, live));
             let mut tasks = self.tasks.lock().expect("watch tasks");
             tasks.retain(|task| !task.is_finished());
             tasks.push(task);
@@ -495,7 +497,7 @@ impl Serving {
     }
 
     /// Whether the sidecar a watch was started on is still that same running process.
-    fn liveness(&self, info: &eitri_server_proto::SidecarInfo) -> watcher::Live {
+    fn liveness(&self, info: &SidecarRecord) -> watcher::Live {
         let sidecars = self.sidecars.clone();
         let (id, pid) = (info.sidecar_id.clone(), info.pid);
         Arc::new(move || {
@@ -1225,7 +1227,8 @@ fn scratch(label: &str) -> std::path::PathBuf {
         .read_exact(&mut random)
         .unwrap();
     let nonce: String = random.iter().map(|byte| format!("{byte:02x}")).collect();
-    let path = std::env::temp_dir().join(format!("serve-{label}-{nonce}"));
+    // Some fixtures bind sockets below this directory and need room for the run key and socket name.
+    let path = std::path::PathBuf::from(format!("/tmp/serve-{label}-{nonce}"));
     agent::private_fs::create_private_dir_all(&path, &path).unwrap();
     path
 }

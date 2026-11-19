@@ -146,7 +146,7 @@ class _PackageCase(unittest.TestCase):
             _read(os.path.join(self.pkgdir, "usr/share/applications", PAGE_DESKTOP)),
             _read(os.path.join(_PACKAGING, PAGE_DESKTOP)),
         )
-        self.assertEqual(len(_plugin_files()), 4)
+        self.assertEqual(len(_plugin_files()), 6)
         self.assertEqual(
             [p for p in got if p.startswith("usr/share/eitri/nvim/")],
             [f"usr/share/eitri/nvim/eitri.nvim/{rel}" for rel in _plugin_files()],

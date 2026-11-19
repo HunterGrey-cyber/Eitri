@@ -917,6 +917,7 @@ mod tests {
 
     fn saved_remote() -> SavedTabs {
         SavedTabs::default().with_remote(vec![eitri_core::saved_tabs::SavedRemoteTab {
+            late_lines: Vec::new(),
             helper: handoff(),
             provider_session_id: Some("claude-1".into()),
             name: Some("saved agent".into()),
@@ -1695,6 +1696,7 @@ mod tests {
             helper.session_id = format!("session-{sidecar}");
             helper.host_key_sha256 = key.into();
             eitri_core::saved_tabs::SavedRemoteTab {
+                late_lines: Vec::new(),
                 window: None,
                 helper,
                 provider_session_id: None,
@@ -1778,6 +1780,7 @@ mod tests {
         helper.sidecar_id = "sc-7".into();
         helper.session_id = "session-7".into();
         let saved = eitri_core::saved_tabs::SavedRemoteTab {
+            late_lines: Vec::new(),
             window: None,
             helper,
             provider_session_id: Some("claude-7".into()),
@@ -2015,6 +2018,7 @@ mod tests {
             helper.sidecar_id = id.into();
             helper.host_key_sha256 = key.into();
             SavedRemoteTab {
+                late_lines: Vec::new(),
                 helper,
                 provider_session_id: None,
                 name: None,

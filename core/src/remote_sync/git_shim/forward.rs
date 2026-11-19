@@ -1,6 +1,10 @@
 use super::{classify::Invocation, read_disk_status, ShimEnv};
 use crate::remote_project::RemoteProject;
-use crate::remote_sync::engine::{FlushOutcome, SessionStatus, SyncState};
+use crate::remote_sync::actor::project_dir;
+use crate::remote_sync::engine::{FlushOutcome, Problem, SessionStatus, Side, SideCounts, SyncState};
+use crate::remote_sync::flush::{omitted_problems, problem_detail, tree_excluded};
+use crate::remote_sync::ignores::Matcher;
+use crate::remote_sync::recreate::read_created_patterns;
 use crate::remote_sync::status_schema::StatusFile;
 use std::ffi::OsString;
 use std::io::{Read, Write};
@@ -13,11 +17,17 @@ pub struct Conflicts {
     pub successful_cycles: u64,
     pub paths: Vec<String>,
     pub excluded: u64,
+    pub problems: Vec<Problem>,
+    pub excluded_scan_problems: SideCounts,
+    pub excluded_transition_problems: SideCounts,
 }
 
 impl From<SessionStatus> for Conflicts {
     fn from(status: SessionStatus) -> Self {
         Self {
+            excluded_scan_problems: status.excluded_scan_problems,
+            excluded_transition_problems: status.excluded_transition_problems,
+            problems: status.problems,
             state: status.state,
             successful_cycles: status.successful_cycles,
             paths: status.conflicts.into_iter().map(|c| c.path).collect(),
@@ -110,23 +120,72 @@ pub(super) fn forward(
             &format!("sync with {} is {state}; nothing was run", project.host),
         );
     }
+    // `mv` operands and output files are literal names: Git never reads them as pathspecs, so a `[` or a leading `:`
+    // in one is part of the name. For a pathspec, the literal name is checked as well as the name Git selects.
+    let literal_from = paths.len() - super::classify::literal_path_count(&invocation.args, paths.len());
+    let named: Vec<_> = paths
+        .iter()
+        .enumerate()
+        .map(|(index, path)| {
+            let literal = super::classify::normalize(&cwd.join(path));
+            let selected = if index >= literal_from {
+                Some((literal.clone(), false))
+            } else {
+                invocation.pathspec_name(path, &project.root)
+            };
+            (literal, selected)
+        })
+        .collect();
+    let affected_path = |entry: &str| {
+        let affected = project.root.join(entry);
+        let overlaps = |path: &Path, icase| {
+            !path.starts_with(&project.root)
+                || path_has_prefix(&affected, path, icase)
+                || path_has_prefix(path, &affected, icase)
+        };
+        whole_tree
+            || conflicts.excluded > 0
+            || named.iter().any(|(literal, selected)| {
+                overlaps(literal, false) || selected.as_ref().is_none_or(|(name, icase)| overlaps(name, *icase))
+            })
+    };
+    if omitted_problems(
+        &conflicts.excluded_scan_problems,
+        &conflicts.excluded_transition_problems,
+    ) {
+        let (scan, transition) = (
+            &conflicts.excluded_scan_problems,
+            &conflicts.excluded_transition_problems,
+        );
+        let side = match (scan.laptop + transition.laptop, scan.server + transition.server) {
+            (_, 0) => Some(Side::Laptop),
+            (0, _) => Some(Side::Server),
+            _ => None,
+        };
+        return refuse(
+            stderr,
+            1,
+            &format!(
+                "more sync problems than Mutagen lists; check :EitriSync. To proceed, {}",
+                super::super::problem_actions(side, &project.host)
+            ),
+        );
+    }
+    if let Some(problem) = conflicts.problems.iter().find(|p| affected_path(&p.path)) {
+        return refuse(
+            stderr,
+            1,
+            &format!(
+                "{}; check :EitriSync. To proceed, {}",
+                problem_detail(problem),
+                super::super::problem_actions(Some(problem.side), &project.host)
+            ),
+        );
+    }
     let affected: Vec<_> = conflicts
         .paths
         .iter()
-        .filter(|entry| {
-            if whole_tree || conflicts.excluded > 0 {
-                return true;
-            }
-            let conflict = project.root.join(entry);
-            paths.iter().any(|path| {
-                let path = super::classify::normalize(&cwd.join(path));
-                let text = path.to_string_lossy();
-                text.contains(['*', '?', '[', ':'])
-                    || !path.starts_with(&project.root)
-                    || path_has_prefix(&conflict, &path, invocation.icase_pathspecs)
-                    || path_has_prefix(&path, &conflict, invocation.icase_pathspecs)
-            })
-        })
+        .filter(|entry| affected_path(entry))
         .map(String::as_str)
         .collect();
     if !affected.is_empty() || conflicts.excluded > 0 {
@@ -146,6 +205,81 @@ pub(super) fn forward(
             ),
         );
     }
+    if !named.is_empty()
+        && !matches!(
+            super::classify::classify_invocation(&invocation.args, true),
+            super::classify::Route::Local { .. }
+        )
+    {
+        let dir = project_dir(&env.state_home, project);
+        let Some(patterns) = read_created_patterns(&dir) else {
+            return refuse(stderr, 1, "sync exclusions could not be read; nothing was run");
+        };
+        let matcher = Matcher::new(&patterns);
+        let leading_revision = super::classify::leading_revision_candidate(&invocation.args);
+        for (index, (operand, (literal, selected))) in paths.iter().zip(&named).enumerate() {
+            if operand.to_str().is_none() {
+                return refuse(stderr, 1, "remote git argument is not UTF-8; nothing was run");
+            }
+            // The first word of `checkout` or `reset` without `--` is a revision when it names one and no path on the
+            // laptop has that name: an ignore pattern such as `*~` or `dist/` must not refuse `reset HEAD~` or
+            // `checkout dist`. A word that is both stays checked as a path (Git refuses it as ambiguous).
+            let could_be_revision = leading_revision && index == 0;
+            if could_be_revision
+                && std::fs::symlink_metadata(literal).is_err()
+                && names_commit(env, project, cwd, operand)
+            {
+                continue;
+            }
+            let run_on_host = if could_be_revision {
+                format!(
+                    "if {} is a revision, add `--` after the revision; otherwise run it in a terminal on {}",
+                    operand.display(),
+                    project.host
+                )
+            } else {
+                format!("run it in a terminal on {}", project.host)
+            };
+            let Some((name, icase)) = selected else {
+                return refuse(
+                    stderr,
+                    1,
+                    &format!(
+                        "cannot check sync exclusions for pathspec {}; {run_on_host}",
+                        operand.display()
+                    ),
+                );
+            };
+            for (path, fold_case) in [(literal, false), (name, *icase)] {
+                let Ok(rel) = path.strip_prefix(&project.root) else {
+                    return refuse(
+                        stderr,
+                        1,
+                        &format!("{} is outside the sync root; {run_on_host}", path.display()),
+                    );
+                };
+                // A server-only directory may have no entry on the laptop.
+                let directory = fold_case || std::fs::symlink_metadata(path).map_or(true, |meta| meta.is_dir());
+                let possible_spelling = fold_case
+                    && (matcher.possibly_ignored_icase(&rel.to_string_lossy())
+                        || tree_excluded(None, Path::new(&rel.to_string_lossy().to_ascii_lowercase()), true));
+                if tree_excluded(Some(&matcher), rel, directory) || possible_spelling {
+                    return refuse(
+                        stderr,
+                        1,
+                        &format!(
+                            "{} is excluded from sync; git on {} uses the server's copy; {run_on_host}",
+                            rel.display(),
+                            project.host
+                        ),
+                    );
+                }
+                if literal == name && !icase {
+                    break;
+                }
+            }
+        }
+    }
     let args = invocation.forwarded_args();
     let stdin: Box<dyn Read + Send> = if super::reads_stdin(&args, false) {
         stdin
@@ -162,6 +296,47 @@ pub(super) fn forward(
     match result {
         Ok(code) => code,
         Err(error) => refuse(stderr, if error.contains("nothing was run") { 1 } else { 128 }, &error),
+    }
+}
+
+/// Whether `word` names a commit on the laptop's mirror: `git rev-parse --verify --quiet --end-of-options
+/// <word>^{commit}` through the sanitized local git (no hooks, no repository config), given at most two seconds. A
+/// mirror without history, or one that cannot run git, names nothing.
+fn names_commit(env: &ShimEnv, project: &RemoteProject, cwd: &Path, word: &Path) -> bool {
+    use std::process::Stdio;
+    let mut spec = word.as_os_str().to_owned();
+    spec.push("^{commit}");
+    let args: Vec<OsString> = vec![
+        "rev-parse".into(),
+        "--verify".into(),
+        "--quiet".into(),
+        "--end-of-options".into(),
+        spec,
+    ];
+    let Ok(mut child) = crate::remote_sync::local_git::LocalGit::new(&env.real_git)
+        .command(&project.root, &args)
+        .and_then(|mut command| {
+            command
+                .current_dir(cwd)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+        })
+    else {
+        return false;
+    };
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return status.success(),
+            Ok(None) if std::time::Instant::now() < deadline => std::thread::sleep(Duration::from_millis(5)),
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return false;
+            }
+        }
     }
 }
 
@@ -206,6 +381,6 @@ fn flush(
 }
 
 pub(super) fn refuse(stderr: &mut dyn Write, code: i32, line: &str) -> i32 {
-    let _ = writeln!(stderr, "Eitri: {line}");
+    let _ = writeln!(stderr, "Eitri: {}", super::super::terminal_text(line));
     code
 }

@@ -56,4 +56,5 @@ you register, and you supervise each of them yourself, in a window you control.
 - [Pages you build](pages.md): your own HTML page as a Lua panel, or a plugin page with a manifest (experimental).
 - [Write a plugin](write-a-plugin.md): the plugin author's reference: the manifest, every capability, the `agents` calls and events, and a complete example.
 - [Working environments](environments.md): whole `init.lua` files to start from, for a tmux person, an i3 person, a Markdown writer, someone running many agents, and Eitri beside a terminal Neovim.
+- [Remote development](remote-development.md): work on a project that lives on another machine (experimental): the prerequisites, `eitri host open`, what syncs, git on your laptop, conflicts and `:EitriSync`.
 - [Known issues](../known-issues.md): what is unsupported or rough today.

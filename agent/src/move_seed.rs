@@ -320,6 +320,7 @@ impl AgentSessionProjection {
             // Live, as the open reply is.
             thinking_open: _,
             last_revision,
+            last_reset_revision: _,
             history,
             evicted,
             ungated_cli_mode,

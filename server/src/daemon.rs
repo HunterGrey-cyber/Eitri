@@ -8,6 +8,8 @@ pub mod serve;
 pub mod sidecars;
 #[path = "sync/mod.rs"]
 pub mod sync;
+#[path = "terminals/mod.rs"]
+pub mod terminals;
 #[path = "test_exec.rs"]
 #[cfg(test)]
 #[allow(dead_code)]
@@ -112,6 +114,31 @@ struct Service {
     runs: Arc<exec::Runs>,
     /// The roots whose file modes are kept; a running keeper holds the daemon past its idle exit.
     modes: Arc<sync::modes::Keepers>,
+    /// Set by SIGTERM: Hello refuses, so `ensure` never takes a stopping daemon for a ready one.
+    stopping: Arc<AtomicBool>,
+    /// 128 random bits made at this daemon's start: a client sees a restarted daemon as another instance.
+    daemon_instance: String,
+    /// This boot's id, so a client tells a daemon restarted after a reboot (its terminals gone) from one that was not.
+    boot_id: String,
+}
+
+fn capabilities(boot_id: &str) -> Vec<String> {
+    let mut caps = vec![
+        CAP_SIDECARS.to_owned(),
+        CAP_JOURNAL.to_owned(),
+        CAP_PENDING.to_owned(),
+        CAP_TRUST_SCAN.to_owned(),
+        CAP_INSTALLATION_ARGS.to_owned(),
+        CAP_SYNC_IGNORES.to_owned(),
+        CAP_GIT_CONFIG.to_owned(),
+        CAP_SYNC_FILES.to_owned(),
+        CAP_SYNC_MODES.to_owned(),
+        CAP_EXEC.to_owned(),
+    ];
+    if !boot_id.is_empty() {
+        caps.push(CAP_TERMINAL.to_owned());
+    }
+    caps
 }
 
 type Streamed<T> = Pin<Box<dyn tokio_stream::Stream<Item = Result<T, Status>> + Send>>;
@@ -154,6 +181,11 @@ impl<T: Send + 'static> Outbox<T> {
 
     /// Sends one item from a blocking thread; `false` when nobody reads any more or the deadline passed.
     fn send(&mut self, item: T) -> bool {
+        // A ready channel can accept a send even when timeout_at's deadline has passed.
+        if tokio::time::Instant::now() >= self.deadline {
+            self.late = true;
+            return false;
+        }
         let sent = self
             .runtime
             .block_on(tokio::time::timeout_at(self.deadline, self.sender.send(Ok(item))));
@@ -193,6 +225,9 @@ async fn off_runtime<T: Send + 'static>(work: impl FnOnce() -> T + Send + 'stati
 #[tonic::async_trait]
 impl Helper for Service {
     async fn hello(&self, request: Request<HelloRequest>) -> Result<Response<HelloResponse>, Status> {
+        if self.stopping.load(Ordering::SeqCst) {
+            return Err(Status::unavailable("daemon is stopping"));
+        }
         if request.get_ref().protocol_major != PROTOCOL_MAJOR {
             return Err(Status::failed_precondition("unsupported helper protocol major"));
         }
@@ -201,20 +236,7 @@ impl Helper for Service {
         Ok(Response::new(HelloResponse {
             protocol_major: PROTOCOL_MAJOR,
             protocol_minor: PROTOCOL_MINOR,
-            capabilities: [
-                CAP_SIDECARS,
-                CAP_JOURNAL,
-                CAP_PENDING,
-                CAP_TRUST_SCAN,
-                CAP_INSTALLATION_ARGS,
-                CAP_SYNC_IGNORES,
-                CAP_GIT_CONFIG,
-                CAP_SYNC_FILES,
-                CAP_SYNC_MODES,
-                CAP_EXEC,
-            ]
-            .map(str::to_owned)
-            .to_vec(),
+            capabilities: capabilities(&self.boot_id),
             helper_version: crate::VERSION.to_owned(),
             helper_build: crate::REVISION.to_owned(),
             sidecar_revision: String::new(),
@@ -225,6 +247,8 @@ impl Helper for Service {
                 .chain(self.serving.warnings())
                 .collect(),
             login_env: self.sidecars.login_env_state() as i32,
+            daemon_instance: self.daemon_instance.clone(),
+            boot_id: self.boot_id.clone(),
             mode_warnings: mode_warnings
                 .into_iter()
                 .map(|warning| SyncModeWarning {
@@ -316,7 +340,14 @@ impl Helper for Service {
     async fn git_config(&self, request: Request<GitConfigRequest>) -> Result<Response<GitConfigResponse>, Status> {
         mark_activity(&request);
         let root = request.into_inner().root;
-        Ok(Response::new(sync::git_config::answer(&root).await))
+        let answer = match self.sidecars.login_environment().await {
+            Ok(captured) => sync::git_config::answer_with(&root, captured.env.clone()).await,
+            Err(status) => GitConfigResponse {
+                refusal: format!("the login environment is unavailable: {}", status.message()),
+                ..Default::default()
+            },
+        };
+        Ok(Response::new(answer))
     }
 
     type ListTreeStream = Streamed<ListTreeEntry>;
@@ -329,20 +360,26 @@ impl Helper for Service {
                 let budget = budget_of(request.budget)?;
                 let root = sync::root(&request.root)?;
                 let ignored = sync::listing::ignore_predicate(&request.patterns);
-                sync::listing::list_tree(&root.dir, &*ignored, budget, &mut |listed| {
-                    outbox.send(match listed {
-                        sync::listing::Listed::Entry(visit) => ListTreeEntry {
-                            rel: visit.rel,
-                            kind: visit.kind.wire().to_owned(),
-                            size: visit.size,
-                            ..Default::default()
-                        },
-                        sync::listing::Listed::Truncated => ListTreeEntry {
-                            truncated: true,
-                            ..Default::default()
-                        },
-                    })
-                })
+                sync::listing::list_tree(
+                    &root.dir,
+                    &*ignored,
+                    budget,
+                    outbox.deadline.into_std(),
+                    &mut |listed| {
+                        outbox.send(match listed {
+                            sync::listing::Listed::Entry(visit) => ListTreeEntry {
+                                rel: visit.rel,
+                                kind: visit.kind.wire().to_owned(),
+                                size: visit.size,
+                                ..Default::default()
+                            },
+                            sync::listing::Listed::Truncated => ListTreeEntry {
+                                truncated: true,
+                                ..Default::default()
+                            },
+                        })
+                    },
+                )
             })();
             let refusal = match listed {
                 Err(refusal) => refusal,
@@ -364,7 +401,13 @@ impl Helper for Service {
         let (mut outbox, stream) = Outbox::new(sync::READ_DEADLINE);
         tokio::task::spawn_blocking(move || {
             let last = match sync::root(&request.root) {
-                Ok(root) => sync::files::read_file(&root, &request.rel, request.limit, &mut |chunk| outbox.send(chunk)),
+                Ok(root) => sync::files::read_file(
+                    &root,
+                    &request.rel,
+                    request.limit,
+                    outbox.deadline.into_std(),
+                    &mut |chunk| outbox.send(chunk),
+                ),
                 Err(refusal) => Some(ReadFileChunk {
                     refusal,
                     ..Default::default()
@@ -446,7 +489,14 @@ impl Helper for Service {
                 let root = sync::root(&request.root)?;
                 let ignored = sync::listing::ignore_predicate(&request.patterns);
                 let deadline = std::time::Instant::now() + sync::LIST_DEADLINE;
-                sync::listing::path_sizes(&root.dir, &request.rels, &*ignored, budget, deadline)
+                sync::listing::path_sizes(
+                    &root.dir,
+                    &request.rels,
+                    request.whole_root,
+                    &*ignored,
+                    budget,
+                    deadline,
+                )
             })();
             match measured {
                 Ok((sizes, truncated)) => PathSizesResponse {
@@ -493,12 +543,13 @@ impl Helper for Service {
         let request = request.into_inner();
         let modes = self.modes.clone();
         let host = modes.host().to_owned();
-        let refusal =
-            off_runtime(move || modes.set(&request.root, request.patterns, &request.staging_name, request.on))
-                .await?
-                .err()
-                .unwrap_or_default();
-        Ok(Response::new(WatchModesResponse { refusal, host }))
+        let answer =
+            off_runtime(move || modes.set(&request.root, request.patterns, &request.staging_name, request.on)).await?;
+        Ok(Response::new(WatchModesResponse {
+            settling: answer == Ok(false),
+            refusal: answer.err().unwrap_or_default(),
+            host,
+        }))
     }
 
     type ExecStream = Streamed<ExecOutput>;
@@ -553,6 +604,20 @@ pub async fn run_with_environment(
     sidecars: OwnedSidecars,
     capture: impl std::future::Future<Output = io::Result<login_env::Captured>> + Send + 'static,
 ) -> io::Result<()> {
+    run_with_terminals(paths, idle, sidecars, capture, terminals::Config::default(), None).await
+}
+
+/// Called with the daemon's terminal hosts once it owns its run directory and has adopted them.
+pub type TerminalsReady = Box<dyn FnOnce(Arc<terminals::TerminalHosts>) + Send>;
+
+pub async fn run_with_terminals(
+    paths: Paths,
+    idle: Duration,
+    sidecars: OwnedSidecars,
+    capture: impl std::future::Future<Output = io::Result<login_env::Captured>> + Send + 'static,
+    terminal_config: terminals::Config,
+    terminals_ready: Option<TerminalsReady>,
+) -> io::Result<()> {
     paths.prepare()?;
     let live = agent::private_fs::PrivateLock::open(&paths.metadata_run().join("live.lock"))?;
     if !live.try_lock()? {
@@ -562,12 +627,17 @@ pub async fn run_with_environment(
         ));
     }
     let managed = Arc::new(sidecars::Sidecars::new(paths.clone())?);
+    let hosts = Arc::new(terminals::TerminalHosts::new(
+        paths.clone(),
+        terminal_config,
+        managed.clone(),
+    ));
     let serving = serve::Serving::new(paths.clone(), managed.clone());
     let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
-    let listener = UnixListener::bind(paths.socket()?)?;
+    let listener = UnixListener::bind(paths.bind_socket()?)?;
     let _cleanup = Cleanup(paths.clone());
     std::fs::set_permissions(
-        paths.socket()?,
+        paths.bind_socket()?,
         std::fs::Permissions::from_mode(agent::private_fs::PRIVATE_FILE_MODE),
     )?;
     let info = probe::DaemonInfo {
@@ -619,14 +689,21 @@ pub async fn run_with_environment(
         let modes = modes.clone();
         let _ = tokio::task::spawn_blocking(move || modes.resume()).await;
     }
+    if let Some(ready) = terminals_ready {
+        ready(hosts.clone());
+    }
     let tracked = connections.clone();
+    let stopping = Arc::new(AtomicBool::new(false));
+    let refusing = stopping.clone();
     let incoming = futures_util::stream::unfold(listener, move |listener| {
         let tracked = tracked.clone();
+        let refusing = refusing.clone();
         async move {
             loop {
                 match listener.accept().await {
                     Ok((stream, _)) => {
-                        if crate::peer::check(&stream).is_err() {
+                        // A stopping daemon lets its open streams finish and takes no new connection.
+                        if refusing.load(Ordering::SeqCst) || crate::peer::check(&stream).is_err() {
                             continue;
                         }
                         tracked.lock().expect("connection state").active += 1;
@@ -647,6 +724,7 @@ pub async fn run_with_environment(
             }
         }
     });
+    let daemon_instance = terminals::new_instance_id()?;
     let result = {
         let server = tonic::transport::Server::builder()
             .http2_keepalive_interval(Some(Duration::from_secs(10)))
@@ -658,8 +736,12 @@ pub async fn run_with_environment(
                 paths: paths.clone(),
                 runs: runs.clone(),
                 modes: modes.clone(),
+                stopping: stopping.clone(),
+                daemon_instance: daemon_instance.clone(),
+                boot_id: terminals::current_boot_id().unwrap_or_default(),
             }))
             .add_service(serve::Proxy(serving.clone()))
+            .add_service(serve::TerminalRoutes::new(hosts.clone(), daemon_instance.clone()))
             .serve_with_incoming(incoming);
         tokio::pin!(server);
         let idle_exit = async {
@@ -667,8 +749,11 @@ pub async fn run_with_environment(
                 tokio::time::sleep(idle.min(Duration::from_millis(100))).await;
                 owned.lock().await.reap_exited(&paths.state);
                 managed.observe_exits();
+                hosts.observe();
+                // A live terminal is owned work, as a sidecar, an Exec run and a mode keeper are.
                 let empty = owned.lock().await.children.is_empty()
                     && !managed.any_alive()
+                    && !hosts.any_live()
                     && runs.running() == 0
                     && !modes.holds();
                 let state = connections.lock().expect("connection state");
@@ -685,6 +770,7 @@ pub async fn run_with_environment(
                 let manager = managed.clone();
                 let _ = tokio::task::spawn_blocking(move || manager.trim_logs()).await;
                 managed.refresh_handshakes().await;
+                hosts.maintain().await;
                 if let Err(error) = serving.maintain().await {
                     serving.audit_budget_error(&error.to_string()).await;
                 }
@@ -697,28 +783,41 @@ pub async fn run_with_environment(
             }
         };
         tokio::pin!(maintenance);
-        tokio::select! {
+        let (result, terminate) = tokio::select! {
             result = &mut server => (result.map_err(io::Error::other), false),
             _ = term.recv() => (Ok(()), true),
             _ = idle_exit => (Ok(()), false),
             _ = &mut maintenance => unreachable!(),
-        }
+        };
+        // Terminal hosts, sidecars and Exec runs stop together, so the stop takes the longest of their bounds, not
+        // their sum, while the server still carries the hosts' final frames.
+        let stops = if terminate {
+            stopping.store(true, Ordering::SeqCst);
+            let all = async {
+                let mut sidecars = owned.lock().await;
+                let pids: Vec<_> = sidecars.children.iter().filter_map(tokio::process::Child::id).collect();
+                let (hosts_stopped, managed_stopped, stopped, ()) = tokio::join!(
+                    hosts.stop_all(),
+                    managed.stop_all(),
+                    sidecars.stop_all(),
+                    stop_runs_and_keepers(&runs, &modes, &paths.state)
+                );
+                (hosts_stopped, managed_stopped, stopped, pids)
+            };
+            tokio::pin!(all);
+            tokio::select! {
+                stops = &mut all => stops,
+                _ = &mut server => all.await,
+            }
+        } else {
+            stop_runs_and_keepers(&runs, &modes, &paths.state).await;
+            (Ok(()), Ok(()), Ok(()), Vec::new())
+        };
+        (result, stops)
         // Dropping the server stops acceptance without waiting for open RPC streams.
     };
     environment.abort();
-    // A run whose laptop has not closed its input is killed before the daemon's end closes that input for it; the
-    // others get a little time to finish and are audited if they do not.
-    runs.kill_unclosed();
-    runs.settle(&paths.state, exec::STOP_GRACE).await;
-    {
-        let modes = modes.clone();
-        let _ = tokio::task::spawn_blocking(move || modes.stop_all()).await;
-    }
-    let (result, terminate) = result;
-    let managed_stopped = if terminate { managed.stop_all().await } else { Ok(()) };
-    let mut sidecars = owned.lock().await;
-    let pids: Vec<_> = sidecars.children.iter().filter_map(tokio::process::Child::id).collect();
-    let stopped = if terminate { sidecars.stop_all().await } else { Ok(()) };
+    let (result, (hosts_stopped, managed_stopped, stopped, pids)) = result;
     for pid in pids {
         crate::audit::record(&paths.state, "sidecar-stop", &format!("pid={pid}"))?;
     }
@@ -727,7 +826,17 @@ pub async fn run_with_environment(
         "daemon-stop",
         &format!("version={} pid={}", paths.version, info.pid),
     );
-    result.and(managed_stopped).and(stopped).and(audited)
+    result.and(hosts_stopped).and(managed_stopped).and(stopped).and(audited)
+}
+
+/// Stops the daemon's Exec runs and mode keepers. A run whose laptop has not closed its input is killed before the
+/// daemon's end closes that input for it; the others get a little time to finish and are audited if they do not. The
+/// keepers stop and keep their registrations.
+async fn stop_runs_and_keepers(runs: &exec::Runs, modes: &Arc<sync::modes::Keepers>, state: &std::path::Path) {
+    runs.kill_unclosed();
+    runs.settle(state, exec::STOP_GRACE).await;
+    let modes = modes.clone();
+    let _ = tokio::task::spawn_blocking(move || modes.stop_all()).await;
 }
 
 /// The account's umask (as the helper inherited it), the server's name and half the account's inotify watches, for
@@ -751,7 +860,7 @@ struct Cleanup(Paths);
 
 impl Drop for Cleanup {
     fn drop(&mut self) {
-        if let Ok(socket) = self.0.socket() {
+        if let Ok(socket) = self.0.bind_socket() {
             let _ = std::fs::remove_file(socket);
         }
         let _ = std::fs::remove_file(self.0.metadata_run().join("info"));
@@ -807,7 +916,7 @@ mod tests {
         }
     }
 
-    fn contract_service() -> (Service, Scratch) {
+    fn contract_scratch() -> Scratch {
         static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
         // Keep the socket names short even when the runner's TMPDIR is long.
         let root = std::path::PathBuf::from(format!(
@@ -815,9 +924,14 @@ mod tests {
             std::process::id(),
             NEXT.fetch_add(1, Ordering::Relaxed)
         ));
-        let scratch = Scratch(root.clone());
         agent::private_fs::create_private_dir_all(&root, &root).unwrap();
-        let paths = Paths::new(crate::VERSION, &root.join("data"), &root.join("state"), &root).unwrap();
+        Scratch(root)
+    }
+
+    fn contract_service() -> (Service, Scratch) {
+        let scratch = contract_scratch();
+        let root = &scratch.0;
+        let paths = Paths::new(crate::VERSION, &root.join("data"), &root.join("state"), root).unwrap();
         paths.prepare().unwrap();
         let sidecars = Arc::new(sidecars::Sidecars::new(paths.clone()).unwrap());
         let serving = serve::Serving::new(paths.clone(), sidecars.clone());
@@ -830,9 +944,168 @@ mod tests {
                 paths,
                 runs: Default::default(),
                 modes,
+                stopping: Default::default(),
+                daemon_instance: "test-instance".into(),
+                boot_id: "test-boot".into(),
             },
             scratch,
         )
+    }
+
+    #[tokio::test]
+    async fn git_config_uses_the_captured_git_search_path() {
+        let (service, scratch) = contract_service();
+        let repo = scratch.0.join("repo");
+        std::fs::create_dir_all(repo.join(".git/objects")).unwrap();
+        std::fs::create_dir(repo.join(".git/refs")).unwrap();
+        std::fs::write(repo.join(".git/HEAD"), "ref: refs/heads/main\n").unwrap();
+        let bin = scratch.0.join("bin");
+        std::fs::create_dir(&bin).unwrap();
+        std::os::unix::fs::symlink("/bin/false", bin.join("git")).unwrap();
+        service.sidecars.set_environment(Ok(login_env::Captured {
+            env: [(std::ffi::OsString::from("PATH"), bin.into_os_string())].into(),
+            fallback: None,
+        }));
+        let answer = service
+            .git_config(Request::new(GitConfigRequest {
+                root: repo.display().to_string(),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(answer.refusal.contains("git could not read"), "{answer:?}");
+    }
+
+    fn cat_run(
+        service: &Service,
+        scratch: &Scratch,
+    ) -> (
+        tokio::sync::mpsc::Sender<Result<ExecInput, Status>>,
+        exec::Output,
+        tokio::task::JoinHandle<exec::Ended>,
+    ) {
+        let (input, receiver) = tokio::sync::mpsc::channel(2);
+        let prepared = exec::Prepared {
+            program: "/bin/cat".into(),
+            args: vec![],
+            cwd: scratch.0.display().to_string(),
+            audit: "git test".into(),
+            env: vec![],
+            deadline: Duration::from_secs(60),
+        };
+        let (output, ended) = exec::run(
+            prepared,
+            tokio_stream::wrappers::ReceiverStream::new(receiver),
+            service.paths.state.clone(),
+            1,
+            service.runs.clone(),
+        );
+        (input, output, ended)
+    }
+
+    #[tokio::test]
+    async fn shutdown_wakes_unclosed_exec_with_laptop_still_connected() {
+        let (service, scratch) = contract_service();
+        let (input, mut output, ended) = cat_run(&service, &scratch);
+        input
+            .send(Ok(ExecInput {
+                input: Some(exec_input::Input::Stdin(b"pending".to_vec())),
+            }))
+            .await
+            .unwrap();
+        assert!(matches!(
+            output.recv().await.unwrap().unwrap().output,
+            Some(exec_output::Output::Stdout(_))
+        ));
+        service.runs.kill_unclosed();
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(10), ended)
+                .await
+                .expect("shutdown did not wake the input wait")
+                .unwrap(),
+            exec::Ended::KilledByDaemonStop
+        );
+        let audit = std::fs::read_to_string(service.paths.state.join("audit.log")).unwrap();
+        assert!(audit.contains("killed=daemon-stop") && !audit.contains("outcome-unknown"));
+    }
+
+    #[tokio::test]
+    async fn shutdown_refuses_exec_even_with_its_first_message_ready() {
+        let (service, scratch) = contract_service();
+        service.runs.kill_unclosed();
+        let (input, mut output, mut ended) = cat_run(&service, &scratch);
+        input
+            .send(Ok(ExecInput {
+                input: Some(exec_input::Input::Close(true)),
+            }))
+            .await
+            .unwrap();
+        // The run stays registered (so the stopping daemon waits for it) until the transport takes its refusal.
+        assert!(
+            tokio::time::timeout(Duration::from_millis(300), &mut ended)
+                .await
+                .is_err(),
+            "the run ended before its refusal was taken"
+        );
+        match output.recv().await.unwrap().unwrap().output {
+            Some(exec_output::Output::Exit(exit)) => {
+                assert!(exit.refusal.contains("nothing was run"), "{exit:?}")
+            }
+            other => panic!("the laptop must get an exit message: {other:?}"),
+        }
+        assert_eq!(ended.await.unwrap(), exec::Ended::NotStarted);
+        assert!(output.recv().await.is_none());
+        let audit = std::fs::read_to_string(service.paths.state.join("audit.log")).unwrap();
+        assert!(!audit.contains("exec-start"));
+    }
+
+    #[test]
+    fn expired_listing_walk_refuses_even_when_every_path_is_ignored() {
+        let scratch = contract_scratch();
+        for i in 0..256 {
+            std::fs::write(scratch.0.join(format!("ignored-{i}")), []).unwrap();
+        }
+        let visited = std::cell::Cell::new(0);
+        let root = std::fs::File::open(&scratch.0).unwrap();
+        let result = sync::listing::list_tree(
+            &root,
+            &|_, _| {
+                visited.set(visited.get() + 1);
+                true
+            },
+            256,
+            std::time::Instant::now(),
+            &mut |_| panic!("ignored"),
+        );
+        assert!(result.is_err_and(|reason| reason.contains("longer")));
+        assert_eq!(visited.get(), 0, "a timed-out walk reached the ignore filter");
+    }
+
+    #[test]
+    fn expired_file_read_refuses_before_emitting_bytes() {
+        let scratch = contract_scratch();
+        std::fs::write(scratch.0.join("file"), b"data").unwrap();
+        let root = sync::root(scratch.0.to_str().unwrap()).unwrap();
+        let mut chunks = 0;
+        let last = sync::files::read_file(&root, "file", 65536, std::time::Instant::now(), &mut |_| {
+            chunks += 1;
+            true
+        })
+        .unwrap();
+        assert!(last.refusal.contains("longer"));
+        assert_eq!(chunks, 0);
+    }
+
+    #[tokio::test]
+    async fn expired_stream_deadline_refuses_even_with_room_for_output() {
+        let (outbox, _stream) = Outbox::<u8>::new(Duration::ZERO);
+        tokio::task::spawn_blocking(move || {
+            let mut outbox = outbox;
+            assert!(!outbox.send(42));
+            assert!(outbox.late);
+        })
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
@@ -944,6 +1217,17 @@ mod tests {
         assert_eq!(seen.len(), filled + 1);
         assert!(seen[..filled].iter().all(|entry| entry.refusal.is_empty()));
         assert_eq!(seen[filled].refusal, "the listing took longer than 0 s");
+    }
+
+    #[test]
+    fn hello_withholds_terminal_when_boot_id_is_unreadable() {
+        let capabilities = super::capabilities("");
+        assert!(capabilities.iter().any(|cap| cap == super::CAP_SIDECARS));
+        assert!(capabilities.iter().any(|cap| cap == super::CAP_EXEC));
+        assert!(!capabilities.iter().any(|cap| cap == super::CAP_TERMINAL));
+        assert!(super::capabilities("known-boot")
+            .iter()
+            .any(|cap| cap == super::CAP_TERMINAL));
     }
 
     #[tokio::test]

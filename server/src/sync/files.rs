@@ -114,9 +114,17 @@ pub fn read_file(
     root: &Root,
     rel: &str,
     limit: u64,
+    deadline: Instant,
     emit: &mut dyn FnMut(ReadFileChunk) -> bool,
 ) -> Option<ReadFileChunk> {
-    match read_into(root, rel, limit, emit) {
+    let result = read_into(root, rel, limit, deadline, emit);
+    if Instant::now() >= deadline {
+        return Some(ReadFileChunk {
+            refusal: format!("the read took longer than {} s", super::READ_DEADLINE.as_secs()),
+            ..Default::default()
+        });
+    }
+    match result {
         Ok(last) => last,
         Err(refusal) => Some(ReadFileChunk {
             refusal,
@@ -129,8 +137,12 @@ fn read_into(
     root: &Root,
     rel: &str,
     limit: u64,
+    deadline: Instant,
     emit: &mut dyn FnMut(ReadFileChunk) -> bool,
 ) -> Result<Option<ReadFileChunk>, String> {
+    if Instant::now() >= deadline {
+        return Ok(None);
+    }
     super::rel(rel)?;
     if limit > MAX_READ_BYTES {
         return Err(format!(
@@ -186,6 +198,9 @@ fn read_into(
     let mut reader = file.take(limit.saturating_add(1));
     let mut chunk = vec![0u8; CHUNK_BYTES];
     loop {
+        if Instant::now() >= deadline {
+            return Ok(None);
+        }
         let read = match reader.read(&mut chunk) {
             Ok(0) => break,
             Ok(read) => read,

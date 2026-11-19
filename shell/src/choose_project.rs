@@ -1,8 +1,8 @@
 //! `shell choose-project [--clean] [--legacy]`: a desktop launch that named no path.
 //!
 //! A process of its own, because `main()` settles one project root for a process and everything after that assumes
-//! the root. This one has no project, no nvim, no WebKit, no lock and no socket. It reads `init.lua` for one key, shows
-//! the chooser when the key asks for it, and hands over to a child that is an ordinary launch of what was picked.
+//! the root. The native chooser reads `init.lua` before GTK and hands the chosen project to its own process.
+//! Open on a host… starts the SSH chooser when remote development is enabled.
 //!
 //! A child and not an `exec`: the activation token names this window's surface, which must outlive the new window's
 //! first map, the crash relay's pipes would have no reader in a new image, and a thread stuck on a dead mount can hold
@@ -124,18 +124,24 @@ fn cwd_how(current: io::Result<PathBuf>) -> Result<How, &'static str> {
     current.map(How::Plain).map_err(|_| NO_DIRECTORY)
 }
 
-/// The window's reading of the key. What `init.lua` got wrong is left for the window that opens to say; a value that is
-/// not one is the default, with a line for whoever reads stderr.
-fn desktop_start(config_dir: &Path) -> DesktopStart {
+/// Read both chooser settings in one init.lua run before bringing up GTK.
+fn chooser_config(config_dir: &Path) -> (DesktopStart, eitri_core::remote_host::cli_sync::SyncSettings) {
     let Ok(kernel) = Kernel::new(config_dir.to_path_buf(), refuse_panels) else {
-        return DesktopStart::Choose;
+        return (DesktopStart::Choose, Default::default());
     };
     kernel.load_init_file(&config_dir.join("init.lua"));
-    let value = kernel.config.borrow().get(DESKTOP_START_KEY).map(str::to_owned);
-    parse_desktop_start(value.as_deref()).unwrap_or_else(|why| {
+    let config = kernel.config.borrow();
+    let start = parse_desktop_start(config.get(DESKTOP_START_KEY)).unwrap_or_else(|why| {
         eprintln!("eitri: {why}; the default is used");
         DesktopStart::Choose
-    })
+    });
+    let (sync, problems) = crate::host_command::sync_settings(&config);
+    if sync.enabled {
+        for problem in problems {
+            eprintln!("eitri: {problem}");
+        }
+    }
+    (start, sync)
 }
 
 /// Persisted roots are canonical, so a home named through a symlink is resolved before it is compared with them.
@@ -169,6 +175,7 @@ struct Shown {
     sources: Sources,
     home: Option<PathBuf>,
     theme: StartTheme,
+    remote: Option<eitri_core::remote_host::cli_sync::SyncSettings>,
     /// A start made before the window, which failed: its folder, and whether that folder was gone.
     failed: Option<(PathBuf, bool)>,
 }
@@ -181,8 +188,10 @@ pub(crate) fn run(args: &[OsString]) -> glib::ExitCode {
     };
     // Before GTK, which takes the token out of the environment; a window it opens asks its own display for one.
     let token = crate::open_requests::token_from_env();
-    let start = eitri_core::config_dir::resolve(&|name| std::env::var_os(name))
-        .map_or(DesktopStart::Choose, |dir| desktop_start(&dir));
+    let (start, settings) = eitri_core::config_dir::resolve(&|name| std::env::var_os(name)).map_or_else(
+        |_| (DesktopStart::Choose, Default::default()),
+        |dir| chooser_config(&dir),
+    );
     let control =
         eitri_core::panel_control::control_dir(std::env::var_os("XDG_RUNTIME_DIR").as_deref(), &std::env::temp_dir());
     let sources = Sources::from_env(
@@ -208,7 +217,7 @@ pub(crate) fn run(args: &[OsString]) -> glib::ExitCode {
     let mut failed = None;
     if let Some(how) = how {
         let target = match &how {
-            How::Raise(path) | How::Plain(path) => path.clone(),
+            How::Raise(path) | How::Plain(path) | How::Remote { path, .. } => path.clone(),
         };
         // No window is up to say a failure, so the child's first seconds are waited for here: a desktop launch must
         // not end in nothing, and the chooser is what is left to offer.
@@ -222,11 +231,13 @@ pub(crate) fn run(args: &[OsString]) -> glib::ExitCode {
     }
     let home = canonical_home(sources.home.as_deref());
     let theme = start_theme(&sources);
+    let remote = project_start::remote::available(&settings).then_some(settings);
     show(Shown {
         flags,
         sources,
         home,
         theme,
+        remote,
         failed,
     })
 }
@@ -359,6 +370,7 @@ impl LaunchWindow {
             sources,
             home,
             theme,
+            remote,
             failed,
         } = shown;
         crate::xft_dpi::ensure_xft_dpi();
@@ -407,6 +419,28 @@ impl LaunchWindow {
                 starts: Cell::new(0),
             }
         });
+        if let Some(settings) = remote {
+            let me = Rc::downgrade(&this);
+            let tokens = theme.tokens;
+            this.view.add_remote(move || {
+                if let Some(this) = me.upgrade() {
+                    project_start::remote::open(
+                        this.window.upcast_ref(),
+                        this.flags.clone(),
+                        settings.clone(),
+                        &tokens,
+                        {
+                            let window = this.window.downgrade();
+                            move || {
+                                if let Some(window) = window.upgrade() {
+                                    window.close();
+                                }
+                            }
+                        },
+                    );
+                }
+            });
+        }
         window.set_child(Some(this.view.widget()));
         window.connect_close_request(|_| {
             println!("[project] closed");
@@ -738,7 +772,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            desktop_start(&scratch.0),
+            chooser_config(&scratch.0).0,
             DesktopStart::Last,
             "a line after the panel still runs"
         );
@@ -749,11 +783,11 @@ mod tests {
         let scratch = Scratch::new("choose-project");
         let init = scratch.0.join("init.lua");
         fs::write(&init, "eitri.config.set(\"window.desktop_start\", \"later\")\n").unwrap();
-        assert_eq!(desktop_start(&scratch.0), DesktopStart::Choose);
+        assert_eq!(chooser_config(&scratch.0).0, DesktopStart::Choose);
         fs::write(&init, "this is not lua\n").unwrap();
-        assert_eq!(desktop_start(&scratch.0), DesktopStart::Choose);
+        assert_eq!(chooser_config(&scratch.0).0, DesktopStart::Choose);
         fs::remove_file(&init).unwrap();
-        assert_eq!(desktop_start(&scratch.0), DesktopStart::Choose);
+        assert_eq!(chooser_config(&scratch.0).0, DesktopStart::Choose);
     }
 
     fn exited(code: Option<i32>) -> Ends {

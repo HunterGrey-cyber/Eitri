@@ -363,6 +363,7 @@ mod tests {
         let new = dir("SHA256:new");
         let remote = |id: &str, key: &str| {
             SavedTabs::default().with_remote(vec![saved_tabs::SavedRemoteTab {
+                late_lines: Vec::new(),
                 helper: agent::HelperHandoff {
                     host: "example-host".into(),
                     host_key_sha256: key.into(),
@@ -409,6 +410,7 @@ mod tests {
             group.rekey_remote(dir(pair[1]), pair[0], pair[1]).unwrap();
         }
         let report = SavedTabs::default().with_remote(vec![saved_tabs::SavedRemoteTab {
+            late_lines: Vec::new(),
             helper: agent::HelperHandoff {
                 host: "example-host".into(),
                 host_key_sha256: reported_key.into(),

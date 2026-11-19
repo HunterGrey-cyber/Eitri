@@ -87,6 +87,7 @@ struct Reads {
     editor_cell: Option<(f64, f64)>,
     editor_facts: EditorFacts,
     terminal_jobs: usize,
+    terminal_job_names: Vec<String>,
     running_chats: Vec<(ModuleId, Option<TabId>)>,
     terminal_job_modules: Vec<ModuleId>,
     pages_with_tasks: Vec<ModuleId>,
@@ -125,6 +126,7 @@ impl Default for Reads {
             editor_cell: None,
             editor_facts: EditorFacts::default(),
             terminal_jobs: 0,
+            terminal_job_names: Vec::new(),
             running_chats: Vec::new(),
             terminal_job_modules: Vec::new(),
             pages_with_tasks: Vec::new(),
@@ -301,6 +303,9 @@ impl FakeHost {
     /// What the move facts of `tab` read as from now on.
     pub fn set_tab_moves(&self, tab: TabId, facts: Result<ChatMoveFacts, String>) {
         self.reads.borrow_mut().tab_moves.insert(tab, facts);
+    }
+    pub fn set_terminal_job_names(&self, names: Vec<String>) {
+        self.reads.borrow_mut().terminal_job_names = names;
     }
     pub fn set_terminal_jobs(&self, jobs: usize) {
         self.reads.borrow_mut().terminal_jobs = jobs;
@@ -565,9 +570,19 @@ impl FakeHost {
                     if !expect.untouched(Some(shell.shell)) {
                         return self.refuse(op);
                     }
-                    let pid = shell.shell.pid.map_or(1, |pid| pid + 1);
+                    let identity = match shell.shell.identity {
+                        Some(ShellIdentity::Server {
+                            generation,
+                            terminal_id,
+                        }) => ShellIdentity::Server {
+                            generation: generation + 1,
+                            terminal_id,
+                        },
+                        Some(ShellIdentity::Local { pid }) => ShellIdentity::Local { pid: pid + 1 },
+                        None => ShellIdentity::Local { pid: 1 },
+                    };
                     let fresh = FakeShell {
-                        shell: ShellStart::of(shell.shell.generation + 1, Some(pid)),
+                        shell: ShellStart::identified(shell.shell.generation + 1, Some(identity)),
                         cwd: Ok(dir.clone()),
                         busy: false,
                     };
@@ -575,7 +590,7 @@ impl FakeHost {
                     self.post(HostEvent::Terminal(TermEvent::Started {
                         win: *win,
                         module: module.clone(),
-                        pid,
+                        identity,
                     }));
                 }
             }
@@ -747,8 +762,18 @@ impl HostReads for FakeHost {
     fn running_chats(&self, _: WinId) -> Vec<(ModuleId, Option<TabId>)> {
         self.reads.borrow().running_chats.clone()
     }
-    fn terminal_job_modules(&self, _: WinId) -> Vec<ModuleId> {
-        self.reads.borrow().terminal_job_modules.clone()
+    fn terminal_job_modules(&self, win: WinId) -> Vec<ModuleId> {
+        let mut modules = self.reads.borrow().terminal_job_modules.clone();
+        modules.extend(
+            self.shells
+                .borrow()
+                .iter()
+                .filter(|((owner, _), shell)| {
+                    *owner == win && shell.busy && matches!(shell.shell.identity, Some(ShellIdentity::Server { .. }))
+                })
+                .map(|((_, module), _)| module.clone()),
+        );
+        modules
     }
     fn pages_with_tasks(&self, _: WinId) -> Vec<ModuleId> {
         self.reads.borrow().pages_with_tasks.clone()
@@ -780,8 +805,19 @@ impl HostReads for FakeHost {
     fn moved_tab_key(&self, _: WinId, tab: TabId) -> Option<crate::window_link::base_tabs::MovedTabKey> {
         self.reads.borrow().moved_tab_keys.get(&tab).cloned()
     }
-    fn terminal_jobs(&self, _: WinId) -> usize {
+    fn terminal_job_names(&self, _: WinId) -> Vec<String> {
+        self.reads.borrow().terminal_job_names.clone()
+    }
+    fn terminal_jobs(&self, win: WinId) -> usize {
         self.reads.borrow().terminal_jobs
+            + self
+                .shells
+                .borrow()
+                .iter()
+                .filter(|((owner, _), shell)| {
+                    *owner == win && shell.busy && matches!(shell.shell.identity, Some(ShellIdentity::Server { .. }))
+                })
+                .count()
     }
     fn tab_can_step(&self, _: WinId, delta: i32) -> bool {
         self.reads.borrow().tab_steps.get(&delta).copied().unwrap_or(false)

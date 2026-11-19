@@ -415,6 +415,30 @@ local function note_what_stood(buf)
   vim.b[buf].eitri_diagnostics_stood = next(stood) and stood or nil
 end
 
+-- Keep one entry per saved path even after its buffer is wiped. Each tab asks with its own cursor.
+local saved = {}
+local generation = 0
+local function saves_since(cursor, prefix)
+  local files = {}
+  for path, at in pairs(saved) do
+    if at > cursor and path:sub(1, #prefix) == prefix then
+      files[#files + 1] = { path, at }
+    end
+  end
+  return files
+end
+_G.__eitri_saves_since = saves_since
+
+vim.api.nvim_create_autocmd({ "BufWritePost", "FileWritePost", "FileAppendPost" }, {
+  group = group,
+  callback = function(args)
+    if args.match == "" then return end
+    local path = vim.uv.fs_realpath(args.match) or vim.fn.fnamemodify(args.match, ":p")
+    generation = math.max(generation + 1, math.floor(vim.uv.hrtime() / 1000))
+    saved[path] = generation
+  end,
+})
+
 vim.api.nvim_create_autocmd({ "BufReadPost", "BufNewFile", "BufWritePost" }, {
   group = group,
   callback = function(args)
@@ -452,6 +476,7 @@ changed()
 -- Undoes this chunk: the autocommands, the timer and the records, which nothing keeps true from here on.
 return function()
   torn = true
+  if _G.__eitri_saves_since == saves_since then _G.__eitri_saves_since = nil end
   pcall(vim.api.nvim_del_augroup_by_id, group)
   if rawget(_G, "__eitri_edit_selection") == edit_selection then
     _G.__eitri_edit_selection = nil

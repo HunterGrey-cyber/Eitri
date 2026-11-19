@@ -324,7 +324,7 @@ enum Stage {
     },
     Writing {
         landing: Landing,
-        report: Receiver<Result<ApplyReport, ProposalRefused>>,
+        report: Receiver<Result<(ApplyReport, Option<String>), ProposalRefused>>,
         since: Instant,
     },
     Over,
@@ -428,9 +428,15 @@ impl ApplyRun {
         };
         let session = cx.session.to_owned();
         let files = to_write(&proposal.files);
+        let hold = cx.memory.with(cx.tab, |m| m.write_hold.clone());
+        let root = cx.root.to_owned();
         self.stage = Stage::Writing {
             landing: Landing::new(cx.memory, cx.tab, &proposal.id),
-            report: lsp::worker(move || writer.apply(&session, &files)),
+            report: lsp::worker(move || {
+                let report = writer.apply(&session, &files)?;
+                let sync_error = hold.and_then(|hold| hold.confirm(&root, &report.written).err());
+                Ok((report, sync_error))
+            }),
             since: Instant::now(),
         };
         Step::PollAfter(STEP_REST)
@@ -441,15 +447,19 @@ impl ApplyRun {
     fn polled(
         &mut self,
         landing: Landing,
-        report: Receiver<Result<ApplyReport, ProposalRefused>>,
+        report: Receiver<Result<(ApplyReport, Option<String>), ProposalRefused>>,
         since: Instant,
     ) -> Step {
         match report.try_recv() {
-            Ok(Ok(report)) => {
+            Ok(Ok((report, sync_error))) => {
                 if report.written.is_empty() {
                     landing.nothing_landed();
                 }
-                answer_of(report)
+                let normal = answer_of(report);
+                if let (Some(error), Step::Done(answer)) = (sync_error, &normal) {
+                    return failure(format!("{}\n{error}", answer.text));
+                }
+                normal
             }
             Ok(Err(refused)) => {
                 landing.nothing_landed();
@@ -870,6 +880,28 @@ mod tests {
     }
 
     #[test]
+    fn an_unconfirmed_remote_proposal_reports_each_laptop_write_and_spends_the_proposal() {
+        let world = World::new("remote-apply");
+        let id = rename_both(&world);
+        world.memory.with(1, |m| {
+            m.write_hold = Some(crate::remote_sync::flush::EditorWriteHold {
+                connection: None,
+                sync_dir: None,
+                host: "example-host".into(),
+            })
+        });
+        let steps = apply(&world, &id, PermissionMode::Manual, allow);
+        let error = the_error(&steps);
+        for path in ["src/a.rs", "src/b.rs"] {
+            assert!(error.contains(&format!(
+                "the write to {path} has not reached example-host yet; it is saved on this laptop"
+            )));
+        }
+        assert_eq!(fs::read(world.root.join("src/b.rs")).unwrap(), b"use bar;\n");
+        assert!(world.memory.proposal(1, &id).is_none());
+    }
+
+    #[test]
     fn bypass_writes_with_no_card() {
         let world = World::new("bypass");
         let id = rename_both(&world);
@@ -1185,7 +1217,11 @@ mod tests {
     }
 
     /// A run left at its write, with `report` as the worker's end.
-    fn writing(world: &World, report: Receiver<Result<ApplyReport, ProposalRefused>>, since: Instant) -> ApplyRun {
+    fn writing(
+        world: &World,
+        report: Receiver<Result<(ApplyReport, Option<String>), ProposalRefused>>,
+        since: Instant,
+    ) -> ApplyRun {
         let id = rename_both(world);
         ApplyRun {
             stage: Stage::Writing {

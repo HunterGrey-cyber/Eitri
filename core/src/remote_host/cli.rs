@@ -1,11 +1,10 @@
 //! `eitri host`: the terminal side of remote projects. `open <host>:<path>` connects (asking about a host key ssh
 //! does not know), probes the server, asks before installing Eitri's server helper, installs and starts it and
-//! writes the project's record, which is what lets a window open the project. `status` reads the records, `list`
+//! records the project and follows its first sync after checking the laptop copy. `status` reads the records, `list`
 //! shows the agents a host runs, `stop` stops the helper daemons there with their agents, `uninstall` removes the
 //! helper and this machine's records of the host. `known-hosts-probe` is ssh's, run as its `KnownHostsCommand`, and
 //! never listed. Everything here blocks: it runs in the `eitri host` process, before and without any toolkit.
 
-use std::cell::RefCell;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -14,9 +13,12 @@ use std::time::{Duration, Instant};
 use agent::ssh::{ChannelLauncher, ConnectError, ControlMaster, DaemonInfo, SshLauncher};
 
 use super::install::{self, InstallPlan};
-use super::window::connecting_text;
-use crate::project_root::REMOTE_PATH_NEEDED;
+use crate::remote_project::terminals::{service_call, terminal_lines, TerminalState};
 use crate::remote_project::{host_key_changed, remote_dev_off, RemoteProject, RemoteProjects};
+use crate::remote_sync::SyncError;
+#[cfg(test)]
+use crate::remote_sync::{actor, status_file};
+use agent::remote_client::terminal_transport::wire;
 
 /// The hidden subcommand ssh runs to record the host key it is checking.
 pub const KNOWN_HOSTS_PROBE: &str = "known-hosts-probe";
@@ -36,9 +38,104 @@ pub fn ssh_dir(xdg_state_home: Option<&std::ffi::OsStr>, home: Option<&std::ffi:
     crate::state_paths::state_subdir(xdg_state_home, home, "ssh")
 }
 
+static CANCELLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub(super) fn interrupted() -> bool {
+    CANCELLED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+extern "C" fn cancel(_: libc::c_int) {
+    CANCELLED.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+fn listen_for_interrupts() -> std::io::Result<()> {
+    // SAFETY: the handler uses only a lock-free atomic. This CLI process exits when the command finishes.
+    unsafe {
+        let mut action: libc::sigaction = std::mem::zeroed();
+        action.sa_flags = libc::SA_RESETHAND;
+        action.sa_sigaction = cancel as *const () as _;
+        libc::sigemptyset(&mut action.sa_mask);
+        for signal in [libc::SIGINT, libc::SIGTERM] {
+            if libc::sigaction(signal, &action, std::ptr::null_mut()) < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Reads the CLI's answer without making cancellation depend on another keystroke.
+pub fn read_answer(answer: &mut String) -> std::io::Result<()> {
+    let (send, receive) = std::sync::mpsc::channel();
+    std::thread::Builder::new()
+        .name("eitri-host-answer".into())
+        .spawn(move || {
+            let mut line = String::new();
+            let result = std::io::stdin().read_line(&mut line).map(|_| line);
+            let _ = send.send(result);
+        })?;
+    while !CANCELLED.load(std::sync::atomic::Ordering::Relaxed) {
+        match receive.recv_timeout(Duration::from_millis(100)) {
+            Ok(line) => {
+                *answer = line?;
+                return Ok(());
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+            Err(_) => return Err(std::io::Error::other("terminal input closed")),
+        }
+    }
+    Err(std::io::ErrorKind::Interrupted.into())
+}
+
 /// The person at the terminal.
 pub trait Terminal {
     fn say(&mut self, line: &str);
+    /// Finishes when a line arrives on stdin. EOF leaves the watch running until sync completes.
+    fn input_line(&mut self) -> std::sync::mpsc::Receiver<()> {
+        let (send, recv) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            if std::io::stdin().read_line(&mut String::new()).is_ok_and(|n| n > 0) {
+                let _ = send.send(());
+            }
+        });
+        recv
+    }
+    /// A root supplied by the caller skips the folder question.
+    fn folder(
+        &mut self,
+        _completion: Option<super::first_connect::FolderCompletion>,
+    ) -> Result<super::first_connect::FolderRequest, String> {
+        Err("no server folder was selected".into())
+    }
+
+    fn watch_first_sync(&mut self) -> std::sync::mpsc::Receiver<()> {
+        self.say("Press Enter to leave sync to the window.");
+        self.input_line()
+    }
+
+    /// A window front end launches the project and returns the child to follow through sync handover.
+    fn tree_ready(
+        &mut self,
+        _project: &RemoteProject,
+        _git_pct: u8,
+    ) -> Result<Option<super::first_connect::WindowLaunch>, String> {
+        Ok(None)
+    }
+
+    fn recorded(&mut self, project: &RemoteProject) {
+        self.say(&format!(
+            "recorded {}:{}; open it with eitri --ssh {} {}",
+            project.host,
+            project.root.display(),
+            project.host,
+            project.root.display()
+        ));
+    }
+
+    fn cancelled(&self) -> bool {
+        interrupted()
+    }
+
     /// A yes-or-no question; only an explicit yes is one.
     fn ask(&mut self, question: &str) -> bool;
 }
@@ -80,8 +177,8 @@ pub trait Reach {
     /// The agents the helper at `helper` runs on the connected host, through a connection pinned to `key`.
     fn agents(&mut self, host: &str, key: &str, helper: &Path) -> Result<Vec<Agent>, String>;
     /// Eitri's Mutagen engine, for the sync verbs and for `stop` (pause) and `uninstall` (terminate).
-    fn sync_engine(&mut self) -> Result<Arc<dyn crate::remote_sync::engine::SyncEngine>, String> {
-        Err("sync is not available here".into())
+    fn sync_engine(&mut self) -> Result<Arc<dyn crate::remote_sync::engine::SyncEngine>, SyncError> {
+        Err(SyncError::Engine("sync is not available here".into()))
     }
     /// A connection to `project`'s helper, for `eitri host sync watch`.
     fn sync_helper(
@@ -94,6 +191,10 @@ pub trait Reach {
     fn sync_settings(&self) -> super::cli_sync::SyncSettings {
         super::cli_sync::SyncSettings::default()
     }
+    /// Terminal inventory of this installation. Reaches without a terminal service have no terminals.
+    fn terminals(&mut self, _host: &str, _key: &str, _helper: &Path) -> Result<wire::ListTerminalsResponse, String> {
+        Ok(wire::ListTerminalsResponse::default())
+    }
 }
 
 /// What a command reads and writes besides its arguments.
@@ -101,7 +202,7 @@ pub struct Context<'a> {
     pub store: &'a RemoteProjects,
     pub reach: &'a mut dyn Reach,
     pub term: &'a mut dyn Terminal,
-    /// `remote_dev.enabled`, read only by `open`.
+    /// `remote_dev.enabled`, checked by `open` and `sync watch`.
     pub remote_dev_enabled: &'a dyn Fn() -> bool,
     /// Seconds since the epoch, for a new record.
     pub now: u64,
@@ -109,6 +210,19 @@ pub struct Context<'a> {
 
 /// Runs `eitri host <args>` and returns its exit code: 0, 1 when it failed, 64 for a command line it does not take.
 pub fn run(args: &[String], cx: &mut Context<'_>) -> i32 {
+    if matches!(args, [command, ..] if command == "open")
+        || matches!(args, [command, verb, ..] if command == "sync" && verb == "watch")
+    {
+        if let Err(error) = listen_for_interrupts() {
+            cx.term
+                .say(&format!("eitri host: could not listen for interrupts: {error}"));
+            return 1;
+        }
+    }
+    run_command(args, cx)
+}
+
+fn run_command(args: &[String], cx: &mut Context<'_>) -> i32 {
     match args.first().map(String::as_str) {
         Some("sync") => return super::cli_sync::run_sync(&args[1..], cx),
         Some("git") => return super::cli_sync::run_git(&args[1..], cx),
@@ -151,141 +265,18 @@ pub fn parse_spec(spec: &str) -> Result<(String, PathBuf), String> {
         .ok_or_else(|| format!("{spec:?}: expected <host>:<absolute path>"))?;
     let (host, path) = (&spec[..split], &spec[split + 1..]);
     agent::ssh::validate_host(host).map_err(|why| format!("{host:?}: {why}"))?;
-    let normal = path == "/"
-        || path[1..]
-            .split('/')
-            .all(|part| !part.is_empty() && part != "." && part != "..");
-    if !normal {
-        return Err(format!(
-            "{path:?}: the project's path must be absolute, with no trailing slash, `.` or `..`"
-        ));
-    }
-    Ok((host.to_owned(), PathBuf::from(path)))
+    let root = PathBuf::from(path);
+    super::first_connect::validate_root(&root)?;
+    Ok((host.to_owned(), root))
 }
 
-/// Connects to `host`, asking first about a host key ssh does not know: on yes the key is added to the person's
-/// known-hosts file and the connection must then show that same key.
-fn connect_asking(cx: &mut Context<'_>, host: &str) -> Result<String, String> {
-    match cx.reach.connect(host) {
-        Ok(key) => Ok(key),
-        Err(refusal) if refusal.stderr_line.trim() == "Host key verification failed." => {
-            // A changed key is refused again here, before any question.
-            let contact = cx.reach.first_contact(host)?;
-            let question = format!(
-                "{host} is not in your known hosts. Its {} host key has the fingerprint {}. Add it to your known \
-                 hosts and connect? [y/N]",
-                contact.key_type, contact.sha256
-            );
-            if !cx.term.ask(&question) {
-                return Err(format!(
-                    "not connected to {host}: its host key was not accepted; nothing was written"
-                ));
-            }
-            let shown = contact.sha256.clone();
-            (contact.accept)()?;
-            let key = cx
-                .reach
-                .connect(host)
-                .map_err(|e| format!("connecting to {host}: {e}"))?;
-            if key != shown {
-                return Err(format!(
-                    "{host} showed the host key {key} after {shown} was accepted; nothing was recorded"
-                ));
-            }
-            Ok(key)
-        }
-        Err(refusal) => Err(format!("connecting to {host}: {refusal}")),
-    }
-}
-
-/// `open <host>:<path>`: connect, probe, consent, install, start, record.
 fn open(cx: &mut Context<'_>, spec: &str) -> Result<(), String> {
     if !(cx.remote_dev_enabled)() {
         return Err(remote_dev_off("eitri host open"));
     }
     let (host, root) = parse_spec(spec)?;
-    cx.term.say(&connecting_text(&host));
-    let key = connect_asking(cx, &host)?;
-    let earlier = cx.store.find(&root).map_err(|e| e.to_string())?;
-    // The record of this root on the same host follows a changed key, its queued stops and saved tabs with it; a record
-    // of this root on another host is that host's, and is replaced only after a yes.
-    let earlier = match earlier {
-        Some(earlier) if earlier.host != host => {
-            let question = format!(
-                "{} is recorded as a project on {}. Record it on {host} instead? This machine would forget that record \
-                 and its {} queued agent stop(s) there. [y/N]",
-                root.display(),
-                earlier.host,
-                earlier.queued_stops.len()
-            );
-            if !cx.term.ask(&question) {
-                return Err(format!(
-                    "nothing was changed: {} stays recorded on {}",
-                    root.display(),
-                    earlier.host
-                ));
-            }
-            None
-        }
-        earlier => earlier,
-    };
-    let mut plan = cx.reach.plan()?;
-    for warning in plan.warnings() {
-        cx.term.say(warning);
-    }
-    let mut record = cx.store.host(&key).map_err(|e| e.to_string())?;
-    if !record.as_ref().is_some_and(|record| record.consented) {
-        plan.check_upload_space().map_err(|e| e.to_string())?;
-        if !cx.term.ask(&install::consent_text(&plan, &host)) {
-            return Err(format!("nothing was installed on {host} and nothing was recorded"));
-        }
-        plan.record_consent(cx.store, &host, &key).map_err(|e| e.to_string())?;
-        record = cx.store.host(&key).map_err(|e| e.to_string())?;
-    }
-    let record = record.ok_or_else(|| format!("the installation record for {host} disappeared"))?;
-    let project = RemoteProject {
-        version: 1,
-        host: host.clone(),
-        host_key_sha256: key.clone(),
-        root: root.clone(),
-        helper_version: plan.version().to_owned(),
-        sync: None,
-        created_at: earlier.as_ref().map_or(cx.now, |earlier| earlier.created_at),
-        queued_stops: Vec::new(),
-    };
-    let launcher = cx.reach.launcher(&plan.install_path().join("bin/eitri-server"));
-    let term = RefCell::new(&mut *cx.term);
-    let band = |line: String| {
-        // A terminal gets the upload in tens.
-        let tenth = line
-            .strip_suffix(" %")
-            .and_then(|rest| rest.rsplit_once(' '))
-            .and_then(|(_, n)| n.parse::<u64>().ok())
-            .is_none_or(|percent| percent % 10 == 0);
-        if tenth {
-            term.borrow_mut().say(&line);
-        }
-    };
-    super::window::start_server(launcher.as_ref(), cx.store, &project, &record, &mut plan, &band, |_| {
-        Ok(())
-    })?;
-    let project = cx.store.save_opened(&project).map_err(|e| e.to_string())?;
-    if let Some(earlier) = earlier.filter(|earlier| earlier.host_key_sha256 != key) {
-        let tabs = crate::remote_project::carry_tabs_to_key(cx.store, &root, &earlier.host_key_sha256, &key);
-        cx.term.say(&format!(
-            "{}{}",
-            host_key_changed(&host, &earlier.host_key_sha256, &key),
-            crate::remote_project::carried_text(tabs, project.queued_stops.len())
-        ));
-    }
-    cx.term.say(&format!(
-        "recorded {host}:{}; open it with eitri --ssh {host} {}",
-        root.display(),
-        root.display()
-    ));
-    if !root.is_dir() {
-        cx.term.say(&format!("{}: {REMOTE_PATH_NEEDED}", root.display()));
-    }
+    super::first_connect::run(cx, host, Some(root))?;
+    cx.term.say("sync continues when you open the window");
     Ok(())
 }
 
@@ -328,6 +319,26 @@ fn status(cx: &mut Context<'_>, host: Option<&str>) -> Result<(), String> {
             Err(e) => format!("  the installation record cannot be read: {e}"),
         };
         cx.term.say(&installation);
+        let entries = match cx.store.terminals().record(&project.host_key_sha256, &project.root) {
+            Ok(record) => record.entries,
+            Err(e) => {
+                cx.term.say(&format!("  terminal record cannot be read: {e}"));
+                Vec::new()
+            }
+        };
+        for entry in entries {
+            let state = match entry.state {
+                TerminalState::Opening => "opening",
+                TerminalState::Open => "open",
+                TerminalState::StopQueued => "stop queued",
+            };
+            cx.term.say(&format!(
+                "  terminal {}  window {}  module {}  {state}",
+                crate::onboarding::display::display_text(entry.terminal_id.as_deref().unwrap_or(&entry.command_id)),
+                entry.slot,
+                crate::onboarding::display::display_text(&entry.module)
+            ));
+        }
         if !project.queued_stops.is_empty() {
             cx.term.say(&format!(
                 "  {} agent stop(s) wait until {} can be reached",
@@ -572,6 +583,20 @@ fn list_one(cx: &mut Context<'_>, host: &str) -> Result<(), String> {
             continue;
         };
         let helper = reached.record.data_dir.join(installation).join("bin/eitri-server");
+        match cx.reach.terminals(host, &reached.key, &helper) {
+            Ok(terminals) => {
+                for line in terminal_lines(&terminals) {
+                    cx.term.say(&format!("[{installation}] {line}"));
+                }
+            }
+            Err(why) => {
+                cx.term.say(&format!(
+                    "terminals of Eitri server {} ({installation}) not listed: {why}",
+                    daemon.version
+                ));
+                failures.push(installation.clone());
+            }
+        }
         match cx.reach.agents(host, &reached.key, &helper) {
             Ok(agents) => {
                 let mut lines = agent_lines(host, &agents);
@@ -743,11 +768,21 @@ fn recover_recorded(cx: &mut Context<'_>, host: &str, reached: &Reached, before:
     recovery
 }
 
+/// Several failures, each on a line of its own: all but the last are said here as `run_command` says an error, and
+/// the last is returned for it to say. A line break inside one line would reach the terminal escaped.
+fn say_all_but_last(cx: &mut Context<'_>, mut failures: Vec<String>) -> String {
+    let last = failures.pop().unwrap_or_default();
+    for failure in failures {
+        cx.term.say(&format!("eitri host: {failure}"));
+    }
+    last
+}
+
 /// `stop <host>`: every helper daemon on `host` this build may stop, with the agents each runs. Returns whether a
 /// daemon was left running (a newer Eitri's).
 fn stop(cx: &mut Context<'_>, host: &str) -> Result<bool, String> {
-    super::cli_sync::pause_host_sessions(cx, host);
     let reached = reach_host(cx, host)?;
+    super::cli_sync::pause_host_sessions(cx, &reached.key, "stop", host);
     let before = running(cx, &reached);
     let mut recovery = recover_recorded(
         cx,
@@ -775,11 +810,21 @@ fn stop(cx: &mut Context<'_>, host: &str) -> Result<bool, String> {
         Ok(stopped) => stopped,
         Err(why) => {
             recovery.failures.push(why);
-            return Err(recovery.failures.join("\n"));
+            return Err(say_all_but_last(cx, recovery.failures));
         }
     };
     if !recovery.failures.is_empty() {
-        return Err(recovery.failures.join("\n"));
+        return Err(say_all_but_last(cx, recovery.failures));
+    }
+    if !stopped.left {
+        for notice in cx
+            .store
+            .terminals()
+            .clear_host(&reached.key)
+            .map_err(|e| e.to_string())?
+        {
+            cx.term.say(&notice);
+        }
     }
     Ok(stopped.left)
 }
@@ -845,8 +890,8 @@ fn stop_running(
 /// up to `wait` for stopped daemons to release their locks; uncertain sidecars retain their records and helper.
 fn uninstall(cx: &mut Context<'_>, host: &str, wait: Duration) -> Result<(), String> {
     // Paused first, so nothing syncs while the helper goes; terminated once it is gone.
-    super::cli_sync::pause_host_sessions(cx, host);
     let reached = reach_host(cx, host)?;
+    super::cli_sync::pause_host_sessions(cx, &reached.key, "uninstall", host);
     let before = running(cx, &reached);
     let recovery = recover_recorded(
         cx,
@@ -914,7 +959,7 @@ fn uninstall(cx: &mut Context<'_>, host: &str, wait: Duration) -> Result<(), Str
                     std::thread::sleep(Duration::from_millis(250));
                 }
                 Err(install::InstallError::SidecarsStillRun(why)) => {
-                    return Err(format!("recorded agents on {host} may still run ({why}); stop the run key with the Eitri that installed it, or kill <pid> for an alive record; if no checked checker is installed, open a project with eitri host open {host}:/path/to/project to reinstall the helper"));
+                    return Err(format!("recorded agents or terminals on {host} may still run ({why}); stop the run key with the Eitri that installed it, or kill <pid> for an alive record; if no checked checker is installed, open a project with eitri host open {host}:/path/to/project to reinstall the helper"));
                 }
                 Err(e) => return Err(format!("removing Eitri server from {host}: {e}")),
             }
@@ -926,6 +971,14 @@ fn uninstall(cx: &mut Context<'_>, host: &str, wait: Duration) -> Result<(), Str
     })?;
     super::cli_sync::terminate_host_sessions(cx, host, &reached.key);
     let mut forgotten = 0;
+    for notice in cx
+        .store
+        .terminals()
+        .clear_host(&reached.key)
+        .map_err(|e| e.to_string())?
+    {
+        cx.term.say(&notice);
+    }
     for project in &reached.projects {
         if cx.store.forget(&project.root).map_err(|e| e.to_string())? {
             forgotten += 1;
@@ -984,6 +1037,23 @@ impl SshReach {
 }
 
 impl Reach for SshReach {
+    fn terminals(&mut self, host: &str, key: &str, helper: &Path) -> Result<wire::ListTerminalsResponse, String> {
+        let client = agent::remote_client::HelperClient::connect(self.launcher(helper), host, Some(key))
+            .map_err(|e| e.to_string())?;
+        service_call(&client, |mut service| async move {
+            match service.list_terminals(wire::ListTerminalsRequest {}).await {
+                Ok(response) => Ok(response.into_inner()),
+                Err(status)
+                    if status.code() == agent::remote_client::terminal_transport::tonic::Code::Unimplemented =>
+                {
+                    Ok(wire::ListTerminalsResponse::default())
+                }
+                Err(status) => Err(status),
+            }
+        })
+        .map_err(|e| e.to_string())
+    }
+
     fn connect(&mut self, host: &str) -> Result<String, ConnectError> {
         let master = ControlMaster::ensure(host, &self.ssh_dir, &self.exe)?;
         let key = master.verified_host_key().map_err(ConnectError::from_io)?;
@@ -1022,19 +1092,17 @@ impl Reach for SshReach {
         install::plan_connection(&probe, &sidecar.path).map_err(|e| e.to_string())
     }
 
-    fn sync_engine(&mut self) -> Result<Arc<dyn crate::remote_sync::engine::SyncEngine>, String> {
+    fn sync_engine(&mut self) -> Result<Arc<dyn crate::remote_sync::engine::SyncEngine>, SyncError> {
         if let Some(engine) = &self.engine {
             return Ok(engine.clone());
         }
-        let state_home = self.state_home()?;
-        let engine: Arc<dyn crate::remote_sync::engine::SyncEngine> = Arc::new(
-            crate::remote_sync::mutagen::MutagenEngine::open(
+        let state_home = self.state_home().map_err(SyncError::Io)?;
+        let engine: Arc<dyn crate::remote_sync::engine::SyncEngine> =
+            Arc::new(crate::remote_sync::mutagen::MutagenEngine::open(
                 &state_home,
                 self.sync.mutagen.as_deref(),
                 &state_home.join("eitri/mutagen/transport"),
-            )
-            .map_err(|error| error.to_string())?,
-        );
+            )?);
         self.engine = Some(engine.clone());
         Ok(engine)
     }
@@ -1089,6 +1157,8 @@ impl Reach for SshReach {
 #[cfg(test)]
 mod tests {
     #[cfg(target_os = "linux")]
+    use super::super::first_connect::MUTAGEN_NEEDED;
+    #[cfg(target_os = "linux")]
     use super::super::window::installed;
     use super::*;
     use crate::remote_project::RemoteHost;
@@ -1104,11 +1174,23 @@ mod tests {
         said: Vec<String>,
         asked: Vec<String>,
         on_ask: Option<Box<dyn FnMut()>>,
+        on_say: Option<Box<dyn FnMut(&str)>>,
+        wait_for_sync: bool,
     }
 
     impl Terminal for Scripted {
+        fn input_line(&mut self) -> std::sync::mpsc::Receiver<()> {
+            let (send, recv) = std::sync::mpsc::channel();
+            if !self.wait_for_sync {
+                let _ = send.send(());
+            }
+            recv
+        }
         fn say(&mut self, line: &str) {
             self.said.push(line.to_owned());
+            if let Some(hook) = &mut self.on_say {
+                hook(line);
+            }
         }
         fn ask(&mut self, question: &str) -> bool {
             self.asked.push(question.to_owned());
@@ -1119,9 +1201,14 @@ mod tests {
         }
     }
 
+    use crate::remote_sync::actor::tests::{FakeEngine, FakeHelper};
+
     /// A host reached without ssh: a key ssh does not know until it is accepted, and the steps and helper of a local
     /// fixture.
     struct Fixture {
+        engine: Arc<FakeEngine>,
+        helper: Arc<FakeHelper>,
+        engine_error: Option<SyncError>,
         root: PathBuf,
         known: Rc<Cell<bool>>,
         connects: usize,
@@ -1131,6 +1218,20 @@ mod tests {
     }
 
     impl Reach for Fixture {
+        fn sync_engine(&mut self) -> Result<Arc<dyn crate::remote_sync::engine::SyncEngine>, SyncError> {
+            if let Some(error) = &self.engine_error {
+                Err(error.clone())
+            } else {
+                Ok(self.engine.clone())
+            }
+        }
+        fn sync_helper(
+            &mut self,
+            _: &RemoteProject,
+        ) -> Result<Arc<dyn crate::remote_sync::sessions::SyncHelper>, String> {
+            Ok(self.helper.clone())
+        }
+
         fn connect(&mut self, host: &str) -> Result<String, ConnectError> {
             if host != "example-host" {
                 return Err("unknown host".to_owned().into());
@@ -1175,7 +1276,11 @@ mod tests {
 
     fn fixture(root: &Path, known: bool) -> Fixture {
         let (_, launcher) = install::test_plan(root, "open");
+        let log = Arc::default();
         Fixture {
+            engine: FakeEngine::new(Arc::clone(&log), &root.join("project")),
+            helper: FakeHelper::new(log),
+            engine_error: None,
             root: root.to_path_buf(),
             known: Rc::new(Cell::new(known)),
             connects: 0,
@@ -1185,10 +1290,811 @@ mod tests {
         }
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn window_flow_asks_the_same_questions_as_host_open() {
+        use super::super::first_connect::{FolderCompletion, FolderRequest, WindowLaunch};
+        use crate::remote_sync::{
+            engine::{session_name, Role, SyncState},
+            SyncKey,
+        };
+
+        struct Window {
+            root: PathBuf,
+            prompt: Scripted,
+            chose_folder: bool,
+            opened: bool,
+        }
+
+        impl Terminal for Window {
+            fn say(&mut self, line: &str) {
+                self.prompt.say(line);
+            }
+
+            fn ask(&mut self, question: &str) -> bool {
+                self.prompt.ask(question)
+            }
+
+            fn folder(&mut self, completion: Option<FolderCompletion>) -> Result<FolderRequest, String> {
+                assert!(completion.is_none());
+                assert_eq!(self.prompt.asked.len(), 1, "only the host key precedes a typed folder");
+                self.chose_folder = true;
+                Ok(FolderRequest::Open(self.root.clone()))
+            }
+
+            fn watch_first_sync(&mut self) -> std::sync::mpsc::Receiver<()> {
+                self.prompt.input_line()
+            }
+
+            fn tree_ready(&mut self, project: &RemoteProject, git_pct: u8) -> Result<Option<WindowLaunch>, String> {
+                assert_eq!(project.root, self.root);
+                assert_eq!(git_pct, 0);
+                self.opened = true;
+                let (exited, ended) = std::sync::mpsc::channel();
+                exited.send(Some(0)).unwrap();
+                Ok(Some(WindowLaunch { pid: 0, ended }))
+            }
+        }
+
+        let server = ScratchDir::new("remote", "question-server");
+        let run = |scratch: &Path, window: bool, other_host: bool| {
+            let root = scratch.join("project");
+            std::fs::create_dir(&root).unwrap();
+            std::fs::write(root.join("local-work"), b"saved here").unwrap();
+            let store = RemoteProjects::new(Some(scratch.as_os_str()), None);
+            if other_host {
+                let mut earlier = project_record("older");
+                earlier.host = "previous-host".into();
+                earlier.root = root.clone();
+                store.save(&earlier).unwrap();
+            }
+            let mut reach = fixture(&server, false);
+            let tree = session_name(&SyncKey::new("SHA256:example", &root), Role::Tree);
+            let engine = reach.engine.clone();
+            let prompt = Scripted {
+                wait_for_sync: window,
+                on_say: window.then(|| {
+                    let finish_tree: Box<dyn FnMut(&str)> = Box::new(move |line| {
+                        if line.starts_with("syncing ") {
+                            crate::remote_sync::actor::tests::wait(|| engine.status_of(&tree).is_some());
+                            let mut status = engine.status_of(&tree).unwrap();
+                            status.state = SyncState::Watching;
+                            status.successful_cycles = 1;
+                            engine.push(status);
+                        }
+                    });
+                    finish_tree
+                }),
+                answers: [true, true, true, true].into(),
+                ..Default::default()
+            };
+            let result = if window {
+                let mut window = Window {
+                    root,
+                    prompt,
+                    chose_folder: false,
+                    opened: false,
+                };
+                super::super::first_connect::run(
+                    &mut Context {
+                        store: &store,
+                        reach: &mut reach,
+                        term: &mut window,
+                        remote_dev_enabled: &|| true,
+                        now: 1_700_000_000,
+                    },
+                    "example-host".into(),
+                    None,
+                )
+                .unwrap();
+                assert!(window.chose_folder && window.opened);
+                window.prompt
+            } else {
+                let mut cli = prompt;
+                assert_eq!(
+                    run_with(
+                        &store,
+                        &mut reach,
+                        &mut cli,
+                        &["open", &format!("example-host:{}", root.display())]
+                    ),
+                    0
+                );
+                cli
+            };
+            assert!(result.said.iter().any(|line| line.starts_with("Server: Linux x86_64")));
+            assert!(result.said.iter().any(|line| line.starts_with("expected size: ")));
+            result
+                .asked
+                .iter()
+                .map(|line| line.replace(scratch.to_str().unwrap(), "/srv"))
+                .collect::<Vec<_>>()
+        };
+
+        let cli = ScratchDir::new("remote", "terminal-questions");
+        let window = ScratchDir::new("remote", "window-questions");
+        let questions = run(&cli, false, false);
+        assert_eq!(questions, run(&window, true, false));
+        assert_eq!(questions.len(), 3);
+        assert!(questions[0].contains("SHA256:example"));
+        assert!(questions[1].starts_with("Install unsigned build"));
+        assert!(questions[2].starts_with("Move /srv/project to"));
+
+        let cli = ScratchDir::new("remote", "terminal-replacement-questions");
+        let window = ScratchDir::new("remote", "window-replacement-questions");
+        let questions = run(&cli, false, true);
+        assert_eq!(questions, run(&window, true, true));
+        assert_eq!(questions.len(), 4);
+        assert!(questions[1].contains("recorded as a project on previous-host. Record it on example-host instead?"));
+        assert!(questions[2].starts_with("Install unsigned build"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn aborted_reopen_withdraws_unused_setup_before_the_first_question() {
+        let scratch = ScratchDir::new("remote", "unused-setup");
+        let mut project = project_record("old");
+        project.root = scratch.join("project");
+        project.set_sync_record(&crate::remote_project::SyncRecord {
+            engine: "mutagen".into(),
+            set_up: true,
+            host_key_sha256: project.host_key_sha256.clone(),
+            ..Default::default()
+        });
+        let store = RemoteProjects::new(Some(scratch.as_os_str()), None);
+        store.save(&project).unwrap();
+        let during = RemoteProjects::new(Some(scratch.as_os_str()), None);
+        let root = project.root.clone();
+        let mut term = Scripted {
+            on_ask: Some(Box::new(move || {
+                let record = during.find(&root).unwrap().unwrap().sync_record().unwrap().unwrap();
+                assert!(!record.set_up && !record.has_sessions());
+            })),
+            ..Default::default()
+        };
+        let mut reach = fixture(&scratch, false);
+        let spec = format!("example-host:{}", project.root.display());
+        assert_eq!(run_with(&store, &mut reach, &mut term, &["open", &spec]), 1);
+        assert_eq!(term.asked.len(), 1);
+        assert!(
+            !store
+                .find(&project.root)
+                .unwrap()
+                .unwrap()
+                .sync_record()
+                .unwrap()
+                .unwrap()
+                .set_up
+        );
+        assert!(reach.engine.calls("create").is_empty());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_marker_refusal_keeps_the_existing_tree_and_leaves_sync_disabled() {
+        let scratch = ScratchDir::new("remote", "refused-setup");
+        let root = scratch.join("project");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::write(root.join("local-work"), b"saved here").unwrap();
+        std::fs::create_dir(scratch.join(".stfolder")).unwrap();
+        let store = RemoteProjects::new(Some(scratch.as_os_str()), None);
+        let mut reach = fixture(&scratch, true);
+        let mut term = Scripted {
+            answers: [true, true].into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            run_with(
+                &store,
+                &mut reach,
+                &mut term,
+                &["open", &format!("example-host:{}", root.display())]
+            ),
+            1
+        );
+        // Each line is said on its own: a line break inside one would reach the terminal escaped.
+        assert!(term.said.iter().all(|line| !line.contains('\n')), "{:?}", term.said);
+        let at = term
+            .said
+            .iter()
+            .position(|line| line.ends_with(".stignore:"))
+            .unwrap_or_else(|| panic!("{:?}", term.said));
+        assert_eq!(term.said[at + 1], "/project");
+        assert!(term
+            .said
+            .last()
+            .unwrap()
+            .contains("other devices stop receiving updates"));
+        assert!(term.said.iter().any(|s| s.contains("1 files, 10 bytes")));
+        assert!(
+            store.find(&root).unwrap().is_none(),
+            "the record this run made is taken back"
+        );
+        assert!(reach.engine.calls("create").is_empty());
+        assert_eq!(std::fs::read(root.join("local-work")).unwrap(), b"saved here");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn missing_mutagen_explains_and_stops() {
+        let scratch = ScratchDir::new("remote", "no-engine");
+        let root = scratch.join("project");
+        let store = RemoteProjects::new(Some(scratch.as_os_str()), None);
+        let mut reach = fixture(&scratch, true);
+        reach.engine_error = Some(SyncError::Unsupported("Mutagen is not installed".into()));
+        let mut term = Scripted {
+            answers: [true].into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            run_with(
+                &store,
+                &mut reach,
+                &mut term,
+                &["open", &format!("example-host:{}", root.display())]
+            ),
+            1
+        );
+        assert!(term.said.last().unwrap().contains(MUTAGEN_NEEDED));
+        assert!(term.said.iter().all(|line| !line.contains('\n')), "{:?}", term.said);
+        assert!(term.said.iter().any(|line| line.ends_with("Mutagen is not installed")));
+        assert!(
+            store.find(&root).unwrap().is_none(),
+            "the record this run made is taken back"
+        );
+        assert!(reach.engine.calls("create").is_empty());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn engine_setup_errors_keep_their_own_diagnostic() {
+        let scratch = ScratchDir::new("remote", "engine-error");
+        let root = scratch.join("project");
+        let store = RemoteProjects::new(Some(scratch.as_os_str()), None);
+        let mut reach = fixture(&scratch, true);
+        reach.engine_error = Some(SyncError::Io("cannot write transport scripts".into()));
+        let mut term = Scripted {
+            answers: [true].into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            run_with(
+                &store,
+                &mut reach,
+                &mut term,
+                &["open", &format!("example-host:{}", root.display())]
+            ),
+            1
+        );
+        assert_eq!(term.said.last().unwrap(), "eitri host: cannot write transport scripts");
+        assert!(!term.said.iter().any(|line| line.contains(MUTAGEN_NEEDED)));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_held_root_lock_refuses_the_move_before_consent_even_without_a_sync_record() {
+        let scratch = ScratchDir::new("remote", "held-root");
+        let root = scratch.join("project");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::write(root.join("work"), b"original").unwrap();
+        let locks = actor::lock_dir(&scratch, &root);
+        status_file::prepare_dir(&scratch, &locks).unwrap();
+        let held = agent::private_fs::PrivateLock::open(&locks.join("lock")).unwrap();
+        assert!(held.try_lock().unwrap());
+        let store = RemoteProjects::new(Some(scratch.as_os_str()), None);
+        let mut old = project_record("old");
+        old.root = root.clone();
+        old.host = "previous-host".into();
+        store.save(&old).unwrap();
+        let mut reach = fixture(&scratch, true);
+        let mut term = Scripted {
+            answers: [true, true].into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            run_with(
+                &store,
+                &mut reach,
+                &mut term,
+                &["open", &format!("example-host:{}", root.display())]
+            ),
+            1
+        );
+        assert!(term
+            .said
+            .last()
+            .unwrap()
+            .contains("close the window or sync watch using"));
+        assert!(term.asked.is_empty());
+        assert_eq!(store.find(&root).unwrap().unwrap().host, old.host);
+        assert_eq!(std::fs::read(root.join("work")).unwrap(), b"original");
+        assert!(reach.engine.calls("create").is_empty());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn failed_attachment_or_watch_withdraws_setup_without_a_session() {
+        for lock_name in ["lock", "action.lock"] {
+            let scratch = ScratchDir::new("remote", "attach-fails");
+            let root = scratch.join("project");
+            let store = RemoteProjects::new(Some(scratch.as_os_str()), None);
+            let mut reach = fixture(&scratch, true);
+            let blocked_lock = actor::lock_dir(&scratch, &root).join(lock_name);
+            let mut term = Scripted {
+                answers: [true].into(),
+                wait_for_sync: true,
+                on_say: Some(Box::new(move |line| {
+                    if line.starts_with("expected size:") {
+                        std::fs::create_dir(&blocked_lock).unwrap();
+                    }
+                })),
+                ..Default::default()
+            };
+            assert_eq!(
+                run_with(
+                    &store,
+                    &mut reach,
+                    &mut term,
+                    &["open", &format!("example-host:{}", root.display())]
+                ),
+                1
+            );
+            let record = store.find(&root).unwrap().unwrap().sync_record().unwrap().unwrap();
+            assert!(!record.set_up && !record.has_sessions());
+            assert!(term.said.iter().any(|s| s.contains("Cleared sync setup")));
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn reopen_of_own_mirror_is_not_moved_aside() {
+        let scratch = ScratchDir::new("remote", "own");
+        let root = scratch.join("project");
+        let store = RemoteProjects::new(Some(scratch.as_os_str()), None);
+        let mut reach = fixture(&scratch, true);
+        let spec = format!("example-host:{}", root.display());
+        let mut term = Scripted {
+            answers: [true].into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            run_with(&store, &mut reach, &mut term, &["open", &spec]),
+            0,
+            "{:?}",
+            term.said
+        );
+        let creates = reach.engine.calls("create");
+        assert_eq!(creates.len(), 2);
+        std::fs::write(root.join("work"), b"still here").unwrap();
+        let mut term = Scripted::default();
+        assert_eq!(
+            run_with(&store, &mut reach, &mut term, &["open", &spec]),
+            0,
+            "{:?}",
+            term.said
+        );
+        assert!(term.asked.is_empty());
+        assert_eq!(std::fs::read(root.join("work")).unwrap(), b"still here");
+        assert_eq!(reach.engine.calls("create"), creates);
+        assert!(!reach.engine.calls("resume").is_empty());
+    }
+
+    /// The record names the folder first connect prepared: another folder put at the same path is not the mirror,
+    /// so reopening asks the move question and starts from a new baseline instead of resuming the old sessions.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_folder_replaced_at_a_mirror_path_is_asked_about_and_starts_afresh() {
+        let scratch = ScratchDir::new("remote", "replaced");
+        let root = scratch.join("project");
+        let store = RemoteProjects::new(Some(scratch.as_os_str()), None);
+        let mut reach = fixture(&scratch, true);
+        let spec = format!("example-host:{}", root.display());
+        let mut term = Scripted {
+            answers: [true].into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            run_with(&store, &mut reach, &mut term, &["open", &spec]),
+            0,
+            "{:?}",
+            term.said
+        );
+        let first = store.find(&root).unwrap().unwrap().sync_record().unwrap().unwrap();
+        assert!(first.root_identity.is_some() && first.has_sessions());
+        let aside = scratch.join("moved-mirror");
+        std::fs::rename(&root, &aside).unwrap();
+        std::fs::create_dir(&root).unwrap();
+        std::fs::write(root.join("clone.txt"), b"a fresh clone").unwrap();
+        let terminated = reach.engine.calls("terminate").len();
+        let mut term = Scripted {
+            answers: [true].into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            run_with(&store, &mut reach, &mut term, &["open", &spec]),
+            0,
+            "{:?}",
+            term.said
+        );
+        assert_eq!(term.asked.len(), 1, "{:?}", term.asked);
+        assert!(
+            term.asked[0].starts_with(&format!("Move {} to ", root.display())),
+            "{:?}",
+            term.asked
+        );
+        assert!(
+            reach.engine.calls("terminate").len() > terminated,
+            "the old sessions were resumed"
+        );
+        let kept = term
+            .said
+            .iter()
+            .find_map(|line| line.strip_prefix("Kept the existing copy at "))
+            .unwrap();
+        assert_eq!(
+            std::fs::read(Path::new(kept).join("clone.txt")).unwrap(),
+            b"a fresh clone"
+        );
+        let record = store.find(&root).unwrap().unwrap().sync_record().unwrap().unwrap();
+        assert_eq!(
+            record.root_identity,
+            crate::remote_sync::mirror_identity::identity(&root)
+        );
+        assert_ne!(record.root_identity, first.root_identity);
+    }
+
+    /// A record an earlier build wrote with sessions and no folder: the person says whether this is still the copy.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_mirror_set_up_without_a_folder_identity_is_confirmed_by_the_person() {
+        for confirmed in [true, false] {
+            let scratch = ScratchDir::new("remote", "unconfirmed");
+            let root = scratch.join("project");
+            let store = RemoteProjects::new(Some(scratch.as_os_str()), None);
+            let mut reach = fixture(&scratch, true);
+            let spec = format!("example-host:{}", root.display());
+            let mut term = Scripted {
+                answers: [true].into(),
+                ..Default::default()
+            };
+            assert_eq!(
+                run_with(&store, &mut reach, &mut term, &["open", &spec]),
+                0,
+                "{:?}",
+                term.said
+            );
+            std::fs::write(root.join("work"), b"synced").unwrap();
+            // The fake engine brings no history: an empty replica would stop the listing before the question.
+            std::fs::remove_dir_all(root.join(".git")).unwrap();
+            store
+                .update(&root, |project| {
+                    let mut record = project.sync_record().unwrap().unwrap();
+                    record.root_identity = None;
+                    project.set_sync_record(&record);
+                })
+                .unwrap();
+            let mut term = Scripted {
+                answers: [confirmed, false].into(),
+                ..Default::default()
+            };
+            let code = run_with(&store, &mut reach, &mut term, &["open", &spec]);
+            assert!(
+                term.asked[0].contains("did not note which folder it synced"),
+                "{:?}",
+                term.asked
+            );
+            let record = store.find(&root).unwrap().unwrap().sync_record().unwrap().unwrap();
+            if confirmed {
+                assert_eq!(code, 0, "{:?}", term.said);
+                assert_eq!(term.asked.len(), 1);
+                assert_eq!(
+                    record.root_identity,
+                    crate::remote_sync::mirror_identity::identity(&root)
+                );
+            } else {
+                // No: the move question, declined, changes nothing.
+                assert_eq!(code, 1);
+                assert!(term.asked[1].starts_with("Move "), "{:?}", term.asked);
+                assert_eq!(record.root_identity, None);
+                assert!(record.has_sessions());
+            }
+            assert_eq!(std::fs::read(root.join("work")).unwrap(), b"synced");
+        }
+    }
+
+    /// A folder inside another recorded mirror, or holding one, is refused before any connection or question.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_folder_nested_with_another_mirror_is_refused_before_anything() {
+        for (recorded, opened) in [("x/a", "x/a/b"), ("x/a", "x")] {
+            let scratch = ScratchDir::new("remote", "nested");
+            let store = RemoteProjects::new(Some(scratch.as_os_str()), None);
+            let mut other = project_record("old");
+            other.host = "host-a".into();
+            other.root = scratch.join(recorded);
+            other.set_sync_record(&crate::remote_project::SyncRecord {
+                engine: "mutagen".into(),
+                set_up: true,
+                host_key_sha256: other.host_key_sha256.clone(),
+                ..Default::default()
+            });
+            store.save(&other).unwrap();
+            let opened = scratch.join(opened);
+            let mut reach = fixture(&scratch, true);
+            let mut term = Scripted::default();
+            let spec = format!("example-host:{}", opened.display());
+            assert_eq!(run_with(&store, &mut reach, &mut term, &["open", &spec]), 1);
+            let said = term.said.last().unwrap();
+            assert!(said.contains(" is inside ") && said.contains("host-a"), "{said}");
+            assert!(term.asked.is_empty());
+            assert_eq!(reach.connects, 0);
+            assert!(store.find(&opened).unwrap().is_none());
+            assert!(!opened.exists());
+        }
+    }
+
+    /// A first connect that stops before sync is set up takes back the record it made, so the person's own folder
+    /// does not read as a remote project; a record that was there before stays.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_declined_move_leaves_no_record_behind_and_an_earlier_one_untouched() {
+        for earlier in [false, true] {
+            let scratch = ScratchDir::new("remote", "declined");
+            let root = scratch.join("project");
+            std::fs::create_dir(&root).unwrap();
+            std::fs::write(root.join("mine"), b"local work").unwrap();
+            let store = RemoteProjects::new(Some(scratch.as_os_str()), None);
+            if earlier {
+                let mut old = project_record("old");
+                old.root = root.clone();
+                store.save(&old).unwrap();
+            }
+            let mut reach = fixture(&scratch, true);
+            let mut term = Scripted {
+                answers: [true, false].into(),
+                ..Default::default()
+            };
+            let spec = format!("example-host:{}", root.display());
+            assert_eq!(run_with(&store, &mut reach, &mut term, &["open", &spec]), 1);
+            assert!(term.asked.last().unwrap().starts_with("Move "), "{:?}", term.asked);
+            assert_eq!(store.find(&root).unwrap().is_some(), earlier);
+            assert_eq!(std::fs::read(root.join("mine")).unwrap(), b"local work");
+            assert!(reach.engine.calls("create").is_empty());
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn mirror_of_another_host_is_moved_aside_and_old_sessions_terminated() {
+        use crate::remote_sync::{
+            engine::{session_name, Role, SyncState},
+            SyncKey,
+        };
+        let scratch = ScratchDir::new("remote", "another-mirror");
+        let root = scratch.join("project");
+        let store = RemoteProjects::new(Some(scratch.as_os_str()), None);
+        let mut reach = fixture(&scratch, true);
+        let key = SyncKey::new("SHA256:old", &root);
+        let name = session_name(&key, Role::Tree);
+        reach.engine.insert(&name, Role::Tree, &root, SyncState::Watching);
+        let mut old = project_record("old");
+        old.host = "other-host".into();
+        old.host_key_sha256 = "SHA256:old".into();
+        old.root = root.clone();
+        old.set_sync_record(&crate::remote_project::SyncRecord {
+            engine: "mutagen".into(),
+            host_key_sha256: old.host_key_sha256.clone(),
+            tree_session: Some(name.clone()),
+            ..Default::default()
+        });
+        store.save(&old).unwrap();
+        std::fs::create_dir(&root).unwrap();
+        std::fs::write(root.join("work"), b"original").unwrap();
+        let mut term = Scripted {
+            answers: [true, true, true].into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            run_with(
+                &store,
+                &mut reach,
+                &mut term,
+                &["open", &format!("example-host:{}", root.display())]
+            ),
+            0,
+            "{:?}",
+            term.said
+        );
+        let stopped = term
+            .said
+            .iter()
+            .position(|l| l.contains(&format!("stopped sync session {name}")))
+            .unwrap();
+        let saved = term
+            .said
+            .iter()
+            .position(|l| l.starts_with("Kept the existing copy at "))
+            .unwrap();
+        assert!(stopped < saved);
+        let copy = Path::new(term.said[saved].strip_prefix("Kept the existing copy at ").unwrap());
+        assert_eq!(std::fs::read(copy.join("work")).unwrap(), b"original");
+        assert!(!root.join("work").exists());
+        assert_eq!(reach.engine.calls("terminate"), [format!("terminate {name}")]);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn moved_copy_is_never_deleted() {
+        use crate::remote_sync::{
+            engine::{session_name, Role, Side, Staging, SyncState},
+            SyncKey,
+        };
+        let scratch = ScratchDir::new("remote", "first-progress");
+        let root = scratch.join("project");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::write(root.join("local-notes"), b"keep this").unwrap();
+        let store = RemoteProjects::new(Some(scratch.as_os_str()), None);
+        let mut reach = fixture(&scratch, true);
+        let key = SyncKey::new("SHA256:example", &root);
+        let tree = session_name(&key, Role::Tree);
+        let git = session_name(&key, Role::Git);
+        let engine = reach.engine.clone();
+        let lock_path = actor::lock_dir(&scratch, &root).join("lock");
+        reach.helper.truncate_sizes();
+        let start = Instant::now();
+        let mut term = Scripted {
+            answers: [true, true].into(),
+            wait_for_sync: true,
+            on_say: Some(Box::new(move |line| {
+                assert!(start.elapsed() < Duration::from_secs(30), "stuck at {line}");
+                if line.contains(" bytes counted") || line.starts_with("Kept the existing copy at ") {
+                    let lock = agent::private_fs::PrivateLock::open(&lock_path).unwrap();
+                    assert!(!lock.try_lock().unwrap(), "{line}");
+                }
+                if line.starts_with("syncing 0 files") {
+                    crate::remote_sync::actor::tests::wait(|| engine.status_of(&git).is_some());
+                    for name in [&tree, &git] {
+                        let mut status = engine.status_of(name).unwrap();
+                        status.state = SyncState::Staging;
+                        status.staging = Some(Staging {
+                            side: Side::Laptop,
+                            expected_bytes: 80 << 20,
+                            received_bytes: 75 << 20,
+                            total_received_bytes: 75 << 20,
+                            received_files: 2,
+                            expected_files: 4,
+                            path: None,
+                        });
+                        engine.push(status);
+                    }
+                }
+                if line.starts_with("syncing 2 files") || line == "history arriving: 50 %" {
+                    let name = if line.starts_with("syncing") { &tree } else { &git };
+                    let mut status = engine.status_of(name).unwrap();
+                    status.state = SyncState::Watching;
+                    status.staging = None;
+                    status.successful_cycles += 1;
+                    engine.push(status);
+                }
+            })),
+            ..Default::default()
+        };
+        assert_eq!(
+            run_with(
+                &store,
+                &mut reach,
+                &mut term,
+                &["open", &format!("example-host:{}", root.display())]
+            ),
+            0,
+            "{:?}",
+            term.said
+        );
+        let backup = term
+            .said
+            .iter()
+            .find_map(|line| line.strip_prefix("Kept the existing copy at "))
+            .unwrap();
+        assert_eq!(
+            std::fs::read(Path::new(backup).join("local-notes")).unwrap(),
+            b"keep this"
+        );
+        assert!(!root.join("local-notes").exists());
+        let index = |prefix| term.said.iter().position(|s| s.starts_with(prefix)).unwrap();
+        assert!(index("expected size: at least 80 MiB") < index("syncing 2 files, 75 / at least 80 MiB, "));
+        assert!(index("syncing 2 files") < index("history arriving: 50 %"));
+        assert_eq!(term.said.last().unwrap(), "sync continues when you open the window");
+        assert!(store
+            .find(&root)
+            .unwrap()
+            .unwrap()
+            .sync_record()
+            .unwrap()
+            .unwrap()
+            .paused
+            .is_none());
+        assert!(reach.engine.calls("pause").len() >= 2);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn first_sync_releases_sessions_and_lock_on_terminal_signals() {
+        const CHILD: &str = "EITRI_TEST_FIRST_SYNC_SIGNAL";
+        let Some(signal) = std::env::var_os(CHILD) else {
+            for signal in [libc::SIGINT, libc::SIGTERM] {
+                let output = std::process::Command::new(std::env::current_exe().unwrap())
+                    .args([
+                        "--exact",
+                        "remote_host::cli::tests::first_sync_releases_sessions_and_lock_on_terminal_signals",
+                    ])
+                    .env(CHILD, signal.to_string())
+                    .output()
+                    .unwrap();
+                assert!(
+                    output.status.success(),
+                    "{}{}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+            return;
+        };
+        let signal: i32 = signal.to_str().unwrap().parse().unwrap();
+        let scratch = ScratchDir::new("remote", "first-sync-signal");
+        let store = RemoteProjects::new(Some(scratch.as_os_str()), None);
+        let root = scratch.join("project");
+        let mut reach = fixture(&scratch, true);
+        let engine = reach.engine.clone();
+        let mut term = Scripted {
+            answers: [true, true].into(),
+            wait_for_sync: true,
+            on_say: Some(Box::new(move |line| {
+                if line.starts_with("syncing 0 files") {
+                    crate::remote_sync::actor::tests::wait(|| engine.calls("create").len() >= 2);
+                    // SAFETY: the CLI installed its handlers in this isolated test process.
+                    assert_eq!(unsafe { libc::raise(signal) }, 0);
+                    // A second interrupt during slow cleanup must use the default disposition.
+                    let mut action: libc::sigaction = unsafe { std::mem::zeroed() };
+                    assert_eq!(unsafe { libc::sigaction(signal, std::ptr::null(), &mut action) }, 0);
+                    assert_eq!(action.sa_sigaction, libc::SIG_DFL);
+                }
+            })),
+            ..Default::default()
+        };
+        let args = ["open".into(), format!("example-host:{}", root.display())];
+        assert_eq!(
+            run(
+                &args,
+                &mut Context {
+                    store: &store,
+                    reach: &mut reach,
+                    term: &mut term,
+                    remote_dev_enabled: &|| true,
+                    now: 1
+                }
+            ),
+            1
+        );
+        assert!(
+            term.said.last().unwrap().contains("first connection cancelled"),
+            "{:?}",
+            term.said
+        );
+        let sync = store.find(&root).unwrap().unwrap().sync_record().unwrap().unwrap();
+        for name in [sync.tree_session.unwrap(), sync.git_session.unwrap()] {
+            assert_eq!(
+                reach.engine.status_of(&name).unwrap().state,
+                crate::remote_sync::engine::SyncState::Paused
+            );
+        }
+        let lock = agent::private_fs::PrivateLock::open(&actor::lock_dir(&scratch, &root).join("lock")).unwrap();
+        assert!(lock.try_lock().unwrap());
+    }
+
     fn run_with(store: &RemoteProjects, reach: &mut dyn Reach, term: &mut Scripted, args: &[&str]) -> i32 {
         let args: Vec<String> = args.iter().map(|arg| arg.to_string()).collect();
         let enabled = || true;
-        run(
+        run_command(
             &args,
             &mut Context {
                 store,
@@ -1221,6 +2127,8 @@ mod tests {
         assert!(term.said.iter().any(|line| line.starts_with("usage: eitri host sync")));
     }
 
+    // Runs the Linux server scripts here as the server; macOS lacks flock(1) and GNU stat.
+    #[cfg(target_os = "linux")]
     #[test]
     fn idle_recorded_installations_are_never_started_by_stop_or_uninstall() {
         for installation in ["99.0.0-abcdef0", "0.0.1-abcdef0"] {
@@ -1390,13 +2298,24 @@ mod tests {
         reach.launcher = Arc::new(agent::ssh::LocalExec { helper });
         let mut term = Scripted::default();
         assert_eq!(run_with(&store, &mut reach, &mut term, &["stop", "example-host"]), 1);
+        // Each failure is a line of its own, not joined to the next by a line break inside one line.
         assert!(
-            term.said
+            !term
+                .said
                 .iter()
                 .any(|line| line.contains("recovery-error") && line.contains("listing-error")),
             "{:?}",
             term.said
         );
+        for error in ["recovery-error", "listing-error"] {
+            assert!(
+                term.said
+                    .iter()
+                    .any(|line| line.starts_with("eitri host: ") && line.contains(error)),
+                "{:?}",
+                term.said
+            );
+        }
     }
 
     #[test]
@@ -1817,8 +2736,9 @@ mod tests {
     fn host_open_writes_the_record_after_both_yeses() {
         let root = ScratchDir::new("remote", "host-open");
         let store = RemoteProjects::new(Some(root.as_os_str()), None);
-        let spec = "example-host:/srv/project";
-        let project = Path::new("/srv/project");
+        let project_path = root.join("project");
+        let project = project_path.as_path();
+        let spec = &format!("example-host:{}", project.display());
 
         let mut reach = fixture(&root, false);
         let mut term = Scripted {
@@ -1864,9 +2784,11 @@ mod tests {
         let host = store.host("SHA256:example").unwrap().unwrap();
         assert!(host.consented && installed(&host, &plan));
         assert!(plan.install_path().join("started").exists());
-        assert!(term.said.iter().any(
-            |line| line == "recorded example-host:/srv/project; open it with eitri --ssh example-host /srv/project"
-        ));
+        assert!(term.said.iter().any(|line| line
+            == &format!(
+                "recorded {spec}; open it with eitri --ssh example-host {}",
+                project.display()
+            )));
 
         // Opened again: no question, the record keeps its creation time.
         let mut reach = fixture(&root, true);
@@ -2276,6 +3198,46 @@ mod tests {
         drop(held);
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn stop_and_uninstall_pause_aliases_of_the_reached_key_with_the_command_named() {
+        for command in ["stop", "uninstall"] {
+            let root = ScratchDir::new("remote", "pause-by-key");
+            let store = RemoteProjects::new(Some(root.as_os_str()), None);
+            installed_host(&root, &store);
+            let mut project = project_record("0.3.0-current");
+            project.host = "another-alias".into();
+            project.set_sync_record(&crate::remote_project::SyncRecord {
+                tree_session: Some("tree".into()),
+                host_key_sha256: project.host_key_sha256.clone(),
+                ..Default::default()
+            });
+            store.save(&project).unwrap();
+            let mut reach = fixture(&root, true);
+            // Leave the installation in place, so the pause can be inspected for both commands.
+            reach.launcher = Arc::new(agent::ssh::LocalExec {
+                helper: daemon_helper(&root, "99.0.0"),
+            });
+            let mut term = Scripted::default();
+            run_with(&store, &mut reach, &mut term, &[command, "example-host"]);
+            assert_eq!(reach.engine.calls("pause"), ["pause tree"]);
+            let pause = store
+                .find(&project.root)
+                .unwrap()
+                .unwrap()
+                .sync_record()
+                .unwrap()
+                .unwrap()
+                .paused
+                .unwrap();
+            assert!(
+                pause.detail.contains(&format!("eitri host {command} example-host")),
+                "{}",
+                pause.detail
+            );
+        }
+    }
+
     /// An installation removed already (from another machine, or by hand) leaves no helper to list the daemons:
     /// `uninstall` still removes what is left and forgets the records, every one under the host's key, whatever host
     /// name it was recorded with; a record under a key the host no longer shows does not stand in the way.
@@ -2364,17 +3326,15 @@ mod tests {
         let root = ScratchDir::new("remote", "host-open-other");
         let store = RemoteProjects::new(Some(root.as_os_str()), None);
         let mut other = project_record("0.3.0-other");
+        let project = root.join("project");
+        let spec = format!("example-host:{}", project.display());
+        other.root = project.clone();
         other.host = "other-host".into();
         other.queued_stops = vec!["sc-9".into()];
         store.save(&other).unwrap();
         let mut term = Scripted::default();
         assert_eq!(
-            run_with(
-                &store,
-                &mut fixture(&root, true),
-                &mut term,
-                &["open", "example-host:/srv/project"]
-            ),
+            run_with(&store, &mut fixture(&root, true), &mut term, &["open", &spec]),
             1
         );
         assert!(
@@ -2388,23 +3348,18 @@ mod tests {
             "{:?}",
             term.said
         );
-        assert_eq!(store.find(Path::new("/srv/project")).unwrap(), Some(other));
+        assert_eq!(store.find(&project).unwrap(), Some(other));
         let mut term = Scripted {
             answers: [true, true].into(),
             ..Default::default()
         };
         assert_eq!(
-            run_with(
-                &store,
-                &mut fixture(&root, true),
-                &mut term,
-                &["open", "example-host:/srv/project"]
-            ),
+            run_with(&store, &mut fixture(&root, true), &mut term, &["open", &spec]),
             0,
             "{:?}",
             term.said
         );
-        let replaced = store.find(Path::new("/srv/project")).unwrap().unwrap();
+        let replaced = store.find(&project).unwrap().unwrap();
         assert_eq!(replaced.host, "example-host");
         assert!(replaced.queued_stops.is_empty());
     }
@@ -2418,6 +3373,9 @@ mod tests {
         let root = ScratchDir::new("remote", "host-open-rekey");
         let store = RemoteProjects::new(Some(root.as_os_str()), None);
         let mut before = project_record("0.3.0-old");
+        let project = root.join("project");
+        let spec = format!("example-host:{}", project.display());
+        before.root = project.clone();
         before.host_key_sha256 = "SHA256:before".into();
         before.queued_stops = vec!["sc-1".into()];
         store.save(&before).unwrap();
@@ -2426,17 +3384,12 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(
-            run_with(
-                &store,
-                &mut fixture(&root, true),
-                &mut term,
-                &["open", "example-host:/srv/project"]
-            ),
+            run_with(&store, &mut fixture(&root, true), &mut term, &["open", &spec]),
             0,
             "{:?}",
             term.said
         );
-        let record = store.find(Path::new("/srv/project")).unwrap().unwrap();
+        let record = store.find(&project).unwrap().unwrap();
         assert_eq!(record.host_key_sha256, "SHA256:example");
         assert_eq!(record.queued_stops, ["sc-1"]);
         assert_eq!(record.created_at, 1);
@@ -2507,6 +3460,9 @@ mod tests {
         let root = ScratchDir::new("remote", "open-commit");
         let store = RemoteProjects::new(Some(root.as_os_str()), None);
         let mut before = project_record("0.2.0-old");
+        let project = root.join("project");
+        let spec = format!("example-host:{}", project.display());
+        before.root = project.clone();
         before.host_key_sha256 = "SHA256:before".into();
         before.queued_stops = vec!["sc-old".into()];
         store.save(&before).unwrap();
@@ -2516,10 +3472,7 @@ mod tests {
         saved_tabs::save_as(&old, &before.root, Role::Main, &SavedTabs::default()).unwrap();
         let mut reach = fixture(&root, true);
         let mut no = Scripted::default();
-        assert_eq!(
-            run_with(&store, &mut reach, &mut no, &["open", "example-host:/srv/project"]),
-            1
-        );
+        assert_eq!(run_with(&store, &mut reach, &mut no, &["open", &spec]), 1);
         assert!(matches!(
             saved_tabs::load(&old, &before.root),
             saved_tabs::Loaded::Saved(_)
@@ -2529,13 +3482,13 @@ mod tests {
         let mut yes = Scripted {
             answers: [true].into(),
             on_ask: Some(Box::new(move || {
-                during.stop_sent(Path::new("/srv/project"), "sc-old").unwrap();
-                during.queue_stop(Path::new("/srv/project"), "sc-new").unwrap();
+                during.stop_sent(&project, "sc-old").unwrap();
+                during.queue_stop(&project, "sc-new").unwrap();
             })),
             ..Default::default()
         };
         assert_eq!(
-            run_with(&store, &mut reach, &mut yes, &["open", "example-host:/srv/project"]),
+            run_with(&store, &mut reach, &mut yes, &["open", &spec]),
             0,
             "{:?}",
             yes.said
@@ -2725,5 +3678,204 @@ mod tests {
             reach_host(&mut cx, "example-host").unwrap().installation,
             plan.version()
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn terminal_records_are_cleared_only_after_host_stop_or_uninstall_succeeds() {
+        for command in ["stop", "uninstall"] {
+            for succeeds in [false, true] {
+                let root = ScratchDir::new("remote", "terminal-host-clear");
+                let store = RemoteProjects::new(Some(root.as_os_str()), None);
+                installed_host(&root, &store);
+                for project in ["/srv/project", "/srv/other"] {
+                    store
+                        .terminals()
+                        .begin_open("SHA256:example", Path::new(project), 1, "term", "0.3.0-current", 42)
+                        .unwrap();
+                }
+                store
+                    .terminals()
+                    .begin_open(
+                        "SHA256:other",
+                        Path::new("/srv/project"),
+                        1,
+                        "term",
+                        "0.3.0-current",
+                        42,
+                    )
+                    .unwrap();
+                let mut reach = fixture(&root, true);
+                reach.launcher = Arc::new(agent::ssh::LocalExec {
+                    helper: daemon_helper(&root, if succeeds { "0.2.0" } else { "99.0.0" }),
+                });
+                let mut term = Scripted::default();
+                let result = run_with(&store, &mut reach, &mut term, &[command, "example-host"]);
+                assert_eq!(result, if succeeds { 0 } else { 1 }, "{:?}", term.said);
+                for project in ["/srv/project", "/srv/other"] {
+                    assert_eq!(
+                        store
+                            .terminals()
+                            .record("SHA256:example", Path::new(project))
+                            .unwrap()
+                            .entries
+                            .is_empty(),
+                        succeeds
+                    );
+                }
+                assert_eq!(
+                    store
+                        .terminals()
+                        .record("SHA256:other", Path::new("/srv/project"))
+                        .unwrap()
+                        .entries
+                        .len(),
+                    1
+                );
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn host_list_reaches_terminal_inventory_and_status_reports_queued_stops_without_connecting() {
+        struct Inventory {
+            fixture: Fixture,
+            helper: PathBuf,
+            calls: usize,
+        }
+        impl Reach for Inventory {
+            fn connect(&mut self, host: &str) -> Result<String, ConnectError> {
+                self.fixture.connect(host)
+            }
+            fn first_contact(&mut self, _: &str) -> Result<Contact, String> {
+                unreachable!()
+            }
+            fn launcher(&self, helper: &Path) -> Arc<dyn ChannelLauncher> {
+                self.fixture.launcher(helper)
+            }
+            fn plan(&mut self) -> Result<InstallPlan, String> {
+                unreachable!()
+            }
+            fn agents(&mut self, _: &str, _: &str, _: &Path) -> Result<Vec<Agent>, String> {
+                Ok(Vec::new())
+            }
+            fn terminals(
+                &mut self,
+                host: &str,
+                key: &str,
+                helper: &Path,
+            ) -> Result<wire::ListTerminalsResponse, String> {
+                assert_eq!(
+                    (host, key, helper),
+                    ("example-host", "SHA256:example", self.helper.as_path())
+                );
+                self.calls += 1;
+                Ok(wire::ListTerminalsResponse {
+                    terminals: vec![wire::TerminalInfo {
+                        terminal_id: "0123456789abcdef".into(),
+                        cwd: "/srv/project\u{1b}[31m".into(),
+                        foreground_job: Some(true),
+                        foreground_name: "job\u{202e}".into(),
+                        attached: true,
+                        ..Default::default()
+                    }],
+                    truncated: true,
+                })
+            }
+        }
+        let root = ScratchDir::new("remote", "terminal-list");
+        let store = RemoteProjects::new(Some(root.as_os_str()), None);
+        let (data, _) = installed_host(&root, &store);
+        let entry = store
+            .terminals()
+            .begin_open(
+                "SHA256:example",
+                Path::new("/srv/project"),
+                1,
+                "term",
+                "0.3.0-current",
+                42,
+            )
+            .unwrap();
+        store
+            .terminals()
+            .queue_stop("SHA256:example", Path::new("/srv/project"), &entry.command_id)
+            .unwrap();
+        let listing = root.join("listing");
+        let info = serde_json::json!({"version":"0.3.0", "rev":"123abcd", "pid":42, "protocol_major":1,
+            "protocol_minor":1, "started_unix_ms":0, "run":installation_run_key("0.3.0-current")});
+        std::fs::write(&listing, format!("#!/bin/sh\nprintf '%s\\n' '{info}'\n")).unwrap();
+        std::fs::set_permissions(&listing, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let mut fixture = fixture(&root, true);
+        fixture.launcher = Arc::new(agent::ssh::LocalExec { helper: listing });
+        let mut reach = Inventory {
+            fixture,
+            helper: data.join("0.3.0-current/bin/eitri-server"),
+            calls: 0,
+        };
+        let mut term = Scripted::default();
+        assert_eq!(run_with(&store, &mut reach, &mut term, &["status", "example-host"]), 0);
+        assert_eq!(reach.fixture.connects, 0);
+        assert!(term
+            .said
+            .iter()
+            .any(|line| line.contains("window 1") && line.ends_with("stop queued")));
+        assert_eq!(
+            run_with(&store, &mut reach, &mut term, &["list", "example-host"]),
+            0,
+            "{:?}",
+            term.said
+        );
+        assert_eq!(reach.calls, 1);
+        assert!(term
+            .said
+            .iter()
+            .any(|line| line.contains("0123456789ab") && line.contains("attached") && line.contains("running job")));
+        assert!(term.said.iter().any(|line| line.ends_with("terminal list truncated")));
+        assert!(term
+            .said
+            .iter()
+            .all(|line| !line.contains('\u{1b}') && !line.contains('\u{202e}')));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn status_reports_a_damaged_terminal_record_and_keeps_the_rest() {
+        let root = ScratchDir::new("remote", "terminal-status-damaged");
+        let store = RemoteProjects::new(Some(root.as_os_str()), None);
+        let first = project_record("0.3.0-example");
+        let mut second = first.clone();
+        second.root = "/srv/other".into();
+        for project in [&first, &second] {
+            store.save(project).unwrap();
+            store
+                .terminals()
+                .begin_open(
+                    &project.host_key_sha256,
+                    &project.root,
+                    1,
+                    "terminal",
+                    "0.3.0-example",
+                    42,
+                )
+                .unwrap();
+        }
+        let damaged = store.terminals().path(&first.host_key_sha256, &first.root).unwrap();
+        agent::private_fs::write_private(&damaged, b"damaged").unwrap();
+        let mut reach = fixture(&root, true);
+        let mut term = Scripted::default();
+        assert_eq!(run_with(&store, &mut reach, &mut term, &["status"]), 0);
+        assert_eq!(reach.connects, 0);
+        assert!(term
+            .said
+            .iter()
+            .any(|line| line.contains("terminal record cannot be read")));
+        assert!(term
+            .said
+            .iter()
+            .any(|line| line.contains("terminal ") && line.ends_with("opening")));
+        assert!(term.said.iter().any(|line| line == "example-host:/srv/other"));
+        assert!(term.said.iter().any(|line| line == "example-host:/srv/project"));
     }
 }

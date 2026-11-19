@@ -1,3 +1,4 @@
+import { STOPPED_BEFORE_SEND } from "./syncChip";
 import { EMPTY_PANEL_TABLE } from "./keymap";
 import type { KeymapHelp } from "./keymap";
 import type { TrustPromptEnvelope } from "./trust";
@@ -143,6 +144,7 @@ export type PageModel = {
    *  `ready`, right after the theme). `prefix` is `Ctrl+b`, the stock tmux default, and the panel table has no
    *  bindings until that envelope arrives. */
   keymapHelp: KeymapHelp;
+  sendSync: import("./syncChip").SendSync | null;
   syncChip: import("./syncChip").SyncStatus | null;
   pages: PageLine[];
   /** The trust question Rust sent last, held until it can take the keys. It is not drawn on arrival: Rust asks
@@ -268,6 +270,7 @@ function chipOf(value: DraftImage): DraftImage {
 export function initialPageModel(): PageModel {
   return {
     answerEpoch: 0, inputRequest: 0, arriveRequest: 0, permissionRequest: 0, navKey: null,
+    sendSync: null,
     syncChip: null,
     pages: [],
     keymapHelp: { prefix: "Ctrl+b", window: [], prefixKeys: [], panel: EMPTY_PANEL_TABLE, newTabChord: "" },
@@ -365,6 +368,8 @@ function reduceEnvelope(model: PageModel, envelope: Envelope): PageModel {
       return { ...model, review: null, chooser: null };
     case "nav_key":
       return { ...model, navKey: { seq: (model.navKey?.seq ?? 0) + 1, direction: envelope.direction } };
+    case "send_sync":
+      return { ...model, sendSync: { waiting: envelope.waiting, stopped: envelope.stopped, lines: envelope.lines, restored: envelope.restored } };
     case "sync_status":
       return { ...model, syncChip: envelope.chip };
     case "pages":
@@ -497,7 +502,7 @@ function reduceEnvelope(model: PageModel, envelope: Envelope): PageModel {
         ...(switched ? {
           answerEpoch: model.answerEpoch + 1, queueTaken: null, draftImages: NO_DRAFT_IMAGES,
           turnClock: null, turnDurations: NO_TURN_DURATIONS, handoff: null, fatalError: null,
-          commandNotice: null, queue: [], queueError: null, queueNote: null, queueSteers: null, shellRunning: false,
+          commandNotice: null, sendSync: null, queue: [], queueError: null, queueNote: null, queueSteers: null, shellRunning: false,
           ruleOffers: {}, scratchEditing: false, chooser: null,
         } : {}),
         state, keptStates, heldRemote,
@@ -566,7 +571,7 @@ function reduceEnvelope(model: PageModel, envelope: Envelope): PageModel {
         // fade before it was read.
         const message = envelope.ok ? envelope.message : envelope.error;
         if (message !== undefined && next.review !== null) next = { ...next, review: withStatus(next.review, message) };
-      } else if (!envelope.ok) {
+      } else if (!envelope.ok && envelope.error !== STOPPED_BEFORE_SEND) {
         if (record?.kind === "send") {
           // On the tab on screen the page puts the text back in the box; a message that vanishes with no trace
           // is the outcome this exists to prevent. A tab switched away from before Rust answered must not get it

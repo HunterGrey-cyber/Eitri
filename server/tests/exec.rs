@@ -480,6 +480,35 @@ async fn a_child_that_exits_before_close_is_reaped_and_audited_and_its_status_co
 }
 
 #[tokio::test]
+async fn daemon_stop_preserves_the_recorded_exit_before_close() {
+    let scratch = Scratch::new("reaped-stop");
+    let runs = Arc::default();
+    let running = launch_with(&scratch, &["git", "quick"], true, &runs, |_| {});
+    running.input.as_ref().unwrap().send(stdin(b"unread")).await.unwrap();
+    until(|| scratch.audit().contains("exec-exited git quick")).await;
+    runs.kill_unclosed();
+    assert!(matches!(running.ended.await.unwrap(), Ended::Exited(exit) if exit.code == 3));
+    assert!(!scratch.audit().contains("killed=daemon-stop"));
+}
+
+#[test]
+fn the_forwarded_argv_owns_the_git_pathspec_environment() {
+    let scratch = Scratch::new("pathspec-env");
+    let mut login = scratch.login(false);
+    let keys = [
+        "GIT_ICASE_PATHSPECS",
+        "GIT_LITERAL_PATHSPECS",
+        "GIT_GLOB_PATHSPECS",
+        "GIT_NOGLOB_PATHSPECS",
+    ];
+    for key in keys {
+        login.insert(key.into(), "true".into());
+    }
+    let prepared = exec::git::prepare(&start(&scratch.path("repo"), &["git", "add", "FILE"]), &login).unwrap();
+    assert!(keys.iter().all(|key| !prepared.env.iter().any(|(k, _)| k == *key)));
+}
+
+#[tokio::test]
 async fn output_is_never_cut_short_for_a_slow_reader() {
     let scratch = Scratch::new("slow-reader");
     let mut running = launch(&scratch, &["git", "big"]);

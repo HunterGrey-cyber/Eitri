@@ -1,3 +1,4 @@
+import { SESSION_ENDED_BEFORE_SEND, STOPPED_BEFORE_SEND } from "./syncChip";
 import { remoteLinkLine } from "./band";
 import { classify as classifyGd, expectedName, validName, wordAt } from "./gdTarget";
 import type { Cited, GdTarget } from "./gdTarget";
@@ -3494,6 +3495,13 @@ export default function App() {
           const record = previousPage.inFlight.get(payload.requestId);
           if (!payload.ok) {
             console.warn("agent-ui: command failed", payload.requestId, payload.error);
+            if (payload.error === STOPPED_BEFORE_SEND) break;
+            if (payload.error === SESSION_ENDED_BEFORE_SEND) {
+              // The host keeps the text in the sending tab's draft, which survives a switch or a reload, and hands it
+              // to the box as `queue_taken`; putting it back here too would show it twice.
+              if (record?.kind === "send") pendingSlashPickerRef.current = null;
+              break;
+            }
             if (record?.kind === "trust" || record?.kind === "review-command" || record?.review === true || record?.kind === "review") break;
             if (record?.kind === "picker-send") {
               // The picker's choice never touched the box, so nothing is put back: a footer flash alone, leaving
@@ -5237,6 +5245,16 @@ export default function App() {
     return true;
   }
 
+  const sendSyncNotice = page.sendSync && <>
+    {page.sendSync.waiting && <div className="queue-note" role="status">syncing… <button onClick={interrupt}>Stop</button></div>}
+    {page.sendSync.stopped && <div className="queue-note" role="status">{STOPPED_BEFORE_SEND}</div>}
+    {page.sendSync.lines.filter(line => page.sendSync?.restored?.includes(line.messageId) &&
+      (line.seq === undefined || state.evicted === null || line.seq >= state.evicted.throughSeq) && !state.userPrompts.some(prompt => prompt.seq === line.seq && prompt.text === line.prompt))
+      .map(line => <div key={line.messageId}>
+        <div className="command-notice">{revealedText(line.prompt)}</div>
+        <div className="queue-note">{revealedText(line.text)}</div>
+      </div>)}
+  </>;
   /* Rendered on both screens. A refused command can return the panel to the start screen (a failed
      handoff close, for one), and a reason that only exists in the conversation view would be gone by
      the time it could be read. */
@@ -5544,6 +5562,8 @@ export default function App() {
                 queueMessage(text, options);
               }}
               history={history}
+              sendSyncNotice={sendSyncNotice}
+              onStopSync={page.sendSync?.waiting ? interrupt : undefined}
               queueCount={heldCount(queue)}
               queue={queue}
               queueError={queueError}
@@ -6673,6 +6693,7 @@ export default function App() {
       operator,
       count,
       turnRunning: turnInProgress || shellRunning,
+      syncWaiting: page.sendSync?.waiting,
       table: panelTable,
     });
     if (action === null) return;
@@ -7675,6 +7696,7 @@ export default function App() {
         <PermissionCardContext.Provider value={cardContext}>
           <FoldAllKey.Provider value={mode === "input" ? "Ctrl+o" : "zi"}>
           <MessageList
+            lateLines={page.sendSync?.lines}
             tab={activeTabId}
             state={frozenSnapshot?.state ?? state}
             turnDurations={frozenSnapshot?.turnDurations ?? turnDurations}
@@ -7841,6 +7863,7 @@ export default function App() {
         <div className="command-notice remote-link-state" role="status">{remoteLinkLine(state.provider?.host, state.linkState)}</div>
       )}
       {commandNoticeBanner}
+      {sendSyncNotice}
       <QueueLines items={queue} error={queueError} note={queueNote} />
       <ActivityLine
         state={state}

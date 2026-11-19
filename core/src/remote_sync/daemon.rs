@@ -60,7 +60,16 @@ impl Daemon {
         agent::socket_path::in_dir(&data_dir.join("daemon"), "daemon.sock")
             .map_err(|e| SyncError::Io(e.to_string()))?;
         let binary = match configured {
-            Some(path) if path.is_absolute() => path.to_owned(),
+            Some(path) if path.is_absolute() => match path.try_exists() {
+                Ok(true) => path.to_owned(),
+                Ok(false) => {
+                    return Err(SyncError::Unsupported(format!(
+                        "Mutagen was not found at {}",
+                        path.display()
+                    )))
+                }
+                Err(e) => return Err(SyncError::Io(format!("{}: {e}", path.display()))),
+            },
             Some(_) => return Err(SyncError::Engine("configured Mutagen path must be absolute".into())),
             None => find_binary()?,
         };
@@ -285,11 +294,22 @@ fn transport_path(transport: Option<&Path>) -> Result<Option<OsString>, SyncErro
 }
 
 fn find_binary() -> Result<PathBuf, SyncError> {
+    let mut unusable = None;
     for directory in absolute_path_entries(&std::env::var_os("PATH").unwrap_or_default()) {
         let path = directory.join("mutagen");
-        if std::fs::metadata(&path).is_ok_and(|meta| meta.is_file() && meta.permissions().mode() & 0o111 != 0) {
-            return std::path::absolute(path).map_err(|e| SyncError::Io(e.to_string()));
+        match std::fs::metadata(&path) {
+            Ok(meta) if meta.is_file() && meta.permissions().mode() & 0o111 != 0 => return Ok(path),
+            Ok(_) => unusable = Some(format!("{} is not an executable file", path.display())),
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+                ) => {}
+            Err(e) => unusable = Some(format!("{}: {e}", path.display())),
         }
+    }
+    if let Some(why) = unusable {
+        return Err(SyncError::Io(why));
     }
     Err(SyncError::Unsupported(
         "Mutagen is not installed; install Mutagen 0.18 or newer".into(),

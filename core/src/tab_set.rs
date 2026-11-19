@@ -305,6 +305,13 @@ impl Queued {
         self.state == QueuedState::Held
     }
 
+    /// Whether this item is the message the provider knows as `client_id`: steered under it, or held again after the
+    /// provider reported that copy dropped.
+    pub(crate) fn carries(&self, client_id: &str) -> bool {
+        matches!(&self.state, QueuedState::Steered { client_id: id, .. } if id == client_id)
+            || self.dropped_as.iter().any(|id| id == client_id)
+    }
+
     /// Whether this item runs as a command of its agent: never in a running turn, and a turn of its own. A
     /// review is the panel's text, whatever it starts with.
     fn is_command(&self, reads_commands: bool) -> bool {
@@ -490,6 +497,7 @@ pub struct Tab {
     pub remote_agent: Option<(agent::HelperHandoff, Option<String>)>,
     /// Whether this remote tab's agent was stopped on its server at the person's choice: it is not saved again.
     pub remote_agent_stopped: bool,
+    pub send_sync: crate::remote_sync::flush::TabSync,
     /// The text of the tab's own note the person dismissed, in whichever page: it stays dismissed in every page
     /// the tab is shown in while the note says the same.
     root_note_dismissed: Option<String>,
@@ -854,6 +862,20 @@ impl SessionState {
 }
 
 impl Tab {
+    pub fn send_sync_payload(&self, changes_only: bool) -> Option<String> {
+        if !self.is_remote() {
+            return None;
+        }
+        let display = self.send_sync.display(changes_only)?;
+        Some(
+            serde_json::json!({
+                "kind": "send_sync", "tab": self.id.0, "waiting": display.waiting, "stopped": display.stopped,
+                "lines": display.lines, "restored": display.restored,
+            })
+            .to_string(),
+        )
+    }
+
     pub fn origin(&self) -> &TabOrigin {
         &self.origin
     }
@@ -946,6 +968,7 @@ impl Tab {
             failed_resume: None,
             remote_agent: None,
             remote_agent_stopped: false,
+            send_sync: Default::default(),
             root_note_dismissed: None,
             pending_handoff: None,
             last_handoff: None,
@@ -1067,6 +1090,8 @@ impl Tab {
     /// Puts `Failed { reason }` in place of the backend together with the two fields every such swap
     /// sets: whether the session had opened (`after_start`) and the saved session the file keeps for
     /// the tab (`failed_resume`). A live backend that was there leaves counted in `retiring`.
+    /// A message still waiting for the sync is refused rather than sent to the session that failed; its
+    /// refusal returns its text as any refusal does.
     fn fail_live(
         &mut self,
         retiring: &mut RetiringCounts,
@@ -1074,6 +1099,7 @@ impl Tab {
         after_start: bool,
         failed_resume: Option<String>,
     ) -> Option<Retired> {
+        self.send_sync.end_waits();
         let reason = match self.live() {
             Some(backend) => backend.failure_with_provider_notes(reason),
             None => reason,
@@ -1088,6 +1114,7 @@ impl Tab {
 
     /// Takes a live backend out, counted in `retiring`, and leaves `NotStarted`; anything else stays.
     fn retire_live(&mut self, retiring: &mut RetiringCounts) -> Option<Retired> {
+        self.send_sync.cancel_waits();
         match std::mem::replace(&mut self.backend, TabBackend::NotStarted) {
             TabBackend::Live(backend) => Some(Retired::new(retiring, self.id, backend)),
             other => {
@@ -1777,6 +1804,7 @@ pub const REMOTE_RESUME_UNAVAILABLE: &str = "session resume is not available on 
 pub const SHELL_LINES_REMOTE_UNAVAILABLE: &str = "shell lines are not available on remote tabs yet";
 
 pub struct TabSet {
+    pub send_port: Option<crate::remote_sync::flush::SendPort>,
     last_link_states: BTreeMap<u64, (u64, Option<agent::RemoteLinkState>)>,
     project_origin: TabOrigin,
     local_copy_host: Option<String>,
@@ -1855,6 +1883,10 @@ pub struct TabSet {
     /// Interrupts of remote tabs whose provider call is out ([`TabSet::poll_interrupts`]), and the number the next
     /// one is told under.
     interrupts_out: Vec<desk_sends::InterruptWait>,
+    /// Synced desk sends between the provider handoff and the start of their own turn.
+    desk_starts: Vec<desk_sends::DeskStart>,
+    /// Texts of desk sends a Stop took back after their call went out ([`TabSet::take_stopped_sends`]).
+    desk_stopped: Vec<(TabId, Vec<String>)>,
     next_interrupt: u64,
     /// A phone's sends refused before their provider call was made, for the next [`TabSet::poll_remote_sends`].
     remote_sent: Vec<RemoteSent>,
@@ -1950,6 +1982,7 @@ impl TabSet {
             mode => mode,
         };
         let mut set = TabSet {
+            send_port: None,
             last_link_states: BTreeMap::new(),
             tabs: Vec::new(),
             history_clears: Vec::new(),
@@ -1982,6 +2015,8 @@ impl TabSet {
             pending_sends: BTreeMap::new(),
             remote_sends: BTreeMap::new(),
             desk_sends: BTreeMap::new(),
+            desk_starts: Vec::new(),
+            desk_stopped: Vec::new(),
             interrupts_out: Vec::new(),
             next_interrupt: 0,
             remote_sent: Vec::new(),
@@ -2420,6 +2455,13 @@ impl TabSet {
     pub fn active(&self) -> TabId {
         self.active
     }
+    fn message_sync(&self, id: TabId) -> Option<crate::remote_sync::flush::MessageSync> {
+        let tab = self.get(id)?;
+        let port = self.send_port.as_ref()?;
+        matches!(tab.origin(), TabOrigin::Remote { host_key_sha256, root, .. } if host_key_sha256 == &port.key && root == &port.root)
+            .then(|| crate::remote_sync::flush::MessageSync { tab: tab.send_sync.clone(), port: port.clone(), wake: self.ui_wake.clone() })
+    }
+
     pub fn tabs(&self) -> &[Tab] {
         &self.tabs
     }
@@ -3940,6 +3982,16 @@ impl TabSet {
         {
             parts.push(first_turn.typed.clone());
         }
+        // A message still waiting for the sync is stopped and comes back too, after the put-off first message and
+        // ahead of the queue it left. A waiting steer's text is its queue item's (steered, or held again after the
+        // provider dropped it), which comes back in its place.
+        let stopped = tab.send_sync.cancel_waits();
+        parts.extend(
+            stopped
+                .iter()
+                .filter(|(id, _)| !tab.session.queue.iter().any(|item| item.carries(id)))
+                .map(|(_, prompt)| prompt.clone()),
+        );
         let mut images = Vec::new();
         for queued in std::mem::take(&mut tab.session.queue) {
             parts.push(queued.text);
@@ -3955,8 +4007,10 @@ impl TabSet {
         // Whatever agent the tab reached on a server goes with its old backend, which the caller ends.
         tab.remote_agent = None;
         tab.remote_agent_stopped = false;
+        tab.send_sync = Default::default();
         tab.replace_draft(parts.join("\n\n"));
         tab.attention.restart();
+        self.stop_desk_send(id, &stopped);
         self.pending_bypass = None;
         self.release_abandoned_imports(id, abandoned);
         self.images_back_to_draft(id, images);
@@ -4090,6 +4144,7 @@ impl TabSet {
             starting: &mut self.starting,
             starting_since: &mut self.starting_since,
             held_sends: &self.pending_sends,
+            desk_starts: &mut self.desk_starts,
             untracked_starts: &mut self.untracked_starts,
             observers: &mut self.observers,
             last_link_states: &mut self.last_link_states,
@@ -4317,6 +4372,18 @@ impl TabSet {
                 &projection,
                 wall_clock_ms(),
             );
+            // A session shown as ended (closed, or unavailable after a lost replay, however it was delivered) takes no
+            // message still waiting for the sync: each is refused as for a failure, since the agent behind it may
+            // still be running.
+            if matches!(
+                projection.status,
+                agent::ProjectionStatus::Closed { .. } | agent::ProjectionStatus::Unavailable { .. }
+            ) {
+                tab.send_sync.end_waits();
+            }
+        }
+        for start in tick.desk_starts.iter_mut() {
+            start.observe(tab.id, tab.backend_generation, &delivery, backend);
         }
         if let RevisedDelivery::Events(tagged) = &delivery {
             // In order: a reset drops the notes of the conversation before it, and a delivery after it in the
@@ -4324,17 +4391,28 @@ impl TabSet {
             for (revision, event) in tagged {
                 match event {
                     AgentDomainEvent::UserMessageDelivered { client_message_id, .. } => {
+                        tab.send_sync.delivered(client_message_id, revision.saturating_sub(1));
                         if let Some(from) = tab.notes.take_remote_sender(client_message_id) {
                             tab.notes.sent_from.insert(revision.saturating_sub(1), from);
                             tab.notes.remote_notes_dirty = true;
                         }
                     }
-                    AgentDomainEvent::ConversationReset { .. } => tab.notes.forget_remote_notes_before(*revision),
+                    AgentDomainEvent::UserMessageDropped { client_message_id, .. } => {
+                        tab.send_sync.settle(client_message_id, false);
+                    }
+                    AgentDomainEvent::ConversationReset { .. } => {
+                        tab.send_sync.reset_before(*revision);
+                        tab.notes.forget_remote_notes_before(*revision);
+                    }
                     _ => {}
                 }
             }
         } else if matches!(delivery, RevisedDelivery::Resync { .. }) {
-            tab.notes.recover_remote_senders(&backend.projection());
+            let projection = backend.projection();
+            if matches!(tab.origin, TabOrigin::Remote { .. }) {
+                tab.send_sync.recover(&projection);
+            }
+            tab.notes.recover_remote_senders(&projection);
         }
         // Notes with no events behind them (a phone's message read, plan mode moved) go out on their own.
         let notes_owed = tab.notes.remote_notes_dirty || tab.notes.planning_dirty;
@@ -4350,6 +4428,7 @@ impl TabSet {
         let generation = tab.backend_generation;
         let mut live = LiveTab {
             remote,
+            send_sync: &tab.send_sync,
             live_edits: tab.session.client_calls.live_edits_on,
             following: tab.following,
             generation: tab.backend_generation,
@@ -4789,6 +4868,9 @@ impl TabSet {
             tick.last_link_states
                 .insert(live.id.0, (live.generation, link_state.clone()));
             let mut view = SnapshotView::of(live.backend, &live.session.host_answered);
+            if live.remote {
+                live.send_sync.recover(&view.projection);
+            }
             hidden = live.session.hidden_permissions(&view.projection);
             view.hidden_pending = Some(&hidden);
             // Observed from this snapshot's own view, under the guard it is serialized from -- not
@@ -5105,6 +5187,9 @@ impl TabSet {
                     let link_state = backend.link_state();
                     snapshot_link = Some((tab.id.0, tab.backend_generation, link_state.clone()));
                     let mut view = SnapshotView::of(backend, &tab.session.host_answered);
+                    if matches!(tab.origin, TabOrigin::Remote { .. }) {
+                        tab.send_sync.recover(&view.projection);
+                    }
                     hidden = tab.session.hidden_permissions(&view.projection);
                     view.hidden_pending = Some(&hidden);
                     settle_opening(
@@ -5157,6 +5242,7 @@ impl TabSet {
             tab.queue_line().as_deref(),
             tab.steers(),
         ));
+        payloads.extend(tab.send_sync_payload(false));
         if with_draft {
             payloads.push(crate::agent_bridge::serialize_draft_for_js(tab.id, &tab.session.draft));
             // The draft's images go with its text: a reload or a switch shows the same chips.
@@ -5504,6 +5590,7 @@ impl TabSet {
         let withdrawn = self.withdraw_remote().contains(&id);
         let widened = self.refuse_widened_in(id);
         let mut next = self.next_steer;
+        let sync = self.message_sync(id);
         let Some(tab) = self.get_mut(id) else { return false };
         let mut changed = tab.settle_steered() || widened || withdrawn;
         if tab.pending_handoff.is_some() || !tab.turn_running() || !tab.session.queue.iter().any(Queued::is_held) {
@@ -5557,8 +5644,12 @@ impl TabSet {
                 refusal = Some("no turn was running when it was typed".to_string());
                 break;
             };
-            let client_id = format!("eitri-{}-{next}", id.0);
-            match backend.steer(turn, &client_id, &item.wire, &item.text, item.origin()) {
+            let client_id = if sync.is_some() {
+                uuid::Uuid::new_v4().to_string()
+            } else {
+                format!("eitri-{}-{next}", id.0)
+            };
+            match backend.steer(turn, &client_id, &item.wire, &item.text, item.origin(), sync.clone()) {
                 Ok(()) => {
                     if let QueuedFrom::Remote { asker, .. } = &item.from {
                         tab.notes.note_remote_sender(client_id.clone(), asker.sent_from());
@@ -6622,6 +6713,7 @@ impl TabSet {
                     None => kept?,
                 };
                 Some(crate::saved_tabs::SavedRemoteTab {
+                    late_lines: tab.send_sync.lines(),
                     window: None,
                     helper,
                     provider_session_id,
@@ -6649,6 +6741,7 @@ impl TabSet {
             mode => tab.agent.offered_mode(mode),
         };
         tab.name = saved.name.clone();
+        tab.send_sync.restore(&saved.late_lines);
         tab.remote_agent = Some((saved.helper.clone(), saved.provider_session_id.clone()));
         tab.remote_agent_stopped = false;
         debug_assert!(self.v1_holds());
@@ -7655,6 +7748,7 @@ struct PumpTick<'a> {
     starting_since: &'a mut BTreeMap<u64, u64>,
     /// The prompts held for the presence: their tabs stay in `starting` whatever is folded.
     held_sends: &'a BTreeMap<u64, moving::PendingSend>,
+    desk_starts: &'a mut [desk_sends::DeskStart],
     /// `TabSet::untracked_starts`.
     untracked_starts: &'a mut BTreeSet<u64>,
     /// `TabSet::observers`: fed from each tab's drain, whatever page shows it.
@@ -7683,6 +7777,7 @@ struct PumpPlace {
 
 /// The parts of a live tab a pump arm works on, borrowed apart so the backend is used beside them.
 struct LiveTab<'a> {
+    send_sync: &'a crate::remote_sync::flush::TabSync,
     generation: u64,
     remote: bool,
     live_edits: bool,

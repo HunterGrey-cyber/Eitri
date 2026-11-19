@@ -1,5 +1,6 @@
 //! The normal dependency graphs of the toolkit-free crates must contain no GTK, WebKit, AppKit
 //! or windowing packages. The macOS host may use AppKit and windowing crates, but not GTK or WebKitGTK.
+//! The server queried alone must also exclude `skia-safe`; terminal painting remains optional.
 //!
 //! Each crate gets its own `cargo tree -p <crate> -e normal --offline --locked --prefix none`.
 //! A package name containing gtk, gdk, glib, gobject, webkit, javascriptcore, gsk, pango or
@@ -149,7 +150,7 @@ fn no_toolkit_in_the_normal_dependency_closure_of_the_toolkit_free_crates() {
             let Some(name) = line.split_whitespace().next() else {
                 continue;
             };
-            if is_banned_for(target, name) {
+            if is_banned_for(target, name) || (*target == "eitri-server" && name == "skia-safe") {
                 failures.insert(format!("{target} -> {name}"));
             }
         }
@@ -158,7 +159,7 @@ fn no_toolkit_in_the_normal_dependency_closure_of_the_toolkit_free_crates() {
     assert!(
         failures.is_empty(),
         "no toolkit below the shell: the normal-dependency closure of a toolkit-free crate \
-         reaches a toolkit or windowing package:\n{}",
+         reaches a toolkit or windowing package, or eitri-server reaches skia-safe:\n{}",
         {
             let mut sorted: Vec<&String> = failures.iter().collect();
             sorted.sort();

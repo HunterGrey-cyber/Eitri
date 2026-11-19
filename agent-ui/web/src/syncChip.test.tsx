@@ -7,7 +7,7 @@ import { initialPageModel, pageModel } from "./page_model";
 const initial = { host: "example-host", phase: "watching", gitPct: 0, conflicts: 0, pausedReason: null };
 it("sync_chip_shows_each_phase", () => {
   const { container, rerender } = render(<SyncChip chip={initial} />);
-  for (const [phase, suffix] of [["watching", ""], ["syncing", " · syncing"], ["history", " · history 43 %"], ["paused", " · paused"]]) {
+  for (const [phase, suffix] of [["watching", ""], ["syncing", " · syncing"], ["history", " · history arriving: 43 %"], ["paused", " · paused"]]) {
     const chip = { ...initial, phase, gitPct: 43 };
     const model = pageModel(initialPageModel(), {kind: "sync_status", chip, receivedAt: 0});
     rerender(<SyncChip chip={model.syncChip!} />);

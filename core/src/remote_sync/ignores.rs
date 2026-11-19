@@ -308,7 +308,7 @@ impl Rule {
         }
     }
 
-    fn matches(&self, path: &str, is_dir: bool) -> bool {
+    fn matches(&self, path: &str, is_dir: bool, icase: bool) -> bool {
         if self.directory && !is_dir {
             return false;
         }
@@ -317,7 +317,7 @@ impl Rule {
         } else {
             path.rsplit('/').next().unwrap_or(path)
         };
-        glob(&self.pattern, path) || self.pattern.strip_suffix("/**").is_some_and(|p| glob(p, path))
+        glob(&self.pattern, path, icase) || self.pattern.strip_suffix("/**").is_some_and(|p| glob(p, path, icase))
     }
 }
 
@@ -339,11 +339,21 @@ impl Matcher {
         }
         let mut ignored = false;
         for rule in &self.rules {
-            if rule.matches(path, is_dir) {
+            if rule.matches(path, is_dir, false) {
                 ignored = !rule.negative;
             }
         }
         ignored
+    }
+
+    /// An icase Git operand can select a server-only spelling. A case-sensitive inclusion of
+    /// one spelling cannot establish that every spelling is synchronized.
+    pub(super) fn possibly_ignored_icase(&self, rel: &str) -> bool {
+        parents(rel).chain(std::iter::once(rel)).any(|path| {
+            self.rules
+                .iter()
+                .any(|rule| !rule.negative && rule.matches(path, true, true))
+        })
     }
 
     fn excluded_parent<'a>(&self, path: &'a str) -> Option<&'a str> {
@@ -357,7 +367,8 @@ impl Matcher {
 
 // Rows are evaluated backwards with O(path length) storage. A whole '**/' component
 // may stop only at a component boundary; an ordinary star never crosses a slash.
-fn glob(pattern: &str, text: &str) -> bool {
+fn glob(pattern: &str, text: &str, icase: bool) -> bool {
+    let equal = |a: char, b: char| a == b || icase && a.eq_ignore_ascii_case(&b);
     let p: Vec<char> = pattern.chars().collect();
     let t: Vec<char> = text.chars().collect();
     let mut tokens = Vec::new();
@@ -393,10 +404,14 @@ fn glob(pattern: &str, text: &str) -> bool {
                 }
                 '?' => j < t.len() && t[j] != '/' && next[j + 1],
                 '[' if end - start > 1 => {
-                    j < t.len() && character_class(&p, start, Some(t[j])).unwrap().1 && next[j + 1]
+                    j < t.len() && next[j + 1] && {
+                        let matches = |c| character_class(&p, start, Some(c)).unwrap().1;
+                        matches(t[j])
+                            || icase && (matches(t[j].to_ascii_lowercase()) || matches(t[j].to_ascii_uppercase()))
+                    }
                 }
-                '\\' if end - start == 2 => t.get(j) == Some(&p[start + 1]) && next[j + 1],
-                c => t.get(j) == Some(&c) && next[j + 1],
+                '\\' if end - start == 2 => t.get(j).is_some_and(|&c| equal(c, p[start + 1])) && next[j + 1],
+                c => t.get(j).is_some_and(|&ch| equal(ch, c)) && next[j + 1],
             };
         }
         next = row;
@@ -460,7 +475,7 @@ pub fn ancestor_source(text: &str, root_from_source: &str) -> IgnoreSource {
                     next.push(index);
                     index += 1;
                 }
-                if components.get(index).is_some_and(|p| glob(p, name)) {
+                if components.get(index).is_some_and(|p| glob(p, name, false)) {
                     next.push(index + 1);
                 }
                 if index == components.len() {
@@ -842,9 +857,9 @@ mod tests {
             ("[!a-c]", "/", false),
             ("x[[]", "x[", true),
         ] {
-            assert_eq!(glob(pattern, path), expected, "{pattern} {path}");
+            assert_eq!(glob(pattern, path, false), expected, "{pattern} {path}");
         }
-        assert!(glob(&"a".repeat(20000), &"a".repeat(10)) == false);
+        assert!(glob(&"a".repeat(20000), &"a".repeat(10), false) == false);
     }
 
     struct Scratch(PathBuf);

@@ -70,7 +70,7 @@ const SENDS: &[(&str, &str)] = &[
     ),
     (
         "core/src/agent_backend.rs",
-        "conversation.send_turn_as_spawned(&turn.wire, &turn.typed, turn.origin, &client_message_id, answered)",
+        "conversation.send_turn_as_spawned(&turn.wire, &turn.typed, turn.origin, &client_message_id, wait, answered)",
     ),
 ];
 

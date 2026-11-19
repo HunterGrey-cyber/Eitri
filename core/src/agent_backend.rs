@@ -701,8 +701,8 @@ pub struct SubmittedPrompt {
 }
 
 /// A turn for [`AgentBackend::send_turn_spawned`]: what goes to the model, what was typed, and who wrote it.
-#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TurnRequest {
+    pub sync: Option<crate::remote_sync::flush::MessageSync>,
     pub wire: String,
     pub typed: String,
     pub origin: agent::PromptOrigin,
@@ -1584,11 +1584,20 @@ impl AgentBackend {
         wire_text: &str,
         as_typed: &str,
         origin: agent::PromptOrigin,
+        sync: Option<crate::remote_sync::flush::MessageSync>,
     ) -> Result<(), SteerRefusal> {
         let result = match self {
             AgentBackend::Legacy(_) => return Err(SteerRefusal::Unsupported),
             AgentBackend::Conversation { conversation, .. } => {
-                conversation.steer_turn(shown_turn, client_message_id, wire_text, as_typed, origin)
+                let wait = sync.map(|sync| {
+                    sync.wait(
+                        client_message_id,
+                        None,
+                        conversation.projection().last_revision,
+                        as_typed,
+                    )
+                });
+                conversation.steer_turn_after(shown_turn, client_message_id, wire_text, as_typed, origin, wait)
             }
         };
         result.map_err(|e| match e {
@@ -1676,9 +1685,24 @@ impl AgentBackend {
             ConversationError::TurnAlreadyActive => BackendError::turn_busy(),
             other => other.into(),
         };
-        let answered = move |outcome: Result<String, ConversationError>| done(outcome.map_err(turn_error));
+        let receipt = turn
+            .sync
+            .as_ref()
+            .map(|sync| (sync.tab.clone(), client_message_id.clone()));
+        let answered = move |outcome: Result<String, ConversationError>| {
+            if let Some((tab, id)) = receipt {
+                tab.settle(&id, outcome.is_ok());
+            }
+            done(outcome.map_err(turn_error));
+        };
+        let seq = row
+            .then(|| conversation.projection().user_prompts.last().map(|p| p.seq))
+            .flatten();
+        let wait = turn
+            .sync
+            .map(|sync| sync.wait(&client_message_id, seq, after_revision, &turn.typed));
         let sent =
-            conversation.send_turn_as_spawned(&turn.wire, &turn.typed, turn.origin, &client_message_id, answered);
+            conversation.send_turn_as_spawned(&turn.wire, &turn.typed, turn.origin, &client_message_id, wait, answered);
         match sent {
             Ok(()) => Ok(spawned),
             Err(error) => {

@@ -320,6 +320,7 @@ fn end_sockets_of_ended_sessions(state: &mut AgentPanelState) {
 
 /// What the broker reads of the panel, for one round.
 struct PanelEnv<'a> {
+    server: Option<&'a eitri_core::remote_project::RemoteConnection>,
     tabs: &'a TabSet,
     way: Option<Rc<dyn EditorWay>>,
     root: &'a Path,
@@ -347,6 +348,36 @@ impl BrokerEnv for PanelEnv<'_> {
 
     fn context(&self) -> Option<EditorContext> {
         (self.context)()
+    }
+
+    fn write_hold(&self, tab: TabId) -> Option<eitri_core::remote_sync::flush::EditorWriteHold> {
+        let eitri_core::remote_project::TabOrigin::Remote {
+            host,
+            host_key_sha256,
+            root,
+        } = self.tabs.get(tab)?.origin()
+        else {
+            return None;
+        };
+        let connection = self
+            .server
+            .filter(|c| &c.project().host_key_sha256 == host_key_sha256 && &c.project().root == root);
+        let sync_dir = eitri_core::remote_project::RemoteProjects::new(
+            self.review_roots.state_home.as_deref(),
+            self.review_roots.home.as_deref(),
+        )
+        .state_home()
+        .map(|home| {
+            eitri_core::remote_sync::status_file::sync_dir(
+                &home,
+                &eitri_core::remote_sync::SyncKey::new(host_key_sha256, root),
+            )
+        });
+        Some(eitri_core::remote_sync::flush::EditorWriteHold {
+            connection: connection.cloned().map(|c| std::sync::Arc::new(c) as _),
+            host: host.clone(),
+            sync_dir,
+        })
     }
 
     /// The store of this window's turn review, and the same directory when `review.enabled` left it with none: a
@@ -401,6 +432,7 @@ pub(super) fn poll(state: &mut AgentPanelState, out: &mut Outbox) {
             .map(|rpc| Rc::new(LocalWay(rpc)) as Rc<dyn EditorWay>)
     };
     let env = PanelEnv {
+        server: state.server.as_ref(),
         tabs,
         way: editor_way.clone().or_else(local),
         root: project_dir,
@@ -788,6 +820,7 @@ pub(super) mod tests {
         assert_eq!(state.tabs.turn_review().is_some(), enabled);
 
         let writer = PanelEnv {
+            server: None,
             tabs: &state.tabs,
             way: None,
             root: &state.project_dir,
@@ -1179,6 +1212,7 @@ pub(super) mod tests {
             let mut state = self.handle.state.borrow_mut();
             let state = &mut *state;
             let env = PanelEnv {
+                server: None,
                 tabs: &state.tabs,
                 way: None,
                 root: &state.project_dir,
@@ -1878,6 +1912,7 @@ pub(super) mod tests {
             let mut state = panel.handle.state.borrow_mut();
             let state = &mut *state;
             let env = PanelEnv {
+                server: None,
                 tabs: &state.tabs,
                 way: None,
                 root: &state.project_dir,

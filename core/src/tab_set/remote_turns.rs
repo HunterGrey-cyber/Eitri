@@ -413,6 +413,7 @@ impl TabSet {
             }
         };
         let request = TurnRequest {
+            sync: self.message_sync(id),
             wire: turn.wire.clone(),
             typed: turn.typed.clone(),
             origin: PromptOrigin::Composed,

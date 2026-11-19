@@ -113,8 +113,14 @@ use super::ime::{im_cursor_rect, Commit, FocusChange, GtkFocus, ImeGate};
 use super::input_queue::{InputQueue, PaneInput, PasteTicket};
 use super::keys::{self, ClipboardChord, CopyModeKey, DeliveredKeys, RawKey, RepeatTracker};
 use super::pointer;
+use super::remote::{self, Again, TermSource};
 use super::TerminalFace;
 use crate::wheel_zoom::WheelZoom;
+use eitri_core::remote_project::terminal_link::OpenAnswer;
+use eitri_core::remote_project::terminals::TerminalEntry;
+use eitri_core::wm::ShellIdentity;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 /// GDK's own numbering (X11/Wayland convention, not named constants in `gtk4-rs`): button 1 is the
 /// primary (left) button, button 2 the middle.
@@ -156,6 +162,8 @@ struct State {
     wanted: bool,
     session: Option<TerminalSession>,
     generation: u64,
+    remote: Option<remote::Binding>,
+    overlay_wake: Option<futures_channel::mpsc::UnboundedSender<()>>,
     /// Counts input accepted for the shell, including keys and mouse reports parked behind a paste and the start
     /// of a paste; focus reports do not count. A restart decided on an idle read compares it, since a command typed
     /// after the read keeps the same shell and pid. Releasing parked input may count it again; only equality matters.
@@ -214,9 +222,9 @@ struct State {
     /// Told the text of an OSC 52 notice the pane could not show because its shell ended and closed the module
     /// first; set by `main.rs` ([`TerminalPane::on_clipboard_notice_lost`]). Called with no borrow of this state held.
     on_notice_lost: Option<Rc<dyn Fn(String)>>,
-    /// Told each time a shell is spawned, with its pid; set by `main.rs` ([`TerminalPane::on_shell_start`]).
+    /// Told each time a shell is spawned, with its local or server identity; set by `main.rs` ([`TerminalPane::on_shell_start`]).
     /// Called with no borrow of this state held.
-    on_shell_start: Option<Rc<dyn Fn(u32)>>,
+    on_shell_start: Option<Rc<dyn Fn(ShellIdentity)>>,
     /// The session is frozen for a move to the other window: what is typed or pointed here goes nowhere until the
     /// move ends, since after a commit the other window answers for the program.
     frozen: bool,
@@ -254,6 +262,119 @@ enum CommitRoute {
 }
 
 impl State {
+    fn bind_remote(&mut self, registry: Rc<remote::Registry>, module: String, restored: bool, wake: Rc<dyn Fn()>) {
+        let mut binding = remote::Binding::new(registry, module);
+        // A window that binds no server terminals (a chat or page window) has no saved entry to read.
+        binding.restore = restored && binding.owner.is_some();
+        binding.ownership_known = !binding.restore;
+        binding.wants_restore = restored;
+        binding.listen(wake);
+        self.remote = Some(binding);
+    }
+
+    fn set_start_dir(&mut self, dir: PathBuf) {
+        // A reused idle surface is identified by the controller's directory operation before placement or start.
+        if !self.wanted {
+            if let Some(binding) = self.remote.as_mut() {
+                binding.adopt_pending();
+            }
+        }
+        self.cwd = dir;
+    }
+
+    fn source(&self) -> TermSource {
+        match &self.remote {
+            Some(remote) => remote::source_for(&remote.registry.origin()),
+            None => remote::unbound_source(),
+        }
+    }
+
+    fn start_source(state: &RefCell<Self>) -> (TermSource, Vec<(OsString, OsString)>) {
+        let (source, shell_env) = {
+            let state = state.borrow();
+            (state.source(), state.shell_env.clone())
+        };
+        let extra = if matches!(source, TermSource::Local) {
+            shell_env.map(|env| env()).unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        (source, extra)
+    }
+
+    fn adopt(
+        &mut self,
+        record: &serde_json::Value,
+        fds: Vec<std::os::fd::OwnedFd>,
+        wake: impl Fn() + Send + 'static,
+    ) -> Result<(TerminalSession, bool), String> {
+        self.allow_adopt()?;
+        if self.session.is_some() && !self.exited {
+            return Err("the pane already runs a shell".into());
+        }
+        let size = self.adopt_size(build_metrics)?;
+        let config = SessionConfig {
+            // An adoption uses the existing PTY and never spawns this shell.
+            spawn: SpawnSpec::user_shell(self.cwd.clone()),
+            size,
+            colors: self.colors,
+            focused: self.focused,
+            tap: None,
+        };
+        super::moving::adopt(record, fds, config, wake)
+    }
+
+    fn remote_report(&mut self, report: eitri_terminal::mirror::MirrorReport) {
+        if let Some(remote) = self.remote.as_mut() {
+            remote.report(report, Instant::now());
+            if remote.model.ending.is_some() {
+                self.exited = true;
+            }
+        }
+    }
+
+    fn remote_exit(&mut self, exit: ExitInfo) {
+        if let Some(remote) = self.remote.as_mut() {
+            if !exit.detached {
+                remote.model.ending = Some(remote::Ending::Exited(exit));
+            }
+        }
+        self.exited = !exit.detached || self.remote.is_none();
+    }
+
+    fn reset_for_restart(&mut self) {
+        if let Some(remote) = self.remote.as_mut() {
+            remote.reset();
+        }
+        self.forget_session();
+        self.generation += 1;
+    }
+
+    fn detach(&mut self) -> Result<Receiver<Result<Detached, DetachRefused>>, String> {
+        self.allow_adopt()?;
+        if self.frozen {
+            return Err("the terminal is already frozen for a move".into());
+        }
+        let session = match (&self.session, self.exited) {
+            (Some(session), false) => session,
+            _ => return Err("no shell runs in the terminal".into()),
+        };
+        if let Some(why) = self.freeze_refusal() {
+            return Err(why);
+        }
+        let (answer, answered) = std::sync::mpsc::channel();
+        session.send(SessionCommand::Detach(answer));
+        self.frozen = true;
+        Ok(answered)
+    }
+
+    fn allow_adopt(&self) -> Result<(), String> {
+        if self.remote.is_some() {
+            return Err(super::moving::refusal_text(DetachRefused::ServerTerminal));
+        }
+        Ok(())
+    }
+
     /// The construction seam `TerminalPane::new` uses. Deliberately GTK-free (no field here holds
     /// a `gtk4` type instantiated by anything but `None`), so a test can assert what a pane's state
     /// looks like the instant it exists -- in particular, that it holds no metrics -- with no
@@ -266,6 +387,8 @@ impl State {
             wanted: false,
             session: None,
             generation: 0,
+            remote: None,
+            overlay_wake: None,
             typed: 0,
             exited: false,
             frame: None,
@@ -442,11 +565,50 @@ impl State {
 
     /// Accepts input now, even when a paste holds it back from the session.
     fn submit(&mut self, input: PaneInput) {
+        if !self.remote_input(matches!(input, PaneInput::Key(_))) {
+            return;
+        }
         let counts_as_typing = !matches!(input, PaneInput::Focus(_));
         match self.queue.submit(input) {
             Some(input) => self.send_input(input),
             None if counts_as_typing => self.typed += 1,
             None => {}
+        }
+    }
+
+    fn remote_input(&mut self, typed: bool) -> bool {
+        let Some(remote) = self.remote.as_mut() else {
+            return true;
+        };
+        let allowed = if typed {
+            remote.model.input(Instant::now())
+        } else {
+            remote.model.recorded && !remote.starting
+        };
+        if typed {
+            if let Some(wake) = &self.overlay_wake {
+                let _ = wake.unbounded_send(());
+            }
+        }
+        allowed
+    }
+
+    fn connection_changed(&mut self, report: &mut eitri_terminal::mirror::MirrorReport) {
+        if report.synced.is_some() && self.copy_mode {
+            self.apply_copy_mode_key(CopyModeKey::Leave);
+        }
+        if report.synced.is_some()
+            || report
+                .link
+                .is_some_and(|link| link != eitri_terminal::mirror::LinkState::Live)
+        {
+            if !self.queue.is_empty() {
+                report.refused_input_bytes = report.refused_input_bytes.saturating_add(1);
+            }
+            self.queue.clear();
+            for (_, read) in self.paste_reads.drain(..) {
+                read.cancel();
+            }
         }
     }
 
@@ -469,6 +631,9 @@ impl State {
     /// 3c): a key is `Input`, a mouse gesture `Mouse`, a focus change `FocusReport` -- never the
     /// direct `SessionCommand::Focus` a report must not ride (`set_focused`'s own doc).
     fn send_input(&mut self, input: PaneInput) {
+        if !self.remote_input(matches!(input, PaneInput::Key(_))) {
+            return;
+        }
         if !matches!(input, PaneInput::Focus(_)) {
             self.typed += 1;
         }
@@ -726,6 +891,22 @@ impl TerminalPane {
         connect_pointer(&area, &state, &im);
         connect_scroll(&area, &state);
         connect_visibility(&area, &state, &im);
+        let (wake, mut woken) = futures_channel::mpsc::unbounded();
+        state.borrow_mut().overlay_wake = Some(wake);
+        let weak_state = Rc::downgrade(&state);
+        let weak_area = area.downgrade();
+        glib::spawn_future_local(async move {
+            while woken.recv().await.is_ok() {
+                let (Some(state), Some(area)) = (weak_state.upgrade(), weak_area.upgrade()) else {
+                    break;
+                };
+                let expiry = state.borrow().remote.as_ref().and_then(|r| r.model.expiry());
+                area.queue_render();
+                if let Some(until) = expiry {
+                    repaint_at(&area, until);
+                }
+            }
+        });
         TerminalPane { area, state, im }
     }
 
@@ -733,6 +914,89 @@ impl TerminalPane {
     /// which refuses hidden modules, rather than through the pane's own focus call.
     pub(crate) fn widget(&self) -> &GLArea {
         &self.area
+    }
+
+    pub(crate) fn set_remote(&self, registry: Rc<remote::Registry>, module: String, restored: bool) {
+        if registry.origin().remote().is_none() || (self.state.borrow().remote.is_some() && !registry.adopting()) {
+            return;
+        }
+        let state = Rc::downgrade(&self.state);
+        let area = self.area.downgrade();
+        let im = self.im.downgrade();
+        self.state.borrow_mut().bind_remote(
+            registry,
+            module,
+            restored,
+            Rc::new(move || {
+                let (Some(state), Some(area), Some(im)) = (state.upgrade(), area.upgrade(), im.upgrade()) else {
+                    return;
+                };
+                restore_remote_owner(&state);
+                ensure_session(&state, &area, &im);
+            }),
+        );
+        restore_remote_owner(&self.state);
+        // A pane wanted before it was bound waited; with its binding it may start now, as a wake would start it.
+        ensure_session(&self.state, &self.area, &self.im);
+    }
+
+    pub(crate) fn claims_remote_terminal(&self) -> bool {
+        self.state
+            .borrow()
+            .remote
+            .as_ref()
+            .is_some_and(remote::Binding::claims_module)
+    }
+
+    pub(crate) fn may_have_job(&self) -> bool {
+        let state = self.state.borrow();
+        !state.exited && (state.session.is_some() || state.remote.as_ref().is_some_and(remote::Binding::may_have_job))
+    }
+
+    pub(crate) fn shell_identity(&self) -> Option<ShellIdentity> {
+        let state = self.state.borrow();
+        if state.exited {
+            return None;
+        }
+        if let Some(remote) = &state.remote {
+            return remote
+                .entry
+                .as_ref()?
+                .terminal_id
+                .as_deref()
+                .and_then(|id| remote::identity(state.generation, id));
+        }
+        state
+            .session
+            .as_ref()
+            .and_then(TerminalSession::local_pid)
+            .map(|pid| ShellIdentity::Local { pid })
+    }
+
+    pub(crate) fn job_query(&self) -> Option<Box<dyn super::jobs::JobQuery>> {
+        let state = self.state.borrow();
+        if state.exited {
+            return None;
+        }
+        if let Some(remote) = &state.remote {
+            let id = remote.entry.as_ref()?.terminal_id.clone()?;
+            return Some(Box::new(super::jobs::Server::new(remote.registry.facts.clone(), id)));
+        }
+        state
+            .session
+            .as_ref()
+            .and_then(TerminalSession::local_pid)
+            .map(|pid| Box::new(super::jobs::Local { pid }) as Box<dyn super::jobs::JobQuery>)
+    }
+
+    pub(crate) fn respawn_server(&self, dir: PathBuf) -> Result<(), String> {
+        if self.state.borrow().remote.is_none() {
+            return Err("this terminal has no server".into());
+        }
+        self.close();
+        self.set_start_dir(dir);
+        self.start();
+        Ok(())
     }
 
     pub(crate) fn set_number(&self, number: u8) {
@@ -752,19 +1016,25 @@ impl TerminalPane {
         ensure_session(&self.state, &self.area, &self.im);
     }
 
+    /// Whether a live local child or mirror session occupies this pane.
+    pub(crate) fn is_running(&self) -> bool {
+        let state = self.state.borrow();
+        !state.exited && (state.session.is_some() || state.remote.as_ref().is_some_and(|r| r.starting))
+    }
+
     /// The running shell's pid, absent before spawn and after exit.
     pub(crate) fn shell_pid(&self) -> Option<u32> {
         let state = self.state.borrow();
         if state.exited {
             None
         } else {
-            state.session.as_ref().map(TerminalSession::pid)
+            state.session.as_ref().and_then(TerminalSession::local_pid)
         }
     }
 
     /// The directory used by the next shell; a running shell keeps its own directory.
     pub(crate) fn set_start_dir(&self, dir: PathBuf) {
-        self.state.borrow_mut().cwd = dir;
+        self.state.borrow_mut().set_start_dir(dir);
     }
 
     /// How many keys and mouse reports the pane has been given for its shell; a focus report is not one.
@@ -888,8 +1158,8 @@ impl TerminalPane {
 
     /// `f` runs each time a shell is spawned in this pane -- at its first allocation after a start, or
     /// at once when the pane is laid out, and on the Enter that restarts an exited one -- with the
-    /// shell's pid, with this pane's state released.
-    pub(crate) fn on_shell_start(&self, f: impl Fn(u32) + 'static) {
+    /// shell's identity, with this pane's state released.
+    pub(crate) fn on_shell_start(&self, f: impl Fn(ShellIdentity) + 'static) {
         self.state.borrow_mut().on_shell_start = Some(Rc::new(f));
     }
 
@@ -904,6 +1174,7 @@ impl TerminalPane {
     /// next [`Self::start`] is a fresh shell on a blank pane, as the first one was. Does not wait:
     /// `TerminalSession`'s own `Drop` hangs up and reaps off the thread.
     pub(crate) fn close(&self) {
+        close_remote(&self.state, !crate::end_signals::signal_close_started());
         self.state.borrow_mut().close();
         // No borrow held: `reset` can emit `commit`/`preedit-changed`, whose handlers borrow the state.
         self.im.reset();
@@ -916,21 +1187,7 @@ impl TerminalPane {
     /// shell, one already frozen, or while input waits behind a paste.
     pub(crate) fn detach(&self) -> Result<Receiver<Result<Detached, DetachRefused>>, String> {
         discard_composition(&self.state, &self.im, &self.area);
-        let mut state = self.state.borrow_mut();
-        if state.frozen {
-            return Err("the terminal is already frozen for a move".into());
-        }
-        let session = match (&state.session, state.exited) {
-            (Some(session), false) => session,
-            _ => return Err("no shell runs in the terminal".into()),
-        };
-        if let Some(why) = state.freeze_refusal() {
-            return Err(why);
-        }
-        let (answer, answered) = std::sync::mpsc::channel();
-        session.send(SessionCommand::Detach(answer));
-        state.frozen = true;
-        Ok(answered)
+        self.state.borrow_mut().detach()
     }
 
     /// The move did not happen: the frozen session rebuilds its screen, writes what it owed and reads again, and
@@ -976,25 +1233,10 @@ impl TerminalPane {
     /// rebuilds and draws, writing what the other window still owed the shell. Refused, with nothing taken, when the
     /// record or its descriptors do not hold a terminal this process can adopt, or the pane already runs a shell.
     pub(crate) fn adopt(&self, record: &serde_json::Value, fds: Vec<std::os::fd::OwnedFd>) -> Result<(), String> {
+        self.state.borrow().allow_adopt()?;
         self.im.set_client_widget(Some(&self.area));
-        let (size, colors, focused, cwd) = {
-            let mut state = self.state.borrow_mut();
-            if state.session.is_some() && !state.exited {
-                return Err("the pane already runs a shell".into());
-            }
-            let size = state.adopt_size(build_metrics)?;
-            (size, state.colors, state.focused, state.cwd.clone())
-        };
         let (wake, woken) = futures_channel::mpsc::unbounded::<()>();
-        let config = SessionConfig {
-            // Not used by an adoption, which spawns nothing.
-            spawn: SpawnSpec::user_shell(cwd),
-            size,
-            colors,
-            focused,
-            tap: None,
-        };
-        let (session, copy_mode) = super::moving::adopt(record, fds, config, move || {
+        let (session, copy_mode) = self.state.borrow_mut().adopt(record, fds, move || {
             let _ = wake.unbounded_send(());
         })?;
         let pid = session.pid();
@@ -1006,7 +1248,7 @@ impl TerminalPane {
             state.on_shell_start.clone()
         };
         if let Some(started) = started {
-            started(pid);
+            started(ShellIdentity::Local { pid });
         }
         watch_session(&self.state, &self.area, &self.im, woken);
         Ok(())
@@ -1018,7 +1260,7 @@ impl TerminalPane {
     pub(crate) fn child_exited(&self, pid: u32, start: u64, status: std::process::ExitStatus) -> bool {
         let state = self.state.borrow();
         match &state.session {
-            Some(session) if session.pid() == pid && session.adopted_start() == Some(start) => {
+            Some(session) if session.local_pid() == Some(pid) && session.adopted_start() == Some(start) => {
                 session.send(SessionCommand::ChildExited(status));
                 true
             }
@@ -1028,6 +1270,7 @@ impl TerminalPane {
 
     /// Window close: hang the shell up. Does not wait -- `TerminalSession`'s own `Drop`.
     pub(crate) fn shutdown(&self) {
+        close_remote(&self.state, !crate::end_signals::signal_close_started());
         let mut state = self.state.borrow_mut();
         state.wanted = false;
         state.session = None;
@@ -1089,7 +1332,10 @@ fn shell_spec(program: Option<PathBuf>, cwd: PathBuf, extra: &[(OsString, OsStri
 /// where the terminal's font metrics are built, the first time they are needed -- never at
 /// construction, so a window whose terminal is never shown never touches a font manager.
 fn ensure_session(state: &Rc<RefCell<State>>, area: &GLArea, im: &IMMulticontext) {
-    let (cwd, shell_env, size, colors, focused) = {
+    if state.borrow().remote.as_ref().is_some_and(|remote| remote.starting) {
+        return;
+    }
+    let (cwd, size, colors, focused) = {
         let mut s = state.borrow_mut();
         let size = match s.spawn_size(build_metrics) {
             None => return,
@@ -1107,10 +1353,29 @@ fn ensure_session(state: &Rc<RefCell<State>>, area: &GLArea, im: &IMMulticontext
                 return;
             }
         };
-        (s.cwd.clone(), s.shell_env.clone(), size, s.colors, s.focused)
+        (s.cwd.clone(), size, s.colors, s.focused)
     };
+    if retry_slot_before_start(state) {
+        return;
+    }
+    let (source, extra) = State::start_source(state);
+    match source {
+        TermSource::Waiting => {
+            let mut s = state.borrow_mut();
+            if s.frame.is_none() {
+                s.frame = Some(message_frame(size, colors, ""));
+            }
+            drop(s);
+            area.queue_render();
+            return;
+        }
+        TermSource::Server(connection) => {
+            start_remote(state, area, im, connection, size, colors, focused);
+            return;
+        }
+        TermSource::Local => {}
+    }
     let (wake, woken) = futures_channel::mpsc::unbounded::<()>();
-    let extra = shell_env.map(|env| env()).unwrap_or_default();
     let mut spec = shell_spec(None, cwd.clone(), &extra);
     let mut tried = Vec::new();
     let started = loop {
@@ -1166,9 +1431,446 @@ fn ensure_session(state: &Rc<RefCell<State>>, area: &GLArea, im: &IMMulticontext
         s.on_shell_start.clone()
     };
     if let Some(started) = started {
-        started(pid);
+        started(ShellIdentity::Local { pid });
     }
     watch_session(state, area, im, woken);
+}
+
+/// A window that could not take the first slot at its start (its previous owner was still exiting) tries again as a
+/// pane is about to start, on Enter included. Taking it wakes every pane, this one too: each reads its saved entry
+/// first, and the woken start goes on, so this one stops (`true`).
+fn retry_slot_before_start(state: &RefCell<State>) -> bool {
+    let retry = state.borrow().slot_retry();
+    match retry {
+        Some(registry) if registry.retry_slot() => {
+            registry.wake();
+            true
+        }
+        _ => false,
+    }
+}
+
+fn restore_remote_owner(state: &Rc<RefCell<State>>) {
+    {
+        let mut s = state.borrow_mut();
+        if let Some(remote) = s.remote.as_mut() {
+            remote.ensure_owner();
+        }
+    }
+    let (owner, work, cancelled, generation) = {
+        let s = state.borrow();
+        let Some(remote) = s.remote.as_ref() else { return };
+        if !remote.restore || remote.ownership_known || remote.starting || s.session.is_some() {
+            return;
+        }
+        let Some(owner) = remote.current_owner() else {
+            return;
+        };
+        (owner, remote.work.clone(), remote.cancelled.clone(), s.generation)
+    };
+    let (tell, mut told) = futures_channel::mpsc::unbounded();
+    work.run(move || {
+        let _ = tell.unbounded_send(owner.restore());
+    });
+    let state = Rc::downgrade(state);
+    glib::spawn_future_local(async move {
+        let Ok(result) = told.recv().await else { return };
+        let Some(state) = state.upgrade() else { return };
+        let mut s = state.borrow_mut();
+        if s.generation != generation || s.session.is_some() || cancelled.load(Ordering::SeqCst) {
+            return;
+        }
+        let Some(remote) = s.remote.as_mut() else { return };
+        if remote.starting {
+            return;
+        }
+        match result {
+            Ok(entry) => {
+                remote.entry = entry;
+                remote.ownership_known = true;
+            }
+            Err(error) => {
+                let registry = remote.registry.clone();
+                drop(s);
+                registry.notice(format!(
+                    "terminal records: {}",
+                    eitri_core::onboarding::display::display_text(&error.to_string())
+                ));
+            }
+        }
+    });
+}
+
+enum RemoteReady {
+    Started(TerminalSession, TerminalEntry, OpenAnswer),
+    Recorded((String, String, String)),
+    Failed(String),
+}
+
+/// The size, colours and focus a server session is started with. The start runs on the record worker and over the
+/// network, and the pane keeps changing meanwhile; what differs when the session arrives is sent to it then.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct View {
+    size: PtySize,
+    colors: TerminalColors,
+    focused: bool,
+}
+
+/// What a session that has just arrived is told about the pane's changes since its start was captured.
+#[derive(Debug, Default, PartialEq)]
+struct CatchUp {
+    size: Option<PtySize>,
+    colors: Option<TerminalColors>,
+    focused: Option<bool>,
+}
+
+/// A server start decided on the GTK thread, for its record worker.
+struct RemoteStart {
+    owner: remote::Owner,
+    work: remote::Work,
+    cancelled: Arc<AtomicBool>,
+    again: Option<Again>,
+    retry: Option<TerminalEntry>,
+    cwd: PathBuf,
+    generation: u64,
+    view: View,
+}
+
+type ShellStarted = Option<(Rc<dyn Fn(ShellIdentity)>, ShellIdentity)>;
+
+impl State {
+    /// The window registry of a bound pane that has no owner yet, which may try for the first slot again.
+    fn slot_retry(&self) -> Option<Rc<remote::Registry>> {
+        self.remote
+            .as_ref()
+            .filter(|remote| remote.owner.is_none() || remote.registry.may_retry_slot())
+            .map(|remote| remote.registry.clone())
+    }
+
+    /// `None` when there is nothing to start: a start is already under way, or this window binds no server terminal
+    /// (the pane then ends with that reason).
+    fn begin_remote_start(&mut self, view: View) -> Option<RemoteStart> {
+        let cwd = self.cwd.clone();
+        let generation = self.generation;
+        let remote = self.remote.as_mut()?;
+        if remote.starting {
+            return None;
+        }
+        remote.ensure_owner();
+        let Some(owner) = remote.current_owner() else {
+            remote.model.ending = Some(remote::Ending::Failed(remote.registry.no_slot_reason().into()));
+            self.exited = true;
+            return None;
+        };
+        remote.starting = true;
+        remote.model.opening = true;
+        remote.cancelled = Arc::new(AtomicBool::new(false));
+        Some(RemoteStart {
+            owner,
+            work: remote.work.clone(),
+            cancelled: remote.cancelled.clone(),
+            again: remote.again.take(),
+            retry: remote.retry_entry.take(),
+            cwd,
+            generation,
+            view,
+        })
+    }
+
+    /// The pane's size, colours and focus now; the size is the metrics' grid, `fallback`'s before any metrics.
+    fn view(&self, fallback: PtySize) -> View {
+        View {
+            size: self.metrics.as_ref().map(PtySize::from_metrics).unwrap_or(fallback),
+            colors: self.colors,
+            focused: self.focused,
+        }
+    }
+
+    /// Takes the started session. Sizes, colours and focus set while the start ran went nowhere (there was no session
+    /// to send them to), so whatever differs from what the session was started with is sent to it now.
+    fn remote_started(
+        &mut self,
+        session: TerminalSession,
+        entry: TerminalEntry,
+        answer: OpenAnswer,
+        started: View,
+        mapped: bool,
+    ) -> (ShellStarted, CatchUp) {
+        let now = self.view(started.size);
+        let catch_up = CatchUp {
+            size: (now.size != started.size).then_some(now.size),
+            colors: (now.colors != started.colors).then_some(now.colors),
+            focused: (now.focused != started.focused).then_some(now.focused),
+        };
+        let generation = self.generation;
+        let callback = self.on_shell_start.clone();
+        let Some(remote) = self.remote.as_mut() else {
+            return (None, CatchUp::default());
+        };
+        remote.starting = false;
+        remote.ownership_known = true;
+        // Attach identities were durable before this start. Open identities wait for Recorded.
+        remote.model.recorded = entry.terminal_id.is_some();
+        let identity = entry
+            .terminal_id
+            .as_deref()
+            .and_then(|id| remote::identity(generation, id));
+        remote.entry = Some(entry);
+        remote.answer = Some(answer);
+        session.send(SessionCommand::Visible(mapped));
+        if let Some(size) = catch_up.size {
+            session.send(SessionCommand::Resize(size));
+        }
+        if let Some(colors) = catch_up.colors {
+            session.send(SessionCommand::SetColors(colors));
+        }
+        if let Some(focused) = catch_up.focused {
+            session.send(SessionCommand::Focus(focused));
+        }
+        self.session = Some(session);
+        (callback.zip(identity), catch_up)
+    }
+
+    fn remote_recorded(&mut self, identity: (String, String, String), generation: u64) -> ShellStarted {
+        let callback = self.on_shell_start.clone();
+        let remote = self.remote.as_mut()?;
+        remote.model.recorded = true;
+        if let Some(entry) = remote.entry.as_mut() {
+            entry.terminal_id = Some(identity.0.clone());
+            entry.daemon_instance = Some(identity.1);
+            entry.boot_id = Some(identity.2);
+        }
+        callback.zip(remote::identity(generation, &identity.0))
+    }
+
+    /// The start failed before a session existed: the entry stays, and Enter reattaches it.
+    fn remote_failed(&mut self, why: &str) -> Option<Rc<remote::Registry>> {
+        let remote = self.remote.as_mut()?;
+        remote.starting = false;
+        remote.model.ending = Some(remote::Ending::Failed(why.to_owned()));
+        // A failed record keeps keys held; Enter reattaches the existing intent.
+        remote.again = Some(Again::Attach);
+        let registry = remote.registry.clone();
+        self.exited = true;
+        Some(registry)
+    }
+}
+
+/// The record worker's half of a server start: the durable intent, then the link and its mirror (`start`), then, for
+/// an open, the answer saved before the pane lets its keys through. Production passes `Owner::start`.
+fn run_remote_start(
+    plan: RemoteStart,
+    start: impl FnOnce(
+        &remote::Owner,
+        PathBuf,
+        Option<Again>,
+        Option<TerminalEntry>,
+        View,
+        Box<dyn Fn() + Send>,
+    ) -> std::io::Result<(TerminalSession, TerminalEntry, OpenAnswer)>,
+    tell: futures_channel::mpsc::UnboundedSender<RemoteReady>,
+    wake: futures_channel::mpsc::UnboundedSender<()>,
+) {
+    let RemoteStart {
+        owner,
+        work: writes,
+        cancelled,
+        again,
+        retry,
+        cwd,
+        view,
+        ..
+    } = plan;
+    if cancelled.load(Ordering::SeqCst) {
+        return;
+    }
+    let started = start(
+        &owner,
+        cwd,
+        again,
+        retry,
+        view,
+        Box::new(move || {
+            let _ = wake.unbounded_send(());
+        }),
+    );
+    let (session, entry, answer) = match started {
+        Ok(started) => started,
+        Err(error) => {
+            let _ = tell.unbounded_send(RemoteReady::Failed(error.to_string()));
+            return;
+        }
+    };
+    let is_attach = entry.terminal_id.is_some();
+    let saved = entry.clone();
+    if tell
+        .unbounded_send(RemoteReady::Started(session, entry, answer.clone()))
+        .is_err()
+    {
+        return;
+    }
+    if is_attach {
+        return;
+    }
+    // Waiting for the open answer holds no record worker, so a close can queue its stop meanwhile.
+    std::thread::spawn(move || {
+        while !cancelled.load(Ordering::SeqCst) {
+            if let Some(identity) = answer.wait(Instant::now() + Duration::from_secs(1)) {
+                writes.run(move || match owner.opened(&saved, &identity) {
+                    Ok(()) => {
+                        let _ = tell.unbounded_send(RemoteReady::Recorded(identity));
+                    }
+                    Err(error) => {
+                        let _ = tell.unbounded_send(RemoteReady::Failed(format!(
+                            "the terminal identity could not be saved: {error}"
+                        )));
+                    }
+                });
+                return;
+            }
+            // A link that ended without an answer never gives one: the GTK side stops listening with this sender.
+            if tell.is_closed() || answer.ended() {
+                return;
+            }
+        }
+    });
+}
+
+fn start_remote(
+    state: &Rc<RefCell<State>>,
+    area: &GLArea,
+    im: &IMMulticontext,
+    connection: eitri_core::remote_project::RemoteConnection,
+    size: PtySize,
+    colors: TerminalColors,
+    focused: bool,
+) {
+    let view = View { size, colors, focused };
+    let plan = state.borrow_mut().begin_remote_start(view);
+    let Some(plan) = plan else {
+        area.queue_render();
+        return;
+    };
+    let generation = plan.generation;
+    let (tell, mut told) = futures_channel::mpsc::unbounded();
+    let (wake, woken) = futures_channel::mpsc::unbounded();
+    let work = plan.work.clone();
+    work.run(move || {
+        run_remote_start(
+            plan,
+            |owner, cwd, again, retry, view, wake| {
+                owner.start(
+                    &connection,
+                    cwd,
+                    again,
+                    retry,
+                    view.size,
+                    view.colors,
+                    view.focused,
+                    wake,
+                )
+            },
+            tell,
+            wake,
+        )
+    });
+    let state = Rc::downgrade(state);
+    let area = area.downgrade();
+    let im = im.downgrade();
+    glib::spawn_future_local(async move {
+        let mut woken = Some(woken);
+        while let Ok(ready) = told.recv().await {
+            let (Some(state), Some(area), Some(im)) = (state.upgrade(), area.upgrade(), im.upgrade()) else {
+                break;
+            };
+            let current = {
+                let s = state.borrow();
+                s.generation == generation
+                    && s.wanted
+                    && s.remote.as_ref().is_some_and(|r| !r.cancelled.load(Ordering::SeqCst))
+            };
+            if !current {
+                break;
+            }
+            match ready {
+                RemoteReady::Started(session, entry, answer) => {
+                    let (started, _) =
+                        state
+                            .borrow_mut()
+                            .remote_started(session, entry, answer, view, area.is_mapped());
+                    if let Some((callback, identity)) = started {
+                        callback(identity);
+                    }
+                    if let Some(woken) = woken.take() {
+                        watch_session(&state, &area, &im, woken);
+                    }
+                    pump(&state, &area, &im, area.is_mapped());
+                }
+                RemoteReady::Recorded(identity) => {
+                    let started = state.borrow_mut().remote_recorded(identity, generation);
+                    if let Some((callback, identity)) = started {
+                        callback(identity);
+                    }
+                    area.queue_render();
+                    break;
+                }
+                RemoteReady::Failed(why) => {
+                    let registry = state.borrow_mut().remote_failed(&why);
+                    if let Some(registry) = registry {
+                        registry.notice(format!(
+                            "terminal: {}",
+                            eitri_core::onboarding::display::display_text(&why)
+                        ));
+                        if why == remote::UNCLAIMED_REFUSAL {
+                            registry.offer_again();
+                        }
+                    }
+                    area.queue_render();
+                    break;
+                }
+            }
+        }
+    });
+}
+
+fn close_remote(state: &RefCell<State>, by_hand: bool) {
+    let operation = {
+        let mut s = state.borrow_mut();
+        let Some(remote) = s.remote.as_mut() else { return };
+        remote.cancelled.store(true, Ordering::SeqCst);
+        remote.starting = false;
+        remote.ownership_known = true;
+        remote.entry = None;
+        remote.retry_entry = None;
+        remote.restore = false;
+        // A pane closed while its window had no slot reads no saved entry when the slot arrives later.
+        remote.wants_restore = false;
+        remote.model = remote::Model::new(remote.registry.origin().remote().map(|p| p.host.as_str()).unwrap_or(""));
+        let owner = remote.current_owner();
+        let connection = match remote::source_for(&remote.registry.origin()) {
+            TermSource::Server(c) => Some(c),
+            _ => None,
+        };
+        (owner, connection, remote.work.clone(), remote.registry.clone())
+    };
+    let (Some(owner), connection, work, registry) = operation else {
+        return;
+    };
+    let (tell, mut told) = futures_channel::mpsc::unbounded();
+    work.run(move || {
+        let _ = tell.unbounded_send(owner.close(by_hand, connection).map_err(|e| e.to_string()));
+    });
+    let hold = if by_hand {
+        gio::Application::default().map(|app| app.hold())
+    } else {
+        None
+    };
+    glib::spawn_future_local(async move {
+        let _hold = hold;
+        if let Ok(answer) = told.recv().await {
+            registry.report_close(answer);
+        }
+    });
 }
 
 /// Takes what the session publishes each time it wakes the pane, on the main loop.
@@ -1254,10 +1956,17 @@ fn pump(state: &RefCell<State>, area: &GLArea, im: &IMMulticontext, on_screen: b
         if let Some(m) = update.mouse {
             s.mouse = m;
         }
+        if let Some(mut report) = update.mirror {
+            // Clipboard reads and parked keys belong to the connection on which they began. A new snapshot
+            // also clears them, covering a whole disconnect/reconnect folded into one UI update.
+            s.connection_changed(&mut report);
+            s.remote_report(report);
+            area.queue_render();
+        }
         if let Some(exit) = update.exited {
-            s.exited = true;
+            s.remote_exit(exit);
             println!("[terminal] {}", exit.notice());
-            if super::closes_on_exit(&exit) {
+            if s.remote.is_none() && super::closes_on_exit(&exit) {
                 closed_by_exit = s.on_shell_exit.clone().map(|callback| (callback, s.generation));
             }
         }
@@ -1335,11 +2044,7 @@ fn repaint_at(area: &GLArea, until: Instant) {
 
 /// Enter after the shell exited: a fresh session on a fresh PTY, in the same place.
 fn restart(state: &Rc<RefCell<State>>, area: &GLArea, im: &IMMulticontext) {
-    {
-        let mut state = state.borrow_mut();
-        state.forget_session();
-        state.generation += 1;
-    }
+    state.borrow_mut().reset_for_restart();
     ensure_session(state, area, im);
 }
 
@@ -1403,6 +2108,23 @@ fn connect_render(area: &GLArea, state: &Rc<RefCell<State>>) {
             s.clipboard_notice
                 .ops(now, s.number, metrics.cols(), metrics.rows(), s.colors)
         });
+        let remote_ops = s.remote.as_ref().zip(s.metrics.as_ref()).map(|(remote, metrics)| {
+            let mut ops = Vec::new();
+            if let Some(text) = remote.model.overlay(now).or_else(|| remote.model.history.clone()) {
+                ops.extend(remote::notice_ops(&text, 0, metrics.cols(), s.colors));
+            }
+            if let Some(text) = remote.model.notice() {
+                ops.extend(remote::notice_ops(
+                    &text,
+                    remote
+                        .model
+                        .ending_row(s.cursor.map(|cursor| cursor.row), metrics.rows()),
+                    metrics.cols(),
+                    s.colors,
+                ));
+            }
+            ops
+        });
         let State {
             skia,
             metrics,
@@ -1441,11 +2163,36 @@ fn connect_render(area: &GLArea, state: &Rc<RefCell<State>>) {
                 surface.canvas().clear(skia_safe::Color::from_rgb(bg.r, bg.g, bg.b));
             }
         }
-        if let Err(error) = skia.gr_context.flush_and_submit() {
+        if let Some((ops, metrics)) = remote_ops.as_ref().zip(metrics.as_ref()) {
+            eitri_terminal::paint_ops(surface.canvas(), ops, metrics);
+        }
+        let submitted = skia.gr_context.flush_and_submit();
+        if let Err(error) = &submitted {
             // The frame is lost; the next draw paints a whole one again. Said once a process, since
             // a context that fails once tends to fail every frame.
             static SAID: std::sync::Once = std::sync::Once::new();
             SAID.call_once(|| eprintln!("[terminal] skia flush failed: {error:?}"));
+        }
+        let gone = s.remote.as_mut().filter(|_| submitted.is_ok()).and_then(|remote| {
+            if matches!(
+                remote.model.ending,
+                Some(remote::Ending::Ended(eitri_terminal::mirror::MirrorEnd::Gone(_)))
+            ) {
+                remote
+                    .current_owner()
+                    .zip(remote.entry.take())
+                    .map(|(owner, entry)| (remote.work.clone(), owner, entry))
+            } else {
+                None
+            }
+        });
+        drop(s);
+        if let Some((work, owner, entry)) = gone {
+            work.run(move || {
+                if let Err(error) = owner.show_gone(&entry) {
+                    eprintln!("[terminal] could not forget the gone terminal: {error}");
+                }
+            });
         }
         glib::Propagation::Stop
     });
@@ -2127,6 +2874,9 @@ fn paste_from(
     label: &'static str,
 ) {
     discard_composition(state, im, area);
+    if !state.borrow_mut().remote_input(true) {
+        return;
+    }
     let (ticket, cancellable) = state.borrow_mut().begin_paste();
     {
         let state = Rc::downgrade(state);
@@ -2167,6 +2917,1141 @@ fn paste_from(
 mod tests {
     use super::*;
     use gtk4::gdk::ScrollUnit;
+
+    #[test]
+    fn a_reconnect_cancels_a_paste_and_every_key_parked_behind_it() {
+        use eitri_terminal::mirror::{HistoryNote, LinkState, MirrorReport};
+        for mut report in [
+            MirrorReport {
+                link: Some(LinkState::Disconnected { since_ms: 0 }),
+                ..Default::default()
+            },
+            MirrorReport {
+                link: Some(LinkState::Live),
+                synced: Some(HistoryNote::default()),
+                ..Default::default()
+            },
+        ] {
+            let mut state = State::new("/srv/project".into());
+            let (ticket, cancelled) = state.begin_paste();
+            state.submit(PaneInput::Key(keys::paste("old command").unwrap()));
+            state.connection_changed(&mut report);
+            assert!(cancelled.is_cancelled());
+            assert!(state.queue.is_empty());
+            assert!(!state.finish_paste(ticket, keys::paste("stale paste")));
+            assert!(report.refused_input_bytes > 0);
+        }
+    }
+
+    #[test]
+    fn a_remote_snapshot_returns_printable_keys_to_the_shell() {
+        let mut state = State::new("/srv/project".into());
+        state.ime.set_focused(true);
+        state.copy_mode = true;
+        assert_eq!(
+            state.route_commit("x", HAS_THE_KEYS),
+            CommitRoute::CopyMode(CopyModeKey::Swallow)
+        );
+
+        let mut report = MirrorReport {
+            synced: Some(Default::default()),
+            ..Default::default()
+        };
+        state.connection_changed(&mut report);
+        assert!(matches!(state.route_commit("x", HAS_THE_KEYS), CommitRoute::Shell(_)));
+    }
+
+    use super::super::remote::test_support as remote_test;
+    use eitri_core::remote_project::terminal_link::TerminalTarget;
+    use eitri_terminal::mirror::{FrameRefused, MirrorEnd, MirrorReport};
+
+    const REMOTE_SIZE: PtySize = PtySize {
+        cols: 80,
+        rows: 24,
+        cell_width_px: 8,
+        cell_height_px: 16,
+    };
+
+    struct QuietLink {
+        read: std::io::PipeReader,
+        _write: std::io::PipeWriter,
+    }
+
+    impl eitri_terminal::mirror::TermLink for QuietLink {
+        fn readiness(&self) -> std::os::fd::BorrowedFd<'_> {
+            use std::os::fd::AsFd;
+            self.read.as_fd()
+        }
+        fn take(&mut self) -> Vec<eitri_terminal::mirror::LinkItem> {
+            Vec::new()
+        }
+        fn write_input(&mut self, _: &[u8]) -> std::io::Result<usize> {
+            Err(std::io::ErrorKind::NotConnected.into())
+        }
+        fn request_resize(&mut self, _: PtySize) {}
+        fn set_colors(&mut self, _: &TerminalColors) {}
+    }
+
+    enum Seen {
+        Size(PtySize),
+        Colors(TerminalColors),
+    }
+
+    /// Hands the mirror `items` once and reports every size and colour the session asks of its link.
+    struct RecordingLink {
+        read: std::io::PipeReader,
+        _write: std::io::PipeWriter,
+        items: Vec<eitri_terminal::mirror::LinkItem>,
+        seen: std::sync::mpsc::Sender<Seen>,
+    }
+
+    impl eitri_terminal::mirror::TermLink for RecordingLink {
+        fn readiness(&self) -> std::os::fd::BorrowedFd<'_> {
+            use std::os::fd::AsFd;
+            self.read.as_fd()
+        }
+        fn take(&mut self) -> Vec<eitri_terminal::mirror::LinkItem> {
+            if !self.items.is_empty() {
+                // The one byte that made the link readable; read only while it is there.
+                let _ = std::io::Read::read(&mut self.read, &mut [0]);
+            }
+            std::mem::take(&mut self.items)
+        }
+        fn write_input(&mut self, _: &[u8]) -> std::io::Result<usize> {
+            Err(std::io::ErrorKind::NotConnected.into())
+        }
+        fn request_resize(&mut self, size: PtySize) {
+            let _ = self.seen.send(Seen::Size(size));
+        }
+        fn set_colors(&mut self, colors: &TerminalColors) {
+            let _ = self.seen.send(Seen::Colors(*colors));
+        }
+    }
+
+    fn quiet_link(
+        _: eitri_core::remote_project::terminal_link::TerminalLinkOptions,
+    ) -> std::io::Result<(Box<dyn eitri_terminal::mirror::TermLink>, OpenAnswer)> {
+        let (read, write) = std::io::pipe()?;
+        Ok((Box::new(QuietLink { read, _write: write }), OpenAnswer::default()))
+    }
+
+    fn failing_link(
+        _: eitri_core::remote_project::terminal_link::TerminalLinkOptions,
+    ) -> std::io::Result<(Box<dyn eitri_terminal::mirror::TermLink>, OpenAnswer)> {
+        Err(std::io::Error::other("scripted connection failure"))
+    }
+
+    type ScriptedLink = fn(
+        eitri_core::remote_project::terminal_link::TerminalLinkOptions,
+    ) -> std::io::Result<(Box<dyn eitri_terminal::mirror::TermLink>, OpenAnswer)>;
+
+    /// The record worker's job and the GTK thread's handling of its answer, as `start_remote` runs them, with
+    /// `link` in place of the network. `Ok` is what the arriving session was told; `Err` the start's failure.
+    fn finish_scripted(
+        state: &Rc<RefCell<State>>,
+        plan: RemoteStart,
+        view: View,
+        link: impl FnOnce(
+            eitri_core::remote_project::terminal_link::TerminalLinkOptions,
+        ) -> std::io::Result<(Box<dyn eitri_terminal::mirror::TermLink>, OpenAnswer)>,
+    ) -> Result<CatchUp, String> {
+        let (tell, mut told) = futures_channel::mpsc::unbounded();
+        let (wake, _woken) = futures_channel::mpsc::unbounded();
+        run_remote_start(
+            plan,
+            |owner, cwd, again, retry, view, wake| {
+                owner.start_with(
+                    &owner.project.host_key_sha256,
+                    "installation",
+                    &cwd,
+                    again,
+                    retry,
+                    eitri_terminal::mirror::MirrorConfig {
+                        size: view.size,
+                        colors: view.colors,
+                        focused: view.focused,
+                    },
+                    wake,
+                    link,
+                )
+            },
+            tell,
+            wake,
+        );
+        match told.try_recv() {
+            Ok(RemoteReady::Started(session, entry, answer)) => {
+                Ok(state.borrow_mut().remote_started(session, entry, answer, view, false).1)
+            }
+            Ok(RemoteReady::Failed(why)) => {
+                state.borrow_mut().remote_failed(&why);
+                Err(why)
+            }
+            _ => panic!("the start answered nothing"),
+        }
+    }
+
+    /// `ensure_session`'s server branch without its GTK glue.
+    fn start_scripted(state: &Rc<RefCell<State>>, link: ScriptedLink) -> Option<Result<CatchUp, String>> {
+        let view = View {
+            size: REMOTE_SIZE,
+            colors: state.borrow().colors,
+            focused: state.borrow().focused,
+        };
+        let plan = state.borrow_mut().begin_remote_start(view)?;
+        Some(finish_scripted(state, plan, view, link))
+    }
+
+    /// A pane bound as the module wiring binds it, whose wake starts its server terminal through the production
+    /// start with a scripted link (failing the first time when `fail_first`).
+    fn scripted_pane(
+        registry: Rc<remote::Registry>,
+        module: &str,
+        restored: bool,
+        fail_first: bool,
+    ) -> Rc<RefCell<State>> {
+        let state = Rc::new(RefCell::new(State::new("/srv/project".into())));
+        state.borrow_mut().wanted = true;
+        let weak = Rc::downgrade(&state);
+        let fail = std::cell::Cell::new(fail_first);
+        state.borrow_mut().bind_remote(
+            registry,
+            module.into(),
+            restored,
+            Rc::new(move || {
+                let Some(state) = weak.upgrade() else { return };
+                if matches!(state.borrow().source(), TermSource::Server(_)) {
+                    let link: ScriptedLink = if fail.replace(false) { failing_link } else { quiet_link };
+                    let _ = start_scripted(&state, link);
+                }
+            }),
+        );
+        state
+    }
+
+    fn bound_pane(registry: Rc<remote::Registry>, module: &str, restored: bool) -> Rc<RefCell<State>> {
+        scripted_pane(registry, module, restored, false)
+    }
+
+    /// An answer whose link said the terminal no longer exists.
+    fn gone_answer() -> OpenAnswer {
+        let answer = OpenAnswer::default();
+        answer.mark_gone();
+        answer
+    }
+
+    fn pane_options(
+        state: &mut State,
+    ) -> (
+        eitri_core::remote_project::terminals::TerminalEntry,
+        eitri_core::remote_project::terminal_link::TerminalLinkOptions,
+    ) {
+        let binding = state.remote.as_mut().unwrap();
+        let owner = binding.current_owner().unwrap();
+        let answer = owner
+            .options(
+                &owner.project.host_key_sha256,
+                "installation",
+                &owner.project.root,
+                binding.again.take(),
+                binding.retry_entry.take(),
+                REMOTE_SIZE,
+                state.colors,
+            )
+            .unwrap();
+        binding.entry = Some(answer.0.clone());
+        answer
+    }
+
+    #[test]
+    fn waiting_becomes_server_when_connected() {
+        for failed_first in [false, true] {
+            let registry = remote_test::registry(1);
+            let bottom = scripted_pane(registry.clone(), "terminal", false, failed_first);
+            let extra = bound_pane(registry.clone(), "terminal#2", false);
+            for pane in [&bottom, &extra] {
+                assert!(matches!(pane.borrow().source(), TermSource::Waiting));
+                assert!(!pane.borrow().remote.as_ref().unwrap().starting);
+            }
+            let connection = remote_test::connection();
+            // A connection for another server hands nothing off; both bindings keep waiting.
+            let mut wrong = connection.project().clone();
+            wrong.host = "other-host".into();
+            assert!(!remote_test::reject_hand_off(&registry, wrong, connection.clone()));
+            assert!(matches!(bottom.borrow().source(), TermSource::Waiting));
+            assert!(matches!(extra.borrow().source(), TermSource::Waiting));
+            assert!(remote_test::hand_off(&registry, connection));
+            if failed_first {
+                // The failed start keeps its durable intent, and Enter's restart reattaches that same intent.
+                let intent = {
+                    let state = bottom.borrow();
+                    assert!(state.exited && state.session.is_none());
+                    let binding = state.remote.as_ref().unwrap();
+                    assert!(matches!(binding.model.ending, Some(remote::Ending::Failed(_))));
+                    assert_eq!(binding.again, Some(Again::Attach));
+                    binding.current_owner().unwrap().saved().unwrap().unwrap()
+                };
+                bottom.borrow_mut().reset_for_restart();
+                assert!(start_scripted(&bottom, quiet_link).unwrap().is_ok());
+                let state = bottom.borrow();
+                assert_eq!(
+                    state.remote.as_ref().unwrap().entry.as_ref().unwrap().command_id,
+                    intent.command_id
+                );
+            }
+            for (pane, module) in [(&bottom, "terminal"), (&extra, "terminal#2")] {
+                let state = pane.borrow();
+                assert!(matches!(state.source(), TermSource::Server(_)));
+                let binding = state.remote.as_ref().unwrap();
+                assert!(state.session.is_some());
+                assert_eq!(state.session.as_ref().unwrap().local_pid(), None);
+                assert!(!binding.starting && binding.ownership_known);
+                let entry = binding.entry.as_ref().unwrap();
+                assert_eq!((entry.slot, entry.module.as_str()), (1, module));
+                // An open's keys stay held until its answer is durable.
+                assert!(entry.terminal_id.is_none() && !binding.model.recorded);
+                assert_eq!(binding.current_owner().unwrap().saved().unwrap().as_ref(), Some(entry));
+            }
+            assert_eq!(remote_test::listeners(&registry), 2);
+            drop(extra);
+            assert_eq!(remote_test::listeners(&registry), 1);
+            drop(bottom);
+            assert_eq!(remote_test::listeners(&registry), 0);
+        }
+    }
+
+    #[test]
+    fn changes_made_while_a_server_start_runs_reach_the_session_when_it_arrives() {
+        for changed in [false, true] {
+            let registry = remote_test::registry(1);
+            let pane = Rc::new(RefCell::new(State::new("/srv/project".into())));
+            pane.borrow_mut()
+                .bind_remote(registry.clone(), "terminal".into(), false, Rc::new(|| {}));
+            remote_test::hand_off(&registry, remote_test::connection());
+            let (plan, view) = {
+                let mut state = pane.borrow_mut();
+                state.wanted = true;
+                state.allocate(FIRST_SHOW);
+                let size = state.spawn_size(build_metrics).unwrap().unwrap();
+                let view = state.view(size);
+                (state.begin_remote_start(view).unwrap(), view)
+            };
+            let mut expected = CatchUp::default();
+            if changed {
+                // While the start is on the record worker and the network: the window settles, the theme and the
+                // focus change. Each went nowhere then, with no session to send it to.
+                let mut state = pane.borrow_mut();
+                expected.size = state.allocate(Allocation {
+                    height: FIRST_SHOW.height * 2.0,
+                    ..FIRST_SHOW
+                });
+                assert!(expected.size.is_some());
+                state.colors.background.r = state.colors.background.r.wrapping_add(1);
+                expected.colors = Some(state.colors);
+                state.focused = !view.focused;
+                expected.focused = Some(state.focused);
+            }
+            let (seen, sizes_and_colors) = std::sync::mpsc::channel();
+            assert_eq!(
+                finish_scripted(&pane, plan, view, move |_| {
+                    let (read, mut write) = std::io::pipe()?;
+                    std::io::Write::write_all(&mut write, &[1])?;
+                    Ok((
+                        Box::new(RecordingLink {
+                            read,
+                            _write: write,
+                            // Owed a snapshot too large to send: the mirror then asks for each new size at once
+                            // instead of waiting for the first request's answer.
+                            items: vec![eitri_terminal::mirror::LinkItem::Waiting(
+                                eitri_terminal::headless::WaitWhy::SnapshotTooLarge,
+                            )],
+                            seen,
+                        }),
+                        OpenAnswer::default(),
+                    ))
+                }),
+                Ok(CatchUp {
+                    size: expected.size,
+                    colors: expected.colors,
+                    focused: expected.focused,
+                })
+            );
+            // What reached the session, as its link was asked: the new grid and the new colours.
+            let now = pane.borrow().view(view.size);
+            let deadline = Instant::now() + Duration::from_secs(if changed { 10 } else { 1 });
+            let (mut size_sent, mut colors_sent) = (false, false);
+            while let Ok(item) = sizes_and_colors.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+                match item {
+                    Seen::Size(size) if (size.cols, size.rows) != (view.size.cols, view.size.rows) => {
+                        assert_eq!((size.cols, size.rows), (now.size.cols, now.size.rows));
+                        size_sent = true;
+                    }
+                    Seen::Colors(colors) if colors != view.colors => {
+                        assert_eq!(colors, now.colors);
+                        colors_sent = true;
+                    }
+                    _ => {}
+                }
+                if changed && size_sent && colors_sent {
+                    break;
+                }
+            }
+            assert_eq!((size_sent, colors_sent), (changed, changed));
+        }
+    }
+
+    #[test]
+    fn a_chat_or_page_window_neither_restores_nor_stops_nor_offers_a_slot_terminal() {
+        use remote::TerminalWindow;
+        assert_eq!(remote::terminal_window(false, false, false), TerminalWindow::Full);
+        assert_eq!(remote::terminal_window(false, false, true), TerminalWindow::Alone);
+        assert_eq!(remote::terminal_window(true, false, false), TerminalWindow::Second);
+        assert_eq!(remote::terminal_window(false, true, false), TerminalWindow::Chat);
+        assert_eq!(remote::terminal_window(true, true, false), TerminalWindow::Chat);
+        let window_two = remote_test::registry(2);
+        let p = remote_test::project();
+        let records = remote_test::records(&window_two);
+        let shell = records
+            .terminals()
+            .begin_open(&p.host_key_sha256, &p.root, 2, "terminal", "installation", 1)
+            .unwrap();
+        records
+            .terminals()
+            .opened(
+                &p.host_key_sha256,
+                &p.root,
+                &shell.command_id,
+                &"a".repeat(32),
+                "daemon",
+                "boot",
+            )
+            .unwrap();
+        let saved = records.terminals().record(&p.host_key_sha256, &p.root).unwrap().entries;
+        let module = remote_test::module_registry(&window_two);
+        assert!(!module.binds_terminals());
+        // The offer band has nothing to read orphans as, and is not built.
+        assert!(module.owner(String::new()).is_none());
+        let pane = bound_pane(module.clone(), "terminal", true);
+        {
+            let state = pane.borrow();
+            let binding = state.remote.as_ref().unwrap();
+            assert!(binding.current_owner().is_none());
+            assert!(binding.ownership_known && !binding.restore);
+            assert!(!binding.claims_module() && !binding.may_have_job());
+        }
+        restore_remote_owner(&pane);
+        assert!(pane.borrow().remote.as_ref().unwrap().entry.is_none());
+        remote_test::hand_off(&module, remote_test::connection());
+        {
+            let state = pane.borrow();
+            assert!(state.exited && state.session.is_none());
+            assert_eq!(
+                state.remote.as_ref().unwrap().model.ending,
+                Some(remote::Ending::Failed(remote::NO_SERVER_TERMINALS.into()))
+            );
+        }
+        close_remote(&pane, true);
+        assert_eq!(
+            records.terminals().record(&p.host_key_sha256, &p.root).unwrap().entries,
+            saved,
+            "window 2's shell is untouched"
+        );
+    }
+
+    #[test]
+    fn an_unbound_pane_in_a_server_projects_window_never_starts_a_local_shell() {
+        let pane = Rc::new(RefCell::new(State::new("/srv/project".into())));
+        pane.borrow_mut().shell_env = Some(Rc::new(|| {
+            panic!("a server project's pane must not evaluate the local shell environment")
+        }));
+        remote_test::local_window();
+        assert!(matches!(pane.borrow().source(), TermSource::Local));
+        let registry = remote_test::registry(1);
+        let (source, extra) = State::start_source(&pane);
+        assert!(matches!(source, TermSource::Waiting));
+        assert!(extra.is_empty());
+        remote_test::hand_off(&registry, remote_test::connection());
+        assert!(
+            matches!(pane.borrow().source(), TermSource::Waiting),
+            "only a binding may start a server terminal"
+        );
+    }
+
+    #[test]
+    fn a_refused_connection_keeps_the_record_and_enter_reattaches() {
+        for gone in [false, true] {
+            let registry = remote_test::registry(1);
+            let pane = bound_pane(registry.clone(), "terminal", false);
+            remote_test::hand_off(&registry, remote_test::connection());
+            let mut state = pane.borrow_mut();
+            state.remote.as_mut().unwrap().answer = Some(if gone { gone_answer() } else { OpenAnswer::default() });
+            state.remote_report(MirrorReport {
+                ended: Some(MirrorEnd::Gone(
+                    "the terminal connection was refused (PermissionDenied)".into(),
+                )),
+                ..Default::default()
+            });
+            let model = &state.remote.as_ref().unwrap().model;
+            if gone {
+                assert!(matches!(model.ending, Some(remote::Ending::Ended(MirrorEnd::Gone(_)))));
+                assert_eq!(model.again(), Some(Again::Open));
+            } else {
+                assert!(matches!(model.ending, Some(remote::Ending::Unreachable(_))));
+                assert_eq!(model.again(), Some(Again::Attach));
+                assert!(model.notice().unwrap().contains("Enter tries again"));
+                // Painting forgets only a gone terminal's entry: this one stays the binding's.
+                assert!(state.remote.as_ref().unwrap().claims_module());
+            }
+        }
+    }
+
+    #[test]
+    fn the_answer_watcher_of_an_open_whose_link_ended_lets_the_start_go() {
+        let registry = remote_test::registry(1);
+        let pane = Rc::new(RefCell::new(State::new("/srv/project".into())));
+        pane.borrow_mut()
+            .bind_remote(registry.clone(), "terminal".into(), false, Rc::new(|| {}));
+        remote_test::hand_off(&registry, remote_test::connection());
+        let view = View {
+            size: REMOTE_SIZE,
+            colors: TerminalColors::default(),
+            focused: false,
+        };
+        let plan = pane.borrow_mut().begin_remote_start(view).unwrap();
+        let answer = OpenAnswer::default();
+        let (tell, mut told) = futures_channel::mpsc::unbounded();
+        let (wake, _woken) = futures_channel::mpsc::unbounded();
+        let handle = answer.clone();
+        run_remote_start(
+            plan,
+            |owner, cwd, again, retry, view, wake| {
+                owner.start_with(
+                    &owner.project.host_key_sha256,
+                    "installation",
+                    &cwd,
+                    again,
+                    retry,
+                    eitri_terminal::mirror::MirrorConfig {
+                        size: view.size,
+                        colors: view.colors,
+                        focused: view.focused,
+                    },
+                    wake,
+                    move |options| quiet_link(options).map(|(link, _)| (link, handle)),
+                )
+            },
+            tell,
+            wake,
+        );
+        assert!(matches!(told.try_recv(), Ok(RemoteReady::Started(..))));
+        // The open was refused before an identity arrived: the link ends with no answer to wait for.
+        answer.finish();
+        let guard = Instant::now() + Duration::from_secs(600);
+        loop {
+            match told.try_recv() {
+                Err(error) if error.is_closed() => break,
+                Err(_) if Instant::now() < guard => std::thread::sleep(Duration::from_millis(10)),
+                other => panic!("the watcher kept its sender: {}", other.is_ok()),
+            }
+        }
+    }
+
+    /// A saved slot-1 base terminal of a window 1 that is still stopping its terminals, and the registry of a full
+    /// window of the same project opened meanwhile.
+    fn window_beside_an_exiting_owner() -> (Rc<remote::Registry>, Rc<remote::Registry>, Vec<TerminalEntry>) {
+        let exiting = remote_test::full_window(None);
+        let p = remote_test::project();
+        let records = remote_test::records(&exiting);
+        let saved = records
+            .terminals()
+            .begin_open(&p.host_key_sha256, &p.root, 1, "terminal", "installation", 1)
+            .unwrap();
+        records
+            .terminals()
+            .opened(
+                &p.host_key_sha256,
+                &p.root,
+                &saved.command_id,
+                &"a".repeat(32),
+                "daemon",
+                "boot",
+            )
+            .unwrap();
+        let saved = records.terminals().record(&p.host_key_sha256, &p.root).unwrap().entries;
+        let window = remote_test::full_window(Some(&exiting));
+        (exiting, window, saved)
+    }
+
+    /// A pane bound at the window's start whose wake is the production one without its GTK glue:
+    /// `restore_remote_owner`, then `ensure_session`'s start once the record worker has run what was queued before.
+    fn startup_pane(window: &Rc<remote::Registry>) -> Rc<RefCell<State>> {
+        let pane = Rc::new(RefCell::new(State::new("/srv/project".into())));
+        pane.borrow_mut().wanted = true;
+        let weak = Rc::downgrade(&pane);
+        pane.borrow_mut().bind_remote(
+            window.clone(),
+            "terminal".into(),
+            true,
+            Rc::new(move || {
+                let Some(state) = weak.upgrade() else { return };
+                restore_remote_owner(&state);
+                let work = state.borrow().remote.as_ref().unwrap().work.clone();
+                let (done, ran) = std::sync::mpsc::channel();
+                work.run(move || {
+                    let _ = done.send(());
+                });
+                ran.recv_timeout(Duration::from_secs(600)).unwrap();
+                if !retry_slot_before_start(&state) && matches!(state.borrow().source(), TermSource::Server(_)) {
+                    let _ = start_scripted(&state, quiet_link);
+                }
+            }),
+        );
+        pane
+    }
+
+    #[test]
+    fn a_window_that_lost_the_first_slot_restores_and_starts_once_the_owner_has_gone() {
+        let context = glib::MainContext::new();
+        context
+            .with_thread_default(|| {
+                let (exiting, window, saved) = window_beside_an_exiting_owner();
+                assert!(!window.binds_terminals() && window.may_bind_terminals());
+                let pane = startup_pane(&window);
+                remote_test::hand_off(&window, remote_test::connection());
+                {
+                    let state = pane.borrow();
+                    let binding = state.remote.as_ref().unwrap();
+                    assert_eq!(
+                        binding.model.ending,
+                        Some(remote::Ending::Failed(remote::ANOTHER_WINDOW_OWNS.into()))
+                    );
+                    assert!(binding.current_owner().is_none() && !binding.claims_module());
+                }
+                pane.borrow_mut().reset_for_restart();
+                assert!(!retry_slot_before_start(&pane), "the owner still runs");
+                let p = remote_test::project();
+                let records = remote_test::records(&window);
+                assert_eq!(
+                    records.terminals().record(&p.host_key_sha256, &p.root).unwrap().entries,
+                    saved,
+                    "a window without the slot touches no slot-1 record"
+                );
+                drop(exiting);
+                // Enter: the start tries for the slot again, and taking it wakes the panes.
+                pane.borrow_mut().reset_for_restart();
+                assert!(retry_slot_before_start(&pane));
+                let state = pane.borrow();
+                let binding = state.remote.as_ref().unwrap();
+                assert!(state.session.is_some(), "started with no relaunch");
+                let entry = binding.entry.as_ref().unwrap();
+                assert_eq!(
+                    entry.command_id, saved[0].command_id,
+                    "the saved shell is attached, not a new one"
+                );
+                assert_eq!(entry.terminal_id.as_deref(), Some("a".repeat(32).as_str()));
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn a_pane_closed_while_its_window_had_no_slot_reads_no_entry_when_the_slot_comes() {
+        let context = glib::MainContext::new();
+        context
+            .with_thread_default(|| {
+                let (exiting, window, _) = window_beside_an_exiting_owner();
+                let closed = startup_pane(&window);
+                closed.borrow_mut().close();
+                close_remote(&closed, true);
+                let other = Rc::new(RefCell::new(State::new("/srv/project".into())));
+                other
+                    .borrow_mut()
+                    .bind_remote(window.clone(), "terminal#2".into(), false, Rc::new(|| {}));
+                drop(exiting);
+                assert!(window.retry_slot());
+                window.wake();
+                let state = closed.borrow();
+                let binding = state.remote.as_ref().unwrap();
+                assert!(binding.current_owner().is_some(), "the window owns the slot now");
+                assert!(!binding.restore && binding.entry.is_none());
+                assert!(!binding.claims_module(), "the closed pane holds nothing of window 1's");
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn enter_opens_a_new_shell_when_the_kept_entry_was_cleared_from_the_record() {
+        let registry = remote_test::registry(1);
+        let pane = bound_pane(registry.clone(), "terminal", false);
+        remote_test::hand_off(&registry, remote_test::connection());
+        let old = pane.borrow().remote.as_ref().unwrap().entry.clone().unwrap();
+        pane.borrow_mut().remote_report(MirrorReport {
+            ended: Some(MirrorEnd::Gone("incompatible Eitri server".into())),
+            ..Default::default()
+        });
+        // `eitri host stop`, as the notice tells the person, clears this host's terminal records.
+        let p = remote_test::project();
+        let records = remote_test::records(&registry);
+        records.terminals().clear_host(&p.host_key_sha256).unwrap();
+        for _ in 0..2 {
+            pane.borrow_mut().reset_for_restart();
+            assert_eq!(
+                start_scripted(&pane, quiet_link).map(|started| started.is_ok()),
+                Some(true)
+            );
+        }
+        let state = pane.borrow();
+        let entry = state.remote.as_ref().unwrap().entry.as_ref().unwrap();
+        assert_ne!(entry.command_id, old.command_id);
+        assert!(entry.terminal_id.is_none(), "a new open");
+        assert_eq!(
+            records.terminals().record(&p.host_key_sha256, &p.root).unwrap().entries,
+            [entry.clone()]
+        );
+    }
+
+    #[test]
+    fn bindings_with_the_same_module_keep_their_own_listeners() {
+        let registry = remote_test::registry(1);
+        let mut panes = Vec::new();
+        for _ in 0..2 {
+            let state = Rc::new(RefCell::new(State::new("/srv/project".into())));
+            let weak = Rc::downgrade(&state);
+            state.borrow_mut().bind_remote(
+                registry.clone(),
+                "terminal".into(),
+                false,
+                Rc::new(move || {
+                    if let Some(state) = weak.upgrade() {
+                        state.borrow_mut().remote.as_mut().unwrap().model.opening = true;
+                    }
+                }),
+            );
+            panes.push(state);
+        }
+        assert_eq!(remote_test::listeners(&registry), 2);
+        panes.remove(0);
+        assert_eq!(remote_test::listeners(&registry), 1);
+        remote_test::hand_off(&registry, remote_test::connection());
+        assert!(panes[0].borrow().remote.as_ref().unwrap().model.opening);
+        panes.clear();
+        assert_eq!(remote_test::listeners(&registry), 0);
+    }
+
+    #[test]
+    fn window_two_gets_the_connection_too() {
+        let connection = remote_test::connection();
+        for slot in [1, 2] {
+            let registry = remote_test::registry(slot);
+            let pane = bound_pane(registry.clone(), "terminal", false);
+            remote_test::hand_off(&registry, connection.clone());
+            let state = pane.borrow();
+            let entry = state.remote.as_ref().unwrap().entry.as_ref().unwrap();
+            assert_eq!(entry.slot, slot);
+            assert!(state.session.is_some());
+            assert_eq!(state.session.as_ref().unwrap().local_pid(), None);
+        }
+    }
+
+    #[test]
+    fn each_ending_keeps_the_screen_and_adds_its_line() {
+        let registry = remote_test::registry(1);
+        for (ending, words) in [
+            (MirrorEnd::Replaced, "Enter takes it back"),
+            (MirrorEnd::Stopped, "eitri host stop"),
+            (MirrorEnd::Closed, "was closed"),
+            (MirrorEnd::Gone("host ended\u{1b}".into()), "gone: host ended\\u{1b}"),
+            (MirrorEnd::Refused(FrameRefused::ReplayUnfinished), "Enter reconnects"),
+        ] {
+            let pane = bound_pane(registry.clone(), "terminal", false);
+            let mut state = pane.borrow_mut();
+            state.remote.as_mut().unwrap().answer = Some(gone_answer());
+            state.frame = Some(message_frame(REMOTE_SIZE, state.colors, "the last server screen"));
+            let before = state.frame.clone();
+            state.remote_report(MirrorReport {
+                ended: Some(ending),
+                ..Default::default()
+            });
+            assert_eq!(state.frame, before);
+            assert!(state.exited);
+            let model = &state.remote.as_ref().unwrap().model;
+            let ops = remote::notice_ops(
+                &model.notice().unwrap(),
+                model.ending_row(Some(0), REMOTE_SIZE.rows),
+                240,
+                state.colors,
+            );
+            assert!(
+                matches!(&ops[0], terminal_render::PaintOp::DrawNotice { row: 1, text, .. } if text.contains(words))
+            );
+        }
+        let pane = bound_pane(registry, "terminal", false);
+        let mut state = pane.borrow_mut();
+        state.frame = Some(message_frame(REMOTE_SIZE, state.colors, "last output before exit"));
+        let before = state.frame.clone();
+        state.remote_exit(EXITED);
+        assert_eq!(state.frame, before);
+        assert!(state
+            .remote
+            .as_ref()
+            .unwrap()
+            .model
+            .notice()
+            .unwrap()
+            .contains("process exited 0"));
+    }
+
+    #[test]
+    fn enter_after_each_ending_does_the_right_call() {
+        for end in [
+            Some(MirrorEnd::Replaced),
+            Some(MirrorEnd::Refused(FrameRefused::OffsetOverflow)),
+            Some(MirrorEnd::Stopped),
+            Some(MirrorEnd::Closed),
+            Some(MirrorEnd::Gone("gone".into())),
+            None,
+        ] {
+            let registry = remote_test::registry(1);
+            let pane = bound_pane(registry.clone(), "terminal", false);
+            pane.borrow_mut().remote.as_mut().unwrap().answer = Some(gone_answer());
+            let old = pane_options(&mut pane.borrow_mut()).0;
+            let owner = pane.borrow().remote.as_ref().unwrap().current_owner().unwrap();
+            owner
+                .opened(&old, &("ab".into(), "daemon".into(), "boot".into()))
+                .unwrap();
+            let records = remote_test::records(&registry);
+            let attach = matches!(end, Some(MirrorEnd::Replaced | MirrorEnd::Refused(_)));
+            if end == Some(MirrorEnd::Replaced) {
+                records
+                    .terminals()
+                    .claim(
+                        &owner.project.host_key_sha256,
+                        &owner.project.root,
+                        &old.command_id,
+                        2,
+                        "terminal#3",
+                    )
+                    .unwrap();
+            }
+            {
+                let mut state = pane.borrow_mut();
+                if let Some(end) = end {
+                    state.remote_report(MirrorReport {
+                        ended: Some(end),
+                        ..Default::default()
+                    });
+                } else {
+                    state.remote_exit(EXITED);
+                }
+                state.reset_for_restart();
+                assert_eq!(
+                    state.remote.as_ref().unwrap().again,
+                    Some(if attach { Again::Attach } else { Again::Open })
+                );
+                let (entry, options) = pane_options(&mut state);
+                // This is the production link-construction boundary: inspect durable state before using its target.
+                let disk = records
+                    .terminals()
+                    .record(&owner.project.host_key_sha256, &owner.project.root)
+                    .unwrap();
+                assert_eq!(disk.entries, [entry.clone()]);
+                assert_eq!((entry.slot, entry.module.as_str()), (1, "terminal"));
+                if attach {
+                    assert_eq!(entry.command_id, old.command_id);
+                    assert!(
+                        matches!(options.target, TerminalTarget::Attach { terminal_id, .. } if terminal_id == "ab")
+                    );
+                } else {
+                    assert_ne!(entry.command_id, old.command_id);
+                    assert!(
+                        matches!(options.target, TerminalTarget::Open { command_id, .. } if command_id == entry.command_id)
+                    );
+                }
+                assert!(!state.remote.as_ref().unwrap().model.recorded);
+            }
+        }
+    }
+
+    #[test]
+    fn restart_resets_the_remote_binding_once() {
+        let registry = remote_test::registry(1);
+        let pane = bound_pane(registry, "terminal", false);
+        pane.borrow_mut().remote_report(MirrorReport {
+            ended: Some(MirrorEnd::Replaced),
+            ..Default::default()
+        });
+        pane.borrow_mut().reset_for_restart();
+        assert_eq!(pane.borrow().remote.as_ref().unwrap().again, Some(Again::Attach));
+        let source = eitri_core::source_scan::read_required("shell/src/terminal/pane.rs");
+        let code = eitri_core::source_scan::code_only(&source.text);
+        let restart = code
+            .split("fn restart(")
+            .nth(1)
+            .unwrap()
+            .split("fn connect_resize")
+            .next()
+            .unwrap();
+        assert_eq!(restart.matches("reset_for_restart()").count(), 1);
+        assert_eq!(restart.matches("Model::new").count(), 0);
+        let reset = code
+            .split("fn reset_for_restart(")
+            .nth(1)
+            .unwrap()
+            .split("fn detach(")
+            .next()
+            .unwrap();
+        assert_eq!(reset.matches("remote.reset()").count(), 1);
+    }
+
+    #[test]
+    fn replaced_then_closed_sends_no_stop() {
+        let registry = remote_test::registry(1);
+        let pane = bound_pane(registry.clone(), "terminal", false);
+        let old = pane_options(&mut pane.borrow_mut()).0;
+        pane.borrow_mut().remote_report(MirrorReport {
+            ended: Some(MirrorEnd::Replaced),
+            ..Default::default()
+        });
+        assert!(pane.borrow().remote.as_ref().unwrap().entry.is_none());
+        let owner = pane.borrow().remote.as_ref().unwrap().current_owner().unwrap();
+        owner.close(true, None).unwrap();
+        assert_eq!(owner.saved().unwrap(), Some(old));
+    }
+
+    #[test]
+    fn a_gone_entry_forgotten_after_its_notice_no_longer_belongs_to_the_binding() {
+        let registry = remote_test::registry(1);
+        let pane = bound_pane(registry.clone(), "terminal", false);
+        let entry = pane_options(&mut pane.borrow_mut()).0;
+        let owner = pane.borrow().remote.as_ref().unwrap().current_owner().unwrap();
+        pane.borrow_mut().remote_report(MirrorReport {
+            ended: Some(MirrorEnd::Gone("gone".into())),
+            ..Default::default()
+        });
+        owner.show_gone(&entry).unwrap();
+        pane.borrow_mut().remote.as_mut().unwrap().entry.take();
+        owner.close(true, None).unwrap();
+        assert!(owner.saved().unwrap().is_none());
+    }
+
+    #[test]
+    fn retired_and_failed_placement_bindings_stop_nothing() {
+        let registry = remote_test::registry(1);
+        let old_pane = bound_pane(registry.clone(), "terminal#2", false);
+        let owner = old_pane.borrow().remote.as_ref().unwrap().current_owner().unwrap();
+        owner.close(true, None).unwrap();
+        let live = bound_pane(registry.clone(), "terminal#2", false);
+        let entry = pane_options(&mut live.borrow_mut()).0;
+        owner.close(true, None).unwrap();
+        assert_eq!(owner.saved().unwrap(), Some(entry.clone()));
+        let failed = bound_pane(registry, "terminal#2", false);
+        failed
+            .borrow()
+            .remote
+            .as_ref()
+            .unwrap()
+            .current_owner()
+            .unwrap()
+            .close(true, None)
+            .unwrap();
+        assert_eq!(owner.saved().unwrap(), Some(entry));
+    }
+
+    #[test]
+    fn only_restored_or_claimed_entries_are_attached() {
+        let registry = remote_test::registry(1);
+        let records = remote_test::records(&registry);
+        let p = remote_test::project();
+        let stale = records
+            .terminals()
+            .begin_open(&p.host_key_sha256, &p.root, 1, "terminal", "installation", 1)
+            .unwrap();
+        let new_pane = bound_pane(registry.clone(), "terminal", false);
+        let binding = new_pane.borrow();
+        let owner = binding.remote.as_ref().unwrap().current_owner().unwrap();
+        assert!(!binding.remote.as_ref().unwrap().claims_module());
+        assert!(owner
+            .options(
+                &p.host_key_sha256,
+                "installation",
+                &p.root,
+                None,
+                None,
+                REMOTE_SIZE,
+                binding.colors
+            )
+            .is_err());
+        assert_eq!(owner.orphans(&[], None).unwrap(), [stale.clone()]);
+        let restored = bound_pane(registry, "terminal", true);
+        let mut state = restored.borrow_mut();
+        let binding = state.remote.as_mut().unwrap();
+        let owner = binding.current_owner().unwrap();
+        binding.entry = owner.restore().unwrap();
+        binding.ownership_known = true;
+        assert_eq!(pane_options(&mut state).0.command_id, stale.command_id);
+    }
+
+    #[test]
+    fn adoption_belongs_to_the_instance_created_for_it() {
+        let registry = remote_test::registry(1);
+        let records = remote_test::records(&registry);
+        let p = remote_test::project();
+        let orphan = records
+            .terminals()
+            .begin_open(&p.host_key_sha256, &p.root, 2, "terminal#4", "installation", 1)
+            .unwrap();
+        let bottom = bound_pane(registry.clone(), "terminal", false);
+        let mut adopted = None;
+        registry.adopt(&orphan, || {
+            adopted = Some(bound_pane(registry.clone(), "terminal#2", false));
+        });
+        let bottom_entry = pane_options(&mut bottom.borrow_mut()).0;
+        assert_ne!(bottom_entry.command_id, orphan.command_id);
+        assert_eq!(
+            pane_options(&mut adopted.unwrap().borrow_mut()).0.command_id,
+            orphan.command_id
+        );
+        let other = records
+            .terminals()
+            .begin_open(&p.host_key_sha256, &p.root, 2, "terminal#5", "installation", 1)
+            .unwrap();
+        registry.adopt(&other, || {}); // Controller refused creation.
+        let later = bound_pane(registry.clone(), "terminal#3", false);
+        assert_ne!(pane_options(&mut later.borrow_mut()).0.command_id, other.command_id);
+        assert!(records
+            .terminals()
+            .orphans(
+                &p.host_key_sha256,
+                &p.root,
+                &[
+                    (1, "terminal".into()),
+                    (1, "terminal#2".into()),
+                    (1, "terminal#3".into())
+                ]
+            )
+            .unwrap()
+            .contains(&other));
+    }
+
+    #[test]
+    fn an_adoption_into_a_reused_idle_pane_keeps_its_instance_id() {
+        let registry = remote_test::registry(1);
+        let records = remote_test::records(&registry);
+        let p = remote_test::project();
+        let pane = bound_pane(registry.clone(), "terminal#2", false);
+        let old = pane_options(&mut pane.borrow_mut()).0;
+        let retired_owner = pane.borrow().remote.as_ref().unwrap().current_owner().unwrap();
+        retired_owner.close(true, None).unwrap();
+        pane.borrow_mut().close();
+        let orphan = records
+            .terminals()
+            .begin_open(&p.host_key_sha256, &p.root, 2, "terminal#4", "installation", 1)
+            .unwrap();
+        registry.adopt(&orphan, || {
+            pane.borrow_mut().set_start_dir(p.root.clone());
+        });
+        // A queued close still holds the retired owner; it must not clear this instance's adoption.
+        retired_owner.close(true, None).unwrap();
+        let entry = pane_options(&mut pane.borrow_mut()).0;
+        assert_eq!(entry.command_id, orphan.command_id);
+        assert_eq!((entry.slot, entry.module.as_str()), (1, "terminal#2"));
+        let disk = records.terminals().record(&p.host_key_sha256, &p.root).unwrap();
+        assert_eq!(disk.entries.len(), 2);
+        assert!(disk.entries.iter().any(|e| e.command_id == old.command_id
+            && e.state == eitri_core::remote_project::terminals::TerminalState::StopQueued));
+    }
+
+    #[test]
+    fn server_terminal_gets_no_open_socket_or_ide_port() {
+        let registry = remote_test::registry(1);
+        let pane = bound_pane(registry, "terminal", false);
+        pane.borrow_mut().shell_env = Some(Rc::new(|| {
+            panic!("server starts must not evaluate the local socket/IDE environment")
+        }));
+        let (source, extra) = State::start_source(&pane);
+        assert!(matches!(source, TermSource::Waiting));
+        assert!(extra.is_empty());
+        let registry = pane.borrow().remote.as_ref().unwrap().registry.clone();
+        remote_test::hand_off(&registry, remote_test::connection());
+        let (source, extra) = State::start_source(&pane);
+        let mut state = pane.borrow_mut();
+        assert!(matches!(source, TermSource::Server(_)));
+        assert!(extra.is_empty());
+        let (entry, options) = pane_options(&mut state);
+        assert_eq!(options.installation, "installation");
+        assert_eq!(options.size, REMOTE_SIZE);
+        assert!(
+            matches!(options.target, TerminalTarget::Open { cwd, command_id } if cwd == PathBuf::from("/srv/project") && command_id == entry.command_id)
+        );
+        assert_eq!(state.session.as_ref().unwrap().local_pid(), None);
+    }
+
+    #[test]
+    fn a_server_terminal_move_is_refused_with_words() {
+        let registry = remote_test::registry(1);
+        let pane = bound_pane(registry, "terminal", false);
+        assert_eq!(
+            pane.borrow_mut().detach().unwrap_err(),
+            "a terminal on the server does not move to another window yet"
+        );
+        assert!(!pane.borrow().frozen);
+    }
+
+    #[test]
+    fn a_remote_binding_refuses_incoming_local_adoption() {
+        let registry = remote_test::registry(1);
+        let pane = bound_pane(registry, "terminal", false);
+        let error = pane
+            .borrow_mut()
+            .adopt(&serde_json::json!({}), vec![], || {})
+            .err()
+            .unwrap();
+        assert_eq!(error, "a terminal on the server does not move to another window yet");
+        assert!(pane.borrow().session.is_none());
+        assert!(State::new("/tmp".into()).allow_adopt().is_ok());
+    }
+
+    #[test]
+    fn a_signal_close_leaves_server_terminals_running() {
+        const CHILD: &str = "EITRI_TERMINAL_SIGNAL_TEST_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "terminal::pane::tests::a_signal_close_leaves_server_terminals_running",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .status()
+                .unwrap();
+            assert!(status.success());
+            return;
+        }
+        let context = glib::MainContext::default();
+        let _guard = context.acquire().unwrap();
+        let registry = remote_test::registry(1);
+        let pane = bound_pane(registry.clone(), "terminal", false);
+        let entry = pane_options(&mut pane.borrow_mut()).0;
+        assert!(!crate::end_signals::signal_close_started());
+        crate::end_signals::mark_closing();
+        close_remote(&pane, !crate::end_signals::signal_close_started());
+        let work = pane.borrow().remote.as_ref().unwrap().work.clone();
+        let (done, wait) = std::sync::mpsc::channel();
+        work.run(move || {
+            done.send(()).unwrap();
+        });
+        wait.recv_timeout(Duration::from_secs(10)).unwrap();
+        while context.pending() {
+            context.iteration(false);
+        }
+        let p = remote_test::project();
+        assert_eq!(
+            remote_test::records(&registry)
+                .terminals()
+                .record(&p.host_key_sha256, &p.root)
+                .unwrap()
+                .entries,
+            [entry]
+        );
+    }
 
     fn osc52_write(bytes: usize) -> HostEvents {
         HostEvents {

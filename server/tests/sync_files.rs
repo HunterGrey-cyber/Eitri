@@ -88,7 +88,7 @@ fn later() -> std::time::Instant {
 
 fn listed(root: &sync::Root, ignored: listing::Ignored, budget: u64) -> Vec<listing::Listed> {
     let mut seen = Vec::new();
-    listing::list_tree(&root.dir, ignored, budget, &mut |step| {
+    listing::list_tree(&root.dir, ignored, budget, later(), &mut |step| {
         seen.push(step);
         true
     })
@@ -98,7 +98,7 @@ fn listed(root: &sync::Root, ignored: listing::Ignored, budget: u64) -> Vec<list
 
 fn read(root: &sync::Root, rel: &str, limit: u64) -> Vec<ReadFileChunk> {
     let mut chunks = Vec::new();
-    let last = files::read_file(root, rel, limit, &mut |chunk| {
+    let last = files::read_file(root, rel, limit, later(), &mut |chunk| {
         chunks.push(chunk);
         true
     });
@@ -203,7 +203,8 @@ fn list_tree_reports_truncation() {
     assert!(!whole.contains(&listing::Listed::Truncated));
     // Path sizes stop at their budget the same way, and say so.
     let rels = ["1".to_owned(), "2".to_owned(), "3".to_owned()];
-    let (sizes, truncated) = listing::path_sizes(&scratch.root().dir, &rels, &nothing_ignored, 2, later()).unwrap();
+    let (sizes, truncated) =
+        listing::path_sizes(&scratch.root().dir, &rels, false, &nothing_ignored, 2, later()).unwrap();
     assert!(truncated);
     assert_eq!(sizes.len(), 2);
 }
@@ -219,7 +220,7 @@ fn path_sizes_sum_a_directory_without_following_links_or_ignored_names() {
     std::os::unix::fs::symlink("../../outside", scratch.project().join("big/out")).unwrap();
     let ignore = |rel: &str, _: bool| rel == "big/skip";
     let rels = ["big".to_owned(), "big/one".to_owned(), "missing/file".to_owned()];
-    let (sizes, truncated) = listing::path_sizes(&scratch.root().dir, &rels, &ignore, 100, later()).unwrap();
+    let (sizes, truncated) = listing::path_sizes(&scratch.root().dir, &rels, false, &ignore, 100, later()).unwrap();
     assert!(!truncated);
     let link = "../../outside".len() as u64;
     assert_eq!(
@@ -412,7 +413,7 @@ fn paths_through_a_symlinked_dir_are_refused() {
         assert_eq!(wait(&scratch, rel, &hash, 100).refusal, why);
         let rels = [rel.to_owned()];
         assert_eq!(
-            listing::path_sizes(&scratch.root().dir, &rels, &nothing_ignored, 10, later()).unwrap_err(),
+            listing::path_sizes(&scratch.root().dir, &rels, false, &nothing_ignored, 10, later()).unwrap_err(),
             why
         );
     }
@@ -449,7 +450,7 @@ fn dot_git_rels_are_refused() {
         assert!(!wait(&scratch, rel, &hash, 10).refusal.is_empty(), "{rel}");
         let rels = [rel.to_owned()];
         assert!(
-            listing::path_sizes(&scratch.root().dir, &rels, &nothing_ignored, 10, later()).is_err(),
+            listing::path_sizes(&scratch.root().dir, &rels, false, &nothing_ignored, 10, later()).is_err(),
             "{rel}"
         );
     }
@@ -710,7 +711,8 @@ fn directories_made_for_a_new_file_are_private() {
 fn path_sizes_charge_every_requested_path_even_a_missing_one() {
     let scratch = Scratch::new("charge-missing");
     let rels: Vec<String> = (0..5).map(|n| format!("missing-{n}")).collect();
-    let (sizes, truncated) = listing::path_sizes(&scratch.root().dir, &rels, &nothing_ignored, 2, later()).unwrap();
+    let (sizes, truncated) =
+        listing::path_sizes(&scratch.root().dir, &rels, false, &nothing_ignored, 2, later()).unwrap();
     assert!(truncated);
     assert_eq!(sizes.len(), 2);
 }
@@ -727,7 +729,10 @@ fn a_directory_is_never_read_past_what_the_walk_may_still_read() {
     assert_eq!(listing::names_in(root.dir.as_raw_fd(), 20).unwrap().unwrap().len(), 20);
     // A listing whose read allowance runs out says it is truncated.
     let mut allowance = 5;
-    let ended = listing::walk(&root.dir, &nothing_ignored, &mut allowance, &mut |_| listing::Flow::Go).unwrap();
+    let ended = listing::walk(&root.dir, &nothing_ignored, &mut allowance, later(), &mut |_| {
+        listing::Flow::Go
+    })
+    .unwrap();
     assert_eq!(ended, listing::Flow::Exhausted);
 }
 
@@ -745,4 +750,36 @@ fn hashing_a_file_is_bounded_by_its_size_and_the_deadline() {
     );
     let waited = wait(&scratch, "huge", &sha(b"x"), 100);
     assert_eq!((waited.matched, waited.observed.as_str()), (false, "too-large"));
+}
+
+#[test]
+fn whole_root_size_keeps_partial_totals_and_honors_ignores_and_read_allowance() {
+    let scratch = Scratch::new("whole-root");
+    scratch.write("a", b"123");
+    scratch.write("b/child", b"45");
+    scratch.write(".git/file", b"ignored");
+    scratch.write("skip/file", b"ignored");
+    let measure =
+        |budget| listing::path_sizes(&scratch.root().dir, &[], true, &|p, _| p == "skip", budget, later()).unwrap();
+    assert_eq!(measure(100), (vec![(String::new(), 5)], false));
+    assert_eq!(measure(1), (vec![(String::new(), 3)], true));
+    for n in 0..listing::read_allowance(1) {
+        scratch.write(&format!("z{n}"), b"");
+    }
+    assert_eq!(measure(1), (vec![(String::new(), 0)], true));
+}
+
+#[test]
+fn sync_whole_root_deadline_returns_a_truncated_estimate() {
+    let scratch = Scratch::new("size-deadline");
+    scratch.write("remaining", b"data");
+    let size = listing::path_sizes(
+        &scratch.root().dir,
+        &[],
+        true,
+        &nothing_ignored,
+        100,
+        std::time::Instant::now(),
+    );
+    assert_eq!(size.unwrap(), (vec![(String::new(), 0)], true));
 }

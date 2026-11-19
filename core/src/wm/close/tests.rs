@@ -2063,3 +2063,79 @@ fn a_user_close_of_a_beside_window_asks_nothing() {
     r.advance();
     assert_eq!(r.close_count(), 1);
 }
+
+fn with_server_job(busy: Option<bool>) -> Rig {
+    let r = driven(two());
+    let identity = ShellIdentity::Server {
+        generation: 7,
+        terminal_id: 1,
+    };
+    r.host.set_shell(
+        WIN,
+        ModuleId::terminal(),
+        Some(crate::wm::fake::FakeShell {
+            shell: ShellStart::identified(1, Some(identity)),
+            cwd: Ok("/srv/project".into()),
+            busy: busy.unwrap_or(true),
+        }),
+    );
+    r.driver.post(HostEvent::Terminal(TermEvent::Started {
+        win: WIN,
+        module: ModuleId::terminal(),
+        identity,
+    }));
+    r
+}
+
+#[test]
+fn close_with_a_busy_server_terminal_asks() {
+    let r = with_server_job(Some(true));
+    r.driver.close_requested(WIN, CloseBy::User);
+    assert!(r
+        .driver
+        .query(|c| c.chrome(WIN).prompt.unwrap().text)
+        .contains("1 terminal job"));
+    r.advance();
+    assert_eq!(r.close_count(), 0);
+}
+
+#[test]
+fn close_with_an_unknown_server_job_asks() {
+    let r = with_server_job(None);
+    r.driver.close_requested(WIN, CloseBy::User);
+    assert!(r.driver.query(|c| c.chrome(WIN).prompt.is_some()));
+    r.advance();
+    assert_eq!(r.close_count(), 0);
+}
+
+#[test]
+fn close_with_an_idle_server_terminal_does_not_ask() {
+    let r = with_server_job(Some(false));
+    r.driver.close_requested(WIN, CloseBy::User);
+    assert!(!r.driver.query(|c| c.chrome(WIN).prompt.is_some()));
+    r.advance();
+    assert_eq!(r.close_count(), 1);
+}
+
+#[test]
+fn terminal_job_modules_counts_server_terminals() {
+    let r = with_server_job(None);
+    assert_eq!(r.host.terminal_job_modules(WIN), [ModuleId::terminal()]);
+    assert_eq!(r.host.terminal_jobs(WIN), 1);
+    assert_eq!(r.host.terminal_jobs(WinId(99)), 0);
+}
+
+#[test]
+fn close_names_the_server_job_without_changing_its_answer_keys() {
+    let r = with_server_job(Some(true));
+    r.host.set_terminal_job_names(vec!["nvim\\u{202e}\\u{a}".into()]);
+    r.driver.close_requested(WIN, CloseBy::User);
+    let text = r.driver.query(|c| c.chrome(WIN).prompt.unwrap().text);
+    assert_eq!(
+        text,
+        "close window? 1 terminal job; server jobs: nvim\\u{202e}\\u{a} (y/n)"
+    );
+    r.answer("n");
+    r.advance();
+    assert_eq!(r.close_count(), 0);
+}

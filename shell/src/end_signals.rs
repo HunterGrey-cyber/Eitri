@@ -94,6 +94,15 @@ pub(crate) fn mark_closing() {
     CLOSING.store(true, Ordering::SeqCst);
 }
 
+/// Server terminals survive a close that began with logout, shutdown or another termination signal.
+#[allow(
+    dead_code,
+    reason = "the standalone signal tests include this module without terminal panes"
+)]
+pub(crate) fn signal_close_started() -> bool {
+    CLOSING.load(Ordering::SeqCst)
+}
+
 /// How long ago the first signal arrived; zero before one has, and while the watchdog, on its own thread, has yet to
 /// write it down: its signal is then a moment old.
 pub(crate) fn since_first_signal() -> Duration {

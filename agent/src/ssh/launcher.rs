@@ -53,6 +53,14 @@ pub trait ChannelLauncher: Send + Sync {
         None
     }
 
+    /// [`Self::host_key`] as a finished master start left it. While a start may be under way, when the record
+    /// can hold the key a server offered before ssh checked it, `Some(Err)` of kind `WouldBlock`: the key could
+    /// not be looked at. Blocking for a moment. A launcher that wraps another forwards this as well as
+    /// `host_key`.
+    fn settled_host_key(&self) -> Option<io::Result<String>> {
+        self.host_key()
+    }
+
     fn spawn_step(&self, _literal: &'static str, _args: &[&str]) -> io::Result<Child> {
         Err(io::Error::new(
             io::ErrorKind::Unsupported,
@@ -109,6 +117,19 @@ impl ChannelLauncher for SshLauncher {
     fn host_key(&self) -> Option<io::Result<String>> {
         Some(super::known_hosts::read_key(&self.master.host_key_record).map(|key| key.sha256))
     }
+
+    /// Every master start runs under the master's lock, and its known-hosts probe writes the key the server offers
+    /// before ssh checks it; a refused start removes the record before it lets the lock go. Read under the lock, the
+    /// record is a finished start's: a key ssh accepted, or none.
+    fn settled_host_key(&self) -> Option<io::Result<String>> {
+        let Ok(_held) = super::lock_within(&self.master.control_path.with_extension("lock"), SETTLED_KEY_WAIT) else {
+            return Some(Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "a start of the ssh master is under way",
+            )));
+        };
+        self.host_key()
+    }
 }
 
 fn check_host_key(observed: Option<io::Result<String>>, expected: &str) -> io::Result<()> {
@@ -132,6 +153,8 @@ pub const MASTER_CHECK: Duration = Duration::from_secs(2);
 
 /// How long a check waits for another caller's restart of the same master before it reports failure.
 pub const MASTER_LOCK_WAIT: Duration = Duration::from_secs(5);
+/// How long a look at the settled host key waits for a master start to finish; a longer one is not looked at.
+const SETTLED_KEY_WAIT: Duration = Duration::from_millis(200);
 
 /// A helper fixture launched directly, without SSH or a network connection.
 pub struct LocalExec {
@@ -197,6 +220,36 @@ mod tests {
     use super::*;
     use std::io::Write;
     use std::os::unix::fs::PermissionsExt;
+
+    /// While another holds the master's lock a start may be under way, and its record may name a key ssh then
+    /// refuses: the settled key is read only with the lock free.
+    #[test]
+    fn the_settled_host_key_is_read_only_while_no_master_start_runs() {
+        use std::os::unix::fs::DirBuilderExt;
+        let dir = std::env::temp_dir().join(format!("kh-settled-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::DirBuilder::new().mode(0o700).create(&dir).unwrap();
+        let record = dir.join("kh-0123456789abcdef");
+        std::fs::write(&record, r#"["example-host","ssh-ed25519","SHA256:offered"]"#).unwrap();
+        std::fs::set_permissions(&record, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let control = dir.join("cm-0123456789abcdef");
+        let launcher = SshLauncher {
+            master: ControlMaster::fixture("example-host", &control, &record),
+            helper: "/unused".into(),
+        };
+        assert_eq!(
+            launcher.settled_host_key().map(|key| key.unwrap()),
+            Some("SHA256:offered".to_owned())
+        );
+        let held = crate::private_fs::PrivateLock::open(&control.with_extension("lock")).unwrap();
+        assert!(held.try_lock().unwrap());
+        assert!(
+            matches!(launcher.settled_host_key(), Some(Err(error)) if error.kind() == io::ErrorKind::WouldBlock),
+            "read while a start may run"
+        );
+        drop(held);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn both_launchers_preserve_empty_and_nonempty_helper_arguments() {

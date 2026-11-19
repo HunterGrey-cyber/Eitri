@@ -17,6 +17,7 @@ remote-test-hooks = []
 
 [dependencies]
 agent = { path = "../agent" }
+eitri-terminal = { path = "../terminal/engine", default-features = false }
 # File names in the editor's record are base64 of their bytes, since JSON strings must be UTF-8 and names need
 # not be. Already linked through `eitri-panel` and `agent`'s `tonic` at 0.22, so no new crate ships.
 base64 = "0.22"

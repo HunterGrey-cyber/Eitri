@@ -365,6 +365,7 @@ fn kept<T: Clone>(items: &[T], seq: impl Fn(&T) -> u64, lo: u64, hi: u64) -> Vec
 /// session's (cloned).
 fn copy_between(projection: &AgentSessionProjection, lo: u64, hi: u64, keep_cards: bool) -> AgentSessionProjection {
     let AgentSessionProjection {
+        last_reset_revision,
         evicted,
         session_id,
         provider_session_id,
@@ -422,6 +423,7 @@ fn copy_between(projection: &AgentSessionProjection, lo: u64, hi: u64, keep_card
         running_turn_cli,
     } = projection;
     AgentSessionProjection {
+        last_reset_revision: *last_reset_revision,
         evicted: evicted.clone(),
         session_id: session_id.clone(),
         provider_session_id: provider_session_id.clone(),

@@ -30,7 +30,7 @@ use super::sessions::{self, SyncHelper};
 use super::status_file::{self, now_unix_ms};
 use super::status_schema::StatusFile;
 use super::tripwire::{self, Allowances, MIB};
-use super::{git_replica, SyncKey};
+use super::{git_replica, mirror_identity, SyncKey};
 use crate::remote_project::{PauseRecord, RemoteProject, RemoteProjects, SyncRecord};
 
 /// Pause reasons kept in `SyncRecord.paused`.
@@ -40,6 +40,9 @@ pub const PAUSE_RECREATE: &str = "recreate";
 pub const PAUSE_OTHER_SYNC: &str = "other-sync";
 /// `eitri host stop <host>` paused the sessions.
 pub const PAUSE_STOPPED: &str = "host-stopped";
+/// The folder at the root is not the one the sessions synced (or an earlier build noted none): only first connect,
+/// which asks before moving anything, sets it up again.
+pub const PAUSE_FOLDER: &str = "folder";
 
 /// What the Mutagen transport says when the master's verified key is not the sync record's (Mutagen passes it on as
 /// the session's error).
@@ -102,13 +105,16 @@ impl ActorConfig {
     }
 }
 
-/// Flushing and reading the status, for whoever needs it: holder or observer, the send path, the shim.
+/// Flushing the tree and reading what the engine says of it, for whoever sends: holder or observer.
 pub trait SyncHandle: Send + Sync {
     fn flush_tree(&self, cap: Duration) -> FlushOutcome;
-    fn status(&self) -> Result<StatusFile, String>;
+    /// The tree session as the engine reports it now, by name, given up after `cap`. `status.json` is not read: the
+    /// holder writes it on its own tick, so it can lag behind a flush that has just returned.
+    fn tree_status(&self, cap: Duration) -> Result<SessionStatus, String>;
+    fn matcher(&self) -> Result<Matcher, String>;
 }
 
-/// The [`SyncHandle`] of one project: the engine's flush (safe for anyone) and the holder's `status.json`.
+/// The [`SyncHandle`] of one project: the engine's flush and named status, both safe for anyone.
 #[derive(Clone)]
 pub struct SyncPort {
     engine: Arc<dyn SyncEngine>,
@@ -122,8 +128,16 @@ impl SyncHandle for SyncPort {
         self.engine.flush(&self.tree, cap)
     }
 
-    fn status(&self) -> Result<StatusFile, String> {
-        status_file::read_status_file(&self.dir)
+    fn tree_status(&self, cap: Duration) -> Result<SessionStatus, String> {
+        self.engine
+            .session_status_within(&self.tree, cap)
+            .map_err(|error| error.to_string())
+    }
+
+    fn matcher(&self) -> Result<Matcher, String> {
+        recreate::read_created_patterns(&self.dir)
+            .map(|p| Matcher::new(&p))
+            .ok_or_else(|| "the session’s ignore patterns are unavailable".into())
     }
 }
 
@@ -269,10 +283,17 @@ fn unlock(lock: &PrivateLock) {
 }
 
 fn holder_kind(dir: &Path) -> Option<HolderKind> {
+    read_holder(dir).map(|holder| holder.kind)
+}
+
+/// The holder record is published by the actor after it takes the root's lock.
+pub(crate) fn window_holds_lock(dir: &Path, pid: u32) -> bool {
+    read_holder(dir).is_some_and(|holder| holder.kind == HolderKind::Window && holder.pid == pid)
+}
+
+fn read_holder(dir: &Path) -> Option<HolderFile> {
     let bytes = agent::private_fs::read_private_nofollow_bytes_capped(&dir.join("holder"), 4096).ok()?;
-    serde_json::from_slice::<HolderFile>(&bytes)
-        .ok()
-        .map(|holder| holder.kind)
+    serde_json::from_slice(&bytes).ok()
 }
 
 /// Why the tree session is re-created.
@@ -313,8 +334,17 @@ struct AwaitingFirstCycle {
 
 /// A session update from a monitor of generation `epoch`; `status: None` says the stream ended.
 struct MonitorMsg {
+    name: String,
     epoch: u64,
     status: Option<SessionStatus>,
+}
+
+/// An ended stream retains its retry delay until the replacement reports a connected state.
+struct MonitorState {
+    epoch: u64,
+    stop: Arc<AtomicBool>,
+    retry_at: Option<Instant>,
+    delay: Duration,
 }
 
 struct Runner {
@@ -346,10 +376,8 @@ struct Hold {
     git: Option<SessionStatus>,
     updates: Receiver<MonitorMsg>,
     sender: Sender<MonitorMsg>,
-    monitor_stop: Arc<AtomicBool>,
-    /// The monitors' generation: a message from an older one (a session since terminated) is dropped.
+    monitors: BTreeMap<String, MonitorState>,
     monitor_epoch: u64,
-    polling: bool,
     /// Whether the sessions were set up (or found) and are being followed; until then every recheck tries again.
     started: bool,
     /// The record as the holder last reacted to it: the person's writes are told from this, not from `record`
@@ -372,6 +400,19 @@ struct Hold {
     batch_cycles: Option<u64>,
     /// When the first-cycle accounting may try its listings again after one failed.
     accounting_after: Option<Instant>,
+    /// A recorded pause Mutagen did not carry out yet: the sessions are listed and paused again every `poll_every`
+    /// until none runs.
+    pause_retry: bool,
+    last_pause_try: Instant,
+    /// When the replica may be tried again after a create or a terminate failed, and how long the next wait is.
+    git_retry_at: Option<Instant>,
+    git_backoff: Duration,
+    /// The git session was paused because the laptop `.git` it writes into moved; it stays paused until that `.git`
+    /// is judged Eitri's again (and resumed) or the session is stopped.
+    git_held: bool,
+    /// The staging name the helper last took for this root (WatchModes answered without a refusal); `None` until
+    /// then or after a failed send. A recheck sends again when the tree session's name differs.
+    modes_sent: Option<String>,
 }
 
 impl Runner {
@@ -536,7 +577,10 @@ impl Runner {
                 for name in [&record.tree_session, &record.git_session].into_iter().flatten() {
                     if let Err(error) = self.deps.engine.pause(name) {
                         if !self.deps.engine.is_missing(&error) {
-                            eprintln!("[sync] {}: {name} was not paused: {error}", self.project.root.display());
+                            self.line(format!(
+                                "{}: {name} was not paused: {error}",
+                                self.project.root.display()
+                            ));
                         }
                     }
                 }
@@ -564,8 +608,9 @@ impl Runner {
     /// Stops following the sessions: monitor threads end at their next update, and what they already queued is dropped.
     fn stop_monitors(&mut self) {
         if let Some(hold) = &mut self.hold {
-            hold.monitor_stop.store(true, Ordering::Release);
-            hold.monitor_epoch += 1;
+            for (_, monitor) in std::mem::take(&mut hold.monitors) {
+                monitor.stop.store(true, Ordering::Release);
+            }
         }
     }
 
@@ -577,7 +622,7 @@ impl Runner {
         let before = hold.record.clone();
         let caught_up = before == hold.seen;
         change(&mut hold.record);
-        let fallback = hold.record.clone();
+
         let host = self.project.host.clone();
         let mut written = None;
         let mut unreadable = None;
@@ -585,7 +630,11 @@ impl Runner {
         let mut only_mine = false;
         let result = self.store.update_for_host(&self.project.root, &host, |project| {
             let mut record = match project.sync_record() {
-                Ok(record) => record.unwrap_or_else(|| fallback.clone()),
+                Ok(Some(record)) => record,
+                Ok(None) => {
+                    unreadable = Some(project.sync_not_set_up());
+                    return;
+                }
                 Err(why) => {
                     unreadable = Some(why);
                     return;
@@ -639,9 +688,7 @@ impl Runner {
         if self.config.kind == HolderKind::Window {
             let _ = std::fs::remove_file(self.locks.join("handover"));
         }
-        let existing = self.reread();
-        let set_up = existing.is_some();
-        let record = existing.unwrap_or_else(|| SyncRecord {
+        let record = self.reread().unwrap_or_else(|| SyncRecord {
             engine: "mutagen".into(),
             host_key_sha256: self.project.host_key_sha256.clone(),
             ..Default::default()
@@ -655,9 +702,8 @@ impl Runner {
             git: None,
             updates,
             sender,
-            monitor_stop: Arc::new(AtomicBool::new(false)),
+            monitors: BTreeMap::new(),
             monitor_epoch: 0,
-            polling: false,
             started: false,
             last_poll: Instant::now(),
             last_change: Instant::now(),
@@ -675,14 +721,20 @@ impl Runner {
             poll_bytes: None,
             batch_cycles: None,
             accounting_after: None,
+            pause_retry: false,
+            last_pause_try: Instant::now(),
+            git_retry_at: None,
+            git_backoff: Duration::ZERO,
+            git_held: false,
+            modes_sent: None,
         });
-        // A project first connect never set up gets no record from here (ensure_sessions says so).
-        if set_up {
-            self.change(|_| {});
+        if self.hold().record.authorized() {
+            self.settle_host_key();
         }
-        self.settle_host_key();
-        if self.hold().record.paused.is_some() {
+        if self.hold().record.authorized() && self.hold().record.paused.is_some() {
             self.hold_paused();
+            // An exclude written while no holder ran is a changed digest only this look can see.
+            self.check_digest();
         } else {
             self.ensure_sessions();
         }
@@ -702,6 +754,10 @@ impl Runner {
             return;
         }
         if self.hold().record.accepted_host_key.as_deref() == Some(current.as_str()) {
+            // Ending the sessions would erase what says the folder was never confirmed: the folder comes first.
+            if self.folder_refused() {
+                return;
+            }
             let old = self.hold().record.clone();
             for name in [&old.tree_session, &old.git_session].into_iter().flatten() {
                 let _ = self.deps.engine.terminate(name);
@@ -738,6 +794,38 @@ impl Runner {
         self.pause_with(PAUSE_HOST_KEY, text, None);
     }
 
+    /// The connection under the helper now shows a host key ssh accepted and the project was not recorded with (a
+    /// window's link that came back to another server): sync pauses with the key line, as in a window opened after
+    /// the change. This window's connection stays pinned to the old key, so nothing it holds is moved to the new one;
+    /// a window opened again takes the new key and its resume settles it. `Paused` when it paused now; `Unknown`
+    /// when the key could not be looked at, which only a re-creation waits on (the connection's channels are
+    /// refused on another key whatever is looked at here).
+    fn key_moved(&mut self) -> KeyLook {
+        // A tripwire pause still lets a re-creation run; the key pause takes its place. Any other pause holds.
+        let other_pause = self
+            .hold()
+            .record
+            .paused
+            .as_ref()
+            .is_some_and(|pause| pause.reason != PAUSE_TRIPWIRE);
+        if other_pause || !self.hold().record.authorized() {
+            return KeyLook::Same;
+        }
+        let shown = match self.deps.helper.changed_host_key() {
+            Ok(Some(shown)) => shown,
+            Ok(None) => return KeyLook::Same,
+            Err(_) => return KeyLook::Unknown,
+        };
+        let text = key_moved_text(
+            &self.project.host,
+            &self.project.host_key_sha256,
+            &shown,
+            &self.project.root,
+        );
+        self.pause_with(PAUSE_HOST_KEY, text, None);
+        KeyLook::Paused
+    }
+
     /// Records a pause that waits for the person, pauses both sessions and says so.
     fn pause_with(&mut self, reason: &str, text: String, path: Option<String>) {
         let names: Vec<String> = {
@@ -757,7 +845,8 @@ impl Runner {
             }
         }
         if !failed.is_empty() {
-            // The pause is recorded anyway; every update from a running session pauses it again.
+            // The pause is recorded anyway; the sessions are listed and paused again until none runs.
+            self.hold().pause_retry = true;
             self.line(format!(
                 "sync could not pause yet ({}); it keeps trying",
                 failed.join("; ")
@@ -786,6 +875,7 @@ impl Runner {
         for name in names {
             if let Err(error) = self.deps.engine.pause(&name) {
                 if !self.deps.engine.is_missing(&error) {
+                    self.hold().pause_retry = true;
                     self.line(format!(
                         "sync for {} could not be paused: {error}",
                         self.project.root.display()
@@ -827,6 +917,7 @@ impl Runner {
     /// Creates or resumes the project's sessions: other keys' sessions of this root first, then tree, then git.
     /// Marks a re-creation as due, here and in `recreate.json`, so the next holder finishes it if this one lets go.
     fn set_pending(&mut self, why: Why) {
+        self.hold().awaiting = None;
         let progress = recreate::Progress {
             why: why.as_str().into(),
             one_sided: None,
@@ -841,20 +932,31 @@ impl Runner {
         let root = self.project.root.clone();
         let key = self.hold().key.clone();
         // Sessions exist only for a project first connect set up (it checks what the laptop path holds first).
-        if self.reread().is_none() {
-            let text = format!(
-                "sync is not set up for {}: run eitri host open {}:{} to set up this machine's copy",
-                root.display(),
-                self.project.host,
-                root.display()
-            );
+        let latest = self.reread();
+        let Some(latest) = latest.filter(SyncRecord::authorized) else {
+            let text = self.project.sync_not_set_up();
             self.hold().notice = Some(text.clone());
             self.line_once(text);
+            return;
+        };
+        self.hold().record = latest;
+        if self.key_moved() == KeyLook::Paused {
             return;
         }
         if let Some(why) = state_inside(&self.config.state_home, &root) {
             self.hold().notice = Some(why.clone());
             self.line_once(why);
+            return;
+        }
+        match mirror_identity::overlapping(&self.store, &root) {
+            Ok(None) => {}
+            Ok(Some(why)) | Err(why) => {
+                self.hold().notice = Some(why.clone());
+                self.line_once(why);
+                return;
+            }
+        }
+        if self.folder_refused() {
             return;
         }
         if let Err(error) = self.deps.engine.start() {
@@ -912,9 +1014,7 @@ impl Runner {
                         } else {
                             recreate::read_created_patterns(&self.dir).unwrap_or_else(|| patterns.clone())
                         };
-                        if self.hold().record.ignore_digest != digest {
-                            self.set_pending(Why::IgnoresChanged);
-                        }
+                        self.check_digest();
                         // Resumed (it syncs with its own ignores until any re-creation) once its monitor runs.
                         self.hold().tree = Some(status);
                     }
@@ -926,6 +1026,9 @@ impl Runner {
                         return;
                     }
                 },
+                None if !self.hold().record.set_up => {
+                    self.line_once(self.project.sync_not_set_up());
+                }
                 None => {
                     if !self.create_tree(&tree_name, &patterns, &digest) {
                         return;
@@ -935,6 +1038,10 @@ impl Runner {
         }
         self.send_watch_modes();
         self.ensure_git();
+        // Looked at again right before the resume: the folder can be replaced while the replica is set up.
+        if self.folder_paused() || self.folder_refused() {
+            return;
+        }
         self.start_monitors();
         // Resumed only now, with its monitor running, so a batch that was waiting is seen by the size tripwire.
         if let Some(name) = self.hold().record.tree_session.clone() {
@@ -951,12 +1058,98 @@ impl Runner {
         self.hold().started = true;
     }
 
+    fn reserve_session(&mut self, role: Role, name: &str) -> bool {
+        let before = self.hold().record.clone();
+        // A re-creation (pending while it creates) replaces a session that already ran over this mirror.
+        let recreating = self.hold().pending.is_some();
+        let mut only_mine = false;
+        let result = self.store.update_checked(&self.project.root, |project| {
+            if !project.same_identity(&self.project) {
+                return Err(std::io::Error::other("the project now points at another server"));
+            }
+            let refused = || std::io::Error::other(project.sync_not_set_up());
+            let mut record = project
+                .sync_record()
+                .map_err(std::io::Error::other)?
+                .ok_or_else(refused)?;
+            only_mine = record == before;
+            // A sessionless mirror was empty when first connect prepared it. A later holder
+            // cannot treat files that appeared since then as an approved first baseline.
+            if role == Role::Tree
+                && !recreating
+                && !record.tree_synced
+                && !record.has_sessions()
+                && std::fs::read_dir(&project.root)?.next().transpose()?.is_some()
+            {
+                return Err(std::io::Error::other(format!(
+                    "{} is no longer empty; run eitri host open again",
+                    project.root.display()
+                )));
+            }
+            // The folder the first session syncs is the one every later session must find there.
+            if role == Role::Tree && record.root_identity.is_none() && !record.has_sessions() {
+                record.root_identity = mirror_identity::identity(&project.root);
+            }
+            if record.root_identity.is_some_and(|recorded| {
+                mirror_identity::identity(&project.root)
+                    .is_none_or(|found| mirror_identity::compare(&recorded, &found) != mirror_identity::Verdict::Same)
+            }) {
+                return Err(std::io::Error::other(mirror_identity::replaced_text(
+                    &project.host,
+                    &project.root,
+                )));
+            }
+            let session = match role {
+                Role::Tree => &mut record.tree_session,
+                Role::Git => &mut record.git_session,
+            };
+            if record.host_key_sha256 != project.host_key_sha256 || (!record.set_up && session.as_deref() != Some(name))
+            {
+                return Err(refused());
+            }
+            *session = Some(name.into());
+            project.set_sync_record(&record);
+            Ok(())
+        });
+        match result {
+            Ok(project) => {
+                let record = project.sync_record().expect("just serialized").expect("just saved");
+                if only_mine {
+                    self.hold().seen = record.clone();
+                }
+                self.hold().record = record;
+                true
+            }
+            Err(error) => {
+                self.hold().notice = Some(error.to_string());
+                self.line_once(error.to_string());
+                false
+            }
+        }
+    }
+
     fn create_tree(&mut self, name: &str, patterns: &[String], digest: &str) -> bool {
+        if self.folder_refused() {
+            return false;
+        }
         let key = self.hold().key.clone();
         let spec = sessions::tree_spec(&key, &self.project.root, patterns);
         // Recorded first: the transport connects only for a session the record names. A holder that stops before
         // the create finishes leaves a name Mutagen may not know, which the next holder re-creates as lost.
-        self.change(|record| record.tree_session = Some(name.to_owned()));
+        if !self.reserve_session(Role::Tree, name) {
+            return false;
+        }
+        // The send path and the git shim read the session's exclusions from `ignores.json`: it is written before the
+        // session exists, and a session never runs beside an older list. An unwritable list is removed (they then
+        // refuse as unknown) and no session is made.
+        if let Err(error) = recreate::write_created_patterns(&self.dir, patterns) {
+            let _ = std::fs::remove_file(self.dir.join("ignores.json"));
+            self.change(|record| record.tree_session = None);
+            let text = format!("sync not started: the session's ignore list could not be saved ({error})");
+            self.hold().notice = Some(text.clone());
+            self.line_once(text);
+            return false;
+        }
         if let Err(error) = self.deps.engine.create(&spec) {
             self.change(|record| record.tree_session = None);
             let text = format!("sync not started: {error}");
@@ -964,7 +1157,6 @@ impl Runner {
             self.line(text);
             return false;
         }
-        let _ = recreate::write_created_patterns(&self.dir, patterns);
         let hold = self.hold();
         hold.patterns = patterns.to_vec();
         hold.notice = None;
@@ -973,135 +1165,424 @@ impl Runner {
     }
 
     fn send_watch_modes(&mut self) {
-        let key = self.hold().key.clone();
         let patterns = self.hold().patterns.clone();
         let root = self.project.root.clone();
-        match self
-            .deps
-            .helper
-            .watch_modes(&root, &patterns, true, &sessions::staging_name(&key))
-        {
-            Ok(response) if !response.refusal.is_empty() => self.line_once(response.refusal),
-            Ok(_) => {}
-            Err(error) => self.line_once(format!("file modes on {} are not kept: {error}", self.project.host)),
+        // The tree session's identifier names its staging directory; a session made just now is looked up for it.
+        let running = self.hold().tree.as_ref().map(|status| status.identifier.clone());
+        let identifier = match (running, self.hold().record.tree_session.clone()) {
+            (Some(identifier), _) => identifier,
+            (None, Some(name)) => sessions::find(self.deps.engine.as_ref(), &root, &name)
+                .ok()
+                .flatten()
+                .map(|status| status.identifier)
+                .unwrap_or_default(),
+            (None, None) => String::new(),
+        };
+        // With the identifier unknown for a moment, the last name stays registered rather than none.
+        let staging = match sessions::staging_name(&identifier) {
+            name if name.is_empty() => self.hold().modes_sent.clone().unwrap_or_default(),
+            name => name,
+        };
+        self.register_modes(&patterns, staging);
+    }
+
+    /// One WatchModes; `modes_sent` keeps the staging name the helper took, `None` after a refusal or a failure.
+    fn register_modes(&mut self, patterns: &[String], staging: String) -> Registered {
+        let root = self.project.root.clone();
+        let (sent, registered) = match self.deps.helper.watch_modes(&root, patterns, true, &staging) {
+            Ok(response) if !response.refusal.is_empty() => {
+                self.line_once(response.refusal);
+                (None, Registered::Not)
+            }
+            Ok(response) if response.settling => (Some(staging), Registered::Settling),
+            Ok(_) => (Some(staging), Registered::Settled),
+            Err(error) => {
+                self.line_once(format!("file modes on {} are not kept: {error}", self.project.host));
+                (None, Registered::Not)
+            }
+        };
+        self.hold().modes_sent = sent;
+        registered
+    }
+
+    /// Whether the folder at the root is not the one the record's sessions sync: then the sessions are paused, the
+    /// pause recorded and said, and nothing is resumed, created or written into `.git`.
+    fn folder_refused(&mut self) -> bool {
+        let record = self.hold().record.clone();
+        if !record.authorized() {
+            return false;
         }
+        let Some(text) = mirror_identity::root_refusal(&record, &self.project.host, &self.project.root) else {
+            return false;
+        };
+        // The monitors stay: a session whose pause failed is seen running and paused again.
+        let paused = self.folder_paused();
+        if paused {
+            self.hold_paused();
+        } else {
+            self.pause_with(PAUSE_FOLDER, text.clone(), None);
+        }
+        let hold = self.hold();
+        hold.notice = Some(text);
+        hold.started = false;
+        true
+    }
+
+    /// Whether the sessions wait paused because the folder at the root is not the one they synced.
+    fn folder_paused(&mut self) -> bool {
+        self.hold()
+            .record
+            .paused
+            .as_ref()
+            .is_some_and(|pause| pause.reason == PAUSE_FOLDER)
     }
 
     /// The `.git` replica: the laptop's config written first, then the session. A root whose git commands must run on
-    /// the server gets none (and loses one it had).
+    /// the server gets none (and loses one it had). Only a `.git` Eitri made is written to or replicated onto.
     fn ensure_git(&mut self) {
-        let root = self.project.root.clone();
-        let key = self.hold().key.clone();
-        let local_git = self.config.local_git.clone();
-        let refusal = match (local_git, self.deps.helper.git_config(&root)) {
-            (None, _) => Some("git was not found on this machine".to_owned()),
-            (Some(local_git), Ok(response)) if response.refusal.is_empty() => {
-                let entries: Vec<(String, String)> = response
-                    .entries
-                    .into_iter()
-                    .map(|entry| (entry.key, entry.value))
-                    .collect();
-                let written = git_replica::install_refuse_hooks(&self.config.state_home).and_then(|hooks| {
-                    git_replica::write_laptop_config(&local_git, &root.join(".git"), &entries, &hooks)
-                });
-                match written {
-                    Ok(()) => {
-                        self.hold().git_digest = Some(response.digest);
-                        None
-                    }
-                    Err(error) => Some(format!("the laptop's git config could not be written: {error}")),
-                }
-            }
-            (Some(_), Ok(response)) => Some(response.refusal),
-            (Some(_), Err(error)) => Some(error),
-        };
-        if let Some(why) = refusal {
-            if let Some(name) = self.hold().record.git_session.clone() {
-                let _ = self.deps.engine.terminate(&name);
-                self.hold().git = None;
-                self.change(|record| {
-                    record.git_session = None;
-                    record.git_ready = false;
-                });
-            }
-            self.line_once(format!(
-                "git history is not mirrored ({why}); git commands run on {}",
-                self.project.host
-            ));
+        if !self.hold().record.set_up && self.hold().record.git_session.is_none() {
+            self.line_once(self.project.sync_not_set_up());
             return;
         }
+        if self.folder_refused() {
+            return;
+        }
+        let root = self.project.root.clone();
+        let key = self.hold().key.clone();
+        let Some(local_git) = self.config.local_git.clone() else {
+            self.end_replica(GitRefusal::Here("git was not found on this machine".into()));
+            return;
+        };
+        let response = match self.deps.helper.git_config(&root) {
+            Ok(response) if response.refusal.is_empty() => response,
+            Ok(response) => return self.end_replica(GitRefusal::Here(response.refusal)),
+            Err(error) => return self.end_replica(GitRefusal::Unreachable(error)),
+        };
+        let unwritable =
+            |error: std::io::Error| GitRefusal::Here(format!("the laptop's git config could not be written: {error}"));
+        let hooks = match git_replica::install_refuse_hooks(&self.config.state_home) {
+            Ok(hooks) => hooks,
+            Err(error) => return self.end_replica(unwritable(error)),
+        };
+        // The server's answer took a round trip: the folder is looked at again before its `.git` is judged.
+        if self.folder_refused() {
+            return;
+        }
+        let record = self.hold().record.clone();
+        let git_dir = root.join(".git");
+        let identity = match mirror_identity::git_dir(&local_git, &root, &record, &hooks) {
+            Err(error) => return self.end_replica(unwritable(error)),
+            Ok(mirror_identity::GitDir::Foreign) => {
+                // The person's own repository: no config is written into it and no replica deletes what it holds. A
+                // replica that would not stop stays recorded and is stopped at a later step.
+                if !self.stop_git_session() {
+                    return;
+                }
+                self.line_once(format!(
+                    "git history is not mirrored (the laptop copy has its own .git; move it out of {} to mirror the \
+                     server's history); git commands run on {}",
+                    root.display(),
+                    self.project.host
+                ));
+                return;
+            }
+            Ok(mirror_identity::GitDir::Ours(identity)) => {
+                match mirror_identity::retire_operations(&self.config.state_home, &key, &root) {
+                    Ok(Some(kept)) => self.line(format!(
+                        "moved an interrupted rebase or cherry-pick out of {} to {}: the copy can neither continue \
+                         nor abort it",
+                        git_dir.display(),
+                        kept.display()
+                    )),
+                    Ok(None) => {}
+                    Err(error) => self.line(format!(
+                        "an interrupted rebase or cherry-pick in {} could not be moved out: {error}",
+                        git_dir.display()
+                    )),
+                }
+                identity
+            }
+            Ok(mirror_identity::GitDir::Missing) => {
+                use std::os::unix::fs::DirBuilderExt;
+                if let Err(error) = std::fs::DirBuilder::new().mode(0o700).create(&git_dir) {
+                    // Made by someone else meanwhile: judged again at the next start.
+                    return self.end_replica(unwritable(error));
+                }
+                match mirror_identity::identity(&git_dir) {
+                    Some(identity) => identity,
+                    None => {
+                        return self.end_replica(GitRefusal::Here(format!("{} is not a directory", git_dir.display())))
+                    }
+                }
+            }
+        };
+        if self.hold().record.git_identity != Some(identity) {
+            self.change(|record| record.git_identity = Some(identity));
+        }
+        if let Err(error) =
+            git_replica::write_laptop_config(&local_git, &git_dir, &config_pairs(response.entries), &hooks)
+        {
+            return self.end_replica(unwritable(error));
+        }
+        self.hold().git_digest = Some(response.digest);
         let name = session_name(&key, Role::Git);
-        let known = match self.hold().record.git_session.clone() {
+        let mut known = match self.hold().record.git_session.clone() {
             Some(recorded) => sessions::find(self.deps.engine.as_ref(), &root, &recorded)
                 .ok()
                 .flatten(),
             None => None,
         };
+        // Mutagen keeps a session's ignores for its whole life: one made from an older description is made again.
+        if known.is_some() && self.hold().record.git_spec_version != git_replica::GIT_SESSION_VERSION {
+            if !self.stop_git_session() {
+                return;
+            }
+            known = None;
+        }
         match known {
             Some(status) => {
                 if sessions::is_paused(&status) && self.hold().record.paused.is_none() {
                     let _ = self.deps.engine.resume(&status.name);
                 }
-                self.hold().git = Some(status);
+                let hold = self.hold();
+                hold.git_held = false;
+                hold.git = Some(status);
             }
             None => {
                 // Recorded first: the transport connects only for a session the record names.
-                self.change(|record| record.git_session = Some(name.clone()));
-                if let Err(error) = self.deps.engine.create(&sessions::git_spec(&key, &root)) {
-                    self.change(|record| record.git_session = None);
-                    self.line(format!("git history is not mirrored: {error}"));
+                if !self.reserve_session(Role::Git, &name) {
+                    return;
+                }
+                match self.deps.engine.create(&sessions::git_spec(&key, &root)) {
+                    Ok(()) => {
+                        let hold = self.hold();
+                        hold.git_retry_at = None;
+                        hold.git_backoff = Duration::ZERO;
+                        self.change(|record| record.git_spec_version = git_replica::GIT_SESSION_VERSION);
+                    }
+                    Err(error) => {
+                        self.change(|record| record.git_session = None);
+                        self.git_failed();
+                        self.line_once(format!("git history is not mirrored: {error}"));
+                    }
                 }
             }
         }
+    }
+
+    /// Terminates the recorded git session and takes it out of the record; the laptop `.git` stays as it is. A
+    /// terminate Mutagen did not carry out (a timeout) keeps the name, so release still pauses it and a later step
+    /// stops it, and pauses what it can meanwhile: `false` then.
+    fn stop_git_session(&mut self) -> bool {
+        let Some(name) = self.hold().record.git_session.clone() else {
+            return true;
+        };
+        if let Err(error) = self.deps.engine.terminate(&name) {
+            if !self.deps.engine.is_missing(&error) {
+                if self.deps.engine.pause(&name).is_err() {
+                    self.hold().pause_retry = true;
+                }
+                self.git_failed();
+                self.line_once(format!(
+                    "the git replica {name} could not be stopped yet ({error}); it keeps trying"
+                ));
+                return false;
+            }
+        }
+        self.stop_monitor(&name);
+        let hold = self.hold();
+        hold.git = None;
+        hold.git_held = false;
+        self.change(|record| {
+            record.git_session = None;
+            record.git_ready = false;
+        });
+        true
+    }
+
+    /// Pauses the git session because its `.git` moved, once; a pause Mutagen did not carry out is tried at the next
+    /// step.
+    fn hold_git(&mut self) {
+        if self.hold().git_held {
+            return;
+        }
+        let Some(name) = self.hold().record.git_session.clone() else {
+            return;
+        };
+        match self.deps.engine.pause(&name) {
+            Ok(()) => self.hold().git_held = true,
+            Err(error) if self.deps.engine.is_missing(&error) => self.hold().git_held = true,
+            Err(error) => self.line_once(format!(
+                "the git replica {name} could not be paused yet ({error}); it keeps trying"
+            )),
+        }
+    }
+
+    /// A replica create or stop failed: the next try waits, twice as long each time up to 32 rechecks, so a server or
+    /// daemon that keeps refusing costs one attempt (and one line) now and then rather than at every recheck.
+    fn git_failed(&mut self) {
+        let cap = self.config.recheck_every.saturating_mul(32);
+        let first = self.config.recheck_every;
+        let hold = self.hold();
+        hold.git_retry_at = Some(Instant::now() + hold.git_backoff);
+        hold.git_backoff = hold.git_backoff.saturating_mul(2).max(first).min(cap);
+    }
+
+    fn git_retry_due(&mut self) -> bool {
+        self.hold().git_retry_at.is_none_or(|at| Instant::now() >= at)
+    }
+
+    /// No replica runs: the git session ends, and when the server or this laptop refused one, Eitri's `.git` leaves
+    /// the mirror (kept under the state home), so plain git on the laptop cannot write into a copy that a later
+    /// replica would bring back to the server's state. A server that could not be reached keeps the copy as it is.
+    fn end_replica(&mut self, refusal: GitRefusal) {
+        let root = self.project.root.clone();
+        let record = self.hold().record.clone();
+        let ours = match &self.config.local_git {
+            Some(local_git) => matches!(
+                mirror_identity::git_dir(
+                    local_git,
+                    &root,
+                    &record,
+                    &git_replica::refuse_hooks_dir(&self.config.state_home)
+                ),
+                Ok(mirror_identity::GitDir::Ours(_))
+            ),
+            None => record.git_identity.is_some_and(|recorded| {
+                mirror_identity::identity(&root.join(".git"))
+                    .is_some_and(|found| mirror_identity::compare(&recorded, &found) == mirror_identity::Verdict::Same)
+            }),
+        };
+        // Eitri's `.git` leaves the mirror only once its replica has stopped: one still running would make it again.
+        let stopped = self.stop_git_session();
+        let why = match refusal {
+            GitRefusal::Unreachable(why) => why,
+            GitRefusal::Here(why) => {
+                // A refusal here is tried again only after the git backoff, so a laptop config that keeps failing
+                // does not make and end a `.git` at every recheck.
+                self.git_failed();
+                if ours && stopped && mirror_identity::holds_only_eitri_files(&root.join(".git")) {
+                    // Nothing of the server's or the person's is in it: removed, not kept among the retired copies.
+                    let _ = std::fs::remove_dir_all(root.join(".git"));
+                    self.change(|record| record.git_identity = None);
+                } else if ours && stopped {
+                    let key = self.hold().key.clone();
+                    match mirror_identity::retire_git_dir(&self.config.state_home, &key, &root) {
+                        Ok(kept) => {
+                            self.change(|record| record.git_identity = None);
+                            self.line(format!(
+                                "moved the laptop's copy of the git history out of {} to {}",
+                                root.display(),
+                                kept.display()
+                            ));
+                        }
+                        Err(error) => self.line(format!(
+                            "the laptop's copy of the git history in {} could not be moved out: {error}",
+                            root.display()
+                        )),
+                    }
+                }
+                why
+            }
+        };
+        self.line_once(format!(
+            "git history is not mirrored ({why}); git commands run on {}",
+            self.project.host
+        ));
     }
 
     /// One thread per session follows Mutagen's monitor stream; a session whose stream cannot start is listed every
     /// `poll_every` instead.
     fn start_monitors(&mut self) {
-        let names: Vec<String> = {
-            let record = &self.hold().record;
-            [&record.tree_session, &record.git_session]
-                .into_iter()
-                .flatten()
-                .cloned()
-                .collect()
-        };
-        self.stop_monitors();
-        let stop = Arc::new(AtomicBool::new(false));
-        self.hold().monitor_stop = stop.clone();
-        let epoch = self.hold().monitor_epoch;
-        let mut polling = false;
+        let hold = self.hold();
+        let tree = hold
+            .record
+            .tree_session
+            .as_ref()
+            .filter(|_| !hold.pending.as_ref().is_some_and(|p| p.why == Why::Lost));
+        let names: Vec<_> = tree.into_iter().chain(&hold.record.git_session).cloned().collect();
+        hold.monitors.retain(|name, monitor| {
+            if names.contains(name) {
+                return true;
+            }
+            monitor.stop.store(true, Ordering::Release);
+            false
+        });
         for name in names {
-            match self.deps.engine.monitor(&name) {
-                Ok(stream) => {
-                    let sender = self.hold().sender.clone();
-                    let stop = stop.clone();
-                    let _ = std::thread::Builder::new()
-                        .name("eitri-sync-monitor".into())
-                        .spawn(move || {
-                            for status in stream {
-                                if stop.load(Ordering::Acquire)
-                                    || sender
-                                        .send(MonitorMsg {
-                                            epoch,
-                                            status: Some(status),
-                                        })
-                                        .is_err()
-                                {
-                                    return;
-                                }
-                            }
-                            // The stream ended (the daemon stopped or restarted): the actor lists instead.
-                            let _ = sender.send(MonitorMsg { epoch, status: None });
-                        });
-                }
-                Err(_) => polling = true,
+            if !self.hold().monitors.contains_key(&name) {
+                self.start_monitor(name, self.config.poll_every.min(self.config.recheck_every));
             }
         }
-        self.hold().polling = polling;
     }
 
-    /// The holder's step.
+    fn stop_monitor(&mut self, name: &str) {
+        if let Some(monitor) = self.hold().monitors.remove(name) {
+            monitor.stop.store(true, Ordering::Release);
+        }
+    }
+
+    fn start_monitor(&mut self, name: String, delay: Duration) {
+        let hold = self.hold();
+        hold.monitor_epoch += 1;
+        let epoch = hold.monitor_epoch;
+        let sender = hold.sender.clone();
+        let stop = Arc::new(AtomicBool::new(false));
+        let started = self.deps.engine.monitor(&name).ok().and_then(|stream| {
+            let name = name.clone();
+            let stop = stop.clone();
+            std::thread::Builder::new()
+                .name("eitri-sync-monitor".into())
+                .spawn(move || {
+                    for status in stream {
+                        if stop.load(Ordering::Acquire)
+                            || sender
+                                .send(MonitorMsg {
+                                    epoch,
+                                    name: name.clone(),
+                                    status: Some(status),
+                                })
+                                .is_err()
+                        {
+                            return;
+                        }
+                    }
+                    let _ = sender.send(MonitorMsg {
+                        epoch,
+                        name,
+                        status: None,
+                    });
+                })
+                .ok()
+        });
+        self.hold().monitors.insert(
+            name,
+            MonitorState {
+                epoch,
+                stop,
+                delay,
+                retry_at: started.is_none().then(|| Instant::now() + delay),
+            },
+        );
+    }
+
+    fn retry_monitors(&mut self) {
+        let cap = self.config.recheck_every;
+        let due: Vec<_> = self
+            .hold()
+            .monitors
+            .iter()
+            .filter_map(|(name, monitor)| {
+                monitor
+                    .retry_at
+                    .filter(|at| *at <= Instant::now())
+                    .map(|_| (name.clone(), monitor.delay.saturating_mul(2).min(cap)))
+            })
+            .collect();
+        for (name, delay) in due {
+            self.start_monitor(name, delay);
+        }
+    }
+
     /// The holder's step. Update intake (and the tripwire, which must never wait) and the status write run without the
     /// action lock; the record's decisions, rechecks, re-creation and the first-cycle accounting run only while this
     /// step holds it, which it takes with a single try and lets go before writing the status, so a CLI action waiting
@@ -1115,31 +1596,63 @@ impl Runner {
         while let Ok(message) = self.hold().updates.try_recv() {
             messages.push(message);
         }
-        let epoch = self.hold().monitor_epoch;
         let mut updates = Vec::new();
-        for message in messages.into_iter().filter(|message| message.epoch == epoch) {
+        let initial_delay = self.config.poll_every.min(self.config.recheck_every);
+        for message in messages {
+            let Some(monitor) = self.hold().monitors.get_mut(&message.name) else {
+                continue;
+            };
+            if monitor.epoch != message.epoch {
+                continue;
+            }
             match message.status {
-                Some(status) => updates.push(status),
-                None => {
-                    self.hold().polling = true;
-                    self.hold().recheck_due = true;
+                Some(status) => {
+                    if !matches!(status.state, SyncState::Disconnected(_)) {
+                        monitor.delay = initial_delay;
+                    }
+                    updates.push(status);
                 }
+                None => monitor.retry_at = Some(Instant::now() + monitor.delay),
             }
         }
-        if self.hold().polling && self.hold().last_poll.elapsed() >= self.config.poll_every {
+        let polling = self.hold().monitors.values().any(|m| m.retry_at.is_some());
+        if polling && self.hold().last_poll.elapsed() >= self.config.poll_every {
             self.hold().last_poll = Instant::now();
             match self.deps.engine.status(&sessions::root_labels(&self.project.root)) {
-                Ok(listed) => updates.extend(listed),
+                Ok(listed) => updates.extend(
+                    listed
+                        .into_iter()
+                        .filter(|s| self.hold().monitors.get(&s.name).is_some_and(|m| m.retry_at.is_some())),
+                ),
                 Err(error) => self.hold().notice = Some(format!("sync status is unavailable: {error}")),
             }
         }
         for status in updates {
             self.take_update(status);
         }
+        self.retry_pause();
         let transition = super::conflicts::try_action_lock(&self.locks)?;
         // Monitor updates can trip the size limit even while a CLI decision owns the transition lock.
         self.follow_record(transition.is_some());
         if transition.is_some() {
+            if self.hold().started && self.hold().record.paused.is_none() {
+                // A folder replaced while the sessions run is paused within a step; a `.git` replaced under a running
+                // replica is judged again (one look, no git run, unless it moved).
+                if !self.folder_refused()
+                    && mirror_identity::git_dir_moved(&self.hold.as_ref().expect("held").record, &self.project.root)
+                {
+                    // Paused at once, before any server round trip and whatever the backoff says: a one-way replica
+                    // writing into a `.git` that is not the recorded one resets what is there, or makes a deleted
+                    // one again before it can be judged.
+                    self.hold_git();
+                    if self.git_retry_due() {
+                        self.ensure_git();
+                        if !self.folder_paused() {
+                            self.start_monitors();
+                        }
+                    }
+                }
+            }
             let recheck = {
                 let hold = self.hold();
                 hold.recheck_due || hold.last_recheck.elapsed() >= self.config.recheck_every
@@ -1147,14 +1660,41 @@ impl Runner {
             if recheck {
                 self.recheck();
             }
-            if self.hold().pending.is_some() {
+            if self.hold().pending.is_some() && self.hold().record.authorized() {
                 self.try_recreate();
             }
+            self.retry_monitors();
             self.finish_first_cycle();
         }
         drop(transition);
         self.publish();
         Ok(())
+    }
+
+    /// While a recorded pause has not been carried out by Mutagen (a pause that failed or timed out), lists this
+    /// project's sessions every `poll_every` and pauses again any still running.
+    fn retry_pause(&mut self) {
+        let every = self.config.poll_every;
+        let hold = self.hold();
+        if !hold.pause_retry || hold.record.paused.is_none() || hold.last_pause_try.elapsed() < every {
+            return;
+        }
+        hold.last_pause_try = Instant::now();
+        let names: Vec<String> = [&hold.record.tree_session, &hold.record.git_session]
+            .into_iter()
+            .flatten()
+            .cloned()
+            .collect();
+        let Ok(listed) = self.deps.engine.status(&sessions::root_labels(&self.project.root)) else {
+            return;
+        };
+        let mut running = false;
+        for status in listed.iter().filter(|status| names.contains(&status.name)) {
+            if !sessions::is_paused(status) && self.deps.engine.pause(&status.name).is_err() {
+                running = true;
+            }
+        }
+        self.hold().pause_retry = running;
     }
 
     fn take_update(&mut self, status: SessionStatus) {
@@ -1189,6 +1729,7 @@ impl Runner {
         );
         if running && self.hold().record.paused.is_some() {
             if let Err(error) = self.deps.engine.pause(&status.name) {
+                self.hold().pause_retry = true;
                 self.line_once(format!("sync could not pause {}: {error}", status.name));
             }
         }
@@ -1219,7 +1760,12 @@ impl Runner {
             }
         }
         self.check_tripwire(&status);
-        if self.hold().polling {
+        if self
+            .hold()
+            .monitors
+            .get(&status.name)
+            .is_some_and(|m| m.retry_at.is_some())
+        {
             self.check_arrived(&status);
         }
         self.hold().tree = Some(status);
@@ -1259,7 +1805,7 @@ impl Runner {
                 match self
                     .deps
                     .helper
-                    .path_sizes(&root, std::slice::from_ref(path), &patterns, 100_000)
+                    .path_sizes(&root, std::slice::from_ref(path), false, &patterns, 100_000)
                 {
                     Ok(response) if response.refusal.is_empty() => response
                         .sizes
@@ -1271,7 +1817,7 @@ impl Runner {
             }
             None => fallback,
         };
-        let text = tripwire::paused_text(&self.project.host, path.as_deref(), bytes);
+        let text = tripwire::paused_text(&self.project.root, &self.project.host, path.as_deref(), bytes);
         self.pause_with(PAUSE_TRIPWIRE, text, path);
     }
 
@@ -1308,6 +1854,10 @@ impl Runner {
             return;
         }
         self.hold().seen = latest.clone();
+        if latest.set_up && !seen.set_up {
+            self.ensure_sessions();
+            return;
+        }
         if latest.accepted_host_key.is_some()
             && latest.accepted_host_key.as_deref() == Some(&self.project.host_key_sha256)
         {
@@ -1329,29 +1879,92 @@ impl Runner {
         self.check_digest();
     }
 
-    /// The effective ignores against the ones the tree session was created with.
+    /// The checks every session start makes before it creates anything: the state home not inside the root, no other
+    /// mirror around or inside it, the folder the record's, the daemon up, and no session of another host key on the
+    /// root. A failure is the notice and a line, as at a start.
+    fn may_start_sessions(&mut self) -> bool {
+        let root = self.project.root.clone();
+        let refusal = state_inside(&self.config.state_home, &root)
+            .or_else(|| match mirror_identity::overlapping(&self.store, &root) {
+                Ok(found) => found,
+                Err(why) => Some(why),
+            })
+            .or_else(|| {
+                self.deps
+                    .engine
+                    .start()
+                    .err()
+                    .map(|error| format!("sync stopped: {error}"))
+            });
+        if let Some(why) = refusal {
+            self.hold().notice = Some(why.clone());
+            self.line_once(why);
+            return false;
+        }
+        if self.folder_refused() {
+            return false;
+        }
+        let key = self.hold().key.clone();
+        match sessions::terminate_other_keys(self.deps.engine.as_ref(), &key, &root) {
+            Ok(terminated) => {
+                for name in terminated {
+                    self.line(format!(
+                        "stopped sync session {name}: it synced {} with another server",
+                        root.display()
+                    ));
+                }
+                true
+            }
+            Err(error) => {
+                let text = format!("sync stopped: {error}");
+                self.hold().notice = Some(text.clone());
+                self.line_once(text);
+                false
+            }
+        }
+    }
+
+    /// The effective ignores against the ones the tree session was created with. A holder that started under a
+    /// tripwire pause has not fetched the server's ignores yet; it fetches them here, since an exclude that leaves the
+    /// tripped path on the server ends that pause through the re-creation this starts.
     fn check_digest(&mut self) {
+        if self.key_moved() == KeyLook::Paused {
+            return;
+        }
+        let tripped = |record: &SyncRecord| record.paused.as_ref().is_some_and(|p| p.reason == PAUSE_TRIPWIRE);
+        if self.hold().translated.is_none() && tripped(&self.hold().record) && self.hold().record.authorized() {
+            // This holder never ran the start's checks; a re-creation must not skip them.
+            if !self.may_start_sessions() {
+                return;
+            }
+            let Some(translated) = self.fetch_ignores() else { return };
+            self.hold().translated = Some(translated);
+        }
         let Some(translated) = self.hold().translated.clone() else {
             return;
         };
         let patterns = ignores::effective(&translated, &self.hold().record);
-        if digest(&patterns) != self.hold().record.ignore_digest
-            && self.hold().record.tree_session.is_some()
-            && self.hold().pending.is_none()
+        let hold = self.hold();
+        // A restart may see the replacement session before its digest was recorded. Keep its accounting
+        // until the first cycle, unless a paused transfer needs an exclusion to make progress.
+        if digest(&patterns) != hold.record.ignore_digest
+            && hold.record.tree_session.is_some()
+            && hold.pending.is_none()
+            && (hold.awaiting.is_none() || hold.record.paused.is_some())
         {
             self.set_pending(Why::IgnoresChanged);
         }
     }
 
     /// The server's ignores, its git config and the mode keeper's lines, asked again; a start that did not complete
-    /// is tried again, and a monitor stream that ended is started again.
+    /// is tried again. Once started, a listing also checks for sessions lost while this actor was holding.
     fn recheck(&mut self) {
         {
             let hold = self.hold();
             hold.recheck_due = false;
             hold.last_recheck = Instant::now();
         }
-        if self.hold().record.paused.is_some() {
+        if self.key_moved() == KeyLook::Paused || self.hold().record.paused.is_some() {
             return;
         }
         if !self.hold().started {
@@ -1359,8 +1972,45 @@ impl Runner {
             self.ensure_sessions();
             return;
         }
-        if self.hold().polling {
-            self.start_monitors();
+        let labels = sessions::root_labels(&self.project.root);
+        let listed = self.deps.engine.status(&labels).or_else(|_| {
+            // A plain listing cannot start an absent daemon. The engine checks liveness before restarting it.
+            self.deps.engine.start()?;
+            self.deps.engine.status(&labels)
+        });
+        let listed = match listed {
+            Ok(sessions) => sessions,
+            Err(error) => {
+                self.hold().notice = Some(format!("sync status is unavailable: {error}"));
+                return;
+            }
+        };
+        // A WatchModes that failed, or one sent before the session's identifier was known, is sent again: the keeper
+        // keeps only the registered staging directory ready.
+        let staging = self.hold().record.tree_session.clone().and_then(|name| {
+            listed
+                .iter()
+                .find(|s| s.name == name && !s.identifier.is_empty())
+                .map(|s| sessions::staging_name(&s.identifier))
+        });
+        if staging.is_some() && staging != self.hold().modes_sent {
+            self.send_watch_modes();
+        }
+        if let Some(name) = self.hold().record.tree_session.clone() {
+            if !listed.iter().any(|s| s.name == name)
+                && !self.hold().pending.as_ref().is_some_and(|p| p.why == Why::Lost)
+            {
+                self.stop_monitor(&name);
+                self.hold().tree = None;
+                self.set_pending(Why::Lost);
+            }
+        }
+        let git_name = self.hold().record.git_session.clone();
+        let git_missing = !listed.iter().any(|s| Some(&s.name) == git_name.as_ref());
+        if let Some(name) = git_name.filter(|_| git_missing) {
+            self.stop_monitor(&name);
+            self.hold().git = None;
+            self.change(|record| record.git_ready = false);
         }
         if let Some(translated) = self.fetch_ignores() {
             self.hold().notice = None;
@@ -1370,9 +2020,14 @@ impl Runner {
         if let Ok(response) = self.deps.helper.git_config(&self.project.root) {
             let changed = Some(&response.digest) != self.hold().git_digest.as_ref();
             let refused_now = !response.refusal.is_empty() && self.hold().record.git_session.is_some();
-            if changed || refused_now {
-                // Writes the new config, or ends a replica the server no longer allows.
+            let retry = response.refusal.is_empty() && git_missing && self.git_retry_due();
+            if changed || refused_now || retry {
+                // Writes the new config, makes a replica whose creation failed, or ends one the server no longer
+                // allows; a folder replaced meanwhile leaves the sessions paused and unfollowed.
                 self.ensure_git();
+                if !self.folder_paused() {
+                    self.start_monitors();
+                }
             }
         }
         self.show_mode_lines();
@@ -1418,6 +2073,11 @@ impl Runner {
         {
             return;
         }
+        // Not past a key the connection may have moved to: a key that could not be looked at (a master start under
+        // way) waits for the next tick too.
+        if self.key_moved() != KeyLook::Same {
+            return;
+        }
         let waiting = match why {
             Why::IgnoresChanged => "ignore rules changed; applying when idle",
             Why::Lost => "the sync session was lost; re-creating it when idle",
@@ -1444,10 +2104,17 @@ impl Runner {
             return;
         }
         let generation = editors.saves_since(0).0;
+        let Some(translated) = self.fetch_ignores() else { return };
+        let patterns = ignores::effective(&translated, &self.hold().record);
+        self.hold().translated = Some(translated);
+        if let Err(error) = super::mutagen::validate_ignores(&patterns) {
+            self.hold().notice = Some(error.to_string());
+            return;
+        }
         // Flush what the laptop has (not when the person paused it, or nothing runs).
         let tree = self.hold().record.tree_session.clone();
         let paused = self.hold().record.paused.is_some();
-        if let (Some(tree), false) = (&tree, paused) {
+        if let (Some(tree), false) = (&tree, paused || why == Why::Lost) {
             if self.hold().tree.as_ref().is_some_and(|s| s.state != SyncState::Paused) {
                 match self.deps.engine.flush(tree, self.config.flush_cap) {
                     FlushOutcome::Flushed => {}
@@ -1464,7 +2131,7 @@ impl Runner {
         }
         if let Some(tree) = tree {
             // What the old session's monitor still has queued (its last cycle, its end) is not the new session's.
-            self.stop_monitors();
+            self.stop_monitor(&tree);
             if let Err(error) = self.deps.engine.terminate(&tree) {
                 if !self.deps.engine.is_missing(&error) {
                     self.start_monitors();
@@ -1473,13 +2140,34 @@ impl Runner {
                 }
             }
             self.hold().tree = None;
-            self.change(|record| record.tree_session = None);
-            // The git session goes on being followed meanwhile.
-            self.start_monitors();
+            if self.hold().record.set_up {
+                self.change(|record| record.tree_session = None);
+            }
         }
-        let Some(translated) = self.fetch_ignores() else { return };
-        let patterns = ignores::effective(&translated, &self.hold().record);
-        self.hold().translated = Some(translated);
+        // Changed patterns restart the helper's mode keeper, whose first walk takes the modes it finds: registered
+        // now, with the old session ended and the new one not yet made, that walk sees no sync write. Asked again
+        // while the keeper has not settled (each answer waits a few seconds on the server), a bounded number of
+        // times; the trees are listed and the save check made after it, so the session is made from what holds then.
+        // The new session's staging name follows after the create, a change the running keeper takes in place.
+        if patterns != self.hold().patterns {
+            let staging = self.hold().modes_sent.clone().unwrap_or_default();
+            let mut asked = 1;
+            while self.register_modes(&patterns, staging.clone()) == Registered::Settling {
+                if self.stopping() {
+                    return;
+                }
+                if asked == MODES_SETTLE_ASKS {
+                    self.line_once(format!(
+                        "file modes on {}: the mode keeper was not ready for {} when sync started again; files sync \
+                         writes first may keep the mode Mutagen gives them",
+                        self.project.host,
+                        self.project.root.display()
+                    ));
+                    break;
+                }
+                asked += 1;
+            }
+        }
         let old_patterns = recreate::read_created_patterns(&self.dir).unwrap_or_else(|| patterns.clone());
         let laptop = recreate::list_laptop(
             &root,
@@ -1509,7 +2197,17 @@ impl Runner {
         let key = self.hold().key.clone();
         let name = session_name(&key, Role::Tree);
         let digest = digest(&patterns);
+        let one_sided = recreate::one_sided(&laptop.files, &server);
+        let progress = recreate::Progress {
+            why: why.as_str().into(),
+            one_sided: Some(one_sided.clone()),
+        };
+        if let Err(error) = recreate::write_progress(&self.dir, &progress) {
+            self.line(format!("sync could not note what the re-creation must check: {error}"));
+            return;
+        }
         if !self.create_tree(&name, &patterns, &digest) {
+            self.set_pending(why);
             return;
         }
         // Earlier entries stay while the laptop still holds them and the new rules still leave them out.
@@ -1547,14 +2245,6 @@ impl Runner {
         if tripped_still {
             let _ = self.deps.engine.pause(&name);
         }
-        let one_sided = recreate::one_sided(&laptop.files, &server);
-        let progress = recreate::Progress {
-            why: why.as_str().into(),
-            one_sided: Some(one_sided.clone()),
-        };
-        if let Err(error) = recreate::write_progress(&self.dir, &progress) {
-            self.line(format!("sync could not note what the re-creation must check: {error}"));
-        }
         let hold = self.hold();
         hold.pending = None;
         hold.awaiting = Some(AwaitingFirstCycle { one_sided });
@@ -1567,7 +2257,9 @@ impl Runner {
         self.send_watch_modes();
         // Resumes a replica a tripwire pause held, or makes one when none runs.
         self.ensure_git();
-        self.start_monitors();
+        if !self.folder_paused() {
+            self.start_monitors();
+        }
         self.line(format!("sync with {} was re-created", self.project.host));
     }
 
@@ -1610,6 +2302,7 @@ impl Runner {
         let copied = recreate::copied_back(&awaiting.one_sided, &laptop, &server);
         self.record_copied_back(copied);
         recreate::clear_progress(&self.dir);
+        self.check_digest();
     }
 
     fn record_copied_back(&mut self, copied: Vec<String>) {
@@ -1634,7 +2327,7 @@ impl Runner {
         ));
     }
 
-    /// Writes `status.json` and tells the window when something changed.
+    /// Disk readers and the window each receive changed status, even if one delivery fails.
     fn publish(&mut self) {
         let Some(hold) = &self.hold else { return };
         let mut status = status_file::compose(
@@ -1648,24 +2341,30 @@ impl Runner {
         if hold.pending.is_some() || hold.awaiting.is_some() {
             status.phase = "recreating".into();
         }
-        if hold
+        let unchanged = hold
             .written
             .as_ref()
-            .is_some_and(|written| same_status(written, &status))
+            .is_some_and(|written| same_status(written, &status));
+        if !unchanged {
+            match status_file::write_status(&self.dir, &status) {
+                Ok(()) => self.hold().written = Some(status.clone()),
+                Err(error) => eprintln!("[sync] {}: status not written: {error}", self.project.root.display()),
+            }
+        }
+        if self
+            .last_status_seen
+            .as_ref()
+            .is_none_or(|seen| !same_status(seen, &status))
         {
-            return;
+            let _ = self.deps.events.send(SyncEvent::Status(status.clone()));
+            self.last_status_seen = Some(status);
         }
-        if let Err(error) = status_file::write_status(&self.dir, &status) {
-            eprintln!("[sync] {}: status not written: {error}", self.project.root.display());
-        }
-        self.hold().written = Some(status.clone());
-        let _ = self.deps.events.send(SyncEvent::Status(status));
     }
 }
 
 /// Refuses a state home inside the project: Eitri's private state and the laptop-only hooks directory would be
 /// synced.
-fn state_inside(state_home: &Path, root: &Path) -> Option<String> {
+pub(crate) fn state_inside(state_home: &Path, root: &Path) -> Option<String> {
     let state = state_home.canonicalize().unwrap_or_else(|_| state_home.to_owned());
     let canonical = root.canonicalize().unwrap_or_else(|_| root.to_owned());
     state.starts_with(&canonical).then(|| {
@@ -1705,6 +2404,41 @@ fn digest(patterns: &[String]) -> String {
 /// A path whose change may change the server's ignores.
 fn touches_ignores(rel: &str) -> bool {
     rel == ".gitignore" || rel.ends_with("/.gitignore")
+}
+
+/// What [`Runner::key_moved`] found.
+#[derive(PartialEq)]
+enum KeyLook {
+    /// The connection shows the project's key, or none to compare.
+    Same,
+    /// It shows another key: the key pause was recorded now.
+    Paused,
+    /// The key could not be looked at (a master start under way).
+    Unknown,
+}
+
+/// What the helper's mode keeper answered a registration.
+#[derive(PartialEq)]
+enum Registered {
+    /// Refused or failed: the line says why.
+    Not,
+    /// Taken, but the keeper had not looked at every change made before it (its first walk still running).
+    Settling,
+    Settled,
+}
+
+/// How many times a registration made before a session is created is asked while the keeper is still settling.
+const MODES_SETTLE_ASKS: u32 = 12;
+
+/// The key pause of a window whose own connection saw the new key: its connection stays pinned to the old one, so
+/// the new key is settled from a window opened again, which reconciles it.
+pub fn key_moved_text(host: &str, old: &str, new: &str, root: &Path) -> String {
+    format!(
+        "the server behind {host} changed its host key from {old} to {new}; sync is paused. This window's connection \
+         stays on the old key: if you expected this, close the windows of {root}, open it again and run eitri host \
+         sync resume in {root}",
+        root = root.display()
+    )
 }
 
 pub fn host_key_text(host: &str, old: &str, new: &str, root: &Path) -> String {
@@ -1752,6 +2486,16 @@ impl EditorState for EditorsRef<'_> {
         }
         (newest, saved)
     }
+}
+
+/// Why no replica runs: the server or this laptop refused one, or the server could not be asked.
+enum GitRefusal {
+    Here(String),
+    Unreachable(String),
+}
+
+fn config_pairs(entries: Vec<agent::remote_client::GitConfigEntry>) -> Vec<(String, String)> {
+    entries.into_iter().map(|entry| (entry.key, entry.value)).collect()
 }
 
 /// Shared by the window's status hand-off: the last status an actor sent, for a late reader.

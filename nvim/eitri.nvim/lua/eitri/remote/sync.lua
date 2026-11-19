@@ -480,9 +480,23 @@ draw = function(s)
         end
       end
     end
+    -- Git in a server terminal helps only with an entry on the server: one this laptop could not send never reached it.
+    local function problem_actions(side)
+      if side == "server" then
+        return ". To proceed, fix the entry on the server, use eitri host sync exclude <path>, or run git in a terminal on "
+          .. shown(st.host)
+      elseif side == "laptop" then
+        return ". To proceed, fix the entry on this laptop or use eitri host sync exclude <path>"
+      end
+      return ". To proceed, fix each entry on the side that reports it or use eitri host sync exclude <path>; for an entry on the server, git in a terminal on "
+        .. shown(st.host) .. " also works"
+    end
+    if (st.problems_more or 0) > 0 then
+      row("And " .. st.problems_more .. " more paths Mutagen could not sync" .. problem_actions(nil))
+    end
     for _, list in ipairs({ st.problems or {}, d.problems or {} }) do
       for _, p in ipairs(list) do
-        row(shown(p.path) .. " (" .. shown(p.side) .. ") · not synced: " .. shown(p.text))
+        row(shown(p.path) .. " (" .. shown(p.side) .. ") · not synced: " .. shown(p.text) .. problem_actions(p.side))
       end
     end
     for _, path in ipairs(st.copied_back or {}) do

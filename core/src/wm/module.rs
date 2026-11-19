@@ -22,7 +22,7 @@ pub enum ModuleState {
 pub enum TermRun {
     NotStarted,
     Running {
-        pid: u32,
+        identity: ShellIdentity,
     },
     Exited,
     /// Its shell was started in the other window of the pair and came here with the move: it runs, and nothing
@@ -369,8 +369,8 @@ impl Lifecycle {
         match event {
             // A shell started, by its `Start` or in place with none (Enter after it ended): a directory kept for
             // the next start is spent, and must not follow a later start into wherever the pane is by then.
-            HostEvent::Terminal(TermEvent::Started { pid, .. }) => {
-                module.terminal = TermRun::Running { pid: *pid };
+            HostEvent::Terminal(TermEvent::Started { identity, .. }) => {
+                module.terminal = TermRun::Running { identity: *identity };
                 module.start_dir = None;
             }
             HostEvent::Terminal(TermEvent::Exited { .. }) => module.terminal = TermRun::Exited,
@@ -691,7 +691,7 @@ mod tests {
             self.driver.post(HostEvent::Terminal(TermEvent::Started {
                 win: WIN,
                 module: module.clone(),
-                pid: 42,
+                identity: crate::wm::ShellIdentity::Local { pid: 42 },
             }));
         }
 
@@ -1027,6 +1027,32 @@ mod tests {
     }
 
     #[test]
+    fn a_server_shell_stays_running_when_the_layout_changes() {
+        let t = terminal("terminal");
+        let d = Driven::hosted(std::slice::from_ref(&t), &[]);
+        let identity = ShellIdentity::Server {
+            generation: 7,
+            terminal_id: 1,
+        };
+        d.driver.post(HostEvent::Terminal(TermEvent::Started {
+            win: WIN,
+            module: t.module.clone(),
+            identity,
+        }));
+        d.changed();
+        d.driver.query(|c| {
+            assert_eq!(
+                c.lifecycle(WIN).unwrap().terminal_run(&t.module),
+                Some(&TermRun::Running { identity })
+            );
+        });
+        assert!(!d
+            .ops()
+            .iter()
+            .any(|op| matches!(op, HostOp::Terminal(TermOp::Start { .. }))));
+    }
+
+    #[test]
     fn a_borrowed_layout_keeps_host_facts_without_lifecycle_effects() {
         let t = terminal("terminal");
         let p = page("plugin", true, false);
@@ -1046,7 +1072,12 @@ mod tests {
         {
             let _borrow = d.layout.borrow_mut();
             d.started(&t.module);
-            assert_eq!(run(), TermRun::Running { pid: 42 });
+            assert_eq!(
+                run(),
+                TermRun::Running {
+                    identity: crate::wm::ShellIdentity::Local { pid: 42 }
+                }
+            );
             d.exited(&t.module);
             assert_eq!(run(), TermRun::Exited);
             d.ended(&t.module, Reopen::At(Placement::BelowEditor));

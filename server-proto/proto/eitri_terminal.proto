@@ -1,0 +1,69 @@
+syntax = "proto3";
+package eitri.server.v1;
+
+// A terminal is a PTY a terminal host owns. One client is attached at a time; a new Attach replaces it.
+service Terminal {
+  rpc OpenTerminal(OpenTerminalRequest) returns (OpenTerminalResponse);
+  rpc Attach(stream TerminalClientFrame) returns (stream TerminalServerFrame);
+  rpc ListTerminals(ListTerminalsRequest) returns (ListTerminalsResponse);
+  rpc CloseTerminal(CloseTerminalRequest) returns (CloseTerminalResponse);
+}
+message TermSize { uint32 columns = 1; uint32 rows = 2; uint32 cell_width = 3; uint32 cell_height = 4; }
+// The pane's colours (eitri_terminal::TerminalColors), for answering colour queries; 0xRRGGBB.
+message TermColors { uint32 background = 1; uint32 foreground = 2; optional uint32 cursor = 3; }
+message OpenTerminalRequest { string command_id = 1; string cwd = 2; TermSize size = 3; TermColors colors = 4; }
+message OpenTerminalResponse { string terminal_id = 1; string daemon_instance = 2; }
+message TerminalClientFrame {
+  oneof frame {
+    AttachHello hello = 1;     // first frame, exactly once
+    InputBytes input = 2;      // encoded keys, pastes, mouse and focus reports
+    TermSize resize = 3;
+    TermColors colors = 4;
+  }
+}
+message AttachHello { string terminal_id = 1; string client_id = 2; uint64 input_sent = 3; TermSize size = 4; TermColors colors = 5; }
+message InputBytes { uint64 offset = 1; bytes data = 2; }    // offset of data[0] in this client's input; at most 64 KiB
+message TerminalServerFrame {
+  oneof frame {
+    SnapshotPart snapshot = 1;  // one snapshot = parts until last = true; nothing else between them
+    OutputBytes output = 2;
+    Resized resized = 3;
+    InputWritten input_written = 4;
+    TerminalExited exited = 5;
+    Detached detached = 6;      // replaced by another client, closed, or stopped
+    Waiting waiting = 7;        // the snapshot is deferred, and why
+  }
+}
+message SnapshotPart {
+  uint64 offset = 1;            // stream offset the snapshot stands at
+  uint32 columns = 2; uint32 rows = 3;
+  uint64 total_bytes = 4;       // the whole replay's length, announced in every part
+  bytes replay = 5;             // this part's slice of ScreenReplay.bytes, at most 1 MiB
+  bool last = 6;
+  // On the last part only:
+  optional uint32 last_input = 7;   // ScreenReplay.last_input as a Unicode scalar
+  TailKind tail_kind = 8; bytes tail = 9; uint32 tail_calls = 10;
+  bool history_at_cap = 11;     // the history is full: older lines are gone
+  uint32 history_trimmed = 12;  // lines left out to fit the snapshot's byte cap
+  bool output_while_detached = 13;
+  uint64 input_written = 14;    // bytes of this client id's input written to the PTY, over all its attachments
+}
+enum TailKind { TAIL_KIND_NONE = 0; TAIL_KIND_READ_AHEAD = 1; TAIL_KIND_RAW = 2; }
+message OutputBytes { uint64 offset = 1; bytes data = 2; }   // offset of data[0]; at most 64 KiB
+message Resized { uint64 offset = 1; TermSize size = 2; }
+message InputWritten { uint64 upto = 1; }
+message TerminalExited { optional int32 code = 1; optional int32 signal = 2; bool left = 3; }
+message Detached { DetachReason reason = 1; }
+enum DetachReason { DETACH_REASON_UNSPECIFIED = 0; DETACH_REASON_REPLACED = 1; DETACH_REASON_CLOSED = 2; DETACH_REASON_STOPPED = 3; }
+message Waiting { WaitReason reason = 1; }
+// SNAPSHOT_TOO_LARGE: the visible grid alone exceeds the snapshot's byte cap; it is retried on a resize or new output.
+enum WaitReason { WAIT_REASON_UNSPECIFIED = 0; WAIT_REASON_OPEN_SEQUENCE = 1; WAIT_REASON_TOO_DEEP = 2; WAIT_REASON_SNAPSHOT_TOO_LARGE = 3; }
+message ListTerminalsRequest {}
+message TerminalInfo {
+  string terminal_id = 1; string start_dir = 2; string cwd = 3; uint32 pid = 4; uint64 started_unix_ms = 5;
+  bool alive = 6; TerminalExited exit = 7; bool attached = 8; uint64 detached_since_unix_ms = 9;
+  optional bool foreground_job = 10; string foreground_name = 11; TermSize size = 12; string open_command_id = 13;
+}
+message ListTerminalsResponse { repeated TerminalInfo terminals = 1; bool truncated = 2; }
+message CloseTerminalRequest { string terminal_id = 1; string command_id = 2; }
+message CloseTerminalResponse { TerminalExited exit = 1; }

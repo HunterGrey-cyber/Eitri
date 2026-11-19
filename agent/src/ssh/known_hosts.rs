@@ -59,6 +59,7 @@ fn record(args: &[OsString]) -> io::Result<()> {
         .and_then(OsStr::to_str)
         .filter(|name| {
             name.strip_prefix("kh-")
+                .map(|id| id.strip_suffix(super::master::TERMINAL_SUFFIX).unwrap_or(id))
                 .is_some_and(|id| id.len() == 16 && id.bytes().all(|byte| byte.is_ascii_hexdigit()))
         })
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "invalid host-key record name"))?;
@@ -132,6 +133,28 @@ mod tests {
                     }
                 );
                 assert_eq!(probe_main(&[]), 1);
+                // The terminals' master records under its own name; nothing else past the id is a record.
+                let observe = |name: &str| {
+                    probe_main(&[
+                        dir.join(name).into(),
+                        "key-alias".into(),
+                        "ssh-ed25519".into(),
+                        "SHA256:example".into(),
+                    ])
+                };
+                assert_eq!(observe("kh-0123456789abcdef-t"), 0);
+                assert_eq!(
+                    read_key(&dir.join("kh-0123456789abcdef-t")).unwrap().sha256,
+                    "SHA256:example"
+                );
+                for name in [
+                    "kh-0123456789abcdef-x",
+                    "kh-0123456789abcdef-t-t",
+                    "kh-0123456789abcde-t",
+                ] {
+                    assert_eq!(observe(name), 1, "{name}");
+                    assert!(!dir.join(name).exists(), "{name}");
+                }
             },
         );
     }

@@ -48,6 +48,27 @@ pub fn probe_with(launcher: &dyn ChannelLauncher) -> Result<ProbeReport, Install
     Ok(report)
 }
 
+/// Runs the installed helper's probe over a channel attached under the verified key.
+pub fn root_probe(
+    launcher: &dyn ChannelLauncher,
+    helper: &std::path::Path,
+    key: &str,
+    root: &std::path::Path,
+) -> Result<ProbeReport, InstallError> {
+    let hex = agent::ssh::encode_args(&[root.as_os_str()]);
+    let child = {
+        let _guard = launcher.hold_host_key(key)?;
+        super::install::attached(
+            launcher.spawn_step(super::steps::ROOT_PROBE, &[super::install::checked_path(helper)?, &hex])?,
+        )?
+    };
+    let bytes = super::install::communicate(child, &[], &|_, _| {})?;
+    ProbeReport::parse(
+        std::str::from_utf8(&bytes).map_err(|_| InstallError::Invalid("the root probe is not UTF-8".into()))?,
+    )
+    .map_err(InstallError::Invalid)
+}
+
 #[cfg(test)]
 pub(crate) fn fixture(root: &std::path::Path) -> ProbeReport {
     ProbeReport {
@@ -66,6 +87,8 @@ pub(crate) fn fixture(root: &std::path::Path) -> ProbeReport {
         gzip: true,
         root: agent::ssh::RootState::Missing,
         sync_marker: None,
+        sync_excluded: None,
+        sync_ignore_line: None,
     }
 }
 

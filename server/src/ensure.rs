@@ -406,11 +406,13 @@ mod tests {
     }
 }
 
-/// Removal must preserve every surviving agent's adoption records, even without a live daemon.
+/// Removal must preserve every surviving agent's and terminal host's adoption records, even without a live daemon.
 pub(crate) fn check_sidecars_stopped(run: &Path) -> io::Result<()> {
-    let runs = sidecar_runs(run, false)?;
+    let (runs, terminals) = sidecar_runs(run, false)?;
     if runs.is_empty() {
         Ok(())
+    } else if terminals {
+        Err(io::Error::other("recorded sidecars or terminal hosts may still run"))
     } else {
         Err(io::Error::other("recorded sidecars may still run"))
     }
@@ -418,20 +420,22 @@ pub(crate) fn check_sidecars_stopped(run: &Path) -> io::Result<()> {
 
 /// Read-only inventory; no ensure, installation touch or garbage collection is performed here.
 pub(crate) fn live_sidecar_runs(run: &Path) -> io::Result<()> {
-    for value in sidecar_runs(run, true)? {
+    for value in sidecar_runs(run, true)?.0 {
         println!("{value}");
     }
     Ok(())
 }
 
-fn sidecar_runs(run: &Path, recovery: bool) -> io::Result<Vec<serde_json::Value>> {
+/// The runs with refusing records, and whether a terminal host's record is among them.
+fn sidecar_runs(run: &Path, recovery: bool) -> io::Result<(Vec<serde_json::Value>, bool)> {
     use std::os::unix::fs::OpenOptionsExt;
     let entries = match std::fs::read_dir(run) {
         Ok(entries) => entries,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok((Vec::new(), false)),
         Err(error) => return Err(error),
     };
     let mut refusing = Vec::new();
+    let mut terminals = false;
     for entry in entries {
         let entry = entry?;
         if !entry.file_type()?.is_dir() {
@@ -442,9 +446,11 @@ fn sidecar_runs(run: &Path, recovery: bool) -> io::Result<Vec<serde_json::Value>
         if records.is_empty() {
             continue;
         }
+        terminals |= records.iter().any(|record| record.kind == "terminal");
         for record in &records {
             eprintln!(
-                "run {key} sidecar {} pid {} {}{}",
+                "run {key} {} {} pid {} {}{}",
+                record.kind,
                 record.id,
                 record
                     .pid
@@ -495,5 +501,5 @@ fn sidecar_runs(run: &Path, recovery: bool) -> io::Result<Vec<serde_json::Value>
             "installation": published.as_ref().and_then(|published| published.installation.as_ref()),
         }));
     }
-    Ok(refusing)
+    Ok((refusing, terminals))
 }

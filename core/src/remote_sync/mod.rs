@@ -4,12 +4,16 @@ pub mod actor;
 pub mod conflicts;
 pub mod daemon;
 pub mod engine;
+pub mod flush;
 pub mod git_replica;
 pub mod git_shim;
 pub mod ignores;
 pub mod local_git;
+pub mod local_path;
+pub mod mirror_identity;
 pub mod mutagen;
 pub mod mutagen_json;
+pub mod other_sync;
 pub mod quiet;
 pub mod recreate;
 pub mod sessions;
@@ -105,5 +109,91 @@ mod tests {
             SyncKey::new("SHA256:example", raw).as_str(),
             &format!("{expected:x}")[..16]
         );
+    }
+}
+
+/// Ways to proceed when a tree entry cannot be synchronized, by the side that reports it (`None` when the sync tool
+/// counted entries without naming them). Fixing the entry or excluding its path settles either side. Git in a server
+/// terminal helps only with an entry on the server: an entry this laptop could not send never reached the server, so
+/// git there would act without it.
+pub fn problem_actions(side: Option<engine::Side>, host: &str) -> String {
+    match side {
+        Some(engine::Side::Server) => format!(
+            "fix the entry on the server, use eitri host sync exclude <path>, or run git in a terminal on {host}"
+        ),
+        Some(engine::Side::Laptop) => "fix the entry on this laptop or use eitri host sync exclude <path>".to_owned(),
+        None => format!(
+            "fix each entry on the side that reports it or use eitri host sync exclude <path>; for an entry on the \
+             server, git in a terminal on {host} also works"
+        ),
+    }
+}
+
+/// [`problem_actions`] for a side as the status file spells it (`laptop` or `server`).
+pub fn problem_actions_for(side: &str, host: &str) -> String {
+    problem_actions(
+        match side {
+            "laptop" => Some(engine::Side::Laptop),
+            "server" => Some(engine::Side::Server),
+            _ => None,
+        },
+        host,
+    )
+}
+
+/// `text` as it may go to a terminal: every control character (C0, DEL, C1), bidirectional
+/// control and line or paragraph separator written as `\u{..}`. Lines about a remote project carry server file names
+/// and server-side messages, which anyone able to write files on the server chooses; raw, an escape sequence among
+/// them would be read by the person's terminal (a clipboard write, a window title, cursor moves). A newline is escaped
+/// too, so a server name can never start a line of its own; Eitri's own messages that need several lines say each line
+/// separately.
+pub fn terminal_text(text: &str) -> String {
+    let mut shown = String::with_capacity(text.len());
+    for c in text.chars() {
+        if crate::agent_bridge::is_control_like(c) {
+            shown.extend(c.escape_unicode());
+        } else {
+            shown.push(c);
+        }
+    }
+    shown
+}
+
+/// A JSON document as it may go to a terminal: every control-like character (see [`terminal_text`]) written as a JSON
+/// `\uXXXX` escape. serde_json escapes only C0 controls, `"` and `\`, so a C1 control (CSI, OSC), DEL, a bidirectional
+/// control or a line separator in a server file name would otherwise reach the terminal raw when `--json` output is
+/// read by a person. Compact JSON holds such characters only inside strings, and each is in the Basic Multilingual
+/// Plane, so the document stays valid and decodes to the same values.
+pub fn terminal_json(document: &str) -> String {
+    let mut shown = String::with_capacity(document.len());
+    for c in document.chars() {
+        if crate::agent_bridge::is_control_like(c) {
+            shown.push_str(&format!("\\u{:04x}", u32::from(c)));
+        } else {
+            shown.push(c);
+        }
+    }
+    shown
+}
+
+#[cfg(test)]
+mod terminal_text_tests {
+    #[test]
+    fn terminal_json_escapes_controls_inside_strings_and_round_trips() {
+        let value = serde_json::json!({"path": "a\u{9b}2Jb\u{9d}0;t\u{7}c\u{202e}d\u{2028}e\u{7f}f\ng\u{61c}"});
+        let shown = super::terminal_json(&serde_json::to_string(&value).unwrap());
+        assert!(!shown.chars().any(crate::agent_bridge::is_control_like), "{shown:?}");
+        assert!(shown.contains("\\u009b2J") && shown.contains("\\u202e"), "{shown}");
+        assert_eq!(serde_json::from_str::<serde_json::Value>(&shown).unwrap(), value);
+    }
+
+    #[test]
+    fn terminal_text_keeps_an_untrusted_message_on_one_line() {
+        let shown = super::terminal_text("a\u{1b}]52;c;eA==\u{7}b\u{9b}2J\u{202e}c\u{7f}\r\n\td");
+        assert_eq!(
+            shown,
+            "a\\u{1b}]52;c;eA==\\u{7}b\\u{9b}2J\\u{202e}c\\u{7f}\\u{d}\\u{a}\\u{9}d"
+        );
+        assert_eq!(super::terminal_text("plain line: ok"), "plain line: ok");
     }
 }

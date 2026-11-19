@@ -153,7 +153,7 @@ impl T {
         self.driver.post(HostEvent::Terminal(TermEvent::Started {
             win: WIN,
             module: terminal(),
-            pid,
+            identity: crate::wm::ShellIdentity::Local { pid },
         }));
     }
 
@@ -391,7 +391,12 @@ fn an_exited_shell_restarted_in_place_spends_the_dir_and_a_later_start_gets_none
     let mark = t.ops().len();
     t.started(4200);
     assert!(terminal_ops(&t.since(mark)).is_empty(), "{:#?}", t.since(mark));
-    assert_eq!(t.run(), Some(TermRun::Running { pid: 4200 }));
+    assert_eq!(
+        t.run(),
+        Some(TermRun::Running {
+            identity: crate::wm::ShellIdentity::Local { pid: 4200 }
+        })
+    );
     let shown = killed_and_shown(&t);
     assert!(
         !shown
@@ -578,7 +583,12 @@ fn an_idle_job_elsewhere_respawns_and_answers_restarted_once_started() {
     t.started(4101);
     assert_eq!(t.answers(), vec![(13, TerminalAtAnswer::Restarted)]);
     assert_eq!(t.state(), (vec![], None));
-    assert_eq!(t.run(), Some(TermRun::Running { pid: 4101 }));
+    assert_eq!(
+        t.run(),
+        Some(TermRun::Running {
+            identity: crate::wm::ShellIdentity::Local { pid: 4101 }
+        })
+    );
     assert!(t.shown(), "the terminal stays where it was");
 }
 
@@ -672,7 +682,9 @@ fn an_exited_while_pending_restart_stands_is_held_and_dropped_when_started_follo
     assert!(t.since(mark).is_empty(), "{:#?}", t.since(mark));
     assert_eq!(
         t.run(),
-        Some(TermRun::Running { pid: 4100 }),
+        Some(TermRun::Running {
+            identity: crate::wm::ShellIdentity::Local { pid: 4100 }
+        }),
         "a held end is not recorded"
     );
     assert!(t.state().1.unwrap().held.is_some());
@@ -687,7 +699,12 @@ fn an_exited_while_pending_restart_stands_is_held_and_dropped_when_started_follo
         "{:#?}",
         t.since(mark)
     );
-    assert_eq!(t.run(), Some(TermRun::Running { pid: 4101 }));
+    assert_eq!(
+        t.run(),
+        Some(TermRun::Running {
+            identity: crate::wm::ShellIdentity::Local { pid: 4101 }
+        })
+    );
     assert!(t.notes().iter().any(|n| n.contains("dropped")), "{:?}", t.notes());
     assert_eq!(t.state(), (vec![], None));
 }
@@ -830,7 +847,7 @@ fn the_batch_for_a_restart_holds_respawn_and_no_layout_focus_or_surface_op() {
     r.controller.handle(HostEvent::Terminal(TermEvent::Started {
         win: WIN,
         module: terminal(),
-        pid: 4100,
+        identity: crate::wm::ShellIdentity::Local { pid: 4100 },
     }));
     let (taken, read) = r.controller.plugin_terminal_at(WIN, PLUGIN, DIR.into(), 1);
     assert_eq!(taken, Ok(()));
@@ -865,7 +882,7 @@ fn the_batch_for_a_restart_holds_respawn_and_no_layout_focus_or_surface_op() {
     let batch = r.controller.handle(HostEvent::Terminal(TermEvent::Started {
         win: WIN,
         module: terminal(),
-        pid: 4101,
+        identity: crate::wm::ShellIdentity::Local { pid: 4101 },
     }));
     assert!(crate::wm::verbs::rig::moves(&batch).is_empty());
     assert!(!batch.ops().any(|op| matches!(
@@ -949,4 +966,43 @@ fn a_request_while_a_restart_waits_or_with_no_terminal_is_refused_now() {
     let mark = t.ops().len();
     assert_eq!(t.at(DIR, 31), Err(NO_TERMINAL_TEXT.to_string()));
     assert!(t.since(mark).is_empty());
+}
+
+#[test]
+fn respawn_of_a_server_terminal_opens_in_its_server_cwd() {
+    let t = driven(two());
+    let identity = crate::wm::ShellIdentity::Server {
+        generation: 7,
+        terminal_id: 1,
+    };
+    t.driver.post(HostEvent::Terminal(TermEvent::Started {
+        win: WIN,
+        module: terminal(),
+        identity,
+    }));
+    t.host.set_shell(
+        WIN,
+        terminal(),
+        Some(FakeShell {
+            shell: ShellStart::identified(1, Some(identity)),
+            cwd: Ok("/srv/project".into()),
+            busy: false,
+        }),
+    );
+    let before = t.ops().len();
+    t.at("/srv/other", 30).unwrap();
+    assert_eq!(t.answers(), [(30, TerminalAtAnswer::Restarted)]);
+    let now = t.host.shell(WIN, &terminal()).unwrap();
+    assert_eq!(now.cwd, Ok(PathBuf::from("/srv/other")));
+    assert_eq!(
+        now.shell.identity,
+        Some(crate::wm::ShellIdentity::Server {
+            generation: 8,
+            terminal_id: 1,
+        })
+    );
+    assert!(!t
+        .since(before)
+        .iter()
+        .any(|op| matches!(op, HostOp::Terminal(TermOp::Start { .. } | TermOp::HangUp { .. }))));
 }

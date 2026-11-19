@@ -1,6 +1,7 @@
 import { StrictMode } from "react";
 import { createRoot } from "react-dom/client";
 import App from "./App";
+import { RemoteProjectChooser } from "./RemoteProjectChooser";
 import { PanelErrorBoundary } from "./components/PanelErrorBoundary";
 import "./index.css";
 
@@ -21,7 +22,7 @@ createRoot(container).render(
         </div>
       )}
     >
-      <App />
+      {window.location.pathname === "/open-on-host" ? <RemoteProjectChooser /> : <App />}
     </PanelErrorBoundary>
   </StrictMode>,
 );

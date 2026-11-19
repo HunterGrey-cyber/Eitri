@@ -63,13 +63,7 @@ impl SyncIgnores {
         })
         .await
         .unwrap_or_else(|_| Err("ignore discovery exceeded its 10 s deadline".into()));
-        match result {
-            Ok(response) => response,
-            Err(refusal) => SyncIgnoresResponse {
-                refusal,
-                ..Default::default()
-            },
-        }
+        bounded_response(result)
     }
 }
 
@@ -611,6 +605,21 @@ fn answer(translated: Translated, tracked_ignored: Vec<String>, mut problems: Ve
     }
 }
 
+fn bounded_response(result: Result<SyncIgnoresResponse, String>) -> SyncIgnoresResponse {
+    let response = result.unwrap_or_else(|refusal| SyncIgnoresResponse {
+        refusal,
+        ..Default::default()
+    });
+    // All repeated strings and their wire framing count toward the laptop's decode limit.
+    if prost::Message::encoded_len(&response) > 7 * 512 * 1024 {
+        return SyncIgnoresResponse {
+            refusal: "the sync ignore response is too large (over 3.5 MiB)".into(),
+            ..Default::default()
+        };
+    }
+    response
+}
+
 fn check_tracked_count(count: usize) -> Result<(), String> {
     if count > 10_000 {
         Err(format!("{count} tracked-but-ignored paths exceed the limit of 10000"))
@@ -673,6 +682,18 @@ mod name_tests {
         );
         assert_eq!(forced, vec!["/dir/bad?name".to_owned()]);
         assert_eq!(problems.len(), 1);
+    }
+
+    #[test]
+    fn oversized_ignore_answer_refuses_before_transport() {
+        let response = bounded_response(Ok(answer(
+            Translated::new(vec![], vec![]),
+            vec!["a".repeat(4096); 1024],
+            vec![],
+        )));
+        assert!(bounded_response(Err("e".repeat(4 << 20))).refusal.contains("too large"));
+        assert!(response.refusal.contains("too large"), "expected a size refusal");
+        assert!(response.tracked_ignored.is_empty() && response.patterns.is_empty() && response.digest.is_empty());
     }
 
     #[test]

@@ -187,6 +187,10 @@ pub fn read_created_patterns(sync_dir: &Path) -> Option<Vec<String>> {
 
 pub fn write_created_patterns(sync_dir: &Path, patterns: &[String]) -> io::Result<()> {
     use std::io::Write;
+    #[cfg(test)]
+    if test_failures::UNWRITABLE.lock().unwrap().contains(sync_dir) {
+        return Err(io::Error::other("the disk is full"));
+    }
     let bytes = serde_json::to_vec(patterns).map_err(io::Error::other)?;
     let temporary = sync_dir.join(format!(".ignores-{}.tmp", uuid::Uuid::new_v4()));
     let written = (|| {
@@ -201,9 +205,16 @@ pub fn write_created_patterns(sync_dir: &Path, patterns: &[String]) -> io::Resul
     written
 }
 
+/// Tests make the ignore list's write fail for one sync directory while the old list stays readable.
+#[cfg(test)]
+pub(crate) mod test_failures {
+    pub(crate) static UNWRITABLE: std::sync::LazyLock<std::sync::Mutex<std::collections::HashSet<std::path::PathBuf>>> =
+        std::sync::LazyLock::new(Default::default);
+}
+
 /// A re-creation in progress, kept in the sync directory (`recreate.json`, 0600) so a holder that lets go (window
-/// closed, watch handing over, a crash) leaves it to the next one: `why` it started, and after the new session was
-/// created the files that were on one side only, which the first cycle's accounting needs.
+/// closed, watch handing over, a crash) leaves it to the next one: `why` it started, and, before creating the replacement, the files
+/// then on one side only. The first cycle's accounting needs that listing even if the creator exits.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Progress {
     pub why: String,

@@ -32,7 +32,7 @@ impl Reach for FakeReach {
     fn agents(&mut self, _host: &str, _key: &str, _helper: &Path) -> Result<Vec<Agent>, String> {
         unreachable!()
     }
-    fn sync_engine(&mut self) -> Result<Arc<dyn SyncEngine>, String> {
+    fn sync_engine(&mut self) -> Result<Arc<dyn SyncEngine>, crate::remote_sync::SyncError> {
         Ok(self.engine.clone())
     }
     fn sync_helper(&mut self, _project: &RemoteProject) -> Result<Arc<dyn SyncHelper>, String> {
@@ -45,9 +45,15 @@ struct Term {
     said: Vec<String>,
     answers: VecDeque<bool>,
     asked: Vec<String>,
+    cancelled: Option<Arc<std::sync::atomic::AtomicBool>>,
 }
 
 impl Terminal for Term {
+    fn cancelled(&self) -> bool {
+        self.cancelled
+            .as_ref()
+            .is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Acquire))
+    }
     fn say(&mut self, line: &str) {
         self.said.push(line.to_owned());
     }
@@ -115,17 +121,89 @@ fn verbs_find_the_project_from_the_path_and_refuse_outside_any() {
         term.said
     );
     let mut term = Term::default();
+    let mut output = Vec::new();
     assert_eq!(
-        run(
+        run_io(
             &lab,
             &mut term,
             Path::new("/"),
-            &["status", "--json", lab.root.to_str().unwrap()]
+            &["status", "--json", lab.root.to_str().unwrap()],
+            b"",
+            &mut output
         ),
         0
     );
-    let json: serde_json::Value = serde_json::from_str(&term.said[0]).unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&output).unwrap();
     assert_eq!(json["host"], "example-host");
+}
+
+#[test]
+fn json_inspection_escapes_terminal_controls_and_round_trips() {
+    use crate::agent_bridge::is_control_like;
+    use crate::remote_sync::status_schema::{ConflictEntry, ProblemEntry};
+    let (lab, _lock) = conflict_fixture(Lab::new());
+    let dir = actor::project_dir(&lab.state, &lab.project());
+    let mut status = status_file::read_status_file(&dir).unwrap();
+    let name = "a\u{9b}2Jb\u{9d}0;t\u{7}c\u{202e}d\u{2028}e\u{7f}f\ng";
+    status.conflicts.push(ConflictEntry {
+        path: name.into(),
+        laptop_kind: "file".into(),
+        server_kind: "file".into(),
+    });
+    status.problems.push(ProblemEntry {
+        path: name.into(),
+        side: "server".into(),
+        text: "\u{9b}2J".into(),
+    });
+    status_file::write_status(&dir, &status).unwrap();
+    for (verb, pointer) in [("status", "/conflicts"), ("conflicts", "")] {
+        let mut output = Vec::new();
+        let mut term = Term::default();
+        assert_eq!(
+            run_io(&lab, &mut term, &lab.root, &[verb, "--json"], b"", &mut output),
+            0
+        );
+        let text = String::from_utf8(output).unwrap();
+        let body = text.strip_suffix('\n').unwrap();
+        assert!(!body.chars().any(is_control_like), "{verb}: {body:?}");
+        let json: serde_json::Value = serde_json::from_str(body).unwrap();
+        let listed = json.pointer(pointer).unwrap().as_array().unwrap();
+        assert!(listed.iter().any(|c| c["path"] == name), "{verb}: {json}");
+    }
+    let line = event_json(&SyncEvent::Line(name.into()));
+    assert!(!line.chars().any(is_control_like), "{line:?}");
+    assert_eq!(serde_json::from_str::<serde_json::Value>(&line).unwrap()["text"], name);
+}
+
+#[test]
+fn human_status_names_problem_actions() {
+    let (lab, _lock) = conflict_fixture(Lab::new());
+    let dir = actor::project_dir(&lab.state, &lab.project());
+    let mut status = status_file::read_status_file(&dir).unwrap();
+    status.problems.push(crate::remote_sync::status_schema::ProblemEntry {
+        path: "entry".into(),
+        side: "server".into(),
+        text: "permission denied".into(),
+    });
+    status.problems.push(crate::remote_sync::status_schema::ProblemEntry {
+        path: "unreadable".into(),
+        side: "laptop".into(),
+        text: "permission denied".into(),
+    });
+    status_file::write_status(&dir, &status).unwrap();
+    let mut term = Term::default();
+    assert_eq!(run(&lab, &mut term, &lab.root, &["status"]), 0);
+    assert!(term.said.iter().any(|s| s.contains("not synced: entry")
+        && s.contains("fix the entry on the server")
+        && s.contains("eitri host sync exclude <path>")));
+    // The server never received a laptop-side entry: neither the server nor its git can help with it.
+    let laptop = term.said.iter().find(|s| s.contains("not synced: unreadable")).unwrap();
+    assert!(laptop.contains("fix the entry on this laptop"), "{laptop}");
+    assert!(laptop.contains("eitri host sync exclude <path>"), "{laptop}");
+    assert!(
+        !laptop.contains("on the server") && !laptop.contains("terminal on"),
+        "{laptop}"
+    );
 }
 
 #[test]
@@ -193,6 +271,23 @@ fn resume_asks_and_accepts_a_changed_host_key() {
     assert_eq!(lab.record().paused, None);
 }
 
+/// A host-key pause whose record already has the project's key (an open window saw another key; no window has
+/// settled it yet) names no key it cannot know: the plain question, and no key is accepted.
+#[test]
+fn resume_of_a_key_pause_this_machine_has_not_settled_names_no_key() {
+    let lab = Lab::new();
+    lab.update_record(|r| r.paused = Some(pause(PAUSE_HOST_KEY, None)));
+    let mut term = Term {
+        answers: VecDeque::from([true]),
+        ..Default::default()
+    };
+    assert_eq!(run(&lab, &mut term, &lab.root, &["resume"]), 0);
+    assert!(!term.asked[0].contains("now shows"), "{}", term.asked[0]);
+    assert!(!term.asked[0].contains("re-created"), "{}", term.asked[0]);
+    let record = lab.record();
+    assert_eq!((record.paused, record.accepted_host_key), (None, None));
+}
+
 #[test]
 fn flush_runs_the_engine_flush_of_the_tree_session() {
     let lab = Lab::new();
@@ -255,6 +350,18 @@ fn report_lines_parse_and_cannot_tell_is_null() {
     assert_eq!(parse_report("not json"), None);
     let line: serde_json::Value = serde_json::from_str(&event_json(&SyncEvent::Line("sync paused: x".into()))).unwrap();
     assert_eq!(line, serde_json::json!({"type": "line", "text": "sync paused: x"}));
+}
+
+#[test]
+fn changing_sync_settings_never_sets_up_a_project() {
+    let lab = Lab::new();
+    lab.store.update(&lab.root, |p| p.sync = None).unwrap();
+    for args in [&["exclude", "file"][..], &["include", "file"], &["allow"], &["resume"]] {
+        let mut term = Term::default();
+        assert_eq!(run(&lab, &mut term, &lab.root, args), 1);
+        assert!(term.said.last().unwrap().contains(&lab.project().sync_not_set_up()));
+        assert!(lab.project().sync.is_none());
+    }
 }
 
 #[test]
@@ -751,4 +858,169 @@ fn a_linked_directory_below_the_root_is_never_followed() {
         );
     }
     assert_eq!(std::fs::read(elsewhere.join("file")).unwrap(), b"not the project's");
+}
+
+#[test]
+fn exclude_and_include_refuse_control_characters() {
+    for rel in ["bad\nname", "bad\tname", "bad\u{1b}name"] {
+        assert!(checked_rel(rel).is_err(), "{rel:?}");
+    }
+}
+
+#[test]
+fn watching_from_a_terminal_keeps_its_shared_input_blocking() {
+    use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd};
+    let (mut master, mut slave) = (-1, -1);
+    // SAFETY: openpty initializes two descriptors for this test's private terminal.
+    assert_eq!(
+        unsafe {
+            libc::openpty(
+                &mut master,
+                &mut slave,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            )
+        },
+        0
+    );
+    let (_master, slave) = unsafe { (OwnedFd::from_raw_fd(master), OwnedFd::from_raw_fd(slave)) };
+    let _output = WatchOutput::new(slave.as_fd(), &|| false).unwrap();
+    assert_eq!(
+        unsafe { libc::fcntl(slave.as_raw_fd(), libc::F_GETFL) } & libc::O_NONBLOCK,
+        0
+    );
+}
+
+#[test]
+fn watching_a_terminal_that_cannot_be_reopened_still_writes_blocking() {
+    use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd};
+    let (mut master, mut slave) = (-1, -1);
+    // SAFETY: openpty initializes two descriptors for this test's private terminal.
+    assert_eq!(
+        unsafe {
+            libc::openpty(
+                &mut master,
+                &mut slave,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            )
+        },
+        0
+    );
+    let (master, slave) = unsafe { (OwnedFd::from_raw_fd(master), OwnedFd::from_raw_fd(slave)) };
+    // SAFETY: geteuid takes no arguments.
+    if unsafe { libc::geteuid() } == 0 {
+        eprintln!("skipped: root opens a terminal whatever its mode, so the reopen cannot be made to fail this way");
+        return;
+    }
+    // As after `su` or inside a container: the terminal is open here but its name cannot be opened again.
+    // SAFETY: fchmod on this test's own terminal.
+    assert_eq!(unsafe { libc::fchmod(slave.as_raw_fd(), 0) }, 0);
+    let mut output = WatchOutput::new(slave.as_fd(), &|| false).unwrap();
+    assert!(output.own_flags.is_none(), "the reopen was expected to fail");
+    assert_eq!(
+        unsafe { libc::fcntl(slave.as_raw_fd(), libc::F_GETFL) } & libc::O_NONBLOCK,
+        0
+    );
+    output.write_all(b"line\n").unwrap();
+    let mut read = [0u8; 16];
+    let mut master = std::fs::File::from(master);
+    let n = std::io::Read::read(&mut master, &mut read).unwrap();
+    assert!(read[..n].starts_with(b"line"), "{:?}", &read[..n]);
+}
+
+#[test]
+fn watching_into_a_pipe_leaves_the_shared_output_blocking() {
+    use std::os::fd::{AsFd, AsRawFd};
+    let (mut read, write) = std::io::pipe().unwrap();
+    let mut output = WatchOutput::new(write.as_fd(), &|| false).unwrap();
+    // The pipe's open description is shared with this process's stdout and with other writers of a pipeline.
+    assert_eq!(
+        unsafe { libc::fcntl(write.as_raw_fd(), libc::F_GETFL) } & libc::O_NONBLOCK,
+        0
+    );
+    // A write larger than the pipe's atomic size still arrives whole.
+    let line = vec![b'x'; 3 * libc::PIPE_BUF + 7];
+    std::thread::scope(|scope| {
+        let reader = scope.spawn(move || {
+            let mut got = vec![0u8; line.len()];
+            std::io::Read::read_exact(&mut read, &mut got).unwrap();
+            got
+        });
+        output.write_all(&vec![b'x'; 3 * libc::PIPE_BUF + 7]).unwrap();
+        assert_eq!(reader.join().unwrap(), vec![b'x'; 3 * libc::PIPE_BUF + 7]);
+    });
+}
+
+#[test]
+fn cancelled_watch_releases_both_sessions_with_stdin_still_open() {
+    let lab = Lab::new();
+    let (read, write) = std::io::pipe().unwrap();
+    let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let (output_read, mut output_write) = std::io::pipe().unwrap();
+    use std::os::fd::AsFd;
+    use std::os::fd::AsRawFd;
+    let fd = output_write.as_raw_fd();
+    // Fill this pipe without a reader, then restore blocking writes before the watch starts.
+    unsafe { assert_eq!(libc::fcntl(fd, libc::F_SETFL, libc::O_NONBLOCK), 0) };
+    let buf = [0u8; 4096];
+    while output_write.write(&buf).is_ok() {}
+    while output_write.write(&[0]).is_ok() {}
+    unsafe { assert_eq!(libc::fcntl(fd, libc::F_SETFL, 0), 0) };
+    let (writing, blocked) = mpsc::channel();
+    let (done, result) = mpsc::channel();
+    std::thread::scope(|scope| {
+        scope.spawn(|| {
+            let mut reach = FakeReach {
+                engine: lab.engine.clone(),
+                helper: lab.helper.clone(),
+            };
+            let mut term = Term {
+                cancelled: Some(cancelled.clone()),
+                ..Default::default()
+            };
+            let mut cx = Context {
+                store: &lab.store,
+                reach: &mut reach,
+                term: &mut term,
+                remote_dev_enabled: &|| true,
+                now: 0,
+            };
+            let check_cancel = || {
+                let _ = writing.send(());
+                cancelled.load(std::sync::atomic::Ordering::Acquire)
+            };
+            let mut writer = WatchOutput::new(output_write.as_fd(), &check_cancel).unwrap();
+            done.send(watch(
+                &mut cx,
+                &lab.root,
+                None,
+                Box::new(std::io::BufReader::new(read)),
+                &mut writer,
+            ))
+            .unwrap();
+        });
+        wait(|| lab.engine.status_of(&lab.git()).is_some());
+        // The second check observes a write that already found the pipe full.
+        for _ in 0..2 {
+            blocked.recv_timeout(Duration::from_secs(10)).unwrap();
+        }
+        cancelled.store(true, std::sync::atomic::Ordering::Release);
+        let outcome = result.recv_timeout(Duration::from_secs(10));
+        drop(output_read);
+        drop(write);
+        outcome
+            .expect("cancellation must wake the watch with stdin open")
+            .unwrap();
+    });
+    for name in [lab.tree(), lab.git()] {
+        assert_eq!(
+            lab.engine.status_of(&name).unwrap().state,
+            crate::remote_sync::engine::SyncState::Paused
+        );
+    }
+    let lock = agent::private_fs::PrivateLock::open(&actor::lock_dir(&lab.state, &lab.root).join("lock")).unwrap();
+    assert!(lock.try_lock().unwrap());
 }

@@ -8,6 +8,7 @@ publish = false
 agent = { path = "../agent" }
 eitri-core = { path = "../core" }
 eitri-server-proto = { path = "../server-proto" }
+eitri-terminal = { path = "../terminal/engine", default-features = false }
 # Every crate below is already in the workspace lock through `agent` or `tonic`; the helper adds no registry package.
 claude-runtime-protocol = { workspace = true }
 tonic = "0.14"

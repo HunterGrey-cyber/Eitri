@@ -3,8 +3,10 @@
 //! The laptop's `.git` is a one-way copy of the server's, so git features (signs, blame, branch names, pickers) read
 //! history locally. Whoever can write the server's `.git` chooses its bytes, so the copy leaves out every file through
 //! which git would run a program or read configuration, attributes or objects from elsewhere: config files, hooks,
-//! `commondir`, `gitdir`, attributes, alternates, locks and fsmonitor state wherever their names appear; the state
-//! of an operation in progress (a rebase's todo list can hold `exec` lines); the gitdirs of submodules and linked
+//! `commondir`, `gitdir`, attributes, alternates, locks and fsmonitor state wherever their names appear, except as
+//! branch, tag and reflog names below `refs/` and `logs/refs/`, which hold nothing but what a ref can be (no `.git`, no
+//! dotted name, no `HEAD`, so git discovers no repository there); the state of an
+//! operation in progress (a rebase's todo list can hold `exec` lines); the gitdirs of submodules and linked
 //! worktrees, which carry their own config; and every symbolic link, since a link inside `.git` can lead a path the
 //! ignores exclude, or a file git reads, to anywhere on the laptop. The laptop's `.git/config` is written here, by
 //! Eitri, from an allow-list of the server's entries; it is never taken from the replica, and it is written before
@@ -32,9 +34,18 @@ pub const TREE_VCS_IGNORES: &[&str] = &[".git"];
 /// that are not ignored and not on the server are deleted; ignored laptop files are left alone.
 pub const GIT_SESSION_MODE: &str = "one-way-replica";
 
-/// The git session's ignores, relative to `.git`. A single name without `/` matches that name at any depth; a
-/// pattern starting with `/` matches only at `.git`'s top; a trailing `/` matches directories only. None of these
-/// has a trailing `/` except `fsmonitor--daemon/`, so an entry of any kind under one of these names stays out.
+/// The git session's ignores, relative to `.git`, read as Mutagen reads them: a single name without `/` matches that
+/// name at any depth; a pattern starting with `/` matches only from `.git`'s top; a trailing `/` matches directories
+/// only; `!` takes back what an earlier pattern ignored, and the last pattern that matches a path decides. None of the
+/// names has a trailing `/` except `fsmonitor--daemon/`, so an entry of any kind under one of these names stays out.
+///
+/// Below `refs/` and `logs/refs/` every name is a branch, tag or remote-branch name (or its reflog), which git reads
+/// only as a ref, never as config, hooks, attributes or alternates; there the names are taken back, so a branch
+/// called `config` or `feature/hooks` is copied like any other. What follows keeps that subtree to what a ref can be:
+/// no name starting with `.` (git refuses such a ref component, and it covers `.git`, a file or a directory) and no
+/// `HEAD` (a bare repository needs one), so no repository or worktree can be discovered below refs by plain git
+/// started there, whatever the server planted. `*.lock` comes last and holds everywhere: git refuses a ref name
+/// ending in `.lock`, so a lock is never a ref.
 ///
 /// The session also copies no symbolic links ([`GIT_SESSION_SYMLINK_MODE`]), so no link can stand in for a directory
 /// these names would exclude or point a file git reads (`shallow`, `objects/info`) outside the mirror.
@@ -46,7 +57,6 @@ pub const GIT_SESSION_IGNORES: &[&str] = &[
     "gitdir",
     "attributes",
     "alternates",
-    "*.lock",
     "fsmonitor--daemon/",
     "fsmonitor--daemon.ipc",
     "/modules",
@@ -54,7 +64,18 @@ pub const GIT_SESSION_IGNORES: &[&str] = &[
     "/rebase-merge",
     "/rebase-apply",
     "/sequencer",
+    "!/refs/**",
+    "!/logs/refs/**",
+    "/refs/**/.*",
+    "/logs/refs/**/.*",
+    "/refs/**/HEAD",
+    "/logs/refs/**/HEAD",
+    "*.lock",
 ];
+
+/// The version of the git session's description ([`GIT_SESSION_IGNORES`], mode, symlink mode). A recorded git
+/// session made from an older one is terminated and made again, since Mutagen keeps a session's ignores for its life.
+pub const GIT_SESSION_VERSION: u32 = 3;
 
 /// The git session's Mutagen symlink mode: a repository's `.git` holds no symbolic links, so none is copied.
 pub const GIT_SESSION_SYMLINK_MODE: &str = "ignore";
@@ -166,21 +187,33 @@ pub fn refuse_hooks_dir(state_home: &Path) -> PathBuf {
     state_home.join("eitri/remote/hooks")
 }
 
-/// The only hook in [`refuse_hooks_dir`]. A commit made in the laptop's copy would be undone by the next replica
-/// cycle (the server's `.git` is the source), so a plain `git commit` there, one run by full path or from a terminal
-/// that has no shim, is refused before it writes anything. Eitri's own git never reaches it: forwarded commands run on
-/// the server and local reads run with hooks off.
+/// Give a plain commit on the laptop copy an explanation before Git creates the commit.
 pub const REFUSE_PRE_COMMIT: &str = "#!/bin/sh\n\
 echo \"eitri: this .git is a read-only copy of the server's history; a commit made here would be undone by the next \
 sync. Commit on the server: from an Eitri window or an nvim with eitri.nvim (git there goes to the server), or in a \
 terminal on the server.\" >&2\n\
 exit 1\n";
 
-/// Writes [`REFUSE_PRE_COMMIT`] as `pre-commit` (0700) into [`refuse_hooks_dir`] (0700) and returns the directory. A
-/// hook that already has that text and mode is left alone; anything else there is replaced through a rename, so
-/// every connection repairs a changed one.
+/// Refuse ref updates while Git can still abort them. Stash stores its ref before it resets the working tree, but
+/// `reset --hard`, `checkout <branch>`, `cherry-pick`, `revert`, `rebase` and `stash pop` change files or the index
+/// before their ref update, and those files sync to the server: the line says so.
+const REFUSE_REFERENCE_TRANSACTION: &str = "#!/bin/sh\n\
+if [ \"$1\" = prepared ]; then\n\
+    echo \"eitri: this .git is a read-only copy of the server's history, so its ref change was refused (the next sync \
+would undo it). Files or the index may already have changed, and changed files sync to the server: check git status \
+in a terminal on the server and run this command there. Eitri moves an interrupted rebase or cherry-pick out of this \
+copy when it next connects.\" >&2\n\
+    exit 1\n\
+fi\n\
+exit 0\n";
+
+const REFUSE_HOOKS: &[(&str, &str)] = &[
+    ("pre-commit", REFUSE_PRE_COMMIT),
+    ("reference-transaction", REFUSE_REFERENCE_TRANSACTION),
+];
+
+/// Install the two 0700 hooks in the laptop-local directory. Each connection repairs missing or changed hooks.
 pub fn install_refuse_hooks(state_home: &Path) -> io::Result<PathBuf> {
-    use std::io::Write;
     if !state_home.is_absolute() {
         return Err(io::Error::other("the state home is not absolute"));
     }
@@ -188,18 +221,43 @@ pub fn install_refuse_hooks(state_home: &Path) -> io::Result<PathBuf> {
     agent::private_fs::require_safe_state_parent(&root, "git hooks for remote mirrors")?;
     let dir = refuse_hooks_dir(state_home);
     agent::private_fs::create_private_dir_all(&dir, &root)?;
-    let hook = dir.join("pre-commit");
-    use std::os::unix::fs::MetadataExt;
-    if std::fs::symlink_metadata(&hook).is_ok_and(|meta| meta.is_file() && meta.mode() & 0o7777 == 0o700)
-        && agent::private_fs::read_private_nofollow_capped(&hook, REFUSE_PRE_COMMIT.len() as u64)
-            .is_ok_and(|text| text == REFUSE_PRE_COMMIT)
-    {
-        return Ok(dir);
+    for &(name, text) in REFUSE_HOOKS {
+        install_hook(&dir, name, text)?;
     }
-    let temporary = dir.join(format!(".pre-commit-{}", uuid::Uuid::new_v4()));
+    // Git can run any other hook left here. Keep unexpected entries with their original names outside hooksPath.
+    let saved = dir.with_file_name(format!("disabled-hooks-{}", uuid::Uuid::new_v4()));
+    for entry in std::fs::read_dir(&dir)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        if REFUSE_HOOKS.iter().any(|&(hook, _)| name == hook) {
+            continue;
+        }
+        agent::private_fs::create_private_dir_all(&saved, &root)?;
+        match std::fs::rename(entry.path(), saved.join(name)) {
+            Ok(()) => {}
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {} // Another connection moved it first.
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(dir)
+}
+
+fn install_hook(dir: &Path, name: &str, text: &str) -> io::Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::MetadataExt;
+
+    let hook = dir.join(name);
+    if std::fs::symlink_metadata(&hook).is_ok_and(|meta| meta.is_file() && meta.mode() & 0o7777 == 0o700)
+        && agent::private_fs::read_private_nofollow_capped(&hook, text.len() as u64)
+            .is_ok_and(|installed| installed == text)
+    {
+        return Ok(());
+    }
+    // Stage beside the hooks directory so another connection never sees the temporary as an extra hook.
+    let temporary = dir.with_file_name(format!(".{name}-{}", uuid::Uuid::new_v4()));
     let written = (|| {
         let mut file = agent::private_fs::open_private(&temporary)?;
-        file.write_all(REFUSE_PRE_COMMIT.as_bytes())?;
+        file.write_all(text.as_bytes())?;
         file.set_permissions(std::fs::Permissions::from_mode(0o700))?;
         file.sync_all()?;
         drop(file);
@@ -208,16 +266,15 @@ pub fn install_refuse_hooks(state_home: &Path) -> io::Result<PathBuf> {
     if written.is_err() {
         let _ = std::fs::remove_file(&temporary);
     }
-    written.map(|()| dir)
+    written
 }
 
 /// The transports git knows, each refused by name in the laptop's config.
 const PROTOCOLS: &[&str] = &["file", "git", "ssh", "http", "https", "ext"];
 
 /// Writes the laptop's `<git_dir>/config` (mode 0600) from `entries`, keeping only what [`sanitize`] keeps, then
-/// Eitri's own two entries: `core.hookspath` naming `hooks_dir` (laptop-local, holding only [`REFUSE_PRE_COMMIT`];
-/// see [`install_refuse_hooks`]) and `protocol.allow=never`, so a git run on the copy by full path fetches and pushes
-/// nothing and commits nothing.
+/// the laptop-local `core.hooksPath` from [`install_refuse_hooks`] and the transport restrictions. Plain Git on the
+/// copy then refuses commits and ref transactions, fetches and pushes.
 ///
 /// Each entry goes through `git config --file <temporary> --add`, so git does the quoting; the temporary file is
 /// synced and renamed over `config`, so a reader sees the old file or the new one. Its name ends in `.lock`, which the
@@ -333,7 +390,7 @@ mod tests {
         assert_eq!(plan.server_root, Path::new("/srv/project/.git"));
         assert_eq!(plan.laptop_git_dir, Path::new("/home/someone/project/.git"));
         assert_eq!(GIT_SESSION_MODE, "one-way-replica");
-        // Single names, matched wherever they appear in `.git`: no `/` at all.
+        // Single names, matched wherever they appear in `.git` (below `refs/` they are taken back): no `/` at all.
         for leaf in [
             "config",
             "config.worktree",
@@ -357,7 +414,23 @@ mod tests {
         for anchored in ["/modules", "/worktrees", "/rebase-merge", "/rebase-apply", "/sequencer"] {
             assert!(plan.ignores.iter().any(|p| p == anchored), "{anchored}");
         }
-        assert_eq!(plan.ignores.len(), 15);
+        // Branch, tag and reflog names are refs; a lock is never one, so `*.lock` comes after and holds there too.
+        let back = |pattern: &str| plan.ignores.iter().position(|p| p == pattern).unwrap();
+        assert!(back("!/refs/**") < back("*.lock") && back("!/logs/refs/**") < back("*.lock"));
+        assert!(plan
+            .ignores
+            .iter()
+            .filter(|p| p.starts_with('!'))
+            .all(|p| p.starts_with("!/refs/") || p.starts_with("!/logs/refs/")));
+        // Below refs, after taking the names back: nothing a ref cannot be, so no repository is discovered there.
+        for narrowing in ["/refs/**/.*", "/logs/refs/**/.*", "/refs/**/HEAD", "/logs/refs/**/HEAD"] {
+            assert!(
+                back("!/refs/**") < back(narrowing) && back(narrowing) < back("*.lock"),
+                "{narrowing}"
+            );
+        }
+        assert_eq!(plan.ignores.len(), 21);
+        assert_eq!(GIT_SESSION_VERSION, 3);
         assert!(
             !plan.ignores.iter().any(|p| p == "hooks/"),
             "a link named hooks must be ignored too"
@@ -559,32 +632,97 @@ mod tests {
     }
 
     #[test]
-    fn refuse_hooks_hold_only_the_pre_commit_hook_and_are_repaired() {
+    fn refuse_hooks_upgrade_the_pre_commit_directory_and_repair_both_hooks() {
         let scratch = red_team::Scratch::new("hooks");
         let state = scratch.path().join("state");
-        let dir = install_refuse_hooks(&state).unwrap();
-        assert_eq!(dir, state.join("eitri/remote/hooks"));
-        assert_eq!(std::fs::metadata(&dir).unwrap().mode() & 0o777, 0o700);
-        let hook = dir.join("pre-commit");
-        assert_eq!(std::fs::metadata(&hook).unwrap().mode() & 0o7777, 0o700);
-        assert_eq!(std::fs::read_to_string(&hook).unwrap(), REFUSE_PRE_COMMIT);
-        let names: Vec<_> = std::fs::read_dir(&dir)
+        let dir = state.join("eitri/remote/hooks");
+        agent::private_fs::create_private_dir_all(&dir, &state.join("eitri")).unwrap();
+        let pre_commit = dir.join("pre-commit");
+        std::fs::write(&pre_commit, REFUSE_PRE_COMMIT).unwrap();
+        std::fs::set_permissions(&pre_commit, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let original = std::fs::metadata(&pre_commit).unwrap().ino();
+
+        assert_eq!(install_refuse_hooks(&state).unwrap(), dir);
+        assert_eq!(std::fs::metadata(&dir).unwrap().mode() & 0o7777, 0o700);
+        assert_eq!(std::fs::metadata(&pre_commit).unwrap().ino(), original);
+        let mut names: Vec<_> = std::fs::read_dir(&dir)
             .unwrap()
             .map(|e| e.unwrap().file_name())
             .collect();
-        assert_eq!(names, vec![OsString::from("pre-commit")]);
-        // The hook refuses with its line, whatever it is given.
-        // Through sh: exec'ing a file just written can meet ETXTBSY while another test thread's fork still holds it.
-        let run = std::process::Command::new("/bin/sh").arg(&hook).output().unwrap();
-        assert_eq!(run.status.code(), Some(1));
-        assert!(String::from_utf8_lossy(&run.stderr).contains("read-only copy"));
-        // An unchanged hook is left alone; a changed one is replaced.
-        let ino = std::fs::metadata(&hook).unwrap().ino();
-        install_refuse_hooks(&state).unwrap();
-        assert_eq!(std::fs::metadata(&hook).unwrap().ino(), ino);
-        std::fs::write(&hook, "#!/bin/sh\nexit 0\n").unwrap();
-        install_refuse_hooks(&state).unwrap();
-        assert_eq!(std::fs::read_to_string(&hook).unwrap(), REFUSE_PRE_COMMIT);
+        names.sort();
+        assert_eq!(names, ["pre-commit", "reference-transaction"]);
+
+        for name in names {
+            let hook = dir.join(name);
+            let text = std::fs::read_to_string(&hook).unwrap();
+            let metadata = std::fs::metadata(&hook).unwrap();
+            assert_eq!(metadata.mode() & 0o7777, 0o700);
+            install_refuse_hooks(&state).unwrap();
+            assert_eq!(std::fs::metadata(&hook).unwrap().ino(), metadata.ino());
+
+            std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+            install_refuse_hooks(&state).unwrap();
+            let repaired = std::fs::metadata(&hook).unwrap();
+            assert_eq!(repaired.mode() & 0o7777, 0o700);
+            assert_ne!(repaired.ino(), metadata.ino());
+
+            std::fs::write(&hook, "#!/bin/sh\nexit 0\n").unwrap();
+            install_refuse_hooks(&state).unwrap();
+            assert_eq!(std::fs::read_to_string(&hook).unwrap(), text);
+            assert_ne!(std::fs::metadata(&hook).unwrap().ino(), repaired.ino());
+        }
         assert!(install_refuse_hooks(Path::new("relative")).is_err());
+    }
+
+    #[test]
+    fn reconnect_leaves_only_the_two_refusing_hooks() {
+        let scratch = red_team::Scratch::new("extra-hook");
+        let state = scratch.path().join("state");
+        let dir = install_refuse_hooks(&state).unwrap();
+        let extra = dir.join("post-checkout");
+        std::fs::write(&extra, "#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(&extra, std::fs::Permissions::from_mode(0o700)).unwrap();
+        install_refuse_hooks(&state).unwrap();
+        let entries: Vec<_> = std::fs::read_dir(dir.parent().unwrap())
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|entry| entry != &dir)
+            .collect();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(
+            std::fs::read_to_string(entries[0].join("post-checkout")).unwrap(),
+            "#!/bin/sh\nexit 0\n"
+        );
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 2);
+        assert!(!extra.exists());
+    }
+
+    #[test]
+    fn reference_transaction_refuses_only_prepared() {
+        let scratch = red_team::Scratch::new("transaction");
+        let hooks = install_refuse_hooks(&scratch.path().join("state")).unwrap();
+        for state in ["preparing", "prepared", "aborted", "committed", "other", ""] {
+            let output = std::process::Command::new("/bin/sh")
+                .arg(hooks.join("reference-transaction"))
+                .arg(state)
+                .output()
+                .unwrap();
+            if state == "prepared" {
+                assert_eq!(output.status.code(), Some(1));
+                let stderr = String::from_utf8(output.stderr).unwrap();
+                assert_eq!(stderr.lines().count(), 1);
+                assert!(stderr.contains("on the server"), "{stderr}");
+                // Some commands change files before their ref update: the line says what to check.
+                assert!(
+                    stderr.contains("may already have changed") && stderr.contains("git status"),
+                    "{stderr}"
+                );
+                assert!(stderr.contains("interrupted rebase"), "{stderr}");
+            } else {
+                assert!(output.status.success(), "{state}");
+                assert!(output.stderr.is_empty(), "{state}");
+            }
+            assert!(output.stdout.is_empty());
+        }
     }
 }

@@ -151,7 +151,25 @@ impl Paths {
         self.state.join("run").join(&self.key)
     }
 
+    /// Where a client finds this daemon's socket. A daemon from before terminal hosts chose its run directory by the
+    /// shorter sidecar socket name, so where that rule kept the ordinary directory and a socket is there, that one is
+    /// the daemon's.
     pub fn socket(&self) -> io::Result<PathBuf> {
+        let ordinary = self.state.join("run").join(&self.key);
+        if self.run != ordinary && socket_path::in_dir(&ordinary, SIDECAR_SOCKET_NAME).is_ok() {
+            let legacy = socket_path::in_dir(&ordinary, "daemon.sock")?;
+            if legacy
+                .symlink_metadata()
+                .is_ok_and(|meta| std::os::unix::fs::FileTypeExt::is_socket(&meta.file_type()))
+            {
+                return Ok(legacy);
+            }
+        }
+        self.bind_socket()
+    }
+
+    /// Where this daemon binds its socket: in the selected run directory, even when only sidecar names fit there.
+    pub fn bind_socket(&self) -> io::Result<PathBuf> {
         socket_path::in_dir(&self.run, "daemon.sock")
     }
 
@@ -236,13 +254,25 @@ pub fn environment_roots() -> io::Result<(PathBuf, PathBuf)> {
     ))
 }
 
+/// The longest socket name a daemon binds in its run directory: a terminal host's, `th-<32 hex>.sock` (a sidecar's,
+/// `sc-<16 hex>.sock`, is shorter).
+pub const LONGEST_SOCKET_NAME: &str = "th-0123456789abcdef0123456789abcdef.sock";
+/// The longest name before terminal hosts, which earlier daemons chose their run directory by.
+const SIDECAR_SOCKET_NAME: &str = "sc-0123456789abcdef.sock";
+
 fn select_run(key: &str, state: &Path, tmp: &Path) -> io::Result<(PathBuf, bool)> {
     let ordinary = state.join("run").join(key);
-    if socket_path::in_dir(&ordinary, "sc-0123456789abcdef.sock").is_ok() {
+    if socket_path::in_dir(&ordinary, LONGEST_SOCKET_NAME).is_ok() {
         return Ok((ordinary, false));
     }
     let fallback = tmp.join(format!("eitri-server-{}", private_fs::euid())).join(key);
-    socket_path::in_dir(&fallback, "sc-0123456789abcdef.sock")?;
+    if socket_path::in_dir(&fallback, LONGEST_SOCKET_NAME).is_ok() {
+        return Ok((fallback, true));
+    }
+    if socket_path::in_dir(&ordinary, SIDECAR_SOCKET_NAME).is_ok() {
+        return Ok((ordinary, false));
+    }
+    socket_path::in_dir(&fallback, SIDECAR_SOCKET_NAME)?;
     Ok((fallback, true))
 }
 
@@ -268,13 +298,13 @@ mod tests {
     #[test]
     fn fallback_reserves_the_longest_socket_not_just_the_daemon_socket() {
         let suffix = "/eitri-server/run/1";
-        let home_len = socket_path::MAX_SOCKET_PATH_BYTES - 1 - "sc-0123456789abcdef.sock".len() - suffix.len();
+        let home_len = socket_path::MAX_SOCKET_PATH_BYTES - 1 - LONGEST_SOCKET_NAME.len() - suffix.len();
         let state_home = PathBuf::from(format!("/{}", "x".repeat(home_len - 1)));
         // These are path calculations only; no directory or socket is created.
         let fits = Paths::new("1", Path::new("/data"), &state_home, Path::new("/")).unwrap();
         assert!(fits.run.starts_with(&state_home));
         assert_eq!(
-            socket_path::in_dir(&fits.run, "sc-0123456789abcdef.sock")
+            socket_path::in_dir(&fits.run, LONGEST_SOCKET_NAME)
                 .unwrap()
                 .as_os_str()
                 .len(),
@@ -288,6 +318,44 @@ mod tests {
             PathBuf::from(format!("/eitri-server-{}/1", private_fs::euid()))
         );
         assert!(socket_path::in_dir(&longer.join("eitri-server/run/1"), "daemon.sock").is_ok());
+    }
+
+    #[test]
+    fn long_tmpdir_keeps_the_ordinary_sidecar_run_usable() {
+        let state_home = PathBuf::from(format!("/{}", "s".repeat(48)));
+        let tmp = PathBuf::from(format!("/tmp/{}", "t".repeat(80)));
+        let paths = Paths::new("1", Path::new("/data"), &state_home, &tmp).unwrap();
+        assert_eq!(paths.run, paths.metadata_run());
+        assert!(socket_path::in_dir(&paths.run, LONGEST_SOCKET_NAME).is_err());
+        assert!(socket_path::in_dir(&paths.run, SIDECAR_SOCKET_NAME).is_ok());
+        assert_eq!(paths.socket().unwrap(), paths.bind_socket().unwrap());
+    }
+
+    #[test]
+    fn an_existing_daemon_socket_is_found_where_the_shorter_rule_put_it() {
+        // A state directory whose run directory fits a sidecar socket but not a terminal host's.
+        let suffix = "/eitri-server/run/1";
+        let parent = PathBuf::from(format!("/tmp/rd-legacy-{}", std::process::id()));
+        let reserve = socket_path::MAX_SOCKET_PATH_BYTES - 1 - LONGEST_SOCKET_NAME.len() - suffix.len();
+        let len = reserve + 4 - parent.as_os_str().len() - 1;
+        let state_home = parent.join("s".repeat(len));
+        let ordinary = state_home.join("eitri-server/run/1");
+        assert!(socket_path::in_dir(&ordinary, SIDECAR_SOCKET_NAME).is_ok());
+        assert!(socket_path::in_dir(&ordinary, LONGEST_SOCKET_NAME).is_err());
+        let tmp = parent.join("t");
+        private_fs::create_private_dir_all(&tmp, &parent).unwrap();
+        let paths = Paths::new("1", Path::new("/data"), &state_home, &tmp).unwrap();
+        assert_ne!(paths.run, ordinary);
+        assert_eq!(paths.socket().unwrap(), paths.bind_socket().unwrap());
+        private_fs::create_private_dir_all(&ordinary, &parent).unwrap();
+        let legacy = socket_path::in_dir(&ordinary, "daemon.sock").unwrap();
+        let _listener = std::os::unix::net::UnixListener::bind(&legacy).unwrap();
+        assert_eq!(paths.socket().unwrap(), legacy);
+        assert_eq!(
+            paths.bind_socket().unwrap(),
+            socket_path::in_dir(&paths.run, "daemon.sock").unwrap()
+        );
+        std::fs::remove_dir_all(parent).unwrap();
     }
 
     #[test]

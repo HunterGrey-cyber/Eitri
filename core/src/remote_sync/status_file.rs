@@ -146,7 +146,9 @@ pub fn chip(status: &StatusFile) -> SyncChip {
         host: status.host.clone(),
         git_pct: status.git_pct,
         phase: status.phase.clone(),
-        conflicts: status.conflicts.len().min(u32::MAX as usize) as u32,
+        conflicts: (status.conflicts.len() as u64)
+            .saturating_add(status.conflicts_more)
+            .min(u32::MAX.into()) as u32,
         paused_reason: status.paused.as_ref().map(|pause| pause.detail.clone()),
     }
 }
@@ -208,7 +210,9 @@ mod tests {
             side: Side::Server,
             text: "invalid symbolic link: target is absolute".into(),
         });
+        tree.excluded_conflicts = 7;
         let first = compose("example-host", &record, Some(&tree), None, None, 1);
+        assert_eq!(chip(&first).conflicts, 8);
         write_status(&dir, &first).unwrap();
         let path = status_path(&dir);
         assert_eq!(std::fs::metadata(&path).unwrap().mode() & 0o777, 0o600);

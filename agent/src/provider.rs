@@ -180,6 +180,15 @@ pub struct SteerTurnRequest {
     pub as_typed: String,
 }
 
+/// Runs on the sending worker. `Err` says why the tab took the request back during the wait; nothing is sent then.
+pub type BeforeSend = Box<dyn FnOnce() -> Result<(), String> + Send>;
+
+/// The person stopped the message while it waited: its text is already back where it was typed.
+pub const STOPPED_BEFORE_SEND: &str = "stopped before it was sent";
+
+/// The tab's session failed or was reset while the message waited: a refusal like any other, so its text returns.
+pub const SESSION_ENDED_BEFORE_SEND: &str = "not sent: the session ended";
+
 /// What a provider may say about a message besides its text ([`AgentProvider::send_turn_stamped`],
 /// [`AgentProvider::steer_turn_stamped`]). A provider that cannot carry a part leaves it off; the
 /// default methods leave all of it off.
@@ -889,6 +898,17 @@ pub trait AgentProvider {
         let _ = stamp;
         self.steer_turn(request)
     }
+
+    /// Admits a steer whose worker must finish a wait before sending it.
+    fn steer_turn_after(
+        &self,
+        _request: SteerTurnRequest,
+        _stamp: TurnStamp,
+        _wait: BeforeSend,
+    ) -> Result<(), ProviderError> {
+        Err(ProviderError::UnsupportedCapability("remote steer"))
+    }
+
     /// Stops work left running between turns. `tasks` is the canonical projection's live,
     /// non-ambient roster; providers with their own background count still validate `shown`.
     fn stop_background(&self, session_id: &str, shown: u32, tasks: &[String]) -> Result<(), ProviderError> {

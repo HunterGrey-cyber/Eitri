@@ -1,11 +1,12 @@
-//! `eitri host sync ...`: what sync holds for a project, and the person's decisions about it. These work whatever
-//! `remote_dev.enabled` says, so a person can always see and settle what sync holds.
+//! `eitri host sync ...`: what sync holds for a project, and the person's decisions about it. Inspection stays available with remote
+//! development off. Following sync requires it to be enabled, and file conflict actions need a live holder.
 //!
 //! The project is the recorded root holding the path given (or the current directory). Decisions (`exclude`,
 //! `include`, `allow`, `resume`) are written into the project's sync record; the holder of the project's sync lock
 //! (its window, or a `watch`) reads the record every step and acts on them.
 
-use std::io::{BufRead, Read, Write};
+use std::io::{BufRead, IsTerminal, Read, Write};
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd};
 use std::path::{Component, Path, PathBuf};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
@@ -16,7 +17,7 @@ use crate::remote_project::{RemoteProject, SyncRecord};
 use crate::remote_sync::actor::{self, ActorConfig, HolderKind, SyncEvent, PAUSE_HOST_KEY, PAUSE_TRIPWIRE};
 use crate::remote_sync::engine::FlushOutcome;
 use crate::remote_sync::quiet::{EditorAnswer, EditorState};
-use crate::remote_sync::{conflicts as actions, ignores, recreate, sessions, status_file};
+use crate::remote_sync::{conflicts as actions, ignores, recreate, sessions, status_file, terminal_json};
 
 /// `remote_dev.*` for the sync verbs, from `init.lua`.
 #[derive(Clone, Debug)]
@@ -25,6 +26,7 @@ pub struct SyncSettings {
     pub mutagen: Option<PathBuf>,
     pub tripwire_mib: u32,
     pub flush_cap: Duration,
+    pub send_waits_for_flush: bool,
 }
 
 impl Default for SyncSettings {
@@ -34,6 +36,7 @@ impl Default for SyncSettings {
             mutagen: None,
             tripwire_mib: 64,
             flush_cap: Duration::from_secs(3),
+            send_waits_for_flush: true,
         }
     }
 }
@@ -52,13 +55,139 @@ pub fn run_sync(args: &[String], cx: &mut Context<'_>) -> i32 {
             return 1;
         }
     };
-    run_sync_in(
-        args,
-        cx,
-        &cwd,
-        Box::new(std::io::BufReader::new(std::io::stdin())),
-        &mut std::io::stdout(),
-    )
+    let stdout = std::io::stdout();
+    let input = Box::new(std::io::BufReader::new(std::io::stdin()));
+    if args.first().is_some_and(|verb| verb == "watch") {
+        let mut output = match WatchOutput::new(stdout.as_fd(), &super::cli::interrupted) {
+            Ok(output) => output,
+            Err(error) => {
+                cx.term.say(&format!("eitri host sync watch: {error}"));
+                return 1;
+            }
+        };
+        run_sync_in(args, cx, &cwd, input, &mut output)
+    } else {
+        run_sync_in(args, cx, &cwd, input, &mut std::io::stdout())
+    }
+}
+
+/// The watch's output. It bypasses stdout's line buffer, which retries interrupted writes internally, and it sees a
+/// cancel while the reader is not taking output. Its open file description is shared (with this process's own stdout,
+/// the shell, the other members of a pipeline), so its status flags are left as they are: a terminal is reopened by
+/// name for a description of its own, which may be non-blocking. When that fails (a terminal of another devpts
+/// instance in a container, or one owned by another user after `su`), and for anything that is not a terminal, each
+/// write first waits for `poll` to report room and then writes at most `PIPE_BUF` bytes, which a pipe takes without
+/// blocking.
+struct WatchOutput<'a> {
+    file: std::fs::File,
+    /// The flags of a reopened terminal before it was made non-blocking; `None` when writes wait on `poll` first.
+    own_flags: Option<libc::c_int>,
+    cancelled: &'a dyn Fn() -> bool,
+}
+
+impl<'a> WatchOutput<'a> {
+    fn new(fd: BorrowedFd<'a>, cancelled: &'a dyn Fn() -> bool) -> std::io::Result<Self> {
+        let file = std::fs::File::from(fd.try_clone_to_owned()?);
+        if file.is_terminal() {
+            if let Some((file, own_flags)) = reopen_nonblocking(fd) {
+                return Ok(Self {
+                    file,
+                    own_flags: Some(own_flags),
+                    cancelled,
+                });
+            }
+        }
+        Ok(Self {
+            file,
+            own_flags: None,
+            cancelled,
+        })
+    }
+
+    /// Waits up to 100 ms for room to write; `false` when none came (or a signal arrived) so the cancel is looked at.
+    fn room(&self) -> std::io::Result<bool> {
+        let mut poll = libc::pollfd {
+            fd: self.file.as_raw_fd(),
+            events: libc::POLLOUT,
+            revents: 0,
+        };
+        // SAFETY: poll points at one initialized entry. Signals can arrive on another thread.
+        match unsafe { libc::poll(&mut poll, 1, 100) } {
+            ready if ready > 0 => Ok(true),
+            0 => Ok(false),
+            _ => {
+                let error = std::io::Error::last_os_error();
+                if error.kind() == std::io::ErrorKind::Interrupted {
+                    Ok(false)
+                } else {
+                    Err(error)
+                }
+            }
+        }
+    }
+}
+
+/// The terminal `fd` opened again by name, non-blocking, with its flags from before; `None` when it cannot be.
+fn reopen_nonblocking(fd: BorrowedFd<'_>) -> Option<(std::fs::File, libc::c_int)> {
+    use std::os::unix::{ffi::OsStrExt, fs::OpenOptionsExt};
+    let mut name = [0u8; libc::PATH_MAX as usize];
+    // SAFETY: ttyname_r receives an open terminal and a writable buffer of the stated size.
+    if unsafe { libc::ttyname_r(fd.as_raw_fd(), name.as_mut_ptr().cast(), name.len()) } != 0 {
+        return None;
+    }
+    let path = std::ffi::CStr::from_bytes_until_nul(&name).ok()?;
+    let file = std::fs::OpenOptions::new()
+        .write(true)
+        .custom_flags(libc::O_NOCTTY)
+        .open(std::ffi::OsStr::from_bytes(path.to_bytes()))
+        .ok()?;
+    // SAFETY: F_GETFL and F_SETFL act on this private description, which `file` holds open.
+    let flags = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETFL) };
+    if flags < 0 || unsafe { libc::fcntl(file.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
+        return None;
+    }
+    Some((file, flags))
+}
+
+impl Drop for WatchOutput<'_> {
+    fn drop(&mut self) {
+        if let Some(flags) = self.own_flags {
+            // SAFETY: the reopened terminal's own description, still held open by `file`.
+            unsafe {
+                libc::fcntl(self.file.as_raw_fd(), libc::F_SETFL, flags);
+            }
+        }
+    }
+}
+
+impl Write for WatchOutput<'_> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let waits_first = self.own_flags.is_none();
+        let chunk = if waits_first {
+            &buf[..buf.len().min(libc::PIPE_BUF)]
+        } else {
+            buf
+        };
+        while !(self.cancelled)() {
+            if waits_first && !self.room()? {
+                continue;
+            }
+            match self.file.write(chunk) {
+                Ok(n) => return Ok(n),
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+                Err(error) => return Err(error),
+            }
+            if !waits_first {
+                self.room()?;
+            }
+        }
+        Err(std::io::ErrorKind::ConnectionAborted.into())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
 }
 
 /// [`run_sync`] from `cwd`, with the watch's input and output given.
@@ -71,14 +200,14 @@ pub fn run_sync_in(
 ) -> i32 {
     let args: Vec<&str> = args.iter().map(String::as_str).collect();
     let result = match args.as_slice() {
-        ["status"] => status(cx, cwd, None, false),
-        ["status", "--json"] => status(cx, cwd, None, true),
-        ["status", "--json", path] => status(cx, cwd, Some(path), true),
-        ["status", path] => status(cx, cwd, Some(path), false),
-        ["conflicts"] => conflicts(cx, cwd, None, false),
-        ["conflicts", "--json"] => conflicts(cx, cwd, None, true),
-        ["conflicts", "--json", path] => conflicts(cx, cwd, Some(path), true),
-        ["conflicts", path] => conflicts(cx, cwd, Some(path), false),
+        ["status"] => status(cx, cwd, None, false, output),
+        ["status", "--json"] => status(cx, cwd, None, true, output),
+        ["status", "--json", path] => status(cx, cwd, Some(path), true, output),
+        ["status", path] => status(cx, cwd, Some(path), false, output),
+        ["conflicts"] => conflicts(cx, cwd, None, false, output),
+        ["conflicts", "--json"] => conflicts(cx, cwd, None, true, output),
+        ["conflicts", "--json", path] => conflicts(cx, cwd, Some(path), true, output),
+        ["conflicts", path] => conflicts(cx, cwd, Some(path), false, output),
         ["resolve", path, "--keep", "server"] => file_action(cx, cwd, path, actions::Action::KeepServer, output),
         ["resolve", path, "--keep", "laptop"] => file_action(cx, cwd, path, actions::Action::KeepLaptop, output),
         ["show-server", path] => file_action(
@@ -191,13 +320,8 @@ fn locate(cx: &Context<'_>, wanted: &Path, canonical: Option<&Path>) -> Result<L
     best.ok_or_else(|| format!("{} is not inside a remote project", wanted.display()))
 }
 
-/// The record, or a fresh one under the project's key (a project that never synced).
 fn record_of(project: &RemoteProject) -> Result<SyncRecord, String> {
-    Ok(project.sync_record()?.unwrap_or_else(|| SyncRecord {
-        engine: "mutagen".into(),
-        host_key_sha256: project.host_key_sha256.clone(),
-        ..Default::default()
-    }))
+    project.sync_record()?.ok_or_else(|| project.sync_not_set_up())
 }
 
 fn update_record(
@@ -222,9 +346,15 @@ fn state_home(cx: &Context<'_>) -> Result<PathBuf, String> {
     cx.store.state_home().ok_or_else(|| "no state home".to_owned())
 }
 
-fn status(cx: &mut Context<'_>, cwd: &Path, path: Option<&str>, json: bool) -> Result<(), String> {
+fn status(
+    cx: &mut Context<'_>,
+    cwd: &Path,
+    path: Option<&str>,
+    json: bool,
+    output: &mut dyn Write,
+) -> Result<(), String> {
     let (project, _) = project_for(cx, cwd, path)?;
-    let record = record_of(&project)?;
+    let record = project.sync_record()?.unwrap_or_default();
     let dir = actor::project_dir(&state_home(cx)?, &project);
     let followed = status_file::read_status_file(&dir).ok();
     let mut status = followed
@@ -240,8 +370,7 @@ fn status(cx: &mut Context<'_>, cwd: &Path, path: Option<&str>, json: bool) -> R
     }
     if json {
         let line = serde_json::to_string(&status).map_err(|error| error.to_string())?;
-        cx.term.say(&line);
-        return Ok(());
+        return writeln!(output, "{}", terminal_json(&line)).map_err(|e| e.to_string());
     }
     cx.term.say(&format!(
         "sync with {} for {}: {}",
@@ -272,14 +401,18 @@ fn status(cx: &mut Context<'_>, cwd: &Path, path: Option<&str>, json: bool) -> R
     }
     for problem in &status.problems {
         cx.term.say(&format!(
-            "not synced: {} ({}): {}",
-            problem.path, problem.side, problem.text
+            "not synced: {} ({}): {}. To proceed, {}",
+            problem.path,
+            problem.side,
+            problem.text,
+            crate::remote_sync::problem_actions_for(&problem.side, &project.host)
         ));
     }
     if status.problems_more > 0 {
         cx.term.say(&format!(
-            "and {} more paths Mutagen did not list that do not sync",
-            status.problems_more
+            "and {} more paths Mutagen did not list that do not sync. To proceed, {}",
+            status.problems_more,
+            crate::remote_sync::problem_actions(None, &project.host)
         ));
     }
     for path in &status.copied_back {
@@ -304,13 +437,18 @@ fn status(cx: &mut Context<'_>, cwd: &Path, path: Option<&str>, json: bool) -> R
     Ok(())
 }
 
-fn conflicts(cx: &mut Context<'_>, cwd: &Path, path: Option<&str>, json: bool) -> Result<(), String> {
+fn conflicts(
+    cx: &mut Context<'_>,
+    cwd: &Path,
+    path: Option<&str>,
+    json: bool,
+    output: &mut dyn Write,
+) -> Result<(), String> {
     let (project, _) = project_for(cx, cwd, path)?;
     let status = status_file::read_status_file(&actor::project_dir(&state_home(cx)?, &project))?;
     if json {
         let line = serde_json::to_string(&status.conflicts).map_err(|error| error.to_string())?;
-        cx.term.say(&line);
-        return Ok(());
+        return writeln!(output, "{}", terminal_json(&line)).map_err(|e| e.to_string());
     }
     if status.conflicts.is_empty() {
         cx.term.say(&format!("no conflicts with {}", project.host));
@@ -420,7 +558,7 @@ fn file_action(
     let state = state_home(cx)?;
     let dir = actor::project_dir(&state, &project);
     let helper = cx.reach.sync_helper(&project)?;
-    let engine = cx.reach.sync_engine()?;
+    let engine = cx.reach.sync_engine().map_err(|e| e.to_string())?;
     let status = status_file::read_status_file(&dir)?;
     let conflict = status
         .conflicts
@@ -491,7 +629,7 @@ fn dismiss(cx: &mut Context<'_>, cwd: &Path, path: &str) -> Result<(), String> {
     };
     let dir = actor::project_dir(&state_home(cx)?, &project);
     let helper = cx.reach.sync_helper(&project)?;
-    let engine = cx.reach.sync_engine()?;
+    let engine = cx.reach.sync_engine().map_err(|e| e.to_string())?;
     let _lock = actions::action_lock(&actor::lock_dir(&state_home(cx)?, &project.root))?;
     ready(cx.store, &project, helper.as_ref(), engine.as_ref(), &dir, None)?;
     if !all && !record_of(&project)?.copied_back.contains(&rel) {
@@ -553,7 +691,10 @@ fn details(cx: &mut Context<'_>, cwd: &Path, path: &str, output: &mut dyn Write)
     if let Err(why) = listing {
         data["notice"] = format!("could not list the server tree: {why}").into();
     }
-    serde_json::to_writer(output, &data).map_err(|e| e.to_string())
+    let document = serde_json::to_string(&data).map_err(|e| e.to_string())?;
+    output
+        .write_all(terminal_json(&document).as_bytes())
+        .map_err(|e| e.to_string())
 }
 
 fn flush(cx: &mut Context<'_>, cwd: &Path, path: Option<&str>) -> Result<(), String> {
@@ -563,7 +704,7 @@ fn flush(cx: &mut Context<'_>, cwd: &Path, path: Option<&str>) -> Result<(), Str
         .tree_session
         .ok_or_else(|| format!("{} has no sync session", project.root.display()))?;
     let cap = cx.reach.sync_settings().flush_cap;
-    let engine = cx.reach.sync_engine()?;
+    let engine = cx.reach.sync_engine().map_err(|e| e.to_string())?;
     match engine.flush(&tree, cap) {
         FlushOutcome::Flushed => {
             // A completed cycle; a conflicted or unsyncable file is still only on this laptop.
@@ -588,6 +729,9 @@ fn checked_rel(rel: &str) -> Result<String, String> {
     if rel.is_empty() {
         return Err("name a path inside the project, not its root".into());
     }
+    if crate::agent_bridge::path_holds_control(rel) {
+        return Err("a path to exclude or include cannot contain control characters".into());
+    }
     if rel
         .split('/')
         .any(|part| part.is_empty() || part == "." || part == ".." || part.eq_ignore_ascii_case(".git"))
@@ -599,6 +743,7 @@ fn checked_rel(rel: &str) -> Result<String, String> {
 
 fn exclude(cx: &mut Context<'_>, cwd: &Path, path: &str) -> Result<(), String> {
     let (project, rel) = project_for(cx, cwd, Some(path))?;
+    record_of(&project)?;
     let rel = checked_rel(&rel)?;
     update_record(cx, &project, |record| {
         record.excludes_removed.retain(|p| p != &rel);
@@ -616,8 +761,8 @@ fn exclude(cx: &mut Context<'_>, cwd: &Path, path: &str) -> Result<(), String> {
 
 fn include(cx: &mut Context<'_>, cwd: &Path, path: &str) -> Result<(), String> {
     let (project, rel) = project_for(cx, cwd, Some(path))?;
-    let rel = checked_rel(&rel)?;
     let record = record_of(&project)?;
+    let rel = checked_rel(&rel)?;
     if !record.excludes_added.contains(&rel) {
         let dir = actor::project_dir(&state_home(cx)?, &project);
         if let Some(patterns) = recreate::read_created_patterns(&dir) {
@@ -683,7 +828,18 @@ fn resume(cx: &mut Context<'_>, cwd: &Path, path: Option<&str>) -> Result<(), St
         return Ok(());
     };
     cx.term.say(&pause.detail);
-    let question = if pause.reason == PAUSE_HOST_KEY {
+    if pause.reason == crate::remote_sync::actor::PAUSE_FOLDER {
+        // Resuming would sync the sessions over a folder they never synced; only first connect sets it up again.
+        return Err(format!(
+            "nothing was resumed: run eitri host open {}:{} to set up the folder there",
+            project.host,
+            project.root.display()
+        ));
+    }
+    // A key pause under a record that already has the project's key was written by a window whose connection saw
+    // another key: this machine has not settled that key, so the question names none (that window pauses again
+    // while it shows the other key; one opened again settles it).
+    let question = if pause.reason == PAUSE_HOST_KEY && record.host_key_sha256 != project.host_key_sha256 {
         format!(
             "Sync {} with the server {} now shows (host key {})? Its sessions are re-created, and files changed on \
              one side only while paused are copied to the other. [y/N]",
@@ -772,12 +928,12 @@ fn parse_report(line: &str) -> Option<Option<EditorAnswer>> {
     serde_json::from_value::<EditorAnswer>(value).ok().map(Some)
 }
 
-/// One JSON line of the watch's output.
+/// One JSON line of the watch's output, with server-chosen names escaped as [`terminal_json`] escapes them.
 pub fn event_json(event: &SyncEvent) -> String {
-    match event {
+    terminal_json(&match event {
         SyncEvent::Status(status) => serde_json::json!({"type": "status", "status": status}).to_string(),
         SyncEvent::Line(text) => serde_json::json!({"type": "line", "text": text}).to_string(),
-    }
+    })
 }
 
 /// `eitri host sync watch --json`: follows the project's sync until its input ends, holding the lock when no window
@@ -790,13 +946,13 @@ fn watch(
     output: &mut dyn Write,
 ) -> Result<(), String> {
     // Following a project starts or resumes its sessions, so the switch must be on (the other verbs only read or
-    // settle what sync holds, and work either way).
+    // settle what sync holds; file actions require a live holder).
     if !(cx.remote_dev_enabled)() {
         return Err(crate::remote_project::remote_dev_off("eitri host sync watch"));
     }
     let (project, _) = project_for(cx, cwd, path)?;
     let settings = cx.reach.sync_settings();
-    let engine = cx.reach.sync_engine()?;
+    let engine = cx.reach.sync_engine().map_err(|e| e.to_string())?;
     let helper = cx.reach.sync_helper(&project)?;
     let config = ActorConfig::new(
         state_home(cx)?,
@@ -823,7 +979,9 @@ fn watch(
         &mut env,
         None,
     )?;
-    follow_with_env(project, engine, helper, config, input, output, Some(&env))
+    follow_with_env(project, engine, helper, config, input, output, Some(&env), &|| {
+        cx.term.cancelled()
+    })
 }
 
 /// The watch's loop over an attachment it makes: until its input ends.
@@ -836,7 +994,7 @@ pub(crate) fn follow(
     input: Box<dyn BufRead + Send>,
     output: &mut dyn Write,
 ) -> Result<(), String> {
-    follow_with_env(project, engine, helper, config, input, output, None)
+    follow_with_env(project, engine, helper, config, input, output, None, &|| false)
 }
 
 fn follow_with_env(
@@ -847,6 +1005,7 @@ fn follow_with_env(
     input: Box<dyn BufRead + Send>,
     output: &mut dyn Write,
     shim: Option<&[(String, String)]>,
+    cancelled: &dyn Fn() -> bool,
 ) -> Result<(), String> {
     let editor = StdinEditor::default();
     let (events, received) = mpsc::channel();
@@ -861,11 +1020,13 @@ fn follow_with_env(
         config,
     )
     .map_err(|error| error.to_string())?;
-    let result = watch_loop(&editor, &received, input, output, shim);
+    let result = watch_loop(&editor, &received, input, output, shim, cancelled);
     drop(attached);
     // What the actor said while letting go.
     for event in received.try_iter() {
-        let _ = writeln!(output, "{}", event_json(&event));
+        if cancelled() || writeln!(output, "{}", event_json(&event)).is_err() {
+            break;
+        }
     }
     result
 }
@@ -876,6 +1037,7 @@ fn watch_loop(
     mut input: Box<dyn BufRead + Send>,
     output: &mut dyn Write,
     shim: Option<&[(String, String)]>,
+    cancelled: &dyn Fn() -> bool,
 ) -> Result<(), String> {
     // The input is read on a thread of its own, left behind when the output closes: a reader blocked on an idle
     // input must never keep this watch (and its hold on the project) alive.
@@ -899,11 +1061,11 @@ fn watch_loop(
                 }
             }
         });
-    loop {
+    while !cancelled() {
         while let Ok(event) = events.try_recv() {
             let line = match (&event, shim) {
                 (SyncEvent::Status(status), Some(env)) => {
-                    serde_json::json!({"type": "status", "status": status, "shim": env}).to_string()
+                    terminal_json(&serde_json::json!({"type": "status", "status": status, "shim": env}).to_string())
                 }
                 _ => event_json(&event),
             };
@@ -921,16 +1083,17 @@ fn watch_loop(
             Err(mpsc::RecvTimeoutError::Timeout) => {}
         }
     }
+    Ok(())
 }
 
 /// `eitri host stop <host>`: every sync session of the host's projects pauses.
-pub fn pause_host_sessions(cx: &mut Context<'_>, host: &str) {
-    if !has_sessions(cx, host) {
+pub fn pause_host_sessions(cx: &mut Context<'_>, host_key: &str, command: &str, host: &str) {
+    if !has_sessions(cx, host_key) {
         return;
     }
     match cx.reach.sync_engine() {
         Ok(engine) => {
-            for line in crate::remote_sync::sessions::pause_host(engine.as_ref(), cx.store, host) {
+            for line in crate::remote_sync::sessions::pause_host(engine.as_ref(), cx.store, host_key, command, host) {
                 cx.term.say(&line);
             }
         }
@@ -941,17 +1104,7 @@ pub fn pause_host_sessions(cx: &mut Context<'_>, host: &str) {
 /// `eitri host uninstall <host>`: every sync session of the projects under the server's verified key ends; the mirrors
 /// stay on disk.
 pub fn terminate_host_sessions(cx: &mut Context<'_>, host: &str, host_key: &str) {
-    let any = cx.store.list().is_ok_and(|(projects, _)| {
-        projects.iter().any(|project| {
-            project.host_key_sha256 == host_key
-                && project
-                    .sync_record()
-                    .ok()
-                    .flatten()
-                    .is_some_and(|record| record.tree_session.is_some() || record.git_session.is_some())
-        })
-    });
-    if !any {
+    if !has_sessions(cx, host_key) {
         return;
     }
     match cx.reach.sync_engine() {
@@ -964,10 +1117,10 @@ pub fn terminate_host_sessions(cx: &mut Context<'_>, host: &str, host_key: &str)
     }
 }
 
-fn has_sessions(cx: &Context<'_>, host: &str) -> bool {
+fn has_sessions(cx: &Context<'_>, host_key: &str) -> bool {
     cx.store.list().is_ok_and(|(projects, _)| {
         projects.iter().any(|project| {
-            project.host == host
+            project.host_key_sha256 == host_key
                 && project
                     .sync_record()
                     .ok()

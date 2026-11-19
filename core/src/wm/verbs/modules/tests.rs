@@ -790,7 +790,7 @@ fn a_reused_idle_terminal_is_declared_afresh_and_starts_a_new_shell() {
     r.host.post(HostEvent::Terminal(TermEvent::Started {
         win: WIN,
         module: terminal2(),
-        pid: 41,
+        identity: crate::wm::ShellIdentity::Local { pid: 41 },
     }));
     r.run(Action::ModuleKill, Origin::Key { keycode: K1 });
     r.window_key(key("y", K2));
@@ -899,7 +899,7 @@ fn the_killed_base_terminal_is_placed_again_by_a_split_key() {
     r.host.post(HostEvent::Terminal(TermEvent::Started {
         win: WIN,
         module: terminal(),
-        pid: 41,
+        identity: crate::wm::ShellIdentity::Local { pid: 41 },
     }));
     r.run(Action::ModuleKill, Origin::Key { keycode: K1 });
     r.window_key(key("y", K2));

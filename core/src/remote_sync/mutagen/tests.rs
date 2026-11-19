@@ -12,6 +12,11 @@ struct Fake {
 
 impl Fake {
     fn new(mut replies: Vec<Value>) -> Self {
+        // The daemon's socket lives under the root: on macOS a socket path holds at most 103 bytes, which a CI
+        // checkout's target directory already nearly fills, so the scratch goes in the system's temporary directory.
+        #[cfg(target_os = "macos")]
+        let target = std::env::temp_dir();
+        #[cfg(not(target_os = "macos"))]
         let target = std::env::var_os("CARGO_TARGET_TMPDIR")
             .map(PathBuf::from)
             .or_else(|| std::env::var_os("CARGO_TARGET_DIR").map(|p| PathBuf::from(p).join("tmp")))
@@ -126,6 +131,8 @@ fn status_parses_every_recorded_state() {
         assert!(statuses.iter().any(|s| s.state == SyncState::Staging), "{file}");
         assert!(matches!(statuses.last().unwrap().state, SyncState::Disconnected(_)));
     }
+    let ready = parse_sessions(&fixture("list-ready.json")).unwrap().remove(0);
+    assert_eq!(ready.identifier, "sync_HFM5JZVye9q5hOlgN6ko1gdClexDPtKpAQqzDhq6ro2");
     let conflicts = parse_sessions(&fixture("list-conflicts.json"))
         .unwrap()
         .remove(0)
@@ -167,6 +174,19 @@ fn session_status_reports_list_failure_after_successful_flush() {
         engine.session_status(&name).unwrap_err().to_string(),
         "daemon socket absent"
     );
+}
+
+#[test]
+fn session_status_within_gives_up_at_its_cap() {
+    let fake = Fake::new(vec![
+        json!({"match":["sync","list"],"stdout_file":"list-ready.json","sleep":5}),
+    ]);
+    let error = fake
+        .engine()
+        .unwrap()
+        .session_status_within(&tree().name, Duration::from_millis(100))
+        .unwrap_err();
+    assert_eq!(error.to_string(), "Mutagen command timed out");
 }
 
 #[test]
@@ -454,6 +474,16 @@ fn old_mutagen_is_refused_with_its_version() {
     assert_eq!(fake.log().len(), 1);
     let fake = Fake::new(vec![json!({"match":["version"],"stdout":"0.18.0\n"})]);
     assert_eq!(fake.engine().unwrap().version(), "0.18.0");
+}
+
+#[test]
+fn missing_configured_mutagen_and_unrecognized_version_have_distinct_errors() {
+    let fake = Fake::new(vec![json!({"match":["version"],"stdout":"unexpected output"})]);
+    assert!(matches!(fake.engine(), Err(SyncError::Engine(text)) if text.contains("unrecognized Mutagen version")));
+    let missing = fake.root.join("missing-binary");
+    assert!(
+        matches!(MutagenEngine::open_local(&fake.root, Some(&missing)), Err(SyncError::Unsupported(text)) if text.contains("missing-binary"))
+    );
 }
 
 #[test]
@@ -879,8 +909,11 @@ fn path_lookup_drops_relative_and_empty_entries_and_commands_use_the_data_direct
     let engine = fake.engine().unwrap();
     engine.create(&tree()).unwrap();
     engine.status(&Labels::new()).unwrap();
+    // Compared as canonical paths: on macOS the temporary directory is reached through a link (/var is /private/var)
+    // and the working directory a command reports is the resolved one.
+    let data_dir = fs::canonicalize(engine.data_dir()).unwrap();
     for entry in fake.log() {
-        assert_eq!(entry["cwd"], engine.data_dir().to_str().unwrap());
+        assert_eq!(fs::canonicalize(entry["cwd"].as_str().unwrap()).unwrap(), data_dir);
         assert_eq!(entry["env"]["SSH_ASKPASS_REQUIRE"], Value::Null);
     }
 }

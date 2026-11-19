@@ -49,6 +49,16 @@ pub fn minimal_environment() -> io::Result<Environment> {
     ]))
 }
 
+/// The account identity a login takes from passwd: what a server terminal's shell gets of it.
+pub const IDENTITY_KEYS: [&str; 4] = ["HOME", "USER", "LOGNAME", "SHELL"];
+
+/// [`minimal_environment`]'s passwd-derived identity alone (`IDENTITY_KEYS`), without its fixed defaults.
+pub fn passwd_identity() -> io::Result<Environment> {
+    let mut env = minimal_environment()?;
+    env.retain(|key, _| IDENTITY_KEYS.iter().any(|identity| key == OsStr::new(identity)));
+    Ok(env)
+}
+
 #[derive(Default)]
 struct PasswdLookup {
     pending: tokio::sync::Mutex<Option<tokio::task::JoinHandle<io::Result<Environment>>>>,

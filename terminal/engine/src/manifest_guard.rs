@@ -141,3 +141,31 @@ fn every_shape_of_a_toolkit_dependency_is_caught() {
         assert_eq!(offenders(manifest), Vec::<String>::new(), "a false alarm:\n{manifest}");
     }
 }
+
+#[test]
+fn skia_is_optional_and_only_behind_paint() {
+    let compact: String = MANIFEST
+        .lines()
+        .map(|line| line.split('#').next().unwrap_or_default())
+        .collect::<String>()
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .collect();
+    let skia = compact.split_once("skia-safe={").expect("Skia dependency").1;
+    let fields = skia.split_once('}').expect("inline dependency table").0;
+    assert!(fields.split(',').any(|field| field == "optional=true"));
+    let features = compact
+        .split_once("[features]")
+        .expect("explicit paint feature")
+        .1
+        .split("[dependencies]")
+        .next()
+        .unwrap();
+    assert!(features.contains("default=[\"paint\"]"));
+    assert!(features.contains("paint=[\"dep:skia-safe\"]"));
+    for entry in features.split(']') {
+        if entry.contains("skia-safe") {
+            assert_eq!(entry, "paint=[\"dep:skia-safe\"", "Skia belongs only to paint");
+        }
+    }
+}

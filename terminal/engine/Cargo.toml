@@ -9,6 +9,10 @@ description = "The bottom terminal's engine: an owned PTY, one session thread pe
 # Never gtk4/glib/gdk/webkit6, used or not -- `src/manifest_guard.rs` rejects those dependencies.
 # The GTK half lives in `shell/src/terminal/`; macOS hosts this crate in an NSView, so the
 # toolkit boundary belongs here rather than at shell.
+[features]
+default = ["paint"]
+paint = ["dep:skia-safe"]
+
 [dependencies]
 terminal-render = { path = "../render" }
 terminal-frame = { path = "../frame" }
@@ -24,7 +28,7 @@ rustix-openpty = "0.2.0"
 rustix = { version = "1", features = ["std", "termios"] }
 # `setsid`/`TIOCSCTTY`/`signal` in the child's `pre_exec`, `poll`, `kill`, `waitpid`, `getpwuid_r`.
 libc = "0.2"
-skia-safe = "0.156.0"
+skia-safe = { version = "0.156.0", optional = true }
 # How many cells an input method's preedit character takes (`src/preedit.rs`): the same crate and
 # version `alacritty_terminal` measures printed characters with, so a committed `你好` lands in the
 # cells its preedit showed. Already in the graph; this adds no crate.
@@ -37,3 +41,36 @@ serde = { version = "1", features = ["derive"] }
 log = "0.4"
 # A replay's serialisation round trip. Already in the lock through `eitri-core`.
 serde_json = "1"
+
+# These integration targets use Skia directly or through their shared raster helpers.
+[[test]]
+name = "corpus"
+required-features = ["paint"]
+
+[[test]]
+name = "golden"
+required-features = ["paint"]
+
+[[test]]
+name = "perf"
+required-features = ["paint"]
+
+[[test]]
+name = "pty"
+required-features = ["paint"]
+
+[[test]]
+name = "render"
+required-features = ["paint"]
+
+[[test]]
+name = "replay_handover"
+required-features = ["paint"]
+
+[[test]]
+name = "session"
+required-features = ["paint"]
+
+[[test]]
+name = "throughput"
+required-features = ["paint"]

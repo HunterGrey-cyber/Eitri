@@ -2646,3 +2646,24 @@ pre.code-block.diagram-drawn > code { display: none; }
 .diagram-scroll { display: block; overflow-x: auto; white-space: normal; }
 .diagram-scroll img { display: block; max-width: 100%; height: auto; }
 .diagram-error { display: block; white-space: normal; color: var(--nv-muted); font-family: var(--nv-font-prose); }
+
+.remote-project-chooser .chooser-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.remote-project-chooser .chooser-row {
+  text-align: start;
+  width: 100%;
+}
+
+.remote-project-chooser .remote-project-actions > button + button {
+  margin-inline-start: 8px;
+}
+
+.remote-project-chooser p, .remote-project-lines {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}

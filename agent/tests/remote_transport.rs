@@ -1015,6 +1015,8 @@ fn helper_major_mismatch_names_both_versions() {
             protocol_major: PROTOCOL_MAJOR + 1,
             protocol_minor: 4,
             helper_version: "9.9.9".into(),
+            daemon_instance: String::new(),
+            boot_id: String::new(),
             ..Default::default()
         })
     });

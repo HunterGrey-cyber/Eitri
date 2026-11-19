@@ -718,6 +718,51 @@ fn handshake_with(
 }
 
 impl ClaudeSidecarProvider {
+    fn queue_steer(
+        &self,
+        request: SteerTurnRequest,
+        stamp: TurnStamp,
+        wait: Option<crate::BeforeSend>,
+    ) -> Result<(), ProviderError> {
+        if !self.capabilities.steer {
+            return Err(ProviderError::UnsupportedCapability("steer"));
+        }
+        self.require_driving()?;
+        let SteerTurnRequest {
+            session_id,
+            expected_turn_id,
+            client_message_id,
+            text,
+            as_typed,
+        } = request;
+        let proto_request = ProtoSteerTurnRequest {
+            session_id,
+            command_id: uuid::Uuid::new_v4().to_string(),
+            expected_turn_id,
+            client_message_id: client_message_id.clone(),
+            text: turn_text(text, stamp.typed_by_person),
+            typed_by_person: stamp.typed_by_person && self.capabilities.human_origin,
+        };
+        if let Some(now) = self.events.open_steer(
+            &client_message_id,
+            as_typed,
+            PendingSteer {
+                request: proto_request,
+                wait,
+            },
+        )? {
+            // Counted before this returns, so a move asked for right after it sees the send in flight.
+            let steering = Steering::begin(&self.events);
+            self.runtime.handle().spawn(send_steers(
+                self.client.clone(),
+                Arc::clone(&self.events),
+                (client_message_id, now),
+                steering,
+            ));
+        }
+        Ok(())
+    }
+
     /// Spawns a fresh sidecar and connects to it, performing the real `Handshake` before returning
     /// -- a provider that constructs successfully has already proven it can talk to a real,
     /// compatible sidecar, not just that a process happened to start.
@@ -2652,36 +2697,16 @@ impl AgentProvider for ClaudeSidecarProvider {
     /// [`steer_turn`](Self::steer_turn), marked as typed by the person when the stamp says so and the
     /// sidecar accepts the mark (capability `human_origin`).
     fn steer_turn_stamped(&self, request: SteerTurnRequest, stamp: TurnStamp) -> Result<(), ProviderError> {
-        if !self.capabilities.steer {
-            return Err(ProviderError::UnsupportedCapability("steer"));
-        }
-        self.require_driving()?;
-        let SteerTurnRequest {
-            session_id,
-            expected_turn_id,
-            client_message_id,
-            text,
-            as_typed,
-        } = request;
-        let proto_request = ProtoSteerTurnRequest {
-            session_id,
-            command_id: uuid::Uuid::new_v4().to_string(),
-            expected_turn_id,
-            client_message_id: client_message_id.clone(),
-            text: turn_text(text, stamp.typed_by_person),
-            typed_by_person: stamp.typed_by_person && self.capabilities.human_origin,
-        };
-        if let Some(now) = self.events.open_steer(&client_message_id, as_typed, proto_request)? {
-            // Counted before this returns, so a move asked for right after it sees the send in flight.
-            let steering = Steering::begin(&self.events);
-            self.runtime.handle().spawn(send_steers(
-                self.client.clone(),
-                Arc::clone(&self.events),
-                (client_message_id, now),
-                steering,
-            ));
-        }
-        Ok(())
+        self.queue_steer(request, stamp, None)
+    }
+
+    fn steer_turn_after(
+        &self,
+        request: SteerTurnRequest,
+        stamp: TurnStamp,
+        wait: crate::BeforeSend,
+    ) -> Result<(), ProviderError> {
+        self.queue_steer(request, stamp, Some(wait))
     }
 
     fn stop_task(&self, session_id: &str, task_id: &str) -> Result<crate::TaskReply<()>, ProviderError> {
@@ -3138,7 +3163,7 @@ struct QueueState {
     /// The most ever queued at once, held events included.
     peak_bytes: usize,
     overflowed: bool,
-    gate: steer::SteerGate<ProtoSteerTurnRequest>,
+    gate: steer::SteerGate<PendingSteer>,
     /// The watch's position after the last wire event queued.
     latest: Option<WatchMark>,
     /// The position after the last wire event whose translation is all in `ready` (or was taken):
@@ -3453,8 +3478,8 @@ impl EventQueue {
         &self,
         client_id: &str,
         as_typed: String,
-        request: ProtoSteerTurnRequest,
-    ) -> Result<Option<ProtoSteerTurnRequest>, ProviderError> {
+        request: impl Into<PendingSteer>,
+    ) -> Result<Option<PendingSteer>, ProviderError> {
         let mut state = self.lock();
         if state.overflowed {
             return Err(ProviderError::Provider {
@@ -3462,7 +3487,8 @@ impl EventQueue {
                 message: EVENT_QUEUE_LOST.into(),
             });
         }
-        let turn_id = request.expected_turn_id.clone();
+        let request = request.into();
+        let turn_id = request.request.expected_turn_id.clone();
         let opened = state.gate.open(&turn_id, client_id, as_typed, request)?;
         state.opened_since_take = true;
         Ok(opened)
@@ -3600,7 +3626,7 @@ impl EventQueue {
     }
 
     /// Records an accepted message; the next one to send, if one waits.
-    fn steer_accepted(&self, client_id: &str) -> Option<(String, ProtoSteerTurnRequest)> {
+    fn steer_accepted(&self, client_id: &str) -> Option<(String, PendingSteer)> {
         self.lock().gate.accepted(client_id)
     }
 
@@ -3699,14 +3725,39 @@ impl Drop for Answering {
     }
 }
 
+struct PendingSteer {
+    request: ProtoSteerTurnRequest,
+    wait: Option<crate::BeforeSend>,
+}
+
+#[cfg(test)]
+impl From<ProtoSteerTurnRequest> for PendingSteer {
+    fn from(request: ProtoSteerTurnRequest) -> Self {
+        Self { request, wait: None }
+    }
+}
+
 async fn send_steers(
     client: RuntimeClient,
     events: Arc<EventQueue>,
-    first: (String, ProtoSteerTurnRequest),
+    first: (String, PendingSteer),
     _steering: Steering,
 ) {
     let mut next = Some(first);
-    while let Some((id, request)) = next.take() {
+    while let Some((id, PendingSteer { request, wait })) = next.take() {
+        if let Some(wait) = wait {
+            match tokio::task::spawn_blocking(wait).await {
+                Ok(Ok(())) => {}
+                Ok(Err(why)) => {
+                    events.steer_refused(&id, &why);
+                    return;
+                }
+                Err(_) => {
+                    events.steer_refused(&id, "the sync worker stopped");
+                    return;
+                }
+            }
+        }
         let mut client = client.clone();
         let answer = tokio::time::timeout(UNARY_RPC_TIMEOUT, client.steer_turn(request)).await;
         next = match answer {
@@ -5995,6 +6046,25 @@ mod tests {
             assert_eq!(state.gate.held_bytes(), 0);
             assert_eq!(state.ready_bytes, state.ready.iter().map(event_bytes).sum::<usize>());
         });
+    }
+
+    #[test]
+    fn a_steer_withheld_in_its_wait_is_dropped_before_the_rpc_with_the_wait_reason() {
+        for why in [crate::STOPPED_BEFORE_SEND, crate::SESSION_ENDED_BEFORE_SEND] {
+            current_thread_runtime().block_on(async {
+                let queue = Arc::new(EventQueue::default());
+                let wait = PendingSteer {
+                    request: ProtoSteerTurnRequest::default(),
+                    wait: Some(Box::new(move || Err(why.to_string()))),
+                };
+                let first = queue.open_steer("m", "typed".into(), wait).unwrap().unwrap();
+                let channel = tonic::transport::Endpoint::from_static("http://[::1]:1").connect_lazy();
+                let client = RuntimeServiceClient::with_interceptor(channel, CallMetadata::new(vec![]).unwrap());
+                send_steers(client, queue.clone(), ("m".into(), first), Steering::begin(&queue)).await;
+                assert!(matches!(queue.take().as_slice(), [AgentDomainEvent::UserMessageDropped { client_message_id, reason, .. }]
+                    if client_message_id == "m" && reason == why));
+            });
+        }
     }
 
     #[test]

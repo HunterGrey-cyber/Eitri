@@ -11,6 +11,7 @@ use agent::remote_client::{self as wire, HelperClient, HelperConnections, Sideca
 use agent::setting_sources::ProjectTrust;
 use agent::ssh::{ChannelLauncher, ControlMaster, SshLauncher};
 
+use super::terminal_link::{retry_terminal_connection, TerminalConnection, TerminalLink};
 use super::{RemoteHost, RemoteProject, RemoteProjects};
 use crate::agent_backend::{AgentBackend, BackendError};
 
@@ -32,6 +33,73 @@ pub struct RemoteConnection {
     /// The sidecar directory the helper starts sidecars from, and the SHA-256 it must have.
     sidecar_directory: String,
     sidecar_sha256: String,
+    terminal_clients: Arc<std::sync::Mutex<std::collections::BTreeMap<String, std::sync::Weak<TerminalConnection>>>>,
+    /// Where terminal connections get their channels; `None` uses the agents' launcher (a connection a test made).
+    terminal_route: Option<Arc<dyn TerminalRoute>>,
+    terminal_master: Option<Arc<TerminalMaster>>,
+}
+
+/// Where a window's terminal connections get their channels.
+pub trait TerminalRoute: Send + Sync {
+    /// The launcher a new terminal connection goes through, its connection checked against the project's key
+    /// first. Blocking: a worker's.
+    fn launcher(&self) -> std::io::Result<Arc<dyn ChannelLauncher>>;
+}
+
+/// The ssh master a window's terminals go through: the host's second master ([`ControlMaster::ensure_terminal_with_key`]),
+/// so a terminal printing without pause cannot hold the agents' channels up inside one TCP connection. Started by
+/// the first terminal connection: a terminal link's, or the one that sends terminal stops queued while the server
+/// was out of reach (at window open, inside that stop's time budget). Nothing else starts it.
+pub struct TerminalMaster {
+    agents: ControlMaster,
+    pinned: String,
+    started: std::sync::Mutex<Option<ControlMaster>>,
+}
+
+impl TerminalMaster {
+    /// Starts the master (or a new one for one that died), under its own lock and from the agents' master's argv,
+    /// then refuses it unless the key it verified is the project's: no channel is opened over a master that shows
+    /// another key, and that key is never written to any record. Blocking: a worker's.
+    fn ensure(&self) -> std::io::Result<ControlMaster> {
+        let master = self.agents.ensure_terminal_with_key(&self.pinned)?;
+        *self.started.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(master.clone());
+        Ok(master)
+    }
+
+    /// The master once a terminal connection started it and found the project's key, for the window's checks
+    /// after a resume or a network change; `None` before that.
+    pub fn started(&self) -> Option<ControlMaster> {
+        self.started
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+}
+
+/// Terminal connections over the terminals' own master, routed and checked as the agents' are: the same recorded
+/// helpers, a checked START before a connection's first channel, and the capabilities Hello reported for each
+/// installation.
+struct SshTerminals {
+    master: Arc<TerminalMaster>,
+    host: RemoteHost,
+    installation: String,
+    installation_args: Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
+}
+
+impl TerminalRoute for SshTerminals {
+    fn launcher(&self) -> std::io::Result<Arc<dyn ChannelLauncher>> {
+        let master = self.master.ensure()?;
+        Ok(Arc::new(InstalledLauncher {
+            base: Arc::new(SshLauncher {
+                master,
+                helper: self.host.data_dir.join(&self.installation).join("bin/eitri-server"),
+            }),
+            host: self.host.clone(),
+            installation: self.installation.clone(),
+            installation_args: Arc::clone(&self.installation_args),
+            checked_start: false.into(),
+        }))
+    }
 }
 
 impl RemoteConnection {
@@ -59,11 +127,25 @@ impl RemoteConnection {
             master: master.clone(),
             helper: host.data_dir.join(version).join("bin/eitri-server"),
         });
-        Self::open(launcher, &verified, project, &host, version, sidecar_revision)
+        let terminals = TerminalMaster {
+            agents: master.clone(),
+            pinned: project.host_key_sha256.clone(),
+            started: Default::default(),
+        };
+        Self::open_with(
+            launcher,
+            Some(terminals),
+            &verified,
+            project,
+            &host,
+            version,
+            sidecar_revision,
+        )
     }
 
     /// [`Self::open_over_ssh`] over any launcher: `verified_host_key` is the key the connection under it
     /// showed, and `host` the record kept under that key.
+    /// Terminals go through `launcher` too.
     pub fn open(
         launcher: Arc<dyn ChannelLauncher>,
         verified_host_key: &str,
@@ -72,24 +154,52 @@ impl RemoteConnection {
         version: &str,
         sidecar_revision: &str,
     ) -> Result<Self, String> {
+        Self::open_with(
+            launcher,
+            None,
+            verified_host_key,
+            project,
+            host,
+            version,
+            sidecar_revision,
+        )
+    }
+
+    fn open_with(
+        launcher: Arc<dyn ChannelLauncher>,
+        terminals: Option<TerminalMaster>,
+        verified_host_key: &str,
+        project: &RemoteProject,
+        host: &RemoteHost,
+        version: &str,
+        sidecar_revision: &str,
+    ) -> Result<Self, String> {
         let (sidecar_directory, sidecar_sha256) =
             installed_sidecar(verified_host_key, project, host, version, sidecar_revision)?;
+        // What Hello says an installation supports holds whichever connection asked it.
+        let installation_args: Arc<std::sync::Mutex<_>> = Default::default();
         let launcher = Arc::new(InstalledLauncher {
             base: launcher,
             host: host.clone(),
             installation: version.to_owned(),
-            installation_args: Default::default(),
+            installation_args: Arc::clone(&installation_args),
             checked_start: true.into(),
         });
         let client = HelperClient::connect_daemon(launcher, &project.host, Some(&project.host_key_sha256), version)
             .map_err(|error| error.to_string())?
             .with_installations(host.helpers.keys().cloned());
-        Ok(Self::with_client(
-            client,
-            project.clone(),
-            sidecar_directory,
-            sidecar_sha256,
-        ))
+        let mut connection = Self::with_client(client, project.clone(), sidecar_directory, sidecar_sha256);
+        if let Some(terminals) = terminals {
+            let master = Arc::new(terminals);
+            connection.terminal_master = Some(Arc::clone(&master));
+            connection.terminal_route = Some(Arc::new(SshTerminals {
+                master,
+                host: host.clone(),
+                installation: version.to_owned(),
+                installation_args,
+            }));
+        }
+        Ok(connection)
     }
 
     /// A connection already open, with the sidecar directory and hash the helper checks: the way a test
@@ -105,11 +215,90 @@ impl RemoteConnection {
             project,
             sidecar_directory,
             sidecar_sha256,
+            terminal_clients: Default::default(),
+            terminal_route: None,
+            terminal_master: None,
+        }
+    }
+
+    /// Sends this connection's terminals through `route` instead of the agents' launcher.
+    pub fn with_terminal_route(mut self, route: Arc<dyn TerminalRoute>) -> Self {
+        self.terminal_route = Some(route);
+        self
+    }
+
+    /// The terminals' own ssh master, for a connection opened over ssh.
+    pub fn terminal_master(&self) -> Option<Arc<TerminalMaster>> {
+        self.terminal_master.clone()
+    }
+
+    /// A new helper connection for terminals, routed to `installation`, over the terminals' own route. Blocking.
+    fn terminal_client(&self, installation: &str) -> std::io::Result<HelperClient> {
+        match &self.terminal_route {
+            Some(route) => self
+                .client
+                .terminal_connection_through(installation, || route.launcher()),
+            None => self.client.terminal_connection(installation),
+        }
+    }
+
+    /// Opens the terminal's own helper connection over the terminals' route, through the installation that owns it.
+    /// A transient connection failure starts a link that backs off and retries that route. Construction belongs on
+    /// the window's worker, and every later link call is nonblocking.
+    pub fn terminal_link(
+        &self,
+        options: super::terminal_link::TerminalLinkOptions,
+        facts: super::terminal_facts::TerminalFactsHandle,
+    ) -> std::io::Result<TerminalLink> {
+        self.client.link_checker(Some(&self.project.host_key_sha256))?;
+        let installation = if options.installation.is_empty() {
+            self.client.daemon()
+        } else {
+            &options.installation
+        };
+        match self.open_terminal_connection(installation) {
+            Ok(connection) => TerminalLink::on_connection(connection, options, facts),
+            Err(error) if retry_terminal_connection(&error) => {
+                let installation = installation.to_owned();
+                let connection = self.clone();
+                TerminalLink::retry_connection(self.client.clone(), error, options, facts, move || {
+                    connection.open_terminal_connection(&installation)
+                })
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    fn open_terminal_connection(&self, installation: &str) -> std::io::Result<Arc<TerminalConnection>> {
+        if let Some(connection) = self
+            .terminal_clients
+            .lock()
+            .unwrap()
+            .get(installation)
+            .and_then(std::sync::Weak::upgrade)
+        {
+            return Ok(connection);
+        }
+        // Connecting may wait for the server; other installations can open throughout that wait.
+        let opened = TerminalConnection::new(self.terminal_client(installation)?)?;
+        let mut connections = self.terminal_clients.lock().unwrap();
+        connections.retain(|_, client| client.strong_count() > 0);
+        if let Some(existing) = connections.get(installation).and_then(std::sync::Weak::upgrade) {
+            drop(connections);
+            Ok(existing)
+        } else {
+            connections.insert(installation.to_owned(), Arc::downgrade(&opened));
+            Ok(opened)
         }
     }
 
     pub fn project(&self) -> &RemoteProject {
         &self.project
+    }
+
+    /// A worker's independent terminal-service connection, routed to the terminal's owning installation.
+    pub(super) fn terminal_control(&self, installation: &str) -> std::io::Result<HelperClient> {
+        self.terminal_client(installation)
     }
 
     pub fn host(&self) -> &str {
@@ -267,6 +456,12 @@ impl RemoteConnection {
     pub fn watch_modes(&self, request: wire::WatchModesRequest) -> Result<wire::WatchModesResponse, String> {
         self.require_capability(wire::CAP_SYNC_MODES)?;
         self.client.watch_modes(request).map_err(|error| error.to_string())
+    }
+
+    /// The host key the connection now shows when ssh accepted one other than the project's
+    /// ([`HelperClient::shown_other_host_key`]). Blocking: it reads ssh's record of the master's key.
+    pub fn changed_host_key(&self) -> Result<Option<String>, String> {
+        self.client.shown_other_host_key()
     }
 
     /// The mode keepers' lines from a fresh Hello (every Hello repeats them; the caller keeps what it showed).
@@ -453,7 +648,8 @@ struct InstalledLauncher {
     base: Arc<dyn ChannelLauncher>,
     host: RemoteHost,
     installation: String,
-    installation_args: std::sync::Mutex<std::collections::HashSet<String>>,
+    /// Installations whose Hello reported `installation-args`, shared by the agents' and the terminals' launchers.
+    installation_args: Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
     /// The window completed this installation's checked START before opening its first channel.
     checked_start: std::sync::atomic::AtomicBool,
 }
@@ -553,6 +749,9 @@ impl ChannelLauncher for InstalledLauncher {
     }
     fn host_key(&self) -> Option<std::io::Result<String>> {
         self.base.host_key()
+    }
+    fn settled_host_key(&self) -> Option<std::io::Result<String>> {
+        self.base.settled_host_key()
     }
 }
 
@@ -674,6 +873,101 @@ mod tests {
             );
         }
         check_capability("example-host", &capabilities, wire::CAP_SYNC_FILES).unwrap();
+    }
+
+    #[test]
+    fn a_first_terminal_connection_failure_retries_without_a_new_link() {
+        use super::super::terminal_facts::TerminalFactsHandle;
+        use super::super::terminal_link::{TerminalLinkOptions, TerminalTarget};
+        use eitri_terminal::mirror::{LinkItem, LinkState, TermLink};
+        use std::io;
+        use std::process::{Child, Command, Stdio};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::time::{Duration, Instant};
+
+        struct Helper(bool);
+        impl ChannelLauncher for Helper {
+            fn spawn(&self, _: &[std::ffi::OsString]) -> io::Result<Child> {
+                if self.0 {
+                    return Err(io::ErrorKind::ConnectionRefused.into());
+                }
+                // An HTTP/2 SETTINGS frame completes the stdio handshake. Leave the pipe open so
+                // the test can observe the recovered connection while its Hello is in flight.
+                Command::new("sh")
+                    .args([
+                        "-c",
+                        r"printf '\000\000\000\004\000\000\000\000\000'; exec cat >/dev/null",
+                    ])
+                    .stdin(Stdio::piped())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped())
+                    .spawn()
+            }
+
+            fn host_key(&self) -> Option<io::Result<String>> {
+                Some(Ok(project().host_key_sha256))
+            }
+        }
+
+        #[derive(Default)]
+        struct Route(AtomicUsize);
+        impl TerminalRoute for Route {
+            fn launcher(&self) -> io::Result<Arc<dyn ChannelLauncher>> {
+                match self.0.fetch_add(1, Ordering::SeqCst) {
+                    0 => Err(io::ErrorKind::ConnectionRefused.into()),
+                    attempt => Ok(Arc::new(Helper(attempt == 1))),
+                }
+            }
+        }
+
+        let project = project();
+        let client =
+            HelperClient::connect(Arc::new(Helper(false)), &project.host, Some(&project.host_key_sha256)).unwrap();
+        let connection = RemoteConnection::with_client(client, project, String::new(), String::new())
+            .with_terminal_route(Arc::new(Route::default()));
+        let options = TerminalLinkOptions {
+            installation: "fixture".into(),
+            target: TerminalTarget::Open {
+                command_id: "open".into(),
+                cwd: "/srv/project".into(),
+            },
+            size: eitri_terminal::PtySize {
+                cols: 80,
+                rows: 24,
+                cell_width_px: 8,
+                cell_height_px: 16,
+            },
+            colors: Default::default(),
+        };
+        let mut link = connection
+            .terminal_link(options, TerminalFactsHandle::default())
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(60);
+        loop {
+            if connection
+                .terminal_clients
+                .lock()
+                .unwrap()
+                .get("fixture")
+                .is_some_and(|client| client.strong_count() > 0)
+            {
+                break;
+            }
+            assert!(Instant::now() < deadline, "the terminal connection never recovered");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let attempts: Vec<_> = link
+            .take()
+            .into_iter()
+            .filter_map(|item| match item {
+                LinkItem::Link {
+                    state: LinkState::Reconnecting { attempt, .. },
+                    ..
+                } => Some(attempt),
+                _ => None,
+            })
+            .collect();
+        assert!(attempts.starts_with(&[1, 2]), "startup retry attempts: {attempts:?}");
     }
 
     #[test]
@@ -954,6 +1248,143 @@ mod tests {
             .message
             .contains("keeps running there"));
         assert_eq!(with_kept_stop(failed(), None, &project.host).message, failed().message);
+    }
+
+    /// A window's terminals get the host's second master, started by the first terminal connection and not
+    /// before, and only while it shows the project's key: a launcher over it reads that master's record of the key,
+    /// never the agents'.
+    #[test]
+    fn terminals_go_through_their_own_master_checked_against_the_project_key() {
+        crate::remote_host::tests::isolated(
+            "remote_project::connection::tests::terminals_go_through_their_own_master_checked_against_the_project_key",
+            |dir| {
+                let observe = |record: &Path, key: &str| {
+                    assert_eq!(
+                        agent::ssh::known_hosts::probe_main(&[
+                            record.into(),
+                            "example-host".into(),
+                            "ssh-ed25519".into(),
+                            key.into()
+                        ]),
+                        0
+                    );
+                };
+                let read = |record: &Path| agent::ssh::known_hosts::read_key(record).unwrap().sha256;
+                let exits = || std::fs::read_to_string(dir.join("exits")).unwrap_or_default();
+                let agents = ControlMaster::ensure("example-host", dir, Path::new("/eitri")).unwrap();
+                observe(&agents.host_key_record, "SHA256:example");
+                let master = Arc::new(TerminalMaster {
+                    agents: agents.clone(),
+                    pinned: "SHA256:example".into(),
+                    started: Default::default(),
+                });
+                let route = SshTerminals {
+                    master: master.clone(),
+                    host: host(true),
+                    installation: "0.3.0-a-b".into(),
+                    installation_args: Default::default(),
+                };
+                assert!(master.started().is_none());
+                assert_eq!(std::fs::read_to_string(dir.join("starts")).unwrap(), "start\n");
+                std::fs::remove_file(dir.join("live")).unwrap();
+
+                // A newly started master without a recorded key is refused and closed.
+                assert_eq!(route.launcher().err().unwrap().kind(), std::io::ErrorKind::NotFound);
+                assert!(master.started().is_none());
+                assert_eq!(std::fs::read_to_string(dir.join("starts")).unwrap(), "start\nstart\n");
+                assert_eq!(exits(), "exit\n");
+                assert!(!dir.join("live").exists());
+
+                // The next master shows another key: refused, closed, and its record left as ssh wrote it.
+                let record = std::path::PathBuf::from(format!("{}-t", agents.host_key_record.display()));
+                std::fs::write(dir.join("master-fingerprint"), "SHA256:other").unwrap();
+                let refused = route.launcher().err().unwrap();
+                assert_eq!(refused.kind(), std::io::ErrorKind::PermissionDenied);
+                assert!(refused.to_string().contains("SHA256:other"), "{refused}");
+                assert!(master.started().is_none());
+                assert_eq!(read(&record), "SHA256:other", "the record is left as ssh wrote it");
+                assert_eq!(exits(), "exit\nexit\n");
+                let argv = std::fs::read_to_string(dir.join("argv")).unwrap();
+                let exit_at = argv.rfind("\nexit\n").unwrap();
+                let socket = format!("{}-t", agents.control_path.display());
+                assert!(
+                    argv[..exit_at].rfind(&socket) > argv[..exit_at].rfind("BEGIN"),
+                    "{argv}"
+                );
+
+                std::fs::write(dir.join("master-fingerprint"), "SHA256:example").unwrap();
+                let launcher = route.launcher().unwrap();
+                assert_eq!(exits(), "exit\nexit\n");
+                let started = master.started().unwrap();
+                assert_eq!(
+                    started.control_path,
+                    std::path::PathBuf::from(format!("{}-t", agents.control_path.display()))
+                );
+                assert_eq!(started.host_key_record, record);
+                observe(&record, "SHA256:later");
+                assert_eq!(launcher.host_key().unwrap().unwrap(), "SHA256:later");
+                assert_eq!(read(&agents.host_key_record), "SHA256:example");
+                assert_eq!(
+                    std::fs::read_to_string(dir.join("starts")).unwrap(),
+                    "start\nstart\nstart\nstart\n"
+                );
+            },
+        );
+    }
+
+    #[test]
+    fn a_stale_pin_or_slow_check_leaves_the_shared_terminal_master_running() {
+        crate::remote_host::tests::isolated(
+            "remote_project::connection::tests::a_stale_pin_or_slow_check_leaves_the_shared_terminal_master_running",
+            |dir| {
+                let agents = ControlMaster::ensure("example-host", dir, Path::new("/eitri")).unwrap();
+                std::fs::remove_file(dir.join("live")).unwrap();
+                std::fs::write(dir.join("master-fingerprint"), "SHA256:example").unwrap();
+                let window = |pin: &str| TerminalMaster {
+                    agents: agents.clone(),
+                    pinned: pin.into(),
+                    started: Default::default(),
+                };
+                let owner = window("SHA256:example");
+                let live = owner.ensure().unwrap();
+                let stale = window("SHA256:other");
+                let refused = stale.ensure().unwrap_err();
+                assert_eq!(refused.kind(), std::io::ErrorKind::PermissionDenied);
+                assert!(refused.to_string().contains("SHA256:example"));
+                assert!(stale.started().is_none());
+                assert!(!dir.join("exits").exists());
+
+                let other = window("SHA256:example");
+                std::fs::write(dir.join("slow-check"), "").unwrap();
+                let refused = other.ensure().unwrap_err();
+                assert!(refused.to_string().contains("ssh timed out"), "{refused}");
+                assert!(other.started().is_none());
+                assert!(live.check(std::time::Duration::from_secs(2)));
+                assert_eq!(other.ensure().unwrap().control_path, live.control_path);
+
+                std::fs::remove_file(&live.host_key_record).unwrap();
+                let unreadable = window("SHA256:example");
+                assert_eq!(unreadable.ensure().unwrap_err().kind(), std::io::ErrorKind::NotFound);
+                assert!(unreadable.started().is_none());
+                assert!(live.check(std::time::Duration::from_secs(2)));
+                assert!(!dir.join("exits").exists());
+                assert_eq!(std::fs::read_to_string(dir.join("starts")).unwrap(), "start\nstart\n");
+            },
+        );
+    }
+
+    #[test]
+    fn a_slow_agents_master_check_starts_a_new_master() {
+        crate::remote_host::tests::isolated(
+            "remote_project::connection::tests::a_slow_agents_master_check_starts_a_new_master",
+            |dir| {
+                let agents = ControlMaster::ensure("example-host", dir, Path::new("/eitri")).unwrap();
+                std::fs::write(dir.join("slow-check"), "").unwrap();
+                let restarted = ControlMaster::ensure("example-host", dir, Path::new("/eitri")).unwrap();
+                assert_eq!(restarted.control_path, agents.control_path);
+                assert_eq!(std::fs::read_to_string(dir.join("starts")).unwrap(), "start\nstart\n");
+            },
+        );
     }
 
     fn project() -> RemoteProject {

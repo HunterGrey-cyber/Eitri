@@ -1088,7 +1088,13 @@ pub(super) fn handle_inbound_message(
             let tab = tab_of(target);
             // The desk's `!` line is the desk's to stop first; only then the agent's work. A remote tab's interrupt
             // crosses the network, so it is asked off this thread and its command answered once the provider has.
-            let outcome = if state.tabs.interrupt_shell_line(tab) {
+            let stopped = state.tabs.cancel_sync_send(tab);
+            if let Some(texts) = &stopped {
+                out.send(view, eitri_core::agent_bridge::serialize_queue_taken_for_js(tab, texts));
+                send_queue(state, tab, &mut out);
+            }
+            let stopped_idle = stopped.is_some() && !state.tabs.get(tab).is_some_and(|t| t.turn_running());
+            let outcome = if stopped_idle || state.tabs.interrupt_shell_line(tab) {
                 Ok(())
             } else if state.tabs.sends_off_thread(tab) {
                 match state.tabs.interrupt_spawned(tab) {
@@ -2896,6 +2902,141 @@ mod tests {
             "no session was started for it"
         );
         assert!(provider.turns().is_empty());
+        shut_down_every_tab(&handle);
+    }
+
+    #[test]
+    fn interrupt_returns_the_waiting_send_to_the_draft_without_interrupting_the_provider() {
+        interrupt_during_sync(false);
+    }
+
+    #[test]
+    fn interrupt_returns_the_waiting_steer_and_interrupts_its_running_turn() {
+        interrupt_during_sync(true);
+    }
+
+    fn interrupt_during_sync(steer: bool) {
+        use std::sync::{mpsc, Arc, Mutex};
+        use std::time::Duration;
+
+        agent::state_dirs::redirect_state_to_a_test_root();
+        let dir = agent::state_dirs::test_workspace_dir("panel-sync-interrupt");
+        let (handle, page, _) = handle_with_two_pages();
+        handle.state.borrow_mut().project_dir = dir.clone();
+        let (tab, provider) = remote_live_tab(&handle, &dir, RecordingProvider::steering());
+        let (release, wait) = mpsc::channel();
+        let wait = Mutex::new(wait);
+        let (entered, editor_query) = mpsc::channel();
+        handle.set_sync_port(Some(eitri_core::remote_sync::flush::SendPort {
+            key: "SHA256:example".into(),
+            root: "/srv/project".into(),
+            host: "example-host".into(),
+            cap: Duration::from_secs(3),
+            sync: Err("offline".into()),
+            saved: Arc::new(move |cursor, _| {
+                entered.send(()).unwrap();
+                wait.lock().unwrap().recv_timeout(Duration::from_secs(10)).unwrap();
+                Ok((cursor, vec![]))
+            }),
+        }));
+        handle.tick();
+        if steer {
+            provider.queue(agent::AgentDomainEvent::TurnStarted { turn_id: "t".into() });
+            tick_handle_until(&handle, "the running turn", || handle.tab_has_work(tab));
+        }
+        let send = if steer {
+            serde_json::json!({"type": "queue_message", "request_id": "s", "tab": tab.0, "text": "original", "turn_id": "t"}).to_string()
+        } else {
+            message("send_message", "s", tab, "original")
+        };
+        handle.page_message(ViewId::BASE, &send);
+        editor_query.recv_timeout(Duration::from_secs(10)).unwrap();
+        tick_handle_until(&handle, "the sync wait", || {
+            page.sent
+                .borrow()
+                .iter()
+                .map(|p| json_of(p))
+                .any(|v| v["kind"] == "send_sync" && v["waiting"] == true)
+        });
+        handle.state.borrow_mut().tabs.set_draft(tab, "typed since");
+        handle.page_message(ViewId::BASE, &message("interrupt", "i", tab, ""));
+        tick_handle_until(&handle, "the interrupt", || {
+            result_for(&page.sent.borrow(), "i").is_some()
+        });
+        assert_eq!(result_for(&page.sent.borrow(), "i"), Some(Ok(())));
+        assert_eq!(
+            handle.state.borrow().tabs.get(tab).unwrap().draft(),
+            "original\n\ntyped since"
+        );
+        assert!(page
+            .sent
+            .borrow()
+            .iter()
+            .map(|p| json_of(p))
+            .any(|v| v["kind"] == "queue_taken" && v["texts"] == serde_json::json!(["original"])));
+        release.send(()).unwrap();
+        tick_handle_until(&handle, "the cancelled send", || {
+            result_for(&page.sent.borrow(), "s").is_some()
+        });
+        assert_eq!(
+            result_for(&page.sent.borrow(), "s"),
+            if steer {
+                Some(Ok(()))
+            } else {
+                Some(Err(agent::STOPPED_BEFORE_SEND.into()))
+            }
+        );
+        assert!(provider.turns().is_empty());
+        assert!(provider.steers().is_empty());
+        assert_eq!(provider.interrupts(), usize::from(steer));
+        shut_down_every_tab(&handle);
+    }
+
+    /// A Stop made while a remote send's call is out, answered as busy because the agent was already running a turn,
+    /// stops that turn and puts the message back in the page's box instead of holding it to steer into the turn.
+    #[test]
+    fn a_stop_owed_to_a_send_refused_as_busy_stops_the_turn_and_returns_the_text() {
+        use std::sync::Arc;
+        use std::time::Duration;
+
+        agent::state_dirs::redirect_state_to_a_test_root();
+        let dir = agent::state_dirs::test_workspace_dir("panel-busy-stop");
+        let (handle, page, _) = handle_with_two_pages();
+        handle.state.borrow_mut().project_dir = dir.clone();
+        let (tab, provider) = remote_live_tab(&handle, &dir, RecordingProvider::steering());
+        handle.set_sync_port(Some(eitri_core::remote_sync::flush::SendPort {
+            key: "SHA256:example".into(),
+            root: "/srv/project".into(),
+            host: "example-host".into(),
+            cap: Duration::from_secs(3),
+            sync: Err("offline".into()),
+            saved: Arc::new(|cursor, _| Ok((cursor, vec![]))),
+        }));
+        handle.tick();
+        let release = provider.hold_calls();
+        handle.page_message(ViewId::BASE, &message("send_message", "s", tab, "original"));
+        tick_handle_until(&handle, "the send's call", || provider.calls_waiting() > 0);
+        handle.page_message(ViewId::BASE, &message("interrupt", "i", tab, ""));
+        provider.refuse_sends(true);
+        drop(release);
+        tick_handle_until(&handle, "the refused send", || {
+            result_for(&page.sent.borrow(), "s").is_some()
+        });
+        assert_eq!(
+            result_for(&page.sent.borrow(), "s"),
+            Some(Err(agent::STOPPED_BEFORE_SEND.into()))
+        );
+        assert!(page
+            .sent
+            .borrow()
+            .iter()
+            .map(|p| json_of(p))
+            .any(|v| v["kind"] == "queue_taken" && v["texts"] == serde_json::json!(["original"])));
+        assert_eq!(handle.state.borrow().tabs.get(tab).unwrap().draft(), "original");
+        assert!(handle.state.borrow().tabs.get(tab).unwrap().session.queue.is_empty());
+        tick_handle_until(&handle, "the stop", || result_for(&page.sent.borrow(), "i").is_some());
+        assert_eq!(result_for(&page.sent.borrow(), "i"), Some(Ok(())));
+        assert_eq!(provider.interrupts(), 1);
         shut_down_every_tab(&handle);
     }
 

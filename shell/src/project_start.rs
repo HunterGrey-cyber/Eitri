@@ -1,5 +1,8 @@
 //! Starting another project's window: a process of its own, which this window neither waits for nor takes down.
 
+#[path = "project_start/remote.rs"]
+pub(crate) mod remote;
+
 use eitri_core::nvim_bin::{self, NEOVIM_BIN_ENV};
 use std::ffi::{OsStr, OsString};
 use std::io;
@@ -41,6 +44,7 @@ pub(crate) fn exe_to_start(current: io::Result<PathBuf>, exists: &dyn Fn(&Path) 
 /// A started child. `ended` carries one message, its exit: the code, or `None` for a death by signal. A sender gone
 /// with no message means the exit could not be read, which says nothing about how the child is doing.
 pub(crate) struct Started {
+    pub pid: u32,
     pub ended: mpsc::Receiver<Option<i32>>,
 }
 
@@ -67,6 +71,8 @@ pub(crate) enum How {
     Raise(PathBuf),
     /// Be a window of the path, as any launch is: `-- <path>`.
     Plain(PathBuf),
+    /// Open the remote project using its recorded host.
+    Remote { host: String, path: PathBuf },
 }
 
 /// What a start comes to: as [`Started::failed_within`], and a spawn that failed has no exit code to report.
@@ -86,6 +92,10 @@ fn command(exe: &Path, flags: &[OsString], how: How, token: Option<&str>) -> Com
             path
         }
         How::Plain(path) => path,
+        How::Remote { host, path } => {
+            command.arg("--ssh").arg(host);
+            path
+        }
     };
     command.arg("--").arg(path);
     // A token is good for one launch, so one this process was itself started with must not reach the child.
@@ -152,15 +162,15 @@ pub(crate) fn start(exe: &Path, flags: &[OsString], how: How, token: Option<&str
                     return;
                 }
             };
-            let _ = spawned.send(Ok(()));
+            let _ = spawned.send(Ok(child.id()));
             if let Ok(status) = child.wait() {
                 let _ = exited.send(status.code());
             }
         })?;
-    spawn_result
+    let pid = spawn_result
         .recv()
         .map_err(|_| io::Error::other("the start's thread ended before it spawned"))??;
-    Ok(Started { ended })
+    Ok(Started { pid, ended })
 }
 
 #[cfg(test)]
@@ -370,7 +380,7 @@ mod tests {
     fn an_exit_nobody_could_read_is_not_a_failure() {
         let (sender, ended) = mpsc::channel();
         drop(sender);
-        assert_eq!(Started { ended }.failed_within(PATIENCE), None);
+        assert_eq!(Started { pid: 0, ended }.failed_within(PATIENCE), None);
     }
 
     /// Not a test of its own: [`the_child_outlives_the_starter`] runs this binary with only this test, as the process

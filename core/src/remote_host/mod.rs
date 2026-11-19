@@ -2,7 +2,10 @@
 
 pub mod cli;
 pub mod cli_sync;
+pub mod first_connect;
 pub mod first_contact;
+pub mod folders;
+pub mod host_list;
 pub mod install;
 pub mod manifest;
 pub mod probe_step;
@@ -16,7 +19,7 @@ pub use first_contact::{accept_first_contact, first_contact, FirstContact};
 pub use resume::{on_resume, ResumeAction};
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::os::unix::fs::PermissionsExt;
     use std::path::Path;
     use std::process::Command;
@@ -154,7 +157,9 @@ for arg do
     previous=$arg
 done
 case "$op" in
-    check) test -f "$state/live"; exit $? ;;
+    check)
+        if [ -f "$state/slow-check" ]; then rm "$state/slow-check"; exec sleep 60; fi
+        test -f "$state/live"; exit $? ;;
     exit) rm -f "$state/live"; echo exit >> "$state/exits"; exit 0 ;;
 esac
 if [ "$previous" = "sh -c 'true'" ]; then
@@ -197,6 +202,9 @@ if [ -n "$contact" ]; then
     exit 255
 fi
 echo start >> "$state/starts"
+if [ -f "$state/master-fingerprint" ] && [ -n "$observer" ]; then
+    printf '["example-host","ssh-ed25519","%s"]' "$(cat "$state/master-fingerprint")" > "$observer"; chmod 600 "$observer"
+fi
 touch "$state/live"
 "##).unwrap();
         std::fs::set_permissions(&ssh, std::fs::Permissions::from_mode(0o700)).unwrap();

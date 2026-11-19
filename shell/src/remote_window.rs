@@ -1,7 +1,8 @@
 //! A window's project origin, and a remote project's window reaching its server.
 //!
 //! **At launch, before GTK.** The command line and the remote project records decide the origin
-//! (`remote_project::decide_origin`): a root with a record opens as remote, `--ssh <host>` needs one, `--local` opens
+//! (`remote_project::decide_origin`): a root with a record opens as remote, and `--ssh <host>` can start first
+//! connect for a new root before origin resolution. `--local` opens
 //! a remote project's copy as a local project with no agent tabs. A remote origin needs `remote_dev.enabled`, read
 //! from `init.lua` here only when the origin is remote. The origin is also the window's identity:
 //! `eitri_core::remote_project::control_dir` keeps a remote window's open socket apart from its copy's.
@@ -165,7 +166,9 @@ fn carry_saved_roles(base: &Path, keyed: &Path, root: &Path, host_key: &str) {
 enum Report {
     Band(String),
     Sync(SyncEvent),
+    SendPort(Option<eitri_core::remote_sync::flush::SendPort>),
     Opened(Box<Opened>, Option<eitri_core::open_socket::OpenServer>),
+    SyncFailed(String),
     Failed(String),
     Replaced(String),
 }
@@ -206,7 +209,7 @@ pub(crate) fn set_editor(rpc: Rc<dyn eitri_core::editor_rpc::EditorRpc>) {
 }
 
 /// The window's own nvim, asked from the actor's worker: the question is sent to the GTK thread, and the answer
-/// waited for here, at most two seconds each way. No answer (no editor, nvim not running, too slow) is "cannot
+/// waited for here, at most two seconds each way. No answer from an attached editor (nvim down or too slow) is "cannot
 /// tell", which the actor takes as not quiet.
 struct WindowEditor {
     root: PathBuf,
@@ -214,19 +217,43 @@ struct WindowEditor {
 
 impl WindowEditor {
     fn ask(&self) -> Option<EditorAnswer> {
-        let root = self.root.to_str()?.to_owned();
+        self.query(None, Duration::from_secs(4)).ok()
+    }
+
+    /// One question to the window's nvim; the error says which step failed, so a line that says the editor could
+    /// not be asked also says why (the GTK thread busy, no editor yet, nvim slow or refusing, no record of saves).
+    fn query(&self, since: Option<u64>, cap: Duration) -> Result<EditorAnswer, String> {
+        let start = std::time::Instant::now();
+        let root = self.root.to_str().ok_or("the project path is not UTF-8")?.to_owned();
+        let mut args = vec![rmpv::Value::from(root)];
+        args.extend(since.map(rmpv::Value::from));
         let (send, receive) = std::sync::mpsc::channel();
         glib::MainContext::default().invoke(move || {
-            let pending = EDITOR.with(|slot| {
-                slot.borrow()
-                    .as_ref()
-                    .map(|rpc| rpc.exec_lua(UNSAVED_UNDER_LUA, vec![rmpv::Value::from(root)]))
-            });
+            let pending = EDITOR.with(|slot| slot.borrow().as_ref().map(|rpc| rpc.exec_lua(UNSAVED_UNDER_LUA, args)));
             let _ = send.send(pending);
         });
-        let pending = receive.recv_timeout(Duration::from_secs(2)).ok()??;
-        let value = pending.wait(Duration::from_secs(2))?.ok()?;
-        EditorAnswer::from_value(&value)
+        let hop = cap.min(Duration::from_secs(2));
+        let pending = receive
+            .recv_timeout(hop)
+            .map_err(|_| format!("the window did not take the question within {:.1} s", hop.as_secs_f64()))?
+            .ok_or("this window has no editor")?;
+        let wait = cap.saturating_sub(start.elapsed()).min(Duration::from_secs(2));
+        let value = pending
+            .wait(wait)
+            .ok_or_else(|| {
+                format!(
+                    "the editor did not answer within {:.1} s",
+                    start.elapsed().as_secs_f64()
+                )
+            })?
+            .map_err(|error| format!("the editor answered with an error: {error}"))?;
+        if since.is_some() && value.is_nil() {
+            // The record of saves comes with the editor-context snippet, which loads only when its feed started.
+            return Err(
+                "the editor keeps no record of saves in this window (its editor-context feed did not start)".into(),
+            );
+        }
+        EditorAnswer::from_value(&value).ok_or_else(|| "the editor's answer was not understood".to_owned())
     }
 }
 
@@ -249,19 +276,63 @@ impl EditorState for WindowEditor {
     }
 }
 
+pub(crate) fn send_port(
+    settings: &SyncSettings,
+    project: &RemoteProject,
+    has_editor: bool,
+    sync: Result<Arc<dyn eitri_core::remote_sync::actor::SyncHandle>, String>,
+) -> Option<eitri_core::remote_sync::flush::SendPort> {
+    let root = project.root.clone();
+    let editor = WindowEditor { root: root.clone() };
+    settings
+        .send_waits_for_flush
+        .then(|| eitri_core::remote_sync::flush::SendPort {
+            saved: Arc::new(move |cursor, cap| {
+                if !has_editor {
+                    return Ok((cursor, vec![]));
+                }
+                let answer = editor.query(Some(cursor), cap).inspect_err(|why| {
+                    eprintln!("[sync] the send could not ask the editor which files were saved: {why}");
+                })?;
+                let generation = answer.generation().max(cursor);
+                let paths = answer
+                    .saved_after(cursor)
+                    .into_iter()
+                    .filter_map(|path| path.strip_prefix(&editor.root).ok().map(Path::to_owned))
+                    .collect();
+                Ok((generation, paths))
+            }),
+            sync,
+            root,
+            key: project.host_key_sha256.clone(),
+            host: project.host.clone(),
+            cap: settings.flush_cap,
+        })
+}
+
 /// Attaches the window to its project's sync, on the open worker. Mutagen missing, or anything else that keeps sync
 /// from starting, is a band line; the window's tabs work without sync.
-fn start_sync(connection: &RemoteConnection, project: &RemoteProject, tell: &UnboundedSender<Report>) {
+fn start_sync(
+    connection: &RemoteConnection,
+    project: &RemoteProject,
+    tell: &UnboundedSender<Report>,
+    has_editor: bool,
+) {
     {
         let slot = SYNC.lock().unwrap();
         if slot.closed || slot.attached.is_some() {
             return;
         }
     }
-    let band = |line: String| {
-        let _ = tell.unbounded_send(Report::Band(line));
-    };
     let settings = SYNC_SETTINGS.lock().unwrap().clone().unwrap_or_default();
+    let port = |sync| {
+        let send_port = send_port(&settings, project, has_editor, sync);
+        let _ = tell.unbounded_send(Report::SendPort(send_port));
+    };
+    let band = |line: String| {
+        port(Err(line.clone()));
+        let _ = tell.unbounded_send(Report::SyncFailed(line));
+    };
     let Some(state_home) = store().state_home() else {
         band("sync not started: no state home".into());
         return;
@@ -289,9 +360,13 @@ fn start_sync(connection: &RemoteConnection, project: &RemoteProject, tell: &Unb
         actor::Deps {
             engine: Arc::new(engine),
             helper: Arc::new(connection.clone()),
-            editor: Arc::new(WindowEditor {
-                root: project.root.clone(),
-            }),
+            editor: if has_editor {
+                Arc::new(WindowEditor {
+                    root: project.root.clone(),
+                })
+            } else {
+                Arc::new(eitri_core::remote_sync::quiet::NoEditor)
+            },
             events,
         },
         config,
@@ -305,6 +380,7 @@ fn start_sync(connection: &RemoteConnection, project: &RemoteProject, tell: &Unb
                 drop(attached);
                 return;
             }
+            port(Ok(Arc::new(attached.port())));
             slot.attached = Some(attached);
         }
         Err(error) => {
@@ -358,6 +434,7 @@ struct Opener {
     tell: UnboundedSender<Report>,
     opened: Arc<AtomicBool>,
     owns_socket: bool,
+    has_editor: bool,
 }
 
 impl Opener {
@@ -376,7 +453,9 @@ impl Opener {
                 return;
             }
         };
-        let sync = |connection: &RemoteConnection, project: &RemoteProject| start_sync(connection, project, &self.tell);
+        let sync = |connection: &RemoteConnection, project: &RemoteProject| {
+            start_sync(connection, project, &self.tell, self.has_editor)
+        };
         let Some(result) = attempt_until_open(&self.opened, || {
             open_window(&project, &self.ssh_dir, &self.exe, &store, &band, &sync)
         }) else {
@@ -449,10 +528,22 @@ pub(crate) fn prepare(panel: &AgentPanelHandle, origin: &WindowOrigin) -> bool {
     match origin {
         WindowOrigin::Local => {}
         WindowOrigin::LocalCopy { host } => panel.set_local_copy_host(Some(host.clone())),
-        WindowOrigin::Remote(_) => {
+        WindowOrigin::Remote(project) => {
             if let Err(why) = panel.set_project_origin(origin.tab_origin()) {
                 eprintln!("[remote] {why}");
                 return false;
+            }
+            // Carry the history indication through window startup while the sync actor attaches.
+            if project.sync_record().ok().flatten().is_some_and(|record| {
+                record.tree_synced && record.git_session.is_some() && !record.git_ready && record.paused.is_none()
+            }) {
+                panel.set_sync_status(eitri_core::remote_sync::status_schema::SyncChip {
+                    host: project.host.clone(),
+                    phase: "history".into(),
+                    conflicts: 0,
+                    git_pct: 0,
+                    paused_reason: None,
+                });
             }
         }
     }
@@ -466,6 +557,7 @@ pub(crate) fn start(
     origin: &WindowOrigin,
     opens: Option<std::rc::Rc<crate::open_requests::OpenRequests>>,
     pair: std::rc::Rc<crate::linked_window::spawn::Pair>,
+    has_editor: bool,
 ) {
     match origin {
         WindowOrigin::Local | WindowOrigin::LocalCopy { .. } => {}
@@ -479,16 +571,17 @@ pub(crate) fn start(
                 std::env::var_os("XDG_STATE_HOME").as_deref(),
                 std::env::var_os("HOME").as_deref(),
             ) else {
-                panel.show_notice(&format!("{}: no state directory for its ssh connection", project.host));
+                show_start_failure(panel, &project.host, "no state directory for its ssh connection");
                 return;
             };
             let exe = match std::env::current_exe() {
                 Ok(exe) => exe,
                 Err(e) => {
-                    panel.show_notice(&format!(
-                        "{}: this Eitri's executable cannot be found ({e})",
-                        project.host
-                    ));
+                    show_start_failure(
+                        panel,
+                        &project.host,
+                        &format!("this Eitri's executable cannot be found ({e})"),
+                    );
                     return;
                 }
             };
@@ -501,9 +594,10 @@ pub(crate) fn start(
                 tell,
                 opened: Arc::new(AtomicBool::new(false)),
                 owns_socket: opens.is_some(),
+                has_editor,
             };
             if let Err(e) = opener.on_a_worker() {
-                panel.show_notice(&format!("{host}: the connection could not start ({e})"));
+                show_start_failure(panel, &host, &format!("the connection could not start ({e})"));
                 return;
             }
             let panel = panel.clone();
@@ -512,23 +606,26 @@ pub(crate) fn start(
                 while let Ok(report) = told.recv().await {
                     match report {
                         Report::Band(line) => {
-                            println!("[remote] {line}");
+                            // Server text: escaped before a terminal can read it.
+                            println!("[remote] {}", eitri_core::remote_sync::terminal_text(&line));
                             panel.show_notice(&line);
                         }
+                        Report::SyncFailed(why) => show_start_failure(&panel, &host, &why),
+                        Report::SendPort(port) => panel.set_sync_port(port),
                         Report::Sync(SyncEvent::Status(status)) => {
                             panel.set_sync_status(eitri_core::remote_sync::status_file::chip(&status));
                         }
                         Report::Sync(SyncEvent::Line(line)) => {
-                            println!("[sync] {line}");
+                            println!("[sync] {}", eitri_core::remote_sync::terminal_text(&line));
                             panel.show_notice(&line);
                         }
                         Report::Replaced(why) => {
-                            panel.show_notice(&why);
+                            show_start_failure(&panel, &host, &why);
                             LISTENER.with(|slot| *slot.borrow_mut() = None);
                         }
                         Report::Failed(why) => {
-                            eprintln!("[remote] {host}: {why}");
-                            panel.show_notice(&format!("{host}: {why}"));
+                            eprintln!("[remote] {host}: {}", eitri_core::remote_sync::terminal_text(&why));
+                            show_start_failure(&panel, &host, &why);
                             retry_later(&opener);
                         }
                         Report::Opened(opened, address) => {
@@ -543,6 +640,17 @@ pub(crate) fn start(
             });
         }
     }
+}
+
+fn show_start_failure(panel: &AgentPanelHandle, host: &str, reason: &str) {
+    panel.set_sync_status(eitri_core::remote_sync::status_schema::SyncChip {
+        host: host.into(),
+        phase: "stopped".into(),
+        conflicts: 0,
+        git_pct: 0,
+        paused_reason: None,
+    });
+    panel.show_notice(&format!("{host}: {reason}"));
 }
 
 /// After a failed connection: the next resume or network change tries again, on a worker, one attempt at a time. The
@@ -583,8 +691,10 @@ fn connected(
     if !follow_origin(panel, &project, panel_key, pair, dir) {
         return false;
     }
+    let terminals = connection.terminal_master();
+    crate::terminal::remote::connected(connection.clone());
     panel.set_remote_connection(connection);
-    let listener = crate::remote_resume::listen(crate::remote_resume::Resume::for_masters(vec![master]));
+    let listener = crate::remote_resume::listen(crate::remote_resume::Resume::for_masters(vec![master], terminals));
     LISTENER.with(|slot| *slot.borrow_mut() = Some(listener));
     true
 }
@@ -646,6 +756,36 @@ mod tests {
     }
 
     #[test]
+    fn startup_failure_replaces_history_with_the_reason() {
+        let panel = AgentPanelHandle::for_host_test_without_pages();
+        let mut project = record("/srv/project");
+        project.set_sync_record(&eitri_core::remote_project::SyncRecord {
+            tree_synced: true,
+            git_session: Some("git".into()),
+            ..Default::default()
+        });
+        assert!(prepare(&panel, &WindowOrigin::Remote(project.clone())));
+        assert_eq!(panel.sync_chip().unwrap().phase, "history");
+        show_start_failure(&panel, &project.host, "offline");
+        let chip = panel.sync_chip().unwrap();
+        assert_eq!(chip.phase, "stopped");
+        assert!(
+            chip.paused_reason.is_none(),
+            "the page renders a pause reason as paused"
+        );
+    }
+
+    #[test]
+    fn window_without_an_editor_reports_no_saved_files() {
+        let settings = SyncSettings {
+            send_waits_for_flush: true,
+            ..Default::default()
+        };
+        let port = send_port(&settings, &record("/srv/project"), false, Err("offline".into())).unwrap();
+        assert_eq!((port.saved)(42, Duration::ZERO).unwrap(), (42, vec![]));
+    }
+
+    #[test]
     fn a_connected_window_never_rekeys_handoffs_to_another_host() {
         use crate::linked_window::spawn::{Pair, PairEnv};
         let root = Path::new("/srv/project");
@@ -703,6 +843,7 @@ mod tests {
         let new = state.join("new");
         let mut group = GroupTabs::read(Some(&old), root, true);
         let saved = SavedTabs::default().with_remote(vec![SavedRemoteTab {
+            late_lines: Vec::new(),
             helper: agent::HelperHandoff {
                 host: "example-host".into(),
                 host_key_sha256: project.host_key_sha256.clone(),
@@ -888,6 +1029,7 @@ mod tests {
         let keyed = base.join("remote");
         let root = Path::new("/srv/project");
         let tab = SavedRemoteTab {
+            late_lines: Vec::new(),
             helper: agent::HelperHandoff {
                 daemon: "0.3.0-abcdef0".into(),
                 host: "example-host".into(),

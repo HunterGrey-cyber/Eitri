@@ -380,6 +380,32 @@ mod tests {
     }
 
     #[test]
+    fn observer_without_an_editor_allows_recreation() {
+        let state = agent::state_dirs::test_workspace_dir("absent-editor-report");
+        let dir = state.join("eitri/remote/sync/0123456789abcdef");
+        let root = Path::new("/srv/project");
+        let mut reports = EditorReports::new(dir.clone());
+        reports.skip_pid = None;
+        let answer = NoEditor
+            .unsaved_under(root)
+            .map(|unsaved| EditorAnswer { unsaved, files: vec![] });
+        write_report(
+            &state,
+            &dir,
+            &EditorReport {
+                pid: std::process::id(),
+                written_unix_ms: super::super::status_file::now_unix_ms(),
+                answer,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            check(&Busy(Ok(false)), &reports, root, Instant::now(), Duration::ZERO),
+            Ok(())
+        );
+    }
+
+    #[test]
     fn editor_reports_from_watch_processes_count_and_go_stale() {
         let state = agent::state_dirs::test_workspace_dir("sync-editor-reports");
         let dir = state.join("eitri/remote/sync/0123456789abcdef");

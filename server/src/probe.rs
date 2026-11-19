@@ -30,6 +30,63 @@ pub async fn run(args: &[OsString]) -> io::Result<()> {
     Ok(())
 }
 
+/// Lists one level of directories matching a literal prefix.
+pub fn complete_folders(args: &[OsString]) -> io::Result<()> {
+    let prefix = match args {
+        [prefix] => prefix
+            .to_str()
+            .filter(|text| text.starts_with('/') && text.len() <= 4096 && !text.contains('\0')),
+        _ => None,
+    }
+    .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "expected one absolute UTF-8 folder prefix"))?;
+    let folders = matching_folders(prefix)?;
+    serde_json::to_writer(io::stdout().lock(), &folders)?;
+    Ok(())
+}
+
+fn matching_folders(prefix: &str) -> io::Result<Vec<String>> {
+    let (dir, partial) = prefix.rsplit_once('/').expect("an absolute path has a slash");
+    let mut folders = Vec::new();
+    let mut encoded_bytes = 2;
+    for entry in std::fs::read_dir(Path::new(if dir.is_empty() { "/" } else { dir }))?.take(20_000) {
+        let Ok(entry) = entry else { continue };
+        let Ok(name) = entry.file_name().into_string() else {
+            continue;
+        };
+        if !name.starts_with(partial) || (name.starts_with('.') && !partial.starts_with('.')) {
+            continue;
+        }
+        if !entry.path().is_dir() {
+            continue;
+        }
+        let folder = format!("{dir}/{name}/");
+        encoded_bytes += serde_json::to_vec(&folder)?.len() + 1;
+        if encoded_bytes > 48 * 1024 || folders.len() == 100 {
+            break;
+        }
+        folders.push(folder);
+    }
+    folders.sort_unstable();
+    Ok(folders)
+}
+
+#[cfg(test)]
+mod folder_tests {
+    use super::*;
+
+    #[test]
+    fn complete_folders_lists_directories_with_a_literal_prefix() {
+        let root = agent::state_dirs::test_workspace_dir("complete-folders");
+        let path = root.join("project [x]; tree");
+        std::fs::create_dir_all(path.join("child")).unwrap();
+        std::fs::create_dir(root.join("project x; other")).unwrap();
+        std::fs::write(root.join("project [x]; file"), b"file").unwrap();
+        let result = matching_folders(root.join("project [x];").to_str().unwrap()).unwrap();
+        assert_eq!(result, [format!("{}/", path.display())]);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+}
+
 async fn report(account: &login_env::Environment, captured: &Captured, root: Option<&Path>) -> io::Result<ProbeReport> {
     let text = |env: &login_env::Environment, key: &str| {
         env.get(OsStr::new(key))
@@ -41,6 +98,11 @@ async fn report(account: &login_env::Environment, captured: &Captured, root: Opt
     let login_path = text(&captured.env, "PATH");
     let uid = agent::private_fs::euid();
     let on_path = |name: &str| find_on_path(name, &login_path);
+    let state = root.map_or(RootState::Missing, root_state);
+    let marker = match root {
+        Some(path) if state == RootState::Ok => eitri_core::remote_sync::other_sync::marker(&path.canonicalize()?)?,
+        _ => None,
+    };
     Ok(ProbeReport {
         uname: uname(),
         home: PathBuf::from(account.get(OsStr::new("HOME")).cloned().unwrap_or_default()),
@@ -60,10 +122,10 @@ async fn report(account: &login_env::Environment, captured: &Captured, root: Opt
         )
         .await,
         kill_user_processes: kill_user_processes(&captured.env).await,
-        root: root.map_or(RootState::Missing, root_state),
-        sync_marker: root
-            .and_then(|root| std::fs::canonicalize(root).ok())
-            .and_then(|root| sync_marker(&root)),
+        root: state,
+        sync_excluded: marker.as_ref().map(|m| m.excluded),
+        sync_ignore_line: marker.as_ref().map(|m| m.line.clone()),
+        sync_marker: marker.map(|m| m.path),
     })
 }
 
@@ -152,14 +214,6 @@ fn root_state(root: &Path) -> RootState {
     }
 }
 
-/// The nearest `.stfolder` directory (Syncthing's marker) at `root` or above it. `root` is canonical, as the
-/// directory a sidecar runs in is: Syncthing shares the real tree, and a link on the way names other parents.
-fn sync_marker(root: &Path) -> Option<PathBuf> {
-    root.ancestors()
-        .map(|dir| dir.join(".stfolder"))
-        .find(|marker| std::fs::symlink_metadata(marker).is_ok_and(|metadata| metadata.is_dir()))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -186,6 +240,11 @@ mod tests {
 
     #[test]
     fn the_sync_marker_is_the_nearest_one_at_or_above_the_root() {
+        let sync_marker = |root: &Path| {
+            eitri_core::remote_sync::other_sync::marker(root)
+                .unwrap()
+                .map(|m| m.path)
+        };
         let dir = scratch("marker");
         let project = dir.join("a/b");
         std::fs::create_dir_all(&project).unwrap();
@@ -194,9 +253,31 @@ mod tests {
         assert_eq!(sync_marker(&project), Some(dir.join(".stfolder")));
         std::fs::create_dir(dir.join("a/.stfolder")).unwrap();
         assert_eq!(sync_marker(&project), Some(dir.join("a/.stfolder")));
-        // A file or a link of that name is not Syncthing's marker directory.
         std::fs::write(project.join(".stfolder"), b"").unwrap();
-        assert_eq!(sync_marker(&project), Some(dir.join("a/.stfolder")));
+        assert_eq!(sync_marker(&project), Some(project.join(".stfolder")));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn root_probe_reports_the_exclusion_at_the_marker() {
+        let dir = scratch("sync-exclusion");
+        let project = dir.join("work/project");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::create_dir(dir.join(".stfolder")).unwrap();
+        std::os::unix::fs::symlink("/bin/false", dir.join("loginctl")).unwrap();
+        let env = login_env::Environment::from([("PATH".into(), dir.clone().into_os_string())]);
+        let captured = Captured {
+            env: env.clone(),
+            fallback: None,
+        };
+        for (rules, excluded) in [("/work/", true), ("/work/\n!/work/project", false)] {
+            std::fs::write(dir.join(".stignore"), rules).unwrap();
+            let found = report(&env, &captured, Some(&project)).await.unwrap();
+            let wire = ProbeReport::parse(&found.render()).unwrap();
+            assert_eq!(wire.sync_marker, Some(dir.join(".stfolder")));
+            assert_eq!(wire.sync_ignore_line.as_deref(), Some("/work/project"));
+            assert_eq!(wire.sync_excluded, Some(excluded));
+        }
         std::fs::remove_dir_all(dir).unwrap();
     }
 
@@ -231,12 +312,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn kill_user_processes_queries_the_logind_manager_property() {
+        let dir = scratch("logind");
+        write_script(
+            &dir.join("loginctl"),
+            "#!/bin/sh\n[ \"$*\" = 'show-session -p KillUserProcesses' ] || exit 1\necho KillUserProcesses=yes\n",
+        );
+        let env = login_env::Environment::from([("PATH".into(), dir.clone().into_os_string())]);
+        assert_eq!(kill_user_processes(&env).await, Some(true));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
     async fn kill_user_processes_is_read_where_logind_runs() {
         if !Path::new("/run/systemd/system").exists() {
             return;
         }
-        let env = login_env::Environment::from([("PATH".into(), "/usr/bin:/bin".into())]);
-        assert!(kill_user_processes(&env).await.is_some());
+        let Some(loginctl) = find_on_path("loginctl", "/usr/bin:/bin") else {
+            return;
+        };
+        // The systemd runtime directory is also visible in sandboxes without access to logind.
+        let available = tokio::time::timeout(
+            LOGINCTL_BUDGET,
+            tokio::process::Command::new(loginctl)
+                .arg("list-sessions")
+                .env_clear()
+                .kill_on_drop(true)
+                .output(),
+        )
+        .await;
+        if matches!(available, Ok(Ok(output)) if output.status.success()) {
+            let env = login_env::Environment::from([("PATH".into(), "/usr/bin:/bin".into())]);
+            assert!(kill_user_processes(&env).await.is_some());
+        }
     }
 
     /// An executable script at `path`, written by a child so no descendant of a test thread holds it open for writing.

@@ -651,11 +651,22 @@ pub fn resolve_launch_in(
 
 /// What a remote project's path on this machine must be until a mirror exists to make it: the same directory, so
 /// the editor, the terminal and the agent's paths agree.
-pub const REMOTE_PATH_NEEDED: &str = "remote projects need the same path on this machine; M2's sync will create it";
+pub const REMOTE_PATH_NEEDED: &str = "remote projects need the same path on this machine";
 
-/// `--ssh <host> <path>`: one path, the project's on the server as typed, absolute and in normal form, which must
-/// be the same directory here (no link or `..` leading elsewhere). It opens no file and takes no line.
-fn remote_launch(host: &str, parsed: &ParsedLaunch) -> Result<Launch, String> {
+/// The explicit SSH destination before checking for a local mirror.
+pub fn ssh_request(args: &[OsString]) -> Result<Option<(String, PathBuf)>, String> {
+    let parsed = parse_launch_args(args)?;
+    if parsed.raise && !parsed.is_one_verbatim_path() {
+        return Err(String::from("--raise takes exactly one path after --"));
+    }
+    parsed
+        .ssh
+        .as_ref()
+        .map(|host| remote_root(host, &parsed).map(|root| (host.clone(), root)))
+        .transpose()
+}
+
+fn remote_root(host: &str, parsed: &ParsedLaunch) -> Result<PathBuf, String> {
     if parsed.local {
         return Err(String::from("--ssh and --local cannot be given together"));
     }
@@ -676,6 +687,13 @@ fn remote_launch(host: &str, parsed: &ParsedLaunch) -> Result<Launch, String> {
             "{text:?}: --ssh needs the project's absolute path on the server, with no trailing slash, `.` or `..`"
         ));
     }
+    Ok(root)
+}
+
+/// An ordinary remote launch opens the mirror at the same path on this machine.
+fn remote_launch(host: &str, parsed: &ParsedLaunch) -> Result<Launch, String> {
+    let root = remote_root(host, parsed)?;
+    let text = root.display();
     match std::fs::metadata(&root) {
         Ok(meta) if meta.is_dir() => {}
         Ok(_) => {
@@ -683,7 +701,12 @@ fn remote_launch(host: &str, parsed: &ParsedLaunch) -> Result<Launch, String> {
                 "{text} is not a directory on this machine; {REMOTE_PATH_NEEDED}"
             ))
         }
-        Err(e) if e.kind() == io::ErrorKind::NotFound => return Err(format!("{text}: {REMOTE_PATH_NEEDED}")),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {
+            return Err(format!(
+                "{text}: {REMOTE_PATH_NEEDED}; {}",
+                crate::remote_project::missing_mirror_hint(host, &root)
+            ))
+        }
         Err(e) => {
             return Err(format!(
                 "cannot open {text} on this machine ({e}); {REMOTE_PATH_NEEDED}"

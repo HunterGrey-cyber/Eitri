@@ -36,6 +36,8 @@ message HelloResponse {
   string helper_version = 4; string helper_build = 5; string sidecar_revision = 6;
   repeated string warnings = 7;
   LoginEnvState login_env = 8;
+  string daemon_instance = 9;
+  string boot_id = 10;
   // The mode keepers' lines, per root; they are not in `warnings`.
   repeated SyncModeWarning mode_warnings = 11;
 }
@@ -85,7 +87,7 @@ message RemoveFileIfRequest { string root = 1; string rel = 2; string expected_s
 message RemoveFileIfResponse { bool removed = 1; string refusal = 2; }
 message WaitFileHashRequest { string root = 1; string rel = 2; string sha256 = 3; uint64 timeout_ms = 4; }
 message WaitFileHashResponse { bool matched = 1; string observed = 2; string refusal = 3; }
-message PathSizesRequest { string root = 1; repeated string rels = 2; repeated string patterns = 3; uint64 budget = 4; }
+message PathSizesRequest { string root = 1; repeated string rels = 2; repeated string patterns = 3; uint64 budget = 4; bool whole_root = 5; }
 message PathSize { string rel = 1; uint64 bytes = 2; }
 message PathSizesResponse { repeated PathSize sizes = 1; bool truncated = 2; string refusal = 3; }
 message ProjectActivityRequest { string root = 1; }
@@ -94,7 +96,9 @@ message ProjectActivityResponse { uint32 turns_running = 1; bool unknown = 2; st
 // `staging_name`: the tree session's neighbouring staging directory (`.mutagen-temporary-staging-<session>-beta`).
 message WatchModesRequest { string root = 1; repeated string patterns = 2; bool on = 3; string staging_name = 4; }
 // `host` is the server's own name, which `refusal` uses; the laptop shows the host as the person typed it.
-message WatchModesResponse { string refusal = 1; string host = 2; }
+// `settling`: the keeper had not looked at every change made before the registration (its first walk still running,
+// or another daemon still holding the root) when the answer was sent; asking again waits for it again.
+message WatchModesResponse { string refusal = 1; string host = 2; bool settling = 3; }
 // A mode keeper's line, with the server's own name and the root apart from the text, and the paths it names.
 // `sequence` grows with each write the keeper counts (0 on other lines) and `epoch` is new at every keeper start:
 // every Hello repeats a line, and the laptop shows a (host, root)'s counted line only when its (epoch, sequence)

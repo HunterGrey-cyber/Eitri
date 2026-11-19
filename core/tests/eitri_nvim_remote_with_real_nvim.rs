@@ -236,8 +236,12 @@ end)"#,
 fn eitri_sync_lists_conflicts_problems_copied_back_and_excludes() {
     check(
         r#"view()
-for _, text in ipairs({"Conflict: file","not synced: absolute link","Copied back: restored","/target/","Keep the server's","Merge","an edit made on one side beats a delete"}) do
-assert(lines():find(text,1,true),lines()) end"#,
+for _, text in ipairs({"Conflict: file","not synced: absolute link","eitri host sync exclude <path>","Copied back: restored","/target/","Keep the server's","Merge","an edit made on one side beats a delete"}) do
+assert(lines():find(text,1,true),lines()) end
+local laptop = lines():match("[^\n]*not synced: absolute link[^\n]*")
+assert(laptop:find("fix the entry on this laptop",1,true) and not laptop:find("terminal on",1,true), laptop)
+local server = lines():match("[^\n]*not synced: other[^\n]*")
+assert(server:find("fix the entry on the server",1,true) and server:find("terminal on example-host",1,true), server)"#,
     )
 }
 #[test]
@@ -272,7 +276,9 @@ fn plain_nvim_attach_puts_the_shim_on_path() {
     check(
         r#"wait(function() return vim.split(vim.env.PATH,":",{plain=true})[1] == base .. "/shim" end)
 assert(vim.env.EITRI_GIT_SHIM_EXE == base .. "/eitri")
-assert(vim.env.EITRI_REAL_GIT == "/usr/bin/git")"#,
+assert(vim.env.EITRI_REAL_GIT == "/usr/bin/git")
+vim.cmd.edit(vim.fn.fnameescape(base .. "/outside"))
+assert(vim.split(vim.env.PATH,":",{plain=true})[1] == base .. "/shim", "local buffer removed the git shim")"#,
     )
 }
 #[test]

@@ -4,7 +4,7 @@
  * grow with the turns an events envelope ends. Placement and chrome rules are `MessageList.turnTime.test.tsx`.
  */
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
-import { act, cleanup, render } from "@testing-library/react";
+import { act, cleanup, fireEvent, render } from "@testing-library/react";
 import App from "./App";
 import { initialState } from "./reducer";
 import { EMPTY_PANEL_TABLE } from "./keymap";
@@ -165,4 +165,46 @@ describe("Worked for", () => {
     });
     expect(lines(container)).toEqual(["Worked for 42s", "Worked for 1m 23s"]);
   });
+});
+
+it("composer_shows_syncing_while_waiting", () => {
+  const { getByText, queryByText } = started();
+  dispatch({ kind: "send_sync", tab: 1, waiting: true, lines: [] });
+  expect(getByText("syncing…").getAttribute("role")).toBe("status");
+  const stop = getByText("Stop");
+  expect(fireEvent.keyDown(stop, { key: "Escape" })).toBe(true);
+  expect(posted.filter(msg => msg.type === "interrupt")).toHaveLength(0);
+  fireEvent.keyDown(stop, { key: "c", ctrlKey: true });
+  expect(posted.filter(msg => msg.type === "interrupt")).toHaveLength(1);
+  fireEvent.click(stop);
+  expect(posted.filter(msg => msg.type === "interrupt")).toHaveLength(2);
+  dispatch({ kind: "send_sync", tab: 1, waiting: false, stopped: true, lines: [] });
+  expect(queryByText("syncing…")).toBeNull();
+  expect(getByText("stopped before it was sent").getAttribute("role")).toBe("status");
+});
+
+it("late_line_renders_under_the_sent_message", () => {
+  const { getByText } = started();
+  dispatch({ kind: "snapshot", tab: 1, throughRevision: 4, state: snapshotState({
+    userPrompts: [{ seq: 1, text: "first" }, { seq: 3, text: "second" }],
+  }) });
+  const text = "your last save of a.rs has not reached example-host";
+  dispatch({ kind: "send_sync", tab: 1, waiting: false, lines: [{ seq: 1, messageId: "m1", prompt: "first", text }] });
+  expect(getByText(text).closest(".row-prompt")?.textContent).toBe("›first" + text);
+});
+
+it("a reattached notice moves from the composer to its replayed row and stays hidden on eviction", () => {
+  const { getByText, queryByText } = started();
+  const text = "sync with example-host has not caught up";
+  const line = { seq: 2, messageId: "m", prompt: "same text", text };
+  dispatch({ kind: "send_sync", tab: 1, waiting: false, restored: ["m"], lines: [line] });
+  expect(getByText(text).previousElementSibling?.textContent).toBe("same text");
+  expect(getByText(text).closest(".row-prompt")).toBeNull();
+  dispatch({ kind: "snapshot", tab: 1, throughRevision: 4, state: snapshotState({
+    userPrompts: [{ seq: 2, text: "same text" }],
+  }) });
+  expect(getByText(text).closest(".row-prompt")?.textContent).toBe("›same text" + text);
+  dispatch({ kind: "events", tab: 1, fromRevision: 4, throughRevision: 5,
+    events: [{ type: "history_evicted", through_seq: 3, turns: 1, lifted: [] }] });
+  expect(queryByText(text)).toBeNull();
 });

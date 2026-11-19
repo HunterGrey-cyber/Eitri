@@ -140,6 +140,8 @@ export type EmptyTabProps = {
   /** Queue lines above the composer: a starting tab can already have messages queued behind its connect.
    *  Editor context is built directly into the outer band by `App.tsx`. */
   queue?: QueueItem[];
+  sendSyncNotice?: React.ReactNode;
+  onStopSync?: () => void;
   queueError?: string | null;
   /** Why its messages are held (the queue envelope's `note`). */
   queueNote?: string | null;
@@ -644,6 +646,11 @@ export function EmptyTab(props: EmptyTabProps) {
       );
       return;
     }
+    if (mode === "browse" && props.onStopSync && event.key === "c" && event.ctrlKey && !event.shiftKey && !event.altKey && !event.metaKey) {
+      event.preventDefault();
+      props.onStopSync();
+      return;
+    }
     if (event.key === "r" && failed) {
       event.preventDefault();
       props.onReset();
@@ -860,6 +867,7 @@ export function EmptyTab(props: EmptyTabProps) {
         {inDashboard && hello !== null && (
           <DashboardHead hello={hello} narrow={narrow} agent={isExternalAgent(tab.agent) ? agentTitle(tab.agent) : null} />
         )}
+        {props.sendSyncNotice}
         <QueueLines items={props.queue ?? []} error={props.queueError ?? null} note={props.queueNote ?? null} />
         <div
           className={inDashboard ? "dash-input" : "empty-box"}

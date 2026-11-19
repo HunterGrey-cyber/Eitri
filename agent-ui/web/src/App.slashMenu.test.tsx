@@ -18,9 +18,11 @@ beforeAll(() => {
   Element.prototype.scrollIntoView = vi.fn();
 });
 
+const postMessage = vi.fn<(msg: string) => void>();
 beforeEach(() => {
+  postMessage.mockClear();
   (window as unknown as { webkit: unknown }).webkit = {
-    messageHandlers: { eitriAgent: { postMessage: () => {} } },
+    messageHandlers: { eitriAgent: { postMessage } },
   };
   vi.useFakeTimers();
 });
@@ -147,8 +149,9 @@ describe("where a tab's / menu rows come from", () => {
 });
 
 describe("Esc with the menu open", () => {
-  it("closes the menu and stays in INPUT with the text; the next Esc leaves INPUT", () => {
+  it.each([false, true])("closes the menu then leaves INPUT while syncing is %s", (waiting) => {
     const { container } = inInput(undefined);
+    dispatch({ kind: "send_sync", tab: 1, waiting, lines: [] });
     type(container, "/co");
     expect(container.querySelector(".slash-menu")).not.toBeNull();
     fireEvent.keyDown(box(container)!, { key: "Escape" });
@@ -158,6 +161,7 @@ describe("Esc with the menu open", () => {
     wait(TYPING_GUARD_MS + 50);
     fireEvent.keyDown(box(container)!, { key: "Escape" });
     expect(mode(container)).toBe("BROWSE");
+    expect(postMessage.mock.calls.map(([msg]) => JSON.parse(msg).type)).not.toContain("interrupt");
   });
 });
 

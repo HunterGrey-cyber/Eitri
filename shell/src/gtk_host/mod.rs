@@ -335,6 +335,10 @@ pub(crate) trait SurfaceMaker {
 /// The pane operations a restart in place needs, independent of a registry or widget implementation.
 pub(crate) trait RespawnPane {
     fn shell_start(&self) -> eitri_core::wm::ShellStart;
+    /// Opens a replacement server terminal in `dir`. The pane owns the asynchronous request.
+    fn respawn_server(&self, _dir: PathBuf) -> Result<(), String> {
+        Err("server terminal restart is not available yet".into())
+    }
     fn close(&self);
     fn set_start_dir(&self, dir: PathBuf);
     fn start(&self);
@@ -351,6 +355,9 @@ pub(crate) fn respawn_pane(
     let pane = pane.ok_or_else(|| "the terminal changed".to_string())?;
     if !expect.untouched(Some(pane.shell_start())) {
         return Err("the terminal changed".into());
+    }
+    if matches!(expect.identity, Some(eitri_core::wm::ShellIdentity::Server { .. })) {
+        return pane.respawn_server(dir);
     }
     pane.close();
     pane.set_start_dir(dir);
@@ -388,6 +395,9 @@ pub(crate) trait ServiceSet {
         Err(NOT_CARRIED_OUT.into())
     }
     fn running_chats(&self) -> Vec<(ModuleId, Option<eitri_core::tabs::TabId>)> {
+        Vec::new()
+    }
+    fn terminal_job_names(&self) -> Vec<String> {
         Vec::new()
     }
     fn terminal_job_modules(&self) -> Vec<ModuleId> {
@@ -1847,6 +1857,10 @@ impl HostReads for GtkHost {
         let services = self.services.borrow().clone();
         services.map_or_else(|| Vec::new(), |s| s.running_chats())
     }
+    fn terminal_job_names(&self, _win: WinId) -> Vec<String> {
+        let services = self.services.borrow().clone();
+        services.map_or_else(Vec::new, |services| services.terminal_job_names())
+    }
     fn terminal_job_modules(&self, _win: WinId) -> Vec<ModuleId> {
         let services = self.services.borrow().clone();
         services.map_or_else(|| Vec::new(), |s| s.terminal_job_modules())
@@ -2444,6 +2458,27 @@ mod terminal_at_tests {
         fn start(&self) {
             self.calls.borrow_mut().push("start".into());
         }
+    }
+
+    #[test]
+    fn a_server_restart_without_a_server_op_is_refused_and_touches_nothing() {
+        let shell = ShellStart::identified(
+            1,
+            Some(eitri_core::wm::ShellIdentity::Server {
+                generation: 7,
+                terminal_id: 1,
+            }),
+        );
+        let calls = Rc::new(RefCell::new(Vec::new()));
+        let pane = Pane {
+            shell,
+            calls: calls.clone(),
+        };
+        assert_eq!(
+            respawn_pane(Some(pane), shell, "/srv/project".into()),
+            Err("server terminal restart is not available yet".into())
+        );
+        assert!(calls.borrow().is_empty());
     }
 
     struct Services(Option<Pane>);

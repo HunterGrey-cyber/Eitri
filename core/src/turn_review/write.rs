@@ -695,7 +695,15 @@ pub fn replace(
                         && target.parent_is_reached()?,
                 )
             };
-            atomic(parent, &target.leaf, bytes, *mode, None, &fault, Some(&unchanged))?;
+            atomic(
+                parent,
+                &target.leaf,
+                bytes,
+                *mode,
+                Original::Review(None),
+                &fault,
+                &unchanged,
+            )?;
             Ok(())
         }
         (Content::Bytes { bytes, mode }, Some(_)) => {
@@ -715,7 +723,15 @@ pub fn replace(
                                 && target.parent_is_reached()?,
                         )
                     };
-                    match atomic(parent, &target.leaf, bytes, *mode, Some(&st), &fault, Some(&unchanged))? {
+                    match atomic(
+                        parent,
+                        &target.leaf,
+                        bytes,
+                        *mode,
+                        Original::Review(Some(&st)),
+                        &fault,
+                        &unchanged,
+                    )? {
                         Renamed::Done => return Ok(()),
                         // The new file could not be given the old one's group: a rename would change
                         // who may read it, so it is rewritten in place like any file a rename would hurt.
@@ -825,9 +841,9 @@ pub fn compare_and_replace(target: &Target, expected_sha256: Option<[u8; 32]>, b
                 &target.leaf,
                 bytes,
                 mode,
-                Some(&fst),
+                Original::Hashed(&st, &expected),
                 &no_fault,
-                Some(&unchanged),
+                &unchanged,
             )? {
                 Renamed::Done => Ok(()),
                 Renamed::GroupWouldChange => Err(kept()),
@@ -861,13 +877,19 @@ pub fn compare_and_remove(target: &Target, expected_sha256: [u8; 32]) -> Result<
     }
     #[cfg(test)]
     tests::run_hook(&tests::BEFORE_REMOVE);
-    remove_hashed(parent, &target.leaf, &st, &shown)
+    remove_hashed(parent, &target.leaf, &st, &expected_sha256, &shown)
 }
 
 /// Unlinks `leaf` when it is still the inode `st` describes: moved aside first, so what is unlinked is what was
 /// checked, and moved back when it is not.
 #[cfg(target_os = "linux")]
-fn remove_hashed(parent: &OwnedFd, leaf: &CString, st: &libc::stat, shown: &str) -> Result<(), WriteError> {
+fn remove_hashed(
+    parent: &OwnedFd,
+    leaf: &CString,
+    st: &libc::stat,
+    digest: &[u8; 32],
+    shown: &str,
+) -> Result<(), WriteError> {
     let io_err = |e: io::Error| WriteError::Io(format!("{shown}: {e}"));
     let aside = temp_name(leaf).map_err(io_err)?;
     match rename_noreplace(parent, leaf, &aside) {
@@ -875,11 +897,7 @@ fn remove_hashed(parent: &OwnedFd, leaf: &CString, st: &libc::stat, shown: &str)
         Err(e) if e.raw_os_error() == Some(libc::ENOENT) => return Err(WriteError::Changed),
         Err(e) => return Err(io_err(e)),
     }
-    // A rename changes the inode's ctime, so only its identity and kind are compared here.
-    let moved = stat_at(parent, &aside);
-    let same = moved.as_ref().is_ok_and(|moved| {
-        moved.st_mode & libc::S_IFMT == libc::S_IFREG && (moved.st_dev, moved.st_ino) == (st.st_dev, st.st_ino)
-    });
+    let same = displaced_hash_matches(parent, &aside, st, digest);
     if same {
         unlink_at(parent, &aside, 0).map_err(io_err)?;
         return sync_fd(parent.as_raw_fd()).map_err(io_err);
@@ -895,9 +913,97 @@ fn remove_hashed(parent: &OwnedFd, leaf: &CString, st: &libc::stat, shown: &str)
     }
 }
 
+/// Rename changes ctime, but preserves the identity, size and modification time of the file it moves.
+#[cfg(target_os = "linux")]
+fn same_after_rename(now: &libc::stat, expected: &libc::stat) -> bool {
+    now.st_mode & libc::S_IFMT == libc::S_IFREG
+        && (now.st_dev, now.st_ino) == (expected.st_dev, expected.st_ino)
+        && (now.st_size, now.st_mtime, now.st_mtime_nsec)
+            == (expected.st_size, expected.st_mtime, expected.st_mtime_nsec)
+}
+
+/// Rename updates ctime. Use the displaced file's new stat to detect writes during the bounded hash.
+#[cfg(target_os = "linux")]
+fn displaced_hash_matches(parent: &OwnedFd, name: &CString, expected: &libc::stat, digest: &[u8; 32]) -> bool {
+    stat_at(parent, name)
+        .is_ok_and(|now| same_after_rename(&now, expected) && still_hashes(parent, name, &now, digest).unwrap_or(false))
+}
+
+/// Exchanges the prepared file with the target so the displaced version can be checked before it is unlinked.
+#[cfg(target_os = "linux")]
+fn exchange_hashed(
+    parent: &OwnedFd,
+    leaf: &CString,
+    temp: &Temp,
+    expected: &libc::stat,
+    digest: &[u8; 32],
+    unchanged: &dyn Fn() -> io::Result<bool>,
+) -> Result<(), WriteError> {
+    let fd = parent.as_raw_fd();
+    let exchange = || {
+        #[cfg(test)]
+        if let Some(errno) = tests::EXCHANGE_ERRNO.take() {
+            return Err(io::Error::from_raw_os_error(errno));
+        }
+        // SAFETY: the open descriptor and both NUL-terminated names outlive each call.
+        retry(|| unsafe { libc::renameat2(fd, temp.name.as_ptr(), fd, leaf.as_ptr(), libc::RENAME_EXCHANGE) })
+    };
+    let io_err = |e: io::Error| WriteError::Io(format!("{}: {e}", leaf.to_string_lossy()));
+    let staged = fstat(temp.file.as_raw_fd())
+        .inspect_err(|_| {
+            let _ = unlink_at(parent, &temp.name, 0);
+        })
+        .map_err(io_err)?;
+    if let Err(error) = exchange() {
+        if matches!(
+            error.raw_os_error(),
+            Some(libc::EINVAL | libc::ENOSYS | libc::EOPNOTSUPP)
+        ) {
+            match unchanged() {
+                Ok(true) => return rename_into_place(parent, &temp.name, leaf).map_err(io_err),
+                result => {
+                    let _ = unlink_at(parent, &temp.name, 0);
+                    return Err(result.err().map_or(WriteError::Changed, io_err));
+                }
+            }
+        }
+        let _ = unlink_at(parent, &temp.name, 0);
+        return Err(if error.kind() == io::ErrorKind::NotFound {
+            WriteError::Changed
+        } else {
+            io_err(error)
+        });
+    }
+    let matches = |name, st: &libc::stat| stat_at(parent, name).is_ok_and(|now| same_after_rename(&now, st));
+    let changed = !displaced_hash_matches(parent, &temp.name, expected, digest);
+    if changed {
+        // If another save raced the rollback too, keep both versions and name the one beside the target.
+        if !matches(leaf, &staged) || exchange().is_err() || !matches(&temp.name, &staged) {
+            return Err(WriteError::Io(format!(
+                "{} changed again during replacement; another version is kept beside it as {}",
+                leaf.to_string_lossy(),
+                temp.name.to_string_lossy()
+            )));
+        }
+    }
+    unlink_at(parent, &temp.name, 0).map_err(io_err)?;
+    sync_fd(fd).map_err(io_err)?;
+    if changed {
+        Err(WriteError::Changed)
+    } else {
+        Ok(())
+    }
+}
+
 /// Elsewhere there is no rename that refuses to replace on a directory descriptor; the last look is the check.
 #[cfg(not(target_os = "linux"))]
-fn remove_hashed(parent: &OwnedFd, leaf: &CString, _st: &libc::stat, shown: &str) -> Result<(), WriteError> {
+fn remove_hashed(
+    parent: &OwnedFd,
+    leaf: &CString,
+    _st: &libc::stat,
+    _digest: &[u8; 32],
+    shown: &str,
+) -> Result<(), WriteError> {
     let io_err = |e: io::Error| WriteError::Io(format!("{shown}: {e}"));
     unlink_at(parent, leaf, 0).map_err(io_err)?;
     sync_fd(parent.as_raw_fd()).map_err(io_err)
@@ -1184,19 +1290,27 @@ fn fill_temp(
     Ok(true)
 }
 
-/// Replaces `leaf` with a new file holding `bytes` with `mode`, through a temporary renamed over it.
-/// On any failure the temporary is removed and `leaf` is as it was.
+enum Original<'a> {
+    Review(Option<&'a libc::stat>),
+    Hashed(&'a libc::stat, &'a [u8; 32]),
+}
+
+/// Replaces `leaf` through a prepared temporary, checking the original after the temporary has been synced.
 fn atomic(
     parent: &OwnedFd,
     leaf: &CString,
     bytes: &[u8],
     mode: u32,
-    orig: Option<&libc::stat>,
+    original: Original,
     fault: &dyn Fn(Stage) -> io::Result<()>,
-    unchanged: Option<&dyn Fn() -> io::Result<bool>>,
+    unchanged: &dyn Fn() -> io::Result<bool>,
 ) -> Result<Renamed, WriteError> {
     let io_err = |e: io::Error| WriteError::Io(format!("{}: {e}", leaf.to_string_lossy()));
     let temp = make_temp(parent, leaf).map_err(io_err)?;
+    let orig = match original {
+        Original::Review(st) => st,
+        Original::Hashed(st, _) => Some(st),
+    };
     let result = fill_temp(&temp, bytes, mode, orig, fault);
     match result {
         Ok(true) => {}
@@ -1211,18 +1325,23 @@ fn atomic(
     }
     // Filling and syncing the temporary is the slow part; look at the original once more right
     // before the rename that would replace it.
-    if let Some(unchanged) = unchanged {
-        match unchanged() {
-            Ok(true) => {}
-            Ok(false) => {
-                let _ = unlink_at(parent, &temp.name, 0);
-                return Err(WriteError::Changed);
-            }
-            Err(e) => {
-                let _ = unlink_at(parent, &temp.name, 0);
-                return Err(io_err(e));
-            }
+    match unchanged() {
+        Ok(true) => {}
+        Ok(false) => {
+            let _ = unlink_at(parent, &temp.name, 0);
+            return Err(WriteError::Changed);
         }
+        Err(e) => {
+            let _ = unlink_at(parent, &temp.name, 0);
+            return Err(io_err(e));
+        }
+    }
+    #[cfg(target_os = "linux")]
+    if let Original::Hashed(st, digest) = original {
+        #[cfg(test)]
+        tests::run_hook(&tests::BEFORE_RENAME);
+        exchange_hashed(parent, leaf, &temp, st, digest, unchanged)?;
+        return Ok(Renamed::Done);
     }
     rename_into_place(parent, &temp.name, leaf).map_err(io_err)?;
     Ok(Renamed::Done)
@@ -1743,11 +1862,15 @@ mod tests {
         /// A change after the link's stat was checked, before its target is read.
         pub(super) static BEFORE_READ_LINK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
             const { std::cell::RefCell::new(None) };
+        #[cfg(target_os = "linux")]
+        pub(super) static EXCHANGE_ERRNO: std::cell::Cell<Option<i32>> = const { std::cell::Cell::new(None) };
         /// A permission bit lost despite a successful chmod.
         pub(super) static AFTER_CHMOD: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
             const { std::cell::RefCell::new(None) };
         /// A change right after a compare-and-act look hashed the file: runs at the call after skipping this many.
         pub(super) static AFTER_HASH: Hook = const { std::cell::RefCell::new(None) };
+        #[cfg(target_os = "linux")]
+        pub(super) static BEFORE_RENAME: Hook = const { std::cell::RefCell::new(None) };
         /// A change after a compare-and-remove's last look, before the file is moved aside.
         pub(super) static BEFORE_REMOVE: Hook = const { std::cell::RefCell::new(None) };
     }
@@ -1805,6 +1928,64 @@ mod tests {
         assert_eq!(std::fs::read(&file).unwrap(), b"theirs\n");
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn compare_and_replace_restores_a_save_after_its_last_look() {
+        let (scratch, root, file, expected) = race("replace-exchange");
+        let target = root.target(Path::new("file"), false).unwrap();
+        set_hook(&BEFORE_RENAME, 0, rename_theirs_over(&scratch));
+        assert_eq!(
+            compare_and_replace(&target, Some(expected), b"new\n"),
+            Err(WriteError::Changed)
+        );
+        assert_eq!(std::fs::read(file).unwrap(), b"theirs\n");
+        assert_eq!(std::fs::read_dir(&*scratch).unwrap().count(), 1);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn unsupported_exchange_rechecks_before_plain_rename() {
+        for race_save in [false, true] {
+            let (scratch, root, file, expected) = race("replace-fallback");
+            let target = root.target(Path::new("file"), false).unwrap();
+            EXCHANGE_ERRNO.set(Some(libc::EINVAL));
+            if race_save {
+                set_hook(&BEFORE_RENAME, 0, rename_theirs_over(&scratch));
+            }
+            let result = compare_and_replace(&target, Some(expected), b"new");
+            if race_save {
+                assert_eq!(result, Err(WriteError::Changed));
+                assert_eq!(std::fs::read(file).unwrap(), b"theirs\n");
+            } else {
+                result.unwrap();
+                assert_eq!(std::fs::read(file).unwrap(), b"new");
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn same_size_edits_with_restored_mtime_survive_conflict_actions() {
+        for remove in [true, false] {
+            let (_scratch, root, file, expected) = race("restored-mtime");
+            let target = root.target(Path::new("file"), false).unwrap();
+            let edited = file.clone();
+            set_hook(if remove { &BEFORE_REMOVE } else { &BEFORE_RENAME }, 0, move || {
+                let mtime = std::fs::metadata(&edited).unwrap().modified().unwrap();
+                let mut handle = std::fs::OpenOptions::new().write(true).open(edited).unwrap();
+                handle.write_all(b"edit\n").unwrap();
+                handle.set_modified(mtime).unwrap();
+            });
+            let result = if remove {
+                compare_and_remove(&target, expected)
+            } else {
+                compare_and_replace(&target, Some(expected), b"new")
+            };
+            assert_eq!(result, Err(WriteError::Changed));
+            assert_eq!(std::fs::read(file).unwrap(), b"edit\n");
+        }
+    }
+
     #[test]
     fn compare_and_remove_refuses_a_file_renamed_over_while_it_was_hashed() {
         let (scratch, root, file, expected) = race("remove-race");
@@ -1827,6 +2008,18 @@ mod tests {
             .map(|entry| entry.unwrap().file_name())
             .collect();
         assert_eq!(names, ["file"], "nothing is left aside");
+        std::fs::write(&file, b"ours\n").unwrap();
+        let path = file.clone();
+        set_hook(&BEFORE_REMOVE, 0, move || {
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(path)
+                .unwrap()
+                .write_all(b"longer edit")
+                .unwrap();
+        });
+        assert_eq!(compare_and_remove(&target, expected), Err(WriteError::Changed));
+        assert_eq!(std::fs::read(&file).unwrap(), b"longer edit");
         // Untouched, the same call removes the file.
         std::fs::write(&file, b"ours\n").unwrap();
         let target = root.target(Path::new("file"), false).unwrap();

@@ -264,6 +264,7 @@ fn a_remote_tab_is_saved_apart_with_where_its_agent_is() {
 
 fn saved_remote(sidecar: &str, mode: SessionModeChoice) -> crate::saved_tabs::SavedRemoteTab {
     crate::saved_tabs::SavedRemoteTab {
+        late_lines: Vec::new(),
         window: None,
         helper: agent::HelperHandoff {
             daemon: "".into(),
@@ -399,4 +400,35 @@ fn a_reattach_partway_through_its_replay_keeps_the_saved_floor() {
         12
     );
     shut_down_all(&mut set);
+}
+
+#[test]
+fn late_line_survives_a_tab_restore() {
+    let mut tabs = set();
+    tabs.set_project_origin(crate::remote_project::TabOrigin::Remote {
+        host: "example-host".into(),
+        host_key_sha256: "SHA256:example".into(),
+        root: "/srv/project".into(),
+    })
+    .unwrap();
+    let mut remote = saved_remote("sc-1", SessionModeChoice::Manual);
+    let text = "your last save of main.rs has not reached example-host";
+    remote.late_lines.push(crate::remote_sync::status_schema::LateLine {
+        started_at: None,
+        seq: Some(7),
+        prompt: "go".into(),
+        message_id: "m1".into(),
+        text: text.into(),
+    });
+    let saved = serde_json::to_vec(&remote).unwrap();
+    let tab = tabs.open_reattaching(&serde_json::from_slice(&saved).unwrap());
+    assert_eq!(
+        tabs.saved_snapshot(PROJECT).unwrap().remote[0].late_lines,
+        remote.late_lines
+    );
+    let payload: serde_json::Value =
+        serde_json::from_str(&tabs.get(tab).unwrap().send_sync_payload(false).unwrap()).unwrap();
+    assert_eq!(payload["restored"], serde_json::json!(["m1"]));
+    assert_eq!(payload["lines"][0]["messageId"], "m1");
+    assert_eq!(payload["lines"][0]["text"], text);
 }

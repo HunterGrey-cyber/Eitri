@@ -14,12 +14,14 @@
 //! it went, and the run goes on (starting with that input, if it had not started yet). One that goes away **after**
 //! `close` has handed
 //! over a command that must not be cut short half-way (a commit), so the child runs to its end, its output is read and
-//! dropped, and its status goes to the audit log. Whatever happens, a run ends by [`Prepared::deadline`].
+//! dropped, and its status goes to the audit log while the daemon is running. At daemon exit the readers go away,
+//! and a child still writing to a pipe can get SIGPIPE.
 pub mod git;
 
 use std::collections::{HashMap, VecDeque};
 use std::ffi::OsString;
 use std::future::Future;
+use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::process::{ExitStatus, Stdio};
@@ -84,8 +86,20 @@ pub enum Ended {
 #[derive(Default)]
 pub struct Runs {
     next: AtomicU64,
+    stopping: tokio::sync::watch::Sender<bool>,
     runs: Mutex<HashMap<u64, RunEntry>>,
     changed: tokio::sync::Notify,
+    /// Holds a byte once stopping has begun. Each child looks at it in `pre_exec`, after `chdir` and just before exec, so
+    /// admission is decided in the child: one whose spawn outlasts the start of a stop (a `chdir` waiting on a stalled
+    /// mount) never execs, and the spawning thread holds no lock while it waits.
+    /// Only a pipe that was made is kept: a failure (out of descriptors) refuses that one run, and the next tries again.
+    admission: std::sync::OnceLock<(std::io::PipeReader, std::io::PipeWriter)>,
+    /// Called on the spawning thread just before a child is created, so a test can start a stop at that moment.
+    #[cfg(test)]
+    spawn_gate: Mutex<Option<Box<dyn Fn() + Send + Sync>>>,
+    /// How many of the next attempts to make the admission pipe fail, as when the daemon is out of descriptors.
+    #[cfg(test)]
+    pipe_failures: AtomicU64,
 }
 
 struct RunEntry {
@@ -130,13 +144,43 @@ impl Runs {
     /// Kills the process group of every run whose laptop has not closed its input, as the daemon stops: the pipe to
     /// its stdin closes with the daemon, and an end of input the laptop never sent must not be read as one.
     pub fn kill_unclosed(&self) {
-        for entry in self.runs.lock().expect("runs").values_mut() {
-            if let (false, Some(group)) = (entry.closed, entry.group) {
+        let mut runs = self.runs.lock().expect("runs");
+        if !self.stopping.send_replace(true) {
+            if let Ok((_, writer)) = self.admission() {
+                // The pipe is empty until now, so one byte never blocks.
+                let _ = std::io::Write::write(&mut &*writer, &[0]);
+            }
+        }
+        for entry in runs.values_mut() {
+            if entry.closed {
+                continue;
+            }
+            if let Some(group) = entry.group {
                 entry.stopped = true;
                 // SAFETY: kill takes no pointers; the group is the unreaped child's own.
                 unsafe { libc::kill(-group, libc::SIGKILL) };
             }
         }
+    }
+
+    /// The admission pipe, made on first use. A run only spawns after this returned the pipe, and a stop writes into the
+    /// same pipe, so every child that could be forked sees the stop.
+    fn admission(&self) -> Result<&(std::io::PipeReader, std::io::PipeWriter), String> {
+        if let Some(pipe) = self.admission.get() {
+            return Ok(pipe);
+        }
+        #[cfg(test)]
+        if self
+            .pipe_failures
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+            .is_ok()
+        {
+            return Err("the admission pipe could not be made: Too many open files".into());
+        }
+        let made = std::io::pipe().map_err(|error| format!("the admission pipe could not be made: {error}"))?;
+        // A run made one at the same moment: either pipe works, and the one kept is the one every caller sees.
+        let _ = self.admission.set(made);
+        Ok(self.admission.get().expect("the admission pipe was just set"))
     }
 
     fn stopped(&self, id: u64) -> bool {
@@ -220,14 +264,49 @@ struct Guard {
 }
 
 impl Guard {
-    fn spawned(&mut self, group: i32) {
-        self.group = Some(group);
-        self.runs.update(self.id, |entry| entry.group = Some(group));
+    /// Registration and shutdown share a lock; process creation, which may wait on the working directory, runs
+    /// outside it. A child that comes back from `spawn` passed admission before the stop began (see [`Runs`]), so it is
+    /// treated as a run published before the stop: killed when its input is unfinished, left to finish when closed.
+    fn spawn(
+        &mut self,
+        closed: bool,
+        spawn: impl FnOnce() -> std::io::Result<tokio::process::Child>,
+    ) -> std::io::Result<Option<tokio::process::Child>> {
+        if *self.runs.stopping.borrow() {
+            return Ok(None);
+        }
+        #[cfg(test)]
+        if let Some(gate) = self.runs.spawn_gate.lock().expect("spawn gate").as_ref() {
+            gate();
+        }
+        let child = spawn()?;
+        let mut runs = self.runs.runs.lock().expect("runs");
+        let entry = runs.get_mut(&self.id).expect("registered run");
+        self.group = child.id().map(|pid| pid as i32);
+        entry.group = self.group;
+        if *self.runs.stopping.borrow() && !closed {
+            entry.stopped = true;
+            if let Some(group) = self.group {
+                // SAFETY: this child has not been reaped and owns the group.
+                unsafe {
+                    libc::kill(-group, libc::SIGKILL);
+                }
+            }
+        } else {
+            self.closed = closed;
+            entry.closed = closed;
+        }
+        Ok(Some(child))
     }
 
-    fn close(&mut self) {
-        self.closed = true;
-        self.runs.update(self.id, |entry| entry.closed = true);
+    fn close(&mut self) -> bool {
+        self.runs.update(self.id, |entry| {
+            if !entry.stopped {
+                entry.closed = true;
+                self.closed = true;
+            }
+        });
+        self.closed
     }
 
     /// The child has been reaped: its group id is no longer its own to signal.
@@ -311,9 +390,15 @@ where
         lost: false,
     };
     // Nothing runs until the laptop says whether there is input. What it sent before going away still counts.
+    let mut stopping = guard.runs.stopping.subscribe();
+    let mut stopped_first = false;
     let first = loop {
         tokio::select! {
             biased;
+            _ = stopping.wait_for(|stopping| *stopping) => {
+                stopped_first = true;
+                break None;
+            }
             next = input.next() => break next,
             _ = sender.closed(), if !input.lost => {
                 if !input.lost_after_close(None) {
@@ -323,10 +408,43 @@ where
             _ = tokio::time::sleep_until(deadline) => break None,
         }
     };
+    // A refusal is the run's only message. The run stays registered until the transport has taken it, so a stopping
+    // daemon (which waits for its runs) does not drop the server with the refusal still queued.
+    let refuse = |refusal: String, ended: Ended| {
+        let sender = sender.clone();
+        async move {
+            let sent = sender
+                .send(Ok(exit_message(ExecExit {
+                    refusal,
+                    ..Default::default()
+                })))
+                .await;
+            if sent.is_ok() {
+                taken(&sender).await;
+            }
+            ended
+        }
+    };
+    let stopping_refusal = || {
+        format!(
+            "the Eitri server is stopping; {} did not start; nothing was run",
+            prepared.audit
+        )
+    };
     let (first_bytes, closed) = match first.map(|message| message.map(|message| message.input)) {
         Some(Ok(Some(exec_input::Input::Stdin(bytes)))) => (Some(bytes), false),
         Some(Ok(Some(exec_input::Input::Close(true)))) => (None, true),
+        // The stop came first, even with the laptop's first message already queued: it is told nothing ran.
+        _ if stopped_first => return finish(refuse(stopping_refusal(), Ended::NotStarted).await).await,
         _ => return finish(Ended::NotStarted).await,
+    };
+    let admission = match guard.runs.admission() {
+        Ok((admission, _)) => admission.as_raw_fd(),
+        Err(why) => {
+            let refusal = format!("{} could not start in {}: {why}", prepared.audit, prepared.cwd);
+            let ended = refuse(refusal.clone(), Ended::Refused(refusal)).await;
+            return finish(ended).await;
+        }
     };
     record("exec-start", line.clone()).await;
     let mut command = tokio::process::Command::new(&prepared.program);
@@ -340,31 +458,56 @@ where
         .stderr(Stdio::piped())
         .kill_on_drop(false);
     // Its own process group, so a kill reaches the hooks and helpers it started.
-    // SAFETY: setsid is async-signal-safe and touches no memory of this process.
+    let daemon_pid = std::process::id() as libc::pid_t;
+    // SAFETY: getppid, poll and setsid are async-signal-safe; poll writes only to this closure's own entry.
     unsafe {
-        command.pre_exec(|| {
+        command.pre_exec(move || {
+            // chdir precedes this hook. The mount can recover after the daemon's grace period and exit.
+            if libc::getppid() != daemon_pid {
+                return Err(std::io::Error::from_raw_os_error(libc::ECANCELED));
+            }
+            // A byte (or any error) on the admission pipe: the daemon has begun to stop, so this child never execs.
+            let mut stop = libc::pollfd {
+                fd: admission,
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            if libc::poll(&mut stop, 1, 0) != 0 {
+                return Err(std::io::Error::from_raw_os_error(libc::ECANCELED));
+            }
             if libc::setsid() < 0 {
                 return Err(std::io::Error::last_os_error());
             }
             Ok(())
         });
     }
-    let mut child = match command.spawn() {
-        Ok(child) => child,
+    // The blocking worker owns registration while chdir/exec waits. Shutdown can take the registry lock
+    // and start its grace timer even when both runtime workers would otherwise be waiting on a mount.
+    let (mut guard, started) = tokio::task::spawn_blocking(move || {
+        let result = guard.spawn(closed, || command.spawn());
+        (guard, result)
+    })
+    .await
+    .expect("spawn worker returns its guard");
+    let refused_by_stop =
+        |error: &std::io::Error| error.raw_os_error() == Some(libc::ECANCELED) && *guard.runs.stopping.borrow();
+    let mut child = match started {
+        Ok(Some(child)) => child,
+        // The daemon began to stop before the child was admitted: nothing ran, and the laptop is told so.
+        Ok(None) => return finish(refuse(stopping_refusal(), Ended::NotStarted).await).await,
+        Err(error) if refused_by_stop(&error) => {
+            return finish(refuse(stopping_refusal(), Ended::NotStarted).await).await
+        }
         Err(error) => {
             let refusal = format!("{} could not start in {}: {error}", prepared.audit, prepared.cwd);
-            let _ = sender
-                .send(Ok(exit_message(ExecExit {
-                    refusal: refusal.clone(),
-                    ..Default::default()
-                })))
-                .await;
-            return finish(Ended::Refused(refusal)).await;
+            return finish(refuse(refusal.clone(), Ended::Refused(refusal)).await).await;
         }
     };
-    guard.spawned(child.id().expect("a child just spawned has a pid") as i32);
-    if closed {
-        guard.close();
+    if guard.runs.stopped(guard.id) {
+        guard.stdin = child.stdin.take();
+        let status = child.wait().await;
+        guard.reaped();
+        return finish(stopped_outcome(status.ok())).await;
     }
     // Taken out of the child: tokio's wait would otherwise close it, which must happen only on the laptop's close.
     guard.stdin = child.stdin.take();
@@ -400,13 +543,11 @@ where
             &reaped,
         )
         .await;
-        if let Input::Closed = ended {
-            guard.close();
-        } else {
+        if !matches!(ended, Input::Closed) || !guard.close() {
             let killed = status.is_none();
             if killed {
                 guard.kill();
-                let _ = child.wait().await;
+                status = Some(child.wait().await);
                 guard.reaped();
             }
             guard.let_go_of_stdin();
@@ -414,9 +555,9 @@ where
             out.abort();
             err.abort();
             let ended = match (ended, status) {
-                _ if guard.runs.stopped(guard.id) => Ended::KilledByDaemonStop,
+                (_, status) if guard.runs.stopped(guard.id) => stopped_outcome(status.and_then(Result::ok)),
                 (Input::Deadline, _) if killed => Ended::KilledAtDeadline,
-                (_, Some(Ok(status))) => Ended::Exited(exit_of(status)),
+                (_, Some(Ok(status))) if !killed => Ended::Exited(exit_of(status)),
                 _ => Ended::KilledBeforeClose,
             };
             return finish(ended).await;
@@ -463,6 +604,25 @@ where
     // Nobody may be reading any more; the status still goes to the audit log.
     let _ = tokio::time::timeout_at(deadline, sender.send(Ok(exit_message(exit.clone())))).await;
     finish(Ended::Exited(exit)).await
+}
+
+/// Waits, for at most two seconds, until the transport has taken every message queued on `sender` or the laptop is
+/// gone.
+async fn taken(sender: &mpsc::Sender<Result<ExecOutput, Status>>) {
+    let _ = tokio::time::timeout(Duration::from_secs(2), async {
+        while sender.capacity() < sender.max_capacity() && !sender.is_closed() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+}
+
+fn stopped_outcome(status: Option<ExitStatus>) -> Ended {
+    use std::os::unix::process::ExitStatusExt;
+    match status {
+        Some(status) if status.signal() != Some(libc::SIGKILL) => Ended::Exited(exit_of(status)),
+        _ => Ended::KilledByDaemonStop,
+    }
 }
 
 fn exit_of(status: ExitStatus) -> ExecExit {
@@ -521,6 +681,7 @@ where
     A: Future<Output = ()> + Send,
 {
     // A child that no longer reads its stdin (it exited, or closed it) gets no more; the input is still followed.
+    let mut stopping = guard.runs.stopping.subscribe();
     let mut writable = true;
     let mut ahead: Option<Option<Result<ExecInput, Status>>> = None;
     loop {
@@ -548,6 +709,7 @@ where
         let reading = ahead.is_none();
         let reaping = status.is_none();
         tokio::select! {
+            _ = async { let _ = stopping.wait_for(|stopping| *stopping).await; } => return Input::Gone,
             written = async { guard.writing.as_mut().expect("a write is pending").await }, if writing => {
                 let (stdin, result) = written;
                 guard.writing = None;
@@ -556,11 +718,11 @@ where
             }
             next = input.next(), if reading => ahead = Some(next),
             exited = child.wait(), if reaping => {
+                guard.reaped();
                 if let Ok(exited) = &exited {
                     reaped(exit_of(*exited)).await;
                 }
                 *status = Some(exited);
-                guard.reaped();
             }
             _ = sender.closed(), if !input.lost => {
                 if !input.lost_after_close(ahead.as_ref()) {
@@ -668,5 +830,149 @@ fn outcome(ended: &Ended) -> String {
         Ended::KilledByDaemonStop => "killed=daemon-stop".to_owned(),
         Ended::NotStarted => "not-started".to_owned(),
         Ended::Refused(refusal) => format!("refused {}", audit_word(refusal)),
+    }
+}
+
+#[cfg(test)]
+mod registration_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn shutdown_can_start_while_a_child_is_spawning() {
+        use std::os::unix::process::ExitStatusExt;
+        // The child here stands for one that passed admission just before the stop began.
+        for closed in [false, true] {
+            let runs = Arc::new(Runs::default());
+            let mut guard = Guard {
+                id: runs.add("git".into()),
+                runs: runs.clone(),
+                group: None,
+                closed: false,
+                stdin: None,
+                writing: None,
+            };
+            let mut child = guard
+                .spawn(closed, || {
+                    if runs.runs.try_lock().is_err() {
+                        return Err(std::io::Error::other("spawn holds the registry"));
+                    }
+                    let child = tokio::process::Command::new("sleep")
+                        .arg("60")
+                        .process_group(0)
+                        .spawn()?;
+                    runs.kill_unclosed();
+                    Ok(child)
+                })
+                .unwrap()
+                .unwrap();
+            if closed {
+                // Its laptop handed over the whole input: it is left to finish, as a run published before the stop.
+                assert!(!runs.stopped(guard.id) && guard.closed);
+                let group = guard.group.unwrap();
+                // SAFETY: the test's own unreaped child.
+                unsafe { libc::kill(-group, libc::SIGKILL) };
+            } else {
+                assert!(runs.stopped(guard.id));
+            }
+            assert_eq!(child.wait().await.unwrap().signal(), Some(libc::SIGKILL));
+            guard.reaped();
+        }
+    }
+
+    #[tokio::test]
+    async fn a_close_first_child_admitted_after_a_stop_began_never_execs_and_says_so() {
+        let dir = std::env::temp_dir().join(format!(
+            "eitri-exec-admission-{}-{}",
+            std::process::id(),
+            uuid_free_suffix()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let marker = dir.join("ran");
+        let runs = Arc::new(Runs::default());
+        let weak = Arc::downgrade(&runs);
+        // The stop begins while the spawn is under way (for example, while chdir waits on a stalled mount).
+        *runs.spawn_gate.lock().unwrap() = Some(Box::new(move || {
+            if let Some(runs) = weak.upgrade() {
+                runs.kill_unclosed();
+            }
+        }));
+        let prepared = Prepared {
+            program: "/bin/sh".into(),
+            args: vec!["-c".into(), format!("touch '{}'", marker.display())],
+            cwd: dir.to_str().unwrap().into(),
+            env: vec![("PATH".into(), "/usr/bin:/bin".into())],
+            audit: "git commit".into(),
+            deadline: Duration::from_secs(60),
+        };
+        let input = tokio_stream::iter(vec![Ok(ExecInput {
+            input: Some(exec_input::Input::Close(true)),
+        })]);
+        let (mut output, ended) = run(prepared, input, dir.join("state"), 1, runs.clone());
+        let mut messages = vec![];
+        while let Some(message) = output.recv().await {
+            messages.push(message.unwrap());
+        }
+        assert_eq!(ended.await.unwrap(), Ended::NotStarted);
+        assert!(!marker.exists(), "the child ran after the stop began");
+        match messages.as_slice() {
+            [ExecOutput {
+                output: Some(exec_output::Output::Exit(exit)),
+            }] => assert!(exit.refusal.contains("nothing was run"), "{exit:?}"),
+            other => panic!("the laptop must get one exit message: {other:?}"),
+        }
+        let audit = std::fs::read_to_string(dir.join("state/audit.log")).unwrap();
+        assert!(audit.contains("not-started"), "{audit}");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn an_admission_pipe_that_could_not_be_made_is_tried_again_for_the_next_run() {
+        let dir = std::env::temp_dir().join(format!(
+            "eitri-exec-admission-retry-{}-{}",
+            std::process::id(),
+            uuid_free_suffix()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let runs = Arc::new(Runs::default());
+        runs.pipe_failures.store(1, Ordering::SeqCst);
+        let mut exits = vec![];
+        for _ in 0..2 {
+            let prepared = Prepared {
+                program: "/bin/sh".into(),
+                args: vec!["-c".into(), "exit 7".into()],
+                cwd: dir.to_str().unwrap().into(),
+                env: vec![],
+                audit: "git commit".into(),
+                deadline: Duration::from_secs(60),
+            };
+            let input = tokio_stream::iter(vec![Ok(ExecInput {
+                input: Some(exec_input::Input::Close(true)),
+            })]);
+            let (mut output, ended) = run(prepared, input, dir.join("state"), 1, runs.clone());
+            let mut exit = None;
+            while let Some(message) = output.recv().await {
+                if let Some(exec_output::Output::Exit(status)) = message.unwrap().output {
+                    exit = Some(status);
+                }
+            }
+            exits.push((exit.expect("an exit message"), ended.await.unwrap()));
+        }
+        assert!(exits[0].0.refusal.contains("admission pipe"), "{:?}", exits[0]);
+        assert!(matches!(exits[0].1, Ended::Refused(_)), "{:?}", exits[0]);
+        // Descriptors were freed in between: the next run makes the pipe and runs.
+        assert_eq!(
+            (exits[1].0.code, exits[1].0.refusal.as_str()),
+            (7, ""),
+            "{:?}",
+            exits[1]
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    fn uuid_free_suffix() -> u128 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
     }
 }

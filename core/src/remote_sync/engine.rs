@@ -16,6 +16,9 @@ pub trait SyncEngine: Send + Sync {
     fn pause(&self, name: &str) -> Result<(), SyncError>;
     fn resume(&self, name: &str) -> Result<(), SyncError>;
     fn status(&self, labels: &Labels) -> Result<Vec<SessionStatus>, SyncError>;
+    /// One session's status as the engine reports it now, by name, given up after `cap`: what a sender checks
+    /// around its flush.
+    fn session_status_within(&self, name: &str, cap: Duration) -> Result<SessionStatus, SyncError>;
     fn flush(&self, name: &str, cap: Duration) -> FlushOutcome;
     fn monitor(&self, name: &str) -> Result<Box<dyn Iterator<Item = SessionStatus> + Send>, SyncError>;
     /// Makes sure the engine can answer: a holder calls it before its first listing, since a status call alone never
@@ -206,6 +209,9 @@ pub fn valid_label_value(value: &str) -> bool {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SessionStatus {
     pub name: String,
+    /// Mutagen's identifier for this instance of the session (`identifier`); a session re-created under the same
+    /// name gets a new one. Empty when unknown.
+    pub identifier: String,
     pub role: Role,
     pub state: SyncState,
     pub successful_cycles: u64,
@@ -225,6 +231,7 @@ impl SessionStatus {
         let reason = reason.into();
         Self {
             name: name.into(),
+            identifier: String::new(),
             role,
             state: SyncState::Disconnected(reason.clone()),
             successful_cycles: 0,

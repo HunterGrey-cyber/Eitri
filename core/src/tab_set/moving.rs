@@ -34,6 +34,8 @@ const SESSION_ID_WAIT: Duration = Duration::from_secs(2);
 /// watchers (handles into this window's review).
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct TabHandoff {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    late_lines: Vec<crate::remote_sync::status_schema::LateLine>,
     /// Where the tab's agent runs. A window running a build that predates remote tabs writes none, and all its tabs
     /// are local; a record whose agent runs on a server and says no remote origin is refused where it is taken up
     /// ([`TabHandoff::check_remote_agent`]).
@@ -473,6 +475,7 @@ fn handoff_of(tab: &Tab, review: Option<ReviewHandoff>) -> TabHandoff {
         // agent it has not reached does not move (`MoveRefusedWhy::UnreachedRemoteAgent`).
         remote_agent: _,
         remote_agent_stopped: _,
+        send_sync,
         // A dismissal is this window's pages': the other window's draw the note again.
         root_note_dismissed: _,
         // Refused by the freeze while set: a terminal handoff in flight does not move.
@@ -572,6 +575,7 @@ fn handoff_of(tab: &Tab, review: Option<ReviewHandoff>) -> TabHandoff {
         ..plan.clone()
     };
     TabHandoff {
+        late_lines: send_sync.lines(),
         origin: origin.clone(),
         name: name.clone(),
         mode: *mode,
@@ -1441,6 +1445,7 @@ impl TabSet {
             starting: &mut self.starting,
             starting_since: &mut self.starting_since,
             held_sends: &self.pending_sends,
+            desk_starts: &mut self.desk_starts,
             untracked_starts: &mut self.untracked_starts,
             observers: &mut self.observers,
             last_link_states: &mut self.last_link_states,
@@ -1618,6 +1623,7 @@ impl TabSet {
 
     fn adopt(&mut self, handoff: TabHandoff, backend: TabBackend, view: ViewId) -> TabId {
         let TabHandoff {
+            late_lines,
             origin,
             name,
             mode,
@@ -1689,6 +1695,7 @@ impl TabSet {
         let at = self.position(id).expect("just inserted");
         let t = &mut self.tabs[at];
         t.origin = origin;
+        t.send_sync.restore(&late_lines);
         t.origin_from_window = false;
         t.name = name;
         t.mode = mode;

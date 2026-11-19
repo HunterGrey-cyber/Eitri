@@ -19,6 +19,8 @@ pub(super) struct Invocation {
     pub args: Vec<OsString>,
     pub foreign: bool,
     pub icase_pathspecs: bool,
+    pub literal_pathspecs: Option<bool>,
+    pub noglob_pathspecs: bool,
     pub git_dir: Option<PathBuf>,
     pub work_tree: Option<PathBuf>,
 }
@@ -31,6 +33,8 @@ impl Invocation {
             args: vec![],
             foreign: false,
             icase_pathspecs: false,
+            literal_pathspecs: None,
+            noglob_pathspecs: false,
             git_dir: None,
             work_tree: None,
         };
@@ -108,7 +112,13 @@ impl Invocation {
                     | "--no-advice"
             ) || arg.starts_with("-c") && arg.len() > 2
             {
-                parsed.icase_pathspecs |= arg == "--icase-pathspecs";
+                match arg.as_ref() {
+                    "--icase-pathspecs" => parsed.icase_pathspecs = true,
+                    "--literal-pathspecs" => parsed.literal_pathspecs = Some(true),
+                    "--no-literal-pathspecs" => parsed.literal_pathspecs = Some(false),
+                    "--noglob-pathspecs" => parsed.noglob_pathspecs = true,
+                    _ => {}
+                }
                 parsed.globals.push(args[i].clone());
             } else {
                 // Git's version, help and path/listing queries end global parsing before any later -C.
@@ -160,6 +170,46 @@ impl Invocation {
         }
         self.globals = globals;
         self
+    }
+
+    /// The single filename a pathspec addresses. Patterns that need a server-side expansion
+    /// have no single name against which the laptop can check the session's exclusions.
+    pub fn pathspec_name(&self, operand: &Path, root: &Path) -> Option<(PathBuf, bool)> {
+        let mut base = self.cwd.as_path();
+        let mut name = operand.to_str()?;
+        let mut icase = self.icase_pathspecs;
+        if self.literal_pathspecs != Some(true) {
+            let mut literal = self.noglob_pathspecs;
+            if let Some(magic) = name.strip_prefix(":(") {
+                let (flags, rest) = magic.split_once(')')?;
+                for flag in flags.split(',') {
+                    match flag {
+                        "top" => base = root,
+                        "literal" => literal = true,
+                        "glob" => literal = false,
+                        "icase" => icase = true,
+                        "" => {}
+                        _ => return None,
+                    }
+                }
+                name = rest;
+            } else if let Some(rest) = name.strip_prefix(":/") {
+                base = root;
+                // Other short magic can follow the slash (for example an exclusion).
+                // Only an explicit terminator or an ordinary filename starts a single path.
+                name = match rest.strip_prefix(':') {
+                    Some(path) => path,
+                    None if rest.starts_with(['!', '^', '/']) => return None,
+                    None => rest,
+                };
+            } else if name.starts_with(':') {
+                return None;
+            }
+            if name.is_empty() || !literal && name.contains(['*', '?', '[', '\\']) {
+                return None;
+            }
+        }
+        Some((normalize(&base.join(name)), icase))
     }
 
     pub fn forwarded_args(&self) -> Vec<OsString> {
@@ -239,6 +289,10 @@ pub(super) fn classify_invocation(args: &[OsString], allow_local: bool) -> Route
                 || (value.is_some() && !takes_value && !long_accepts_attached_value(cmd, name))
         })
     {
+        return Route::RefuseUnknown;
+    }
+    // Paths read from a file are never seen here, so neither conflicts nor sync exclusions could be checked for them.
+    if parsed.long.iter().any(|&(name, _)| name == "--pathspec-from-file") {
         return Route::RefuseUnknown;
     }
     if cmd == "grep" && (parsed.short_values.contains(&('f', "-")) || parsed.long.contains(&("--file", Some("-"))))
@@ -405,7 +459,7 @@ pub(super) fn classify_invocation(args: &[OsString], allow_local: bool) -> Route
     let mut paths = if cmd == "commit" {
         commit_paths(args, &parsed)
     } else {
-        path_arguments(cmd, args, &parsed, path_separator)
+        path_arguments(cmd, mode, args, &parsed, path_separator)
     };
     paths.extend(output_files.into_iter().flatten());
     let whole = match cmd {
@@ -413,7 +467,8 @@ pub(super) fn classify_invocation(args: &[OsString], allow_local: bool) -> Route
         "commit" => paths.is_empty() || short('a') || has("--all") || short('i') || has("--include"),
         "add" => paths.is_empty() || paths.iter().any(|p| p == Path::new(".")),
         "stash" => true,
-        "checkout" => paths.is_empty(),
+        // Without `--`, a lone operand may be a branch to switch to.
+        "checkout" => paths.is_empty() || !path_separator && parsed.operands.len() == 1,
         "switch" => true,
         "restore" => paths.is_empty(),
         "reset" => !path_separator || has("--hard") || has("--merge") || has("--keep") || paths.is_empty(),
@@ -422,7 +477,35 @@ pub(super) fn classify_invocation(args: &[OsString], allow_local: bool) -> Route
         "rm" | "mv" => paths.is_empty(),
         _ => false,
     };
-    forward(whole || has("--pathspec-from-file"), paths)
+    forward(whole, paths)
+}
+
+/// Whether a forwarded route's first path is the first operand of `checkout` or `reset` given without `--`, which Git
+/// reads as a revision when it names one (and as a path otherwise).
+pub(super) fn leading_revision_candidate(args: &[OsString]) -> bool {
+    let words: Vec<_> = args.iter().map(|s| s.to_string_lossy()).collect();
+    let Some(cmd) = words.first().map(|s| s.as_ref()) else {
+        return false;
+    };
+    if !matches!(cmd, "checkout" | "reset") {
+        return false;
+    }
+    let parsed = CommandOptions::parse(cmd, &words);
+    !parsed.operands.is_empty() && words.get(parsed.end).is_none_or(|word| word != "--")
+}
+
+/// How many of a forwarded route's paths, counted from the end, Git takes as literal file names rather than as
+/// pathspecs: every operand of `mv`, and the `--output` files, which [`classify_invocation`] lists last.
+pub(super) fn literal_path_count(args: &[OsString], paths: usize) -> usize {
+    let cmd = args.first().map(|cmd| cmd.to_string_lossy()).unwrap_or_default();
+    if cmd == "mv" {
+        return paths;
+    }
+    revision_output_files(&cmd, args)
+        .into_iter()
+        .flatten()
+        .count()
+        .min(paths)
 }
 
 fn forward(whole_tree: bool, paths: Vec<PathBuf>) -> Route {
@@ -475,7 +558,7 @@ fn allowed_form(cmd: &str, mode: Option<&str>, operands_before_end: usize) -> Op
             ignore-errors ignore-missing sparse refresh renormalize pathspec-file-nul"),
         "am" => ("pC3qsk", "3way no-3way quiet signoff keep keep-non-patch continue skip abort quit show-current-patch"),
         "apply" => ("pCRzv", "cached index check stat numstat summary apply reverse reject recount allow-empty \
-            ignore-space-change ignore-whitespace verbose"),
+            ignore-space-change ignore-whitespace verbose unidiff-zero"),
         "branch" => ("larvdfDmMcCq", "list all remotes verbose show-current contains no-contains merged no-merged \
             delete force move copy quiet track no-track unset-upstream"),
         "checkout" => ("bBoqftp", "quiet force detach track no-track ours theirs merge patch recurse-submodules \
@@ -763,73 +846,36 @@ fn commit_option_known(name: &str) -> bool {
         )
 }
 
-fn path_arguments(cmd: &str, args: &[OsString], parsed: &CommandOptions<'_>, path_separator: bool) -> Vec<PathBuf> {
-    if matches!(
-        cmd,
-        "push" | "fetch" | "tag" | "symbolic-ref" | "branch" | "remote" | "config" | "help"
-    ) {
-        return vec![];
+/// The operands of a forwarded form that may name paths. Every option has passed the form's list by now, and
+/// [`CommandOptions`] consumed the value of each option that takes one, so the operands are exactly the words Git
+/// does not read as options or option values.
+fn path_arguments(
+    cmd: &str,
+    mode: Option<&str>,
+    args: &[OsString],
+    parsed: &CommandOptions<'_>,
+    path_separator: bool,
+) -> Vec<PathBuf> {
+    let operands = |skip: usize| {
+        parsed
+            .operands
+            .iter()
+            .skip(skip)
+            .map(|&index| PathBuf::from(&args[index]))
+            .collect()
+    };
+    match cmd {
+        "push" | "fetch" | "tag" | "symbolic-ref" | "branch" | "remote" | "config" | "help" => vec![],
+        // These take paths on both sides of `--`.
+        "add" | "rm" | "mv" | "restore" => operands(0),
+        // Without `--`, Git decides for each word whether it names a revision or a path, so each is checked as a path.
+        "checkout" | "reset" if !path_separator => operands(0),
+        // Every operand after the mode word is a pathspec, with or without `--`.
+        "stash" if mode == Some("push") => operands(1),
+        // Other commands need a separator to distinguish paths from revisions.
+        _ if path_separator => args[parsed.end + 1..].iter().map(PathBuf::from).collect(),
+        _ => vec![],
     }
-    // These commands accept paths on both sides. Other commands need a separator to distinguish paths from revisions.
-    if !matches!(cmd, "add" | "rm" | "mv" | "restore") {
-        return if path_separator {
-            args[parsed.end + 1..].iter().map(PathBuf::from).collect()
-        } else {
-            vec![]
-        };
-    }
-    let mut skip = false;
-    for arg in &args[1..parsed.end] {
-        if skip {
-            skip = false;
-            continue;
-        }
-        let s = arg.to_string_lossy();
-        if cmd == "restore" && matches!(s.as_ref(), "--source" | "-s") {
-            skip = true;
-            continue;
-        }
-        if s.starts_with('-') && (cmd != "add" || s != "-") {
-            let known = match cmd {
-                "add" => {
-                    matches!(
-                        s.as_ref(),
-                        "--update"
-                            | "--all"
-                            | "--force"
-                            | "--verbose"
-                            | "--intent-to-add"
-                            | "--ignore-errors"
-                            | "--ignore-missing"
-                            | "--sparse"
-                    ) || s[1..].chars().all(|flag| matches!(flag, 'u' | 'A' | 'f' | 'v' | 'N'))
-                }
-                "restore" => {
-                    matches!(
-                        s.as_ref(),
-                        "--staged" | "--worktree" | "-S" | "-W" | "--ours" | "--theirs"
-                    ) || s.starts_with("--source=")
-                }
-                "rm" => matches!(
-                    s.as_ref(),
-                    "-f" | "--force" | "-r" | "--cached" | "--ignore-unmatch" | "-n" | "--dry-run" | "-q" | "--quiet"
-                ),
-                "mv" => matches!(
-                    s.as_ref(),
-                    "-f" | "--force" | "-k" | "-n" | "--dry-run" | "-v" | "--verbose"
-                ),
-                _ => false,
-            };
-            if !known {
-                return vec![];
-            }
-        }
-    }
-    parsed
-        .operands
-        .iter()
-        .map(|&index| PathBuf::from(&args[index]))
-        .collect()
 }
 
 fn reflog_maintenance_mode(cmd: &str, first_word: Option<&str>) -> bool {

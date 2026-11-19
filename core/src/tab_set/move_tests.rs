@@ -161,6 +161,7 @@ fn a_tab_that_only_names_its_saved_remote_agent_does_not_move() {
         })
         .unwrap();
     let saved = crate::saved_tabs::SavedRemoteTab {
+        late_lines: Vec::new(),
         helper: agent::HelperHandoff {
             host: "example-host".into(),
             host_key_sha256: "SHA256:example".into(),

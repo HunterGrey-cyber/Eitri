@@ -1795,6 +1795,11 @@ impl AgentPanelHandle {
         });
     }
 
+    pub fn set_sync_port(&self, port: Option<eitri_core::remote_sync::flush::SendPort>) {
+        self.wake();
+        self.state.borrow_mut().tabs.send_port = port;
+    }
+
     /// The window's sync actor reports its status (a remote window only): kept for the project bar's chip.
     pub fn set_sync_status(&self, chip: eitri_core::remote_sync::status_schema::SyncChip) {
         self.wake();
@@ -4417,6 +4422,7 @@ mod tests {
         let state_home = project.join("state");
         let base = saved_tabs::state_dir(Some(state_home.as_os_str()), None).unwrap();
         let remote = |sidecar: &str, key: &str| SavedRemoteTab {
+            late_lines: Vec::new(),
             window: None,
             helper: agent::HelperHandoff {
                 daemon: "".into(),

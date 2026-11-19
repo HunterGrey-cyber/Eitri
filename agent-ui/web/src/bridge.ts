@@ -450,6 +450,7 @@ type InboundHandler = (
      *  `serialize_arrive_for_js` in `core/src/agent_bridge.rs`. `intent` says why the keys came (a reveal to look,
      *  or to stop the tab: then the chat asks its own y/n question); it never acts by itself. */
     | { kind: "arrive"; intent?: "show" | "stop" }
+    | ({ kind: "send_sync"; tab: TabId } & import("./syncChip").SendSync)
     | { kind: "sync_status"; chip: import("./syncChip").SyncStatus }
     | { kind: "pages"; pages: PageLine[] }
     /** `shell`'s keys for the `?` overlay (`serialize_keymap_for_js`). */
@@ -975,6 +976,7 @@ export function installDispatch(handler: InboundHandler): void {
         obj.kind === "editor_typing" ||
         obj.kind === "enter_input" ||
         obj.kind === "arrive" ||
+        obj.kind === "send_sync" ||
         obj.kind === "sync_status" ||
         obj.kind === "pages" ||
         obj.kind === "keymap" ||

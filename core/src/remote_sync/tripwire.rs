@@ -63,16 +63,17 @@ pub fn top_missing(root: &Path, rel: &str) -> String {
 }
 
 /// The band line for a trip. `path` is the named path (none when the batch named no file), `bytes` what it would send.
-pub fn paused_text(host: &str, path: Option<&str>, bytes: u64) -> String {
+pub fn paused_text(root: &Path, host: &str, path: Option<&str>, bytes: u64) -> String {
     let mib = bytes.div_ceil(MIB);
+    let root = root.display();
     match path {
         Some(path) => format!(
-            "sync paused: {path} on {host} would send {mib} MiB to this laptop; all sync with {host} waits until you \
+            "sync paused: {path} on {host} would send {mib} MiB to this laptop; sync of {root} with {host} waits until you \
              choose: sync it anyway (eitri host sync allow {path}) or leave it on the server (eitri host sync exclude \
              {path})"
         ),
         None => format!(
-            "sync paused: a {mib} MiB change on {host} would reach this laptop; all sync with {host} waits until you \
+            "sync paused: a {mib} MiB change on {host} would reach this laptop; sync of {root} with {host} waits until you \
              choose: sync it anyway (eitri host sync allow) or leave a path on the server (eitri host sync exclude \
              <path>)"
         ),
@@ -152,11 +153,16 @@ mod tests {
 
     #[test]
     fn texts_name_the_path_the_host_and_the_size() {
-        let text = paused_text("au", Some("assets/video"), 70 * MIB + 1);
+        let text = paused_text(Path::new("/srv/project"), "au", Some("assets/video"), 70 * MIB + 1);
         assert!(text.starts_with("sync paused: assets/video on au would send 71 MiB to this laptop"));
+        for path in [Some("assets/video"), None] {
+            assert!(paused_text(Path::new("/srv/project"), "au", path, MIB)
+                .contains("sync of /srv/project with au waits until you choose"));
+        }
         assert!(text.contains("eitri host sync allow assets/video"));
         assert!(text.contains("eitri host sync exclude assets/video"));
-        assert!(paused_text("au", None, 64 * MIB).starts_with("sync paused: a 64 MiB change on au"));
+        assert!(paused_text(Path::new("/srv/project"), "au", None, 64 * MIB)
+            .starts_with("sync paused: a 64 MiB change on au"));
         assert_eq!(
             arrived_text("au", 100 * MIB),
             "this laptop's copy grew by 100 MiB within one sync cycle; if that came from au, it arrived before sync \

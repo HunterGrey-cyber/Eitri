@@ -63,6 +63,9 @@ pub trait BrokerEnv {
     fn home(&self) -> Option<&Path>;
     fn context(&self) -> Option<EditorContext>;
     /// Where a proposal keeps its bytes. `None`: this window can keep none.
+    fn write_hold(&self, _tab: TabId) -> Option<crate::remote_sync::flush::EditorWriteHold> {
+        None
+    }
     fn proposal_writer(&self) -> Option<ProposalWriter> {
         None
     }
@@ -546,6 +549,8 @@ impl Broker {
         let id = self.ids.call();
         let context = env.context();
         self.memory.set_writer(env.proposal_writer());
+        self.memory
+            .with(tab.0, |memory| memory.write_hold = env.write_hold(tab));
         let began = tool.begin(
             &args,
             &tool_cx(

@@ -477,6 +477,7 @@ export type KeyContext = {
    *  mean "not running" -- idle is the common case and every existing caller that never mentions
    *  this field must keep meaning idle. */
   turnRunning?: boolean;
+  syncWaiting?: boolean;
   /** The panel's own which-key table, absent before the first `keymap`
    *  envelope. Consulted only for a second key completing a two-key BROWSE prefix (`[b`); `App.tsx`
    *  is expected to pass `KeymapHelp.panel` (or leave it unset), never `EMPTY_PANEL_TABLE` -- an
@@ -737,7 +738,7 @@ export const FIXED_PAIRS: Record<PendingPrefix, Readonly<Record<string, NonNulla
  *  so for them only the second key still reads Alt/Meta -- a pair whose first half was plain. */
 function resolvePendingSecond(prefix: PendingPrefix, event: KeyLike, ctx: KeyContext): PanelAction {
   if (isModifierKey(event.key)) return null;
-  if (event.ctrlKey && !event.shiftKey && event.key === "c") return ctx.turnRunning === true ? { kind: "interrupt" } : null;
+  if (event.ctrlKey && !event.shiftKey && event.key === "c") return ctx.turnRunning || ctx.syncWaiting ? { kind: "interrupt" } : null;
   if (!event.ctrlKey && (!event.shiftKey || event.key === "?")) {
     // `hasOwn`, not a bare index: a key spelled like an `Object.prototype` member (`constructor`)
     // must be looked up in this table alone, never inherited into a pair.
@@ -782,7 +783,7 @@ export function resolveKey(mode: PanelMode, event: KeyLike, ctx: KeyContext): Pa
     const op = ctx.operator;
     const cancel: PanelAction = { kind: "cancel", why: "unbound" };
     if (isModifierKey(event.key)) return { kind: "operator", op };
-    if (event.ctrlKey && !event.shiftKey && event.key === "c") return ctx.turnRunning === true ? { kind: "interrupt" } : cancel;
+    if (event.ctrlKey && !event.shiftKey && event.key === "c") return ctx.turnRunning || ctx.syncWaiting ? { kind: "interrupt" } : cancel;
     // Brackets may need Option/Meta or AltGr on the user's layout, including the
     // second bracket of a pair. Ctrl alone and Super/Hyper still cancel.
     const layoutBracket = op.scope === null && ["[", "]", "{", "}"].includes(event.key)
@@ -871,7 +872,7 @@ export function resolveKey(mode: PanelMode, event: KeyLike, ctx: KeyContext): Pa
     // Claude Code's `Ctrl+c` interrupt, minus the exit half -- this table never closes
     // anything. Idle, it is left to the browser (a text selection's native copy); `Ctrl+c` in INPUT
     // is the composer's own, so it is deliberately not named here at all.
-    if (event.ctrlKey && !event.shiftKey && event.key === "c") return ctx.turnRunning === true ? { kind: "interrupt" } : null;
+    if (event.ctrlKey && !event.shiftKey && event.key === "c") return ctx.turnRunning || ctx.syncWaiting ? { kind: "interrupt" } : null;
     // Table motions take the built-in's key before named Shift keys, braces and plain keys.
     // Ctrl chords stay above; produced keys may carry Shift, Option or AltGr.
     if (!event.ctrlKey && !hasSuperOrHyper(event)) {

@@ -63,6 +63,9 @@ fn dispatch_with_probe<F: std::future::Future<Output = io::Result<()>>>(
         )
         .map_err(|error| invalid(error.to_string()))?;
     }
+    if command == "complete-folders" {
+        return probe::complete_folders(&args);
+    }
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
         .enable_all()
@@ -96,10 +99,15 @@ fn dispatch_with_probe<F: std::future::Future<Output = io::Result<()>>>(
             };
             finish_runtime(runtime, ensure::connect(&paths))
         }
-        Some("check-sidecars") if args.len() == 2 && args[1] == "--live-runs" => {
+        // `--terminals` says the caller saw terminal hosts' records: a helper from before them refuses the flag, so
+        // it cannot report a run clear while a terminal it does not know of still runs.
+        Some("check-sidecars")
+            if (args.len() == 2 && args[1] == "--live-runs")
+                || (args.len() == 3 && args[1] == "--live-runs" && args[2] == "--terminals") =>
+        {
             ensure::live_sidecar_runs(&std::path::Path::new(&args[0]).join("run"))
         }
-        Some("check-sidecars") if args.len() == 1 => {
+        Some("check-sidecars") if args.len() == 1 || (args.len() == 2 && args[1] == "--terminals") => {
             let run = std::path::Path::new(&args[0]).join("run");
             ensure::check_sidecars_stopped(&run)
         }
@@ -110,6 +118,12 @@ fn dispatch_with_probe<F: std::future::Future<Output = io::Result<()>>>(
             ensure::stop_daemon(&run_dir::Paths::from_env(key)?)
         }
         Some("probe") => finish_runtime(runtime, probe(args)),
+        // One terminal's process, started by the daemon; not a command a person runs.
+        Some("term-host") if args.len() == 2 && args[0] == "--args-fd" && args[1] == "3" => {
+            finish_runtime(runtime, async move {
+                daemon::terminals::host::run(daemon::terminals::host::read_args()?).await
+            })
+        }
         _ => Err(invalid("unknown command or unexpected arguments")),
     }
 }

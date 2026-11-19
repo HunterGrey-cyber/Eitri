@@ -137,6 +137,8 @@ pub enum DetachRefused {
     TooDeep,
     /// The PTY's controller side could not be duplicated (no descriptors left).
     NoDescriptor,
+    /// The terminal runs on another machine and this session only shows it: there is no PTY here to hand over.
+    ServerTerminal,
 }
 
 /// What the host tells the session.
@@ -256,6 +258,9 @@ pub struct Update {
     /// (a bell, a title) must not overwrite the host's last-known modes with `MouseModes::default()`
     /// and silently switch reporting off. Applied only when `Some`; see [`Worker::publish_mouse_modes`].
     pub mouse: Option<MouseModes>,
+    /// What a mirror session ([`TerminalSession::mirror`]) has to say about its link and its server terminal;
+    /// latest state wins and counts add up. Always `None` for a session over a local PTY.
+    pub mirror: Option<crate::mirror::MirrorReport>,
 }
 
 /// How to start a session.
@@ -271,19 +276,22 @@ pub struct SessionConfig {
 }
 
 #[derive(Default)]
-struct Shared {
+pub(crate) struct Shared {
     update: Mutex<Update>,
     wake_pending: AtomicBool,
-    renders: AtomicU64,
-    thread_wakeups: AtomicU64,
+    pub(crate) renders: AtomicU64,
+    pub(crate) thread_wakeups: AtomicU64,
     outbox_high_water: AtomicUsize,
     replies_dropped: AtomicU64,
     /// [`BOUNDARY_WAIT`] unless the host set another, in microseconds.
     boundary_wait_us: AtomicU64,
+    /// A mirror's input gate (`crate::mirror`): which connection input belongs to, and whether it is open.
+    /// Stamped on every command a mirror's handle sends.
+    pub(crate) mirror_gate: AtomicU64,
 }
 
 impl Shared {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         let shared = Shared::default();
         shared
             .boundary_wait_us
@@ -297,11 +305,11 @@ impl Shared {
 
     /// The pending update. A panic on the session thread is contained, and must not reach the host
     /// through a poisoned lock on its next `take_update`: a poisoned `Update` is still a valid one.
-    fn update(&self) -> MutexGuard<'_, Update> {
+    pub(crate) fn update(&self) -> MutexGuard<'_, Update> {
         self.update.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    fn publish(&self, wake: &dyn Fn(), apply: impl FnOnce(&mut Update)) {
+    pub(crate) fn publish(&self, wake: &dyn Fn(), apply: impl FnOnce(&mut Update)) {
         self.apply_pending(apply);
         self.ring(wake);
     }
@@ -310,13 +318,13 @@ impl Shared {
     /// render clock out (see `Worker::events_pending`) rather
     /// than waking the host itself, so a stream with an event on most reads wakes the host once per
     /// rendered frame, not once per loop turn.
-    fn apply_pending(&self, apply: impl FnOnce(&mut Update)) {
+    pub(crate) fn apply_pending(&self, apply: impl FnOnce(&mut Update)) {
         apply(&mut self.update());
     }
 
     /// Rings the host for whatever is already pending, if it has not already been rung since its
     /// last `take_update`.
-    fn ring(&self, wake: &dyn Fn()) {
+    pub(crate) fn ring(&self, wake: &dyn Fn()) {
         if !self.wake_pending.swap(true, Ordering::SeqCst) {
             wake();
         }
@@ -327,12 +335,22 @@ impl Shared {
 /// its own; [`TerminalSession::shutdown_and_wait`] does the same and waits.
 pub struct TerminalSession {
     shared: Arc<Shared>,
-    commands: Sender<SessionCommand>,
+    commands: Commands,
     doorbell: PipeWriter,
     pid: u32,
     /// The start time the move's record gave the shell this session took over; `None` for one it spawned.
     adopted_start: Option<u64>,
+    /// A mirror of a terminal on another machine: `pid` names nothing here.
+    mirror: bool,
     thread: Option<JoinHandle<Option<ExitInfo>>>,
+}
+
+/// Where a handle's commands go.
+pub(crate) enum Commands {
+    Local(Sender<SessionCommand>),
+    /// A mirror's commands carry its input gate as it stood when each was sent, so input typed while the link was
+    /// down is known as such however late the thread reads it.
+    Mirror(Sender<(u64, SessionCommand)>),
 }
 
 /// What a session thread starts from: a child it spawned, or a terminal another process read.
@@ -482,16 +500,43 @@ impl TerminalSession {
             })?;
         Ok(TerminalSession {
             shared,
-            commands,
+            commands: Commands::Local(commands),
             doorbell: bell_tx,
             pid,
             adopted_start: None,
+            mirror: false,
             thread: Some(thread),
         })
     }
 
+    /// A session around a mirror's thread ([`crate::mirror`]), which shares this handle's update slot, commands
+    /// and doorbell. It has no local child.
+    pub(crate) fn from_mirror(
+        shared: Arc<Shared>,
+        commands: Sender<(u64, SessionCommand)>,
+        doorbell: PipeWriter,
+        thread: JoinHandle<Option<ExitInfo>>,
+    ) -> Self {
+        TerminalSession {
+            shared,
+            commands: Commands::Mirror(commands),
+            doorbell,
+            pid: 0,
+            adopted_start: None,
+            mirror: true,
+            thread: Some(thread),
+        }
+    }
+
     pub fn send(&self, command: SessionCommand) {
-        if self.commands.send(command).is_ok() {
+        let sent = match &self.commands {
+            Commands::Local(commands) => commands.send(command).is_ok(),
+            Commands::Mirror(commands) => {
+                let gate = self.shared.mirror_gate.load(Ordering::SeqCst);
+                commands.send((gate, command)).is_ok()
+            }
+        };
+        if sent {
             // Non-blocking: a full doorbell already guarantees a wake-up that drains every command.
             let _ = (&self.doorbell).write(&[1]);
         }
@@ -505,8 +550,18 @@ impl TerminalSession {
     }
 
     /// The child's pid, captured at spawn.
+    ///
+    /// # Panics
+    /// On a mirror ([`TerminalSession::mirror`]): its program runs on another machine, and any number given here
+    /// would name an unrelated local process to whoever reads `/proc` or sends a signal with it.
     pub fn pid(&self) -> u32 {
+        assert!(!self.mirror, "a mirror session has no local process");
         self.pid
+    }
+
+    /// The local child's pid, or `None` for a mirror of a terminal on another machine.
+    pub fn local_pid(&self) -> Option<u32> {
+        (!self.mirror).then_some(self.pid)
     }
 
     /// The start time of the shell this session took over from another process, as the move's record gave it and
@@ -556,7 +611,13 @@ impl Drop for TerminalSession {
 /// worker has already unwound: its `PtyChild` hung the child up and handed it to a reaper (unless
 /// it was adopted for a move not yet committed, whose child stays the source's). What is left is
 /// to say so where the pane looks: a frame with one line, and `exited`, so Enter restarts.
-fn contain_panic(shared: &Shared, wake: &dyn Fn(), size: PtySize, colors: TerminalColors, payload: &(dyn Any + Send)) {
+pub(crate) fn contain_panic(
+    shared: &Shared,
+    wake: &dyn Fn(),
+    size: PtySize,
+    colors: TerminalColors,
+    payload: &(dyn Any + Send),
+) {
     let why = payload
         .downcast_ref::<&str>()
         .map(ToString::to_string)

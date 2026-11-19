@@ -55,6 +55,9 @@ use crate::gtk_host::instance_pool::{InstancePool, Retire, Reused};
 use crate::gtk_host::{respawn_pane, LuaRunner, RespawnPane, RestartRefused, ServiceSet, NOT_CARRIED_OUT};
 use crate::lua::LuaEngine;
 use crate::plugin_panels::PluginPanels;
+#[cfg(test)]
+use crate::terminal::jobs::read_job_with;
+use crate::terminal::jobs::{counts_as_busy, JobQuery};
 use crate::terminal::registry::Pane;
 use crate::terminal::TerminalPane;
 use crate::webview_crash_guard::WebViewCrashGuard;
@@ -215,22 +218,36 @@ impl<P: Retire + Clone> Registry<P> {
 pub(crate) trait ShellPane: Pane + Clone {
     /// A shell is running in the pane.
     fn running(&self) -> bool;
+    /// An unshown server terminal can own a shell before its mirror starts.
+    fn may_have_job(&self) -> bool {
+        self.running()
+    }
     /// Wants a shell: spawned now if the pane has been laid out, else at its first allocation.
     fn start(&self);
+    /// A live shell's query, including one whose facts are unknown.
+    fn job_query(&self) -> Option<Box<dyn JobQuery>> {
+        None
+    }
 }
 
 impl ShellPane for TerminalPane {
     fn running(&self) -> bool {
-        self.shell_pid().is_some()
+        self.is_running()
+    }
+    fn may_have_job(&self) -> bool {
+        TerminalPane::may_have_job(self)
     }
     fn start(&self) {
         TerminalPane::start(self);
+    }
+    fn job_query(&self) -> Option<Box<dyn JobQuery>> {
+        TerminalPane::job_query(self)
     }
 }
 
 impl RespawnPane for TerminalPane {
     fn shell_start(&self) -> eitri_core::wm::ShellStart {
-        eitri_core::wm::ShellStart::of(self.generation(), self.shell_pid()).typed(self.typed())
+        eitri_core::wm::ShellStart::identified(self.generation(), self.shell_identity()).typed(self.typed())
     }
     fn close(&self) {
         TerminalPane::close(self);
@@ -241,18 +258,44 @@ impl RespawnPane for TerminalPane {
     fn start(&self) {
         TerminalPane::start(self);
     }
+    fn respawn_server(&self, dir: PathBuf) -> Result<(), String> {
+        TerminalPane::respawn_server(self, dir)
+    }
 }
 
-/// Both filesystem reads run together on the worker; an unreadable cwd remains an error.
-fn read_job_with(
-    pid: Option<u32>,
-    cwd: impl FnOnce(u32) -> std::io::Result<PathBuf>,
-    busy: impl FnOnce(u32) -> std::io::Result<bool>,
-) -> (Result<PathBuf, String>, bool) {
-    let Some(pid) = pid else {
-        return (Err("its shell is not running".into()), true);
-    };
-    (cwd(pid).map_err(|error| error.to_string()), busy(pid).unwrap_or(true))
+/// All held panes count, including hidden instances and idle registry slots that still own a live session.
+fn terminal_jobs<P: ShellPane>(terminals: &Registry<P>) -> usize {
+    terminals
+        .each()
+        .iter()
+        .filter(|pane| pane.may_have_job() && counts_as_busy(pane.job_query().as_deref()))
+        .count()
+}
+
+fn terminal_job_modules<P: ShellPane>(terminals: &Registry<P>) -> Vec<ModuleId> {
+    terminals
+        .live()
+        .into_iter()
+        .filter(|(_, pane)| pane.may_have_job() && counts_as_busy(pane.job_query().as_deref()))
+        .map(|(id, _)| id)
+        .collect()
+}
+
+fn terminal_job_names<P: ShellPane + RespawnPane>(terminals: &Registry<P>) -> Vec<String> {
+    terminals
+        .each()
+        .iter()
+        .filter(|pane| pane.may_have_job())
+        .filter(|pane| {
+            matches!(
+                pane.shell_start().identity,
+                Some(eitri_core::wm::ShellIdentity::Server { .. })
+            )
+        })
+        .filter_map(|pane| pane.job_query())
+        .filter(|query| query.busy().unwrap_or(true))
+        .filter_map(|query| query.name())
+        .collect()
 }
 
 /// Starts `module`'s pane unless a shell already runs in it; whether it started one. The pane is a clone the
@@ -465,14 +508,14 @@ impl Services {
     fn read_job(&self, win: WinId, module: &ModuleId, read: u64) -> Result<(), String> {
         let pane = self.pane(module)?;
         let shell = pane.shell_start();
+        let query = pane.job_query();
         let sink = self.sink.clone();
         let module = module.clone();
         gtk4::glib::spawn_future_local(async move {
             let (cwd, busy) = gtk4::gio::spawn_blocking(move || {
-                read_job_with(
-                    shell.pid,
-                    |pid| crate::terminal::usable_dir(std::fs::read_link(format!("/proc/{pid}/cwd"))),
-                    crate::terminal::jobs::session_has_other_process,
+                query.map_or_else(
+                    || (Err("its shell is not running".into()), true),
+                    |query| query.read_job(),
                 )
             })
             .await
@@ -492,37 +535,39 @@ impl Services {
     }
 
     /// Reads the directory `module`'s shell is in now, on a worker thread (a slow or hung filesystem must never
-    /// stall the window), and reports it as [`TermEvent::Cwd`]: the project root, with one log line, where it cannot
-    /// be read or no shell runs; a refusal when the terminal was killed while it was read, since its number may
-    /// name a new terminal by then.
+    /// stall the window), and reports it as [`TermEvent::Cwd`]. A failed local read uses the project root with one
+    /// log line; an unknown server directory is refused. A terminal killed during the read is refused too, since
+    /// its number may name a new terminal by then.
     fn read_cwd(&self, win: WinId, module: &ModuleId, read: u64) -> Result<(), String> {
         let pane = self.pane(module)?;
-        let captured = eitri_core::wm::ShellStart::of(pane.generation(), pane.shell_pid());
+        let captured = pane.shell_start();
+        let query = pane.job_query();
         let terminals = Rc::downgrade(&self.terminals);
         let root = self.project_dir.clone();
         let sink = self.sink.clone();
         let module = module.clone();
         gtk4::glib::spawn_future_local(async move {
-            let found = match captured.pid {
-                // The stat that tells a removed directory runs here too, off the GTK thread.
-                Some(pid) => gtk4::gio::spawn_blocking(move || {
-                    crate::terminal::usable_dir(std::fs::read_link(format!("/proc/{pid}/cwd")))
-                })
-                .await
-                .unwrap_or_else(|_| Err(std::io::Error::other("the reading thread panicked"))),
-                None => Err(std::io::Error::other("its shell is not running")),
-            };
-            let now = terminals.upgrade().and_then(|terminals| {
-                terminals
-                    .get(&module)
-                    .map(|pane| eitri_core::wm::ShellStart::of(pane.generation(), pane.shell_pid()))
-            });
+            let found = gtk4::gio::spawn_blocking(move || {
+                query.map_or_else(
+                    || Err(std::io::Error::other("its shell is not running")),
+                    |query| query.read_cwd(),
+                )
+            })
+            .await
+            .unwrap_or_else(|_| Err(std::io::Error::other("the reading thread panicked")));
+            let now = terminals
+                .upgrade()
+                .and_then(|terminals| terminals.get(&module).map(|pane| pane.shell_start()));
             let dir = if captured.still(now) {
-                let (dir, note) = crate::terminal::start_dir(found, &root);
-                if let Some(note) = note {
-                    println!("[terminal] {note}");
+                if matches!(captured.identity, Some(eitri_core::wm::ShellIdentity::Server { .. })) {
+                    found.map_err(|error| error.to_string())
+                } else {
+                    let (dir, note) = crate::terminal::start_dir(found, &root);
+                    if let Some(note) = note {
+                        println!("[terminal] {note}");
+                    }
+                    Ok(dir)
                 }
-                Ok(dir)
             } else {
                 Err(format!(
                     "{module} closed while its directory was read; no terminal was opened"
@@ -701,19 +746,17 @@ impl ServiceSet for Services {
     fn tab_place(&self, n: u16) -> Option<eitri_core::tab_set::TabPlace> {
         self.agent.tab_place(n)
     }
+    fn terminal_job_names(&self) -> Vec<String> {
+        terminal_job_names(&self.terminals)
+    }
     fn terminal_job_modules(&self) -> Vec<ModuleId> {
-        self.terminals
-            .live()
-            .into_iter()
-            .filter(|(_, pane)| pane.shell_pid().is_some_and(crate::terminal::jobs::has_foreground_job))
-            .map(|(id, _)| id)
-            .collect()
+        terminal_job_modules(&self.terminals)
     }
     fn pages_with_tasks(&self) -> Vec<ModuleId> {
         self.plugin_panels.pages_with_tasks()
     }
     fn terminal_jobs(&self) -> usize {
-        crate::terminal::jobs::count_terminal_jobs(&self.terminals.each())
+        terminal_jobs(&self.terminals)
     }
     fn editor(&self, op: &EditorCall) -> Result<(), String> {
         match op {
@@ -1473,6 +1516,194 @@ mod tests {
         terminals.retire(&id);
         assert!(start_pane(&terminals, &id).is_err());
         assert_eq!(pane.starts.get(), 2);
+    }
+
+    #[derive(Clone)]
+    struct ServerPane {
+        shell: eitri_core::wm::ShellStart,
+        facts: eitri_core::remote_project::terminal_facts::TerminalFactsHandle,
+        opened: Rc<RefCell<Vec<PathBuf>>>,
+    }
+
+    impl ServerPane {
+        fn new(busy: Option<bool>) -> Self {
+            let facts = eitri_core::remote_project::terminal_facts::TerminalFactsHandle::default();
+            facts.set(
+                "terminal-a",
+                eitri_core::remote_project::terminal_facts::TerminalFacts {
+                    busy,
+                    name: Some("nvim\u{202e}\n".into()),
+                    cwd: Some("/srv/project".into()),
+                    at: std::time::Instant::now(),
+                },
+            );
+            Self {
+                shell: eitri_core::wm::ShellStart::identified(
+                    1,
+                    Some(eitri_core::wm::ShellIdentity::Server {
+                        generation: 7,
+                        terminal_id: 1,
+                    }),
+                ),
+                facts,
+                opened: Rc::default(),
+            }
+        }
+    }
+
+    impl Pane for ServerPane {
+        fn close(&self) {
+            panic!("no local close for a server terminal")
+        }
+    }
+
+    impl ShellPane for ServerPane {
+        fn running(&self) -> bool {
+            true
+        }
+        fn start(&self) {
+            panic!("no local shell for a server terminal")
+        }
+        fn job_query(&self) -> Option<Box<dyn JobQuery>> {
+            Some(Box::new(crate::terminal::jobs::Server::new(
+                self.facts.clone(),
+                "terminal-a".into(),
+            )))
+        }
+    }
+
+    impl RespawnPane for ServerPane {
+        fn shell_start(&self) -> eitri_core::wm::ShellStart {
+            self.shell
+        }
+        fn close(&self) {
+            panic!("no local close for a server terminal")
+        }
+        fn set_start_dir(&self, _: PathBuf) {
+            panic!("no local directory for a server terminal")
+        }
+        fn start(&self) {
+            panic!("no local shell for a server terminal")
+        }
+        fn respawn_server(&self, dir: PathBuf) -> Result<(), String> {
+            self.opened.borrow_mut().push(dir);
+            Ok(())
+        }
+    }
+
+    #[derive(Clone)]
+    struct UnshownServer;
+
+    impl Pane for UnshownServer {
+        fn close(&self) {}
+    }
+    impl ShellPane for UnshownServer {
+        fn running(&self) -> bool {
+            false
+        }
+        fn may_have_job(&self) -> bool {
+            true
+        }
+        fn start(&self) {}
+    }
+
+    #[test]
+    fn a_saved_server_shell_is_counted_before_its_hidden_mirror_starts() {
+        let terminals = Registry::new();
+        let id = ModuleId::terminal();
+        terminals.take_or_make(&id, || UnshownServer);
+        assert_eq!(terminal_jobs(&terminals), 1);
+        assert_eq!(terminal_job_modules(&terminals), [id.clone()]);
+        assert_eq!(
+            start_pane(&terminals, &id),
+            Ok(true),
+            "ownership does not block the mirror's first start"
+        );
+    }
+
+    #[test]
+    fn start_pane_does_not_restart_a_live_mirror() {
+        let terminals = Registry::new();
+        terminals.take_or_make(&ModuleId::terminal(), || ServerPane::new(None));
+        assert_eq!(start_pane(&terminals, &ModuleId::terminal()), Ok(false));
+    }
+
+    #[test]
+    fn terminal_job_modules_counts_server_terminals() {
+        for (busy, count) in [(Some(true), 1), (None, 1), (Some(false), 0)] {
+            let terminals = Registry::new();
+            let (pane, _) = terminals.take_or_make(&ModuleId::terminal(), || ServerPane::new(busy));
+            assert_eq!(terminal_jobs(&terminals), count);
+            assert_eq!(terminal_job_modules(&terminals).len(), count);
+            pane.facts.remove("terminal-a");
+            assert_eq!(terminal_jobs(&terminals), 1, "disconnected is unknown immediately");
+            assert_eq!(terminal_job_modules(&terminals), [ModuleId::terminal()]);
+        }
+    }
+
+    #[test]
+    fn server_job_counts_include_hidden_and_idle_registry_slots() {
+        let terminals = Registry::new();
+        let id = ModuleId::instance(eitri_core::layout::ModuleKind::Terminal, 2).unwrap();
+        terminals.take_or_make(&id, || ServerPane::new(Some(true)));
+        // Mark the slot idle without invoking a fake pane's deliberate close refusal.
+        terminals.pool.borrow_mut().set_idle(&id);
+        assert_eq!(terminal_jobs(&terminals), 1);
+        assert!(terminal_job_modules(&terminals).is_empty());
+    }
+
+    #[test]
+    fn read_job_and_cwd_use_server_facts_without_inspecting_the_local_path() {
+        let pane = ServerPane::new(Some(false));
+        let query = pane.job_query().unwrap();
+        // An idle foreground is not an empty session: a restart's read stays busy.
+        assert_eq!(query.read_job(), (Ok(PathBuf::from("/srv/project")), true));
+        assert_eq!(query.cwd(), Some(PathBuf::from("/srv/project")));
+        pane.facts.remove("terminal-a");
+        let (cwd, busy) = query.read_job();
+        assert!(cwd.is_err());
+        assert!(busy);
+    }
+
+    #[test]
+    fn respawn_of_a_server_terminal_opens_in_its_server_cwd() {
+        let pane = ServerPane::new(Some(false));
+        let cwd = pane.job_query().unwrap().cwd().unwrap();
+        assert_eq!(
+            respawn_pane(Some(pane.clone()), pane.shell_start(), cwd.clone()),
+            Ok(())
+        );
+        assert_eq!(*pane.opened.borrow(), [cwd]);
+        let typed = pane.shell.typed(1);
+        assert!(respawn_pane(Some(pane.clone()), typed, "/srv/other".into()).is_err());
+        let changed = eitri_core::wm::ShellStart::identified(
+            1,
+            Some(eitri_core::wm::ShellIdentity::Server {
+                generation: 8,
+                terminal_id: 1,
+            }),
+        );
+        assert!(respawn_pane(Some(pane.clone()), changed, "/srv/other".into()).is_err());
+        assert_eq!(pane.opened.borrow().len(), 1);
+    }
+
+    #[test]
+    fn the_job_name_is_escaped() {
+        let terminals = Registry::new();
+        terminals.take_or_make(&ModuleId::terminal(), || ServerPane::new(Some(true)));
+        assert_eq!(terminal_job_names(&terminals), ["nvim\\u{202e}\\u{a}"]);
+    }
+
+    #[test]
+    fn a_running_pane_without_a_query_is_unknown_and_an_ended_pane_has_no_job() {
+        let terminals = Registry::new();
+        let (pane, _) = terminals.take_or_make(&ModuleId::terminal(), FakePane::default);
+        assert_eq!(terminal_jobs(&terminals), 0);
+        pane.running.set(true);
+        assert_eq!(terminal_jobs(&terminals), 1);
+        assert_eq!(terminal_job_modules(&terminals), [ModuleId::terminal()]);
+        pane.running.set(false);
+        assert_eq!(terminal_jobs(&terminals), 0);
     }
 
     /// A pane that asks the registry from inside what the registry calls on it: the shell it starts, the hook its

@@ -46,11 +46,64 @@ pub(super) struct DeskSendWait {
     ended_turn: Option<u64>,
     /// A flush was deferred while this send was out; its reply may release that flush.
     flush_owed: bool,
+    /// The panel has already restored the text and withdrawn this send's row.
+    restored_on_stop: bool,
+    /// The person pressed Stop while the call was out, whether its interrupt went at once or waits for this send's
+    /// turn to start.
+    stopped_while_out: bool,
     spawned: SpawnedTurn,
     answer: mpsc::Receiver<Result<String, BackendError>>,
 }
 
+pub(super) struct DeskStart {
+    tab: TabId,
+    generation: u64,
+    spawned: SpawnedTurn,
+    turn_id: Option<String>,
+    // A turn can finish before the provider reply identifies it.
+    ended: BTreeSet<String>,
+    lost_ending: bool,
+    interrupts: Vec<Box<dyn FnOnce(Result<(), BackendError>) + Send>>,
+}
+
+impl DeskStart {
+    pub(super) fn observe(&mut self, tab: TabId, generation: u64, delivery: &RevisedDelivery, backend: &AgentBackend) {
+        if self.tab != tab || self.generation != generation {
+            return;
+        }
+        match delivery {
+            RevisedDelivery::Events(events) => {
+                for (revision, event) in events {
+                    if let AgentDomainEvent::TurnCompleted { turn_id, .. } = event {
+                        if *revision > self.spawned.after_revision {
+                            self.ended.insert(turn_id.clone());
+                        }
+                    }
+                }
+            }
+            RevisedDelivery::Resync { .. } => {
+                // A dropped ending cannot identify its turn. Only a matching active turn is safe to interrupt.
+                self.lost_ending |= backend
+                    .projection()
+                    .last_turn_end_seq
+                    .is_some_and(|s| s > self.spawned.after_revision);
+            }
+            RevisedDelivery::Nothing => {}
+        }
+    }
+}
+
 impl DeskTurn {
+    fn has_prompt_row(&self) -> bool {
+        !matches!(
+            self,
+            DeskTurn::Queue {
+                origin: PromptOrigin::ShellLine,
+                ..
+            }
+        )
+    }
+
     fn request(&self) -> Option<(&str, Option<ViewId>)> {
         match self {
             DeskTurn::Queue { .. } => None,
@@ -84,6 +137,49 @@ impl TabSet {
         self.get(id).is_some_and(|tab| {
             !tab.agent.is_external() && (tab.is_remote() || tab.live().is_some_and(|b| b.link_state().is_some()))
         })
+    }
+
+    /// Gives waiting messages back to the tab before a steer drop or a turn refusal can requeue them.
+    pub fn cancel_sync_send(&mut self, id: TabId) -> Option<Vec<String>> {
+        let tab = self.get(id)?;
+        let generation = tab.backend_generation;
+        let stopped = tab.send_sync.cancel_waits();
+        if stopped.is_empty() {
+            return None;
+        }
+        let withdraw = self.stop_desk_send(id, &stopped) && self.desk_send_generation(id) == Some(generation);
+        let tab = self.get_mut(id)?;
+        if withdraw {
+            if let Some(backend) = tab.live_mut() {
+                backend.withdraw_prompt();
+            }
+        }
+        tab.session
+            .queue
+            .retain(|item| !stopped.iter().any(|(id, _)| item.carries(id)));
+        let texts: Vec<_> = stopped.into_iter().map(|(_, prompt)| prompt).collect();
+        put_before_draft(tab, &texts);
+        Some(texts)
+    }
+
+    /// Marks the desk send of `id` among `stopped` as answered by its Stop, so whatever its call later answers
+    /// never returns its text a second time. Whether that send folded a row of its own.
+    pub(super) fn stop_desk_send(&mut self, id: TabId, stopped: &[(String, String)]) -> bool {
+        self.desk_sends.get_mut(&id.0).is_some_and(|wait| {
+            let ours = stopped.iter().any(|(id, _)| id == &wait.spawned.client_message_id);
+            wait.restored_on_stop |= ours;
+            ours && wait.turn.has_prompt_row()
+        })
+    }
+
+    fn desk_send_generation(&self, id: TabId) -> Option<u64> {
+        self.desk_sends.get(&id.0).map(|wait| wait.generation)
+    }
+
+    /// The texts of desk sends put back in their tabs' drafts since the last look (stopped after their call went out,
+    /// or refused because their session ended during the wait): the page puts them in its box as it does a Stop's.
+    pub fn take_stopped_sends(&mut self) -> Vec<(TabId, Vec<String>)> {
+        std::mem::take(&mut self.desk_stopped)
     }
 
     /// Whether a desk send of `id` waits for its provider call.
@@ -145,7 +241,13 @@ impl TabSet {
                 wake();
             }
         };
-        let request = TurnRequest { wire, typed, origin };
+        let request = TurnRequest {
+            sync: self.message_sync(id),
+            wire,
+            typed,
+            origin,
+        };
+        let synced = request.sync.is_some();
         let started = match self.get_mut(id) {
             Some(tab) => match tab.live_mut() {
                 Some(backend) => backend.send_turn_spawned(request, answered),
@@ -161,6 +263,18 @@ impl TabSet {
         };
         match started {
             Ok(spawned) => {
+                if synced {
+                    self.desk_starts.push(DeskStart {
+                        tab: id,
+                        generation,
+                        spawned: spawned.clone(),
+                        turn_id: None,
+                        ended: BTreeSet::new(),
+                        lost_ending: false,
+                        interrupts: Vec::new(),
+                    });
+                }
+
                 self.desk_sends.insert(
                     id.0,
                     DeskSendWait {
@@ -169,6 +283,8 @@ impl TabSet {
                         generation,
                         ended_turn,
                         flush_owed: false,
+                        restored_on_stop: false,
+                        stopped_while_out: false,
                         spawned,
                         answer,
                     },
@@ -213,6 +329,8 @@ impl TabSet {
                 generation,
                 ended_turn,
                 flush_owed,
+                restored_on_stop,
+                stopped_while_out,
                 spawned,
                 ..
             } = wait;
@@ -221,10 +339,20 @@ impl TabSet {
                 continue;
             };
             let busy = outcome.as_ref().is_err_and(BackendError::is_turn_busy);
+            let ended = outcome
+                .as_ref()
+                .is_err_and(|error| error.message == agent::SESSION_ENDED_BEFORE_SEND);
             if now != generation {
                 self.end_start_of(&gate);
                 let gone = Err(BackendError {
-                    message: "the tab's session changed before the agent answered".to_string(),
+                    message: if restored_on_stop {
+                        agent::STOPPED_BEFORE_SEND
+                    } else if ended {
+                        agent::SESSION_ENDED_BEFORE_SEND
+                    } else {
+                        "the tab's session changed before the agent answered"
+                    }
+                    .into(),
                     benign: true,
                 });
                 // The old backend owns its accepted turn; keep failed sends without installing its prompt here.
@@ -232,12 +360,14 @@ impl TabSet {
                 // can reach a resumed conversation twice by choice, rather than not at all; never after success.
                 sent.push(match turn {
                     DeskTurn::Queue { typed, items, .. } => {
-                        if let Err(error) = &outcome {
+                        if let Some(error) = outcome.as_ref().err().filter(|_| !restored_on_stop) {
                             if let Some(tab) = self.get_mut(tab) {
                                 tab.session.queue.splice(0..0, items);
                                 tab.session.queue_error = Some(if busy {
                                     "the tab's session changed; queued messages were not sent because the old session was busy"
                                         .to_string()
+                                } else if ended {
+                                    agent::SESSION_ENDED_BEFORE_SEND.to_string()
                                 } else {
                                     format!(
                                         "the tab's session changed; queued messages may not have reached the agent: {}",
@@ -251,27 +381,69 @@ impl TabSet {
                             flush: Flush { typed, outcome: gone },
                         }
                     }
-                    DeskTurn::First { request_id, turn } => Sent::First {
-                        tab,
-                        request_id,
-                        typed: turn.typed,
-                        outcome: gone,
-                    },
-                    DeskTurn::Prompt { request_id, page, turn } => Sent::Prompt {
-                        tab,
-                        page,
-                        request_id,
-                        typed: turn.typed,
-                        outcome: gone,
-                    },
+                    DeskTurn::First { request_id, turn } => {
+                        if ended {
+                            self.put_back(tab, &turn.typed);
+                        }
+                        Sent::First {
+                            tab,
+                            request_id,
+                            typed: turn.typed,
+                            outcome: gone,
+                        }
+                    }
+                    DeskTurn::Prompt { request_id, page, turn } => {
+                        if ended {
+                            self.put_back(tab, &turn.typed);
+                        }
+                        Sent::Prompt {
+                            tab,
+                            page,
+                            request_id,
+                            typed: turn.typed,
+                            outcome: gone,
+                        }
+                    }
                 });
                 if flush_owed {
                     self.owe_flush_if_idle(tab);
                 }
                 continue;
             }
+            // A Stop made while the call was out, met by a busy reply: the agent was already running a turn this side
+            // had not folded, which is what the Stop stops. The message, which the agent did not take, comes back to
+            // the draft as a stopped send instead of waiting to steer. An interrupt still owed to this send goes to
+            // that turn only while no turn has ended since the call went out; once one has, the turn the Stop meant
+            // is over, and a later one is never stopped in its place.
+            if busy && stopped_while_out {
+                let start = self
+                    .desk_starts
+                    .iter()
+                    .position(|s| s.spawned.client_message_id == spawned.client_message_id)
+                    .map(|at| self.desk_starts.remove(at));
+                let over = self.turn_ended_since(tab, ended_turn)
+                    || start.as_ref().is_some_and(|s| !s.ended.is_empty() || s.lost_ending);
+                let interrupts = start.map(|s| s.interrupts).unwrap_or_default();
+                self.stop_into_busy_turn(tab, &turn, interrupts, !over);
+                let stopped = Err(BackendError {
+                    message: agent::STOPPED_BEFORE_SEND.into(),
+                    benign: true,
+                });
+                sent.push(self.desk_send_done(gate, turn, stopped));
+                if flush_owed && self.turn_ended_since(tab, ended_turn) {
+                    self.owe_flush_if_idle(tab);
+                }
+                continue;
+            }
             let outcome = match outcome {
                 Ok(turn_id) => {
+                    if let Some(start) = self
+                        .desk_starts
+                        .iter_mut()
+                        .find(|s| s.spawned.client_message_id == spawned.client_message_id)
+                    {
+                        start.turn_id = Some(turn_id.clone());
+                    }
                     let typed = match &turn {
                         DeskTurn::Queue { typed, .. } => typed.clone(),
                         DeskTurn::First { turn, .. } | DeskTurn::Prompt { turn, .. } => turn.typed.clone(),
@@ -283,7 +455,7 @@ impl TabSet {
                 }
                 Err(error) => {
                     // The row was folded when the call went out; a turn the agent already had open took nothing.
-                    if error.is_turn_busy() {
+                    if error.is_turn_busy() && turn.has_prompt_row() {
                         if let Some(backend) = self.get_mut(tab).and_then(Tab::live_mut) {
                             backend.withdraw_prompt();
                         }
@@ -292,16 +464,115 @@ impl TabSet {
                 }
             };
             sent.push(self.desk_send_done(gate, turn, outcome));
-            let turn_ended = self
-                .get(tab)
-                .and_then(Tab::live)
-                .and_then(|backend| backend.projection().last_turn_end_seq)
-                > ended_turn;
-            if flush_owed && (!busy || turn_ended) {
+            if flush_owed && (!busy || self.turn_ended_since(tab, ended_turn)) {
                 self.owe_flush_if_idle(tab);
             }
         }
+        self.release_start_interrupts();
         sent
+    }
+
+    fn turn_ended_since(&self, tab: TabId, ended_turn: Option<u64>) -> bool {
+        self.get(tab)
+            .and_then(Tab::live)
+            .and_then(|backend| backend.projection().last_turn_end_seq)
+            > ended_turn
+    }
+
+    /// The Stop met by a busy reply: the send's row is withdrawn and its text put back in the draft, as a Stop during
+    /// the wait does. Owed interrupts go to the turn the agent is running when `interrupt`, else are told there was
+    /// nothing left to stop.
+    fn stop_into_busy_turn(
+        &mut self,
+        id: TabId,
+        turn: &DeskTurn,
+        interrupts: Vec<Box<dyn FnOnce(Result<(), BackendError>) + Send>>,
+        interrupt: bool,
+    ) {
+        let typed = match turn {
+            DeskTurn::Queue { typed, .. } => typed.clone(),
+            DeskTurn::First { turn, .. } | DeskTurn::Prompt { turn, .. } => turn.typed.clone(),
+        };
+        let Some(tab) = self.get_mut(id) else {
+            for done in interrupts {
+                done(Ok(()));
+            }
+            return;
+        };
+        match tab.live_mut() {
+            Some(backend) => {
+                if turn.has_prompt_row() {
+                    backend.withdraw_prompt();
+                }
+                for done in interrupts {
+                    if interrupt {
+                        backend.interrupt_spawned(done);
+                    } else {
+                        done(Ok(()));
+                    }
+                }
+            }
+            None => {
+                for done in interrupts {
+                    done(Ok(()));
+                }
+            }
+        }
+        self.put_back(id, &typed);
+    }
+
+    /// Puts a send's text back in its tab's draft, ahead of what was typed since, for the page to merge into its box
+    /// ([`TabSet::take_stopped_sends`]): the tab keeps it across a switch or a reload.
+    fn put_back(&mut self, id: TabId, typed: &str) {
+        if let Some(tab) = self.get_mut(id) {
+            put_before_draft(tab, &[typed.to_string()]);
+            self.desk_stopped.push((id, vec![typed.to_string()]));
+        }
+    }
+
+    fn release_start_interrupts(&mut self) {
+        self.desk_starts.retain_mut(|start| {
+            let backend = self
+                .tabs
+                .iter_mut()
+                .find(|tab| tab.id == start.tab && tab.backend_generation == start.generation)
+                .and_then(Tab::live_mut);
+            if let Some(backend) = backend {
+                if let Some(turn_id) = &start.turn_id {
+                    let projection = backend.projection();
+                    if projection.active_turn_id.as_ref() == Some(turn_id) {
+                        drop(projection);
+                        for done in start.interrupts.drain(..) {
+                            backend.interrupt_spawned(done);
+                        }
+                        return false;
+                    }
+                    // A whole turn can start and finish between polls, leaving no active turn to stop.
+                    if !start.ended.contains(turn_id)
+                        && !start.lost_ending
+                        && projection.last_reset_revision <= start.spawned.after_revision
+                        && !matches!(
+                            projection.status,
+                            agent::ProjectionStatus::Closed { .. } | agent::ProjectionStatus::Unavailable { .. }
+                        )
+                    {
+                        return true;
+                    }
+                } else if self
+                    .desk_sends
+                    .get(&start.tab.0)
+                    .is_some_and(|w| w.spawned.client_message_id == start.spawned.client_message_id)
+                {
+                    // The provider's answer identifies the turn this interrupt belongs to.
+                    return true;
+                }
+            }
+            // A refusal, session change or completed turn leaves nothing to interrupt.
+            for done in start.interrupts.drain(..) {
+                done(Ok(()));
+            }
+            false
+        });
     }
 
     /// What a desk send's outcome does to its tab, as the send on this thread does it, and the [`Sent`] it is told
@@ -358,6 +629,7 @@ impl TabSet {
                                 .then(|| refused_note(agent::CLI_REFUSED_DROP));
                             tab.session.turn_trace = trace;
                         }
+                        Err(error) if error.message == agent::STOPPED_BEFORE_SEND => {}
                         Err(error) => {
                             // Items still in the queue may have been taken back or read while the call was
                             // out. Count only surviving original neighbours; later messages stay behind them.
@@ -392,6 +664,7 @@ impl TabSet {
             }
             DeskTurn::First { request_id, turn } => {
                 let outcome = self.opening_prompt_from(id, &turn, outcome);
+                self.put_back_if_ended(id, &turn.typed, &outcome);
                 Sent::First {
                     tab: id,
                     request_id,
@@ -401,7 +674,11 @@ impl TabSet {
             }
             DeskTurn::Prompt { request_id, page, turn } => {
                 let mut outcome = self.opening_prompt_from(id, &turn, outcome);
-                if outcome.as_ref().is_err_and(BackendError::is_turn_busy) && self.hold_as_steer(id, &turn) {
+                self.put_back_if_ended(id, &turn.typed, &outcome);
+                if outcome.as_ref().is_err_and(BackendError::is_turn_busy)
+                    && self.get(id).and_then(Tab::live).is_some()
+                    && self.hold_as_steer(id, &turn)
+                {
                     outcome = Ok(());
                 }
                 Sent::Prompt {
@@ -412,6 +689,17 @@ impl TabSet {
                     outcome,
                 }
             }
+        }
+    }
+
+    /// A message refused because its session ended during the wait is put back by the host, so it survives the page
+    /// that sent it switching tabs or reloading; the page leaves that refusal's text to it.
+    fn put_back_if_ended(&mut self, id: TabId, typed: &str, outcome: &Result<(), BackendError>) {
+        if outcome
+            .as_ref()
+            .is_err_and(|error| error.message == agent::SESSION_ENDED_BEFORE_SEND)
+        {
+            self.put_back(id, typed);
         }
     }
 
@@ -455,7 +743,9 @@ impl TabSet {
             }
         };
         let backend = self
-            .get_mut(id)
+            .tabs
+            .iter_mut()
+            .find(|tab| tab.id == id)
             .ok_or_else(|| BackendError {
                 message: format!("no tab {}", id.0),
                 benign: true,
@@ -465,7 +755,22 @@ impl TabSet {
                 message: "no active session".to_string(),
                 benign: true,
             })?;
-        backend.interrupt_spawned(done);
+        if let Some(wait) = self
+            .desk_sends
+            .get_mut(&id.0)
+            .filter(|wait| wait.generation == generation)
+        {
+            wait.stopped_while_out = true;
+        }
+        let pending_start = self
+            .desk_starts
+            .iter_mut()
+            .rev()
+            .find(|s| s.tab == id && s.generation == generation);
+        match pending_start {
+            Some(start) if backend.projection().active_turn_id.is_none() => start.interrupts.push(Box::new(done)),
+            _ => backend.interrupt_spawned(done),
+        }
         let number = self.next_interrupt;
         self.next_interrupt += 1;
         self.interrupts_out.push(InterruptWait {
@@ -505,4 +810,14 @@ impl TabSet {
     pub(super) fn desk_calls_out(&self) -> bool {
         !self.desk_sends.is_empty() || !self.interrupts_out.is_empty()
     }
+}
+
+/// Texts taken back from a send go into the draft ahead of what was typed since, so neither is lost.
+fn put_before_draft(tab: &mut Tab, texts: &[String]) {
+    let mut draft = texts.join("\n\n");
+    if !tab.draft().is_empty() {
+        draft.push_str("\n\n");
+        draft.push_str(tab.draft());
+    }
+    tab.replace_draft(draft);
 }

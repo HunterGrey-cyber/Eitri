@@ -197,6 +197,9 @@ impl gtk_host::ServiceSet for PanelServices {
     fn terminal_job_modules(&self) -> Vec<ModuleId> {
         self.inner.terminal_job_modules()
     }
+    fn terminal_job_names(&self) -> Vec<String> {
+        self.inner.terminal_job_names()
+    }
     fn pages_with_tasks(&self) -> Vec<ModuleId> {
         self.inner.pages_with_tasks()
     }

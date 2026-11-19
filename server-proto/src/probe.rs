@@ -22,6 +22,8 @@ pub struct ProbeReport {
     pub gzip: bool,
     pub root: RootState,
     pub sync_marker: Option<PathBuf>,
+    pub sync_excluded: Option<bool>,
+    pub sync_ignore_line: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -67,6 +69,8 @@ impl ProbeReport {
                     | "gzip"
                     | "root"
                     | "sync_marker"
+                    | "sync_excluded"
+                    | "sync_ignore_line"
             ) {
                 return Err(format!("unknown probe key {key:?}"));
             }
@@ -125,6 +129,11 @@ impl ProbeReport {
             gzip: boolean("gzip", required("gzip")?)?,
             root,
             sync_marker: optional_path("sync_marker"),
+            sync_excluded: optional_bool("sync_excluded")?,
+            sync_ignore_line: values
+                .get("sync_ignore_line")
+                .map(|v| as_text("sync_ignore_line", v).map(str::to_owned))
+                .transpose()?,
         })
     }
 
@@ -175,6 +184,12 @@ impl ProbeReport {
                 RootState::Ok => b"ok",
             },
         );
+        if let Some(value) = self.sync_excluded {
+            line("sync_excluded", if value { b"true" } else { b"false" });
+        }
+        if let Some(value) = &self.sync_ignore_line {
+            line("sync_ignore_line", value.as_bytes());
+        }
         out
     }
 }
@@ -254,6 +269,8 @@ mod tests {
             gzip: true,
             root: RootState::Ok,
             sync_marker: Some("/srv/project/.stfolder".into()),
+            sync_excluded: Some(false),
+            sync_ignore_line: Some("/".into()),
         }
     }
 

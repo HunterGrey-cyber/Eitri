@@ -83,6 +83,8 @@ pub enum ConversationError {
     /// matching `AgentSession::send_turn`'s identical rule. Benign: the
     /// conversation is fine, the caller simply asked too early.
     TurnAlreadyActive,
+    /// The send's wait took the turn back before the provider was asked (`BeforeSend`); the words say why.
+    NotSent(String),
     /// A command that needs a live session arrived before one existed (or after it closed).
     NoSession,
     /// `cwd` could not be canonicalized -- it does not exist, or is not readable.
@@ -131,7 +133,9 @@ impl ConversationError {
     /// carry on; tearing down the session over one would discard a working conversation.
     pub fn is_benign(&self) -> bool {
         match self {
-            ConversationError::TurnAlreadyActive | ConversationError::Unsupported => true,
+            ConversationError::NotSent(_) | ConversationError::TurnAlreadyActive | ConversationError::Unsupported => {
+                true
+            }
             ConversationError::Provider(e) => e.is_benign(),
             ConversationError::NoSession | ConversationError::Cwd(_) => false,
             // A refused resume leaves nothing running and nothing to tear down, but it is not
@@ -173,6 +177,7 @@ impl std::fmt::Display for ConversationError {
                  That session has been closed rather than handed back: continuing it would look like \
                  your previous conversation while carrying none of it. Start a new session instead."
             ),
+            ConversationError::NotSent(why) => f.write_str(why),
             ConversationError::Unsupported => {
                 write!(f, "this conversation's agent does not take a turn sent that way")
             }
@@ -1584,6 +1589,7 @@ impl AgentConversation {
         as_typed: &str,
         origin: PromptOrigin,
         client_message_id: &str,
+        wait: Option<crate::BeforeSend>,
         done: impl FnOnce(Result<String, ConversationError>) + Send + 'static,
     ) -> Result<(), ConversationError> {
         if self.external.is_some() {
@@ -1602,7 +1608,12 @@ impl AgentConversation {
         };
         spawn_provider_call(
             "eitri-send-turn",
-            move || provider.send_turn_stamped(request, stamp).map_err(Self::turn_error),
+            move || {
+                if let Some(Err(why)) = wait.map(|wait| wait()) {
+                    return Err(ConversationError::NotSent(why));
+                }
+                provider.send_turn_stamped(request, stamp).map_err(Self::turn_error)
+            },
             done,
         );
         Ok(())
@@ -1628,6 +1639,18 @@ impl AgentConversation {
         as_typed: &str,
         origin: PromptOrigin,
     ) -> Result<(), ConversationError> {
+        self.steer_turn_after(expected_turn_id, client_message_id, text, as_typed, origin, None)
+    }
+
+    pub fn steer_turn_after(
+        &self,
+        expected_turn_id: &str,
+        client_message_id: &str,
+        text: &str,
+        as_typed: &str,
+        origin: PromptOrigin,
+        wait: Option<crate::BeforeSend>,
+    ) -> Result<(), ConversationError> {
         if !self.steers() {
             return Err(ConversationError::Provider(ProviderError::UnsupportedCapability(
                 "steer",
@@ -1647,19 +1670,21 @@ impl AgentConversation {
         }
         let expected_turn_id = expected_turn_id.to_string();
         let session_id = self.require_session()?;
-        self.provider.steer_turn_stamped(
-            crate::provider::SteerTurnRequest {
-                session_id,
-                expected_turn_id,
-                client_message_id: client_message_id.to_string(),
-                text: text.to_string(),
-                as_typed: as_typed.to_string(),
-            },
-            TurnStamp {
-                typed_by_person: origin == PromptOrigin::Typed,
-                ..TurnStamp::default()
-            },
-        )?;
+        let request = crate::provider::SteerTurnRequest {
+            session_id,
+            expected_turn_id,
+            client_message_id: client_message_id.to_string(),
+            text: text.to_string(),
+            as_typed: as_typed.to_string(),
+        };
+        let stamp = TurnStamp {
+            typed_by_person: origin == PromptOrigin::Typed,
+            ..TurnStamp::default()
+        };
+        match wait {
+            Some(wait) => self.provider.steer_turn_after(request, stamp, wait)?,
+            None => self.provider.steer_turn_stamped(request, stamp)?,
+        }
         Ok(())
     }
 
@@ -3155,6 +3180,35 @@ mod tests {
     /// `resume()` never sends one -- so `SessionOpened` never arrived inside the window and the
     /// check never actually ran in production. The provider now states a typed verdict instead, and
     /// that is what these drive.
+    #[test]
+    fn a_wait_that_takes_the_turn_back_answers_its_reason_and_never_asks_the_provider() {
+        for why in [crate::STOPPED_BEFORE_SEND, crate::SESSION_ENDED_BEFORE_SEND] {
+            let fake = Arc::new(FakeProvider::new());
+            let mut conversation = conversation_with(fake.clone());
+            let (tell, told) = std::sync::mpsc::channel();
+            conversation
+                .send_turn_as_spawned(
+                    "hello",
+                    "hello",
+                    crate::PromptOrigin::Typed,
+                    "m",
+                    Some(Box::new(move || Err(why.to_string()))),
+                    move |outcome| {
+                        let _ = tell.send(outcome);
+                    },
+                )
+                .unwrap();
+            let error = told
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .unwrap()
+                .unwrap_err();
+            assert!(matches!(&error, ConversationError::NotSent(reason) if reason == why));
+            assert!(error.is_benign());
+            assert_eq!(error.to_string(), why);
+            assert!(!fake.calls().iter().any(|call| call.starts_with("send_turn")));
+        }
+    }
+
     #[test]
     fn a_provider_that_attached_to_a_different_session_is_a_failed_resume() {
         let fake = Arc::new(FakeProvider::new());

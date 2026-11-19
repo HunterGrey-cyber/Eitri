@@ -40,8 +40,17 @@ pub fn prepare(start: &ExecStart, login: &Environment) -> Result<Prepared, Strin
     let mut env: Vec<(OsString, OsString)> = login
         .iter()
         .filter(|(key, _)| {
-            !key.to_str()
-                .is_some_and(|key| ASKING.contains(&key) || key == "SSH_ASKPASS")
+            !key.to_str().is_some_and(|key| {
+                ASKING.contains(&key)
+                    || matches!(
+                        key,
+                        "SSH_ASKPASS"
+                            | "GIT_ICASE_PATHSPECS"
+                            | "GIT_LITERAL_PATHSPECS"
+                            | "GIT_GLOB_PATHSPECS"
+                            | "GIT_NOGLOB_PATHSPECS"
+                    )
+            })
         })
         .map(|(key, value)| (key.clone(), value.clone()))
         .collect();

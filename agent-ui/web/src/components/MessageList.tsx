@@ -31,6 +31,7 @@ import { captureAnchor, restoreAnchor, type ViewAnchor } from "../viewAnchor";
 import { firstRowBelow, headerBand, headerCount, headerPrompt, headerText, PROMPT_HEADER_CLASS, type HeaderPrompt } from "../promptHeader";
 
 type Props = {
+  lateLines?: import("../syncChip").SendSync["lines"];
   /** The conversation's identity: row keys can be shared by different tabs. */
   tab?: number | null;
   state: AgentUiState;
@@ -280,6 +281,7 @@ export function bandBox(row: HTMLElement, listWidth: number): BandBox {
 }
 
 export function MessageList({
+  lateLines,
   tab = null,
   state,
   historyFromTurn,
@@ -983,6 +985,7 @@ export function MessageList({
           const sentHere = touch && source !== null && thisDevice !== null && source.deviceId === thisDevice;
           const props: TimelineRowProps = {
             item,
+            lateLine: item.kind === "prompt" ? lateLines?.find(line => line.seq === item.seq && line.prompt === (item.promptText ?? item.text))?.text : undefined,
             sentFrom: sentHere ? null : source?.name ?? null,
             sentHere,
             atDesk: touch ? deskLocation : null,
@@ -1115,13 +1118,13 @@ type HeldRow = {
 function sameRowProps(a: TimelineRowProps, b: TimelineRowProps): boolean {
   if (a.sentFrom !== b.sentFrom || a.sentHere !== b.sentHere || a.atDesk !== b.atDesk) return false;
   const {
-    sentFrom, sentHere, atDesk, item, current, yanked, expanded, detailed, thinkingDisplay, sessionEnded, abandoned, cardLine, agent, gated,
+    lateLine, sentFrom, sentHere, atDesk, item, current, yanked, expanded, detailed, thinkingDisplay, sessionEnded, abandoned, cardLine, agent, gated,
     ruleOffer, alreadyAnswered, cardMode, ranFor, handlers, streaming, selecting, ...none
   } = a;
   const _exhaustive: Record<string, never> = none;
   void _exhaustive;
   return (
-    item === b.item && current === b.current && yanked === b.yanked && expanded === b.expanded &&
+    lateLine === b.lateLine && item === b.item && current === b.current && yanked === b.yanked && expanded === b.expanded &&
     detailed === b.detailed && thinkingDisplay === b.thinkingDisplay && sessionEnded === b.sessionEnded &&
     abandoned === b.abandoned && cardLine === b.cardLine && agent === b.agent && gated === b.gated &&
     ruleOffer === b.ruleOffer && alreadyAnswered === b.alreadyAnswered && cardMode === b.cardMode && ranFor === b.ranFor &&
@@ -1130,6 +1133,7 @@ function sameRowProps(a: TimelineRowProps, b: TimelineRowProps): boolean {
 }
 
 type TimelineRowProps = {
+  lateLine?: string;
   sentFrom: string | null;
   /** This phone sent the prompt (the touch page). */
   sentHere: boolean;
@@ -1175,6 +1179,7 @@ export function timelineRowRenderCount(): number {
  *  a batch renders the one row it wrote to. Anything a row draws must come from its item or from a
  *  prop here, or the row keeps showing what it showed before. */
 const TimelineRow = memo(function TimelineRow({
+  lateLine,
   sentFrom,
   sentHere,
   atDesk,
@@ -1211,6 +1216,7 @@ const TimelineRow = memo(function TimelineRow({
       return (
         <Row kind="prompt" sign="›" current={current} className={promptClass || undefined} navStop="row" rowKey={item.key}>
           {item.promptText ?? item.text}
+          {lateLine && <div className="queue-note"><Revealed pieces={revealHidden(lateLine)} /></div>}
           {item.images && <div className="prompt-images">{revealedText(item.images)}</div>}
           {sentHere && <div className="phone-source"><small>sent from this phone</small></div>}
           {sentFrom !== null && <div className="phone-source"><small>from <Revealed pieces={revealHidden(sentFrom)} /></small></div>}

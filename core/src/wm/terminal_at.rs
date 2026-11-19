@@ -171,14 +171,14 @@ pub(super) fn request(
 }
 
 /// Whether the shell a read captured is the one the terminal's record runs now. A record that left running since
-/// the read, or runs a shell with another pid, describes another shell; a moved terminal has no pid here, and the
-/// host's own check of the capture before a restart covers it.
-fn same_shell(w: &Window, pending: &PendingAt, module: &ModuleId, shell: ShellStart) -> bool {
+/// the read, or runs a shell with another identity, describes another shell. A moved terminal's identity is
+/// checked by the host against the capture before a restart.
+fn same_shell(w: &Window, pending: &PendingAt, module: &ModuleId, shell: &ShellStart) -> bool {
     if pending.stale || w.pending_restart.is_some() {
         return false;
     }
     match w.lifecycle.terminal_run(module) {
-        Some(TermRun::Running { pid }) => shell.pid == Some(*pid),
+        Some(TermRun::Running { identity }) => shell.identity.as_ref() == Some(identity),
         Some(TermRun::Moved) => true,
         _ => false,
     }
@@ -208,7 +208,7 @@ pub(super) fn job(
     };
     let pending = w.pending_at.remove(at);
     w.cancel_timer(pending.timer);
-    let decided = if *module != ModuleId::terminal() || !same_shell(w, &pending, module, shell) {
+    let decided = if *module != ModuleId::terminal() || !same_shell(w, &pending, module, &shell) {
         Some(TerminalAtAnswer::Busy(CHANGED_TEXT.to_string()))
     } else {
         match cwd {

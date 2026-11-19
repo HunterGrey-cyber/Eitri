@@ -126,15 +126,22 @@ function M.attach(root, retry)
   if not s.job and (retry or not s.failed_at or uv.now() - s.failed_at >= 60000) then
     local sync = require("eitri.remote.sync")
     sync.start(s, function(env)
-      if M.current() == s then
+      if not active_shim or M.current() == s then
         shim(env)
       end
     end, function()
       s.failed_at = uv.now()
-      if active_shim and active_shim == s.env then
+      local expired = s.env
+      s.env = nil
+      if expired and active_shim == expired then
+        for _, other in pairs(sessions) do
+          if other.env then
+            shim(other.env)
+            return
+          end
+        end
         shim(nil)
       end
-      s.env = nil
     end)
   end
   return sessions[root]
@@ -179,11 +186,9 @@ function M.setup(opts)
     if root then
       local s = M.attach(root)
       if s then
-        shim(s.env)
+        if s.env then shim(s.env) end
         require("eitri.remote.sync").mark(s)
       end
-    elseif not options.embedded then
-      shim(nil)
     end
   end
   local group = api.nvim_create_augroup("EitriRemote", { clear = true })

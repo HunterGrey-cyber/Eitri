@@ -82,6 +82,18 @@ pub fn start_server<T>(
             host_open_hint(host, &project.root)
         ));
     }
+    start_server_on_host(launcher, store, host, record, plan, band, connect)
+}
+
+pub(super) fn start_server_on_host<T>(
+    launcher: &dyn ChannelLauncher,
+    store: &RemoteProjects,
+    host: &str,
+    record: &RemoteHost,
+    plan: &mut InstallPlan,
+    band: &dyn Fn(String),
+    connect: impl FnOnce(&InstallPlan) -> Result<T, String>,
+) -> Result<T, String> {
     plan.use_host_record(record).map_err(|e| e.to_string())?;
     let install_now = |plan: &InstallPlan| -> Result<(), String> {
         let version = plan.version().to_owned();
@@ -136,6 +148,7 @@ pub fn open_window(
     let master = ControlMaster::ensure(&host, ssh_dir, exe).map_err(|e| format!("connecting to {host}: {e}"))?;
     let verified = verified_host_key(&master)?;
     let (project, key_changed) = reconcile_host_key(store, project, &verified).map_err(|e| e.to_string())?;
+    crate::remote_project::terminals::reconcile_records(store, &project, band);
     if let Some(notice) = &key_changed {
         band(notice.clone());
         // Sync waits for the person: its sessions run under the old key until they resume it.
@@ -195,6 +208,7 @@ pub fn open_window(
         }
         RemoteConnection::open_over_ssh(&master, store, &project, plan.version(), plan.revision())
     })?;
+    crate::remote_project::terminals::send_queued_stops(store, &connection, band);
     sync(&connection, &project);
     Ok(Opened {
         connection,

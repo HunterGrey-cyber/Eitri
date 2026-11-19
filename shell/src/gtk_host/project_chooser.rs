@@ -233,6 +233,14 @@ impl ProjectChooserView {
         }
     }
 
+    pub(crate) fn add_remote(&self, open: impl Fn() + 'static) {
+        let button = gtk4::Button::with_label("Open on a host…");
+        button.set_halign(gtk4::Align::Start);
+        button.set_focus_on_click(false);
+        button.connect_clicked(move |_| open());
+        self.panel.insert_child_after(&button, Some(&self.title));
+    }
+
     /// Overlay children do not contribute to the window's minimum, so the frame tick fits the panel to the actual
     /// allocation. It runs while the chooser is up and nowhere else.
     fn start_tick(&self) {

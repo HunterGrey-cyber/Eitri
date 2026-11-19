@@ -1,5 +1,5 @@
 [English](README.md) | 简体中文
-<!-- translated-from: README.md sha256=4b5a43a5548d44c6fd8f787480cdd354c2f914f8cb932e0e9208f2bc924b3cfb -->
+<!-- translated-from: README.md sha256=24da360ac516caf1d4dbc005ce858f8bb29525ad0acc09648af088547a153b3f -->
 
 # Eitri 文档
 
@@ -47,4 +47,5 @@ Eitri 不取代 Neovim：缓冲区、动作、LSP 和补全仍然是 Neovim 自�
 - [你自己做的页面](pages.zh-CN.md)：把你自己的 HTML 页面作为 Lua 面板，或者带清单的插件页面（实验性）。
 - [写一个插件](write-a-plugin.zh-CN.md)：插件作者的参考：清单、每项能力、`agents` 的调用和事件，以及一个完整的例子。
 - [工作环境](environments.zh-CN.md)：可以直接拿来改的完整 `init.lua`，分别给 tmux 用户、i3 用户、用 Markdown 写作的人、同时跑很多 agent 的人，以及把 Eitri 放在终端 Neovim 旁边的人。
+- [远程开发](remote-development.zh-CN.md)：在放在另一台机器上的项目上工作（实验性）：前提条件、`eitri host open`、哪些会同步、笔记本上的 git、冲突和 `:EitriSync`。
 - [已知问题](../known-issues.zh-CN.md)：今天不支持的和还比较粗糙的地方。

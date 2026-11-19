@@ -185,6 +185,8 @@ pub struct SavedTabs {
 /// the server no longer runs that agent.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SavedRemoteTab {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub late_lines: Vec<crate::remote_sync::status_schema::LateLine>,
     pub helper: agent::HelperHandoff,
     /// The CLI's session id, once the agent reported it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2952,6 +2954,7 @@ mod tests {
 
     fn remote_tab(sidecar: &str) -> SavedRemoteTab {
         SavedRemoteTab {
+            late_lines: Vec::new(),
             window: None,
             helper: agent::HelperHandoff {
                 daemon: "".into(),

@@ -28,7 +28,7 @@ pub const STARTSIDECAR_ENV_ALLOWED: &[&str] = &[];
 const SIDECAR_BIND_BUDGET: Duration = Duration::from_secs(15);
 const STOP_GRACE: Duration = Duration::from_secs(6);
 const KILL_BUDGET: Duration = Duration::from_secs(2);
-const LOG_CAP: u64 = 8 * 1024 * 1024;
+pub(crate) const LOG_CAP: u64 = 8 * 1024 * 1024;
 const LOG_TAIL: u64 = 1024 * 1024;
 const RETENTION_MS: u64 = 7 * 24 * 3600 * 1000;
 
@@ -169,6 +169,13 @@ impl Sidecars {
             Some(Err(_)) => LoginEnvState::Unavailable,
             None => LoginEnvState::Capturing,
         }
+    }
+
+    /// The captured login environment's `LANG`, once capture has finished: `None` when capture failed or the login
+    /// sets none. A start waits for the capture as a sidecar start does.
+    pub async fn login_lang(&self) -> Option<std::ffi::OsString> {
+        let captured = self.environment().await.ok()?;
+        captured.env.get(OsStr::new("LANG")).cloned()
     }
 
     async fn environment(&self) -> Result<Arc<Captured>, Status> {
@@ -507,6 +514,14 @@ impl Sidecars {
         self.list().sidecars.iter().any(|s| s.alive)
     }
 
+    /// The validated record and handshake state of a running sidecar.
+    pub(crate) fn live_record(&self, id: &str) -> Option<(Record, bool)> {
+        let entry = self.entries.lock().expect("sidecar registry").get(id)?.clone();
+        let mut entry = entry.lock().expect("sidecar entry");
+        let _ = entry.reap_exited();
+        entry.alive().then(|| (entry.record.clone(), entry.handshake))
+    }
+
     pub async fn stop(&self, id: &str) -> Result<(), Status> {
         let entry = self
             .entries
@@ -555,10 +570,10 @@ impl Sidecars {
                 );
             }
             if now.saturating_sub(entry.record.exited_unix_ms.unwrap_or(now)) >= RETENTION_MS {
-                expired.push(entry.record.sidecar_id.clone());
+                expired.push((entry.record.sidecar_id.clone(), entry.record.socket.clone()));
             }
         }
-        for id in expired {
+        for (id, socket) in expired {
             let result = (|| -> io::Result<()> {
                 for extension in ["out", "err", "out.1", "err.1", "pid"] {
                     match std::fs::remove_file(self.paths.metadata_run().join(format!("sc-{id}.{extension}"))) {
@@ -567,7 +582,6 @@ impl Sidecars {
                         Err(e) => return Err(e),
                     }
                 }
-                let socket = agent::socket_path::in_dir(&self.paths.run, &format!("sc-{id}.sock"))?;
                 match std::fs::remove_file(socket) {
                     Ok(()) => {}
                     Err(e) if e.kind() == io::ErrorKind::NotFound => {}
@@ -588,6 +602,11 @@ impl Sidecars {
     }
 
     pub async fn refresh_handshakes(&self) {
+        self.refresh_handshakes_with(handshake).await;
+    }
+
+    pub(super) async fn refresh_handshakes_with(&self, handshake: impl AsyncFn(&Path, u32) -> io::Result<()>) {
+        let handshake = &handshake;
         futures_util::future::join_all(self.snapshot().into_iter().map(|entry| async move {
             let command_id = entry.lock().expect("sidecar entry").record.command_id.clone();
             // Maintenance and retries must not stop or claim the same interrupted start concurrently.
@@ -709,15 +728,29 @@ pub(crate) fn in_normal_form(root: &[u8]) -> bool {
 }
 
 pub(crate) fn open_root(root: &str) -> Result<File, Status> {
-    if !root.starts_with('/') {
-        return Err(Status::invalid_argument("root must be absolute"));
+    let dir = open_directory(root, "root")?;
+    if dir.metadata().map_err(internal)?.uid() != private_fs::euid() {
+        return Err(Status::invalid_argument("root must be owned by the daemon's uid"));
     }
-    if !in_normal_form(root.as_bytes()) {
-        return Err(Status::invalid_argument("root must be in normal form"));
+    Ok(dir)
+}
+
+/// An absolute, normal-form directory of at most 4096 bytes, each component opened `O_DIRECTORY` from the one before
+/// (following links), so the descriptor names the directory the path named when it was opened. `what` names the
+/// field in a refusal.
+pub(crate) fn open_directory(path: &str, what: &str) -> Result<File, Status> {
+    if path.len() > 4096 {
+        return Err(Status::invalid_argument(format!("{what} exceeds byte cap")));
+    }
+    if !path.starts_with('/') {
+        return Err(Status::invalid_argument(format!("{what} must be absolute")));
+    }
+    if !in_normal_form(path.as_bytes()) {
+        return Err(Status::invalid_argument(format!("{what} must be in normal form")));
     }
     let mut dir = private_fs::open_dir(Path::new("/")).map_err(internal)?;
-    for part in root.split('/').skip(1).filter(|s| !s.is_empty()) {
-        let name = CString::new(part).map_err(|_| Status::invalid_argument("invalid root"))?;
+    for part in path.split('/').skip(1).filter(|s| !s.is_empty()) {
+        let name = CString::new(part).map_err(|_| Status::invalid_argument(format!("invalid {what}")))?;
         let fd = unsafe {
             libc::openat(
                 dir.as_raw_fd(),
@@ -726,12 +759,11 @@ pub(crate) fn open_root(root: &str) -> Result<File, Status> {
             )
         };
         if fd < 0 {
-            return Err(Status::invalid_argument("root must be an existing directory"));
+            return Err(Status::invalid_argument(format!(
+                "{what} must be an existing directory"
+            )));
         }
         dir = unsafe { File::from_raw_fd(fd) };
-    }
-    if dir.metadata().map_err(internal)?.uid() != private_fs::euid() {
-        return Err(Status::invalid_argument("root must be owned by the daemon's uid"));
     }
     Ok(dir)
 }
@@ -746,7 +778,8 @@ pub(crate) fn canonical_root(root: &File) -> Result<String, Status> {
         .map_err(|_| Status::invalid_argument("canonical root must be UTF-8"))
 }
 
-unsafe fn child_setup(root_fd: i32, umask: libc::mode_t) -> io::Result<()> {
+/// A detached child's setup between fork and exec: its own session, the held directory, the login's umask.
+pub(crate) unsafe fn child_setup(root_fd: i32, umask: libc::mode_t) -> io::Result<()> {
     if unsafe { libc::setsid() < 0 || libc::fchdir(root_fd) < 0 } {
         return Err(io::Error::last_os_error());
     }
@@ -756,7 +789,8 @@ unsafe fn child_setup(root_fd: i32, umask: libc::mode_t) -> io::Result<()> {
     Ok(())
 }
 
-struct Starting(Option<Child>);
+/// A child spawned but not yet registered: dropped on an error path, it kills its group and the child.
+pub(crate) struct Starting(pub(crate) Option<Child>);
 impl Drop for Starting {
     fn drop(&mut self) {
         if let Some(child) = &mut self.0 {
@@ -889,6 +923,20 @@ fn audit_stop(state: &Path, pid: u32, operation: &str, error: &impl std::fmt::Di
 }
 
 fn pin_session_members(leader_fd: &OwnedFd, leader: u32, leader_start: u64, state: &Path) -> io::Result<Vec<OwnedFd>> {
+    pin_session_members_audited(leader_fd, leader, leader_start, state, "sidecar-stop-error")
+}
+
+/// The processes of the session `leader` leads, started no earlier than it, each pinned by a pidfd while the leader
+/// still reserves its session id. Skipped members are audited as `event`.
+pub(crate) fn pin_session_members_audited(
+    leader_fd: &OwnedFd,
+    leader: u32,
+    leader_start: u64,
+    state: &Path,
+    event: &str,
+) -> io::Result<Vec<OwnedFd>> {
+    let skipped_member_error =
+        |state: &Path, pid: u32, error: &io::Error| skipped_member_error(state, pid, error, event);
     let mut members = Vec::new();
     if exited(leader_fd)? {
         return Ok(members);
@@ -944,12 +992,12 @@ fn pin_session_members(leader_fd: &OwnedFd, leader: u32, leader_start: u64, stat
     Ok(members)
 }
 
-fn skipped_member_error(state: &Path, pid: u32, error: &io::Error) -> bool {
+fn skipped_member_error(state: &Path, pid: u32, error: &io::Error, event: &str) -> bool {
     if matches!(
         error.raw_os_error(),
         Some(libc::ENOENT | libc::ESRCH | libc::EACCES | libc::EPERM)
     ) {
-        audit_stop(state, pid, "member-scan", error);
+        let _ = crate::audit::record(state, event, &format!("pid={pid} member-scan: {error}"));
         true
     } else {
         false
@@ -988,7 +1036,7 @@ pub fn start_time(pid: u32) -> io::Result<u64> {
     stat_start_time(&stat)
 }
 
-fn identity_start_time(pid: u32) -> io::Result<u64> {
+pub(crate) fn identity_start_time(pid: u32) -> io::Result<u64> {
     parse_start_time(&std::fs::read(format!("/proc/{pid}/stat"))?, false)
 }
 
@@ -996,7 +1044,7 @@ fn stat_start_time(stat: &[u8]) -> io::Result<u64> {
     parse_start_time(stat, true)
 }
 
-fn parse_start_time(stat: &[u8], require_alive: bool) -> io::Result<u64> {
+pub(crate) fn parse_start_time(stat: &[u8], require_alive: bool) -> io::Result<u64> {
     let fields = stat_fields(stat)?;
     if require_alive && matches!(fields.first(), Some(&"Z") | Some(&"X")) {
         return Err(io::Error::other("sidecar has exited"));
@@ -1007,7 +1055,7 @@ fn parse_start_time(stat: &[u8], require_alive: bool) -> io::Result<u64> {
         .ok_or_else(|| crate::invalid("invalid process start time"))
 }
 
-fn stat_fields(stat: &[u8]) -> io::Result<Vec<&str>> {
+pub(crate) fn stat_fields(stat: &[u8]) -> io::Result<Vec<&str>> {
     let end_name = stat
         .iter()
         .rposition(|b| *b == b')')
@@ -1018,7 +1066,7 @@ fn stat_fields(stat: &[u8]) -> io::Result<Vec<&str>> {
         .collect())
 }
 
-fn pin(pid: u32) -> io::Result<OwnedFd> {
+pub(crate) fn pin(pid: u32) -> io::Result<OwnedFd> {
     if pid < 2 || pid > i32::MAX as u32 {
         return Err(crate::invalid("invalid sidecar pid"));
     }
@@ -1030,7 +1078,7 @@ fn pin(pid: u32) -> io::Result<OwnedFd> {
     Ok(unsafe { OwnedFd::from_raw_fd(fd as i32) })
 }
 
-fn signal(fd: &OwnedFd, signal: i32) -> io::Result<()> {
+pub(crate) fn signal(fd: &OwnedFd, signal: i32) -> io::Result<()> {
     // SAFETY: the owned pidfd pins the target; no raw process id can be reused here.
     if unsafe {
         libc::syscall(
@@ -1047,7 +1095,7 @@ fn signal(fd: &OwnedFd, signal: i32) -> io::Result<()> {
     Err(io::Error::last_os_error())
 }
 
-fn exited(fd: &OwnedFd) -> io::Result<bool> {
+pub(crate) fn exited(fd: &OwnedFd) -> io::Result<bool> {
     loop {
         let mut poll = libc::pollfd {
             fd: fd.as_raw_fd(),
@@ -1069,7 +1117,7 @@ fn exited(fd: &OwnedFd) -> io::Result<bool> {
     }
 }
 
-async fn wait_pidfd(fd: &OwnedFd) -> io::Result<()> {
+pub(crate) async fn wait_pidfd(fd: &OwnedFd) -> io::Result<()> {
     while !exited(fd)? {
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
@@ -1113,6 +1161,8 @@ pub async fn handshake(socket: &Path, pid: u32) -> io::Result<()> {
 
 /// A refusing record remains available to explain why removal cannot safely proceed.
 pub(crate) struct RefusingRecord {
+    /// `sidecar`, or `terminal` for a terminal host's record.
+    pub kind: &'static str,
     pub id: String,
     pub pid: Option<u32>,
     pub status: &'static str,
@@ -1163,7 +1213,12 @@ pub(crate) fn live_roots_in(run: &Path) -> io::Result<Vec<Option<String>>> {
         let judged = (|| {
             let bytes = private_fs::read_private_nofollow_bytes_capped(&entry.path(), 64 * 1024)?;
             let record: Record = serde_json::from_slice(&bytes)?;
-            Ok::<_, io::Error>(record_alive_with(&record, &identity_start_time)?.then_some(record.root))
+            let identity = ProcessIdentity {
+                pid: record.pid,
+                start_time: record.start_time,
+                boot_id: String::new(),
+            };
+            Ok::<_, io::Error>(record_alive_with(&identity, &identity_start_time)?.then_some(record.root))
         })();
         match judged {
             Ok(Some(root)) => roots.push(Some(root)),
@@ -1184,26 +1239,36 @@ fn refusing_records_with(run: &Path, stat: impl Fn(u32) -> io::Result<u64>) -> i
     for entry in entries {
         let entry = entry?;
         let name = entry.file_name();
-        let Some(id) = name
-            .to_str()
-            .and_then(|name| name.strip_prefix("sc-"))
-            .and_then(|name| name.strip_suffix(".pid"))
-        else {
+        // Sidecars and terminal hosts are both detached processes that outlive their daemon.
+        let Some((kind, id)) = name.to_str().and_then(|name| {
+            let name = name.strip_suffix(".pid")?;
+            let (kind, id, len) = match name.split_at_checked(3)? {
+                ("sc-", id) => ("sidecar", id, 16),
+                ("th-", id) => ("terminal", id, 32),
+                _ => return None,
+            };
+            (id.len() == len && id.bytes().all(|b| b.is_ascii_hexdigit())).then_some((kind, id))
+        }) else {
             continue;
         };
-        if id.len() != 16 || !id.bytes().all(|b| b.is_ascii_hexdigit()) {
-            continue;
-        }
         let mut pid = None;
         let alive = (|| {
             let bytes = private_fs::read_private_nofollow_bytes_capped(&entry.path(), 64 * 1024)?;
-            let record: Record = serde_json::from_slice(&bytes)?;
+            let record: ProcessIdentity = serde_json::from_slice(&bytes)?;
             pid = Some(record.pid);
+            // A record without a boot id can still describe a live terminal, so check its process.
+            if kind == "terminal"
+                && !record.boot_id.is_empty()
+                && record.boot_id != super::terminals::current_boot_id()?
+            {
+                return Ok(false);
+            }
             record_alive_with(&record, &stat)
         })();
         match alive {
             Ok(false) => {}
             result => refusing.push(RefusingRecord {
+                kind,
                 id: id.into(),
                 pid,
                 status: if result.is_ok() { "alive" } else { "unreadable" },
@@ -1214,12 +1279,21 @@ fn refusing_records_with(run: &Path, stat: impl Fn(u32) -> io::Result<u64>) -> i
     Ok(refusing)
 }
 
-fn record_alive_with(record: &Record, stat: &impl Fn(u32) -> io::Result<u64>) -> io::Result<bool> {
+/// A detached process's pid and start time, with the boot id when recorded.
+#[derive(Deserialize)]
+struct ProcessIdentity {
+    pid: u32,
+    start_time: u64,
+    #[serde(default)]
+    boot_id: String,
+}
+
+fn record_alive_with(record: &ProcessIdentity, stat: &impl Fn(u32) -> io::Result<u64>) -> io::Result<bool> {
     record_alive_readers(record, stat, &|fd| signal(fd, 0))
 }
 
 fn record_alive_readers(
-    record: &Record,
+    record: &ProcessIdentity,
     stat: &impl Fn(u32) -> io::Result<u64>,
     ownership: &impl Fn(&OwnedFd) -> io::Result<()>,
 ) -> io::Result<bool> {
@@ -1247,8 +1321,7 @@ fn record_alive_readers(
 
 fn read_records(paths: &Paths) -> Vec<Record> {
     let metadata_run = paths.metadata_run();
-    let run_dir = &paths.run;
-    let Ok(files) = std::fs::read_dir(metadata_run) else {
+    let Ok(files) = std::fs::read_dir(&metadata_run) else {
         return Vec::new();
     };
     files
@@ -1262,7 +1335,11 @@ fn read_records(paths: &Paths) -> Vec<Record> {
             }
             let bytes = private_fs::read_private_nofollow_bytes_capped(&file.path(), 64 * 1024).ok()?;
             let mut record: Record = serde_json::from_slice(&bytes).ok()?;
-            if record.socket != agent::socket_path::in_dir(run_dir, &format!("sc-{id}.sock")).ok()? {
+            let name = format!("sc-{id}.sock");
+            if ![&paths.run, &metadata_run]
+                .into_iter()
+                .any(|run| agent::socket_path::in_dir(run, &name).is_ok_and(|socket| socket == record.socket))
+            {
                 return None;
             }
             validate_command_id(&record.command_id).ok()?;
@@ -1278,7 +1355,7 @@ fn read_records(paths: &Paths) -> Vec<Record> {
         .collect()
 }
 
-fn trim_log(path: &Path) -> io::Result<()> {
+pub(crate) fn trim_log(path: &Path) -> io::Result<()> {
     trim_log_with(path, |dir, name, bytes| {
         private_fs::publish_private_file(dir, name, bytes).map(|_| ())
     })
@@ -1371,9 +1448,51 @@ mod tests {
     }
 
     #[test]
+    fn terminal_inventory_counts_a_live_legacy_record_without_a_boot_id() {
+        let scratch = Scratch::new();
+        let pid = std::process::id();
+        let start_time = identity_start_time(pid).unwrap();
+        let path = scratch.0.join("th-0123456789abcdef0123456789abcdef.pid");
+        let record = serde_json::json!({"pid": pid, "start_time": start_time});
+        private_fs::write_private(&path, &serde_json::to_vec(&record).unwrap()).unwrap();
+
+        let refusing = refusing_records_in(&scratch.0).unwrap();
+        assert_eq!(refusing.len(), 1);
+        assert_eq!(
+            (refusing[0].kind, refusing[0].pid, refusing[0].status),
+            ("terminal", Some(pid), "alive")
+        );
+        assert!(recorded_alive_in(&scratch.0).unwrap());
+    }
+
+    #[test]
+    fn terminal_inventory_ignores_pid_and_start_time_matches_from_another_boot() {
+        let scratch = Scratch::new();
+        let pid = std::process::id();
+        let start_time = identity_start_time(pid).unwrap();
+        let boot_id = super::super::terminals::current_boot_id().unwrap();
+        let path = scratch.0.join("th-0123456789abcdef0123456789abcdef.pid");
+        let mut record = serde_json::json!({"pid": pid, "start_time": start_time + 1});
+        private_fs::write_private(&path, &serde_json::to_vec(&record).unwrap()).unwrap();
+        assert!(refusing_records_in(&scratch.0).unwrap().is_empty());
+
+        record["start_time"] = start_time.into();
+        record["boot_id"] = "00000000-0000-0000-0000-000000000000".into();
+        private_fs::write_private(&path, &serde_json::to_vec(&record).unwrap()).unwrap();
+        assert!(refusing_records_in(&scratch.0).unwrap().is_empty());
+        assert!(!recorded_alive_in(&scratch.0).unwrap());
+
+        record["boot_id"] = boot_id.into();
+        private_fs::write_private(&path, &serde_json::to_vec(&record).unwrap()).unwrap();
+        let refusing = refusing_records_in(&scratch.0).unwrap();
+        assert_eq!(refusing.len(), 1);
+        assert_eq!((refusing[0].kind, refusing[0].status), ("terminal", "alive"));
+    }
+
+    #[test]
     fn hidden_identity_checks_ownership_independently() {
         let pid = std::process::id();
-        let record: Record = serde_json::from_value(serde_json::json!({
+        let record: ProcessIdentity = serde_json::from_value(serde_json::json!({
             "pid": pid, "start_time": identity_start_time(pid).unwrap(), "socket": ""
         }))
         .unwrap();
@@ -2085,6 +2204,36 @@ mod tests {
         assert!(std::fs::read_to_string(manager.paths.state.join("audit.log"))
             .unwrap()
             .contains("sidecar-expire"));
+    }
+
+    #[tokio::test]
+    async fn a_sidecar_in_the_ordinary_directory_survives_run_relocation_and_is_stoppable() {
+        let scratch = short_scratch();
+        let state = scratch.0.join("s".repeat(48 - scratch.0.as_os_str().len() - 1));
+        let paths = Paths::new("1", &scratch.0.join("d"), &state, &scratch.0).unwrap();
+        paths.prepare().unwrap();
+        assert_ne!(paths.run, paths.metadata_run());
+        let mut command = tokio::process::Command::new("/bin/sleep");
+        command.arg("60").kill_on_drop(true);
+        unsafe {
+            command.pre_exec(|| {
+                if libc::setsid() < 0 {
+                    return Err(io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let mut child = command.spawn().unwrap();
+        let pid = child.id().unwrap();
+        let mut record = record("0123456789abcdef");
+        record.pid = pid;
+        record.start_time = start_time(pid).unwrap();
+        record.socket = agent::socket_path::in_dir(&paths.metadata_run(), "sc-0123456789abcdef.sock").unwrap();
+        Sidecars::new(paths.clone()).unwrap().persist(&record).unwrap();
+        let adopted = Sidecars::new(paths).unwrap();
+        assert!(adopted.any_alive());
+        adopted.stop_all().await.unwrap();
+        assert!(child.try_wait().unwrap().is_some());
     }
 
     #[tokio::test]

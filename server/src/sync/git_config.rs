@@ -13,7 +13,7 @@ use eitri_core::remote_sync::git_replica::{config_digest, parse_config_list, san
 use eitri_server_proto::{GitConfigEntry, GitConfigResponse};
 use tokio::io::AsyncReadExt;
 
-use super::super::login_env::{self, Environment};
+use super::super::login_env::Environment;
 use super::super::sidecars::{canonical_root, open_root};
 
 /// The most `git config --list` output read; a repository's own config is a few kilobytes.
@@ -22,16 +22,7 @@ const MAX_LISTING: usize = 1 << 20;
 const MAX_STDERR: usize = 16 << 10;
 const GIT_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// The answer for `root`: entries and digest, or a refusal and nothing else.
-pub async fn answer(root: &str) -> GitConfigResponse {
-    let environment = match login_env::minimal_environment() {
-        Ok(environment) => environment,
-        Err(error) => return refused(format!("cannot read the server account's environment: {error}")),
-    };
-    answer_with(root, environment).await
-}
-
-/// [`answer`], running git with `environment` (less every `GIT_*` variable).
+/// Reads the repository config with the daemon's captured login environment, omitting every Git override.
 pub async fn answer_with(root: &str, environment: Environment) -> GitConfigResponse {
     let owned = root.to_owned();
     let checked = tokio::task::spawn_blocking(move || mirrorable_config(&owned)).await;

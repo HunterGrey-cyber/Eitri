@@ -625,6 +625,7 @@ fn send_calls(code: &str) -> Vec<String> {
         "steer",
         "steer_turn",
         "steer_turn_stamped",
+        "steer_turn_after",
     ] {
         for end in word_ends(code, name) {
             let before = code[..end - name.len()].trim_end();
@@ -718,7 +719,7 @@ fn every_send_caller_names_its_origin() {
         ),
         (
             "core/src/agent_backend.rs",
-            "send_turn_as_spawned(&turn.wire,&turn.typed,turn.origin,&client_message_id,answered)",
+            "send_turn_as_spawned(&turn.wire,&turn.typed,turn.origin,&client_message_id,wait,answered)",
         ),
         // A phone's turn: its request names `PromptOrigin::Composed`.
         (
@@ -729,7 +730,7 @@ fn every_send_caller_names_its_origin() {
         ("core/src/tab_set/desk_sends.rs", "send_turn_spawned(request,answered)"),
         (
             "core/src/agent_backend.rs",
-            "steer_turn(shown_turn,client_message_id,wire_text,as_typed,origin)",
+            "steer_turn_after(shown_turn,client_message_id,wire_text,as_typed,origin,wait)",
         ),
         (
             "core/src/tab_set.rs",
@@ -741,7 +742,7 @@ fn every_send_caller_names_its_origin() {
         ),
         (
             "core/src/tab_set.rs",
-            "steer(turn,&client_id,&item.wire,&item.text,item.origin())",
+            "steer(turn,&client_id,&item.wire,&item.text,item.origin(),sync.clone())",
         ),
     ]
     .into_iter()

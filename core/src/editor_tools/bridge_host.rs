@@ -899,29 +899,36 @@ mod tests {
     const PATIENCE: Duration = Duration::from_secs(30);
 
     /// A private directory under the target dir (the test binary's own place), removed when dropped.
-    struct Scratch(PathBuf);
+    struct Scratch {
+        dir: PathBuf,
+        _build: std::fs::File,
+    }
 
     impl Scratch {
         fn new() -> Scratch {
             use std::os::unix::fs::DirBuilderExt;
             let exe = std::env::current_exe().expect("the test binary has a path");
             let build = exe.ancestors().nth(2).expect("target/<profile>/deps/<binary>");
-            let dir = build.join(format!("bh-{}", &uuid::Uuid::new_v4().simple().to_string()[..8]));
+            // The target directory can exceed sun_path's limit by itself. Both peers run in this process,
+            // so they can reach the same scratch directory through its parent's open descriptor.
+            let build = std::fs::File::open(build).expect("opens the build directory");
+            let dir = PathBuf::from(format!("/proc/self/fd/{}", build.as_raw_fd()))
+                .join(format!("bh-{}", &uuid::Uuid::new_v4().simple().to_string()[..8]));
             std::fs::DirBuilder::new()
                 .mode(0o700)
                 .create(&dir)
                 .expect("makes a directory");
-            Scratch(dir)
+            Scratch { dir, _build: build }
         }
 
         fn control(&self) -> PathBuf {
-            self.0.join("c")
+            self.dir.join("c")
         }
     }
 
     impl Drop for Scratch {
         fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
+            let _ = std::fs::remove_dir_all(&self.dir);
         }
     }
 
@@ -1164,7 +1171,7 @@ mod tests {
         let dir = scratch.control().symlink_metadata().expect("made");
         assert_eq!(dir.mode() & 0o777, 0o700);
 
-        let open = scratch.0.join("open");
+        let open = scratch.dir.join("open");
         std::fs::create_dir(&open).expect("makes a directory");
         std::fs::set_permissions(&open, std::fs::Permissions::from_mode(0o777)).expect("widens it");
         let in_a_shared_directory = BridgeHost::start(open, counted_wake().0).expect("starts");
@@ -1654,7 +1661,7 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&path).expect("reads"), "a file");
 
         std::fs::remove_file(&path).expect("removes");
-        std::os::unix::fs::symlink(scratch.0.join("elsewhere"), &path).expect("links");
+        std::os::unix::fs::symlink(scratch.dir.join("elsewhere"), &path).expect("links");
         host.adopt(1, &name(), tools()).expect_err("a link");
         assert!(path.symlink_metadata().expect("still").file_type().is_symlink());
     }
@@ -1678,7 +1685,7 @@ mod tests {
         let scratch = Scratch::new();
         let host = host(&scratch);
         let path = file_name(&name().hex, &scratch.control());
-        let target = scratch.0.join("target");
+        let target = scratch.dir.join("target");
         std::fs::write(&target, "kept").expect("writes");
         std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o640)).expect("sets it");
         let (planted_path, planted_target) = (path.clone(), target.clone());
@@ -1710,7 +1717,7 @@ mod tests {
     #[test]
     fn a_path_over_the_limit_is_refused() {
         let scratch = Scratch::new();
-        let host_dir = scratch.0.join("d".repeat(agent::socket_path::MAX_SOCKET_PATH_BYTES));
+        let host_dir = scratch.dir.join("d".repeat(agent::socket_path::MAX_SOCKET_PATH_BYTES));
         std::fs::create_dir(&host_dir).expect("makes a directory");
         let host = BridgeHost::start(host_dir.clone(), counted_wake().0).expect("starts");
         let error = host.open(1, tools()).expect_err("too long");

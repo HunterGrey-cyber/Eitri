@@ -43,6 +43,7 @@ use std::time::{Duration, Instant};
 
 use rustix::termios::{self, InputModes, OptionalActions, Winsize};
 
+#[cfg(feature = "paint")]
 use crate::metrics::TerminalMetrics;
 
 /// Removed from the child's environment. An Eitri started from inside tmux would otherwise make
@@ -170,6 +171,15 @@ impl SpawnSpec {
     }
 }
 
+/// Additional child setup for a login shell whose environment and directory are supplied by its host.
+#[derive(Default)]
+pub struct SpawnExtras {
+    pub exact_env: Option<Vec<(OsString, OsString)>>,
+    pub arg0: Option<OsString>,
+    pub umask: Option<u32>,
+    pub cwd_fd: Option<OwnedFd>,
+}
+
 /// The PTY's size, in cells and in pixels per cell.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PtySize {
@@ -205,6 +215,7 @@ impl PtySize {
     }
 
     /// The size `metrics` currently lays out: its grid, and its cell rounded to whole device pixels.
+    #[cfg(feature = "paint")]
     pub fn from_metrics(metrics: &TerminalMetrics) -> Self {
         let px = |v: f32| v.round().clamp(0.0, f32::from(u16::MAX)) as u16;
         PtySize {
@@ -255,6 +266,12 @@ impl PtyChild {
     /// Opens a PTY of `size` and runs `spec` on it as a session leader with the PTY as its
     /// controlling terminal. The master is non-blocking: the session thread polls it.
     pub fn spawn(spec: &SpawnSpec, size: PtySize) -> io::Result<Self> {
+        Self::spawn_with(spec, size, &SpawnExtras::default())
+    }
+
+    /// Opens a PTY with explicit login-shell setup. A directory descriptor wins over `spec.cwd`;
+    /// an exact environment replaces every inherited and per-spec variable.
+    pub fn spawn_with(spec: &SpawnSpec, size: PtySize, extras: &SpawnExtras) -> io::Result<Self> {
         let pty = rustix_openpty::openpty(None, Some(&size.to_winsize())).map_err(io::Error::from)?;
         // Before the spawn, so no error after it can drop a child nobody reaps. `O_NONBLOCK` is on
         // the controller's open file description, which the child never has (it is `CLOEXEC`).
@@ -269,18 +286,36 @@ impl PtyChild {
             // Scoped: `Command` owns the three `Stdio`s, i.e. the parent's copies of the user side.
             // They must be closed before anything reads the master, or EOF never arrives.
             let mut cmd = Command::new(&spec.program);
-            cmd.args(&spec.args)
-                .current_dir(&spec.cwd)
-                .env_clear()
-                .envs(child_environment_with(std::env::vars_os(), &spec.extra_env))
-                .envs(spec.env.iter().cloned())
-                .stdin(Stdio::from(pty.user.try_clone()?))
+            cmd.args(&spec.args).env_clear();
+            if let Some(env) = &extras.exact_env {
+                cmd.envs(env.iter().cloned());
+            } else {
+                cmd.envs(child_environment_with(std::env::vars_os(), &spec.extra_env))
+                    .envs(spec.env.iter().cloned());
+            }
+            if let Some(arg0) = &extras.arg0 {
+                cmd.arg0(arg0);
+            }
+            if extras.cwd_fd.is_none() {
+                cmd.current_dir(&spec.cwd);
+            }
+            cmd.stdin(Stdio::from(pty.user.try_clone()?))
                 .stdout(Stdio::from(pty.user.try_clone()?))
                 .stderr(Stdio::from(pty.user));
+            let cwd_fd = extras.cwd_fd.as_ref().map(AsRawFd::as_raw_fd);
+            let umask = extras.umask;
             // SAFETY: runs in the forked child before exec, and calls only async-signal-safe
             // functions. std has already put the PTY on fds 0/1/2 and reset the signal mask.
             unsafe {
-                cmd.pre_exec(|| {
+                cmd.pre_exec(move || {
+                    if let Some(fd) = cwd_fd {
+                        if libc::fchdir(fd) == -1 {
+                            return Err(io::Error::last_os_error());
+                        }
+                    }
+                    if let Some(mask) = umask {
+                        libc::umask(mask as libc::mode_t);
+                    }
                     if libc::setsid() == -1 {
                         return Err(io::Error::last_os_error());
                     }
@@ -896,6 +931,7 @@ mod tests {
     /// `from_metrics` rounds the cell size to whole device pixels and carries the grid through
     /// unchanged; checking the constructor directly catches lost grid dimensions.
     #[test]
+    #[cfg(feature = "paint")]
     fn from_metrics_rounds_the_cell_size_and_copies_the_grid() {
         let metrics = TerminalMetrics::new(1000.0, 500.0, 1.0);
         let size = PtySize::from_metrics(&metrics);

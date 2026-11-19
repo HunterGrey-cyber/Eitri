@@ -21,6 +21,7 @@ pub struct Memory {
 
 #[derive(Default)]
 pub struct TabMemory {
+    pub write_hold: Option<crate::remote_sync::flush::EditorWriteHold>,
     /// What the tab's diagnostics were when its newest turn began.
     pub baseline: Option<TurnBaseline>,
     /// The exec calls already taken, oldest first, each by a digest of the agent's key for it.

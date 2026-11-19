@@ -6,12 +6,16 @@
 -- A buffer is under the root when its resolved full name is the root or starts with the root and a slash.
 -- Times are milliseconds since the epoch (seconds and nanoseconds from the file system), which Lua's numbers
 -- hold exactly.
-local root = ...
+local root, since = ...
 if type(root) ~= 'string' or root == '' then
   return { unsaved = {}, files = {} }
 end
 root = root:gsub('/+$', '')
 local prefix = root .. '/'
+if since ~= nil then
+  if not _G.__eitri_saves_since then return nil end
+  return { files = _G.__eitri_saves_since(since, prefix) }
+end
 
 local function under(name)
   return name == root or name:sub(1, #prefix) == prefix

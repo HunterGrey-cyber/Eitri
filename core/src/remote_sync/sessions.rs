@@ -33,6 +33,7 @@ pub trait SyncHelper: Send + Sync {
         &self,
         root: &Path,
         rels: &[String],
+        whole_root: bool,
         patterns: &[String],
         budget: u64,
     ) -> Result<wire::PathSizesResponse, String>;
@@ -45,6 +46,10 @@ pub trait SyncHelper: Send + Sync {
         staging_name: &str,
     ) -> Result<wire::WatchModesResponse, String>;
     fn mode_lines(&self) -> Result<Vec<ModeLine>, String>;
+    /// The host key the connection under this helper shows now, when ssh accepted one other than the key the project
+    /// was recorded with (a window's link that came back to another server). `None` while it shows the recorded key,
+    /// when none can be read, or with no ssh master. Blocking: it reads ssh's record of the master's key.
+    fn changed_host_key(&self) -> Result<Option<String>, String>;
 }
 
 fn root_text(root: &Path) -> Result<String, String> {
@@ -89,6 +94,7 @@ impl SyncHelper for RemoteConnection {
         &self,
         root: &Path,
         rels: &[String],
+        whole_root: bool,
         patterns: &[String],
         budget: u64,
     ) -> Result<wire::PathSizesResponse, String> {
@@ -97,6 +103,7 @@ impl SyncHelper for RemoteConnection {
             wire::PathSizesRequest {
                 root: root_text(root)?,
                 rels: rels.to_vec(),
+                whole_root,
                 patterns: patterns.to_vec(),
                 budget,
             },
@@ -128,13 +135,21 @@ impl SyncHelper for RemoteConnection {
     fn mode_lines(&self) -> Result<Vec<ModeLine>, String> {
         RemoteConnection::mode_lines(self)
     }
+
+    fn changed_host_key(&self) -> Result<Option<String>, String> {
+        RemoteConnection::changed_host_key(self)
+    }
 }
 
-/// The staging directory name the mode keeper is told to pair renames with. Mutagen names the directory after its
-/// session identifier (`.mutagen-temporary-staging-sync_<id>-beta`), which a session's status does not carry here,
-/// so none is named and the keeper pairs any `.mutagen-temporary-staging-*` in the root's parent.
-pub fn staging_name(_key: &SyncKey) -> String {
-    String::new()
+/// The staging directory name the mode keeper is told about: Mutagen names a session's neighbouring staging directory
+/// after the session's identifier (`.mutagen-temporary-staging-sync_<id>-beta`), which differs for each instance of
+/// a session. The keeper keeps that directory ready between cycles; with no identifier known, none is named and the
+/// keeper pairs any `.mutagen-temporary-staging-*` in the root's parent without making one.
+pub fn staging_name(identifier: &str) -> String {
+    if identifier.is_empty() {
+        return String::new();
+    }
+    format!(".mutagen-temporary-staging-{identifier}-beta")
 }
 
 /// The tree session's spec: `.git`, the effective patterns in their order (repetitions kept: Mutagen's last match
@@ -204,23 +219,6 @@ fn key_sessions(store: &RemoteProjects, host_key: &str) -> (Vec<(RemoteProject, 
     (found, problems)
 }
 
-/// Every recorded session of `host`'s projects, with its project's root.
-fn host_sessions(store: &RemoteProjects, host: &str) -> (Vec<(RemoteProject, SyncRecord)>, Vec<String>) {
-    let (projects, mut problems) = match store.list() {
-        Ok(listed) => listed,
-        Err(error) => return (vec![], vec![error.to_string()]),
-    };
-    let mut found = Vec::new();
-    for project in projects.into_iter().filter(|project| project.host == host) {
-        match project.sync_record() {
-            Ok(Some(record)) => found.push((project, record)),
-            Ok(None) => {}
-            Err(why) => problems.push(why),
-        }
-    }
-    (found, problems)
-}
-
 /// After the window recorded a changed host key: a sync record whose sessions run under the old key gets the host-key
 /// pause (unless the person already accepted this key), so nothing syncs until they resume. Returns the line to show.
 pub fn note_key_change(store: &RemoteProjects, project: &RemoteProject) -> Option<String> {
@@ -255,16 +253,25 @@ pub fn note_key_change(store: &RemoteProjects, project: &RemoteProject) -> Optio
 }
 
 /// `eitri host stop <host>`: pauses every session of `host`'s projects. Returns the lines to show.
-pub fn pause_host(engine: &dyn SyncEngine, store: &RemoteProjects, host: &str) -> Vec<String> {
-    let (found, mut lines) = host_sessions(store, host);
+pub fn pause_host(
+    engine: &dyn SyncEngine,
+    store: &RemoteProjects,
+    host_key: &str,
+    command: &str,
+    host: &str,
+) -> Vec<String> {
+    let (found, mut lines) = key_sessions(store, host_key);
     for (project, record) in found {
         // Recorded, so a window holding the project keeps it paused and `eitri host sync resume` lifts it.
         if record.paused.is_none() {
             let text = format!(
-                "sync paused by eitri host stop {host}; run eitri host sync resume in {} to sync again",
+                "sync paused by eitri host {command} {host}; run eitri host sync resume in {} to sync again",
                 project.root.display()
             );
-            let saved = store.update_for_host(&project.root, host, |project| {
+            let saved = store.update_checked(&project.root, |project| {
+                if project.host_key_sha256 != host_key {
+                    return Err(std::io::Error::other("the project now points at another server"));
+                }
                 if let Ok(Some(mut record)) = project.sync_record() {
                     record.paused = Some(crate::remote_project::PauseRecord {
                         reason: super::actor::PAUSE_STOPPED.into(),
@@ -274,6 +281,7 @@ pub fn pause_host(engine: &dyn SyncEngine, store: &RemoteProjects, host: &str) -
                     });
                     project.set_sync_record(&record);
                 }
+                Ok(())
             });
             if let Err(error) = saved {
                 lines.push(format!(
@@ -383,7 +391,8 @@ mod tests {
         assert!(matcher.ignored("a/.git", false));
         assert!(matcher.ignored("private", false));
         assert_eq!(spec.name, format!("eitri-{key}-tree"));
-        assert_eq!(staging_name(&key), "");
+        assert_eq!(staging_name(""), "");
+        assert_eq!(staging_name("sync_abc"), ".mutagen-temporary-staging-sync_abc-beta");
         let labels = root_labels(Path::new("/srv/project"));
         assert_eq!(labels.len(), 1);
         assert_eq!(labels["eitri-root"], spec.labels["eitri-root"]);

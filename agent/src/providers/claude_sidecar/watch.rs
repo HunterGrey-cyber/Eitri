@@ -58,16 +58,7 @@ pub(crate) const WATCH_RECONNECT_BACKOFF: [Duration; 3] = [
 /// staying there. There is no last attempt. The agent lives on the server whatever the laptop's link
 /// does, so only the helper's own word (the session or its sidecar is gone, or the journal has a gap)
 /// ends the tab, or the person closing it.
-pub(crate) const REMOTE_RECONNECT_BACKOFF: [Duration; 8] = [
-    Duration::from_millis(500),
-    Duration::from_secs(1),
-    Duration::from_secs(2),
-    Duration::from_secs(4),
-    Duration::from_secs(8),
-    Duration::from_secs(15),
-    Duration::from_secs(30),
-    Duration::from_secs(60),
-];
+pub use crate::remote_client::REMOTE_RECONNECT_BACKOFF;
 
 /// The helper's refusal of a call naming a sidecar it does not run (any more, after a reboot).
 pub(crate) const NO_SUCH_SIDECAR: &str = "no such sidecar on this server";

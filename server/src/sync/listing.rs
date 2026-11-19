@@ -5,6 +5,7 @@ use std::fs::File;
 use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::ffi::OsStrExt;
+use std::time::Instant;
 
 /// Whether a path (relative to the root, and whether it is a directory) is left out of a walk.
 pub type Ignored<'a> = &'a dyn Fn(&str, bool) -> bool;
@@ -112,10 +113,11 @@ pub fn walk(
     root: &File,
     ignored: Ignored,
     allowance: &mut u64,
+    deadline: Instant,
     visit: &mut dyn FnMut(&Visit) -> Flow,
 ) -> Result<Flow, String> {
     let dir = dup(root.as_raw_fd()).map_err(|error| format!("the root: {error}"))?;
-    walk_dir(&dir, "", 0, ignored, allowance, visit)
+    walk_dir(&dir, "", 0, ignored, allowance, deadline, visit)
 }
 
 /// [`walk`] from the directory `dir`, whose path from the root is `prefix` (empty for the root itself).
@@ -125,20 +127,27 @@ pub fn walk_dir(
     depth: usize,
     ignored: Ignored,
     allowance: &mut u64,
+    deadline: Instant,
     visit: &mut dyn FnMut(&Visit) -> Flow,
 ) -> Result<Flow, String> {
     let shown = if prefix.is_empty() { "the root" } else { prefix };
+    if Instant::now() >= deadline {
+        return Ok(Flow::Exhausted);
+    }
     if depth > MAX_DEPTH {
         return Err(format!("{shown} is more than {MAX_DEPTH} directories deep"));
     }
-    let Some(mut names) =
-        names_in(dir.as_raw_fd(), *allowance).map_err(|error| format!("cannot read {shown}: {error}"))?
+    let Some(mut names) = names_in_until(dir.as_raw_fd(), *allowance, Some(deadline))
+        .map_err(|error| format!("cannot read {shown}: {error}"))?
     else {
         return Ok(Flow::Exhausted);
     };
     *allowance -= names.len() as u64;
     names.sort_by(|left, right| left.as_bytes().cmp(right.as_bytes()));
     for name in names {
+        if Instant::now() >= deadline {
+            return Ok(Flow::Exhausted);
+        }
         if name.as_bytes().eq_ignore_ascii_case(b".git") {
             continue;
         }
@@ -187,7 +196,7 @@ pub fn walk_dir(
                 }
                 Err(error) => return Err(format!("cannot read {rel}: {error}")),
             };
-            match walk_dir(&child, &rel, depth + 1, ignored, allowance, visit)? {
+            match walk_dir(&child, &rel, depth + 1, ignored, allowance, deadline, visit)? {
                 Flow::Go => {}
                 ended => return Ok(ended),
             }
@@ -210,12 +219,13 @@ pub fn list_tree(
     root: &File,
     ignored: Ignored,
     budget: u64,
+    deadline: Instant,
     emit: &mut dyn FnMut(Listed) -> bool,
 ) -> Result<(), String> {
     let mut listed = 0u64;
     let mut allowance = read_allowance(budget);
     let mut stopped = false;
-    let ended = walk(root, ignored, &mut allowance, &mut |visit| {
+    let ended = walk(root, ignored, &mut allowance, deadline, &mut |visit| {
         if listed == budget {
             return Flow::Exhausted;
         }
@@ -227,6 +237,12 @@ pub fn list_tree(
             Flow::Stop
         }
     })?;
+    if Instant::now() >= deadline {
+        return Err(format!(
+            "the listing took longer than {} s",
+            super::LIST_DEADLINE.as_secs()
+        ));
+    }
     if ended == Flow::Exhausted && !stopped {
         emit(Listed::Truncated);
     }
@@ -237,10 +253,11 @@ pub fn list_tree(
 /// holds (links not followed, `.git` and what `ignored` leaves out not counted), nothing there 0. Each requested path
 /// costs one of `budget` whatever is there, and so does each name under it; past the budget (or the walk's
 /// [`read_allowance`]) the answer stops early and says it is truncated, and the caller treats the sizes as unknown.
-/// Past `deadline` it refuses.
+/// At the deadline a whole-root estimate returns its partial total. Individual path measurements refuse.
 pub fn path_sizes(
     root: &File,
     rels: &[String],
+    whole_root: bool,
     ignored: Ignored,
     budget: u64,
     deadline: std::time::Instant,
@@ -249,6 +266,21 @@ pub fn path_sizes(
     let mut sizes = Vec::with_capacity(rels.len());
     let mut seen = 0u64;
     let mut allowance = read_allowance(budget);
+    if whole_root {
+        if !rels.is_empty() {
+            return Err("whole_root requires an empty path list".into());
+        }
+        let mut total = 0u64;
+        let ended = walk(root, ignored, &mut allowance, deadline, &mut |visit| {
+            if seen == budget || std::time::Instant::now() >= deadline {
+                return Flow::Exhausted;
+            }
+            seen += 1;
+            total = total.saturating_add(visit.size);
+            Flow::Go
+        })?;
+        return Ok((vec![(String::new(), total)], ended == Flow::Exhausted));
+    }
     for rel in rels {
         super::rel(rel)?;
         if seen == budget {
@@ -294,20 +326,15 @@ pub fn path_sizes(
                 }
                 Err(error) => return Err(format!("cannot read {rel}: {error}")),
             };
-            let mut timed_out = false;
-            let ended = walk_dir(&dir, rel, 1, ignored, &mut allowance, &mut |visit| {
+            let ended = walk_dir(&dir, rel, 1, ignored, &mut allowance, deadline, &mut |visit| {
                 if seen == budget {
                     return Flow::Exhausted;
-                }
-                if std::time::Instant::now() >= deadline {
-                    timed_out = true;
-                    return Flow::Stop;
                 }
                 seen += 1;
                 total = total.saturating_add(visit.size);
                 Flow::Go
             })?;
-            if timed_out {
+            if Instant::now() >= deadline {
                 return Err(late());
             }
             if ended == Flow::Exhausted {
@@ -380,11 +407,15 @@ fn join(prefix: &str, name: &str) -> String {
 /// The names in the directory `dir` (not `.` or `..`), read through a descriptor of their own so `dir`'s position is
 /// untouched; `None` when it holds more than `cap`, found after reading at most one name past it.
 pub fn names_in(dir: RawFd, cap: u64) -> io::Result<Option<Vec<OsString>>> {
+    names_in_until(dir, cap, None)
+}
+
+fn names_in_until(dir: RawFd, cap: u64, deadline: Option<Instant>) -> io::Result<Option<Vec<OsString>>> {
     // `/proc/self/fd/<n>` names the very directory the descriptor holds, wherever it has been moved since.
     let held = open_at(dir, c".", libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC)?;
     let mut names = Vec::new();
     for entry in std::fs::read_dir(format!("/proc/self/fd/{}", held.as_raw_fd()))? {
-        if names.len() as u64 == cap {
+        if names.len() as u64 == cap || deadline.is_some_and(|end| Instant::now() >= end) {
             return Ok(None);
         }
         names.push(entry?.file_name());

@@ -27,7 +27,7 @@
 //! projects the current grid, including any resize, and a render during an open update owes
 //! another frame when it closes (`redraw_at_end`).
 
-use alacritty_terminal::event::WindowSize;
+use alacritty_terminal::event::{Event, EventListener, WindowSize};
 use alacritty_terminal::grid::Dimensions;
 use alacritty_terminal::index::{Column, Line, Point, Side};
 use alacritty_terminal::selection::{Selection, SelectionType};
@@ -45,8 +45,8 @@ use terminal_sync::SyncDriver;
 
 mod osc;
 
+use crate::indicator::indicator_ops;
 use crate::listener::{HostEvents, Listener, Reply};
-use crate::paint::indicator_ops;
 use crate::pty::PtySize;
 use crate::replay::gate::Gate;
 use crate::replay::screen_replay::{self, ReplayRefused, ScreenReplay};
@@ -218,9 +218,51 @@ pub struct SelectionRecord {
     pub block: bool,
 }
 
+/// Which of a terminal's events a screen passes on.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ListenerMode {
+    /// The window's own terminal: everything.
+    Window,
+    /// A server-side screen nobody looks at: it answers the program's queries and has no clipboard, bell or title
+    /// to show.
+    Headless,
+    /// A view of a terminal whose program is answered elsewhere: no query is answered here (an answer would reach the
+    /// program twice), and the host's side effects pass as usual.
+    Mirror,
+}
+
+#[derive(Clone)]
+struct ScreenListener {
+    listener: Listener,
+    mode: ListenerMode,
+}
+
+impl EventListener for ScreenListener {
+    fn send_event(&self, event: Event) {
+        let dropped = match self.mode {
+            ListenerMode::Window => false,
+            ListenerMode::Headless => matches!(
+                event,
+                Event::ClipboardStore(..)
+                    | Event::ClipboardLoad(..)
+                    | Event::Title(_)
+                    | Event::ResetTitle
+                    | Event::Bell
+            ),
+            ListenerMode::Mirror => matches!(
+                event,
+                Event::PtyWrite(_) | Event::ColorRequest(..) | Event::TextAreaSizeRequest(_) | Event::ClipboardLoad(..)
+            ),
+        };
+        if !dropped {
+            self.listener.send_event(event);
+        }
+    }
+}
+
 /// One terminal's emulator state. Owned by exactly one thread (the session's); nothing here blocks.
 pub struct Screen {
-    term: Term<Listener>,
+    term: Term<ScreenListener>,
     listener: Listener,
     sync: SyncDriver,
     projector: Projector,
@@ -290,11 +332,27 @@ pub struct Screen {
 
 impl Screen {
     pub fn new(size: PtySize, colors: TerminalColors) -> Self {
+        Self::new_with_listener(size, colors, ListenerMode::Window)
+    }
+
+    /// A screen that answers terminal queries but never emits host side effects.
+    pub fn headless(size: PtySize, colors: TerminalColors) -> Self {
+        Self::new_with_listener(size, colors, ListenerMode::Headless)
+    }
+
+    fn new_with_listener(size: PtySize, colors: TerminalColors, mode: ListenerMode) -> Self {
         let size = size.clamped();
         let listener = Listener::default();
         let config = term_config();
         let shadows = Shadows::new(usize::from(size.cols), config.kitty_keyboard);
-        let term = Term::new(config, &grid_size(size), listener.clone());
+        let term = Term::new(
+            config,
+            &grid_size(size),
+            ScreenListener {
+                listener: listener.clone(),
+                mode,
+            },
+        );
         let mut projector = Projector::new();
         let frame = projector.full(&term);
         Screen {
@@ -332,12 +390,70 @@ impl Screen {
     /// only the parser keeps. Nothing the replay sets off is owed to the program: its answers, if
     /// any, are dropped.
     pub fn replayed(replay: &ScreenReplay, size: PtySize, colors: TerminalColors) -> Self {
+        Self::replayed_with_listener(replay, size, colors, ListenerMode::Window)
+    }
+
+    pub(crate) fn replayed_headless(replay: &ScreenReplay, size: PtySize, colors: TerminalColors) -> Self {
+        Self::replayed_with_listener(replay, size, colors, ListenerMode::Headless)
+    }
+
+    /// A blank screen that shows a terminal answered elsewhere: it generates no answers to the program's queries.
+    pub fn mirror(size: PtySize, colors: TerminalColors) -> Self {
+        Self::new_with_listener(size, colors, ListenerMode::Mirror)
+    }
+
+    /// [`Screen::replayed`] for a replay that came from another machine and is read as its input: the screen
+    /// generates no answers at all, and the bytes pass the same OSC bounds as live output, one at a time, so a
+    /// replay can hold nothing a program's own output could not. The caller checks the grid size first. What the
+    /// replay sets off on its way (a bell, a clipboard write) is not the host's to act on; the title it leaves, or
+    /// none, is reported as the current title.
+    ///
+    /// Refused (`None`) when the replay ends inside a sequence or its last character is a C0 control.
+    /// Priming REP with ESC would start a new sequence outside the OSC filter.
+    pub fn replayed_untrusted(replay: &ScreenReplay, size: PtySize, colors: TerminalColors) -> Option<Self> {
+        if replay.last_input.is_some_and(|c| c < ' ') {
+            return None;
+        }
         let size = PtySize {
             cols: replay.columns,
             rows: replay.rows,
             ..size
         };
-        let mut screen = Screen::new(size, colors);
+        let mut screen = Screen::new_with_listener(size, colors, ListenerMode::Mirror);
+        for &byte in &replay.bytes {
+            let filtered = screen.osc.byte(byte);
+            screen.sync.feed(
+                &mut Shadowed::new(&mut screen.term, &mut screen.shadows),
+                filtered,
+                |_, _| {},
+            );
+            screen.osc.clear_released();
+        }
+        if !screen.at_boundary() {
+            return None;
+        }
+        screen_replay::finish_apply(&mut screen.term, &mut screen.shadows, &mut screen.sync, replay);
+        let title = screen.take_events().title.unwrap_or(None);
+        screen.listener.0.lock().expect("listener mutex").events.title = Some(title);
+        screen.published_revision = screen.content_revision();
+        screen.published_inert = screen.listener.inert_events();
+        screen.dirty = true;
+        screen.scroll.observe(&screen.term);
+        Some(screen)
+    }
+
+    fn replayed_with_listener(
+        replay: &ScreenReplay,
+        size: PtySize,
+        colors: TerminalColors,
+        mode: ListenerMode,
+    ) -> Self {
+        let size = PtySize {
+            cols: replay.columns,
+            rows: replay.rows,
+            ..size
+        };
+        let mut screen = Screen::new_with_listener(size, colors, mode);
         screen_replay::apply(&mut screen.term, &mut screen.shadows, &mut screen.sync, replay);
         let _ = screen.take_replies();
         screen.published_revision = screen.content_revision();
@@ -428,6 +544,22 @@ impl Screen {
     /// stack is too deep to replay.
     pub fn read_for_move(&mut self) -> Result<ScreenReplay, ReplayRefused> {
         screen_replay::build(&mut self.term, &self.shadows)
+    }
+
+    /// Reads a replay retaining at most the newest `lines` history rows. Consumes the `Term`.
+    pub(crate) fn read_with_history(&mut self, lines: usize) -> Result<ScreenReplay, ReplayRefused> {
+        screen_replay::build_with_history(&mut self.term, &self.shadows, lines)
+    }
+
+    /// Retained primary history after `read_for_move` has exposed that grid. The consumed screen
+    /// is inspected only for this fact, then replaced from its full replay.
+    pub(crate) fn history_lines(&self) -> usize {
+        debug_assert!(!self.term.mode().contains(TermMode::ALT_SCREEN));
+        self.term.grid().history_size()
+    }
+
+    pub(crate) fn history_at_cap(&self) -> bool {
+        self.history_lines() == term_config().scrolling_history
     }
 
     /// Parses one chunk of output. Marks the screen dirty when the chunk reached a publication

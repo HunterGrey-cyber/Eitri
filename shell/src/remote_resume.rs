@@ -1,8 +1,9 @@
 //! A remote window's ssh connection after a suspend or a network change. A master on a path that died with the
 //! network takes a minute to notice, and every channel hangs on it meanwhile, so logind's `PrepareForSleep(false)` on
-//! the system bus and gio's network monitor each run `remote_host::on_resume` for the window's masters: one round
-//! trip through each, and a fresh master for one that fails. That blocks on ssh, so it runs on a worker, never on the
-//! GTK thread; a signal that comes while one runs is folded into one more run after it.
+//! the system bus and gio's network monitor each run `remote_host::on_resume` for the window's masters (the agents'
+//! and, once a terminal started it, the terminals' own): one round trip through each, and a fresh master for one that
+//! fails. That blocks on ssh, so it runs on a worker, never on the GTK thread; a signal that comes while one runs is
+//! folded into one more run after it.
 
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -41,9 +42,15 @@ impl Resume {
         }
     }
 
-    /// The check of `masters`: `on_resume` for each, its outcome logged.
-    pub(crate) fn for_masters(masters: Vec<ControlMaster>) -> Resume {
+    /// The check of `masters`: `on_resume` for each, its outcome logged. The terminals' master joins them once a
+    /// terminal has started it; before that there is nothing of it to check, and nothing here starts it.
+    pub(crate) fn for_masters(
+        masters: Vec<ControlMaster>,
+        terminals: Option<Arc<eitri_core::remote_project::TerminalMaster>>,
+    ) -> Resume {
         Resume::new(move |signal| {
+            let mut masters = masters.clone();
+            masters.extend(terminals.as_ref().and_then(|terminals| terminals.started()));
             for action in eitri_core::remote_host::on_resume(&masters) {
                 eprintln!("[remote] after {signal:?}: {action:?}");
             }

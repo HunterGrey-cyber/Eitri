@@ -45,7 +45,7 @@ impl MutagenEngine {
         }
         let version = String::from_utf8_lossy(&output.stdout).trim().to_owned();
         let parsed = version_tuple(&version)
-            .ok_or_else(|| SyncError::Unsupported(format!("unrecognized Mutagen version: {version}")))?;
+            .ok_or_else(|| SyncError::Engine(format!("unrecognized Mutagen version: {version}")))?;
         if parsed < (0, 18, 0) || parsed == (0, 18, 0) && version.split('+').next().unwrap().contains('-') {
             return Err(SyncError::Unsupported(format!("Mutagen {version} is older than 0.18")));
         }
@@ -129,9 +129,16 @@ impl MutagenEngine {
     }
 
     pub fn session_status(&self, name: &str) -> Result<SessionStatus, SyncError> {
+        self.session_status_within(name, COMMAND_CAP)
+    }
+
+    /// [`Self::session_status`] given up after `cap` (never more than a command's own cap).
+    pub fn session_status_within(&self, name: &str, cap: Duration) -> Result<SessionStatus, SyncError> {
         check_name(name)?;
         let args = words(&["sync", "list", "--template", "{{json .}}", name]);
-        let output = self.run(&args, false)?;
+        let output = self
+            .run_until(&args, deadline_after(cap.min(COMMAND_CAP)), false, false)
+            .map_err(command_error)?;
         let mut sessions = parse_sessions(&output.stdout)?
             .into_iter()
             .filter(|session| session.name == name);
@@ -223,6 +230,10 @@ impl SyncEngine for MutagenEngine {
     }
     fn resume(&self, name: &str) -> Result<(), SyncError> {
         self.operation("resume", name)
+    }
+
+    fn session_status_within(&self, name: &str, cap: Duration) -> Result<SessionStatus, SyncError> {
+        MutagenEngine::session_status_within(self, name, cap)
     }
 
     fn status(&self, labels: &Labels) -> Result<Vec<SessionStatus>, SyncError> {
@@ -383,10 +394,8 @@ pub fn create_args(spec: &SessionSpec) -> Result<Vec<OsString>, SyncError> {
     if spec.staging == StagingMode::Neighboring || spec.role == Role::Tree {
         args.push("--stage-mode-beta=neighboring".into());
     }
+    validate_ignores(&spec.ignores)?;
     for ignore in &spec.ignores {
-        if ignore.contains(['\0', '\n']) {
-            return Err(SyncError::Engine(format!("invalid Mutagen ignore pattern: {ignore:?}")));
-        }
         args.push("-i".into());
         args.push(csv_value(ignore).into());
     }
@@ -514,6 +523,13 @@ pub(super) fn checked_output(
 
 fn check_root_for_labels(root: &Path) -> Result<(), SyncError> {
     Endpoint::Laptop(root.to_owned()).render().map(|_| ())
+}
+
+pub(super) fn validate_ignores(patterns: &[String]) -> Result<(), SyncError> {
+    if let Some(ignore) = patterns.iter().find(|p| p.contains(['\0', '\n'])) {
+        return Err(SyncError::Engine(format!("invalid Mutagen ignore pattern: {ignore:?}")));
+    }
+    Ok(())
 }
 
 fn csv_value(value: &str) -> String {

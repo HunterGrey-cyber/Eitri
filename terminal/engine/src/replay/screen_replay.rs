@@ -76,6 +76,16 @@ enum Route {
 /// Reads `term` (calling `swap_alt` once when the alternate screen is shown: the source `Term` is not used again)
 /// and the shadows into a replay.
 pub fn build<L: EventListener>(term: &mut Term<L>, shadows: &Shadows) -> Result<ScreenReplay, ReplayRefused> {
+    build_with_history(term, shadows, usize::MAX)
+}
+
+/// Builds a replay with only the newest `max_lines` history rows; visible rows are always kept.
+/// Like [`build`], this consumes the source `Term`.
+pub fn build_with_history<L: EventListener>(
+    term: &mut Term<L>,
+    shadows: &Shadows,
+    max_lines: usize,
+) -> Result<ScreenReplay, ReplayRefused> {
     if shadows.too_deep() {
         return Err(ReplayRefused::TooDeep);
     }
@@ -112,6 +122,9 @@ pub fn build<L: EventListener>(term: &mut Term<L>, shadows: &Shadows) -> Result<
         term.swap_alt();
     }
 
+    if max_lines < term.grid().history_size() {
+        term.grid_mut().update_history(max_lines);
+    }
     let grid = term.grid();
     let mut out = Vec::new();
     if !alt && !shadows.keyboard_inactive.is_empty() {
@@ -214,6 +227,17 @@ pub fn apply<L: EventListener>(
     replay: &ScreenReplay,
 ) {
     driver.feed(&mut Shadowed::new(term, shadows), &replay.bytes, |_, _| {});
+    finish_apply(term, shadows, driver, replay);
+}
+
+/// What [`apply`] does once the replay's bytes are fed: the parser left as a fresh one would be, holding only
+/// the replay's last printed character. Shared with a caller that feeds the bytes its own way.
+pub(crate) fn finish_apply<L: EventListener>(
+    term: &mut Term<L>,
+    shadows: &mut Shadows,
+    driver: &mut SyncDriver,
+    replay: &ScreenReplay,
+) {
     // The stream printed characters of its own, which the parser and the shadow now hold for `REP`. A fresh parser
     // holds none, as the source's held none when it never printed (a screen filled by `DECALN`, say); the barrier
     // is kept as it is.

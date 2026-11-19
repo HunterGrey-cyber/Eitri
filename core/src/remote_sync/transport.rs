@@ -179,6 +179,20 @@ fn project_for(store: &RemoteProjects, key: &str) -> io::Result<RemoteProject> {
             {
                 return Err(changed(&project.host));
             }
+            // A daemon restores its sessions on start (after an unclean stop, for another project's window), with no
+            // holder looking: the folder and the replica's `.git` are checked here too, so a session never connects
+            // over a folder that is not the one it synced.
+            if let Some(why) = super::mirror_identity::root_refusal(&sync, &project.host, &project.root) {
+                return Err(io::Error::other(why));
+            }
+            if super::mirror_identity::git_dir_moved(&sync, &project.root) {
+                return Err(io::Error::other(format!(
+                    "the laptop .git in {} is not the one the replica of {} writes into; an Eitri window or eitri \
+                     host sync watch on it stops the replica first",
+                    project.root.display(),
+                    project.host
+                )));
+            }
             return Ok(project);
         }
     }
@@ -267,7 +281,6 @@ mod tests {
 
     const HOST: &str = "example-host";
     const KEY: &str = "SHA256:example";
-    const ROOT: &str = "/srv/project";
     const FAKE: &str = r#"#!/usr/bin/env python3
 import json, os, pathlib, socket, stat, sys
 state = pathlib.Path(os.environ['XDG_STATE_HOME'])
@@ -294,6 +307,8 @@ else:
 
     struct Fixture {
         state: PathBuf,
+        /// The laptop mirror the record names, a real directory whose identity the record keeps.
+        root: PathBuf,
         dest: String,
     }
 
@@ -311,14 +326,17 @@ else:
             }
             let state = base.join(format!("mt-{}", &uuid::Uuid::new_v4().simple().to_string()[..12]));
             fs::DirBuilder::new().mode(0o700).create(&state).unwrap();
-            let dest = format!("eitri-{}", SyncKey::new(KEY, Path::new(ROOT)));
-            let fixture = Self { state, dest };
+            let root = state.join("p");
+            fs::create_dir(&root).unwrap();
+            let dest = format!("eitri-{}", SyncKey::new(KEY, &root));
+            let identity = super::super::mirror_identity::identity(&root).unwrap();
             let project = serde_json::from_value(serde_json::json!({
-                "version": 1, "host": HOST, "host_key_sha256": KEY, "root": ROOT, "created_at": 0,
+                "version": 1, "host": HOST, "host_key_sha256": KEY, "root": root, "created_at": 0,
                 "helper_version": "example", "sync": {"engine": "mutagen", "host_key_sha256": KEY,
-                "tree_session": format!("{}-tree", fixture.dest)}
+                "tree_session": format!("{dest}-tree"), "root_identity": identity}
             }))
             .unwrap();
+            let fixture = Self { state, root, dest };
             RemoteProjects::new(Some(fixture.state.as_os_str()), None)
                 .save(&project)
                 .unwrap();
@@ -503,13 +521,56 @@ else:
     fn transport_skips_an_unreadable_unrelated_sync_record() {
         let fixture = Fixture::new();
         let store = RemoteProjects::new(Some(fixture.state.as_os_str()), None);
-        let project = store.find(Path::new(ROOT)).unwrap().unwrap();
+        let project = store.find(&fixture.root).unwrap().unwrap();
         let mut unrelated = project.clone();
         unrelated.root = PathBuf::from("/srv/earlier");
         unrelated.sync = Some(serde_json::json!({"engine": 42}));
         store.save(&unrelated).unwrap();
         let key = fixture.dest.strip_prefix("eitri-").unwrap();
         assert_eq!(project_for(&store, key).unwrap(), project);
+    }
+
+    /// A daemon that restores a session nobody follows (after an unclean stop) cannot sync it over a folder that is not
+    /// the one the record names: the transport refuses before any master or channel starts.
+    #[test]
+    fn transport_refuses_a_session_whose_folder_was_replaced() {
+        let fixture = Fixture::new();
+        fs::rename(&fixture.root, fixture.state.join("aside")).unwrap();
+        fs::create_dir(&fixture.root).unwrap();
+        let output = fixture.run("ssh", &[&fixture.dest, "cmd"], KEY);
+        assert_eq!(output.status.code(), Some(255));
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains("is not the copy Eitri synced"), "{stderr}");
+        assert!(!fixture.state.join("master").exists());
+        assert!(!fixture.state.join("channel").exists());
+    }
+
+    /// The replica's `.git` is checked as the folder is: a session of a record whose `.git` is no longer the one its
+    /// replica writes into does not connect.
+    #[test]
+    fn transport_refuses_while_the_replicas_git_dir_is_not_the_recorded_one() {
+        let fixture = Fixture::new();
+        let store = RemoteProjects::new(Some(fixture.state.as_os_str()), None);
+        let git_dir = fixture.root.join(".git");
+        fs::create_dir(&git_dir).unwrap();
+        store
+            .update(&fixture.root, |project| {
+                let mut record = project.sync_record().unwrap().unwrap();
+                record.git_session = Some(format!("{}-git", fixture.dest));
+                record.git_identity = super::super::mirror_identity::identity(&git_dir);
+                project.set_sync_record(&record);
+            })
+            .unwrap();
+        let ok = fixture.run("ssh", &[&fixture.dest, "cmd"], KEY);
+        assert!(ok.status.success(), "{}", String::from_utf8_lossy(&ok.stderr));
+        fs::remove_file(fixture.state.join("channel")).unwrap();
+        fs::rename(&git_dir, fixture.state.join("aside-git")).unwrap();
+        fs::create_dir(&git_dir).unwrap();
+        let output = fixture.run("ssh", &[&fixture.dest, "cmd"], KEY);
+        assert_eq!(output.status.code(), Some(255));
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains("is not the one the replica"), "{stderr}");
+        assert!(!fixture.state.join("channel").exists());
     }
 
     #[test]

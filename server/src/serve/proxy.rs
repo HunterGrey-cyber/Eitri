@@ -1,5 +1,6 @@
 use std::convert::Infallible;
 use std::future::Future;
+use std::path::Path;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
@@ -15,7 +16,6 @@ use tonic::Status;
 use tower_service::Service;
 
 use super::Serving;
-use crate::run_dir::Paths;
 
 pub(super) const SERVICE: &str = "verdandi.claude.runtime.v1.RuntimeService";
 
@@ -41,7 +41,7 @@ impl Service<http::Request<Body>> for Proxy {
             if let Some(activity) = request.extensions().get::<Arc<std::sync::atomic::AtomicBool>>() {
                 activity.store(true, std::sync::atomic::Ordering::Relaxed);
             }
-            let response = tokio::spawn(route(serving, request)).await;
+            let response = tokio::spawn(route(serving, request, connect)).await;
             Ok(match response {
                 Ok(Ok(response)) => response,
                 Ok(Err(status)) => status.into_http(),
@@ -51,7 +51,14 @@ impl Service<http::Request<Body>> for Proxy {
     }
 }
 
-async fn route(serving: Arc<Serving>, request: http::Request<Body>) -> Result<http::Response<Body>, Status> {
+async fn route<S>(
+    serving: Arc<Serving>,
+    request: http::Request<Body>,
+    connect: impl AsyncFnOnce(&Path, u32) -> Result<S, Status>,
+) -> Result<http::Response<Body>, Status>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
     let sidecar = request
         .headers()
         .get(eitri_server_proto::SIDECAR_METADATA)
@@ -65,7 +72,7 @@ async fn route(serving: Arc<Serving>, request: http::Request<Body>) -> Result<ht
     }
     let info = serving.sidecar(&sidecar)?;
     let create = method == "CreateSession";
-    let response = forward(connect(&serving.paths, &info), request).await?;
+    let response = forward(connect(&info.socket, info.pid), request).await?;
     if !create {
         return Ok(response.map(Body::new));
     }
@@ -173,15 +180,10 @@ pub(super) async fn within_connect_timeout<T>(setup: impl Future<Output = Result
         .unwrap_or_else(|_| Err(Status::unavailable("the sidecar did not accept a connection in time")))
 }
 
-pub(super) async fn connect(
-    paths: &Paths,
-    info: &eitri_server_proto::SidecarInfo,
-) -> Result<tokio::net::UnixStream, Status> {
-    let socket =
-        agent::socket_path::in_dir(&paths.run, &format!("sc-{}.sock", info.sidecar_id)).map_err(unavailable)?;
+pub(super) async fn connect(socket: &Path, pid: u32) -> Result<tokio::net::UnixStream, Status> {
     let stream = tokio::net::UnixStream::connect(socket).await.map_err(unavailable)?;
     crate::peer::check(&stream).map_err(unavailable)?;
-    if stream.peer_cred().map_err(unavailable)?.pid() != Some(info.pid as i32) {
+    if stream.peer_cred().map_err(unavailable)?.pid() != Some(pid as i32) {
         return Err(Status::unavailable("sidecar socket peer pid differs"));
     }
     Ok(stream)
@@ -223,6 +225,80 @@ impl Decoder for RawDecoder {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn proxy_reaches_an_adopted_sidecar_in_the_ordinary_run_directory() {
+        use crate::daemon::sidecars::{self, Record, Sidecars};
+        use crate::run_dir::Paths;
+
+        let root = super::super::scratch("proxy");
+        let state = root.join("s".repeat(48 - root.as_os_str().len() - 1));
+        let paths = Paths::new("1", &root.join("d"), &state, &root).unwrap();
+        paths.prepare().unwrap();
+        let ordinary = paths.metadata_run();
+        assert_ne!(paths.run, ordinary);
+        let id = "0123456789abcdef";
+        let socket = agent::socket_path::in_dir(&ordinary, &format!("sc-{id}.sock")).unwrap();
+        let pid = std::process::id();
+        let record = Record {
+            pid,
+            start_time: sidecars::start_time(pid).unwrap(),
+            socket: socket.clone(),
+            sidecar_id: id.into(),
+            root: "/srv/project".into(),
+            account: String::new(),
+            command_id: "start-sidecar".into(),
+            started_unix_ms: crate::run_dir::unix_ms(),
+            ready: true,
+            failure: None,
+            exited_unix_ms: None,
+        };
+        agent::private_fs::write_private(
+            &ordinary.join(format!("sc-{id}.pid")),
+            &serde_json::to_vec(&record).unwrap(),
+        )
+        .unwrap();
+        let sidecars = Arc::new(Sidecars::new(paths.clone()).unwrap());
+        sidecars
+            .refresh_handshakes_with(async |path, peer_pid| {
+                assert_eq!((path, peer_pid), (socket.as_path(), pid));
+                Ok(())
+            })
+            .await;
+        assert!(sidecars.list().sidecars[0].handshake);
+
+        let (stream, peer) = tokio::io::duplex(64 * 1024);
+        let fake = tokio::spawn(async move {
+            let service = hyper::service::service_fn(|_| async {
+                let response = http::Response::builder()
+                    .header("grpc-status", "0")
+                    .body(Body::empty())
+                    .unwrap();
+                Ok::<_, Infallible>(response)
+            });
+            let _ = hyper::server::conn::http2::Builder::new(hyper_util::rt::TokioExecutor::new())
+                .serve_connection(hyper_util::rt::TokioIo::new(peer), service)
+                .await;
+        });
+        let request = http::Request::builder()
+            .method(http::Method::POST)
+            .uri(format!("http://localhost/{SERVICE}/Handshake"))
+            .header(eitri_server_proto::SIDECAR_METADATA, id)
+            .body(Body::empty())
+            .unwrap();
+        let response = route(Serving::new(paths, sidecars), request, async |path, peer_pid| {
+            if (path, peer_pid) != (socket.as_path(), pid) {
+                return Err(Status::unavailable("wrong sidecar socket or pid"));
+            }
+            Ok(stream)
+        })
+        .await;
+        fake.abort();
+        std::fs::remove_dir_all(root).unwrap();
+
+        assert_eq!(response.unwrap().headers()["grpc-status"], "0");
+    }
+
     #[tokio::test]
     async fn a_healthy_unary_handler_can_take_longer_than_connection_setup() {
         let (stream, peer) = tokio::io::duplex(64 * 1024);

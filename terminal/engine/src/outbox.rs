@@ -6,8 +6,8 @@
 //! reads the answers -- `yes $'\e[6n'` -- fills the tty's input buffer, after which every write
 //! gets `EAGAIN`; a single queue then grows by an answer per question, at the rate the program
 //! can print, until the whole IDE runs out of memory. So:
-//! - **input is never dropped**: it is what the user typed or pasted, and it is bounded by what a
-//!   person can type or a clipboard holds;
+//! - **input is retained until written or explicitly discarded**: it is what the user typed or
+//!   pasted; a remote attachment discards its pending input when its stream ends;
 //! - **answers are capped** at [`REPLY_CAP`] bytes pending; beyond it they are dropped and counted.
 //!   An answer nobody reads is worth nothing, and xterm and foot answer on a best-effort basis too;
 //! - **input goes first**, so a backlog of answers never delays a key. The one exception is an
@@ -43,6 +43,7 @@ pub struct Outbox {
     reply_bytes: usize,
     dropped: u64,
     high_water: usize,
+    input_written: u64,
 }
 
 impl Outbox {
@@ -54,6 +55,16 @@ impl Outbox {
     pub fn push_input(&mut self, bytes: &[u8]) {
         self.input.extend(bytes);
         self.note_len();
+    }
+
+    /// Total user-input bytes accepted by the PTY, excluding terminal replies.
+    pub fn input_written(&self) -> u64 {
+        self.input_written
+    }
+
+    /// Drops only input that has not reached the PTY. A partially written reply still finishes.
+    pub fn discard_input(&mut self) {
+        self.input.clear();
     }
 
     /// Queues answers to the program, as one unit. `false`: dropped, because the answers already
@@ -106,6 +117,7 @@ impl Outbox {
                 Ok(0) => return Flushed::Blocked,
                 Ok(n) if from_input => {
                     self.input.drain(..n);
+                    self.input_written += n as u64;
                 }
                 Ok(n) => {
                     self.reply_written += n;
@@ -156,6 +168,26 @@ impl Outbox {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn discard_preserves_replies_and_counts_only_partial_input_writes() {
+        let mut out = Outbox::new();
+        out.push_reply(b"reply".to_vec());
+        let mut kernel = Kernel::new(2, 2);
+        out.flush(|b| kernel.write(b));
+        out.push_input(b"stale");
+        out.discard_input();
+        out.push_input(b"new");
+        kernel.room = 6;
+        out.flush(|b| kernel.write(b));
+        assert_eq!(kernel.taken, b"replyn");
+        assert_eq!(out.input_written(), 1);
+        out.discard_input();
+        kernel.room = 100;
+        out.flush(|b| kernel.write(b));
+        assert_eq!(kernel.taken, b"replyn");
+        assert_eq!(out.input_written(), 1);
+    }
 
     /// A kernel that takes at most `room` bytes in all, `per_write` at a time.
     struct Kernel {

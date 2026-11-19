@@ -25,11 +25,10 @@ pub const CHUNK_BYTES: usize = 64 * 1024;
 pub const MAX_WAIT_MS: u64 = 10_000;
 /// The most entries one ListTree or PathSizes call looks at, whatever budget it asks for.
 pub const MAX_BUDGET: u64 = 4 * 1024 * 1024;
-/// The longest a ListTree or PathSizes call may take, a laptop that stops reading included: a walk never holds a
-/// blocking thread longer than this.
-pub const LIST_DEADLINE: std::time::Duration = std::time::Duration::from_secs(300);
+/// ListTree and PathSizes check this budget between filesystem operations and while streaming.
+pub const LIST_DEADLINE: std::time::Duration = eitri_server_proto::SYNC_STREAM_DEADLINE;
 /// The longest a ReadFile call may take, a laptop that stops reading included.
-pub const READ_DEADLINE: std::time::Duration = std::time::Duration::from_secs(300);
+pub const READ_DEADLINE: std::time::Duration = eitri_server_proto::SYNC_STREAM_DEADLINE;
 /// The longest ReplaceFileIf and RemoveFileIf take to say what is there now in a refusal; a file still being hashed
 /// then is reported as `unfinished`.
 pub const FACT_DEADLINE: std::time::Duration = std::time::Duration::from_secs(10);

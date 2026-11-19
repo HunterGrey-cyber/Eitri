@@ -1,4 +1,5 @@
 use std::io;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -68,14 +69,14 @@ pub(super) fn recover(journal: &Journal, pending: &mut Pending) -> io::Result<bo
 }
 
 /// Follows one session until it closes or cannot continue.
-pub(super) async fn run(paths: Paths, info: eitri_server_proto::SidecarInfo, session: SharedSession, live: Live) {
+pub(super) async fn run(paths: Paths, socket: PathBuf, pid: u32, session: SharedSession, live: Live) {
     let mut start = Start::AfterHead;
     let mut retry = RETRY_FIRST;
     let mut failing = Failing::default();
     loop {
         let mut delivered = false;
         let mut refused = false;
-        let result = watch(&paths, &info, &session, start, &mut delivered, &mut failing).await;
+        let result = watch(&paths, &socket, pid, &session, start, &mut delivered, &mut failing).await;
         let shared = session.clone();
         if blocking(move || Ok(shared.lock().expect("session").closed))
             .await
@@ -150,7 +151,8 @@ struct Failing {
 
 async fn watch(
     paths: &Paths,
-    info: &eitri_server_proto::SidecarInfo,
+    socket: &Path,
+    pid: u32,
     session: &SharedSession,
     start: Start,
     delivered: &mut bool,
@@ -163,7 +165,7 @@ async fn watch(
     })
     .await?;
     let mut events = proxy::within_connect_timeout(async {
-        let stream = proxy::connect(paths, info).await?;
+        let stream = proxy::connect(socket, pid).await?;
         let mut stream = Some(stream);
         let channel = tonic::transport::Endpoint::from_static("http://localhost")
             .connect_with_connector(tower::service_fn(move |_| {
@@ -459,7 +461,15 @@ mod tests {
     }
 
     fn follow(sidecar: &FakeSidecar, session: &SharedSession, live: Live) -> tokio::task::JoinHandle<()> {
-        tokio::spawn(run(sidecar.paths.clone(), sidecar.info.clone(), session.clone(), live))
+        let name = format!("sc-{}.sock", sidecar.info.sidecar_id);
+        let socket = agent::socket_path::in_dir(&sidecar.paths.run, &name).unwrap();
+        tokio::spawn(run(
+            sidecar.paths.clone(),
+            socket,
+            sidecar.info.pid,
+            session.clone(),
+            live,
+        ))
     }
 
     fn running() -> Live {

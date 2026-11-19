@@ -78,6 +78,10 @@ mod module_grid;
 #[allow(dead_code, unused_imports)]
 #[path = "../src/terminal/mod.rs"]
 mod terminal;
+// The terminal pane asks whether a close began with a termination signal.
+#[allow(dead_code, unused_imports)]
+#[path = "../src/end_signals.rs"]
+mod end_signals;
 #[allow(dead_code, unused_imports)]
 #[path = "../src/text_size.rs"]
 mod text_size;

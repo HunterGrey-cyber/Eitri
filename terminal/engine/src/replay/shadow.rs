@@ -245,10 +245,10 @@ impl<H: Handler + ShadowTarget> Handler for Shadowed<'_, H> {
     fn push_keyboard_mode(&mut self, a0: KeyboardModes) {
         if self.shadows.kitty_keyboard {
             if self.shadows.keyboard_active.len() >= KEYBOARD_STACK_MAX {
-                // The pinned emulator removes a title here, and panics if none exists.
-                // Dropping the call leaves both keyboard stacks and the active mode unchanged.
-                if self.shadows.title_stack.is_empty() { return; }
-                self.shadows.title_stack.remove(0);
+                // At the depth limit the pinned emulator removes a saved title instead of an old mode (and panics
+                // with none saved), so its keyboard stack would grow for as long as titles are saved between
+                // pushes. Dropping the call keeps both keyboard stacks, the titles and the active mode unchanged.
+                return;
             }
             self.shadows.keyboard_active.push(a0);
         }
@@ -419,7 +419,7 @@ mod tests {
     }
 
     #[test]
-    fn a_keyboard_push_past_the_depth_limit_drops_the_oldest_title_as_alacritty_does() {
+    fn a_keyboard_push_past_the_depth_limit_is_dropped_and_keeps_the_titles() {
         let (mut t, mut s, mut d) = setup(80, 24);
         feed(&mut t, &mut s, &mut d, b"\x1b]2;a\x07\x1b[22t\x1b]2;b\x07\x1b[22t");
         for _ in 0..KEYBOARD_STACK_MAX {
@@ -428,7 +428,23 @@ mod tests {
         assert!(s.too_deep());
         assert_eq!(s.title_stack, vec![Some("a".into()), Some("b".into())]);
         feed(&mut t, &mut s, &mut d, b"\x1b[>1u");
-        assert_eq!(s.title_stack, vec![Some("b".into())]);
+        assert_eq!(s.title_stack, vec![Some("a".into()), Some("b".into())]);
+        assert_eq!(s.keyboard_active.len(), KEYBOARD_STACK_MAX);
+    }
+
+    #[test]
+    fn saving_a_title_before_every_push_cannot_grow_the_keyboard_stack() {
+        let (mut t, mut s, mut d) = setup(80, 24);
+        for _ in 0..KEYBOARD_STACK_MAX {
+            feed(&mut t, &mut s, &mut d, b"\x1b[>1u");
+        }
+        for _ in 0..1000 {
+            feed(&mut t, &mut s, &mut d, b"\x1b[22;0t\x1b[>1u");
+        }
+        assert_eq!(s.keyboard_active.len(), KEYBOARD_STACK_MAX);
+        // The emulator's own stack is checked through what it reports: popping the whole limit leaves no mode.
+        feed(&mut t, &mut s, &mut d, b"\x1b[<4096u");
+        assert!(s.keyboard_active.is_empty());
     }
 
     #[test]

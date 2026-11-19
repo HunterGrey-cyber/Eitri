@@ -1814,6 +1814,9 @@ pub struct Evicted {
 /// through `apply` ([`AgentSessionProjection::adopt`]).
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct AgentSessionProjection {
+    /// First row revision of the current conversation, retained when a UI drain overflows.
+    #[serde(skip)]
+    pub last_reset_revision: u64,
     pub evicted: Option<Evicted>,
     pub session_id: Option<String>,
     /// The real Claude CLI session UUID -- for the legacy backend this is identical to

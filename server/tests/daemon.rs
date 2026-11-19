@@ -43,8 +43,8 @@ struct Sandbox {
 impl Sandbox {
     fn new() -> Self {
         static SERIAL: AtomicU32 = AtomicU32::new(0);
-        let root = std::env::temp_dir().join(format!(
-            "d{:x}-{:x}",
+        let root = PathBuf::from(format!(
+            "/tmp/d{:x}-{:x}",
             std::process::id(),
             SERIAL.fetch_add(1, Ordering::Relaxed)
         ));
@@ -52,14 +52,12 @@ impl Sandbox {
         Self { root }
     }
 
+    fn temp(&self) -> PathBuf {
+        self.root.join("r")
+    }
+
     fn paths(&self) -> run_dir::Paths {
-        run_dir::Paths::new(
-            VERSION,
-            &self.root.join("d"),
-            &self.root.join("s"),
-            &std::env::temp_dir(),
-        )
-        .unwrap()
+        run_dir::Paths::new(VERSION, &self.root.join("d"), &self.root.join("s"), &self.temp()).unwrap()
     }
 
     fn command(&self) -> Command {
@@ -73,7 +71,8 @@ impl Sandbox {
             .env("HOME", &self.root)
             .env("XDG_DATA_HOME", self.root.join("d"))
             .env("XDG_STATE_HOME", self.root.join("s"))
-            .env("XDG_RUNTIME_DIR", self.root.join("r"))
+            .env("XDG_RUNTIME_DIR", self.temp())
+            .env("TMPDIR", self.temp())
             .env_remove("DISPLAY")
             .env_remove("WAYLAND_DISPLAY")
             .env_remove("DBUS_SESSION_BUS_ADDRESS")
@@ -98,12 +97,7 @@ impl Sandbox {
 
 impl Drop for Sandbox {
     fn drop(&mut self) {
-        if let Ok(paths) = run_dir::Paths::new(
-            VERSION,
-            &self.root.join("d"),
-            &self.root.join("s"),
-            &std::env::temp_dir(),
-        ) {
+        if let Ok(paths) = run_dir::Paths::new(VERSION, &self.root.join("d"), &self.root.join("s"), &self.temp()) {
             if let Ok(info) = paths.published().map(|published| published.info) {
                 let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, info.pid as libc::pid_t, 0) };
                 if fd >= 0 {
@@ -337,12 +331,13 @@ fn long_home_falls_back_to_a_private_tmp_run_dir() {
         VERSION,
         &home.join(".local/share"),
         &home.join(".local/state"),
-        &std::env::temp_dir(),
+        &sandbox.temp(),
     )
     .unwrap();
     assert_eq!(
         paths.run,
-        std::env::temp_dir()
+        sandbox
+            .temp()
             .join(format!("eitri-server-{}", private_fs::euid()))
             .join(VERSION)
     );
@@ -390,13 +385,7 @@ fn long_home_falls_back_to_a_private_tmp_run_dir() {
 fn list_daemons_reports_only_live_answering_daemons() {
     let sandbox = Sandbox::new();
     let _daemon = sandbox.start(60);
-    let stale = run_dir::Paths::new(
-        "old",
-        &sandbox.root.join("d"),
-        &sandbox.root.join("s"),
-        &std::env::temp_dir(),
-    )
-    .unwrap();
+    let stale = run_dir::Paths::new("old", &sandbox.root.join("d"), &sandbox.root.join("s"), &sandbox.temp()).unwrap();
     write_info(&stale, std::process::id());
     let output = sandbox.command().arg("list-daemons").output().unwrap();
     assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
@@ -424,7 +413,7 @@ fn connect_reaches_another_versions_daemon() {
         "older",
         &sandbox.root.join("d"),
         &sandbox.root.join("s"),
-        &std::env::temp_dir(),
+        &sandbox.temp(),
     )
     .unwrap();
     paths.prepare().unwrap();
@@ -537,7 +526,7 @@ fn stop_daemon_stops_a_daemon_installed_as(name: &str, legacy: bool) {
         &run_dir::run_key_of(name),
         &sandbox.root.join("d"),
         &sandbox.root.join("s"),
-        &std::env::temp_dir(),
+        &sandbox.temp(),
     )
     .unwrap();
     let bin = paths.data.join(name).join("bin");

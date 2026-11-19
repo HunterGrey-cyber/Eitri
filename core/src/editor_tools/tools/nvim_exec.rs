@@ -204,6 +204,7 @@ impl PendingExec {
 /// A person's approval of one call's exact text. Not `Clone`, no public field, and `from_card` is its one
 /// constructor, private to this file.
 pub struct ApprovalRecord {
+    observe_saves: bool,
     tab: u64,
     call: String,
     kind: ExecKind,
@@ -222,6 +223,7 @@ impl ApprovalRecord {
         answer: CardAnswer,
         tab: u64,
         call: &str,
+        observe_saves: bool,
     ) -> Result<ApprovalRecord, ExecRefused> {
         if !answer.allowed() {
             return Err(ExecRefused::NotAllowed);
@@ -241,6 +243,7 @@ impl ApprovalRecord {
             return Err(ExecRefused::OtherText);
         }
         Ok(ApprovalRecord {
+            observe_saves,
             tab,
             call: pending.call,
             kind: pending.kind,
@@ -325,13 +328,14 @@ pub fn send(rpc: &dyn EditorRpc, stamp: &Stamp, slot: &ExecSlot) -> Pending {
 }
 
 fn exec_args(stamp: &Stamp, record: ApprovalRecord) -> Vec<Value> {
-    vec![
-        stamp.to_value(),
-        Value::Map(vec![
-            (Value::from("kind"), Value::from(record.kind.word())),
-            (Value::from("code"), Value::from(record.code)),
-        ]),
-    ]
+    let mut args = vec![
+        (Value::from("kind"), Value::from(record.kind.word())),
+        (Value::from("code"), Value::from(record.code)),
+    ];
+    if record.observe_saves {
+        args.push(("observe_saves".into(), true.into()));
+    }
+    vec![stamp.to_value(), Value::Map(args)]
 }
 
 /// What the chunk said of a text it ran.
@@ -449,6 +453,7 @@ enum Stage {
     Asking { kind: ExecKind, code: String, why: String },
     OnCard(PendingExec),
     Called,
+    Confirming(std::sync::mpsc::Receiver<ToolResult>),
     Over,
 }
 
@@ -519,7 +524,8 @@ impl ExecRun {
     }
 
     fn run_approved(&mut self, pending: PendingExec, answer: CardAnswer, cx: &ToolCx<'_>) -> Step {
-        let record = match ApprovalRecord::from_card(pending, answer, cx.tab, cx.call) {
+        let observe_saves = cx.memory.with(cx.tab, |m| m.write_hold.is_some());
+        let record = match ApprovalRecord::from_card(pending, answer, cx.tab, cx.call, observe_saves) {
             Ok(record) => record,
             Err(refused) => return failure(refused.sentence()),
         };
@@ -539,7 +545,64 @@ impl ToolRun for ExecRun {
         match (std::mem::replace(&mut self.stage, Stage::Over), event) {
             (Stage::Asking { kind, code, why }, StepEvent::Start) => self.ask(kind, code, why, cx),
             (Stage::OnCard(pending), StepEvent::Card(answer)) => self.run_approved(pending, answer, cx),
-            (Stage::Called, StepEvent::Answer(reply)) => told(reply),
+            (Stage::Called, StepEvent::Answer(reply)) => {
+                let Some(hold) = cx.memory.with(cx.tab, |m| m.write_hold.clone()) else {
+                    return told(reply);
+                };
+                let Ok(value) = &reply else { return told(reply) };
+                let saves = field(value, "saves");
+                if matches!(saves, Some(Value::Map(entries)) if entries.is_empty())
+                    || (saves.is_none() && field(value, "failed").is_some())
+                {
+                    return told(reply);
+                }
+                let Some(saved) = saves.and_then(Value::as_array) else {
+                    return failure("the editor could not report which files the command saved");
+                };
+                let paths: Option<Vec<_>> = saved
+                    .iter()
+                    .map(|name| Some(std::path::PathBuf::from(name.as_str()?)))
+                    .collect();
+                let Some(paths) = paths else {
+                    return failure("the editor returned an unreadable saved path");
+                };
+                if paths.is_empty() {
+                    return told(reply);
+                }
+                let root = cx.root.to_owned();
+                let Step::Done(mut answer) = told(reply) else {
+                    unreachable!()
+                };
+                self.stage = Stage::Confirming(super::lsp::worker(move || {
+                    let confirmed = root
+                        .canonicalize()
+                        .map_err(|error| format!("could not resolve the project root: {error}"))
+                        .and_then(|root| {
+                            let rels: Vec<_> = paths
+                                .iter()
+                                .map(|path| path.strip_prefix(&root).unwrap_or(path).to_owned())
+                                .collect();
+                            hold.confirm(&root, &rels)
+                        });
+                    if let Err(error) = confirmed {
+                        answer.is_error = true;
+                        if !answer.text.is_empty() {
+                            answer.text.push('\n');
+                        }
+                        answer.text.push_str(&error);
+                    }
+                    answer
+                }));
+                Step::PollAfter(Duration::from_millis(20))
+            }
+            (Stage::Confirming(receiver), StepEvent::Poll) => match receiver.try_recv() {
+                Ok(answer) => Step::Done(answer),
+                Err(std::sync::mpsc::TryRecvError::Empty) => {
+                    self.stage = Stage::Confirming(receiver);
+                    Step::PollAfter(Duration::from_millis(20))
+                }
+                Err(_) => failure("the worker confirming the editor’s saved files stopped"),
+            },
             _ => failure("the call was out of step; nothing more runs"),
         }
     }
@@ -692,7 +755,7 @@ mod tests {
     /// A record of `code`, through a card raised for it and answered with a key.
     fn approved(kind: ExecKind, code: &str) -> ApprovalRecord {
         let answer = allow(card_bound_to(kind, code));
-        match ApprovalRecord::from_card(pending(kind, code), answer, TAB, CALL) {
+        match ApprovalRecord::from_card(pending(kind, code), answer, TAB, CALL, false) {
             Ok(record) => record,
             Err(refused) => panic!("a matching card was refused: {refused:?}"),
         }
@@ -882,35 +945,35 @@ mod tests {
     fn a_deny_records_nothing() {
         let request = card_bound_to(ExecKind::Lua, "return 1");
         let answer = answer_to(request, CardDecision::Deny, CardOrigin::Key, CALL);
-        let result = ApprovalRecord::from_card(pending(ExecKind::Lua, "return 1"), answer, TAB, CALL);
+        let result = ApprovalRecord::from_card(pending(ExecKind::Lua, "return 1"), answer, TAB, CALL, false);
         assert_eq!(refusal(result), ExecRefused::NotAllowed);
     }
 
     #[test]
     fn a_wrong_hash_is_refused() {
         let answer = allow(card_bound_to(ExecKind::Lua, "return 1"));
-        let result = ApprovalRecord::from_card(pending(ExecKind::Lua, "return 2"), answer, TAB, CALL);
+        let result = ApprovalRecord::from_card(pending(ExecKind::Lua, "return 2"), answer, TAB, CALL, false);
         assert_eq!(refusal(result), ExecRefused::OtherText);
     }
 
     #[test]
     fn a_card_with_no_binding_is_refused() {
         let answer = allow(CardRequest::new("Run this in your editor?", vec![]));
-        let result = ApprovalRecord::from_card(pending(ExecKind::Lua, "return 1"), answer, TAB, CALL);
+        let result = ApprovalRecord::from_card(pending(ExecKind::Lua, "return 1"), answer, TAB, CALL, false);
         assert_eq!(refusal(result), ExecRefused::OtherText);
     }
 
     #[test]
     fn a_changed_kind_is_refused() {
         let answer = allow(card_bound_to(ExecKind::Lua, "echo 1"));
-        let result = ApprovalRecord::from_card(pending(ExecKind::Ex, "echo 1"), answer, TAB, CALL);
+        let result = ApprovalRecord::from_card(pending(ExecKind::Ex, "echo 1"), answer, TAB, CALL, false);
         assert_eq!(refusal(result), ExecRefused::OtherText);
     }
 
     #[test]
     fn another_tab_is_refused() {
         let answer = allow(card_bound_to(ExecKind::Lua, "return 1"));
-        let result = ApprovalRecord::from_card(pending(ExecKind::Lua, "return 1"), answer, TAB + 1, CALL);
+        let result = ApprovalRecord::from_card(pending(ExecKind::Lua, "return 1"), answer, TAB + 1, CALL, false);
         assert_eq!(refusal(result), ExecRefused::OtherTab);
     }
 
@@ -920,14 +983,14 @@ mod tests {
         let bound = || card_bound_to(ExecKind::Lua, code);
 
         let answer = answer_to(bound(), CardDecision::Allow, CardOrigin::Key, "call-2");
-        let result = ApprovalRecord::from_card(pending(ExecKind::Lua, code), answer, TAB, CALL);
+        let result = ApprovalRecord::from_card(pending(ExecKind::Lua, code), answer, TAB, CALL, false);
         assert_eq!(refusal(result), ExecRefused::OtherCall, "the answer is another call's");
 
-        let result = ApprovalRecord::from_card(pending(ExecKind::Lua, code), allow(bound()), TAB, "call-2");
+        let result = ApprovalRecord::from_card(pending(ExecKind::Lua, code), allow(bound()), TAB, "call-2", false);
         assert_eq!(refusal(result), ExecRefused::OtherCall, "the run is another call's");
 
         let elsewhere = PendingExec::new(TAB, "call-2", ExecKind::Lua, code.to_owned());
-        let result = ApprovalRecord::from_card(elsewhere, allow(bound()), TAB, CALL);
+        let result = ApprovalRecord::from_card(elsewhere, allow(bound()), TAB, CALL, false);
         assert_eq!(refusal(result), ExecRefused::OtherCall, "the text is another call's");
     }
 
@@ -936,7 +999,7 @@ mod tests {
         for origin in [CardOrigin::Key, CardOrigin::Click] {
             let code = "return 1";
             let answer = answer_to(card_bound_to(ExecKind::Lua, code), CardDecision::Allow, origin, CALL);
-            let record = ApprovalRecord::from_card(pending(ExecKind::Lua, code), answer, TAB, CALL);
+            let record = ApprovalRecord::from_card(pending(ExecKind::Lua, code), answer, TAB, CALL, false);
             let Ok(record) = record else {
                 panic!("a matching card was refused");
             };
@@ -1880,6 +1943,77 @@ mod tests {
             map.iter()
                 .any(|(key, value)| key.as_str() == Some("expired") && *value == Value::from(true))
         })
+    }
+
+    #[test]
+    #[ignore = "needs nvim on PATH"]
+    fn observed_saves_check_only_included_project_files_with_the_server() {
+        use crate::remote_sync::{flush::EditorWriteHold, recreate::write_created_patterns};
+        use agent::remote_client::{WaitFileHashRequest, WaitFileHashResponse};
+        use std::sync::{Arc, Mutex};
+
+        let mut nvim = Nvim::start("save-hold");
+        let project = nvim.dir.join("project");
+        let alias = nvim.dir.join("alias");
+        std::fs::create_dir_all(project.join(".git")).unwrap();
+        std::fs::create_dir_all(project.join(".hg")).unwrap();
+        std::os::unix::fs::symlink(&project, &alias).unwrap();
+        write_created_patterns(&nvim.dir, &[]).unwrap();
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let seen = requests.clone();
+        let connection = move |request: WaitFileHashRequest| {
+            seen.lock().unwrap().push(request);
+            Ok(WaitFileHashResponse {
+                matched: true,
+                ..Default::default()
+            })
+        };
+        let memory = Memory::default();
+        memory.with(TAB, |m| {
+            m.write_hold = Some(EditorWriteHold {
+                connection: Some(Arc::new(connection)),
+                host: "example-host".into(),
+                sync_dir: Some(nvim.dir.clone()),
+            })
+        });
+        let cx = ToolCx {
+            root: &alias,
+            ..exec_cx(&memory)
+        };
+        let code = "vim.cmd('edit alias/a'); vim.api.nvim_buf_set_lines(0,0,-1,false,{'saved'}); vim.cmd('write'); vim.cmd('write alias/.git/config'); vim.cmd('write alias/.hg/state'); vim.cmd('write outside')";
+        let steps = drive_with_cards(
+            begun(&lua(code), &cx),
+            &cx,
+            |call| {
+                let EditorCall::Exec(slot) = call else {
+                    panic!("expected the approved command")
+                };
+                let rpc = Recording::default();
+                let _ = send(
+                    &rpc,
+                    &Stamp {
+                        deadline_ms: wall_ms() + FAR_MS,
+                        ..stamp()
+                    },
+                    slot,
+                );
+                let (chunk, args) = rpc.0.borrow_mut().pop().unwrap();
+                Ok(nvim.embed.lua(chunk, args))
+            },
+            |_| (CardDecision::Allow, CardOrigin::Click),
+        );
+        let result = result_of(&steps);
+        assert!(result.is_error, "{result:?}");
+        assert!(
+            result.text.contains("outside is outside the project and is not synced"),
+            "{result:?}"
+        );
+        assert!(result.text.contains(".git/config is excluded from sync"), "{result:?}");
+        assert!(result.text.contains(".hg/state is excluded from sync"), "{result:?}");
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].rel, "a");
+        assert_eq!(requests[0].sha256, crate::remote_sync::conflicts::hash(b"saved\n"));
     }
 
     #[test]

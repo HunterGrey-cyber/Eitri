@@ -1,20 +1,133 @@
 //! Whether a terminal's shell is running a job, for the questions a window close and the last
-//! module's kill ask. A terminal has a job when the foreground process group of its shell's
+//! module's kill ask. A local terminal has a job when the foreground process group of its shell's
 //! controlling terminal is set and is not the shell's own group: the shell has handed the terminal
 //! to a command (`sleep 600`, `vim`, a build). A job started with `&` at a prompt leaves the
 //! terminal with the shell, so it does not count, as in foot and GNOME Terminal; brought back with
 //! `fg`, it does.
 //!
-//! The fact is read from `/proc/<shell pid>/stat` (its `tpgid` and `pgrp` fields), which gives what
+//! The local fact is read from `/proc/<shell pid>/stat` (its `tpgid` and `pgrp` fields), which gives what
 //! `tcgetpgrp` on the PTY's master would without the master's descriptor: that belongs to the
 //! terminal's session thread. One small procfs read per terminal, made only when a close or a kill
 //! asks, never on a timer, so it is cheap enough for the GTK thread.
 //!
-//! A restart in a new directory instead scans the whole session on a worker: ending the shell
-//! can end its background jobs too. An error leaves that terminal busy.
+//! A local restart in a new directory instead scans the whole session on a worker: ending the shell
+//! can end its background jobs too. An error leaves that terminal busy. A server terminal reads cached
+//! job and directory facts, with no local filesystem read; an unknown fact leaves it busy too, and a restart always
+//! finds it busy, since no fact says whether its session holds a background job.
 
-use super::TerminalPane;
+use eitri_core::remote_project::terminal_facts::TerminalFactsHandle;
 use std::io;
+use std::path::PathBuf;
+
+/// A pane's job and directory facts. Server implementations read only a synchronous cache.
+pub(crate) trait JobQuery: Send {
+    fn busy(&self) -> Option<bool>;
+    fn name(&self) -> Option<String>;
+    /// Local filesystem work belongs on a worker; server paths must never be inspected locally.
+    fn cwd(&self) -> Option<PathBuf>;
+    fn read_cwd(&self) -> io::Result<PathBuf> {
+        self.cwd()
+            .ok_or_else(|| io::Error::other("its shell's directory is unknown"))
+    }
+    fn read_job(&self) -> (Result<PathBuf, String>, bool) {
+        (
+            self.cwd().ok_or_else(|| "its shell's directory is unknown".into()),
+            self.busy().unwrap_or(true),
+        )
+    }
+}
+
+pub(crate) struct Local {
+    pub pid: u32,
+}
+
+impl JobQuery for Local {
+    fn busy(&self) -> Option<bool> {
+        Some(has_foreground_job(self.pid))
+    }
+    fn name(&self) -> Option<String> {
+        let stat = std::fs::read_to_string(format!("/proc/{}/stat", self.pid)).ok()?;
+        let (_, group) = stat_groups(&stat)?;
+        if group <= 0 {
+            return None;
+        }
+        let name = std::fs::read_to_string(format!("/proc/{group}/comm")).ok()?;
+        Some(eitri_core::onboarding::display::display_text(
+            name.trim_end_matches('\n'),
+        ))
+    }
+    fn cwd(&self) -> Option<PathBuf> {
+        self.read_cwd().ok()
+    }
+    fn read_cwd(&self) -> io::Result<PathBuf> {
+        crate::terminal::usable_dir(std::fs::read_link(format!("/proc/{}/cwd", self.pid)))
+    }
+    fn read_job(&self) -> (Result<PathBuf, String>, bool) {
+        read_job_with(
+            Some(self.pid),
+            |pid| crate::terminal::usable_dir(std::fs::read_link(format!("/proc/{pid}/cwd"))),
+            session_has_other_process,
+        )
+    }
+}
+
+/// The link fills this cache and invalidates it when disconnected. No server query runs here.
+#[allow(dead_code)]
+pub(crate) struct Server {
+    facts: TerminalFactsHandle,
+    terminal_id: String,
+}
+
+impl Server {
+    #[allow(dead_code)]
+    pub(crate) fn new(facts: TerminalFactsHandle, terminal_id: String) -> Self {
+        Self { facts, terminal_id }
+    }
+}
+
+impl JobQuery for Server {
+    fn busy(&self) -> Option<bool> {
+        self.facts.get(&self.terminal_id)?.busy
+    }
+    fn name(&self) -> Option<String> {
+        self.facts
+            .get(&self.terminal_id)?
+            .name
+            .map(|name| eitri_core::onboarding::display::display_text(&name))
+    }
+    fn cwd(&self) -> Option<PathBuf> {
+        self.facts.get(&self.terminal_id)?.cwd
+    }
+    /// A restart closes the server terminal, and closing ends everything in its shell's session. The server's busy
+    /// fact is the foreground job only: a job started with `&` at the prompt leaves it false. Nothing reports whether
+    /// the session holds other processes, so for a restart a server shell always counts as busy.
+    fn read_job(&self) -> (Result<PathBuf, String>, bool) {
+        (
+            self.facts
+                .get(&self.terminal_id)
+                .and_then(|facts| facts.cwd)
+                .ok_or_else(|| "its server directory is unknown".into()),
+            true,
+        )
+    }
+}
+
+/// A running shell with unknown facts needs a close question. Callers first check that the pane is running.
+pub(crate) fn counts_as_busy(query: Option<&dyn JobQuery>) -> bool {
+    query.is_none_or(|query| query.busy().unwrap_or(true))
+}
+
+/// Both filesystem reads run together on a worker; an unreadable cwd remains an error.
+pub(crate) fn read_job_with(
+    pid: Option<u32>,
+    cwd: impl FnOnce(u32) -> io::Result<PathBuf>,
+    busy: impl FnOnce(u32) -> io::Result<bool>,
+) -> (Result<PathBuf, String>, bool) {
+    let Some(pid) = pid else {
+        return (Err("its shell is not running".into()), true);
+    };
+    (cwd(pid).map_err(|error| error.to_string()), busy(pid).unwrap_or(true))
+}
 
 /// Whether any other process belongs to this shell's session, including background and stopped jobs.
 /// Reads procfs only on a worker. An unreadable session is an error, which callers must treat as busy.
@@ -99,22 +212,66 @@ pub(crate) fn has_foreground_job(shell_pid: u32) -> bool {
         .unwrap_or(false)
 }
 
-/// How many of the window's terminals run a job: every pane it holds, the base terminal, each live
-/// instance and the idle pool alike, since a hidden terminal's job ends with the window too.
-pub(crate) fn count_terminal_jobs(terminals: &[TerminalPane]) -> usize {
-    terminals
-        .iter()
-        .filter_map(TerminalPane::shell_pid)
-        .filter(|&pid| has_foreground_job(pid))
-        .count()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use eitri_terminal::pty::{PtyChild, PtySize, SpawnSpec};
     use std::path::PathBuf;
     use std::time::{Duration, Instant};
+
+    fn server(busy: Option<bool>) -> Server {
+        let facts = TerminalFactsHandle::default();
+        facts.set(
+            "terminal-a",
+            eitri_core::remote_project::terminal_facts::TerminalFacts {
+                busy,
+                name: Some("nvim".into()),
+                cwd: Some("/srv/project".into()),
+                at: Instant::now(),
+            },
+        );
+        Server::new(facts, "terminal-a".into())
+    }
+
+    #[test]
+    fn cached_server_facts_need_no_local_pid_or_filesystem() {
+        let job = server(Some(false));
+        assert_eq!(job.busy(), Some(false));
+        assert_eq!(job.cwd(), Some(PathBuf::from("/srv/project")));
+        assert_eq!(job.name().as_deref(), Some("nvim"));
+        assert!(counts_as_busy(Some(&server(Some(true)))));
+        assert!(counts_as_busy(Some(&server(None))));
+        assert!(!counts_as_busy(Some(&job)));
+        assert!(counts_as_busy(None));
+    }
+
+    #[test]
+    fn a_server_restart_read_counts_an_idle_prompt_as_busy() {
+        let job = server(Some(false));
+        assert_eq!(
+            job.busy(),
+            Some(false),
+            "the close question still reads the foreground fact"
+        );
+        let (cwd, busy) = job.read_job();
+        assert!(busy, "a background job would end with the closed session");
+        assert_eq!(cwd.unwrap(), PathBuf::from("/srv/project"));
+    }
+
+    #[test]
+    fn the_job_name_is_escaped() {
+        let job = server(Some(true));
+        job.facts.set(
+            "terminal-a",
+            eitri_core::remote_project::terminal_facts::TerminalFacts {
+                busy: Some(true),
+                name: Some("nvim\u{202e}\n\u{200b}".into()),
+                cwd: None,
+                at: Instant::now(),
+            },
+        );
+        assert_eq!(job.name().as_deref(), Some("nvim\\u{202e}\\u{a}\\u{200b}"));
+    }
 
     #[test]
     fn the_stat_line_is_read_past_a_name_holding_spaces_and_parentheses() {

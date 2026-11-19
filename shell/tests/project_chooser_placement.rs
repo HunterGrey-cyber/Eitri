@@ -417,6 +417,46 @@ fn the_list_reports_plain_keys_and_the_line_takes_text(display: &str) {
         .any(|r| matches!(r, ChooserReport::Line(LineEv::DeleteSegment))));
 }
 
+fn ctrl_o_keeps_opening_the_folder_dialog_with_remote_available(display: &str) {
+    let stage = Stage::new();
+    let remote_opens = Rc::new(std::cell::Cell::new(0));
+    stage.chooser.add_remote({
+        let remote_opens = remote_opens.clone();
+        move || remote_opens.set(remote_opens.get() + 1)
+    });
+    stage.show();
+    focus_window(display, "eitri-project-placement");
+    for in_line in [false, true] {
+        stage.chooser.show(Some(&ChooserView { in_line, ..view() }));
+        stage.reports.borrow_mut().clear();
+        assert!(stage.entry_has_keys());
+        xdo(display, &["key", "--clearmodifiers", "ctrl+o"]);
+        pump();
+        assert_eq!(remote_opens.get(), 0);
+        assert_eq!(
+            stage
+                .reports
+                .borrow()
+                .iter()
+                .filter(|report| matches!(report, ChooserReport::Line(LineEv::ChooseFolder)))
+                .count(),
+            1
+        );
+    }
+    let button = stage
+        .widgets()
+        .into_iter()
+        .find_map(|widget| {
+            widget
+                .downcast::<gtk4::Button>()
+                .ok()
+                .filter(|button| button.label().as_deref() == Some("Open on a host…"))
+        })
+        .unwrap();
+    button.emit_clicked();
+    assert_eq!(remote_opens.get(), 1);
+}
+
 fn updates_over(stage: &Stage, turns: u64) -> u32 {
     let updates = Rc::new(std::cell::Cell::new(0));
     let observed = updates.clone();
@@ -955,6 +995,11 @@ fn main() {
     run(f, "the_list_reports_plain_keys_and_the_line_takes_text", || {
         the_list_reports_plain_keys_and_the_line_takes_text(d)
     });
+    run(
+        f,
+        "ctrl_o_keeps_opening_the_folder_dialog_with_remote_available",
+        || ctrl_o_keeps_opening_the_folder_dialog_with_remote_available(d),
+    );
     run(
         f,
         "the_frame_tick_runs_only_while_the_chooser_is_up",

@@ -14,6 +14,8 @@ struct Session {
     #[serde(default, deserialize_with = "null_default")]
     name: String,
     #[serde(default, deserialize_with = "null_default")]
+    identifier: String,
+    #[serde(default, deserialize_with = "null_default")]
     labels: Labels,
     #[serde(default, deserialize_with = "null_default")]
     paused: bool,
@@ -186,6 +188,7 @@ fn convert(raw: Session) -> Result<SessionStatus, SyncError> {
         .collect();
     Ok(SessionStatus {
         name: raw.name,
+        identifier: raw.identifier,
         role,
         state,
         successful_cycles: raw.successful_cycles,

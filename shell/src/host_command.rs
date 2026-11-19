@@ -4,7 +4,7 @@
 //! person's terminal.
 
 use std::ffi::OsString;
-use std::io::{BufRead, Write};
+use std::io::Write;
 use std::path::PathBuf;
 
 use eitri_core::lua::config::{parse_remote_dev_enabled, REMOTE_DEV_ENABLED_KEY};
@@ -24,7 +24,10 @@ pub(crate) fn run(args: impl IntoIterator<Item = OsString>) -> Option<glib::Exit
     let rest: Vec<OsString> = args.collect();
     if rest.first().is_some_and(|first| first == "mutagen-transport") {
         let error = eitri_core::remote_sync::transport::exec(&rest[1..]).unwrap_err();
-        eprintln!("eitri host mutagen-transport: {error}");
+        eprintln!(
+            "eitri host mutagen-transport: {}",
+            eitri_core::remote_sync::terminal_text(&error.to_string())
+        );
         return Some(code(255));
     }
     if rest.first().is_some_and(|first| first == "git") {
@@ -32,7 +35,7 @@ pub(crate) fn run(args: impl IntoIterator<Item = OsString>) -> Option<glib::Exit
         let status = match eitri_core::remote_sync::git_shim::ShimEnv::from_process() {
             Ok(env) => eitri_core::remote_sync::git_shim::run(args.to_vec(), env),
             Err(error) => {
-                eprintln!("Eitri: {error}");
+                eprintln!("Eitri: {}", eitri_core::remote_sync::terminal_text(&error));
                 128
             }
         };
@@ -68,8 +71,14 @@ pub(crate) fn run(args: impl IntoIterator<Item = OsString>) -> Option<glib::Exit
         .map(|home| PathBuf::from(home).join(".ssh/known_hosts"))
         .unwrap_or_default();
     let mut reach = cli::SshReach::new(ssh_dir, exe, known_hosts);
-    // The sync verbs, and `stop`/`uninstall` (which pause or end sync sessions), use `remote_dev.*` from `init.lua`.
-    if matches!(rest.first().map(String::as_str), Some("sync" | "stop" | "uninstall")) {
+    // Status and conflicts inspect recorded state without starting an engine. Loading init.lua here
+    // would mix its startup output (including a missing-file notice) into the JSON document.
+    let needs_settings = match rest.as_slice() {
+        [command, verb, ..] if command == "sync" => !matches!(verb.as_str(), "status" | "conflicts"),
+        [command, ..] => matches!(command.as_str(), "open" | "stop" | "uninstall"),
+        [] => false,
+    };
+    if needs_settings {
         reach = reach.with_sync_settings(init_sync_settings());
     }
     let mut term = Stdio;
@@ -112,7 +121,7 @@ pub(crate) fn remote_dev_enabled() -> bool {
 }
 
 /// `remote_dev.*` for the sync verbs, read from `init.lua` the way [`remote_dev_enabled`] reads its key.
-fn init_sync_settings() -> eitri_core::remote_host::cli_sync::SyncSettings {
+pub(crate) fn init_sync_settings() -> eitri_core::remote_host::cli_sync::SyncSettings {
     let Ok(config_dir) = eitri_core::config_dir::resolve(&|key| std::env::var_os(key)) else {
         return Default::default();
     };
@@ -132,18 +141,29 @@ struct Stdio;
 
 impl cli::Terminal for Stdio {
     fn say(&mut self, line: &str) {
-        println!("{line}");
+        say_to(&mut std::io::stdout().lock(), line);
     }
 
     fn ask(&mut self, question: &str) -> bool {
-        print!("{question} ");
-        let _ = std::io::stdout().flush();
+        ask_to(&mut std::io::stdout().lock(), question);
         let mut answer = String::new();
-        if std::io::stdin().lock().read_line(&mut answer).is_err() {
+        if cli::read_answer(&mut answer).is_err() {
             return false;
         }
         matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes")
     }
+}
+
+/// A line of `eitri host` on `out`. Lines name server files and repeat server-side messages: control characters are
+/// escaped first, so none reaches the terminal as an escape sequence.
+fn say_to(out: &mut dyn Write, line: &str) {
+    let _ = writeln!(out, "{}", eitri_core::remote_sync::terminal_text(line));
+}
+
+/// A question of `eitri host` on `out`, escaped as [`say_to`] escapes a line, left open for the answer.
+fn ask_to(out: &mut dyn Write, question: &str) {
+    let _ = write!(out, "{} ", eitri_core::remote_sync::terminal_text(question));
+    let _ = out.flush();
 }
 
 /// Prepare the fixed script before GTK. Settings come from the window's existing kernel after it loads.
@@ -222,6 +242,13 @@ pub(crate) fn sync_settings(
             mutagen,
             tripwire_mib,
             flush_cap,
+            send_waits_for_flush: parse_remote_dev_send_waits_for_flush(
+                config.get(REMOTE_DEV_SEND_WAITS_FOR_FLUSH_KEY),
+            )
+            .unwrap_or_else(|e| {
+                fallback(e);
+                defaults.send_waits_for_flush
+            }),
         },
         problems,
     )
@@ -233,6 +260,80 @@ mod tests {
     use std::path::Path;
     use std::process::{Command, Stdio};
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn host_lines_and_questions_carry_no_escape_byte() {
+        let mut out = Vec::new();
+        say_to(&mut out, "file modes on h: 1 sync writes into /p: \u{1b}]52;c;x\u{7}");
+        ask_to(&mut out, "Move \u{9b}2J? [y/N]");
+        assert!(!out.iter().any(|b| *b == 0x1b || *b == 0x07), "{out:?}");
+        let text = String::from_utf8(out).unwrap();
+        assert!(!text.contains('\u{9b}'), "{text:?}");
+        assert!(
+            text.starts_with("file modes on h: 1 sync writes into /p: \\u{1b}]52;c;x\\u{7}\n"),
+            "{text:?}"
+        );
+        assert!(text.ends_with("Move \\u{9b}2J? [y/N] "), "{text:?}");
+    }
+
+    #[test]
+    fn sync_inspection_writes_one_complete_json_document() {
+        use eitri_core::remote_project::{RemoteProject, RemoteProjects};
+        use eitri_core::remote_sync::{actor, status_file, status_schema::ConflictEntry};
+        let root = agent::state_dirs::test_workspace_dir("host-json");
+        let state = root.join("state");
+        let project = RemoteProject {
+            version: 1,
+            host: "example-host".into(),
+            host_key_sha256: "key".into(),
+            root: root.clone(),
+            helper_version: "test".into(),
+            sync: None,
+            created_at: 0,
+            queued_stops: vec![],
+        };
+        RemoteProjects::new(Some(state.as_os_str()), None)
+            .save(&project)
+            .unwrap();
+        let dir = actor::project_dir(&state, &project);
+        status_file::prepare_dir(&state, &dir).unwrap();
+        let path = "file\u{202e}\u{9b}2J\u{2028}\nname";
+        let mut status = status_file::compose(&project.host, &Default::default(), None, None, None, 1);
+        status.conflicts.push(ConflictEntry {
+            path: path.into(),
+            laptop_kind: "file".into(),
+            server_kind: "file".into(),
+        });
+        status_file::write_status(&dir, &status).unwrap();
+        for verb in ["status", "conflicts"] {
+            let output = Command::new(shell_binary())
+                .args(["host", "sync", verb, "--json"])
+                .current_dir(&root)
+                .env("HOME", &root)
+                .env("XDG_STATE_HOME", &state)
+                .env("EITRI_CONFIG_DIR", &root)
+                .env_remove("DISPLAY")
+                .env_remove("WAYLAND_DISPLAY")
+                .env_remove("DBUS_SESSION_BUS_ADDRESS")
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+            // A person may run --json in a terminal: no control or bidirectional character arrives raw.
+            let text = String::from_utf8(output.stdout.clone()).unwrap();
+            let body = text.strip_suffix('\n').unwrap();
+            assert!(
+                !body.chars().any(eitri_core::agent_bridge::is_control_like),
+                "{verb}: {body:?}"
+            );
+            let document: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+            let conflicts = if verb == "status" {
+                &document["conflicts"]
+            } else {
+                &document
+            };
+            assert_eq!(conflicts[0]["path"], path);
+        }
+    }
 
     #[test]
     fn the_early_arm_reads_no_init_lua() {
@@ -387,6 +488,30 @@ mod tests {
             assert!(
                 shim[10] <= start[10] + plain[10] * 2 + spread,
                 "the git arm does work beyond binary start and Git"
+            );
+        }
+    }
+
+    #[test]
+    fn send_waits_for_flush_false_skips_it() {
+        let project = eitri_core::remote_project::RemoteProject {
+            version: 1,
+            host: "example-host".into(),
+            host_key_sha256: "key".into(),
+            root: "/srv/project".into(),
+            helper_version: "test".into(),
+            sync: None,
+            created_at: 0,
+            queued_stops: vec![],
+        };
+        let mut config = eitri_core::lua::config::ConfigStore::default();
+        for (setting, expected) in [("false", false), ("true", true)] {
+            config.set_text("remote_dev.send_waits_for_flush", setting);
+            let (settings, problems) = sync_settings(&config);
+            assert!(problems.is_empty());
+            assert_eq!(
+                crate::remote_window::send_port(&settings, &project, false, Err("offline".into())).is_some(),
+                expected
             );
         }
     }

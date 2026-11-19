@@ -268,17 +268,21 @@ pub trait HostReads {
             lang: crate::onboarding::Lang::En,
         }
     }
-    /// Terminals with a running foreground job, counted without waiting for a child.
+    /// Terminals with a foreground job or unknown server facts, counted without waiting for a child.
     fn terminal_jobs(&self, win: WinId) -> usize {
         let _ = win;
         0
+    }
+    /// Display-safe names of server jobs a close would end; unknown names are omitted.
+    fn terminal_job_names(&self, _win: WinId) -> Vec<String> {
+        Vec::new()
     }
     /// The running tabs and views a close can offer to the linked window.
     fn running_chats(&self, win: WinId) -> Vec<(ModuleId, Option<TabId>)> {
         let _ = win;
         Vec::new()
     }
-    /// The terminal panes with foreground jobs, read without waiting for a child.
+    /// Terminal panes with foreground jobs or unknown server facts, read without waiting for a child.
     fn terminal_job_modules(&self, win: WinId) -> Vec<ModuleId> {
         let _ = win;
         Vec::new()
@@ -1114,9 +1118,9 @@ pub enum TermOp {
     /// new shell there; answered with [`TermEvent::Cwd`] carrying the same `read`, since reads of one module (a
     /// number reused meanwhile, two splits in a row) may come back in any order.
     ReadCwd { win: WinId, module: ModuleId, read: u64 },
-    /// Reads, off the toolkit's thread, the directory the terminal's shell is in and whether any process but the
-    /// shell runs in its session, after capturing which shell the pane runs ([`ShellStart`]); answered with
-    /// [`TermEvent::Job`] carrying the same `read`. No fallback directory: a directory that cannot be read is an
+    /// Reads, off the toolkit's thread, the shell's directory and busy state after capturing which shell the pane
+    /// runs ([`ShellStart`]): a local shell's whole session, including background jobs, or a server's cached facts.
+    /// Answered with [`TermEvent::Job`] carrying the same `read`. No fallback: an unknown directory is an
     /// `Err`, since a guess would read as "elsewhere" and restart a shell whose directory is unknown.
     ReadJob { win: WinId, module: ModuleId, read: u64 },
     /// Ends the terminal's shell and starts a fresh one in `dir`, in the same pane, in one step: the pane, its place,
@@ -1824,23 +1828,45 @@ impl PartialEq for Handoff {
     }
 }
 
-/// Which shell of a terminal pane something was asked against: the pane's start count, and the shell's pid when
-/// one was running. Captured by the host before a read off the toolkit's thread and handed back with its answer,
-/// so whoever acts on the answer can tell whether the pane still runs that shell. `typed` is how many keys and mouse
-/// reports the pane had been given for its shell at the capture: a read that found the shell idle says nothing of a
-/// command typed after it, which leaves the shell and its pid as they were.
+/// A shell may be a local child or a terminal owned by a server. Its server generation distinguishes a
+/// replacement from an earlier terminal even if the server reuses its id.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ShellIdentity {
+    Local {
+        pid: u32,
+    },
+    /// The server's 128-bit id, sent on the wire as 32 hexadecimal digits.
+    Server {
+        generation: u64,
+        terminal_id: u128,
+    },
+}
+
+/// Which shell a read describes: the pane's start count, the shell's identity, and how many keys and mouse
+/// reports the pane had received. Typing after an idle read can start a job without changing the shell.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ShellStart {
     pub generation: u64,
+    pub identity: Option<ShellIdentity>,
+    /// The local pid for local pane callers; identity comparisons always use `identity`.
     pub pid: Option<u32>,
     pub typed: u64,
 }
 
 impl ShellStart {
+    /// A capture of a local pane, including one whose child has not started yet.
     pub fn of(generation: u64, pid: Option<u32>) -> Self {
+        Self::identified(generation, pid.map(|pid| ShellIdentity::Local { pid }))
+    }
+
+    pub fn identified(generation: u64, identity: Option<ShellIdentity>) -> Self {
         Self {
             generation,
-            pid,
+            identity,
+            pid: match identity {
+                Some(ShellIdentity::Local { pid }) => Some(pid),
+                _ => None,
+            },
             typed: 0,
         }
     }
@@ -1850,29 +1876,28 @@ impl ShellStart {
         Self { typed, ..self }
     }
 
-    /// Whether `now` still runs the shell captured here ([`Self::still`]) and was given nothing for it since: what
-    /// a restart decided on an idle read needs, since a command typed meanwhile may be running in the same shell.
-    pub fn untouched(self, now: Option<ShellStart>) -> bool {
+    /// Whether the captured shell still runs and was given no keys or mouse reports since the capture.
+    pub fn untouched(&self, now: Option<ShellStart>) -> bool {
         self.still(now) && now.is_some_and(|now| now.typed == self.typed)
     }
 
-    /// Whether `now` (the pane as it is today, `None` once it is idle or gone) still runs the shell captured here. A
-    /// new start bumps the count, so a pane killed and reused under the same number fails; a shell that was running
-    /// must be the same process, so a pane closed in place (the base terminal keeps its pane when killed) fails too.
-    /// A shell not yet spawned at the capture may have spawned since, under the same start.
-    pub fn still(self, now: Option<ShellStart>) -> bool {
-        let Some(now) = now else {
-            return false;
-        };
-        now.generation == self.generation && (self.pid.is_none() || now.pid == self.pid)
+    /// A new pane start or a changed shell invalidates a capture. A shell not yet started at capture may
+    /// have started since, under the same pane start.
+    pub fn still(&self, now: Option<ShellStart>) -> bool {
+        let Some(now) = now else { return false };
+        now.generation == self.generation && (self.identity.is_none() || now.identity == self.identity)
     }
 }
 
 /// Facts reported by terminal services.
 #[derive(Debug, Clone, PartialEq)]
 pub enum TermEvent {
-    /// A terminal child started.
-    Started { win: WinId, module: ModuleId, pid: u32 },
+    /// A terminal shell started locally or on a server.
+    Started {
+        win: WinId,
+        module: ModuleId,
+        identity: ShellIdentity,
+    },
     /// A terminal child exited.
     Exited { win: WinId, module: ModuleId },
     /// A terminal rang its bell.
@@ -1888,7 +1913,8 @@ pub enum TermEvent {
     },
     /// What a [`TermOp::ReadJob`] read: `shell` is the pane's shell captured before the read, `cwd` that shell's
     /// directory (`Err` when it could not be read, the shell having ended meanwhile among the reasons), and `busy`
-    /// whether any process but the shell runs in its session, in the foreground or not. `read` is the request's own.
+    /// whether a local shell's session has another process (foreground or background), or the server's cached job
+    /// state, with unknown counted as busy. `read` is the request's own.
     Job {
         win: WinId,
         module: ModuleId,
@@ -2360,6 +2386,34 @@ impl Batch {
 mod tests {
     use super::*;
     use crate::layout::ModuleId;
+
+    #[test]
+    fn a_server_shell_is_running_without_a_pid() {
+        let identity = ShellIdentity::Server {
+            generation: 7,
+            terminal_id: 1,
+        };
+        let captured = ShellStart::identified(3, Some(identity)).typed(4);
+        assert!(captured.untouched(Some(captured)));
+        assert_eq!(captured.identity, Some(identity));
+        assert_eq!(captured.pid, None);
+        assert!(!captured.still(Some(ShellStart::identified(
+            3,
+            Some(ShellIdentity::Server {
+                generation: 8,
+                terminal_id: 1,
+            })
+        ))));
+        assert!(!captured.still(Some(ShellStart::identified(
+            3,
+            Some(ShellIdentity::Server {
+                generation: 7,
+                terminal_id: 2,
+            })
+        ))));
+        assert!(!captured.still(Some(ShellStart::of(3, Some(7)))));
+        assert!(!captured.still(Some(ShellStart::of(3, None))));
+    }
 
     /// A split from a terminal, or a restart in place, goes ahead after its read only if the same shell is still
     /// there: not once the pane is idle, not after a new start under the same number, not after the running shell

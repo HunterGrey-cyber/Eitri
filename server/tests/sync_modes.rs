@@ -13,7 +13,8 @@ mod run_dir;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use daemon::sync::modes::{self, Keeper, Keepers, Options};
@@ -157,7 +158,8 @@ impl Scratch {
     /// A Mutagen write when the root is on another file system than its staging: during a cycle, a copy made in the
     /// target directory and renamed into place.
     fn cross_device_write(&self, keeper: &Keeper, rel: &str, bytes: &[u8], mode: u32) {
-        let _ = std::fs::create_dir(self.staging());
+        // Mutagen stages the file first; the rename out of staging then fails across devices and it copies instead.
+        let _staged = self.stage(bytes, 0o600);
         let target = self.path(rel);
         let copy = target
             .parent()
@@ -227,6 +229,444 @@ fn a_mutagen_rename_over_0644_restores_0644() {
     assert_eq!(keeper.status().unpaired, 0);
     assert_eq!(scratch.modes_file().get("src/a.txt"), Some(&0o644));
     assert!(keeper.warnings().is_empty(), "{:?}", keeper.warnings());
+}
+
+/// Mutagen makes its staging directory when a cycle starts and places a file the moment it is staged, with no pause a
+/// watch added after the directory appears could use. The keeper keeps the named staging directory and its `<2 hex>`
+/// subdirectories ready and watched between cycles, so such a write is still paired, cycle after cycle.
+#[test]
+fn a_mutagen_write_with_no_pause_between_staging_and_placing_is_restored() {
+    let scratch = Scratch::new("nopause");
+    scratch.file("a.txt", b"one", 0o644);
+    scratch.file("b.txt", b"two", 0o640);
+    let keeper = scratch.keeper(0o022);
+    for (rel, want, text) in [
+        ("a.txt", 0o644, &b"saved once"[..]),
+        ("b.txt", 0o640, b"saved twice"),
+        ("a.txt", 0o644, b"saved again"),
+    ] {
+        let staged = scratch.stage(text, 0o600);
+        std::fs::rename(staged, scratch.path(rel)).unwrap();
+        scratch.end_cycle();
+        keeper.settle();
+        assert_eq!(mode(&scratch.path(rel)), want, "{rel}");
+    }
+    let status = keeper.status();
+    assert_eq!((status.restored, status.unpaired, status.unpaired_in_sync), (3, 0, 0));
+    assert!(keeper.warnings().is_empty(), "{:?}", keeper.warnings());
+}
+
+#[test]
+fn the_named_staging_directory_is_kept_ready_and_removed_when_the_keeper_stops() {
+    let scratch = Scratch::new("ready");
+    let keeper = scratch.keeper(0o022);
+    assert_eq!(mode(&scratch.staging()), 0o700);
+    assert!(scratch.staging().join("00").is_dir() && scratch.staging().join("ff").is_dir());
+    // Mutagen removes it when a cycle ends; it is made again for the next one.
+    scratch.end_cycle();
+    keeper.settle();
+    assert!(scratch.staging().join("c7").is_dir());
+    drop(keeper);
+    assert!(!scratch.staging().exists());
+    // One Mutagen is using when the keeper stops is left to Mutagen.
+    let keeper = scratch.keeper(0o022);
+    let _staged = scratch.stage(b"in flight", 0o600);
+    keeper.settle();
+    drop(keeper);
+    for byte in 0..=u8::MAX {
+        assert!(scratch.staging().join(format!("{byte:02x}")).is_dir(), "{byte:02x}");
+    }
+    scratch.end_cycle();
+    // Without a staging name nothing is made beside the root.
+    let keeper = scratch.keeper_named(None, 0o022, Box::new(|_: &str, _: bool| false), None);
+    let beside: Vec<_> = std::fs::read_dir(&scratch.base)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .filter(|name| name.to_string_lossy().starts_with(modes::STAGING_PREFIX))
+        .collect();
+    assert!(beside.is_empty(), "{beside:?}");
+    drop(keeper);
+}
+
+/// The keeper holds its root open, so removing the root sends the root's own watch nothing; the parent's event for the
+/// root's name stops it, and a daemon's next look starts a keeper on the folder now at that path.
+#[test]
+fn a_root_removed_and_made_again_is_kept_afresh() {
+    let scratch = Scratch::new("remade");
+    scratch.file("a.txt", b"one", 0o644);
+    let keepers = Keepers::new(&scratch.state(), options(0o022, None), "run-a");
+    keepers.set(&scratch.root(), Vec::new(), STAGING, true).unwrap();
+    keepers.with_keeper(&scratch.root(), Keeper::settle).unwrap();
+    std::fs::remove_dir_all(scratch.project()).unwrap();
+    std::fs::create_dir(scratch.project()).unwrap();
+    wait_for(|| {
+        keepers
+            .with_keeper(&scratch.root(), |keeper| !keeper.running())
+            .unwrap_or(true)
+    });
+    let lines = keepers.hello_warnings();
+    assert!(
+        lines
+            .iter()
+            .any(|line| line.text.contains("the root was moved or removed")),
+        "{lines:?}"
+    );
+    scratch.file("b.txt", b"two", 0o640);
+    keepers.resume();
+    let settle = || keepers.with_keeper(&scratch.root(), Keeper::settle).unwrap();
+    settle();
+    assert_eq!(
+        keepers.with_keeper(&scratch.root(), |keeper| keeper.recorded("b.txt")),
+        Some(Some(0o640))
+    );
+    scratch.mutagen_write_via(settle, "b.txt", b"two, saved", 0o600);
+    assert_eq!(mode(&scratch.path("b.txt")), 0o640);
+}
+
+/// A re-created session stages under a new name: the running keeper takes it in place (no new walk, so its counted
+/// line keeps its epoch and sequence), the directory kept ready for the old name goes, and a write with no pause
+/// through the new name is paired.
+#[test]
+fn a_new_staging_name_is_taken_by_the_running_keeper() {
+    let scratch = Scratch::new("rename");
+    scratch.file("a.txt", b"one", 0o644);
+    let keepers = Keepers::new(&scratch.state(), options(0o022, None), "run-a");
+    keepers.set(&scratch.root(), Vec::new(), STAGING, true).unwrap();
+    let settle = || keepers.with_keeper(&scratch.root(), Keeper::settle).unwrap();
+    settle();
+    // A counted line, so a restarted keeper (which counts from nothing under a new epoch) would show.
+    let _cycle = scratch.stage(b"cycle", 0o600);
+    settle();
+    let outside = scratch.base.join("outside/x");
+    std::fs::write(&outside, b"x").unwrap();
+    chmod(&outside, 0o600);
+    std::fs::rename(&outside, scratch.path("landed.txt")).unwrap();
+    settle();
+    scratch.end_cycle();
+    settle();
+    let before = keepers.hello_warnings();
+    assert_eq!(before.len(), 1, "{before:?}");
+    const OTHER: &str = ".mutagen-temporary-staging-sync_other-beta";
+    keepers.set(&scratch.root(), Vec::new(), OTHER, true).unwrap();
+    settle();
+    let after = keepers.hello_warnings();
+    assert_eq!(
+        (after[0].epoch, after[0].sequence),
+        (before[0].epoch, before[0].sequence)
+    );
+    assert!(!scratch.staging().exists());
+    let other = scratch.base.join(OTHER);
+    assert!(other.join("c7").is_dir());
+    std::fs::write(other.join("storage1"), b"two").unwrap();
+    chmod(&other.join("storage1"), 0o600);
+    std::fs::rename(other.join("storage1"), other.join("c7/c7aa")).unwrap();
+    std::fs::rename(other.join("c7/c7aa"), scratch.path("a.txt")).unwrap();
+    std::fs::remove_dir_all(&other).unwrap();
+    settle();
+    assert_eq!(mode(&scratch.path("a.txt")), 0o644);
+}
+
+/// A neighbouring root's staging directory kept ready is no cycle here: a rename from elsewhere is counted as
+/// outside a cycle, and its empty subdirectories are not watched.
+#[test]
+fn a_neighbours_ready_staging_directory_is_no_cycle() {
+    let scratch = Scratch::new("neighbour");
+    scratch.file("a.txt", b"one", 0o644);
+    std::fs::create_dir(scratch.base.join("q")).unwrap();
+    let neighbour = Keeper::start(
+        scratch.base.join("q").to_str().unwrap(),
+        Some(STAGING.to_owned()),
+        Box::new(|_: &str, _: bool| false),
+        options(0o022, None),
+        None,
+    )
+    .unwrap();
+    neighbour.settle();
+    assert!(scratch.staging().join("00").is_dir());
+    let keeper = scratch.keeper_named(None, 0o022, Box::new(|_: &str, _: bool| false), None);
+    let outside = scratch.base.join("outside/x");
+    std::fs::write(&outside, b"x").unwrap();
+    chmod(&outside, 0o600);
+    std::fs::rename(&outside, scratch.path("a.txt")).unwrap();
+    keeper.settle();
+    let status = keeper.status();
+    assert_eq!((status.unpaired, status.unpaired_in_sync), (1, 0), "{status:?}");
+    drop(keeper);
+    drop(neighbour);
+    assert!(!scratch.staging().exists());
+}
+
+/// Changed patterns start a new keeper, whose first walk takes the modes it finds; the registration answers only
+/// after that walk, so a sync write right after it (the laptop creates the session once the patterns are registered)
+/// is judged, not adopted.
+#[test]
+fn a_pattern_change_answers_after_the_new_keepers_walk() {
+    let scratch = Scratch::new("repattern");
+    for n in 0..3000 {
+        scratch.file(&format!("bulk/{:02}/f{n}", n % 50), b"x", 0o644);
+    }
+    scratch.file("a.txt", b"one", 0o644);
+    let keepers = Keepers::new(&scratch.state(), options(0o022, None), "run-a");
+    keepers.set(&scratch.root(), Vec::new(), STAGING, true).unwrap();
+    keepers.with_keeper(&scratch.root(), Keeper::settle).unwrap();
+    keepers
+        .set(&scratch.root(), vec!["/target/".to_owned()], STAGING, true)
+        .unwrap();
+    let staged = scratch.stage(b"saved", 0o600);
+    std::fs::rename(staged, scratch.path("a.txt")).unwrap();
+    scratch.end_cycle();
+    keepers.with_keeper(&scratch.root(), Keeper::settle).unwrap();
+    assert_eq!(mode(&scratch.path("a.txt")), 0o644);
+}
+
+/// A registration waiting for its keeper to settle holds no lock the daemon's other calls take: the idle check and
+/// Hello answer meanwhile.
+#[test]
+fn a_registration_waiting_for_its_keeper_blocks_no_other_call() {
+    let scratch = Scratch::new("waitlock");
+    scratch.file("a.txt", b"one", 0o644);
+    let root = scratch.root();
+    let keepers = Arc::new(
+        Keepers::new(&scratch.state(), options(0o022, None), "run-a").with_register_settle(Duration::from_secs(120)),
+    );
+    keepers.set(&root, Vec::new(), STAGING, true).unwrap();
+    let asked = keepers.with_keeper(&root, Keeper::settles_asked).unwrap();
+    let paused = keepers.with_keeper(&root, Keeper::paused).unwrap();
+    let done = Arc::new(AtomicBool::new(false));
+    let waiting = {
+        let (keepers, done, root) = (Arc::clone(&keepers), Arc::clone(&done), root.clone());
+        std::thread::spawn(move || {
+            let answer = keepers.set(&root, Vec::new(), STAGING, true);
+            done.store(true, Ordering::SeqCst);
+            answer
+        })
+    };
+    while keepers.with_keeper(&root, Keeper::settles_asked).unwrap() == asked {
+        std::thread::yield_now();
+    }
+    // Waiting under the locks, these would answer only after the registration's whole wait.
+    let (answered, answers) = std::sync::mpsc::channel();
+    {
+        let keepers = Arc::clone(&keepers);
+        std::thread::spawn(move || {
+            let holds = keepers.holds();
+            let _ = keepers.hello_warnings();
+            let _ = answered.send(holds);
+        });
+    }
+    assert_eq!(answers.recv_timeout(Duration::from_secs(20)), Ok(true));
+    assert!(!done.load(Ordering::SeqCst), "the registration still waits");
+    drop(paused);
+    assert_eq!(waiting.join().unwrap(), Ok(true));
+}
+
+/// A registration whose keeper has not settled within the wait says so: the laptop then waits before it creates the
+/// session the registration is for.
+#[test]
+fn a_registration_says_when_its_keeper_has_not_settled() {
+    let scratch = Scratch::new("unsettled");
+    scratch.file("a.txt", b"one", 0o644);
+    let root = scratch.root();
+    let keepers =
+        Keepers::new(&scratch.state(), options(0o022, None), "run-a").with_register_settle(Duration::from_millis(100));
+    keepers.set(&root, Vec::new(), STAGING, true).unwrap();
+    let paused = keepers.with_keeper(&root, Keeper::paused).unwrap();
+    assert_eq!(keepers.set(&root, Vec::new(), STAGING, true), Ok(false));
+    drop(paused);
+    assert_eq!(keepers.set(&root, Vec::new(), STAGING, true), Ok(true));
+}
+
+/// While another daemon still holds a root's keeper, nothing keeps it under this registration yet: not settled.
+#[test]
+fn a_root_another_daemon_still_keeps_is_not_settled_here() {
+    let scratch = Scratch::new("handover");
+    scratch.file("a.txt", b"one", 0o644);
+    let root = scratch.root();
+    running_daemon(&scratch.state(), "run-old");
+    let old = Keepers::new(&scratch.state(), options(0o022, None), "run-old");
+    old.set(&root, Vec::new(), STAGING, true).unwrap();
+    running_daemon(&scratch.state(), "run-new");
+    let new = Keepers::new(&scratch.state(), options(0o022, None), "run-new")
+        .with_register_settle(Duration::from_millis(300));
+    assert_eq!(new.set(&root, Vec::new(), STAGING, true), Ok(false));
+    // The old daemon lets the root go at its next tick, while a registration waits: that registration takes it.
+    let new = Arc::new(
+        Keepers::new(&scratch.state(), options(0o022, None), "run-new").with_register_settle(Duration::from_secs(30)),
+    );
+    let waiting = {
+        let (new, root) = (Arc::clone(&new), root.clone());
+        std::thread::spawn(move || new.set(&root, Vec::new(), STAGING, true))
+    };
+    std::thread::sleep(Duration::from_millis(300));
+    old.resume();
+    assert!(!old.keeps(&root));
+    assert_eq!(waiting.join().unwrap(), Ok(true));
+    assert!(new.keeps(&root));
+}
+
+/// A registration waiting for another daemon to let the root go stops when the root is turned off meanwhile, or the
+/// daemon stops its keepers: nothing is kept for it afterwards.
+#[test]
+fn a_registration_waiting_for_the_root_keeps_nothing_after_off_or_stop() {
+    for stop in [false, true] {
+        let scratch = Scratch::new("waitoff");
+        scratch.file("a.txt", b"one", 0o644);
+        let root = scratch.root();
+        running_daemon(&scratch.state(), "run-old");
+        let old = Keepers::new(&scratch.state(), options(0o022, None), "run-old");
+        old.set(&root, Vec::new(), STAGING, true).unwrap();
+        running_daemon(&scratch.state(), "run-new");
+        let new = Arc::new(
+            Keepers::new(&scratch.state(), options(0o022, None), "run-new")
+                .with_register_settle(Duration::from_secs(30)),
+        );
+        let waiting = {
+            let (new, root) = (Arc::clone(&new), root.clone());
+            std::thread::spawn(move || new.set(&root, Vec::new(), STAGING, true))
+        };
+        std::thread::sleep(Duration::from_millis(300));
+        if stop {
+            new.stop_all();
+        } else {
+            new.set(&root, Vec::new(), "", false).unwrap();
+        }
+        // The old daemon lets the root go at its next tick (no registration now names it, or the new one runs).
+        old.resume();
+        assert!(!old.keeps(&root));
+        assert_eq!(waiting.join().unwrap(), Ok(false), "stop {stop}");
+        assert!(!new.keeps(&root), "stop {stop}");
+    }
+}
+
+/// A daemon that stopped its keepers starts none at a later tick either.
+#[test]
+fn a_tick_after_stop_all_starts_no_keeper() {
+    let scratch = Scratch::new("stoptick");
+    scratch.file("a.txt", b"one", 0o644);
+    let root = scratch.root();
+    let keepers = Keepers::new(&scratch.state(), options(0o022, None), "run-a");
+    keepers.set(&root, Vec::new(), STAGING, true).unwrap();
+    keepers.stop_all();
+    keepers.resume();
+    assert!(!keepers.keeps(&root));
+}
+
+/// A keeper followed every staging directory while it had no name; once named, a sibling's staging directory it
+/// followed then is not this root's: its file renamed here is not restored.
+#[test]
+fn a_sibling_followed_before_the_name_came_never_pairs() {
+    let scratch = Scratch::new("namedlate");
+    scratch.file("a.txt", b"one", 0o644);
+    let keeper = scratch.keeper_named(None, 0o022, Box::new(|_: &str, _: bool| false), None);
+    let sibling = scratch.base.join(".mutagen-temporary-staging-sync_other-beta");
+    std::fs::create_dir_all(sibling.join("ab")).unwrap();
+    let storage = sibling.join("storage1");
+    std::fs::write(&storage, b"other").unwrap();
+    chmod(&storage, 0o600);
+    std::fs::rename(&storage, sibling.join("ab/f")).unwrap();
+    keeper.settle();
+    keeper.set_staging(Some(STAGING.to_owned())).unwrap();
+    keeper.settle();
+    std::fs::rename(sibling.join("ab/f"), scratch.path("a.txt")).unwrap();
+    keeper.settle();
+    assert_eq!(mode(&scratch.path("a.txt")), 0o600);
+    std::fs::remove_dir_all(&sibling).unwrap();
+    keeper.settle();
+}
+
+/// A registration that names no staging directory (the laptop does not know the session's yet) keeps the one the
+/// root has, so the keeper never goes back to following every staging directory beside it.
+#[test]
+fn a_registration_with_no_staging_name_keeps_the_roots_name() {
+    let scratch = Scratch::new("noname");
+    scratch.file("a.txt", b"one", 0o644);
+    let root = scratch.root();
+    let keepers = Keepers::new(&scratch.state(), options(0o022, None), "run-a");
+    keepers.set(&root, Vec::new(), STAGING, true).unwrap();
+    keepers.with_keeper(&root, Keeper::settle).unwrap();
+    assert!(scratch.staging().join("00").is_dir());
+    keepers.set(&root, vec!["/target/".to_owned()], "", true).unwrap();
+    keepers.with_keeper(&root, Keeper::settle).unwrap();
+    assert!(
+        scratch.staging().join("00").is_dir(),
+        "a new keeper keeps the root's name"
+    );
+    keepers.set(&root, vec!["/target/".to_owned()], "", true).unwrap();
+    keepers.with_keeper(&root, Keeper::settle).unwrap();
+    assert!(
+        scratch.staging().join("00").is_dir(),
+        "the running keeper keeps its name"
+    );
+}
+
+/// A neighbour's directory kept ready, first seen while the neighbour was still making its subdirectories, is no cycle
+/// once it has all 256 of them.
+#[test]
+fn a_neighbours_ready_directory_seen_half_made_is_no_cycle() {
+    let scratch = Scratch::new("halfmade");
+    scratch.file("a.txt", b"one", 0o644);
+    let keeper = scratch.keeper_named(None, 0o022, Box::new(|_: &str, _: bool| false), None);
+    let ready = scratch.base.join(".mutagen-temporary-staging-sync_next-beta");
+    {
+        let _held = keeper.hold();
+        std::fs::create_dir(&ready).unwrap();
+        for n in 0..40 {
+            std::fs::create_dir(ready.join(format!("{n:02x}"))).unwrap();
+        }
+    }
+    keeper.settle();
+    for n in 40..256 {
+        std::fs::create_dir(ready.join(format!("{n:02x}"))).unwrap();
+    }
+    keeper.settle();
+    let outside = scratch.base.join("outside/x");
+    std::fs::write(&outside, b"x").unwrap();
+    chmod(&outside, 0o600);
+    std::fs::rename(&outside, scratch.path("a.txt")).unwrap();
+    keeper.settle();
+    let status = keeper.status();
+    assert_eq!((status.unpaired, status.unpaired_in_sync), (1, 0), "{status:?}");
+    std::fs::remove_dir_all(&ready).unwrap();
+    keeper.settle();
+}
+
+/// The keeper removes the directory it kept ready only while it is as it made it: a file Mutagen staged straight into
+/// a subdirectory (which leaves the top directory's change time as it was) keeps every subdirectory.
+#[test]
+fn a_ready_directory_with_a_file_in_a_subdirectory_is_left_when_the_keeper_stops() {
+    let scratch = Scratch::new("leftready");
+    scratch.file("a.txt", b"one", 0o644);
+    let keeper = scratch.keeper(0o022);
+    std::fs::write(scratch.staging().join("ab/f"), b"staged").unwrap();
+    keeper.settle();
+    drop(keeper);
+    assert!(scratch.staging().join("ab/f").is_file());
+    assert!(scratch.staging().join("00").is_dir());
+    scratch.end_cycle();
+}
+
+/// A staging directory Mutagen made and already used (an empty `<2 hex>` left after a one-file cycle outran the watch)
+/// is a cycle; one found empty or holding exactly the 256 empty subdirectories of a directory kept ready is not.
+#[test]
+fn a_used_staging_directory_found_late_is_a_cycle() {
+    let scratch = Scratch::new("late");
+    scratch.file("a.txt", b"one", 0o644);
+    let keeper = scratch.keeper_named(None, 0o022, Box::new(|_: &str, _: bool| false), None);
+    let staging = scratch.base.join(".mutagen-temporary-staging-sync_late-beta");
+    {
+        let _held = keeper.hold();
+        std::fs::create_dir_all(staging.join("3f")).unwrap();
+    }
+    keeper.settle();
+    let outside = scratch.base.join("outside/x");
+    std::fs::write(&outside, b"x").unwrap();
+    chmod(&outside, 0o600);
+    std::fs::rename(&outside, scratch.path("a.txt")).unwrap();
+    keeper.settle();
+    let status = keeper.status();
+    assert_eq!((status.unpaired, status.unpaired_in_sync), (1, 1), "{status:?}");
+    std::fs::remove_dir_all(&staging).unwrap();
+    keeper.settle();
 }
 
 #[test]
@@ -379,7 +819,8 @@ fn counted_lines_repeat_with_growing_sequences_and_name_the_last_twenty() {
     keepers.set(&scratch.root(), Vec::new(), STAGING, true).unwrap();
     let settle = || keepers.with_keeper(&scratch.root(), Keeper::settle).unwrap();
     settle();
-    std::fs::create_dir(scratch.staging()).unwrap();
+    // A cycle: Mutagen stages in the staging directory the keeper keeps ready.
+    let _cycle = scratch.stage(b"cycle", 0o600);
     settle();
     let outside = scratch.base.join("outside/x");
     let land = |rel: &str| {
@@ -439,12 +880,15 @@ fn a_root_whose_registrant_is_gone_is_kept_by_another_daemon() {
         lines[0].text,
         format!("file modes on {HOST} are not kept for {root}: the daemon that registered it is not running")
     );
-    // The registering daemon comes back and takes the root; the other one, back too, leaves it to it.
+    // Both daemons come back (new processes, so new keepers): the other one takes the root while the registering daemon
+    // is away, and leaves it to it once it runs again.
+    let other = Keepers::new(&scratch.state(), options(0o022, None), "run-other");
     other.resume();
     assert!(other.keeps(&root));
     running_daemon(&scratch.state(), "run-old");
     other.resume();
     assert!(!other.keeps(&root));
+    let old = Keepers::new(&scratch.state(), options(0o022, None), "run-old");
     old.resume();
     assert!(old.keeps(&root));
 }
@@ -527,7 +971,8 @@ fn a_cross_device_name_reached_by_a_rename_is_not_mutagens() {
     let scratch = Scratch::new("xname");
     scratch.file("a.txt", b"one", 0o644);
     let keeper = scratch.keeper(0o022);
-    std::fs::create_dir(scratch.staging()).unwrap();
+    // A cycle: Mutagen stages in the staging directory the keeper keeps ready.
+    let _cycle = scratch.stage(b"cycle", 0o600);
     keeper.settle();
     // A file from elsewhere given Mutagen's temporary name, then renamed over a file: nobody's copy.
     let outside = scratch.base.join("outside/secret");
@@ -829,7 +1274,8 @@ fn two_daemons_keep_one_root_once() {
     assert_eq!(new.with_keeper(&root, |k| k.status().restored), Some(1));
     // The daemon that does not keep the root passes the keeper's lines on, the counted ones once.
     let outside = scratch.base.join("outside/x");
-    std::fs::create_dir(scratch.staging()).unwrap();
+    // A cycle: Mutagen stages in the staging directory the keeper keeps ready.
+    let _cycle = scratch.stage(b"cycle", 0o600);
     settle(&new);
     std::fs::write(&outside, b"x").unwrap();
     chmod(&outside, 0o600);
@@ -1195,8 +1641,6 @@ fn real_laptop_save_keeps_server_0644_and_0600() {
     std::fs::write(laptop.join("new.txt"), b"new\n").unwrap();
     std::fs::create_dir(laptop.join("newdir")).unwrap();
     std::fs::write(laptop.join("newdir/inner.txt"), b"inner\n").unwrap();
-    // Over ssh Mutagen applies a batch at least one round trip after staging it; between two local directories it
-    // applies at once. A large file staged last gives the keeper the time a network would.
     std::fs::write(laptop.join("zz-large.bin"), vec![0u8; 96 << 20]).unwrap();
     mutagen.run(&["sync", "resume", name]);
     mutagen.run(&["sync", "flush", name]);
@@ -1214,23 +1658,22 @@ fn real_laptop_save_keeps_server_0644_and_0600() {
         mode(&scratch.path("zz-large.bin")),
     );
     assert_eq!(mode(&scratch.path("b.txt")), 0o600);
-    // The large file, staged last, gives the keeper time to see the batch: it is always restored.
-    assert_eq!(mode(&scratch.path("zz-large.bin")), 0o644);
-    // A file Mutagen applied before the keeper looked at its staging (between two local directories under load) is
-    // left as Mutagen wrote it and counted; restored or counted, it is never anything else.
-    let mut missed = 0;
-    for (rel, restored, written) in [
-        ("a.txt", 0o644, 0o600),
-        ("run.sh", 0o755, 0o700),
-        ("new.txt", 0o644, 0o600),
-        ("newdir/inner.txt", 0o644, 0o600),
+    // Mutagen places each file the moment it is staged; the staging directory kept ready pairs every rename into a
+    // watched directory.
+    for (rel, restored) in [
+        ("a.txt", 0o644),
+        ("run.sh", 0o755),
+        ("new.txt", 0o644),
+        ("zz-large.bin", 0o644),
     ] {
-        let found = mode(&scratch.path(rel));
-        assert!(found == restored || found == written, "{rel}: {found:o}");
-        missed += u64::from(found == written);
+        assert_eq!(mode(&scratch.path(rel)), restored, "{rel}: {status:?}");
     }
-    assert_eq!(status.restored + missed, 5, "{status:?}");
-    assert!(missed <= status.unpaired_in_sync, "{missed} missed, {status:?}");
+    // A file Mutagen renames into a directory it made in the same cycle lands before that directory can be watched:
+    // it is restored when the keeper caught its identity in staging, else left as Mutagen wrote it and counted.
+    let inner = mode(&scratch.path("newdir/inner.txt"));
+    assert!(inner == 0o644 || inner == 0o600, "newdir/inner.txt: {inner:o}");
+    assert_eq!(status.restored + u64::from(inner == 0o600), 5, "{status:?}");
+    assert_eq!(status.unpaired_in_sync == 0, inner == 0o644, "{status:?}");
     // The keeper's chmods change no executability, so they start no cycle of their own: the count settles and
     // stays, and the laptop's files keep the modes Mutagen gave them.
     let laptop_modes = (mode(&laptop.join("a.txt")), mode(&laptop.join("run.sh")));
