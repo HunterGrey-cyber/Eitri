@@ -22,6 +22,11 @@ pub(crate) fn run(args: impl IntoIterator<Item = OsString>) -> Option<glib::Exit
         return None;
     }
     let rest: Vec<OsString> = args.collect();
+    if rest.first().is_some_and(|first| first == "mutagen-transport") {
+        let error = eitri_core::remote_sync::transport::exec(&rest[1..]).unwrap_err();
+        eprintln!("eitri host mutagen-transport: {error}");
+        return Some(code(255));
+    }
     if rest.first().is_some_and(|first| first == "git") {
         let args = rest[1..].strip_prefix(&[OsString::from("--")]).unwrap_or(&rest[1..]);
         let status = match eitri_core::remote_sync::git_shim::ShimEnv::from_process() {
@@ -174,6 +179,38 @@ mod tests {
     use std::path::Path;
     use std::process::{Command, Stdio};
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn the_early_arm_reads_no_init_lua() {
+        let root = agent::state_dirs::test_workspace_dir("transport-config");
+        std::fs::write(root.join("init.lua"), "io.stderr:write('INIT_LUA_TRIPWIRE')").unwrap();
+        let output = Command::new(shell_binary())
+            .args([
+                "host",
+                "mutagen-transport",
+                "ssh",
+                "--",
+                "eitri-0000000000000000",
+                "cmd",
+            ])
+            .env("EITRI_CONFIG_DIR", &root)
+            .env("XDG_STATE_HOME", &root)
+            .env("HOME", &root)
+            .env(
+                "PATH",
+                std::env::join_paths([root.join("eitri/mutagen/transport"), root.join("empty-bin")]).unwrap(),
+            )
+            .env_remove("DISPLAY")
+            .env_remove("WAYLAND_DISPLAY")
+            .env_remove("DBUS_SESSION_BUS_ADDRESS")
+            .env_remove("DBUS_SYSTEM_BUS_ADDRESS")
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(output.status.code(), Some(255), "{stderr}");
+        assert!(stderr.contains("no remote project records a session"), "{stderr}");
+        assert!(!stderr.contains("INIT_LUA_TRIPWIRE"), "{stderr}");
+    }
 
     fn shell_binary() -> PathBuf {
         if let Some(path) = std::env::var_os("EITRI_TEST_SHELL") {

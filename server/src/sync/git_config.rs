@@ -35,33 +35,70 @@ pub async fn answer(root: &str) -> GitConfigResponse {
 pub async fn answer_with(root: &str, environment: Environment) -> GitConfigResponse {
     let owned = root.to_owned();
     let checked = tokio::task::spawn_blocking(move || mirrorable_config(&owned)).await;
-    let config = match checked {
-        Ok(Ok(config)) => config,
+    let (git_dir, config) = match checked {
+        Ok(Ok(paths)) => paths,
         Ok(Err(refusal)) => return refused(refusal),
         Err(error) => return refused(format!("checking {root} failed: {error}")),
     };
+    // Resolve this directory directly so Git cannot fall back to a repository above the root.
+    let mut resolve = git_command(&environment);
+    resolve.args(["rev-parse", "--resolve-git-dir"]).arg(&git_dir);
+    match run_git(&mut resolve, &git_dir).await {
+        Ok(resolved) if resolved.strip_suffix(b"\n") == Some(git_dir.as_os_str().as_bytes()) => {}
+        Ok(_) => return refused(format!("{root}/.git resolves to another directory; {FORWARDED}")),
+        Err(error) => {
+            return refused(format!(
+                "{root}/.git is not a usable git directory ({error}); {FORWARDED}"
+            ))
+        }
+    }
     let Some(config) = config else {
         return entries(Vec::new());
     };
-    match list(&config, environment).await {
-        Ok(listed) if declares_partial_clone(&listed) => refused(format!(
+    let listed = match run_git(config_command(&environment, &config).args(["--list", "-z"]), &config).await {
+        Ok(listed) => listed,
+        Err(refusal) => return refused(refusal),
+    };
+    match declares_partial_clone(&listed, &config, &environment).await {
+        Ok(true) => refused(format!(
             "{root}/.git/config contains partial clone settings, so the copy may be missing objects; {FORWARDED}"
         )),
-        Ok(listed) => entries(sanitize(&parse_config_list(&listed))),
+        Ok(false) => entries(sanitize(&parse_config_list(&listed))),
         Err(refusal) => refused(refusal),
     }
 }
 
-fn declares_partial_clone(listed: &[u8]) -> bool {
+async fn declares_partial_clone(listed: &[u8], config: &Path, environment: &Environment) -> Result<bool, String> {
     // The allow-list drops these settings, and a promisor remote's subsection name can contain non-UTF-8 bytes.
-    listed.split(|&byte| byte == 0).any(|record| {
+    let mut has_promisor = false;
+    for record in listed.split(|&byte| byte == 0) {
         let key = record.split(|&byte| byte == b'\n').next().unwrap_or_default();
-        key == b"extensions.partialclone"
-            || key
-                .strip_prefix(b"remote.")
-                .and_then(|name| name.strip_suffix(b".promisor"))
-                .is_some_and(|name| !name.is_empty())
-    })
+        if key == b"extensions.partialclone" || remote_setting(key) == Some(b"partialclonefilter") {
+            return Ok(true);
+        }
+        has_promisor |= remote_setting(key) == Some(b"promisor");
+    }
+    if !has_promisor {
+        return Ok(false);
+    }
+    // Git normalizes implicit booleans and numeric spellings. Any true entry registers a promisor remote.
+    let mut command = config_command(environment, config);
+    command.args(["--type=bool", "-z", "--get-regexp", "^remote[.](.*[.])?promisor$"]);
+    let values = run_git(&mut command, config).await?;
+    Ok(values.split(|&byte| byte == 0).any(|record| {
+        record
+            .strip_suffix(b"\ntrue")
+            .is_some_and(|key| remote_setting(key) == Some(b"promisor"))
+    }))
+}
+
+fn remote_setting(key: &[u8]) -> Option<&[u8]> {
+    let key = key.strip_prefix(b"remote.")?;
+    // Git ignores promisor remotes whose name starts with a slash.
+    if key.starts_with(b"/") {
+        return None;
+    }
+    key.rsplit(|&byte| byte == b'.').next()
 }
 
 fn refused(refusal: String) -> GitConfigResponse {
@@ -85,9 +122,8 @@ fn entries(kept: Vec<(String, String)>) -> GitConfigResponse {
 
 const FORWARDED: &str = "git commands there run on the server";
 
-/// The repository config file of `root` (None when it has none), once the root is known to hold its own repository
-/// in a plain `.git` directory; otherwise the reason it cannot be mirrored.
-fn mirrorable_config(root: &str) -> Result<Option<PathBuf>, String> {
+/// The plain `.git` directory and its optional config, or the reason it cannot be mirrored.
+fn mirrorable_config(root: &str) -> Result<(PathBuf, Option<PathBuf>), String> {
     // Absolute, normal form, an existing directory this account owns: the checks every root-taking call makes.
     let held = open_root(root).map_err(|status| status.message().to_owned())?;
     let canonical = PathBuf::from(canonical_root(&held).map_err(|status| status.message().to_owned())?);
@@ -128,13 +164,13 @@ fn mirrorable_config(root: &str) -> Result<Option<PathBuf>, String> {
              be incomplete; {FORWARDED}"
         ));
     }
-    // Git can skip an empty .git directory and discover a repository above it. A replica needs its own HEAD
-    // and objects directory, and the sync excludes symbolic links.
+    // A replica needs its own HEAD, objects and refs. Sync excludes symbolic links.
     if !std::fs::symlink_metadata(git_dir.join("HEAD")).is_ok_and(|meta| meta.is_file())
         || !std::fs::symlink_metadata(git_dir.join("objects")).is_ok_and(|meta| meta.is_dir())
+        || !std::fs::symlink_metadata(git_dir.join("refs")).is_ok_and(|meta| meta.is_dir())
     {
         return Err(format!(
-            "{root}/.git requires a regular HEAD file and an objects directory to be mirrored; {FORWARDED}"
+            "{root}/.git requires a regular HEAD file and objects and refs directories to be mirrored; {FORWARDED}"
         ));
     }
     let config = git_dir.join("config");
@@ -142,9 +178,9 @@ fn mirrorable_config(root: &str) -> Result<Option<PathBuf>, String> {
         Ok(meta) if meta.file_type().is_symlink() => Err(format!(
             "{root}/.git/config is a symbolic link, so its entries would come from another file; {FORWARDED}"
         )),
-        Ok(meta) if meta.is_file() => Ok(Some(config)),
+        Ok(meta) if meta.is_file() => Ok((git_dir, Some(config))),
         Ok(_) => Err(format!("{root}/.git/config is not a regular file")),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok((git_dir, None)),
         Err(error) => Err(format!("cannot read {}: {error}", config.display())),
     }
 }
@@ -153,25 +189,34 @@ fn has_entry(path: &Path) -> bool {
     std::fs::symlink_metadata(path).is_ok()
 }
 
-async fn list(config: &Path, environment: Environment) -> Result<Vec<u8>, String> {
+fn git_command(environment: &Environment) -> tokio::process::Command {
     let mut command = tokio::process::Command::new("git");
     command
         .env_clear()
         .envs(
             environment
-                .into_iter()
+                .iter()
                 .filter(|(name, _)| !name.as_bytes().starts_with(b"GIT_")),
         )
         .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("LC_ALL", "C")
         .current_dir("/")
-        .args(["config", "--no-includes", "--file"])
-        .arg(config)
-        .args(["--list", "-z"])
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
-    let shown = config.display().to_string();
+    command
+}
+
+fn config_command(environment: &Environment, config: &Path) -> tokio::process::Command {
+    let mut command = git_command(environment);
+    command.args(["config", "--no-includes", "--file"]).arg(config);
+    command
+}
+
+async fn run_git(command: &mut tokio::process::Command, path: &Path) -> Result<Vec<u8>, String> {
+    let shown = path.display().to_string();
     let mut child = command
         .spawn()
         .map_err(|error| format!("cannot run git to read {shown}: {error}"))?;
@@ -223,7 +268,7 @@ async fn collect(child: &mut tokio::process::Child, shown: &str) -> Result<Vec<u
 mod tests {
     use super::*;
     use std::ffi::OsString;
-    use std::process::Command;
+    use std::process::{Command, Output};
 
     struct Scratch(PathBuf);
     impl Drop for Scratch {
@@ -258,10 +303,21 @@ mod tests {
     }
 
     fn git(scratch: &Scratch, cwd: &Path, args: &[&str]) {
-        let output = Command::new("git")
+        let output = git_output(scratch, cwd, args);
+        assert!(
+            output.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    fn git_output(scratch: &Scratch, cwd: &Path, args: &[&str]) -> Output {
+        Command::new("git")
             .env_clear()
             .envs(environment(&scratch.0.join("home")))
             .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_ALLOW_PROTOCOL", "")
+            .env("LC_ALL", "C")
             .env("GIT_AUTHOR_NAME", "Someone")
             .env("GIT_AUTHOR_EMAIL", "someone@example.com")
             .env("GIT_COMMITTER_NAME", "Someone")
@@ -269,12 +325,7 @@ mod tests {
             .current_dir(cwd)
             .args(args)
             .output()
-            .unwrap();
-        assert!(
-            output.status.success(),
-            "git {args:?}: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
+            .unwrap()
     }
 
     fn repository(scratch: &Scratch, name: &str) -> PathBuf {
@@ -376,6 +427,65 @@ mod tests {
         let response = ask(&scratch, &subdir).await;
         assert!(response.refusal.contains(FORWARDED), "{response:?}");
         assert!(response.entries.is_empty() && response.digest.is_empty());
+    }
+
+    #[tokio::test]
+    async fn partial_git_dirs_that_git_skips_are_refused() {
+        let scratch = scratch("partial-gitdir");
+        let root = repository(&scratch, "repo");
+        let subdir = root.join("child");
+        let git_dir = subdir.join(".git");
+        std::fs::create_dir_all(git_dir.join("objects")).unwrap();
+        std::fs::create_dir(git_dir.join("refs")).unwrap();
+        std::fs::write(git_dir.join("HEAD"), "").unwrap();
+        for missing in ["HEAD contents", "refs directory"] {
+            let discovery = git_output(&scratch, &subdir, &["rev-parse", "--show-prefix"]);
+            assert!(discovery.status.success());
+            assert_eq!(discovery.stdout, b"child/\n", "{missing}");
+
+            let response = ask(&scratch, &subdir).await;
+            assert!(response.refusal.contains(FORWARDED), "{missing}: {response:?}");
+            assert!(response.entries.is_empty() && response.digest.is_empty());
+
+            if missing == "HEAD contents" {
+                std::fs::write(git_dir.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+                std::fs::remove_dir(git_dir.join("refs")).unwrap();
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn partial_clone_eligibility_matches_git_promisor_settings() {
+        let scratch = scratch("promisor-settings");
+        let root = repository(&scratch, "repo");
+        let config = root.join(".git/config");
+        let original = std::fs::read_to_string(&config).unwrap();
+        for (settings, promisor) in [
+            ("partialCloneFilter = blob:none", true),
+            ("promisor = false\npartialCloneFilter = blob:none", true),
+            ("promisor", true),
+            ("promisor = true\npromisor = false", true),
+            ("promisor = false", false),
+            ("promisor = OFF", false),
+            ("promisor =", false),
+            ("promisor = 0x0k", false),
+        ] {
+            std::fs::write(
+                &config,
+                format!("{original}\n[remote \"origin.with.dots\"]\nurl = /srv/project\n{settings}\n"),
+            )
+            .unwrap();
+            let output = git_output(&scratch, &root, &["cat-file", "-p", &"1".repeat(40)]);
+            assert!(!output.status.success());
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert_eq!(stderr.contains("transport 'file' not allowed"), promisor, "{stderr}");
+
+            let response = ask(&scratch, &root).await;
+            assert_eq!(response.refusal.is_empty(), !promisor, "{settings}: {response:?}");
+            if promisor {
+                assert!(response.refusal.contains("partial clone"), "{response:?}");
+            }
+        }
     }
 
     #[tokio::test]

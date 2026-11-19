@@ -4,6 +4,7 @@ mod remote_sync {
         use eitri_core::remote_sync::engine::{Conflict, EntryKind, FlushOutcome, Role, SessionStatus, SyncState};
         use eitri_core::remote_sync::git_shim::forward::{Conflicts, Services};
         use eitri_core::remote_sync::git_shim::{classify, run_with, Route, ShimEnv};
+        use eitri_core::remote_sync::mutagen_json::parse_sessions;
         use eitri_core::remote_sync::status_schema::{ConflictEntry, StatusFile, STATUS_VERSION};
         use eitri_core::remote_sync::SyncKey;
         use std::ffi::OsString;
@@ -125,6 +126,7 @@ mod remote_sync {
             outcome: FlushOutcome,
             post_outcome: Option<FlushOutcome>,
             engine_state: SyncState,
+            engine_listing: Option<&'static [u8]>,
             engine_conflicts: Option<Vec<String>>,
             conflicts_error: Option<String>,
             excluded_conflicts: u64,
@@ -145,6 +147,7 @@ mod remote_sync {
                     outcome: FlushOutcome::Flushed,
                     post_outcome: None,
                     engine_state: SyncState::Watching,
+                    engine_listing: None,
                     engine_conflicts: None,
                     conflicts_error: None,
                     excluded_conflicts: 0,
@@ -167,6 +170,10 @@ mod remote_sync {
                 if let Some(error) = &self.conflicts_error {
                     return Err(error.clone());
                 }
+                if let Some(listing) = self.engine_listing {
+                    let status = parse_sessions(listing).unwrap().remove(0);
+                    return Ok(status.into());
+                }
                 let paths = self.engine_conflicts.clone().unwrap_or_else(|| {
                     self.status
                         .as_ref()
@@ -178,6 +185,7 @@ mod remote_sync {
                 });
                 let mut status = SessionStatus::disconnected("recorded-tree", Role::Tree, "fake");
                 status.state = self.engine_state.clone();
+                status.successful_cycles = 1;
                 status.conflicts = paths
                     .into_iter()
                     .map(|path| Conflict {
@@ -425,6 +433,45 @@ mod remote_sync {
             let (code, _, err) = repo.invoke(&["--no-replace-objects", "-C", "project", "add", "file"], &mut fake);
             assert_eq!(code, 0, "{err}");
             assert_eq!(fake.exec_cwd, Some(root));
+        }
+        #[test]
+        fn global_options_before_dash_c_cannot_hide_a_replica_write() {
+            let mut repo = Repo::new();
+            let root = std::mem::replace(&mut repo.env.cwd, repo.base.clone());
+            std::fs::write(root.join("file"), "changed\n").unwrap();
+            for globals in [
+                &["--namespace=review"][..],
+                &["--namespace", "review"],
+                &["--attr-source=HEAD"],
+                &["--attr-source", "HEAD"],
+                &["--config-env=user.name=EXAMPLE"],
+                &["--config-env", "user.name=EXAMPLE"],
+                &["--super-prefix=review"],
+                &["--super-prefix", "review"],
+                &["--exec-path=/srv/project"],
+                &["--shallow-file", "shallow"],
+                &["--no-lazy-fetch", "--no-advice", "--no-literal-pathspecs"],
+            ] {
+                let mut fake = Fake::default();
+                let mut words = globals.to_vec();
+                words.extend(["-C", "project", "add", "file"]);
+                let (code, _, err) = repo.invoke(&words, &mut fake);
+                assert_eq!(code, 0, "{words:?}: {err}");
+                assert_eq!(fake.exec_cwd.as_ref(), Some(&root), "{words:?}");
+            }
+            for query in [
+                "--exec-path",
+                "--html-path",
+                "--man-path",
+                "--info-path",
+                "--list-cmds=builtins",
+            ] {
+                let mut fake = Fake::default();
+                let (code, out, err) = repo.invoke(&[query, "-C", "project", "add", "file"], &mut fake);
+                assert_eq!(code, 0, "{query}: {err}");
+                assert!(!out.is_empty(), "{query}");
+                assert!(fake.calls.is_empty(), "{query}");
+            }
         }
         #[test]
         fn relative_git_dir_before_dash_c_still_selects_mirror() {
@@ -719,6 +766,25 @@ mod remote_sync {
             }
         }
         #[test]
+        fn tag_and_symbolic_ref_count_operands_after_the_separator() {
+            for words in [
+                &["tag", "--", "release"][..],
+                &["tag", "--end-of-options", "release"],
+                &["symbolic-ref", "HEAD", "--", "refs/heads/topic"],
+                &["symbolic-ref", "HEAD", "--end-of-options", "refs/heads/topic"],
+            ] {
+                assert!(matches!(route(words), Route::Forward { .. }), "{words:?}");
+            }
+            for words in [
+                &["tag", "--"][..],
+                &["tag", "--list", "--", "release"],
+                &["symbolic-ref", "--", "HEAD"],
+                &["symbolic-ref", "HEAD", "--"],
+            ] {
+                assert_eq!(route(words), Route::Local { extra: vec![] }, "{words:?}");
+            }
+        }
+        #[test]
         fn outside_a_remote_root_the_real_git_runs_unchanged() {
             let mut repo = Repo::new();
             repo.env.projects.clear();
@@ -912,6 +978,75 @@ mod remote_sync {
                 assert!(err.contains(": file;"), "{err}");
                 assert_eq!(fake.calls, ["flush recorded-tree"]);
             }
+        }
+        #[test]
+        fn rm_and_mv_check_conflicts_on_both_sides_of_the_separator() {
+            let repo = Repo::new();
+            for command in ["rm", "mv"] {
+                for separator in ["--", "--end-of-options"] {
+                    for (first, second) in [("file", "clean"), ("clean", "file")] {
+                        let words = [command, "-f", first, separator, second];
+                        assert_eq!(
+                            route(&words),
+                            Route::Forward {
+                                whole_tree: false,
+                                paths: vec![first.into(), second.into()],
+                            },
+                            "{words:?}"
+                        );
+                        let mut fake = Fake::default();
+                        conflict(&mut fake);
+                        let (code, _, err) = repo.invoke(&words, &mut fake);
+                        assert_eq!(code, 1, "{words:?}: {err}");
+                        assert!(err.contains(": file;"), "{words:?}: {err}");
+                        assert_eq!(fake.calls, ["flush recorded-tree"]);
+                    }
+                }
+            }
+        }
+        #[test]
+        fn trailing_separator_keeps_branch_checkout_whole_tree() {
+            let repo = Repo::new();
+            let mut fake = Fake::default();
+            conflict(&mut fake);
+            let (code, _, err) = repo.invoke(&["checkout", "-f", "topic", "--"], &mut fake);
+            assert_eq!(code, 1, "{err}");
+            assert!(err.contains(": file;"), "{err}");
+            assert_eq!(fake.calls, ["flush recorded-tree"]);
+            assert_eq!(
+                route(&["checkout", "topic", "--", "clean"]),
+                Route::Forward {
+                    whole_tree: false,
+                    paths: vec!["clean".into()],
+                }
+            );
+        }
+        #[test]
+        fn first_cycle_after_reconnect_cannot_authorize_a_reset() {
+            let repo = Repo::new();
+            for listing in [
+                &br#"[{"status":"reconciling","successfulCycles":0}]"#[..],
+                br#"[{"status":"staging-alpha","successfulCycles":0}]"#,
+                br#"[{"status":"transitioning","successfulCycles":0}]"#,
+                br#"[{"status":"saving","successfulCycles":0}]"#,
+                br#"[{"status":"reconciling"}]"#,
+            ] {
+                let mut fake = Fake {
+                    engine_listing: Some(listing),
+                    ..Default::default()
+                };
+                let (code, _, err) = repo.invoke(&["reset", "--hard"], &mut fake);
+                assert_eq!(code, 1, "{err}");
+                assert!(err.contains("nothing was run"), "{err}");
+                assert_eq!(fake.calls, ["flush recorded-tree"]);
+            }
+            let mut fake = Fake {
+                engine_listing: Some(br#"[{"status":"reconciling","successfulCycles":1}]"#),
+                ..Default::default()
+            };
+            let (code, _, err) = repo.invoke(&["reset", "--hard"], &mut fake);
+            assert_eq!(code, 0, "{err}");
+            assert!(fake.calls.iter().any(|call| call == "exec"));
         }
         #[test]
         fn forward_refuses_reset_when_conflict_status_is_unreadable() {

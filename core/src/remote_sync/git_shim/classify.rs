@@ -69,10 +69,7 @@ impl Invocation {
                 } else {
                     parsed.foreign = true;
                 }
-            } else if matches!(
-                arg.as_ref(),
-                "-c" | "--config-env" | "--namespace" | "--super-prefix" | "--attr-source" | "--list-cmds"
-            ) {
+            } else if global_takes_separate_value(&arg) {
                 parsed.globals.push(args[i].clone());
                 i += 1;
                 if let Some(value) = args.get(i) {
@@ -83,7 +80,14 @@ impl Invocation {
                 if arg != "-c" {
                     parsed.foreign = true;
                 }
-            } else if arg.starts_with("--config-env=") || arg.starts_with("--exec-path") || arg == "--bare" {
+            } else if arg == "--bare"
+                || arg.split_once('=').is_some_and(|(name, _)| {
+                    matches!(
+                        name,
+                        "--config-env" | "--namespace" | "--super-prefix" | "--attr-source" | "--exec-path"
+                    )
+                })
+            {
                 parsed.foreign = true;
                 parsed.globals.push(args[i].clone());
             } else if matches!(
@@ -93,16 +97,20 @@ impl Invocation {
                     | "-p"
                     | "-P"
                     | "--literal-pathspecs"
+                    | "--no-literal-pathspecs"
                     | "--glob-pathspecs"
                     | "--noglob-pathspecs"
                     | "--icase-pathspecs"
                     | "--no-optional-locks"
                     | "--no-replace-objects"
+                    | "--no-lazy-fetch"
+                    | "--no-advice"
             ) || arg.starts_with("-c") && arg.len() > 2
             {
                 parsed.icase_pathspecs |= arg == "--icase-pathspecs";
                 parsed.globals.push(args[i].clone());
             } else {
+                // Git's version, help and path/listing queries end global parsing before any later -C.
                 break;
             }
             i += 1;
@@ -140,12 +148,7 @@ impl Invocation {
                     }
                 }
             } else {
-                let takes_value = arg == "-c"
-                    || arg == "--config-env"
-                    || arg == "--namespace"
-                    || arg == "--super-prefix"
-                    || arg == "--attr-source"
-                    || arg == "--list-cmds";
+                let takes_value = global_takes_separate_value(&arg.to_string_lossy());
                 globals.push(arg);
                 if takes_value {
                     if let Some(value) = values.next() {
@@ -161,6 +164,13 @@ impl Invocation {
     pub fn forwarded_args(&self) -> Vec<OsString> {
         self.globals.iter().chain(&self.args).cloned().collect()
     }
+}
+
+fn global_takes_separate_value(arg: &str) -> bool {
+    matches!(
+        arg,
+        "-c" | "--config-env" | "--namespace" | "--super-prefix" | "--attr-source" | "--shallow-file"
+    )
 }
 
 pub(super) fn normalize(path: &Path) -> PathBuf {
@@ -255,7 +265,7 @@ pub(super) fn classify_invocation(args: &[OsString], allow_local: bool) -> Route
         | "merge-base" | "name-rev" | "describe" | "check-ignore" | "check-attr" | "var" | "--version" | "help" => true,
         "cat-file" => cat_file_read(options),
         "symbolic-ref" => {
-            options.iter().filter(|s| !s.starts_with('-')).count() == 1
+            parsed.operands.len() == 1
                 && options
                     .iter()
                     .all(|s| !s.starts_with('-') || matches!(s.as_ref(), "--short" | "--quiet" | "-q"))
@@ -284,7 +294,7 @@ pub(super) fn classify_invocation(args: &[OsString], allow_local: bool) -> Route
                     && (options.len() == 1 || options.len() == 2 && !options[1].starts_with('-'))
         }
         "tag" => {
-            options.is_empty()
+            options.is_empty() && parsed.operands.is_empty()
                 || options.first().is_some_and(|s| s == "-l" || s == "--list")
                     && options[1..].iter().all(|s| !s.starts_with('-'))
         }
@@ -319,25 +329,21 @@ pub(super) fn classify_invocation(args: &[OsString], allow_local: bool) -> Route
             },
         };
     }
-    let path_separator = if words.get(end).is_some_and(|word| word == "--") {
-        end
-    } else {
-        args.len()
-    };
+    let path_separator = words.get(end).is_some_and(|word| word == "--");
     let mut paths = if cmd == "commit" {
         commit_paths(args, &parsed)
     } else {
-        path_arguments(cmd, args, path_separator)
+        path_arguments(cmd, args, &parsed, path_separator)
     };
     paths.extend(output_files.into_iter().flatten());
     let whole = match cmd {
         "commit" => paths.is_empty() || short('a') || has("--all"),
         "add" => paths.is_empty() || paths.iter().any(|p| p == Path::new(".")),
         "stash" => true,
-        "checkout" => path_separator == args.len(),
+        "checkout" => paths.is_empty(),
         "switch" => true,
         "restore" => paths.is_empty(),
-        "reset" => path_separator == args.len() || has("--hard") || has("--merge") || has("--keep") || paths.is_empty(),
+        "reset" => !path_separator || has("--hard") || has("--merge") || has("--keep") || paths.is_empty(),
         "merge" | "rebase" | "pull" | "cherry-pick" | "revert" | "am" => true,
         "apply" => !has("--cached"),
         "rm" | "mv" => paths.is_empty(),
@@ -388,6 +394,7 @@ impl<'a> CommandOptions<'a> {
         while let Some((index, arg)) = args.next() {
             if matches!(arg.as_ref(), "--" | "--end-of-options") {
                 parsed.end = index;
+                parsed.operands.extend(args.map(|(index, _)| index));
                 break;
             }
             if arg.starts_with("--") {
@@ -428,7 +435,6 @@ fn commit_paths(args: &[OsString], options: &CommandOptions<'_>) -> Vec<PathBuf>
         .operands
         .iter()
         .map(|&index| PathBuf::from(&args[index]))
-        .chain(args.iter().skip(options.end + 1).map(PathBuf::from))
         .collect()
 }
 
@@ -466,28 +472,23 @@ fn commit_option_known(name: &str) -> bool {
         )
 }
 
-fn path_arguments(cmd: &str, args: &[OsString], end: usize) -> Vec<PathBuf> {
-    if matches!(cmd, "push" | "fetch" | "tag" | "branch" | "remote" | "config" | "help") {
-        return vec![];
-    }
-    let (before_separator, after_separator) = args.split_at(end);
-    let explicit_paths = after_separator.iter().skip(1).map(PathBuf::from);
-    if !after_separator.is_empty() && cmd != "add" {
-        return explicit_paths.collect();
-    }
+fn path_arguments(cmd: &str, args: &[OsString], parsed: &CommandOptions<'_>, path_separator: bool) -> Vec<PathBuf> {
     if matches!(
         cmd,
-        "apply" | "am" | "stash" | "switch" | "merge" | "rebase" | "pull" | "cherry-pick" | "revert"
+        "push" | "fetch" | "tag" | "symbolic-ref" | "branch" | "remote" | "config" | "help"
     ) {
         return vec![];
     }
-    // Only unambiguous path commands accept implicit paths. Other commands require an explicit separator.
+    // These commands accept paths on both sides. Other commands need a separator to distinguish paths from revisions.
     if !matches!(cmd, "add" | "rm" | "mv" | "restore") {
-        return vec![];
+        return if path_separator {
+            args[parsed.end + 1..].iter().map(PathBuf::from).collect()
+        } else {
+            vec![]
+        };
     }
-    let mut paths = vec![];
     let mut skip = false;
-    for arg in &before_separator[1..] {
+    for arg in &args[1..parsed.end] {
         if skip {
             skip = false;
             continue;
@@ -531,12 +532,13 @@ fn path_arguments(cmd: &str, args: &[OsString], end: usize) -> Vec<PathBuf> {
             if !known {
                 return vec![];
             }
-        } else {
-            paths.push(PathBuf::from(arg));
         }
     }
-    paths.extend(explicit_paths);
-    paths
+    parsed
+        .operands
+        .iter()
+        .map(|&index| PathBuf::from(&args[index]))
+        .collect()
 }
 
 fn short_takes_value(cmd: &str, ch: char) -> bool {

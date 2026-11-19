@@ -186,6 +186,7 @@ fn convert(raw: Session) -> Result<SessionStatus, SyncError> {
         name: raw.name,
         role,
         state,
+        successful_cycles: raw.successful_cycles,
         conflicts,
         problems,
         excluded_conflicts: raw.excluded_conflicts,

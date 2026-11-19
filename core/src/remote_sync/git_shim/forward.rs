@@ -10,6 +10,7 @@ use std::time::Duration;
 #[derive(Clone, Debug)]
 pub struct Conflicts {
     pub state: SyncState,
+    pub successful_cycles: u64,
     pub paths: Vec<String>,
     pub excluded: u64,
 }
@@ -18,6 +19,7 @@ impl From<SessionStatus> for Conflicts {
     fn from(status: SessionStatus) -> Self {
         Self {
             state: status.state,
+            successful_cycles: status.successful_cycles,
             paths: status.conflicts.into_iter().map(|c| c.path).collect(),
             excluded: status.excluded_conflicts,
         }
@@ -90,6 +92,9 @@ pub(super) fn forward(
     };
     // Mutagen can clear conflicts on reconnect, and a scanning status does not say whether a cycle has completed.
     let non_current = match conflicts.state {
+        SyncState::Watching | SyncState::Staging | SyncState::Applying if conflicts.successful_cycles == 0 => {
+            Some("still completing its first sync cycle")
+        }
         SyncState::Watching | SyncState::Staging | SyncState::Applying => None,
         SyncState::Disconnected(_) => Some("disconnected"),
         SyncState::Connecting => Some("connecting"),

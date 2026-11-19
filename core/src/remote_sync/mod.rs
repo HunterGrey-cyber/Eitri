@@ -10,6 +10,7 @@ pub mod mutagen;
 pub mod mutagen_json;
 pub mod shim_dir;
 pub mod status_schema;
+pub mod transport;
 
 use sha2::{Digest, Sha256};
 use std::fmt;

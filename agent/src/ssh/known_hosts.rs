@@ -8,6 +8,26 @@ pub struct HostKey {
     pub sha256: String,
 }
 
+#[derive(Debug)]
+pub enum HostKeyRefusal {
+    NoKey,
+    Mismatch { expected: String, observed: String },
+}
+
+impl std::fmt::Display for HostKeyRefusal {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NoKey => formatter.write_str("SSH did not record a host key"),
+            Self::Mismatch { expected, observed } => write!(
+                formatter,
+                "SSH host key changed from {expected} to {observed}; refusing lifecycle command"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for HostKeyRefusal {}
+
 /// Prints nothing: SSH's own known-hosts files remain the authority for accepting a key.
 pub fn probe_main(args: &[OsString]) -> i32 {
     if record(args).is_ok() {
@@ -61,10 +81,7 @@ pub fn read_key(record: &Path) -> io::Result<HostKey> {
     let text = crate::private_fs::read_private_nofollow_capped(record, 16384)?;
     let [_host, key_type, sha256]: [String; 3] = serde_json::from_str(&text)?;
     if key_type.is_empty() || key_type == "NONE" || !sha256.starts_with("SHA256:") || sha256.len() <= 7 {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "SSH did not record a host key",
-        ));
+        return Err(io::Error::new(io::ErrorKind::InvalidData, HostKeyRefusal::NoKey));
     }
     Ok(HostKey { key_type, sha256 })
 }

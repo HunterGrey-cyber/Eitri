@@ -34,6 +34,7 @@ impl MutagenEngine {
     }
 
     pub fn open(state_home: &Path, configured: Option<&Path>, transport: &Path) -> Result<Self, SyncError> {
+        super::transport::install(state_home, transport).map_err(|error| SyncError::Io(error.to_string()))?;
         Self::from_daemon(Daemon::prepare(state_home, configured, Some(transport.to_owned()))?)
     }
 

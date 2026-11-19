@@ -117,7 +117,10 @@ fn check_host_key(observed: Option<io::Result<String>>, expected: &str) -> io::R
         if observed != expected {
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
-                format!("SSH host key changed from {expected} to {observed}; refusing lifecycle command"),
+                super::known_hosts::HostKeyRefusal::Mismatch {
+                    expected: expected.to_owned(),
+                    observed,
+                },
             ));
         }
     }
