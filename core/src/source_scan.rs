@@ -149,6 +149,15 @@ fn dependency_tables(manifest: &toml::Table) -> impl Iterator<Item = (String, &t
         })
 }
 
+/// A crate manifest read as TOML, for a guard that checks more than which dependencies it names: whether one is
+/// optional, which features turn it on.
+///
+/// # Panics
+/// When the manifest is not valid TOML.
+pub fn manifest_table(manifest: &str) -> toml::Table {
+    manifest.parse::<toml::Table>().expect("valid crate manifest TOML")
+}
+
 /// The table and key of each forbidden dependency name or renamed package in a crate manifest.
 pub fn manifest_dependency_offenders(manifest: &str, forbidden: impl Fn(&str) -> bool) -> Vec<String> {
     let manifest = manifest.parse::<toml::Table>().expect("valid crate manifest TOML");

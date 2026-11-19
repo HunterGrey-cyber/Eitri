@@ -10,7 +10,7 @@
 //! `[workspace.dependencies]` is not: this manifest names only the key. What it cannot see is a toolkit arriving
 //! transitively through another dependency; `cargo tree -p eitri-terminal -e normal` is the check for that.
 
-use eitri_core::source_scan::{is_package_in_family, manifest_dependency_offenders};
+use eitri_core::source_scan::{is_package_in_family, manifest_dependency_offenders, manifest_table};
 #[cfg(test)]
 use eitri_core::source_scan::{AWKWARD_DEPENDENCY_SPELLINGS, NAMES_INSIDE_OTHER_WORDS};
 
@@ -80,31 +80,34 @@ fn every_shape_of_a_toolkit_dependency_is_caught() {
     }
 }
 
+/// Skia is one optional dependency that only `paint` turns on, and `paint` is a default feature: a build without
+/// default features (the remote server's headless terminals) links no Skia.
 #[test]
 fn skia_is_optional_and_only_behind_paint() {
-    let compact: String = MANIFEST
-        .lines()
-        .map(|line| line.split('#').next().unwrap_or_default())
-        .collect::<String>()
-        .chars()
-        .filter(|c| !c.is_whitespace())
-        .collect();
-    let skia = compact.split_once("skia-safe={").expect("Skia dependency").1;
-    let fields = skia.split_once('}').expect("inline dependency table").0;
-    assert!(fields.split(',').any(|field| field == "optional=true"));
-    let features = compact
-        .split_once("[features]")
-        .expect("explicit paint feature")
-        .1
-        .split("[dependencies]")
-        .next()
-        .unwrap();
-    assert!(features.contains("default=[\"paint\"]"));
-    assert!(features.contains("paint=[\"dep:skia-safe\"]"));
-    for entry in features.split(']') {
-        if entry.contains("skia-safe") {
-            assert_eq!(entry, "paint=[\"dep:skia-safe\"", "Skia belongs only to paint");
-        }
+    assert_eq!(
+        manifest_dependency_offenders(MANIFEST, |name| name == "skia-safe"),
+        ["[dependencies] skia-safe"],
+        "Skia is declared once, as a normal dependency"
+    );
+    let manifest = manifest_table(MANIFEST);
+    let skia = &manifest["dependencies"]["skia-safe"];
+    assert_eq!(skia.get("optional").and_then(|optional| optional.as_bool()), Some(true));
+    let features = manifest["features"].as_table().expect("a [features] table");
+    let enables = |feature: &str| -> Vec<&str> {
+        features[feature]
+            .as_array()
+            .expect("a feature is a list")
+            .iter()
+            .map(|entry| entry.as_str().expect("a feature entry is a string"))
+            .collect()
+    };
+    assert_eq!(enables("default"), ["paint"]);
+    assert_eq!(enables("paint"), ["dep:skia-safe"]);
+    for feature in features.keys().filter(|feature| *feature != "paint") {
+        assert!(
+            !enables(feature).iter().any(|entry| entry.contains("skia-safe")),
+            "`{feature}` turns Skia on; only `paint` may"
+        );
     }
 }
 
