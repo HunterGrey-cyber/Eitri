@@ -42,9 +42,6 @@ RS_IMAGE_REPO=eitri-release-build
 RS_BINARIES=(shell eitri-tmux-shim eitri-claude-handoff eitri-run-guard eitri-editor-bridge eitri-server)
 RS_VERSION_ERE='^[0-9]+\.[0-9]+\.[0-9]+(-rc\.[0-9]+)?$'
 RS_LEGACY_MESSAGE='the legacy backend is not in this build'
-# Public identity required by public_commits_check for the released commit.
-RS_PUBLIC_NAME="Hunter Grey"
-RS_PUBLIC_EMAIL="71165939+HunterGrey-cyber@users.noreply.github.com"
 
 die() { echo "release.sh: $*" >&2; exit 1; }
 say() { echo "release.sh: $*" >&2; }
@@ -297,59 +294,6 @@ source_asset_url() {
 	printf '%s\n' "$RS_PUBLIC_REPO/releases/download/v$1/eitri-$1-source.tar.gz"
 }
 
-# public_commits_check CLONE: HEAD is the commit this run releases. The printed
-# git push origin HEAD:main publishes it and its unpublished ancestors.
-# HEAD must use RS_PUBLIC_NAME/EMAIL for both author and committer. Its raw object
-# must pass RS_SCAN --message and its full tree must pass the content scan, even
-# when already public. Check unpublished commits reachable from HEAD or main too,
-# as publish/tag.sh does. Read public branches with git ls-remote against the public
-# repository, since local origin refs can already contain unpublished commits.
-# A public tip missing locally excludes nothing, so missing tips only widen the scan.
-# EITRI_PUBLIC_REPO_URL reads the public branches from another URL, for tests, with a warning.
-# Replacement objects change what git log, rev-list and cat-file read, but a push
-# still sends the originals. Ignore replacements for all reads and reject clones
-# with refs/replace/ entries, which would also affect git archive in the build container.
-public_commits_check() {
-	local -x GIT_NO_REPLACE_OBJECTS=1
-	local ident dump url refs sha ref head new count replace_refs tips="" base=() published=(HEAD)
-	replace_refs="$(git -C "$1" for-each-ref --count=1 refs/replace/)" || die "cannot list $1's refs"
-	[ -z "$replace_refs" ] \
-		|| die "$1 has replacement refs (refs/replace/, from git replace): they change what git log, this scan and the build read, never what a push sends, so 'git replace --edit' fixes nothing a push publishes -- delete them (git -C $1 replace -d <sha>) and rewrite the commit instead"
-	ident="$(git -C "$1" log -1 --format='%an <%ae>|%cn <%ce>' HEAD)" || die "cannot read $1's HEAD commit"
-	[ "$ident" = "$RS_PUBLIC_NAME <$RS_PUBLIC_EMAIL>|$RS_PUBLIC_NAME <$RS_PUBLIC_EMAIL>" ] \
-		|| die "$1's HEAD is authored|committed as '$ident', not the public identity $RS_PUBLIC_NAME <$RS_PUBLIC_EMAIL> publish/commit.sh commits with: a release publishes that commit as it is"
-	url="${EITRI_PUBLIC_REPO_URL:-$RS_PUBLIC_REPO.git}"
-	[ "$url" = "$RS_PUBLIC_REPO.git" ] || warn "reading the public repo's branches from $url (EITRI_PUBLIC_REPO_URL, for tests), not $RS_PUBLIC_REPO.git"
-	refs="$(GIT_TERMINAL_PROMPT=0 git -C "$1" ls-remote "$url")" \
-		|| die "cannot read the branches of $url: the commits new to the public repo, which are the ones scanned, are read from it, never from $1's own refs/remotes/origin/*"
-	while IFS=$'\t' read -r sha ref; do
-		case "$ref" in refs/heads/*) ;; *) continue ;; esac
-		tips="$tips ${ref#refs/heads/} at ${sha:0:12}"
-		if git -C "$1" cat-file -e "$sha^{commit}" 2>/dev/null; then
-			base+=("$sha")
-		else
-			warn "$url's ${ref#refs/heads/} is at $sha, which $1 does not have (git -C $1 fetch origin): the scan also reads the commits it would have excluded"
-		fi
-	done <<< "$refs"
-	if git -C "$1" rev-parse -q --verify refs/heads/main >/dev/null; then published+=(refs/heads/main); fi
-	head="$(git -C "$1" rev-parse HEAD)" || die "cannot read $1's HEAD commit"
-	new="$(git -C "$1" rev-list "${published[@]}" --not ${base[@]+"${base[@]}"})" \
-		|| die "cannot list the commits $1 would publish"
-	count=0
-	[ -z "$new" ] || count="$(printf '%s\n' "$new" | wc -l)"
-	say "$url has${tips:- no branches}; $count commit(s) reachable from HEAD or main are new to it -- scanning those and HEAD"
-	mkdir -p -- "${XDG_CACHE_HOME:-$HOME/.cache}"
-	dump="$(mktemp "${XDG_CACHE_HOME:-$HOME/.cache}/eitri-release-commits.XXXXXX")"
-	if ! { printf '%s\n' "$head"; [ -z "$new" ] || printf '%s\n' "$new"; } | awk '!seen[$0]++' \
-		| git -C "$1" cat-file --batch > "$dump"; then
-		rm -f -- "$dump"
-		die "cannot read the commits $1 would publish"
-	fi
-	"$RS_SCAN" --commit-trees "$1" --message "$dump" \
-		|| die "a commit 'git push origin HEAD:main' would publish from $1 does not pass publish/scan.sh (tree hits name commit:path; metadata line numbers are in $dump, kept)"
-	rm -f -- "$dump"
-}
-
 # fork_history_check CLONE: the fork submodule publishes all ancestors of its pinned
 # commit, which public_commits_check and the asset scans do not inspect. Pass that
 # commit to publish/fork-guard.sh to reject assistant trailers and author or committer
@@ -435,6 +379,10 @@ preflight() {
 	RS_SCAN="$(dirname "$script_path")/../publish/scan.sh"
 	if [ -x "$RS_SCAN" ]; then
 		[ "$RS_NO_LEAK_SCAN" = 0 ] || die "--no-leak-scan, but $RS_SCAN is here: where the scanner exists it always runs"
+		# public_commits_check and the public identity, shared with publish/tag.sh. Absent from the public tree,
+		# like the scanner beside it.
+		# shellcheck disable=SC1091
+		. "$(dirname "$RS_SCAN")/public-commits.sh"
 	elif [ "$RS_NO_LEAK_SCAN" = 0 ]; then
 		die "publish/scan.sh is not beside this release.sh ($RS_SCAN): run the private checkout's packaging/release.sh, which has the host leak scan, or pass --no-leak-scan to reproduce a release candidate without it"
 	else
@@ -652,7 +600,9 @@ preflight() {
 	# Check commit metadata whenever host_scans runs. --no-leak-scan skips both checks;
 	# it is refused for final versions and whenever publish/scan.sh is available.
 	if [ "$RS_NO_LEAK_SCAN" = 0 ]; then
-		public_commits_check "$RS_SOURCE"
+		# HEAD is the commit this run releases; the printed git push origin HEAD:main publishes it and its
+		# unpublished ancestors. Its full tree is scanned even when already public.
+		public_commits_check "$RS_SOURCE" HEAD "$RS_SCAN"
 		fork_history_check "$RS_SOURCE"
 	else
 		warn "--no-leak-scan: $RS_SOURCE's HEAD, the commits a push would publish and the fork's commits are not checked for a private identity or path"

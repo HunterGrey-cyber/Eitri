@@ -41,7 +41,7 @@ TAGLINE = "Sick of reading agent replies and Markdown in a terminal? Run your ow
 _VERDANDI_REV = "0123456789abcdef0123456789abcdef01234567"
 _NVIM_PIN = "NVIM_VERSION=0.11.4\nNVIM_SHA256_linux_x86_64=" + "ab" * 32 + "\n"
 _DOCKER_EXIT = 97
-# The identity every public commit carries: release.sh's RS_PUBLIC_NAME/RS_PUBLIC_EMAIL.
+# The identity every public commit carries: publish/public-commits.sh's PUBLIC_NAME/PUBLIC_EMAIL.
 _PUBLIC_NAME = "Hunter Grey"
 _PUBLIC_EMAIL = "71165939+HunterGrey-cyber@users.noreply.github.com"
 # The fixture's packaging/release-signers, and the matching block a
