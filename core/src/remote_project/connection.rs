@@ -128,20 +128,26 @@ impl RemoteConnection {
         }
     }
 
-    /// Starts a remote Claude tab (`AgentBackend::start_remote`) spending `account`. Blocking.
+    /// Starts a remote Claude tab (`AgentBackend::start_remote`) spending `account`. A sidecar left running by a
+    /// failed start whose stop did not go through has its stop kept in the project's record in `store`, where the
+    /// window's stop sender (and any later window's) sends it once the server can be reached. Blocking.
     pub fn start_tab(
         &self,
         account: Option<&str>,
         project: ProjectTrust,
         client_tools: Option<agent::ClientToolSet>,
+        store: &RemoteProjects,
     ) -> Result<AgentBackend, BackendError> {
-        AgentBackend::start_remote(
+        let kept = std::cell::Cell::new(None);
+        let started = AgentBackend::start_remote(
             self.client.clone(),
             &self.project.host_key_sha256,
             &self.sidecar_start(account),
             project,
             client_tools,
-        )
+            |sidecar| kept.set(Some(keep_unstopped(store, &self.project, sidecar))),
+        );
+        started.map_err(|error| with_kept_stop(error, kept.take(), &self.project.host))
     }
 
     /// Takes a saved remote tab up again: the sidecar `handoff` names, its history folded afresh from the
@@ -153,22 +159,27 @@ impl RemoteConnection {
     }
 
     /// Continues the CLI's own session `provider_session_id` through a new sidecar, with the existing
-    /// resume request: a tab whose agent the server no longer runs. Blocking.
+    /// resume request: a tab whose agent the server no longer runs. A sidecar left running by a failed resume is
+    /// kept to be stopped as [`Self::start_tab`] keeps one. Blocking.
     pub fn resume_tab(
         &self,
         provider_session_id: &str,
         account: Option<&str>,
         project: ProjectTrust,
         client_tools: Option<agent::ClientToolSet>,
+        store: &RemoteProjects,
     ) -> Result<AgentBackend, BackendError> {
-        AgentBackend::resume_remote(
+        let kept = std::cell::Cell::new(None);
+        let resumed = AgentBackend::resume_remote(
             self.client.clone(),
             &self.project.host_key_sha256,
             &self.sidecar_start(account),
             provider_session_id,
             project,
             client_tools,
-        )
+            |sidecar| kept.set(Some(keep_unstopped(store, &self.project, sidecar))),
+        );
+        resumed.map_err(|error| with_kept_stop(error, kept.take(), &self.project.host))
     }
 
     /// Stops the sidecar `sidecar_id` on the server (a tab closed while connected, a stop queued earlier).
@@ -277,6 +288,50 @@ fn check_capability(host: &str, capabilities: &[String], capability: &str) -> Re
     Err(format!(
         "the server's Eitri helper on {host} does not offer {capability}"
     ))
+}
+
+/// Keeps the stop of `sidecar`, which a failed start left running, in `project`'s record under the identity the
+/// sidecar was started for. Another window may hold the record's lock for a moment: a few tries before giving up.
+fn keep_unstopped(
+    store: &RemoteProjects,
+    project: &RemoteProject,
+    sidecar: &agent::HelperHandoff,
+) -> Result<(), String> {
+    let write = || {
+        store.write_stop_for(
+            &project.root,
+            &sidecar.host,
+            &sidecar.host_key_sha256,
+            &sidecar.stop_key(),
+            true,
+        )
+    };
+    let mut written = write();
+    for _ in 0..3 {
+        match &written {
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                std::thread::sleep(std::time::Duration::from_millis(200));
+                written = write();
+            }
+            _ => break,
+        }
+    }
+    written.map_err(|error| error.to_string())
+}
+
+/// A failed start's error, saying what became of the sidecar it left running: `kept` is the outcome of keeping its
+/// stop, `None` when nothing was left running.
+fn with_kept_stop(mut error: BackendError, kept: Option<Result<(), String>>, host: &str) -> BackendError {
+    match kept {
+        None => {}
+        Some(Ok(())) => error
+            .message
+            .push_str(&format!("; its agent on {host} is stopped once {host} can be reached")),
+        Some(Err(why)) => error.message.push_str(&format!(
+            "; its agent on {host} keeps running there: its stop could not be kept ({why})"
+        )),
+    }
+    error
 }
 
 /// Why a saved tab's agent is not taken up through `project`'s connection: it was saved under another host key,
@@ -761,6 +816,47 @@ mod tests {
                 ("old".into(), "sc-offline".into())
             ]
         );
+    }
+
+    #[test]
+    fn a_sidecar_a_failed_start_left_running_has_its_stop_kept_and_said() {
+        let root = crate::test_scratch_dir::ScratchDir::new("remote", "unstopped");
+        let store = RemoteProjects::new(Some(root.as_os_str()), None);
+        let project = project();
+        store.save(&project).unwrap();
+        let sidecar = agent::HelperHandoff {
+            daemon: "0.3.0-a-b".into(),
+            declared_client_tools: Default::default(),
+            host: project.host.clone(),
+            host_key_sha256: project.host_key_sha256.clone(),
+            sidecar_id: "sc-left".into(),
+            session_id: String::new(),
+            last_folded_sequence: 0,
+        };
+        let failed = || BackendError {
+            message: "failed to create a Claude session".into(),
+            benign: false,
+        };
+        let kept = keep_unstopped(&store, &project, &sidecar);
+        assert_eq!(kept, Ok(()));
+        assert_eq!(
+            store.queued_stops_for(&project).unwrap(),
+            vec!["0.3.0-a-b/sc-left".to_string()]
+        );
+        let said = with_kept_stop(failed(), Some(kept), &project.host).message;
+        assert!(
+            said.ends_with("its agent on example-host is stopped once example-host can be reached"),
+            "{said}"
+        );
+        // A sidecar started for another server identity is not kept under this project's record.
+        let mut other = sidecar.clone();
+        other.host_key_sha256 = "SHA256:other".into();
+        let refused = keep_unstopped(&store, &project, &other);
+        assert!(refused.is_err());
+        assert!(with_kept_stop(failed(), Some(refused), &project.host)
+            .message
+            .contains("keeps running there"));
+        assert_eq!(with_kept_stop(failed(), None, &project.host).message, failed().message);
     }
 
     fn project() -> RemoteProject {

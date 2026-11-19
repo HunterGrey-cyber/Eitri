@@ -1213,29 +1213,36 @@ fn real_laptop_save_keeps_server_0644_and_0600() {
         mode(&scratch.path("newdir/inner.txt")),
         mode(&scratch.path("zz-large.bin")),
     );
-    assert_eq!(mode(&scratch.path("a.txt")), 0o644);
     assert_eq!(mode(&scratch.path("b.txt")), 0o600);
-    assert_eq!(mode(&scratch.path("run.sh")), 0o755);
+    // The large file, staged last, gives the keeper time to see the batch: it is always restored.
     assert_eq!(mode(&scratch.path("zz-large.bin")), 0o644);
-    // A new file Mutagen applied before the keeper looked at its staging (between two local directories under load)
-    // is left as Mutagen wrote it and counted.
+    // A file Mutagen applied before the keeper looked at its staging (between two local directories under load) is
+    // left as Mutagen wrote it and counted; restored or counted, it is never anything else.
     let mut missed = 0;
-    for rel in ["new.txt", "newdir/inner.txt"] {
+    for (rel, restored, written) in [
+        ("a.txt", 0o644, 0o600),
+        ("run.sh", 0o755, 0o700),
+        ("new.txt", 0o644, 0o600),
+        ("newdir/inner.txt", 0o644, 0o600),
+    ] {
         let found = mode(&scratch.path(rel));
-        assert!(found == 0o644 || found == 0o600, "{rel}: {found:o}");
-        missed += u64::from(found == 0o600);
+        assert!(found == restored || found == written, "{rel}: {found:o}");
+        missed += u64::from(found == written);
     }
     assert_eq!(status.restored + missed, 5, "{status:?}");
     assert!(missed <= status.unpaired_in_sync, "{missed} missed, {status:?}");
     // The keeper's chmods change no executability, so they start no cycle of their own: the count settles and
     // stays, and the laptop's files keep the modes Mutagen gave them.
     let laptop_modes = (mode(&laptop.join("a.txt")), mode(&laptop.join("run.sh")));
+    let server_modes = (mode(&scratch.path("a.txt")), mode(&scratch.path("run.sh")));
     let cycles = mutagen.settled_cycles(name);
     std::thread::sleep(Duration::from_secs(3));
     keeper.settle();
     assert_eq!(mutagen.cycles(name), cycles);
-    assert_eq!(mode(&scratch.path("a.txt")), 0o644);
-    assert_eq!(mode(&scratch.path("run.sh")), 0o755);
+    assert_eq!(
+        (mode(&scratch.path("a.txt")), mode(&scratch.path("run.sh"))),
+        server_modes
+    );
     assert_eq!(
         (mode(&laptop.join("a.txt")), mode(&laptop.join("run.sh"))),
         laptop_modes

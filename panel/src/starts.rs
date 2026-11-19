@@ -778,6 +778,9 @@ pub(super) fn collect_pending_starts(state: &mut AgentPanelState, screen: &Scree
                     "[agent_panel] tab {}: backend failed to start: {}",
                     tab.0, error.message
                 );
+                // A remote start that failed may have kept the stop of the sidecar it left running; the stop
+                // sender (absent in a local window) sends it, and tries again while the server cannot be reached.
+                state.remote_stops.send_now();
                 // A tab a restore started is reported with the rest of the restore, and was tidied
                 // away by `account_for_restore`, rather than left on screen as a dead tab each.
                 if let RestoreStart::Failed { was_active } = part_of_a_restore {

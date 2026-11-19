@@ -884,14 +884,17 @@ impl AgentBackend {
     /// Starts a remote Claude tab (`agent::remote_client::open_remote_session`): the root is checked
     /// here first, the sidecar runs on the server, started and held by the helper behind `client`, and
     /// its session runs in `start.root` exactly as the remote project records it; a sidecar whose
-    /// session could not be created is stopped again. The tab's link state is the provider's from here
-    /// on. **Blocking**: ssh and the helper's start, so callers run it off the GTK main loop.
+    /// session could not be created is stopped again, and when that stop does not go through (the link broke
+    /// during the create) it is given to `keep_stop`, to be sent once the server can be reached. The tab's link
+    /// state is the provider's from here on. **Blocking**: ssh and the helper's start, so callers run it off the
+    /// GTK main loop.
     pub fn start_remote(
         client: agent::remote_client::HelperClient,
         host_key_sha256: &str,
         start: &agent::remote_client::SidecarStart,
         project: ProjectTrust,
         client_tools: Option<agent::ClientToolSet>,
+        keep_stop: impl FnOnce(&agent::HelperHandoff),
     ) -> Result<Self, BackendError> {
         agent::remote_client::open_remote_session(client, host_key_sha256, start, project, client_tools)
             .map(|conversation| AgentBackend::Conversation {
@@ -899,6 +902,9 @@ impl AgentBackend {
                 conversation: Box::new(conversation),
             })
             .map_err(|failure| {
+                if let Some(sidecar) = &failure.unstopped {
+                    keep_stop(sidecar);
+                }
                 BackendError::fatal(match &failure.info {
                     Some(info) => with_provider_notes(failure.message, info),
                     None => failure.message,
@@ -945,7 +951,8 @@ impl AgentBackend {
 
     /// Continues the CLI's own session `provider_session_id` on the server through a new sidecar started
     /// for `start`, with the resume request a local tab sends: a remote tab whose agent the server no longer
-    /// runs. The new sidecar is stopped again when the resume fails. **Blocking.**
+    /// runs. The new sidecar is stopped again when the resume fails, or given to `keep_stop` when that stop does
+    /// not go through. **Blocking.**
     pub fn resume_remote(
         client: agent::remote_client::HelperClient,
         host_key_sha256: &str,
@@ -953,6 +960,7 @@ impl AgentBackend {
         provider_session_id: &str,
         project: ProjectTrust,
         client_tools: Option<agent::ClientToolSet>,
+        keep_stop: impl FnOnce(&agent::HelperHandoff),
     ) -> Result<Self, BackendError> {
         let provider = std::sync::Arc::new(
             ClaudeSidecarProvider::connect_through_helper(client, host_key_sha256, start)
@@ -973,6 +981,9 @@ impl AgentBackend {
         .map_err(|e| {
             if let Err(stop) = provider.stop_remote_sidecar() {
                 eprintln!("[agent_backend] the sidecar of a resume that failed was not stopped: {stop}");
+                if let Some(sidecar) = provider.remote_sidecar() {
+                    keep_stop(&sidecar);
+                }
             }
             BackendError::fatal(with_provider_notes(
                 format!("could not continue the previous session: {e}"),

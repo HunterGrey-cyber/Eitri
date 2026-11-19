@@ -37,7 +37,7 @@ message HelloResponse {
   repeated string warnings = 7;
   LoginEnvState login_env = 8;
   // The mode keepers' lines, per root; they are not in `warnings`.
-  repeated SyncModeWarning mode_warnings = 9;
+  repeated SyncModeWarning mode_warnings = 11;
 }
 message StartSidecarRequest {
   string root = 1; string account = 2; map<string, string> env = 3; string command_id = 4;

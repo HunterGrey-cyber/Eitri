@@ -22,11 +22,17 @@ impl Drop for FirstContact {
     }
 }
 
+/// How long each of first contact's connections may take. A floor sized for a slow link, not a measurement:
+/// nothing is connected yet to measure. A connection that stops before authentication is a few round trips, and
+/// a lossy or relayed link can stretch that well past ten seconds; only a host that never answers is made to wait
+/// this long.
+const CONTACT_DEADLINE: Duration = Duration::from_secs(30);
+
 pub fn first_contact(host: &str, private_dir: &Path) -> Result<FirstContact, ConnectError> {
     agent::ssh::validate_host(host)?;
     agent::ssh::check_openssh()?;
     agent::ssh::validate_state_path(private_dir)?;
-    agent::private_fs::require_safe_parent(private_dir.parent().unwrap_or(private_dir), "SSH first contact")?;
+    agent::private_fs::require_safe_state_parent(private_dir, "SSH first contact")?;
     agent::private_fs::create_private_dir_all(private_dir, private_dir)?;
     if !agent::private_fs::is_private_dir(private_dir) {
         return Err("SSH first contact needs a private real directory".to_owned().into());
@@ -35,7 +41,7 @@ pub fn first_contact(host: &str, private_dir: &Path) -> Result<FirstContact, Con
     // A scratch file must never turn an existing changed-key refusal into a new-key question.
     let mut strict = contact_command();
     strict.args(["-o", "StrictHostKeyChecking=yes", "--", host, "true"]);
-    let output = agent::ssh::run(&mut strict, Duration::from_secs(15))?;
+    let output = agent::ssh::run(&mut strict, CONTACT_DEADLINE)?;
     let stderr = String::from_utf8_lossy(&output.stderr);
     if output.timed_out
         || !stderr.contains(" host key is known for ")
@@ -64,7 +70,7 @@ pub fn first_contact(host: &str, private_dir: &Path) -> Result<FirstContact, Con
     ]);
     // Capture precedes authentication. A server allowing none authentication runs only the fixed no-op.
     command.args(["-o", "KnownHostsCommand=none", "--", host, "true"]);
-    let output = agent::ssh::run(&mut command, Duration::from_secs(15))?;
+    let output = agent::ssh::run(&mut command, CONTACT_DEADLINE)?;
     // The key is written before authentication, including when the server refuses the initial "none" attempt.
     contact.scratch_line = agent::private_fs::read_private_nofollow_bytes_capped(&contact.scratch_known_hosts, 16384)?;
     if contact.scratch_line.is_empty() {
@@ -207,7 +213,7 @@ fn accepted_since_display(contact: &FirstContact, user_file: Option<&Path>) -> i
             .arg(format!("UserKnownHostsFile=\"{}\"", file.display()));
     }
     command.args(["--", &contact.host, "true"]);
-    let output = agent::ssh::run(&mut command, Duration::from_secs(15)).map_err(io::Error::other)?;
+    let output = agent::ssh::run(&mut command, CONTACT_DEADLINE).map_err(io::Error::other)?;
     let stderr = String::from_utf8_lossy(&output.stderr);
     if !output.timed_out
         && stderr.contains(" host key is known for ")
@@ -324,6 +330,18 @@ mod tests {
                 let scratch = contact.scratch_known_hosts.clone();
                 drop(contact);
                 assert!(!scratch.exists());
+            },
+        );
+    }
+
+    #[test]
+    fn a_preflight_slower_than_fifteen_seconds_still_reaches_the_key() {
+        super::super::tests::isolated(
+            "remote_host::first_contact::tests::a_preflight_slower_than_fifteen_seconds_still_reaches_the_key",
+            |dir| {
+                std::fs::write(dir.join("slow-preflight"), "16").unwrap();
+                let contact = first_contact("example-host", dir).unwrap();
+                assert_eq!(contact.key_type, "ssh-ed25519");
             },
         );
     }

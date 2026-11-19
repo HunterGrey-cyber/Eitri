@@ -754,9 +754,15 @@ pub(super) fn spawn_remote_connect(
     let (result_tx, result_rx) = mpsc::channel();
     std::thread::spawn(move || {
         let account = agent::account::configured().map(|account| account.name().to_string());
+        // A start that fails leaving its sidecar running keeps that sidecar's stop here; the failure wakes the
+        // window's stop sender ([`RemoteStops::send_now`]).
+        let store = RemoteProjects::new(
+            std::env::var_os("XDG_STATE_HOME").as_deref(),
+            std::env::var_os("HOME").as_deref(),
+        );
         let result = match resume {
-            None => connection.start_tab(account.as_deref(), project, client_tools),
-            Some(session) => connection.resume_tab(&session, account.as_deref(), project, client_tools),
+            None => connection.start_tab(account.as_deref(), project, client_tools, &store),
+            Some(session) => connection.resume_tab(&session, account.as_deref(), project, client_tools, &store),
         };
         let _ = result_tx.send(result);
     });

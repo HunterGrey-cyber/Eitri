@@ -155,7 +155,7 @@ pub(crate) fn private_dir(dir: &Path) -> io::Result<()> {
             "SSH private directory must be absolute",
         ));
     }
-    crate::private_fs::require_safe_parent(dir.parent().unwrap_or(dir), "SSH private state")?;
+    crate::private_fs::require_safe_state_parent(dir, "SSH private state")?;
     crate::private_fs::create_private_dir_all(dir, dir)?;
     if !crate::private_fs::is_private_dir(dir) {
         return Err(io::Error::new(
@@ -428,6 +428,17 @@ touch "$state/live"
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
         );
+    }
+
+    /// The first `eitri host` command on a machine where no window ever ran: `<state home>/eitri` is missing.
+    #[test]
+    fn ssh_state_is_made_in_a_fresh_state_home() {
+        let base = crate::test_tmp::TmpDir::new("nv-ssh-state", "fresh");
+        std::fs::set_permissions(&*base, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let dir = base.join("state").join("eitri").join("ssh");
+        private_dir(&dir).unwrap();
+        assert!(crate::private_fs::is_private_dir(&dir));
+        assert!(crate::private_fs::is_private_dir(&base.join("state").join("eitri")));
     }
 
     #[test]

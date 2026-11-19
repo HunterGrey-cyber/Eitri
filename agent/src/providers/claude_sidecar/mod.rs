@@ -1274,6 +1274,13 @@ impl ClaudeSidecarProvider {
         transport::stop_remote(&self.transport)
     }
 
+    /// This remote tab's sidecar as a kept stop names it (`HelperHandoff::stop_key`): its host, host key, owning
+    /// installation and id, known from its start on, with no session. `None` for a sidecar on this machine.
+    pub fn remote_sidecar(&self) -> Option<HelperHandoff> {
+        self.remote.as_ref()?;
+        lock(&self.transport).helper_handoff(String::new(), 0)
+    }
+
     fn map_status(&self, status: tonic::Status) -> ProviderError {
         map_status(status)
     }

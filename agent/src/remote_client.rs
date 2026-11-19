@@ -912,12 +912,16 @@ impl PendingAsker {
 pub struct RemoteStartFailure {
     pub message: String,
     pub info: Option<crate::ProviderInfo>,
+    /// The sidecar started for the tab when its stop did not go through after the session failed (the link
+    /// broke during the create): the caller keeps its stop for when the server can be reached again.
+    pub unstopped: Option<crate::HelperHandoff>,
 }
 
 /// Starts a remote Claude tab: checks the root on this machine, has the helper start a sidecar
 /// (`ClaudeSidecarProvider::connect_through_helper`) and creates the session in the root as recorded.
-/// A sidecar the helper started is stopped again when the session cannot be created, so a failed
-/// start leaves nothing running on the server. Blocking: a worker's call.
+/// A sidecar the helper started is stopped again when the session cannot be created; when that stop
+/// does not go through either, the failure names the sidecar (`unstopped`) for its stop to be kept.
+/// Blocking: a worker's call.
 pub fn open_remote_session(
     client: HelperClient,
     host_key_sha256: &str,
@@ -928,27 +932,31 @@ pub fn open_remote_session(
     crate::AgentConversation::check_remote_root(&start.root).map_err(|error| RemoteStartFailure {
         message: error.to_string(),
         info: None,
+        unstopped: None,
     })?;
     let provider =
         crate::ClaudeSidecarProvider::connect_through_helper(client, host_key_sha256, start).map_err(|error| {
             RemoteStartFailure {
                 message: error.to_string(),
                 info: None,
+                unstopped: None,
             }
         })?;
     let provider = Arc::new(provider);
     let info = crate::AgentProvider::info(provider.as_ref());
     crate::AgentConversation::create_remote_with_tools(provider.clone(), &start.root, project, client_tools).map_err(
         |error| {
-            if let Err(stop) = provider.stop_remote_sidecar() {
+            let unstopped = provider.stop_remote_sidecar().err().and_then(|stop| {
                 eprintln!(
                     "agent: the sidecar on {} of a session that could not be created was not stopped: {stop}",
                     info.host.as_deref().unwrap_or("its server")
                 );
-            }
+                provider.remote_sidecar()
+            });
             RemoteStartFailure {
                 message: format!("failed to create a Claude session: {error}"),
                 info: Some(info),
+                unstopped,
             }
         },
     )

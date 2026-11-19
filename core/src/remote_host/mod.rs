@@ -174,6 +174,7 @@ if [ -n "$accept_new" ]; then
     exit 255
 fi
 if [ -n "$contact" ]; then
+    if [ -f "$state/slow-preflight" ] && [ -z "$scratch" ]; then sleep "$(cat "$state/slow-preflight")"; fi
     known=${scratch:-$state/known_hosts}
     match=
     if [ -f "$known" ]; then match=$(awk '$1 == "example-host" || substr($1,1,3) == "|1|" {print $2 " " $3}' "$known"); fi

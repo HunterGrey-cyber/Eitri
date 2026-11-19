@@ -108,6 +108,20 @@ pub fn require_safe_parent(dir: &Path, what: &str) -> std::io::Result<()> {
     ))
 }
 
+/// [`require_safe_parent`] for `dir`, a private directory about to be made in Eitri's own state root, where
+/// that root (`dir`'s parent, `<state home>/eitri`) may not exist yet: on a machine where no window ever ran,
+/// the first `eitri host` command is the first thing to need it. A missing parent is made first, exactly 0700,
+/// with [`create_private_dir_all`] (which also makes a missing state home above it); a parent that exists is
+/// judged as it is and never changed, so a shared or group-writable one is still refused.
+pub fn require_safe_state_parent(dir: &Path, what: &str) -> std::io::Result<()> {
+    let parent = dir.parent().unwrap_or(dir);
+    match std::fs::symlink_metadata(parent) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => create_private_dir_all(parent, parent)?,
+        _ => {}
+    }
+    require_safe_parent(parent, what)
+}
+
 /// Whether `path` is itself a real directory (a symlink is not followed) owned by this user.
 pub fn is_own_real_dir(path: &Path) -> bool {
     matches!(path.symlink_metadata(), Ok(meta) if meta.is_dir() && meta.uid() == current_uid())
@@ -2354,6 +2368,35 @@ mod tests {
         set_mode(&shared, 0o1777);
         assert!(open_user_config_dir(&dir).is_ok());
         std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    /// A fresh state home: neither it nor Eitri's root in it exists yet. Both are made exactly 0700, and the
+    /// directory asked for is left to its caller.
+    #[test]
+    fn a_missing_state_root_is_made_private_before_it_is_judged() {
+        let base = config_scratch("state-root-missing");
+        let state = base.join("state");
+        let dir = state.join("eitri").join("ssh");
+        require_safe_state_parent(&dir, "test state").unwrap();
+        for made in [&state, &state.join("eitri")] {
+            let meta = std::fs::symlink_metadata(made).unwrap();
+            assert!(meta.is_dir() && meta.mode() & 0o777 == 0o700, "{}", made.display());
+        }
+        assert!(!dir.exists());
+        require_safe_state_parent(&dir, "test state").unwrap();
+    }
+
+    /// An existing root is judged as it stands and never changed.
+    #[test]
+    fn an_existing_shared_state_root_is_refused_and_left_alone() {
+        let base = config_scratch("state-root-shared");
+        let root = base.join("eitri");
+        real_config_dir(&root);
+        set_mode(&root, 0o777);
+        let error = require_safe_state_parent(&root.join("ssh"), "test state").unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+        assert_eq!(std::fs::symlink_metadata(&root).unwrap().mode() & 0o7777, 0o777);
+        assert!(!root.join("ssh").exists());
     }
 
     #[test]

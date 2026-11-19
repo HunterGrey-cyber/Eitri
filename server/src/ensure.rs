@@ -110,7 +110,8 @@ fn refresh_install(paths: &Paths) {
 fn spawn_daemon() -> io::Result<std::process::Child> {
     let exe = std::env::current_exe()?;
     let runtime = std::env::var_os("XDG_RUNTIME_DIR");
-    let mut command = if use_systemd_scope(runtime.as_deref().map(Path::new)) {
+    let lingering = account_name().is_some_and(|name| lingers(Path::new(LINGER_DIR), &name));
+    let mut command = if use_systemd_scope(runtime.as_deref().map(Path::new), lingering) {
         let mut command = Command::new("systemd-run");
         command.args(["--user", "--scope", "--quiet"]).arg(&exe);
         command
@@ -166,8 +167,39 @@ async fn remove_stale_socket(paths: &Paths) -> io::Result<()> {
     }
 }
 
-pub fn use_systemd_scope(runtime: Option<&Path>) -> bool {
-    runtime.is_some_and(|dir| dir.is_absolute() && dir.join("systemd/private").exists())
+/// The account's passwd name, for the linger check. The lookup runs on a thread of its own and gets a second: a
+/// directory service that does not answer (NSS can outlive any deadline) counts as not lingering, the placement that
+/// is safe while KillUserProcesses is off, rather than holding the start lock.
+fn account_name() -> Option<std::ffi::OsString> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::Builder::new()
+        .name("eitri-passwd".into())
+        .spawn(move || {
+            let name = crate::daemon::login_env::minimal_environment()
+                .ok()
+                .and_then(|account| account.get(std::ffi::OsStr::new("USER")).cloned());
+            let _ = tx.send(name);
+        })
+        .ok()?;
+    rx.recv_timeout(Duration::from_secs(1)).ok().flatten()
+}
+
+/// Where logind keeps one empty file per lingering account (`loginctl enable-linger` creates it).
+const LINGER_DIR: &str = "/var/lib/systemd/linger";
+
+fn lingers(dir: &Path, name: &std::ffi::OsStr) -> bool {
+    let plain = !name.is_empty() && name != "." && name != ".." && !name.as_encoded_bytes().contains(&b'/');
+    plain && dir.join(name).exists()
+}
+
+/// The daemon moves into a scope of the user manager only while the account lingers. Without lingering, logind stops
+/// the user manager about ten seconds after no process is left in any of the account's sessions, and everything in
+/// the manager's scopes (the daemon, its sidecars and their agents) is killed with it. Left in the ssh session's scope
+/// instead, the detached daemon keeps that session "closing" rather than gone, so the account's processes live on as
+/// long as logind's KillUserProcesses is off (its default). With lingering on, the user manager outlives every
+/// session, and its scope also survives a KillUserProcesses=yes server.
+pub fn use_systemd_scope(runtime: Option<&Path>, lingering: bool) -> bool {
+    lingering && runtime.is_some_and(|dir| dir.is_absolute() && dir.join("systemd/private").exists())
 }
 
 pub async fn connect(paths: &Paths) -> io::Result<()> {
@@ -322,13 +354,33 @@ mod tests {
 
     #[test]
     fn systemd_scope_requires_the_user_manager_socket() {
-        assert!(!super::use_systemd_scope(None));
-        assert!(!super::use_systemd_scope(Some(std::path::Path::new("relative"))));
+        assert!(!super::use_systemd_scope(None, true));
+        assert!(!super::use_systemd_scope(Some(std::path::Path::new("relative")), true));
         let root = std::env::temp_dir().join(format!("scope-{}", std::process::id()));
         agent::private_fs::create_private_dir_all(&root.join("systemd"), &root).unwrap();
-        assert!(!super::use_systemd_scope(Some(&root)));
+        assert!(!super::use_systemd_scope(Some(&root), true));
         agent::private_fs::write_private(&root.join("systemd/private"), b"").unwrap();
-        assert!(super::use_systemd_scope(Some(&root)));
+        assert!(super::use_systemd_scope(Some(&root), true));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_user_that_does_not_linger_keeps_the_daemon_in_its_session() {
+        let root = std::env::temp_dir().join(format!("linger-{}", std::process::id()));
+        agent::private_fs::create_private_dir_all(&root.join("runtime/systemd"), &root).unwrap();
+        agent::private_fs::write_private(&root.join("runtime/systemd/private"), b"").unwrap();
+        let linger = root.join("linger");
+        agent::private_fs::create_private_dir_all(&linger, &root).unwrap();
+        let name = std::ffi::OsStr::new("someone");
+        let runtime = root.join("runtime");
+        assert!(!super::lingers(&linger, name));
+        assert!(!super::use_systemd_scope(Some(&runtime), super::lingers(&linger, name)));
+        agent::private_fs::write_private(&linger.join("someone"), b"").unwrap();
+        assert!(super::lingers(&linger, name));
+        assert!(super::use_systemd_scope(Some(&runtime), super::lingers(&linger, name)));
+        for odd in ["", ".", "..", "a/b"] {
+            assert!(!super::lingers(&linger, std::ffi::OsStr::new(odd)), "{odd:?}");
+        }
         std::fs::remove_dir_all(root).unwrap();
     }
     #[test]

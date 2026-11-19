@@ -22,8 +22,10 @@ pub fn validate(probe: &ProbeReport) -> Result<Vec<String>, InstallError> {
         super::install::checked_path(path)?;
     }
     Ok(
-        if probe.linger == Some(false) && probe.kill_user_processes == Some(true) {
-            vec!["Server processes may stop at logout (Linger=no, KillUserProcesses=yes). Run loginctl enable-linger on the server.".into()]
+        // The helper keeps its daemon out of the user manager unless the account is known to linger, so an unknown
+        // linger is warned about like a known "no".
+        if probe.linger != Some(true) && probe.kill_user_processes == Some(true) {
+            vec!["Server processes may stop at logout (lingering is not on, KillUserProcesses=yes). Run loginctl enable-linger on the server.".into()]
         } else {
             Vec::new()
         },
@@ -94,6 +96,13 @@ mod tests {
         report.linger = Some(false);
         report.kill_user_processes = Some(true);
         assert!(validate(&report).unwrap()[0].contains("loginctl enable-linger"));
+        report.linger = None;
+        assert!(validate(&report).unwrap()[0].contains("loginctl enable-linger"));
+        report.linger = Some(true);
+        assert!(validate(&report).unwrap().is_empty());
+        report.linger = Some(false);
+        report.kill_user_processes = Some(false);
+        assert!(validate(&report).unwrap().is_empty());
     }
 
     // Runs the Linux server scripts here as the server; macOS lacks flock(1) and GNU stat.

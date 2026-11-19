@@ -100,6 +100,8 @@
 //!   refusing evicted cursors with `EVENT_GAP`;
 //! - `EITRI_STANDIN_BIND_AFTER_MS=<ms>`: the process waits this long before it binds;
 //! - `EITRI_STANDIN_REFUSE_CREATE`: every `CreateSession` is refused with `FAILED_PRECONDITION`;
+//! - `EITRI_STANDIN_CREATE_GATE=<directory>`: every `CreateSession` publishes `creating` there and answers only once
+//!   `release` exists (a session being created while the link is cut);
 //! - `EITRI_STANDIN_ACCOUNTS=<directory>`: an account named by `VERDANDI_CLAUDE_ACCOUNT` exists when
 //!   `<directory>/.claude-<name>` is a directory; otherwise the process refuses before it binds, with
 //!   the sidecar's own words. Unset, every account exists, under `$HOME`.
@@ -1077,6 +1079,13 @@ impl Service<http::Request<Body>> for StandIn {
                             file.write_all(&(bytes.len() as u32).to_le_bytes()).unwrap();
                             file.write_all(&bytes).unwrap();
                             file.flush().unwrap();
+                        }
+                        if let Some(gate) = std::env::var_os("EITRI_STANDIN_CREATE_GATE") {
+                            let gate = std::path::PathBuf::from(gate);
+                            std::fs::write(gate.join("creating"), b"").unwrap();
+                            while !gate.join("release").exists() {
+                                tokio::time::sleep(Duration::from_millis(10)).await;
+                            }
                         }
                         if std::env::var_os("EITRI_STANDIN_REFUSE_CREATE").is_some() {
                             return Err(Status::failed_precondition("sessions refused by the test"));

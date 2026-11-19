@@ -1222,6 +1222,56 @@ fn a_start_that_fails_after_the_sidecar_started_stops_it() {
     }
 }
 
+/// The link breaks while the session is being created: the start fails, the stop it then sends cannot go out, and
+/// the failure names the sidecar left running, whose kept stop stops it once the server can be reached again.
+#[test]
+fn a_link_cut_during_the_create_names_the_sidecar_left_running_for_its_stop() {
+    let gate = std::env::temp_dir().join(format!(
+        "create-gate-{}",
+        &uuid::Uuid::new_v4().simple().to_string()[..8]
+    ));
+    agent::private_fs::create_private_dir_all(&gate, &gate).unwrap();
+    let server = Server::new(&[&format!("EITRI_STANDIN_CREATE_GATE={}", gate.display())]);
+    let flaky = Flaky::new(&server);
+    let client = server.client(flaky.clone());
+    let start = server.start(None);
+    let starting = std::thread::spawn(move || {
+        agent::remote_client::open_remote_session(client, HOST_KEY, &start, ProjectTrust::Untrusted, None)
+    });
+    wait_for("the session being created", || gate.join("creating").exists());
+    flaky.cut();
+    std::fs::write(gate.join("release"), b"").unwrap();
+    let failed = starting
+        .join()
+        .unwrap()
+        .err()
+        .expect("the start fails with the link cut");
+    let sidecar = failed.unstopped.expect("the sidecar left running is named");
+    let direct = server.direct();
+    assert_eq!(server.alive(&direct), 1, "the sidecar still runs: {}", failed.message);
+    assert_eq!(sidecar.host, HOST);
+    assert_eq!(sidecar.host_key_sha256, HOST_KEY);
+    assert!(direct
+        .list()
+        .unwrap()
+        .iter()
+        .any(|listed| listed.sidecar_id == sidecar.sidecar_id));
+    // What a window's stop sender does with the kept stop once the link is back.
+    flaky.restore();
+    let (daemon, id) = sidecar
+        .stop_key()
+        .split_once('/')
+        .map_or((String::new(), sidecar.stop_key()), |(d, i)| {
+            (d.to_string(), i.to_string())
+        });
+    server
+        .client(Arc::new(server.launcher()))
+        .stop_saved(&daemon, &id)
+        .unwrap();
+    wait_for("the sidecar stopped", || server.alive(&direct) == 0);
+    let _ = std::fs::remove_dir_all(&gate);
+}
+
 /// A start whose channel breaks while the helper is starting the sidecar is asked again with the same
 /// command id: the helper answers with the sidecar it started, and one sidecar runs.
 #[test]
@@ -2343,6 +2393,82 @@ fn a_daemon_killed_during_a_turn_is_restarted_and_adopts_the_same_sidecar() {
     assert!(unavailable(&seen).is_empty());
     assert!(text_of(&seen).contains("after restart"));
     assert_eq!(server.alive(&server.direct()), 1);
+}
+
+/// [`EnsuringLauncher`] whose restart, once armed, waits until `until` exists: a test holds the replacement daemon
+/// back until the sidecar has written everything it was going to write.
+struct HeldEnsure {
+    inner: EnsuringLauncher,
+    until: PathBuf,
+    armed: AtomicBool,
+}
+impl ChannelLauncher for HeldEnsure {
+    fn spawn(&self, tail: &[OsString]) -> std::io::Result<Child> {
+        self.inner.spawn(tail)
+    }
+    fn ensure_helper(&self, daemon: &str) -> std::io::Result<()> {
+        if self.armed.load(Ordering::SeqCst) {
+            wait_for("the sidecar done writing", || self.until.exists());
+        }
+        self.inner.ensure_helper(daemon)
+    }
+}
+
+/// The 2026-11-17 pass's crash, as a test: the daemon is killed while a turn streams with no permission waiting,
+/// and no daemon runs while the sidecar writes the rest of the turn, its end included; the replacement re-adopts the
+/// sidecar and the tab gets every chunk once, the turn's end and a next turn.
+#[test]
+fn a_daemon_killed_mid_stream_loses_and_repeats_nothing_and_the_next_turn_runs() {
+    let server = Server::new(&[]);
+    let done = server.root.join("written");
+    let launcher = Arc::new(HeldEnsure {
+        inner: EnsuringLauncher(server.launcher()),
+        until: done.clone(),
+        armed: AtomicBool::new(false),
+    });
+    let provider = server.provider(launcher.clone(), real_clock(), None).unwrap();
+    let session = create(&provider, &server.project);
+    let gate = server.root.join("gate");
+    std::fs::create_dir(&gate).unwrap();
+    send(
+        &provider,
+        &session,
+        &format!(
+            "text m1 drip-one ; gate {}; text m2 drip-two ; sleep 300; text m3 drip-three ; end; touch {}",
+            gate.display(),
+            done.display()
+        ),
+    );
+    let mut seen = Vec::new();
+    pump_until(&provider, &mut seen, "the first chunk", |events| {
+        text_of(events).contains("drip-one")
+    });
+    wait_for("the stand-in at its gate", || gate.join("ready").exists());
+    launcher.armed.store(true, Ordering::SeqCst);
+    let old_pid = kill_daemon(&server);
+    std::fs::write(gate.join("release"), b"").unwrap();
+    pump_until(&provider, &mut seen, "the turn's end after the crash", turn_completed);
+    assert!(done.exists(), "the turn ended while no daemon ran");
+    let text = text_of(&seen);
+    for chunk in ["drip-one", "drip-two", "drip-three"] {
+        assert_eq!(text.matches(chunk).count(), 1, "{chunk} in {text:?}");
+    }
+    assert!(text.find("drip-one") < text.find("drip-two") && text.find("drip-two") < text.find("drip-three"));
+    assert!(unavailable(&seen).is_empty(), "{:?}", unavailable(&seen));
+    let info: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(server.run_dir().join("info")).unwrap()).unwrap();
+    assert_ne!(
+        info["pid"].as_u64(),
+        Some(old_pid as u64),
+        "a replacement daemon serves the tab"
+    );
+    send(&provider, &session, "text m4 next-turn ; end");
+    let before = seen.len();
+    pump_until(&provider, &mut seen, "the next turn", |events| {
+        turn_completed(&events[before..]) && text_of(&events[before..]).contains("next-turn")
+    });
+    assert!(unavailable(&seen).is_empty());
+    assert_eq!(server.alive(&server.direct()), 1, "the same sidecar, no second one");
 }
 
 struct Installation {
