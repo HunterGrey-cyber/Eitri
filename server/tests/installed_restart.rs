@@ -154,6 +154,8 @@ fn a_daemon_killed_mid_turn_is_restarted_by_the_windows_own_launcher_and_the_tab
         gzip: false,
         root: RootState::Missing,
         sync_marker: None,
+        sync_excluded: None,
+        sync_ignore_line: None,
     };
     let provenance = HelperProvenance::Unsigned {
         sha256: format!("{:x}", Sha256::digest(std::fs::read(BINARY).unwrap())),

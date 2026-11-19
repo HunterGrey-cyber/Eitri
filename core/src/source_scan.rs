@@ -1497,12 +1497,12 @@ mod socket_scan_tests {
     fn the_awkward_spellings_are_each_one_dependency() {
         for manifest in AWKWARD_DEPENDENCY_SPELLINGS {
             assert_eq!(
-                manifest_dependency_offenders(manifest, |name| name == "gtk4").len(),
+                manifest_dependency_offenders(manifest, "", |name| name == "gtk4").len(),
                 1,
                 "{manifest}"
             );
         }
-        let inside = manifest_dependency_offenders(NAMES_INSIDE_OTHER_WORDS, |name| {
+        let inside = manifest_dependency_offenders(NAMES_INSIDE_OTHER_WORDS, "", |name| {
             is_package_in_family(name, &["gtk4", "gtk", "glib", "gio", "gdk"])
         });
         assert_eq!(inside, Vec::<String>::new());

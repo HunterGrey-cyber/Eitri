@@ -6,15 +6,17 @@
 //! whole gtk-rs family (`gdk4`, `gio`, `pango`, `cairo`, ...), and the manifest is read as TOML through
 //! `source_scan::manifest_dependency_offenders`: a dependency in any table of either spelling, a `[dependencies.gtk4]`
 //! sub-table, a dotted key (`gtk4.version = ...`) and a rename (`ui = { package = "gtk4" }`) are caught. A rename
-//! inherited from the root's `[workspace.dependencies]` is not: this manifest names only the key. What it cannot see is
-//! a toolkit arriving transitively through another dependency; `cargo tree -p eitri-mac -e normal --target all` is the
-//! check for that.
+//! inherited from the root's `[workspace.dependencies]` is caught too: the root manifest is read with this one. What it
+//! cannot see is a toolkit arriving transitively through another dependency; `cargo tree -p eitri-mac -e normal
+//! --target all` is the check for that.
 
 use eitri_core::source_scan::{is_package_in_family, manifest_dependency_offenders};
 #[cfg(test)]
 use eitri_core::source_scan::{AWKWARD_DEPENDENCY_SPELLINGS, NAMES_INSIDE_OTHER_WORDS};
 
 const MANIFEST: &str = include_str!("../Cargo.toml");
+/// The root manifest, whose `[workspace.dependencies]` an inherited dependency of this crate resolves through.
+const WORKSPACE: &str = include_str!("../../Cargo.toml");
 
 /// Package names (or the start of one, for a `gtk4-sys`-shaped transitive) that must never appear
 /// as a dependency of this crate.
@@ -37,7 +39,7 @@ const FORBIDDEN: &[&str] = &[
 
 /// Every dependency of `manifest` that is, or renames, a forbidden package, as `[table] name`.
 fn offenders(manifest: &str) -> Vec<String> {
-    manifest_dependency_offenders(manifest, |name| is_package_in_family(name, FORBIDDEN))
+    manifest_dependency_offenders(manifest, WORKSPACE, |name| is_package_in_family(name, FORBIDDEN))
 }
 
 #[test]
