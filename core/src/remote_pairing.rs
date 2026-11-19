@@ -22,7 +22,7 @@
 use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::io::{self, Read, Write};
+use std::io::{self, Read};
 use std::net::IpAddr;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
@@ -623,16 +623,7 @@ pub fn record_listen(state_dir: &Path, addr: &str, kind: IfaceKind, at: u64) -> 
     })
     .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
     let tmp = crate::state_paths::temporary(&path);
-    let written = (|| {
-        let mut file = agent::private_fs::open_private(&tmp)?;
-        file.write_all(&body)?;
-        file.sync_all()?;
-        std::fs::rename(&tmp, &path)
-    })();
-    if written.is_err() {
-        let _ = std::fs::remove_file(&tmp);
-    }
-    written
+    agent::private_fs::replace_private(&tmp, &path, &body, agent::private_fs::Flush::File)
 }
 
 #[cfg(test)]

@@ -617,12 +617,13 @@ impl Pending {
 /// Writes `name` in `dir` whole or not at all: a reader never sees half of it.
 fn write_replacing(dir: &Path, name: &str, value: &Value) -> std::io::Result<()> {
     let temp = dir.join(format!("{name}.{}", std::process::id()));
-    let written =
-        write_private(&temp, value.to_string().as_bytes()).and_then(|()| std::fs::rename(&temp, dir.join(name)));
-    if written.is_err() {
-        let _ = std::fs::remove_file(&temp);
-    }
-    written
+    let text = value.to_string();
+    crate::private_fs::replace_private(
+        &temp,
+        &dir.join(name),
+        text.as_bytes(),
+        crate::private_fs::Flush::Nothing,
+    )
 }
 
 /// The reasons of a failed run of this check on this key that finished after `seen` was read, if the last

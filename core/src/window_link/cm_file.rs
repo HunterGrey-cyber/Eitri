@@ -200,11 +200,7 @@ pub fn write_cm(dir: &Path, root: &Path, file: &CmFile) -> io::Result<()> {
     let path = dir.join(cm_file_name(root));
     let temporary = crate::state_paths::temporary(&path);
     let bytes = serde_json::to_vec_pretty(file).map_err(io::Error::other)?;
-    let result = agent::private_fs::write_private(&temporary, &bytes).and_then(|()| std::fs::rename(&temporary, &path));
-    if result.is_err() {
-        let _ = std::fs::remove_file(&temporary);
-    }
-    result
+    agent::private_fs::replace_private(&temporary, &path, &bytes, agent::private_fs::Flush::Nothing)
 }
 
 enum Write {

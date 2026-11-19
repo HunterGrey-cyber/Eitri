@@ -25,7 +25,6 @@
 //! picker -- reads and parses every one of them.
 
 use serde::{Deserialize, Serialize};
-use std::io::Write;
 use std::path::{Path, PathBuf};
 
 /// How many session records one conversation keeps, newest-`updated_at` first.
@@ -435,16 +434,8 @@ pub(crate) fn write_record(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     // `.tmp` extension, not `.json`: `read_conversation_records` filters on the extension, so a
     // reader that lists the directory mid-write cannot pick this up as a record.
     let temp = dir.join(format!(".{}.tmp", uuid::Uuid::new_v4()));
-    let written = (|| {
-        let mut file = crate::private_fs::open_private(&temp)?;
-        file.write_all(bytes)?;
-        file.sync_all()
-    })();
-    if let Err(e) = written.and_then(|()| std::fs::rename(&temp, path)) {
-        // Leaving a temp file behind would accumulate one per failed write forever.
-        let _ = std::fs::remove_file(&temp);
-        return Err(e);
-    }
+    // `Flush::File`, not `FileAndDirectory`: a refused directory flush must not fail a save (see above).
+    crate::private_fs::replace_private(&temp, path, bytes, crate::private_fs::Flush::File)?;
     // The rename itself, not the bytes. Best-effort -- see this function's doc for exactly what
     // that narrows the durability claim to.
     if let Ok(handle) = std::fs::File::open(dir) {

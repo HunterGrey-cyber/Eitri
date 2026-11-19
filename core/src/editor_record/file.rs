@@ -9,6 +9,8 @@ use std::io;
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 
+use agent::private_fs::{replace_private, Flush};
+
 use super::{encode_name, parse, Record, RECORD_MAX};
 use crate::state_paths::{create_state_dir, lock_store, project_key, state_subdir, temporary, LockTries};
 use crate::window_link::pair::Role;
@@ -103,7 +105,7 @@ impl RecordFile {
             ));
         }
         create_state_dir(&self.dir)?;
-        replace_private(&temporary(&self.path), &self.path, json.as_bytes())
+        replace_private(&temporary(&self.path), &self.path, json.as_bytes(), Flush::Nothing)
     }
 
     /// The token in the marker, when there is one. A marker that is there but cannot be read (a link, a FIFO,
@@ -121,7 +123,7 @@ impl RecordFile {
         create_state_dir(&self.dir)?;
         let marker = self.marker_path();
         let tmp = with_suffix(&marker, &format!(".{}.tmp", std::process::id()));
-        replace_private(&tmp, &marker, token.as_bytes())
+        replace_private(&tmp, &marker, token.as_bytes(), Flush::Nothing)
     }
 
     /// Takes the record's store lock, so two windows on one record file never interleave a write or a marker change;
@@ -145,51 +147,6 @@ fn with_suffix(path: &Path, suffix: &str) -> PathBuf {
     let mut name = OsString::from(path.as_os_str());
     name.push(suffix);
     PathBuf::from(name)
-}
-
-/// Writes `bytes` to `tmp` as a 0600 file and renames it over `path`; on a failure the temporary file goes.
-pub(crate) fn replace_private(tmp: &Path, path: &Path, bytes: &[u8]) -> io::Result<()> {
-    let written = agent::private_fs::write_private(tmp, bytes).and_then(|()| std::fs::rename(tmp, path));
-    if written.is_err() {
-        let _ = std::fs::remove_file(tmp);
-    }
-    written
-}
-
-/// [`replace_private`] for a record that has to survive a crash or a power loss: the temporary file's bytes reach
-/// the disk before the rename, and the directory's new entry after it, so the name holds the previous record or
-/// the new one whole, never an empty file. On a failure before the rename the temporary file goes.
-pub(crate) fn replace_private_durable(tmp: &Path, path: &Path, bytes: &[u8]) -> io::Result<()> {
-    let filled = agent::private_fs::open_private(tmp).and_then(|mut file| {
-        use std::io::Write;
-        file.write_all(bytes)?;
-        sync(&file)
-    });
-    if let Err(error) = filled.and_then(|()| std::fs::rename(tmp, path)) {
-        let _ = std::fs::remove_file(tmp);
-        return Err(error);
-    }
-    let dir = path
-        .parent()
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "a record path names no directory"))?;
-    sync(&std::fs::File::open(dir)?)
-}
-
-#[cfg(test)]
-thread_local! {
-    static SYNCS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
-}
-
-/// How many files and directories [`replace_private_durable`] has flushed to disk on this thread.
-#[cfg(test)]
-pub(crate) fn syncs() -> usize {
-    SYNCS.with(std::cell::Cell::get)
-}
-
-fn sync(file: &std::fs::File) -> io::Result<()> {
-    #[cfg(test)]
-    SYNCS.with(|syncs| syncs.set(syncs.get() + 1));
-    file.sync_all()
 }
 
 /// Whether `token` is 16 lowercase hex digits, the only form that goes into names nvim makes.
@@ -228,5 +185,5 @@ pub fn write_input(
     );
     let path = channel_dir.join(INPUT_FILE_NAME);
     let tmp = with_suffix(&path, &format!(".{}.tmp", std::process::id()));
-    replace_private(&tmp, &path, json.as_bytes())
+    replace_private(&tmp, &path, json.as_bytes(), Flush::Nothing)
 }

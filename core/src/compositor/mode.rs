@@ -216,11 +216,7 @@ pub fn write_mode_state(dir: &Path, root: &Path, state: &ModeState) -> io::Resul
     let file = state_file(dir, root);
     let text = serde_json::to_string(state).expect("a plain struct serializes");
     let tmp = crate::state_paths::temporary(&file);
-    let written = agent::private_fs::write_private(&tmp, text.as_bytes()).and_then(|()| std::fs::rename(&tmp, &file));
-    if written.is_err() {
-        let _ = std::fs::remove_file(&tmp);
-    }
-    written
+    agent::private_fs::replace_private(&tmp, &file, text.as_bytes(), agent::private_fs::Flush::Nothing)
 }
 
 /// What the compositor is called in a notice.

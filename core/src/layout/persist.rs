@@ -1302,12 +1302,7 @@ pub fn v2_state_as(dir: &Path, project_root: &Path, role: Role, lua: &[ModuleDec
 fn write_whole(dir: &Path, path: &Path, text: &str) -> std::io::Result<()> {
     create_state_dir(dir)?;
     let tmp = temporary(path);
-    let written = agent::private_fs::write_private(&tmp, text.as_bytes()).and_then(|()| std::fs::rename(&tmp, path));
-    if let Err(err) = written {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(err);
-    }
-    Ok(())
+    agent::private_fs::replace_private(&tmp, path, text.as_bytes(), agent::private_fs::Flush::Nothing)
 }
 
 /// Writes every workspace of the window, and every kept key, to this project's version 2 file in

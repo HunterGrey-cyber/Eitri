@@ -54,6 +54,11 @@ use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Component, Path};
 
+mod replace;
+#[cfg(any(test, feature = "test-support"))]
+pub use replace::test_hooks as replace_test_hooks;
+pub use replace::{replace_private, Flush};
+
 /// Directories: owner only.
 pub const PRIVATE_DIR_MODE: u32 = 0o700;
 /// Files: owner read/write only.

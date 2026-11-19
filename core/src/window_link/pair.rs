@@ -251,12 +251,7 @@ pub fn write_pair(layout_dir: &Path, project_root: &Path, file: &PairFile) -> io
     // passes from one to the other, and a shared name would let one rename the other's half-written file.
     let tmp = layout_dir.join(format!("{}.{}.tmp", pair_file_name(project_root), std::process::id()));
     let text = serde_json::to_string_pretty(file).expect("a pair file serialises");
-    let written = agent::private_fs::write_private(&tmp, text.as_bytes()).and_then(|()| std::fs::rename(&tmp, &path));
-    if written.is_err() {
-        // Named after this process, a temporary left behind is never written over by a later write.
-        let _ = std::fs::remove_file(&tmp);
-    }
-    written
+    agent::private_fs::replace_private(&tmp, &path, text.as_bytes(), agent::private_fs::Flush::Nothing)
 }
 
 /// Renames `path` to `<path>.taken` once its content is safely elsewhere, and returns the new path.

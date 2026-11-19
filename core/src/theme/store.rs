@@ -209,13 +209,12 @@ fn write_loop(shared: &WriterShared, dir: &Path, root: &Path, before_write: impl
         let written = (|| {
             state_paths::create_state_dir(dir).map_err(|e| e.to_string())?;
             let text = encode(root, &payload)?;
-            agent::private_fs::write_private(&temporary, text.as_bytes()).map_err(|e| e.to_string())?;
-            std::fs::rename(&temporary, &path).map_err(|e| e.to_string())
+            agent::private_fs::replace_private(&temporary, &path, text.as_bytes(), agent::private_fs::Flush::Nothing)
+                .map_err(|e| e.to_string())
         })();
         match written {
             Ok(()) => failed = false,
             Err(e) => {
-                let _ = std::fs::remove_file(&temporary);
                 if !failed {
                     eprintln!("[theme] could not remember the colours: {e}");
                 }

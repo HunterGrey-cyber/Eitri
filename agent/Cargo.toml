@@ -37,7 +37,8 @@ regex = { version = "1", optional = true }
 [features]
 legacy-backend = []
 # The crate's own test doubles for its integration tests, which see it only as an outside crate:
-# today the scripted stand-in child that plays an agent's stdio (`eitri-agent-standin`).
+# the scripted stand-in child that plays an agent's stdio (`eitri-agent-standin`), and the seams of
+# `private_fs::replace_private` (`private_fs::replace_test_hooks`) other crates' tests use.
 test-support = ["dep:regex"]
 
 [dev-dependencies]

@@ -277,14 +277,8 @@ impl PluginStore {
             }
         }
         let tmp = dir.join(format!("{key}.json.{}.tmp", std::process::id()));
-        let written = agent::private_fs::write_private(&tmp, text.as_bytes())
-            .and_then(|()| File::open(&tmp).and_then(|f| f.sync_all()))
-            .and_then(|()| std::fs::rename(&tmp, &path));
-        if let Err(e) = written {
-            let _ = std::fs::remove_file(&tmp);
-            return Err(io(&path, e));
-        }
-        Ok(())
+        agent::private_fs::replace_private(&tmp, &path, text.as_bytes(), agent::private_fs::Flush::File)
+            .map_err(|e| io(&path, e))
     }
 
     /// The segments of `stream`, numbered, in order.

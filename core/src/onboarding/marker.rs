@@ -137,19 +137,7 @@ fn write(path: &Path, marker: &Marker) -> io::Result<()> {
     static NEXT_TEMPORARY: AtomicU64 = AtomicU64::new(0);
     let serial = NEXT_TEMPORARY.fetch_add(1, Ordering::Relaxed);
     let temporary = path.with_extension(format!("json.{}.{serial}.tmp", std::process::id()));
-    let result = agent::private_fs::write_private(&temporary, text.as_bytes()).and_then(|()| {
-        #[cfg(test)]
-        tests::BEFORE_PUBLISH.with(|hook| {
-            if let Some(hook) = hook.borrow_mut().take() {
-                hook();
-            }
-        });
-        std::fs::rename(&temporary, path)
-    });
-    if result.is_err() {
-        let _ = std::fs::remove_file(&temporary);
-    }
-    result
+    agent::private_fs::replace_private(&temporary, path, text.as_bytes(), agent::private_fs::Flush::Nothing)
 }
 
 #[cfg(test)]
@@ -164,10 +152,6 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
         dir
-    }
-
-    thread_local! {
-        pub(super) static BEFORE_PUBLISH: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
     }
 
     #[test]
@@ -191,11 +175,9 @@ mod tests {
             let path = &path;
             let first = &first;
             let writer = scope.spawn(move || {
-                BEFORE_PUBLISH.with(|hook| {
-                    *hook.borrow_mut() = Some(Box::new(move || {
-                        ready_tx.send(()).unwrap();
-                        resume_rx.recv_timeout(Duration::from_secs(60)).unwrap();
-                    }))
+                agent::private_fs::replace_test_hooks::before_next_rename(move || {
+                    ready_tx.send(()).unwrap();
+                    resume_rx.recv_timeout(Duration::from_secs(60)).unwrap();
                 });
                 write(path, first)
             });

@@ -27,7 +27,7 @@
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::io::{self, Read, Write};
+use std::io::{self, Read};
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
@@ -628,16 +628,7 @@ fn lock_until(path: &Path, shared: bool, deadline: Instant) -> io::Result<agent:
 /// Writes `bytes` beside `path` and renames them into place.
 fn save(path: &Path, bytes: &[u8]) -> io::Result<()> {
     let tmp = crate::state_paths::temporary(path);
-    let written = (|| {
-        let mut file = agent::private_fs::open_private(&tmp)?;
-        file.write_all(bytes)?;
-        file.sync_all()?;
-        std::fs::rename(&tmp, path)
-    })();
-    if written.is_err() {
-        let _ = std::fs::remove_file(&tmp);
-    }
-    written
+    agent::private_fs::replace_private(&tmp, path, bytes, agent::private_fs::Flush::File)
 }
 
 /// Whether the two hashes are equal, looking at every byte whatever the first difference.

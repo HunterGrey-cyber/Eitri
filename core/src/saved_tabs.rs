@@ -1013,12 +1013,8 @@ pub fn save_as(dir: &Path, project_root: &Path, role: Role, saved: &SavedTabs) -
 fn save_path(dir: &Path, path: PathBuf, project_root: &Path, saved: &SavedTabs) -> std::io::Result<PathBuf> {
     create_state_dir(dir)?;
     let tmp = temporary(&path);
-    let written = agent::private_fs::write_private(&tmp, encode(saved, project_root).as_bytes())
-        .and_then(|()| std::fs::rename(&tmp, &path));
-    if let Err(err) = written {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(err);
-    }
+    let bytes = encode(saved, project_root);
+    agent::private_fs::replace_private(&tmp, &path, bytes.as_bytes(), agent::private_fs::Flush::Nothing)?;
     Ok(path)
 }
 

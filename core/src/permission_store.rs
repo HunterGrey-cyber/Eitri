@@ -163,12 +163,7 @@ pub fn add(dir: &Path, project_root: &Path, rule: &PrefixRule) -> std::io::Resul
     };
     let tmp = temporary(&file);
     let text = serde_json::to_string_pretty(&body).expect("a rules file always serializes");
-    if let Err(err) =
-        agent::private_fs::write_private(&tmp, text.as_bytes()).and_then(|()| std::fs::rename(&tmp, &file))
-    {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(err);
-    }
+    agent::private_fs::replace_private(&tmp, &file, text.as_bytes(), agent::private_fs::Flush::Nothing)?;
     Ok(rules)
 }
 

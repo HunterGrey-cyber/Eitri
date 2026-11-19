@@ -129,12 +129,7 @@ fn append_with(
         .map(|l| serde_json::to_string(l).expect("a history line always serializes") + "\n")
         .collect();
     let tmp = temporary(&file);
-    if let Err(err) =
-        agent::private_fs::write_private(&tmp, body.as_bytes()).and_then(|()| std::fs::rename(&tmp, &file))
-    {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(err);
-    }
+    agent::private_fs::replace_private(&tmp, &file, body.as_bytes(), agent::private_fs::Flush::Nothing)?;
     Ok(lines.into_iter().map(|l| l.text).collect())
 }
 

@@ -382,7 +382,7 @@ impl TrustStore {
             ));
         }
         state_paths::create_state_dir(&dir)?;
-        replace_private(&path, &text)?;
+        replace_record(&path, &text)?;
         // What `state` will read must be what was just written; anything else would tell the user
         // the project is trusted while the next start asks again.
         let fingerprint = discovery.fingerprint.hex();
@@ -420,13 +420,13 @@ impl TrustStore {
 }
 
 /// Replaces `path` atomically: a temporary file beside it, 0600, renamed over it.
-fn replace_private(path: &Path, text: &str) -> io::Result<()> {
-    let tmp = record_temporary(path);
-    let written = agent::private_fs::write_private(&tmp, text.as_bytes()).and_then(|()| std::fs::rename(&tmp, path));
-    if written.is_err() {
-        let _ = std::fs::remove_file(&tmp);
-    }
-    written
+fn replace_record(path: &Path, text: &str) -> io::Result<()> {
+    agent::private_fs::replace_private(
+        &record_temporary(path),
+        path,
+        text.as_bytes(),
+        agent::private_fs::Flush::Nothing,
+    )
 }
 
 /// Keeps what `discovery` read of the instruction files beside `record`, which has been written. The
@@ -435,7 +435,7 @@ fn replace_private(path: &Path, text: &str) -> io::Result<()> {
 fn keep_copy(place: &TrustPlace, record: &Path, discovery: &Discovery) {
     let path = copy_path(record);
     let kept = last_trusted::encode(discovery, profile_field(&discovery.profile));
-    let written = kept.is_some_and(|text| replace_private(&path, &text).is_ok());
+    let written = kept.is_some_and(|text| replace_record(&path, &text).is_ok());
     // Another window's `:untrust` can have taken the record since it was read back; its text goes too.
     let fingerprint = discovery.fingerprint.hex();
     let record_stands = read_usable_at(record, place, &discovery.root, &discovery.profile)

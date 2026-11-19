@@ -111,11 +111,7 @@ pub fn save_mode(dir: &Path, project_root: &Path, mode: SessionModeChoice) -> st
         permission_mode: mode,
     };
     let text = serde_json::to_string_pretty(&file).expect("prefs always serialize");
-    let written = agent::private_fs::write_private(&tmp, text.as_bytes()).and_then(|()| std::fs::rename(&tmp, &path));
-    if let Err(err) = written {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(err);
-    }
+    agent::private_fs::replace_private(&tmp, &path, text.as_bytes(), agent::private_fs::Flush::Nothing)?;
     Ok(path)
 }
 

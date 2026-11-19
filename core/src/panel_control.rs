@@ -1033,12 +1033,9 @@ fn serve(
         make_control_socket_private(dir, &sock, file_identity(bound))
             .map_err(|e| format!("could not set the mode of {}: {e}", sock.display()))?;
         let tmp = pid_file.with_extension("pid.tmp");
-        agent::private_fs::write_private(&tmp, PidRecord::own().line().as_bytes())
-            .and_then(|()| std::fs::rename(&tmp, &pid_file))
-            .map_err(|e| {
-                let _ = std::fs::remove_file(&tmp);
-                format!("could not write {}: {e}", pid_file.display())
-            })?;
+        let line = PidRecord::own().line();
+        agent::private_fs::replace_private(&tmp, &pid_file, line.as_bytes(), agent::private_fs::Flush::Nothing)
+            .map_err(|e| format!("could not write {}: {e}", pid_file.display()))?;
         let stop = Arc::new(AtomicBool::new(false));
         let (requests_tx, requests) = mpsc::sync_channel(64);
         let raise_queued = Arc::new(AtomicBool::new(false));

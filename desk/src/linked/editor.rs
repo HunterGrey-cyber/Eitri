@@ -2570,8 +2570,7 @@ fn one_line(why: &str) -> String {
 /// The marker the panel polls, written whole: a marker read mid-write must never be taken as the end.
 fn write_marker(done: &Path, text: &str) -> std::io::Result<()> {
     let tmp = done.with_extension("done.tmp");
-    std::fs::write(&tmp, text)?;
-    std::fs::rename(&tmp, done)
+    agent::private_fs::replace_private(&tmp, done, text.as_bytes(), agent::private_fs::Flush::Nothing)
 }
 
 #[cfg(test)]

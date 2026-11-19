@@ -536,7 +536,12 @@ impl RemoteProjects {
 
     fn write(&self, path: &Path, record: &impl Serialize) -> io::Result<()> {
         let bytes = serde_json::to_vec(record).map_err(|e| invalid(path, e))?;
-        crate::editor_record::file::replace_private_durable(&temporary(path), path, &bytes)
+        agent::private_fs::replace_private(
+            &temporary(path),
+            path,
+            &bytes,
+            agent::private_fs::Flush::FileAndDirectory,
+        )
     }
 }
 
@@ -695,18 +700,18 @@ mod tests {
     fn every_record_write_is_flushed_before_and_after_its_rename() {
         let store = store();
         let record = record();
-        let before = crate::editor_record::file::syncs();
+        let before = agent::private_fs::replace_test_hooks::syncs();
         store.save(&record).unwrap();
         assert_eq!(
-            crate::editor_record::file::syncs() - before,
+            agent::private_fs::replace_test_hooks::syncs() - before,
             2,
             "the file, then its directory"
         );
-        let before = crate::editor_record::file::syncs();
+        let before = agent::private_fs::replace_test_hooks::syncs();
         store
             .update_host(&host_record().host_key_sha256, |_| host_record())
             .unwrap();
-        assert_eq!(crate::editor_record::file::syncs() - before, 2);
+        assert_eq!(agent::private_fs::replace_test_hooks::syncs() - before, 2);
         assert_eq!(store.find(&record.root).unwrap(), Some(record));
     }
 

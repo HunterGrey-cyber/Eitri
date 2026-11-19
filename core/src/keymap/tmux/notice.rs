@@ -103,11 +103,7 @@ pub fn remember(file: &Path, fingerprint: &str) -> std::io::Result<()> {
     })
     .expect("a string serializes");
     let tmp = file.with_extension(format!("json.{}.tmp", std::process::id()));
-    let written = agent::private_fs::write_private(&tmp, text.as_bytes()).and_then(|()| std::fs::rename(&tmp, file));
-    if written.is_err() {
-        let _ = std::fs::remove_file(&tmp);
-    }
-    written
+    agent::private_fs::replace_private(&tmp, file, text.as_bytes(), agent::private_fs::Flush::Nothing)
 }
 
 /// A path as the user would type it: under the home directory, `~/...`.
