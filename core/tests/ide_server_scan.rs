@@ -69,19 +69,31 @@ fn the_scan_sees_a_word_in_a_literal_and_in_a_comment() {
     }
 }
 
-/// A file's production text: everything before its unit-test module (a `test-support` module is cut there too, which
-/// `production_text` does not treat as test-gated), with the `#[cfg(test)]` items above it blanked.
-fn product_text(text: &str) -> String {
-    let end = [
-        "#[cfg(test)]\nmod tests",
-        "#[cfg(test)]\npub(crate) mod tests",
-        "#[cfg(any(test, feature = \"test-support\"))]\npub mod tests",
-    ]
-    .iter()
-    .filter_map(|marker| text.find(marker))
-    .min()
-    .unwrap_or(text.len());
+/// A file's production text: `production_text` (every `#[cfg(test)]` item blanked, the code after it still read),
+/// cut first at a `test-support` test module, which builds outside tests too and so is not blanked there.
+fn scanned_text(text: &str) -> String {
+    let end = text
+        .find("#[cfg(any(test, feature = \"test-support\"))]\npub mod tests")
+        .unwrap_or(text.len());
     production_text(&text[..end])
+}
+
+/// A `#[cfg(test)] mod tests;` declaration near the top of a file hides nothing below it.
+#[test]
+fn product_code_after_a_test_module_declaration_is_scanned() {
+    let text = format!("#[cfg(test)]\nmod tests;\n\nfn product() {{ let _ = \"{PORT_VAR}\"; }}\n");
+    assert!(scanned_text(&text).contains(PORT_VAR));
+    let gated = format!("#[cfg(test)]\nmod tests {{ const P: &str = \"{PORT_VAR}\"; }}\nfn product() {{}}\n");
+    assert!(!scanned_text(&gated).contains(PORT_VAR));
+    let support = format!(
+        concat!(
+            "fn product() {{}}\n",
+            "#[cfg(any(test, feature = \"test-support\"))]\n",
+            "pub mod tests {{ const P: &str = \"{}\"; }}\n"
+        ),
+        PORT_VAR
+    );
+    assert!(!scanned_text(&support).contains(PORT_VAR));
 }
 
 /// The port is set on the terminal's shells through its one constant, so product code that spells the variable out is
@@ -95,7 +107,7 @@ fn the_port_variable_is_named_only_in_its_module() {
     );
     let naming: Vec<&str> = read
         .iter()
-        .filter(|source| product_text(&source.text).contains(PORT_VAR))
+        .filter(|source| scanned_text(&source.text).contains(PORT_VAR))
         .map(|source| source.path.as_str())
         .collect();
     assert_eq!(naming, vec!["core/src/ide_server/types.rs"]);
@@ -166,13 +178,13 @@ fn the_wiring_is_behind_the_linux_gate() {
         ("shell/src/gtk_host/services.rs", "crate::ide_wiring::IdeWiring"),
     ] {
         let text = read_required(path).text;
-        let product = product_text(&text);
+        let product = scanned_text(&text);
         assert!(product.contains(anchor), "{path} no longer has the wiring");
         assert_eq!(ungated(&product), Vec::<String>::new(), "{path}");
     }
     for path in ["shell/src/launch.rs", "shell/src/window_services.rs"] {
         let text = read_required(path).text;
-        assert_eq!(ungated(&product_text(&text)), Vec::<String>::new(), "{path}");
+        assert_eq!(ungated(&scanned_text(&text)), Vec::<String>::new(), "{path}");
     }
 }
 

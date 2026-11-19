@@ -96,3 +96,11 @@ fn awkward_spellings_are_still_caught() {
 fn a_forbidden_name_inside_another_word_is_not_flagged() {
     assert_eq!(offenders(NAMES_INSIDE_OTHER_WORDS), Vec::<String>::new());
 }
+
+/// The guard reads an inherited dependency through the root manifest: `claude-runtime-protocol` is the root's one
+/// `[workspace.dependencies]` entry, which an empty or wrong workspace text could not resolve.
+#[test]
+fn an_inherited_dependency_resolves_through_the_root_manifest() {
+    let manifest = "[dependencies]\nclaude-runtime-protocol = { workspace = true }\n";
+    assert_eq!(offenders(manifest), Vec::<String>::new());
+}
