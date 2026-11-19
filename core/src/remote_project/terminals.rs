@@ -1041,7 +1041,7 @@ mod tests {
         let state = ScratchDir::new("remote", "terminal-sync");
         let projects = RemoteProjects::new(Some(state.as_os_str()), None);
         let records = projects.terminals();
-        let before = crate::editor_record::file::syncs();
+        let before = agent::private_fs::replace_test_hooks::syncs();
         let entry = records
             .begin_open(
                 "SHA256:example",
@@ -1052,8 +1052,8 @@ mod tests {
                 42,
             )
             .unwrap();
-        assert_eq!(crate::editor_record::file::syncs() - before, 2);
-        let before = crate::editor_record::file::syncs();
+        assert_eq!(agent::private_fs::replace_test_hooks::syncs() - before, 2);
+        let before = agent::private_fs::replace_test_hooks::syncs();
         records
             .opened(
                 "SHA256:example",
@@ -1064,7 +1064,7 @@ mod tests {
                 "boot",
             )
             .unwrap();
-        assert_eq!(crate::editor_record::file::syncs() - before, 2);
+        assert_eq!(agent::private_fs::replace_test_hooks::syncs() - before, 2);
     }
     fn entry() -> TerminalEntry {
         TerminalEntry {
