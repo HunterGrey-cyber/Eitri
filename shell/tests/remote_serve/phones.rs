@@ -1778,7 +1778,10 @@ fn push_endpoint_set_records_the_host_only(dir: &Path) -> Result<(), String> {
         || set.line.clone(),
     )?;
     let log = String::from_utf8_lossy(&world.log_bytes()).into_owned();
-    for part in ["topic-secret", "topic-user", "AbCdEf123", "8443", "/up"] {
+    // The port is looked for after the host, never as a bare number: every record carries timestamps, hashes and a
+    // peer address with an ephemeral port, any of which can contain "8443" (or ":8443") by chance. Nothing in a
+    // record but a leaked URL has a host name directly followed by that port.
+    for part in ["topic-secret", "topic-user", "AbCdEf123", "example.net:8443", "/up"] {
         check(!log.contains(part), || format!("{part} is in the log"))?;
     }
     Ok(())
