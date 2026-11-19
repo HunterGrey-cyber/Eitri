@@ -15,6 +15,7 @@ pub mod editor;
 pub(crate) mod focus;
 pub mod group_tabs;
 pub mod hand_over;
+pub mod host_loop;
 pub mod pair_files;
 pub mod registry;
 pub mod relink;
@@ -211,14 +212,17 @@ pub enum WindowStart {
 /// `linked-window`) parsed, the link end made close-on-exec, checked and owned, then the window's own log put on
 /// stdout and stderr. An error is the reason the window cannot start; a log that cannot be opened is not one, since
 /// stdout and stderr are `/dev/null` from the spawn and a write there cannot fail.
-pub fn second_first_acts(args: &[OsString]) -> Result<WindowStart, String> {
+pub fn second_first_acts(
+    args: &[OsString],
+    log: impl FnOnce(Option<&Path>, &Path, &WindowName),
+) -> Result<WindowStart, String> {
     let parsed = start::parse_args(args)?;
     let sock = start::first_acts(&parsed)?;
     let home = state_home(
         std::env::var_os("XDG_STATE_HOME").as_deref(),
         std::env::var_os("HOME").as_deref(),
     );
-    crate::window_log::start_linked(home.as_deref(), &parsed.root, &parsed.name());
+    log(home.as_deref(), &parsed.root, &parsed.name());
     Ok(linked_start(parsed, sock))
 }
 
@@ -329,31 +333,6 @@ impl LinkEnd {
     /// that says the window is kept: only window 1 can hold a window's tabs and place for its next start.
     pub fn closed_for_good(&self) -> bool {
         matches!(self, LinkEnd::Bye { why } if !why.ends_with(KEPT_WORDS))
-    }
-}
-
-/// Loads `module`'s page again, from its store as it is now: a plugin's page with no view here (never built, or
-/// dropped when it left for the other window) is built, an away host is reopened, and a page already loaded for
-/// this return is reused. A Lua panel's view always loads its URL. Whether the page is available.
-pub(crate) fn reload_page_back(
-    plugin_panels: &crate::plugin_panels::PluginPanels,
-    lua_pages: &crate::gtk_host_services::LuaPages,
-    module: &ModuleId,
-) -> bool {
-    use gtk4::prelude::*;
-    use webkit6::prelude::*;
-    if plugin_panels.modules().contains(module) {
-        return plugin_panels.reload_back(module);
-    }
-    let Some((_, widget, url, _)) = crate::gtk_host_services::lua_page(lua_pages, module) else {
-        return false;
-    };
-    match widget.downcast_ref::<webkit6::WebView>() {
-        Some(view) => {
-            view.load_uri(&url);
-            true
-        }
-        None => false,
     }
 }
 
@@ -847,14 +826,14 @@ pub(crate) mod tests {
             assert!(!other.is_beside());
         }
 
-        let pair = spawn::Pair::beside(name.clone(), Path::new("/p"), link.clone());
+        let pair = spawn::Pair::beside(spawn::PairEnv::for_tests(), name.clone(), Path::new("/p"), link.clone());
         assert!(pair.is_beside());
         assert!(!pair.is_second(), "window 1 did not start it");
         assert!(!pair.is_module() && !pair.is_unpaired() && !pair.is_alone());
         assert_eq!(pair.module_window(), Some(name));
         assert!(!pair.owns_editor());
         assert!(pair.beside_link().is_some_and(|held| Rc::ptr_eq(&held, &link)));
-        let full = spawn::Pair::full(Ok(None), Path::new("/p"), false, false);
+        let full = spawn::Pair::full(spawn::PairEnv::for_tests(), Ok(None), Path::new("/p"), false, false);
         assert!(!full.is_beside() && full.beside_link().is_none());
     }
 

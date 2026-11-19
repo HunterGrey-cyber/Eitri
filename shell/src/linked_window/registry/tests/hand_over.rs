@@ -9,8 +9,8 @@ use eitri_core::saved_tabs::{SavedTab, SavedTabs};
 use eitri_core::tab_set::AgentId;
 
 use super::*;
-use crate::agent_panel::TabAnswer;
 use crate::linked_window::hand_over::{answer_message, serve, HandOvers, TabHolder, TabHolderSlot};
+use eitri_panel::agent_panel::TabAnswer;
 
 /// What every window did, in one order.
 type Log = Rc<RefCell<Vec<String>>>;
@@ -291,7 +291,7 @@ fn a_target_that_never_links_leaves_the_tab_where_it_is() {
         .processes
         .borrow_mut()
         .push(group.pair.module_process(&chat(2)).unwrap());
-    group.fire_timers();
+    group.clock.advance(Duration::ZERO);
     assert!(group.until(&[&c1], || has(&log, "c1: told: window c2 did not come up")));
     assert_eq!(log.borrow().len(), 1, "it was never asked to let go");
 }
@@ -428,7 +428,7 @@ fn a_tab_let_go_on_a_link_whose_end_has_not_reached_this_thread_comes_back() {
     let root = Path::new("/p");
     let lock = PairLock::try_take(&dir.0, root).unwrap().unwrap();
     let (one, two) = fdpass::seqpacket_pair().unwrap();
-    let pair = Pair::module(two, chat(2), root).unwrap();
+    let pair = Pair::module(PairEnv::for_tests(), two, chat(2), root).unwrap();
     let (handle, _inbound) = LinkHandle::start(one, PresenceFlag::default()).unwrap();
     let log = Log::default();
     let (mine, _their) = fdpass::seqpacket_pair().unwrap();
@@ -501,7 +501,7 @@ fn a_release_that_was_queued_and_never_written_gives_the_tab_back_on_the_links_w
     let root = Path::new("/p");
     let lock = PairLock::try_take(&dir.0, root).unwrap().unwrap();
     let (one, two) = fdpass::seqpacket_pair().unwrap();
-    let pair = Pair::module(two, chat(2), root).unwrap();
+    let pair = Pair::module(PairEnv::for_tests(), two, chat(2), root).unwrap();
     let (handle, _inbound) = LinkHandle::start(one, PresenceFlag::default()).unwrap();
     let log = Log::default();
     let (mine, _their) = fdpass::seqpacket_pair().unwrap();
@@ -544,7 +544,7 @@ fn a_chat_windows_answers_reach_window_1_and_what_stays_is_said_there() {
     let root = Path::new("/p");
     let lock = PairLock::try_take(&dir.0, root).unwrap().unwrap();
     let (one, two) = fdpass::seqpacket_pair().unwrap();
-    let pair = Pair::module(two, chat(2), root).unwrap();
+    let pair = Pair::module(PairEnv::for_tests(), two, chat(2), root).unwrap();
     let (handle, inbound) = LinkHandle::start(one, PresenceFlag::default()).unwrap();
     assert!(matches!(
         inbound.recv_timeout(Duration::from_secs(5)).unwrap(),

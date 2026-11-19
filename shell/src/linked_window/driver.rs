@@ -1,4 +1,4 @@
-//! The link's GTK side: the link thread's wake descriptor watched on the main context, what arrived drained on
+//! The link's host side: the link thread's wake descriptor watched on the host loop, what arrived drained on
 //! each wake and handed to the handler registered for its kind, and the end of the link reported once.
 //!
 //! The link thread does every read and write, so nothing here waits: a wake drains what is already queued, a send
@@ -19,12 +19,12 @@ use std::rc::Rc;
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::time::{Duration, Instant};
 
+use super::host_loop::{Armed, Flow, Interest, LinkWatch, Priority};
 use eitri_core::window_link::link::{Inbound, LinkHandle, LinkSender, PresenceFlag};
 use eitri_core::window_link::msg::KINDS;
 use eitri_core::window_link::names::WindowName;
 use eitri_core::window_link::{LinkError, Msg, TurnEdge};
 use eitri_core::wm::{Controller, Driver, PeerId, WinId};
-use gtk4::glib;
 
 use super::LinkEnd;
 use crate::gtk_host::peer::{self, LinkPort, LinkSend};
@@ -74,10 +74,10 @@ struct Inner {
     closed_here: Cell<bool>,
     /// When the handshake must be done by, for a link whose other window was started here.
     handshake_by: Cell<Option<Instant>>,
-    watch: RefCell<Option<glib::SourceId>>,
+    watch: RefCell<Option<Box<dyn Armed>>>,
 }
 
-/// One window's end of the link on the GTK thread. Cheap to clone: every clone is the same link.
+/// One window's end of the link on the host loop's thread. Cheap to clone: every clone is the same link.
 #[derive(Clone)]
 pub struct LinkDriver {
     inner: Rc<Inner>,
@@ -110,34 +110,48 @@ impl LinkDriver {
         }
     }
 
-    /// Watches the link's wake descriptor on the default main context; each wake pumps. The watch ends with
-    /// the link. `false` when it could not be added (not on the main context's thread).
-    pub fn watch(&self) -> bool {
+    /// The link's wake descriptor, while the link is up.
+    #[cfg(test)]
+    pub(crate) fn wake_fd(&self) -> Option<std::os::fd::RawFd> {
+        self.inner
+            .handle
+            .borrow()
+            .as_ref()
+            .map(|handle| handle.wake_fd().as_raw_fd())
+    }
+
+    /// Watches the link's wake descriptor on the host loop; each wake pumps. The watch ends with the link.
+    /// Returns `false` if the link is down or the watch could not be armed.
+    pub fn watch(&self, on: &dyn LinkWatch) -> bool {
         let fd = match self.inner.handle.borrow().as_ref() {
             Some(handle) => handle.wake_fd().as_raw_fd(),
             None => return false,
         };
         let me = Rc::downgrade(&self.inner);
-        let watched =
-            neovide_editor::fd_watch::add_local(fd, glib::IOCondition::IN, glib::ffi::G_PRIORITY_DEFAULT, move |_| {
+        let watched = on.arm(
+            fd,
+            Interest::Readable,
+            Priority::Default,
+            Box::new(move || {
                 let Some(inner) = me.upgrade() else {
-                    return glib::ControlFlow::Break;
+                    return Flow::Stop;
                 };
                 let driver = LinkDriver { inner };
                 driver.pump();
                 if driver.ended().is_some() || driver.inner.handle.borrow().is_none() {
-                    // GLib removes the source once this returns `Break`, so its id is forgotten here.
+                    // The host removes the watch once this returns `Stop`, so forget the token here.
                     driver.inner.watch.borrow_mut().take();
-                    glib::ControlFlow::Break
+                    Flow::Stop
                 } else {
-                    glib::ControlFlow::Continue
+                    Flow::Continue
                 }
-            });
-        let Ok(id) = watched else {
+            }),
+        );
+        let Ok(watch) = watched else {
             eprintln!("[link] BUG: the link is watched off the main context's thread; nothing arrives");
             return false;
         };
-        *self.inner.watch.borrow_mut() = Some(id);
+        *self.inner.watch.borrow_mut() = Some(watch);
         true
     }
 
@@ -403,7 +417,7 @@ impl LinkDriver {
     }
 
     /// [`LinkDriver::close`] with the wait for a full socket on a thread of its own: for one close of many, each of which
-    /// could otherwise hold the GTK thread for its whole bound.
+    /// could otherwise hold the host loop's thread for its whole bound.
     pub fn close_detached(&self, why: &str) {
         if let Some(handle) = self.closing() {
             handle.close_detached(why);
@@ -421,8 +435,9 @@ impl LinkDriver {
         self.inner.closed_here.set(true);
         self.inner.linked.set(false);
         // The watch goes first: closing the link closes the descriptor it watches.
-        if let Some(id) = self.inner.watch.borrow_mut().take() {
-            id.remove();
+        let watch = self.inner.watch.borrow_mut().take();
+        if let Some(watch) = watch {
+            watch.disarm();
         }
         self.inner.handle.borrow_mut().take()
     }
@@ -499,6 +514,7 @@ impl LinkSend for LinkDriver {
 
 #[cfg(test)]
 pub(crate) mod tests {
+    use super::super::host_loop::tests::RecordingWatch;
     use super::*;
     use eitri_core::window_link::fdpass;
     use eitri_core::window_link::link::PresenceFlag;
@@ -523,6 +539,38 @@ pub(crate) mod tests {
             std::thread::sleep(Duration::from_millis(5));
         }
         false
+    }
+
+    #[test]
+    fn watching_arms_the_wake_fd_and_local_close_disarms_once() {
+        let (driver, _theirs, _their_inbound) = pair();
+        let fd = driver.inner.handle.borrow().as_ref().unwrap().wake_fd().as_raw_fd();
+        let watch = RecordingWatch::default();
+
+        assert!(driver.watch(&watch));
+        assert_eq!(*watch.arms.borrow(), [(fd, Interest::Readable, Priority::Default)]);
+        assert!(watch.disarms.borrow().is_empty());
+
+        driver.close("window closed");
+        driver.close("already closed");
+        assert_eq!(*watch.disarms.borrow(), [fd]);
+    }
+
+    #[test]
+    fn a_watch_that_stops_after_the_peer_ends_is_not_disarmed() {
+        let (driver, theirs, _their_inbound) = pair();
+        let watch = RecordingWatch::default();
+        assert!(driver.watch(&watch));
+        let mut ready = watch.callbacks.borrow_mut().pop().unwrap();
+        assert_eq!(ready(), Flow::Continue);
+
+        drop(theirs);
+        assert!(wait_queued(&driver), "the end reached this side's queue");
+        assert_eq!(ready(), Flow::Stop);
+        assert_eq!(driver.ended(), Some(LinkEnd::Eof));
+
+        driver.close("already ended");
+        assert!(watch.disarms.borrow().is_empty());
     }
 
     #[test]

@@ -110,6 +110,7 @@ fn each_kind_of_window_has_its_app_id() {
 
 fn beside_pair() -> Rc<linked_window::spawn::Pair> {
     linked_window::spawn::Pair::beside(
+        linked_window::spawn::PairEnv::for_tests(),
         WindowName::Page("notes".into()),
         Path::new("/p"),
         linked_window::spawn::tests::idle_beside_link("notes"),
@@ -124,7 +125,13 @@ fn early_facts_of_a_beside_window_rule_out_a_hub() {
     assert!(facts.started, "the mode is not in question");
     assert!(!facts.shows_chat);
     assert!(!facts.unpaired && !facts.alone && !facts.window2_orphan && !facts.module_orphans);
-    let full = linked_window::spawn::Pair::full(Err(std::io::Error::other("no state")), Path::new("/p"), false, false);
+    let full = linked_window::spawn::Pair::full(
+        linked_window::spawn::PairEnv::for_tests(),
+        Err(std::io::Error::other("no state")),
+        Path::new("/p"),
+        false,
+        false,
+    );
     assert!(
         !early_facts(&full, true).started,
         "a full window's mode is still decided"
@@ -135,9 +142,21 @@ fn early_facts_of_a_beside_window_rule_out_a_hub() {
 #[test]
 fn a_beside_window_runs_no_onboarding() {
     assert!(!onboarding_full_window(&beside_pair()));
-    let alone = linked_window::spawn::Pair::full(Err(std::io::Error::other("no state")), Path::new("/p"), false, false);
+    let alone = linked_window::spawn::Pair::full(
+        linked_window::spawn::PairEnv::for_tests(),
+        Err(std::io::Error::other("no state")),
+        Path::new("/p"),
+        false,
+        false,
+    );
     assert!(onboarding_full_window(&alone), "a full window still offers it");
-    let unpaired = linked_window::spawn::Pair::full(Ok(None), Path::new("/p"), false, false);
+    let unpaired = linked_window::spawn::Pair::full(
+        linked_window::spawn::PairEnv::for_tests(),
+        Ok(None),
+        Path::new("/p"),
+        false,
+        false,
+    );
     assert!(!onboarding_full_window(&unpaired));
     // The first show presents a beside window through the pair's raise, as a module window's is.
     let src = include_str!("main.rs");
@@ -476,7 +495,10 @@ fn the_linked_window_subcommand_is_dispatched_before_the_project_resolver() {
     let order = [
         at(concat!("args_os().skip(1)", ".collect()")),
         at(concat!("start::", "SUBCOMMAND")),
-        at(concat!("second_first_acts(", "&early_args[1..])")),
+        at(concat!(
+            "second_first_acts(",
+            "&early_args[1..], crate::window_log::start_linked)"
+        )),
         at(concat!("run_guard::", "SUBCOMMAND")),
         at(concat!("companion::run(", "early_args")),
         at(concat!("drop_inherited", "_editor_env()")),

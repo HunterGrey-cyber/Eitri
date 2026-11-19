@@ -263,14 +263,5 @@ pub(crate) fn adopt(
     Ok((session, copy_mode))
 }
 
-/// A wait status as `child_exited` carries it: the kernel's raw status word (an exit code in its second byte, a
-/// signal in its first).
-pub(crate) fn raw_status(code: agent::child::ExitCode) -> i32 {
-    match code {
-        agent::child::ExitCode::Exited { code } => (code & 0xff) << 8,
-        agent::child::ExitCode::Signaled { signal } => signal & 0x7f,
-    }
-}
-
 #[cfg(test)]
 mod tests;

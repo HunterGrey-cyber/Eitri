@@ -31,6 +31,17 @@ pub enum ExitCode {
     Signaled { signal: i32 },
 }
 
+impl ExitCode {
+    /// The status as `child_exited` carries it: the kernel's raw status word (an exit code in its second byte, a
+    /// signal in its first).
+    pub fn raw_status(self) -> i32 {
+        match self {
+            ExitCode::Exited { code } => (code & 0xff) << 8,
+            ExitCode::Signaled { signal } => signal & 0x7f,
+        }
+    }
+}
+
 /// Linux's `PIDFD_SIGNAL_PROCESS_GROUP` (since 6.9): the signal goes to the pidfd's process group.
 const PIDFD_SIGNAL_PROCESS_GROUP: libc::c_uint = 1 << 2;
 
@@ -279,6 +290,13 @@ mod tests {
             Some(ExitCode::Signaled { signal: libc::SIGTERM })
         );
         std::mem::forget(child);
+    }
+
+    #[test]
+    fn the_raw_status_puts_an_exit_code_in_the_second_byte_and_a_signal_in_the_first() {
+        assert_eq!(ExitCode::Exited { code: 3 }.raw_status(), 0x300);
+        assert_eq!(ExitCode::Exited { code: 0x1ff }.raw_status(), 0xff00);
+        assert_eq!(ExitCode::Signaled { signal: 9 }.raw_status(), 9);
     }
 
     #[test]

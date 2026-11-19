@@ -8,12 +8,10 @@
 use std::cell::{Cell, RefCell};
 use std::os::fd::OwnedFd;
 use std::path::PathBuf;
-use std::rc::Rc;
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::time::{Duration, SystemTime};
 
 use eitri_core::window_link::pair::PairLock;
-use gtk4::prelude::GtkWindowExt;
 
 /// One window's stamping thread, which ends with this and owns a copy of the lock's descriptor until it does.
 pub(crate) struct ProjectStamp {
@@ -109,15 +107,6 @@ impl StampSlot {
     pub(crate) fn started(&self) -> bool {
         self.stamp.borrow().is_some()
     }
-}
-
-/// Hands every activation of `window` to its stamp. A window with no lock never fills the slot, and writes nothing.
-pub(crate) fn watch_activation(window: &gtk4::ApplicationWindow, slot: Rc<StampSlot>) {
-    window.connect_is_active_notify(move |window| {
-        if window.is_active() {
-            slot.activated(SystemTime::now());
-        }
-    });
 }
 
 #[cfg(test)]
@@ -320,7 +309,7 @@ mod tests {
         assert_eq!(main.matches(holder).count(), 1);
 
         let window = flat(functions(&main_rs, "build_ui")[0]);
-        let watched = "project_stamp::watch_activation(&window,pair.stamp())";
+        let watched = "linked_window_glue::watch_activation(&window,pair.stamp())";
         assert_eq!(window.matches(watched).count(), 1);
 
         let services = code_only(&read_required("shell/src/gtk_host/services.rs").text);

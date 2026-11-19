@@ -35,6 +35,7 @@ mod launch_env;
 mod layout;
 mod layout_state;
 mod linked_window;
+mod linked_window_glue;
 mod lua;
 mod module_grid;
 mod nvim_verbs;
@@ -202,7 +203,7 @@ fn main() -> glib::ExitCode {
         .first()
         .is_some_and(|a| a == eitri_core::window_link::start::SUBCOMMAND)
     {
-        match linked_window::second_first_acts(&early_args[1..]) {
+        match linked_window::second_first_acts(&early_args[1..], crate::window_log::start_linked) {
             Ok(start) => start,
             Err(message) => {
                 eprintln!("eitri: {message}");
@@ -528,6 +529,7 @@ fn main() -> glib::ExitCode {
         let Some(start) = start.borrow_mut().take() else { return };
         // Why an orphaned window 2 refused this window, shown once the window is up.
         let mut start_note: Option<String> = None;
+        let env = linked_window_glue::pair_env();
         let pair = match start {
             linked_window::WindowStart::Full => {
                 let layout_dir = eitri_core::layout::persist::state_dir(
@@ -548,7 +550,7 @@ fn main() -> glib::ExitCode {
                             &linked_window::relink::orphan_dir(),
                             dir,
                             &project_root,
-                            version::fingerprint(),
+                            env.build.clone(),
                             linked_window::relink::RELINK_WITHIN,
                         );
                         start_note = note;
@@ -558,15 +560,22 @@ fn main() -> glib::ExitCode {
                 };
                 match relinked {
                     StartRelink::Window2(relinked) => {
-                        let pair = linked_window::spawn::Pair::relinked(relinked, &project_root, legacy, want_clean);
+                        let pair = linked_window::spawn::Pair::relinked(
+                            env.clone(),
+                            relinked,
+                            &project_root,
+                            legacy,
+                            want_clean,
+                        );
                         pair.start_stamp(None);
                         if let Some(link) = pair.link() {
-                            link.watch();
+                            link.watch(&*env.clock);
                         }
                         pair
                     }
                     StartRelink::Modules(group, claim) => {
-                        let pair = linked_window::spawn::Pair::relinked_group(group, &project_root, legacy, want_clean);
+                        let pair =
+                            linked_window::spawn::Pair::relinked_group(env, group, &project_root, legacy, want_clean);
                         pair.hold_group_claim(Some(claim));
                         pair.start_stamp(None);
                         pair.watch_module_links();
@@ -583,7 +592,7 @@ fn main() -> glib::ExitCode {
                             }
                             _ => None,
                         };
-                        let pair = linked_window::spawn::Pair::full(taken, &project_root, legacy, want_clean);
+                        let pair = linked_window::spawn::Pair::full(env, taken, &project_root, legacy, want_clean);
                         pair.hold_group_claim(claim);
                         pair.start_stamp(Some(project_root.to_path_buf()));
                         pair
@@ -598,7 +607,7 @@ fn main() -> glib::ExitCode {
                 ..
             } => {
                 let pair = linked_pair(
-                    linked_window::spawn::Pair::second(sock, &project_root),
+                    linked_window::spawn::Pair::second(env, sock, &project_root),
                     token,
                     restore,
                     backend_kind,
@@ -615,7 +624,7 @@ fn main() -> glib::ExitCode {
                 restore,
                 ..
             } => linked_pair(
-                linked_window::spawn::Pair::module(sock, name, &project_root),
+                linked_window::spawn::Pair::module(env, sock, name, &project_root),
                 token,
                 restore,
                 backend_kind,
@@ -5086,7 +5095,7 @@ fn build_ui(
             }
         });
     }
-    project_stamp::watch_activation(&window, pair.stamp());
+    linked_window_glue::watch_activation(&window, pair.stamp());
     driver.start(
         WinId::MAIN,
         StartStep::Present {

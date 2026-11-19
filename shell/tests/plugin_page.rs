@@ -92,6 +92,10 @@ mod wheel_zoom;
 #[path = "../src/layout.rs"]
 mod layout;
 
+// The link driver is written against the watch contract of `host_loop`, which it reaches as `super::host_loop`.
+#[allow(dead_code, unused_imports)]
+#[path = "../src/linked_window/host_loop.rs"]
+mod host_loop;
 // The terminal's compiled move-test helpers refer to the link driver; this run creates no link.
 #[allow(dead_code, unused_imports)]
 #[path = "../src/linked_window/driver.rs"]

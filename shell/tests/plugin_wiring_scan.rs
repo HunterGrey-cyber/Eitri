@@ -1564,7 +1564,7 @@ fn the_link_ended_hook_loads_again_every_page_that_comes_back() {
     let services = file_code("shell/src/gtk_host/services.rs");
     let reload = arm(&services, "PairOp::ReloadPage{", "}Ok(())");
     assert!(
-        reload.contains("crate::linked_window::reload_page_back(&self.plugin_panels,&self.lua_pages,module)"),
+        reload.contains("crate::linked_window_glue::reload_page_back(&self.plugin_panels,&self.lua_pages,module)"),
         "{reload}"
     );
     assert!(

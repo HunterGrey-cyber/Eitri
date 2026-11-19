@@ -216,7 +216,8 @@ pub(crate) fn run(args: PageArgs) -> glib::ExitCode {
                 app.quit();
                 return;
             }
-            let pair = crate::linked_window::spawn::Pair::beside(name, &root, link);
+            let env = crate::linked_window_glue::pair_env();
+            let pair = crate::linked_window::spawn::Pair::beside(env, name, &root, link);
             crate::build_ui(
                 &app,
                 false,

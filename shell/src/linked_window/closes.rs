@@ -9,8 +9,8 @@ use std::time::Instant;
 use eitri_core::window_link::close_burst::CloseBurst;
 use eitri_core::window_link::names::WindowName;
 
+use super::host_loop::PairClock;
 use super::registry::ModuleWindows;
-use super::spawn::After;
 
 /// Told of each window that is closed for good, after its tabs have left the tabs file.
 pub type OnForgotten = Rc<dyn Fn(&WindowName)>;
@@ -38,17 +38,17 @@ impl WindowCloses {
     }
 
     /// A linked module window said it was closed.
-    pub fn window_closed(self: &Rc<Self>, name: WindowName, after: &After) {
-        let ended = self.burst.borrow_mut().window_closed(name, Instant::now());
+    pub fn window_closed(self: &Rc<Self>, name: WindowName, clock: &Rc<dyn PairClock>) {
+        let ended = self.burst.borrow_mut().window_closed(name, clock.now());
         self.forget_all(ended);
-        self.watch(after);
+        self.watch(clock);
     }
 
     /// Window 1 was asked to close.
-    pub fn group_asked(self: &Rc<Self>, after: &After) {
-        let ended = self.burst.borrow_mut().group_asked(Instant::now());
+    pub fn group_asked(self: &Rc<Self>, clock: &Rc<dyn PairClock>) {
+        let ended = self.burst.borrow_mut().group_asked(clock.now());
         self.forget_all(ended);
-        self.watch(after);
+        self.watch(clock);
     }
 
     /// A window is about to start under `name`: it starts empty if the window of that name was closed.
@@ -58,21 +58,21 @@ impl WindowCloses {
         }
     }
 
-    fn watch(self: &Rc<Self>, after: &After) {
+    fn watch(self: &Rc<Self>, clock: &Rc<dyn PairClock>) {
         if self.timing.get() {
             return;
         }
-        let Some(due) = self.burst.borrow().due_in(Instant::now()) else {
+        let Some(due) = self.burst.borrow().due_in(clock.now()) else {
             return;
         };
         self.timing.set(true);
         let closes = self.clone();
-        let again = after.clone();
-        after(
+        let again = clock.clone();
+        clock.after(
             due,
             Box::new(move || {
                 closes.timing.set(false);
-                closes.settle(Instant::now());
+                closes.settle(again.now());
                 closes.watch(&again);
             }),
         );

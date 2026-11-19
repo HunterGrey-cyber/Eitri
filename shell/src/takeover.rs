@@ -363,7 +363,8 @@ fn run_window(root: PathBuf, start: TakeoverStart) {
             .as_deref()
             .ok_or_else(|| std::io::Error::other("no state directory"))
             .and_then(|dir| eitri_core::window_link::pair::PairLock::try_take(dir, &root));
-        let pair = crate::linked_window::spawn::Pair::full(taken, &root, false, false);
+        let env = crate::linked_window_glue::pair_env();
+        let pair = crate::linked_window::spawn::Pair::full(env, taken, &root, false, false);
         crate::build_ui(
             app,
             false,

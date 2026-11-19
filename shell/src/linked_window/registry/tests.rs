@@ -17,7 +17,11 @@ use eitri_core::wm::{Controller, Driver, PeerId, WinId};
 use super::{ModuleWindows, OpenModule, MODULE_WINDOWS_ARE_WINDOW_1S};
 use crate::gtk_host::LinkedWindows;
 use crate::linked_window::driver::tests::{controller, pump_until};
-use crate::linked_window::spawn::{hello, After, LinkEnds, Pair, PairHooks, SecondProcess, Starts, HUB_PEER};
+use crate::linked_window::group_tabs::GroupTabs;
+use crate::linked_window::host_loop::tests::ManualClock;
+use crate::linked_window::spawn::{
+    hello, LinkEnds, Pair, PairEnv, PairHooks, SecondProcess, Starts, HUB_PEER, TEST_BUILD,
+};
 use crate::linked_window::tests::Scratch;
 use crate::linked_window::{LinkDriver, LinkEnd};
 
@@ -31,18 +35,18 @@ fn stand_in(report: &Path) -> String {
 }
 
 /// The window's side of one link, in the test's hands.
-struct Their {
-    handle: LinkHandle,
+pub(in crate::linked_window) struct Their {
+    pub(in crate::linked_window) handle: LinkHandle,
     inbound: Receiver<Inbound>,
 }
 
 /// A window 1 holding the group lock, whose module windows are stand-ins. What its hooks were called with is
 /// recorded, and the handshakes' timers are held for the test to fire.
-struct Group {
-    pair: Rc<Pair>,
+pub(in crate::linked_window) struct Group {
+    pub(in crate::linked_window) pair: Rc<Pair>,
     wm: Rc<Driver<Controller>>,
     window_ends: Rc<RefCell<Vec<OwnedFd>>>,
-    timers: Rc<RefCell<Vec<Box<dyn FnOnce()>>>>,
+    pub(in crate::linked_window) clock: Rc<ManualClock>,
     linked: Rc<RefCell<Vec<(WindowName, PeerId)>>>,
     ended: Rc<RefCell<Vec<(WindowName, PeerId)>>>,
     /// The windows reported as never linked, with why.
@@ -53,17 +57,23 @@ struct Group {
 }
 
 fn group(label: &str, within: Duration) -> Group {
+    group_with_env(label, within, |_| {})
+}
+
+/// A group whose pair's env is the test one with `change` applied after the stand-in and clock are set.
+fn group_with_env(label: &str, within: Duration, change: impl FnOnce(&mut PairEnv)) -> Group {
     let dir = Scratch::new(label);
     let report = dir.1.join("started");
     let exe = dir.1.join("module-window-stand-in");
     script_fixture::write_executable_script(&exe, stand_in(&report), 0o700).unwrap();
     let lock = PairLock::try_take(&dir.0, Path::new("/p")).unwrap().unwrap();
-    let pair = Pair::full(Ok(Some(lock)), &dir.1, false, false);
-    let timers: Rc<RefCell<Vec<Box<dyn FnOnce()>>>> = Rc::default();
-    let after: After = {
-        let timers = timers.clone();
-        Rc::new(move |_, run| timers.borrow_mut().push(run))
-    };
+    let clock = Rc::new(ManualClock::default());
+    let env = PairEnv::for_tests_with(|env| {
+        env.exe = exe;
+        env.clock = clock.clone();
+        change(env);
+    });
+    let pair = Pair::full(env, Ok(Some(lock)), &dir.1, false, false);
     let window_ends: Rc<RefCell<Vec<OwnedFd>>> = Rc::default();
     let link_ends: LinkEnds = {
         let window_ends = window_ends.clone();
@@ -74,9 +84,7 @@ fn group(label: &str, within: Duration) -> Group {
         })
     };
     pair.set_starts(Starts {
-        exe,
         handshake_within: within,
-        after,
         link_ends,
     });
     let (wm, _host) = controller();
@@ -103,7 +111,7 @@ fn group(label: &str, within: Duration) -> Group {
         pair,
         wm,
         window_ends,
-        timers,
+        clock,
         linked,
         ended,
         failed,
@@ -111,6 +119,15 @@ fn group(label: &str, within: Duration) -> Group {
         report,
         dir,
     }
+}
+
+/// A group whose window 1 keeps its tabs under the group's scratch directory.
+pub(in crate::linked_window) fn keeping(label: &str) -> Group {
+    let group = group(label, Duration::from_secs(30));
+    group
+        .pair
+        .keep_group_tabs(GroupTabs::read(Some(&group.dir.0), &group.dir.1, false));
+    group
 }
 
 impl Group {
@@ -156,12 +173,12 @@ impl Group {
     /// Says hello for the stand-in `started`, under `says`.
     fn say_hello(&self, their: &Their, started: &WindowName, says: &WindowName) {
         let process = self.pair.module_process(started).unwrap();
-        let hello = hello(crate::version::fingerprint(), says, process.pid(), process.start());
+        let hello = hello(TEST_BUILD.into(), says, process.pid(), process.start());
         their.handle.send(hello, Vec::new()).unwrap();
     }
 
     /// Opens `name` and finishes its handshake; the descriptors its `welcome` carried.
-    fn link(&self, name: &WindowName) -> (PeerId, Their, Vec<OwnedFd>) {
+    pub(in crate::linked_window) fn link(&self, name: &WindowName) -> (PeerId, Their, Vec<OwnedFd>) {
         let (peer, their) = self.open(name);
         self.say_hello(&their, name, name);
         let link = self.pair.module_link(name).unwrap();
@@ -173,17 +190,11 @@ impl Group {
     fn peers(&self) -> Vec<(PeerId, WindowName)> {
         self.wm.query(|wm| wm.peer_names(WinId::MAIN))
     }
-
-    fn fire_timers(&self) {
-        let timers: Vec<_> = self.timers.borrow_mut().drain(..).collect();
-        for timer in timers {
-            timer();
-        }
-    }
 }
 
 impl Drop for Group {
     fn drop(&mut self) {
+        self.clock.clear_timers();
         for process in self.processes.borrow().iter() {
             let _ = process.end(Duration::from_secs(10)).map(|ending| ending.join());
         }
@@ -288,6 +299,58 @@ fn two_module_windows_link_and_each_gets_its_own_peer() {
 }
 
 #[test]
+fn a_started_window_must_say_the_pairs_build_to_link() {
+    let group = group_with_env("hello-pair-build", Duration::from_secs(30), |env| {
+        env.build = "x".into()
+    });
+
+    for (name, build) in [(chat(1), "y"), (chat(2), "x")] {
+        let (_, their) = group.open(&name);
+        let link = group.pair.module_link(&name).unwrap();
+        let process = group.pair.module_process(&name).unwrap();
+        their
+            .handle
+            .send(hello(build.into(), &name, process.pid(), process.start()), Vec::new())
+            .unwrap();
+        if build == "x" {
+            assert!(pump_until(&link, || link.linked()));
+            assert_eq!(welcome_fds(&their.inbound).len(), 1);
+        } else {
+            assert!(pump_until(&link, || !link.is_up()));
+            let reply = their.inbound.recv_timeout(Duration::from_secs(5)).unwrap();
+            assert!(
+                matches!(&reply, Inbound::Msg { msg: Msg::Bye { why }, fds }
+                    if why.contains("another build (y, this one is x)") && fds.is_empty()),
+                "{reply:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn a_started_module_window_runs_the_pairs_executable() {
+    let group = group("module-pair-exe", Duration::from_secs(30));
+    group.stand_ins_run(&format!(
+        "printf '%s\\n' \"$0\" > '{}'\nexec sleep 30",
+        group.report.display()
+    ));
+    let _window = group.open(&chat(1));
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let argv0 = loop {
+        let text = std::fs::read_to_string(&group.report).unwrap_or_default();
+        if let Some(path) = text.strip_suffix('\n') {
+            break path.to_owned();
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the stand-in never reported its executable"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    };
+    assert_eq!(Path::new(&argv0), group.dir.1.join("module-window-stand-in"));
+}
+
+#[test]
 fn a_hello_with_another_windows_name_is_refused() {
     let group = group("hello-other-name", Duration::from_secs(30));
     let (_, their) = group.open(&chat(1));
@@ -342,7 +405,7 @@ fn a_module_window_that_misses_its_handshake_is_ended_and_others_stay_linked() {
     let (_silent_peer, _silent_end) = group.open(&chat(2));
     let silent = group.pair.module_process(&chat(2)).unwrap();
     let silent_link = group.pair.module_link(&chat(2)).unwrap();
-    group.fire_timers();
+    group.clock.advance(Duration::ZERO);
     assert!(!silent_link.is_up(), "its link is closed");
     let status = silent
         .wait_reaped(Duration::from_secs(10))
@@ -380,7 +443,9 @@ fn a_module_window_that_misses_its_handshake_is_ended_and_others_stay_linked() {
 
 #[test]
 fn a_module_window_that_dies_before_hello_is_forgotten() {
-    let group = group("dies-before-hello", Duration::from_secs(30));
+    let within = Duration::from_secs(30);
+    let step = Duration::from_millis(1);
+    let group = group("dies-before-hello", within);
     let (peer, their) = group.open(&chat(1));
     let link = group.pair.module_link(&chat(1)).unwrap();
     drop(their);
@@ -394,12 +459,12 @@ fn a_module_window_that_dies_before_hello_is_forgotten() {
         assert_eq!(failed[0].0, chat(1));
         assert!(failed[0].1.contains("ended before it linked"), "{failed:?}");
     }
+    group.clock.advance(step);
     let (again, _their) = group.open(&chat(1));
     assert!(again.0 > peer.0);
     // The first start's timer fires late, and finds a window of that name that is not the one it was started for:
     // it is not reported again, which would make the controller give up the new start.
-    let first_timer = group.timers.borrow_mut().remove(0);
-    first_timer();
+    group.clock.advance(within - step);
     assert_eq!(group.pair.module_names(), vec![chat(1)]);
     assert_eq!(group.failed.borrow().len(), 1, "{:?}", group.failed.borrow());
 }
@@ -471,12 +536,18 @@ fn a_second_unpaired_or_alone_window_refuses_to_open_module_windows() {
         );
         assert!(pair.module_names().is_empty());
     };
-    refused(&Pair::full(Ok(None), root, false, false));
-    refused(&Pair::full(Err(std::io::Error::other("no state")), root, false, false));
+    refused(&Pair::full(PairEnv::for_tests(), Ok(None), root, false, false));
+    refused(&Pair::full(
+        PairEnv::for_tests(),
+        Err(std::io::Error::other("no state")),
+        root,
+        false,
+        false,
+    ));
     let (_one, two) = fdpass::seqpacket_pair().unwrap();
-    refused(&Pair::second(two, root).unwrap());
+    refused(&Pair::second(PairEnv::for_tests(), two, root).unwrap());
     let (_one, two) = fdpass::seqpacket_pair().unwrap();
-    refused(&Pair::module(two, chat(2), root).unwrap());
+    refused(&Pair::module(PairEnv::for_tests(), two, chat(2), root).unwrap());
 }
 
 #[test]
@@ -642,7 +713,7 @@ fn a_module_window_says_hello_with_its_name_and_links_on_welcome() {
     let root = Path::new("/p");
     let lock = PairLock::try_take(&dir.0, root).unwrap().unwrap();
     let (one, two) = fdpass::seqpacket_pair().unwrap();
-    let pair = Pair::module(two, markdown(), root).unwrap();
+    let pair = Pair::module(PairEnv::for_tests(), two, markdown(), root).unwrap();
     let linked: Rc<RefCell<Vec<(WindowName, PeerId)>>> = Rc::default();
     let ended: Rc<RefCell<Vec<(WindowName, PeerId)>>> = Rc::default();
     {
@@ -772,7 +843,7 @@ fn focus_in_of_a_module_window_tells_window_1() {
     let root = Path::new("/p");
     let lock = PairLock::try_take(&dir.0, root).unwrap().unwrap();
     let (one, two) = fdpass::seqpacket_pair().unwrap();
-    let pair = Pair::module(two, markdown(), root).unwrap();
+    let pair = Pair::module(PairEnv::for_tests(), two, markdown(), root).unwrap();
     let (handle, inbound) = LinkHandle::start(one, PresenceFlag::default()).unwrap();
     assert!(matches!(
         inbound.recv_timeout(Duration::from_secs(5)).unwrap(),
@@ -816,7 +887,7 @@ fn focus_in_of_a_module_window_tells_window_1() {
     assert!(pump_until(&link, || !posted.borrow().is_empty()));
     assert_eq!(*posted.borrow(), vec![PeerEvent::WindowFocused { peer }]);
     // Any window but a module window says nothing.
-    let main = Pair::full(Ok(None), root, false, false);
+    let main = Pair::full(PairEnv::for_tests(), Ok(None), root, false, false);
     main.say_window_focused();
 }
 

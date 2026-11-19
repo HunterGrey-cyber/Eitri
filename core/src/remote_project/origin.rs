@@ -4,7 +4,7 @@
 //! (the open socket, the saved tabs) keys it by origin as well.
 
 use std::io;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use sha2::{Digest, Sha256};
 
@@ -54,6 +54,17 @@ impl WindowOrigin {
     /// found by its root (`None` for a local project and its copy, which keep today's places).
     pub fn key(&self) -> Option<String> {
         self.remote().map(|project| origin_key(&project.host_key_sha256))
+    }
+}
+
+/// The directory a window of `origin` holds its open socket in, and a launch looks for one: the shared control
+/// directory for a local project and its copy, a subdirectory named by the server's key for a remote one, so a file
+/// or a raise for one never reaches the other's window.
+pub fn control_dir(origin: &WindowOrigin) -> PathBuf {
+    let base = crate::panel_control::control_dir(std::env::var_os("XDG_RUNTIME_DIR").as_deref(), &std::env::temp_dir());
+    match origin.key() {
+        Some(key) => base.join(key),
+        None => base,
     }
 }
 
@@ -218,6 +229,20 @@ mod tests {
             created_at: 1,
             queued_stops: vec!["sc-1".into()],
         }
+    }
+
+    #[test]
+    fn a_remote_origin_keeps_its_sockets_in_a_subdirectory_named_by_its_key() {
+        let base =
+            crate::panel_control::control_dir(std::env::var_os("XDG_RUNTIME_DIR").as_deref(), &std::env::temp_dir());
+        assert_eq!(control_dir(&WindowOrigin::Local), base);
+        let copy = WindowOrigin::LocalCopy {
+            host: "example-host".into(),
+        };
+        assert_eq!(control_dir(&copy), base);
+        let remote = WindowOrigin::Remote(record());
+        assert_eq!(control_dir(&remote), base.join(origin_key("SHA256:old")));
+        assert_ne!(control_dir(&remote), base);
     }
 
     /// `--ssh` needs a record of that root on that host and says what to run when there is none; a recorded root

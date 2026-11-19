@@ -3,8 +3,8 @@
 //! **At launch, before GTK.** The command line and the remote project records decide the origin
 //! (`remote_project::decide_origin`): a root with a record opens as remote, `--ssh <host>` needs one, `--local` opens
 //! a remote project's copy as a local project with no agent tabs. A remote origin needs `remote_dev.enabled`, read
-//! from `init.lua` here only when the origin is remote. The origin is also the window's identity: [`control_dir`]
-//! keeps a remote window's open socket apart from its copy's.
+//! from `init.lua` here only when the origin is remote. The origin is also the window's identity:
+//! `eitri_core::remote_project::control_dir` keeps a remote window's open socket apart from its copy's.
 //!
 //! **In the window.** [`prepare`] gives the panel its origin before any tab can start. After saved tabs are read,
 //! [`start`] opens the connection on a worker (`remote_host::window::open_window`: the master, the host key, the
@@ -145,18 +145,6 @@ fn carry_saved_roles(base: &Path, keyed: &Path, root: &Path, host_key: &str) {
                 keyed.display()
             );
         }
-    }
-}
-
-/// The directory a window of `origin` holds its open socket in, and a launch looks for one: the shared control
-/// directory for a local project and its copy, a subdirectory named by the server's key for a remote one, so a file
-/// or a raise for one never reaches the other's window.
-pub(crate) fn control_dir(origin: &WindowOrigin) -> PathBuf {
-    let base =
-        eitri_core::panel_control::control_dir(std::env::var_os("XDG_RUNTIME_DIR").as_deref(), &std::env::temp_dir());
-    match origin.key() {
-        Some(key) => base.join(key),
-        None => base,
     }
 }
 
@@ -439,6 +427,7 @@ fn follow_origin(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use eitri_core::remote_project::control_dir;
 
     #[test]
     fn retries_refuse_a_roots_replacement_host_user_or_port_but_follow_its_new_key() {
@@ -459,9 +448,9 @@ mod tests {
 
     #[test]
     fn a_connected_window_never_rekeys_handoffs_to_another_host() {
-        use crate::linked_window::spawn::Pair;
+        use crate::linked_window::spawn::{Pair, PairEnv};
         let root = Path::new("/srv/project");
-        let pair = Pair::full(Ok(None), root, false, false);
+        let pair = Pair::full(PairEnv::for_tests(), Ok(None), root, false, false);
         let panel = AgentPanelHandle::for_host_test_without_pages();
         let launched = record("/srv/project");
         assert!(prepare(&panel, &WindowOrigin::Remote(launched.clone())));
@@ -501,7 +490,10 @@ mod tests {
 
     #[test]
     fn a_connected_origin_change_moves_the_hubs_writer_with_the_panels() {
-        use crate::linked_window::{group_tabs::GroupTabs, spawn::Pair};
+        use crate::linked_window::{
+            group_tabs::GroupTabs,
+            spawn::{Pair, PairEnv},
+        };
         use eitri_core::agent_bridge::SessionModeChoice;
         use eitri_core::saved_tabs::{self, SavedRemoteTab, SavedTabs};
         use eitri_core::window_link::names::WindowName;
@@ -528,7 +520,7 @@ mod tests {
         }]);
         group.reported(&WindowName::Chat(1), &saved.to_wire());
         assert!(group.wait_written());
-        let pair = Pair::full(Ok(None), root, false, false);
+        let pair = Pair::full(PairEnv::for_tests(), Ok(None), root, false, false);
         pair.keep_group_tabs(group);
         let panel = AgentPanelHandle::for_host_test_without_pages();
         assert!(prepare(&panel, &WindowOrigin::Remote(project.clone())));

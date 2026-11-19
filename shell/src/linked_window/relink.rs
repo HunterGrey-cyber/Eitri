@@ -91,7 +91,7 @@ pub fn orphan_dir() -> PathBuf {
 /// A remote pairing belongs to the host as typed, so a replacement key does not strand an orphan under the old key.
 pub fn orphan_dir_path(origin: &eitri_core::remote_project::WindowOrigin) -> PathBuf {
     orphan_dir_at(
-        &crate::remote_window::control_dir(&eitri_core::remote_project::WindowOrigin::Local),
+        &eitri_core::remote_project::control_dir(&eitri_core::remote_project::WindowOrigin::Local),
         origin,
     )
 }

@@ -5,8 +5,8 @@ mod origin;
 
 pub use connection::{verified_host_key, RemoteConnection};
 pub use origin::{
-    carried_text, carry_tabs_to_key, check_remote_dev, decide_origin, host_key_changed, host_open_hint, origin_key,
-    reconcile_host_key, remote_dev_off, tab_origin_key, WindowOrigin,
+    carried_text, carry_tabs_to_key, check_remote_dev, control_dir, decide_origin, host_key_changed, host_open_hint,
+    origin_key, reconcile_host_key, remote_dev_off, tab_origin_key, WindowOrigin,
 };
 
 use std::collections::BTreeMap;

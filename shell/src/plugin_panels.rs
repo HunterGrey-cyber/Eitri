@@ -2923,13 +2923,17 @@ mod tests {
         let panels = plugin_panels(vec![panel(&registered, Rc::default(), Some(build))]);
         let lua_pages: crate::gtk_host_services::LuaPages = Rc::default();
         assert!(
-            crate::linked_window::reload_page_back(&panels, &lua_pages, &demo()),
+            crate::linked_window_glue::reload_page_back(&panels, &lua_pages, &demo()),
             "a page never built here is built from its store as it is"
         );
         assert_eq!(pages.borrow().len(), 1);
         panels.forget(&demo());
         assert!(panels.follower("demo").is_none());
-        assert!(crate::linked_window::reload_page_back(&panels, &lua_pages, &demo()));
+        assert!(crate::linked_window_glue::reload_page_back(
+            &panels,
+            &lua_pages,
+            &demo()
+        ));
         assert_eq!(pages.borrow().len(), 2, "a page whose view was dropped is built again");
         assert!(panels.is_built(&demo()));
         assert!(
@@ -2945,7 +2949,7 @@ mod tests {
         assert_eq!(replies[0]["re"], 7);
         assert_eq!(replies[0]["ok"], true);
         assert!(
-            !crate::linked_window::reload_page_back(&panels, &lua_pages, &ModuleId::lua("other")),
+            !crate::linked_window_glue::reload_page_back(&panels, &lua_pages, &ModuleId::lua("other")),
             "a module that is no plugin's and no Lua panel's loads nothing"
         );
     }
@@ -3098,7 +3102,11 @@ mod tests {
                     panels.build_page(module, &panels.theme());
                 }
                 HostOp::Pair(PairOp::ReloadPage { module, .. }) => {
-                    assert!(crate::linked_window::reload_page_back(panels, &Rc::default(), module));
+                    assert!(crate::linked_window_glue::reload_page_back(
+                        panels,
+                        &Rc::default(),
+                        module
+                    ));
                 }
                 _ => {}
             }
@@ -3173,7 +3181,11 @@ mod tests {
         panels.build_page(&demo(), &panels.theme());
         panels.mark_away(&demo());
         assert!(panels.follower("demo").is_none());
-        assert!(crate::linked_window::reload_page_back(&panels, &Rc::default(), &demo()));
+        assert!(crate::linked_window_glue::reload_page_back(
+            &panels,
+            &Rc::default(),
+            &demo()
+        ));
         assert_eq!(loads.get(), 2, "one initial load and one return load");
         assert_eq!(pages.borrow().len(), 1, "the retained view is reused");
         let host = panels.panel(&demo()).unwrap().pump.as_ref().unwrap().host.clone();
@@ -3204,7 +3216,11 @@ mod tests {
             panels.activate_holding(&demo());
             panels.build_page(&demo(), &panels.theme());
             assert_eq!(loads.get(), before + 1);
-            assert!(crate::linked_window::reload_page_back(&panels, &Rc::default(), &demo()));
+            assert!(crate::linked_window_glue::reload_page_back(
+                &panels,
+                &Rc::default(),
+                &demo()
+            ));
             assert_eq!(loads.get(), before + 1, "the same change loads the page only once");
         }
     }

@@ -1,6 +1,8 @@
 use super::*;
 use crate::linked_window::driver::tests::pump_until;
-use crate::linked_window::spawn::{welcome, Pair, PairHooks};
+use crate::linked_window::host_loop::tests::ManualClock;
+use crate::linked_window::host_loop::{Flow, Interest, Priority};
+use crate::linked_window::spawn::{welcome, Pair, PairEnv, PairHooks, TEST_BUILD};
 use crate::linked_window::tests::Scratch;
 use crate::linked_window::LinkEnd;
 use eitri_core::compositor::mode::{resolve_mode, Mode, ModeFacts, TilingChoice, Why};
@@ -92,11 +94,11 @@ fn a_new_key_window_1_relinks_to_the_remote_window_2_left_under_the_old_key() {
     let saw = orphan(
         socket,
         lock,
-        crate::version::fingerprint(),
+        TEST_BUILD.to_string(),
         relink_welcome(&BTreeSet::new(), Vec::new()),
         then,
     );
-    let (found, note) = relink_at_start(&new, &layout.0, &root(), crate::version::fingerprint(), RELINK_WITHIN);
+    let (found, note) = relink_at_start(&new, &layout.0, &root(), TEST_BUILD.to_string(), RELINK_WITHIN);
     tell.send(None).unwrap();
     let saw = saw.join().unwrap();
     assert!(matches!(found, StartRelink::Window2(_)), "{note:?}");
@@ -323,15 +325,15 @@ struct LinkedSecond {
     linked_as: Rc<RefCell<Vec<WindowName>>>,
 }
 
-fn linked_second(lock: &PairLock, run: &RunDir) -> LinkedSecond {
+fn linked_second(env: Rc<PairEnv>, lock: &PairLock, run: &RunDir) -> LinkedSecond {
     let (one, two) = fdpass::seqpacket_pair().unwrap();
-    linked_by_hub(Pair::second(two, &root()).unwrap(), one, lock, run)
+    linked_by_hub(Pair::second(env, two, &root()).unwrap(), one, lock, run)
 }
 
 /// As [`linked_second`], for the module window `name`.
-fn linked_module(name: &WindowName, lock: &PairLock, run: &RunDir) -> LinkedSecond {
+fn linked_module(env: Rc<PairEnv>, name: &WindowName, lock: &PairLock, run: &RunDir) -> LinkedSecond {
     let (one, two) = fdpass::seqpacket_pair().unwrap();
-    linked_by_hub(Pair::module(two, name.clone(), &root()).unwrap(), one, lock, run)
+    linked_by_hub(Pair::module(env, two, name.clone(), &root()).unwrap(), one, lock, run)
 }
 
 fn linked_by_hub(pair: Rc<Pair>, one: OwnedFd, lock: &PairLock, run: &RunDir) -> LinkedSecond {
@@ -391,7 +393,16 @@ fn a_bye_and_an_end_of_file_both_start_the_orphan_listener() {
     for bye in [true, false] {
         let (layout, lock) = held_pair("orphan-ends");
         let run = RunDir::new();
-        let mut second = linked_second(&lock, &run);
+        let clock = Rc::new(ManualClock::default());
+        let env = PairEnv::for_tests_with(|env| env.clock = clock.clone());
+        let mut second = linked_second(env, &lock, &run);
+        let wake_fd = second.pair.link().unwrap().wake_fd().expect("the link is up");
+        let initial_watch = clock.watches.arms.borrow()[0];
+        assert_eq!(
+            initial_watch,
+            (wake_fd, Interest::Readable, Priority::Default),
+            "the link's wake descriptor is what window 2 watches first"
+        );
         let window1 = second.window1.take().unwrap();
         if bye {
             window1.close("window 1 closed");
@@ -409,6 +420,13 @@ fn a_bye_and_an_end_of_file_both_start_the_orphan_listener() {
         };
         assert_eq!(*second.ends.borrow(), vec![want]);
         assert_eq!(*second.waited.borrow(), vec![Ok(())]);
+        let fd = second.pair.orphan_fd().expect("an orphan listener");
+        assert_eq!(
+            *clock.watches.arms.borrow(),
+            [initial_watch, (fd, Interest::Readable, Priority::Default)]
+        );
+        assert!(clock.watches.disarms.borrow().is_empty());
+        let mut ready = clock.watches.callbacks.borrow_mut().pop().unwrap();
         let path = socket_path(&run.dir, &root()).unwrap();
         assert!(is_socket(&path), "the orphan listens once its link ended (bye: {bye})");
         drop(lock);
@@ -421,14 +439,16 @@ fn a_bye_and_an_end_of_file_both_start_the_orphan_listener() {
                 &dir,
                 &layout_dir,
                 &root(),
-                crate::version::fingerprint(),
+                TEST_BUILD.to_string(),
                 Duration::from_secs(5),
             )
         });
         let deadline = Instant::now() + Duration::from_secs(10);
         while !new_window.is_finished() {
             assert!(Instant::now() < deadline, "the re-link did not finish");
-            second.pair.accept_relink();
+            if clock.watches.disarms.borrow().is_empty() {
+                assert_eq!(ready(), Flow::Continue);
+            }
             if let Some(candidate) = second.pair.relink_candidate() {
                 candidate.pump();
             }
@@ -448,11 +468,41 @@ fn a_bye_and_an_end_of_file_both_start_the_orphan_listener() {
         assert_eq!(link.partner().map(|p| p.pid), Some(std::process::id()));
         assert_eq!(second.linked.get(), 1, "the window hears of its new link once");
         assert!(!path.exists(), "the socket goes once the link is made");
+        assert_eq!(second.pair.orphan_fd(), None);
+        assert_eq!(
+            *clock.watches.disarms.borrow(),
+            [fd],
+            "the listener watch was disarmed once"
+        );
         assert!(
             PairLock::try_take(&layout.0, &root()).unwrap().is_none(),
             "the pair stays held"
         );
     }
+}
+
+/// A pair that goes while it waits for a window 1 takes its orphan's watch off the host before the listener's
+/// descriptor closes: the descriptor number can be reused, and a watch left on it would fire for another socket.
+#[test]
+fn a_pair_dropped_while_waiting_for_a_relink_disarms_the_orphan_watch() {
+    let (_layout, lock) = held_pair("orphan-dropped");
+    let run = RunDir::new();
+    let clock = Rc::new(ManualClock::default());
+    let env = PairEnv::for_tests_with(|env| env.clock = clock.clone());
+    let mut second = linked_second(env, &lock, &run);
+    let window1 = second.window1.take().unwrap();
+    window1.close("window 1 closed");
+    let link = second.pair.link().unwrap();
+    assert!(pump_until(&link, || link.ended().is_some()));
+    drop(link);
+    let fd = second.pair.orphan_fd().expect("an orphan listener");
+    assert!(clock.watches.disarms.borrow().is_empty(), "the orphan still waits");
+    clock.clear_timers();
+    assert_eq!(Rc::strong_count(&second.pair), 1, "nothing else keeps the pair alive");
+
+    drop(second);
+
+    assert_eq!(*clock.watches.disarms.borrow(), [fd]);
 }
 
 #[test]
@@ -537,7 +587,7 @@ fn a_new_window_1_finds_the_held_pair_lock_and_relinks_once() {
     let saw = orphan(
         socket,
         lock,
-        crate::version::fingerprint(),
+        TEST_BUILD.to_string(),
         relink_welcome(&held, Vec::new()),
         then,
     );
@@ -546,14 +596,8 @@ fn a_new_window_1_finds_the_held_pair_lock_and_relinks_once() {
         PairLock::try_take(&layout.0, &root()).unwrap().is_none(),
         "the orphan holds the pair"
     );
-    let relinked = relink(
-        &run.dir,
-        &layout.0,
-        &root(),
-        crate::version::fingerprint(),
-        RELINK_WITHIN,
-    )
-    .expect("the new window 1 links");
+    let relinked =
+        relink(&run.dir, &layout.0, &root(), TEST_BUILD.to_string(), RELINK_WITHIN).expect("the new window 1 links");
     assert_eq!(identity_of(&relinked.lock), held_identity, "the lock is the pair's own");
     assert_eq!(relinked.partner.pid, std::process::id());
     assert_eq!(
@@ -666,20 +710,13 @@ fn a_turn_the_orphan_started_just_before_the_relink_is_seen_by_the_new_window_1(
     let saw = orphan(
         socket,
         lock,
-        crate::version::fingerprint(),
+        TEST_BUILD.to_string(),
         relink_welcome(&BTreeSet::new(), vec![turn.clone()]),
         then,
     );
-    let relinked = relink(
-        &run.dir,
-        &layout.0,
-        &root(),
-        crate::version::fingerprint(),
-        RELINK_WITHIN,
-    )
-    .unwrap();
+    let relinked = relink(&run.dir, &layout.0, &root(), TEST_BUILD.to_string(), RELINK_WITHIN).unwrap();
     assert_eq!(relinked.running, vec![turn.clone()]);
-    let pair = Pair::relinked(relinked, &root(), false, false);
+    let pair = Pair::relinked(PairEnv::for_tests(), relinked, &root(), false, false);
     let link = pair.link().unwrap();
     assert!(link.linked());
     assert_eq!(
@@ -794,7 +831,6 @@ fn start_editor_detaches_eitri_for_the_root() {
 #[test]
 fn window_2_starts_one_editor_window_until_that_one_links_or_ends() {
     use crate::gtk_host::LinkedWindows;
-    use crate::linked_window::spawn::Starts;
     let scratch = Scratch::new("one-editor");
     let project = scratch.1.join("project");
     std::fs::create_dir_all(&project).unwrap();
@@ -811,15 +847,12 @@ fn window_2_starts_one_editor_window_until_that_one_links_or_ends() {
     .unwrap();
     // A window 2 whose window 1 is gone, never linked.
     let (one, two) = fdpass::seqpacket_pair().unwrap();
-    let pair = Pair::second(two, &project).unwrap();
+    let env = PairEnv::for_tests_with(|env| env.exe = exe);
+    let pair = Pair::second(env, two, &project).unwrap();
     drop(one);
     let link = pair.link().unwrap();
     assert!(pump_until(&link, || link.ended().is_some()));
     pair.set_launch_flags(true, false);
-    pair.set_starts(Starts {
-        exe,
-        ..Starts::default()
-    });
     let win = eitri_core::wm::WinId::MAIN;
     let started_pid = || {
         let deadline = Instant::now() + Duration::from_secs(10);
@@ -871,7 +904,7 @@ fn a_second_hello_on_a_relinked_link_leaves_the_pair_file_to_the_new_window_1() 
     use crate::linked_window::pair_files::PairWriter;
     let (layout, lock) = held_pair("relink-hello-twice");
     let run = RunDir::new();
-    let mut second = linked_second(&lock, &run);
+    let mut second = linked_second(PairEnv::for_tests(), &lock, &run);
     second
         .pair
         .set_pair_writer(PairWriter::new(&layout.0, &root(), Default::default(), false));
@@ -887,7 +920,7 @@ fn a_second_hello_on_a_relinked_link_leaves_the_pair_file_to_the_new_window_1() 
             &dir,
             &layout_dir,
             &root(),
-            crate::version::fingerprint(),
+            TEST_BUILD.to_string(),
             Duration::from_secs(5),
         )
     });
@@ -912,7 +945,7 @@ fn a_second_hello_on_a_relinked_link_leaves_the_pair_file_to_the_new_window_1() 
     let start = agent::child::start_time(me).unwrap();
     relinked
         .handle
-        .send(hello_as_window_1(crate::version::fingerprint(), me, start), Vec::new())
+        .send(hello_as_window_1(TEST_BUILD.to_string(), me, start), Vec::new())
         .unwrap();
     let link = second.pair.link().unwrap();
     link.read_handle_through_for_test(&relinked.handle);
@@ -928,7 +961,7 @@ fn a_busy_pair_file_leaves_window_two_orphaned_and_answers_bye_instead_of_welcom
     use crate::linked_window::pair_files::PairWriter;
     let (layout, lock) = held_pair("relink-busy-file");
     let run = RunDir::new();
-    let mut second = linked_second(&lock, &run);
+    let mut second = linked_second(PairEnv::for_tests(), &lock, &run);
     // Keep the orphan's listener out of this test; only the hello decision and file ownership are exercised.
     second.pair.set_hooks(PairHooks {
         linked: Rc::new(|_, _, _| {}),
@@ -945,7 +978,7 @@ fn a_busy_pair_file_leaves_window_two_orphaned_and_answers_bye_instead_of_welcom
     let (candidate, _window_one, inbound) = crate::linked_window::driver::tests::pair();
     let pid = std::process::id();
     let start = agent::child::start_time(pid).unwrap();
-    let hello = hello_as_window_1(crate::version::fingerprint(), pid, start);
+    let hello = hello_as_window_1(TEST_BUILD.to_string(), pid, start);
     second
         .pair
         .answer_relink_after_hand_over(&candidate, &hello, Some(Partner { pid, start }), false);
@@ -1003,7 +1036,7 @@ fn copy_of(lock: &PairLock) -> PairLock {
 }
 
 fn relink_all_now(run: &RunDir, layout: &Scratch, within: Duration) -> Result<Vec<Relinked>, String> {
-    relink_all(&run.dir, &layout.0, &root(), crate::version::fingerprint(), within)
+    relink_all(&run.dir, &layout.0, &root(), TEST_BUILD.to_string(), within)
 }
 
 #[test]
@@ -1059,8 +1092,8 @@ fn the_longest_module_orphan_socket_fits_the_path_cap() {
 fn two_orphans_both_relink_to_a_new_window_1_and_keep_their_modules() {
     let (layout, lock) = held_pair("relink-all");
     let run = RunDir::new();
-    let (tell_chat, chat) = module_orphan(&run, &c(1), copy_of(&lock), crate::version::fingerprint());
-    let (tell_page, page) = module_orphan(&run, &markdown(), lock, crate::version::fingerprint());
+    let (tell_chat, chat) = module_orphan(&run, &c(1), copy_of(&lock), TEST_BUILD.to_string());
+    let (tell_page, page) = module_orphan(&run, &markdown(), lock, TEST_BUILD.to_string());
 
     let relinked = relink_all_now(&run, &layout, RELINK_WITHIN).expect("both link");
     let named: BTreeMap<WindowName, BTreeMap<String, String>> = relinked
@@ -1091,7 +1124,7 @@ fn an_orphan_that_misses_the_bound_is_left_and_the_rest_relink() {
     let run = RunDir::new();
     // It listens and never answers.
     let silent = OrphanSocket::bind_as(&run.dir, &root(), &c(2)).unwrap();
-    let (tell, chat) = module_orphan(&run, &c(1), lock, crate::version::fingerprint());
+    let (tell, chat) = module_orphan(&run, &c(1), lock, TEST_BUILD.to_string());
 
     let trace = WaitTrace::new(silent.path().to_path_buf());
     let relinked = relink_all_now(&run, &layout, RELINK_WITHIN).expect("the one that answered links");
@@ -1108,11 +1141,11 @@ fn a_window_1_that_relinks_two_module_orphans_is_main_and_holds_the_lock() {
     let (layout, lock) = held_pair("relink-group");
     let run = RunDir::new();
     let lock_file = layout.0.join(pair_lock_name(&root()));
-    let (tell_chat, chat) = module_orphan(&run, &c(1), copy_of(&lock), crate::version::fingerprint());
-    let (tell_page, page) = module_orphan(&run, &markdown(), lock, crate::version::fingerprint());
+    let (tell_chat, chat) = module_orphan(&run, &c(1), copy_of(&lock), TEST_BUILD.to_string());
+    let (tell_page, page) = module_orphan(&run, &markdown(), lock, TEST_BUILD.to_string());
 
     let relinked = relink_all_now(&run, &layout, RELINK_WITHIN).expect("both link");
-    let pair = Pair::relinked_group(relinked, &root(), false, false);
+    let pair = Pair::relinked_group(PairEnv::for_tests(), relinked, &root(), false, false);
 
     assert_eq!(pair.pair_role(), Role::Main);
     assert!(pair.link().is_none(), "no window 2 here");
@@ -1176,7 +1209,7 @@ fn a_window_1_that_relinks_two_module_orphans_is_main_and_holds_the_lock() {
 
 #[test]
 fn a_group_of_no_orphans_runs_unpaired() {
-    let pair = Pair::relinked_group(Vec::new(), &root(), false, false);
+    let pair = Pair::relinked_group(PairEnv::for_tests(), Vec::new(), &root(), false, false);
     assert!(pair.is_unpaired());
     assert!(pair.module_names().is_empty());
 }
@@ -1193,7 +1226,7 @@ fn a_welcome_under_another_windows_name_or_lock_is_refused() {
     ] {
         let socket = OrphanSocket::bind_as(&run.dir, &root(), &c(2)).unwrap();
         let (tell, then) = mpsc::channel();
-        let saw = orphan(socket, copy_of(&lock), crate::version::fingerprint(), said, then);
+        let saw = orphan(socket, copy_of(&lock), TEST_BUILD.to_string(), said, then);
         let err = relink_all_now(&run, &layout, RELINK_WITHIN).err().expect("refused");
         assert!(err.contains("welcome came from window"), "{err}");
         tell.send(None).unwrap();
@@ -1202,7 +1235,7 @@ fn a_welcome_under_another_windows_name_or_lock_is_refused() {
 
     // Another project's lock.
     let (_other, foreign) = held_pair("relink-foreign");
-    let (tell, saw) = module_orphan(&run, &c(2), foreign, crate::version::fingerprint());
+    let (tell, saw) = module_orphan(&run, &c(2), foreign, TEST_BUILD.to_string());
     let err = relink_all_now(&run, &layout, RELINK_WITHIN).err().expect("refused");
     assert!(err.contains("not this project's pair lock"), "{err}");
     tell.send(None).unwrap();
@@ -1213,7 +1246,7 @@ fn a_welcome_under_another_windows_name_or_lock_is_refused() {
 fn a_module_window_that_loses_its_hub_without_bye_waits_on_its_own_name() {
     let (layout, lock) = held_pair("module-orphan");
     let run = RunDir::new();
-    let mut module = linked_module(&markdown(), &lock, &run);
+    let mut module = linked_module(PairEnv::for_tests(), &markdown(), &lock, &run);
     drop(module.window1.take());
     let link = module.pair.link().unwrap();
     assert!(pump_until(&link, || link.ended().is_some()));
@@ -1232,7 +1265,7 @@ fn a_module_window_that_loses_its_hub_without_bye_waits_on_its_own_name() {
             &dir,
             &layout_dir,
             &root(),
-            crate::version::fingerprint(),
+            TEST_BUILD.to_string(),
             Duration::from_secs(5),
         )
     });
@@ -1290,24 +1323,16 @@ fn an_orphan_chat_windows_tabs_survive_window_1s_restart() {
     let (layout, lock) = held_pair("orphan-tabs");
     let state = Scratch::new("orphan-tabs-state");
     let run = RunDir::new();
-    let mut module = linked_module(&c(2), &lock, &run);
-    let timers: Rc<RefCell<Vec<Box<dyn FnOnce()>>>> = Rc::default();
-    module.pair.set_starts(crate::linked_window::spawn::Starts {
-        after: {
-            let timers = timers.clone();
-            Rc::new(move |_, run| timers.borrow_mut().push(run))
-        },
-        ..Default::default()
-    });
+    let clock = Rc::new(ManualClock::default());
+    let env = PairEnv::for_tests_with(|env| env.clock = clock.clone());
+    let mut module = linked_module(env, &c(2), &lock, &run);
     drop(module.window1.take());
     let link = module.pair.link().unwrap();
     assert!(pump_until(&link, || link.ended().is_some()));
 
     module.pair.tabs_changed(tabs(&["s-early"]));
     module.pair.tabs_changed(tabs(&["s-1", "s-2"]));
-    for timer in timers.borrow_mut().drain(..) {
-        timer();
-    }
+    clock.advance(crate::linked_window::group_tabs::REPORT_AFTER);
     drop(lock);
 
     let (dir, layout_dir) = (run.dir.clone(), layout.0.clone());
@@ -1316,7 +1341,7 @@ fn an_orphan_chat_windows_tabs_survive_window_1s_restart() {
             &dir,
             &layout_dir,
             &root(),
-            crate::version::fingerprint(),
+            TEST_BUILD.to_string(),
             Duration::from_secs(5),
         )
     });
@@ -1330,7 +1355,7 @@ fn an_orphan_chat_windows_tabs_survive_window_1s_restart() {
         std::thread::sleep(Duration::from_millis(5));
     }
     let relinked = new_window.join().unwrap().expect("the new window 1 is linked");
-    let hub = Pair::relinked_group(relinked, &root(), false, false);
+    let hub = Pair::relinked_group(PairEnv::for_tests(), relinked, &root(), false, false);
     hub.keep_group_tabs(GroupTabs::read(Some(&state.0), &root(), false));
     hub.set_hooks(PairHooks {
         linked: Rc::new(|_, _, _| {}),
@@ -1353,7 +1378,7 @@ fn an_orphan_chat_windows_tabs_survive_window_1s_restart() {
 fn a_module_window_whose_hub_said_goodbye_does_not_wait() {
     let (_layout, lock) = held_pair("module-bye");
     let run = RunDir::new();
-    let mut module = linked_module(&c(2), &lock, &run);
+    let mut module = linked_module(PairEnv::for_tests(), &c(2), &lock, &run);
     module.window1.take().unwrap().close("window 1 closed");
     let link = module.pair.link().unwrap();
     assert!(pump_until(&link, || link.ended().is_some()));
@@ -1379,7 +1404,7 @@ fn a_module_orphan_of_another_build_says_which_window_to_close() {
 fn window_1_tries_window_2_first_and_then_every_module_window() {
     let (layout, lock) = held_pair("relink-start");
     let run = RunDir::new();
-    let build = crate::version::fingerprint();
+    let build = TEST_BUILD.to_string();
 
     // With nobody waiting there is nothing to link and nothing to say.
     let (found, note) = relink_at_start(&run.dir, &layout.0, &root(), build.clone(), RELINK_WITHIN);
@@ -1439,7 +1464,7 @@ fn window_1_tries_window_2_first_and_then_every_module_window() {
 fn a_start_that_finds_the_group_claimed_leaves_every_orphan_waiting() {
     let (layout, lock) = held_pair("relink-claimed");
     let run = RunDir::new();
-    let build = crate::version::fingerprint();
+    let build = TEST_BUILD.to_string();
     let claim = GroupClaim::try_take(&layout.0, &root())
         .unwrap()
         .expect("nobody holds it");
@@ -1465,7 +1490,7 @@ fn a_start_that_finds_the_group_claimed_leaves_every_orphan_waiting() {
 fn a_window_that_took_part_of_a_group_keeps_the_rest_from_a_later_start() {
     let (layout, lock) = held_pair("relink-part");
     let run = RunDir::new();
-    let build = crate::version::fingerprint();
+    let build = TEST_BUILD.to_string();
     // Past the bound of the first start: it listens and does not answer.
     let late = OrphanSocket::bind_as(&run.dir, &root(), &c(2)).unwrap();
     let (tell, chat) = module_orphan(&run, &c(1), copy_of(&lock), build.clone());
@@ -1489,7 +1514,7 @@ fn a_window_that_took_part_of_a_group_keeps_the_rest_from_a_later_start() {
 fn two_starts_at_once_never_both_lead_the_group() {
     let (layout, lock) = held_pair("relink-race");
     let run = RunDir::new();
-    let build = crate::version::fingerprint();
+    let build = TEST_BUILD.to_string();
     let (tell_one, one) = module_orphan(&run, &c(1), copy_of(&lock), build.clone());
     let (tell_two, two) = module_orphan(&run, &c(2), lock, build.clone());
 
@@ -1522,9 +1547,9 @@ fn two_starts_at_once_never_both_lead_the_group() {
 fn a_late_orphan_is_found_by_the_start_after_its_window_1_ended() {
     let (layout, lock) = held_pair("relink-late");
     let run = RunDir::new();
-    let build = crate::version::fingerprint();
+    let build = TEST_BUILD.to_string();
     // Orphaned, and busy through the first start: nothing here steps it until that start has given up on it.
-    let mut late = linked_module(&c(2), &lock, &run);
+    let mut late = linked_module(PairEnv::for_tests(), &c(2), &lock, &run);
     drop(late.window1.take());
     let link = late.pair.link().unwrap();
     assert!(pump_until(&link, || link.ended().is_some()));
@@ -1575,10 +1600,15 @@ fn a_window_says_its_own_name_as_it_closes() {
     let (_layout, lock) = held_pair("close-words");
     let run = RunDir::new();
     assert_eq!(
-        linked_module(&c(3), &lock, &run).pair.closed_words(),
+        linked_module(PairEnv::for_tests(), &c(3), &lock, &run)
+            .pair
+            .closed_words(),
         "window c3 closed"
     );
-    assert_eq!(linked_second(&lock, &run).pair.closed_words(), "window 2 closed");
+    assert_eq!(
+        linked_second(PairEnv::for_tests(), &lock, &run).pair.closed_words(),
+        "window 2 closed"
+    );
 }
 
 #[cfg(test)]

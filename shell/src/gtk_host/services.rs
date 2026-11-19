@@ -1270,7 +1270,7 @@ impl ServiceSet for Services {
                 self.agent.release_launch_restore();
             }
             PairOp::ReloadPage { module, .. } => {
-                if crate::linked_window::reload_page_back(&self.plugin_panels, &self.lua_pages, module) {
+                if crate::linked_window_glue::reload_page_back(&self.plugin_panels, &self.lua_pages, module) {
                     println!("[window] {module}: loaded again, from its store as it is now");
                 }
             }

@@ -37,7 +37,7 @@ const NO_ANSWER: &str = "nvim did not answer; it may be waiting at a prompt";
 /// Where the sockets of windows of `origin` are: a remote project's window and a window of its copy share a root
 /// and are still two projects, so each answers only for its own.
 fn control_dir(origin: &WindowOrigin) -> PathBuf {
-    crate::remote_window::control_dir(origin)
+    eitri_core::remote_project::control_dir(origin)
 }
 
 /// The socket of the terminal this process was started in. For `main` to read before it scrubs the variable.

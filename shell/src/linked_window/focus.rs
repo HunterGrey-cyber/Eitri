@@ -710,11 +710,17 @@ mod tests {
 
     #[test]
     fn a_new_module_window_raises_itself_once_with_its_spawn_token() {
-        use crate::linked_window::spawn::Pair;
+        use crate::linked_window::spawn::{Pair, PairEnv};
         use eitri_core::window_link::names::WindowName;
         // The token the spawn carried is taken once, by the first show.
         let (_one, two) = eitri_core::window_link::fdpass::seqpacket_pair().unwrap();
-        let pair = Pair::module(two, WindowName::Chat(2), std::path::Path::new("/p")).unwrap();
+        let pair = Pair::module(
+            PairEnv::for_tests(),
+            two,
+            WindowName::Chat(2),
+            std::path::Path::new("/p"),
+        )
+        .unwrap();
         pair.set_activation(Some("spawn-token".into()));
         assert_eq!(pair.take_activation().as_deref(), Some("spawn-token"));
         assert_eq!(pair.take_activation(), None, "no later show raises with it again");

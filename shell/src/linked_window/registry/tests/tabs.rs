@@ -11,9 +11,9 @@ use eitri_core::saved_tabs::{load, Loaded, SavedTab, SavedTabs};
 use serde_json::Value;
 
 use super::*;
-use crate::linked_window::group_tabs::{GroupTabs, REPORT_AFTER};
+use crate::linked_window::group_tabs::REPORT_AFTER;
 use crate::linked_window::hand_over::TabHolder;
-use crate::linked_window::spawn::welcome;
+use crate::linked_window::spawn::{welcome, LAST_TABS_POLL, LAST_TABS_WITHIN};
 use crate::linked_window::KEPT_WORDS;
 
 fn c(n: u8) -> WindowName {
@@ -38,15 +38,6 @@ fn tabs(sessions: &[&str]) -> SavedTabs {
         })
         .collect();
     SavedTabs::from_parts(tabs, 0, Vec::new(), None)
-}
-
-/// A group whose window 1 keeps its tabs under the group's scratch directory.
-fn keeping(label: &str) -> Group {
-    let group = group(label, Duration::from_secs(30));
-    group
-        .pair
-        .keep_group_tabs(GroupTabs::read(Some(&group.dir.0), &group.dir.1, false));
-    group
 }
 
 fn sessions_on_disk(group: &Group) -> Vec<String> {
@@ -275,9 +266,10 @@ fn what_else_is_kept_for_a_window_goes_only_when_its_close_is_settled() {
 #[test]
 fn a_close_settles_by_a_timer_of_its_own() {
     let (group, [_one, two], [_first, second], _fds) = two_windows("tabs-timer");
+    let pending = group.clock.pending_timers();
     two.handle.close("window c2 closed");
     assert!(pump_until(&second, || second.ended().is_some()));
-    assert!(group.timers.borrow().len() >= 1, "the close armed the wait");
+    assert_eq!(group.clock.pending_timers(), pending + 1, "the close armed the wait");
 }
 
 /// A window a signal ended, or one with tabs on offer, was not closed by the user: its tabs stay for its next start.
@@ -351,13 +343,13 @@ fn a_closing_group_hears_each_chat_windows_last_tabs_before_its_bye() {
         matches!(msg, Msg::GroupClosing {}).then_some(())
     });
     assert!(asked.is_some());
-    group.fire_timers();
+    group.clock.advance(LAST_TABS_POLL);
     assert_eq!(group.pair.module_names(), [c(2)], "no goodbye while its answer is owed");
 
     their.handle.send(report(&["s-1", "s-2"]), Vec::new()).unwrap();
     their.handle.send(Msg::TabsSaid {}, Vec::new()).unwrap();
     assert!(pump_until(&link, || {
-        group.fire_timers();
+        group.clock.advance(LAST_TABS_POLL);
         group.pair.module_names().is_empty()
     }));
     assert_eq!(heard_bye(&their).as_deref(), Some("window 1 closed"));
@@ -378,12 +370,11 @@ fn a_chat_window_that_does_not_answer_does_not_hold_the_close() {
     let group = keeping("tabs-last-silent");
     let (_, their, _fds) = group.link(&c(2));
     group.pair.end_group();
-    let deadline = std::time::Instant::now() + Duration::from_secs(10);
-    while !group.pair.module_names().is_empty() {
-        assert!(std::time::Instant::now() < deadline, "the wait is bounded");
-        group.fire_timers();
-        std::thread::sleep(Duration::from_millis(5));
-    }
+    assert_eq!(group.clock.after_delays.borrow().last(), Some(&LAST_TABS_POLL));
+    group.clock.advance(LAST_TABS_WITHIN - LAST_TABS_POLL);
+    assert_eq!(group.pair.module_names(), [c(2)], "still waiting for the last tabs");
+    group.clock.advance(LAST_TABS_POLL * 2);
+    assert!(group.pair.module_names().is_empty(), "closed once the wait expired");
     assert_eq!(heard_bye(&their).as_deref(), Some("window 1 closed"));
 }
 
@@ -426,9 +417,6 @@ fn a_window_that_never_linked_leaves_what_is_kept_for_it() {
     assert!(given_within(&their, Duration::from_secs(5)).is_some());
 }
 
-/// What a chat window asked to run later, held for the test to fire.
-type Timers = Rc<RefCell<Vec<(Duration, Box<dyn FnOnce()>)>>>;
-
 /// A chat window's end of a link: its real pair, linked to a test that speaks for window 1, its panel a stand-in and
 /// its timers held for the test to fire.
 struct ChatWindow {
@@ -437,7 +425,7 @@ struct ChatWindow {
     window1: LinkHandle,
     inbound: Receiver<Inbound>,
     holder: Rc<Holder>,
-    timers: Timers,
+    clock: Rc<ManualClock>,
     _dir: Scratch,
     _lock: PairLock,
 }
@@ -481,7 +469,9 @@ fn chat_window(label: &str) -> ChatWindow {
     let dir = Scratch::new(label);
     let lock = PairLock::try_take(&dir.0, Path::new("/p")).unwrap().unwrap();
     let (one, two) = fdpass::seqpacket_pair().unwrap();
-    let pair = Pair::module(two, c(2), &dir.1).unwrap();
+    let clock = Rc::new(ManualClock::default());
+    let env = PairEnv::for_tests_with(|env| env.clock = clock.clone());
+    let pair = Pair::module(env, two, c(2), &dir.1).unwrap();
     let (window1, inbound) = LinkHandle::start(one, PresenceFlag::default()).unwrap();
     match inbound.recv_timeout(Duration::from_secs(5)).unwrap() {
         Inbound::Msg {
@@ -489,15 +479,6 @@ fn chat_window(label: &str) -> ChatWindow {
         } => {}
         other => panic!("the window said {other:?} first"),
     }
-    let timers: Timers = Rc::default();
-    let after: After = {
-        let timers = timers.clone();
-        Rc::new(move |within, run| timers.borrow_mut().push((within, run)))
-    };
-    pair.set_starts(Starts {
-        after,
-        ..Starts::default()
-    });
     let holder = Rc::new(Holder::default());
     pair.set_tab_holder(holder.clone());
     ChatWindow {
@@ -506,7 +487,7 @@ fn chat_window(label: &str) -> ChatWindow {
         window1,
         inbound,
         holder,
-        timers,
+        clock,
         _dir: dir,
         _lock: lock,
     }
@@ -517,13 +498,6 @@ impl ChatWindow {
         let welcome = welcome(Default::default(), Vec::new());
         self.window1.send(welcome, vec![self._lock.share().unwrap()]).unwrap();
         assert!(pump_until(&self.link, || self.link.linked()));
-    }
-
-    fn fire_timers(&self) {
-        let timers: Vec<_> = self.timers.borrow_mut().drain(..).collect();
-        for (_, timer) in timers {
-            timer();
-        }
     }
 
     /// Each set window 1 hears before the ordered marker or goodbye.
@@ -635,20 +609,20 @@ fn a_lone_tab_change_goes_out_at_once_and_what_follows_it_gathers() {
     window.pair.tabs_changed(tabs(&["s-1"]));
     window.pair.tabs_changed(tabs(&["s-1", "s-2"]));
     window.pair.tabs_changed(tabs(&["s-2"]));
-    assert_eq!(window.timers.borrow().len(), 1, "one timer gathers them");
-    assert_eq!(window.timers.borrow()[0].0, REPORT_AFTER);
+    assert_eq!(window.clock.pending_timers(), 1, "one timer gathers them");
+    assert_eq!(*window.clock.after_delays.borrow(), [REPORT_AFTER]);
     assert_eq!(
         window.reports(),
         (vec![vec!["s-1".to_string()]], false),
         "the first, and none of the rest yet"
     );
-    window.fire_timers();
+    window.clock.advance(REPORT_AFTER);
     assert_eq!(window.reports().0, [["s-2".to_string()]]);
 
     window.pair.tabs_changed(tabs(&["s-3"]));
     assert_eq!(window.reports().0, [["s-3".to_string()]], "quiet again, so at once");
-    assert_eq!(window.timers.borrow().len(), 1, "with a timer for what follows it");
-    window.fire_timers();
+    assert_eq!(window.clock.pending_timers(), 1, "with a timer for what follows it");
+    window.clock.advance(REPORT_AFTER);
     assert_eq!(window.reports().0, Vec::<Vec<String>>::new(), "and nothing did");
 }
 
@@ -656,7 +630,7 @@ fn a_lone_tab_change_goes_out_at_once_and_what_follows_it_gathers() {
 fn a_change_with_no_link_up_goes_out_when_one_comes() {
     let window = chat_window("tabs-before-link");
     window.pair.tabs_changed(tabs(&["s-1"]));
-    window.fire_timers();
+    window.clock.advance(REPORT_AFTER);
     window.pair.say_tabs();
     assert_eq!(window.reports().0, Vec::<Vec<String>>::new());
     window.link_up();

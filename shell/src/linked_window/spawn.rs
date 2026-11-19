@@ -49,13 +49,14 @@ use super::closes::WindowCloses;
 use super::driver::{LinkDriver, Partner, HANDSHAKE_WITHIN};
 use super::group_tabs::{GroupTabs, TabReports, REPORT_AFTER};
 use super::hand_over::{self, TabHolder, TabHolderSlot};
+use super::host_loop::{Armed, Flow, Interest, PairClock, Priority};
 use super::pair_files::PairWriter;
 use super::registry::{ModuleLink, ModuleWindows, OpenModule, MODULE_WINDOWS_ARE_WINDOW_1S};
 use super::relink::{self, HeldNow, OrphanSocket, Relinked};
 use super::{LinkEnd, WindowNew, WindowRole, KEPT_WORDS, NO_OTHER_WINDOW};
-use crate::agent_panel::TabAnswer;
 use crate::project_stamp::{ProjectStamp, StampSlot};
 use eitri_core::saved_tabs::{SavedTab, SavedTabs};
+use eitri_panel::agent_panel::TabAnswer;
 
 /// Window 1's name on the link.
 pub const FIRST_WINDOW: &str = "1";
@@ -170,39 +171,56 @@ pub type OnModuleFailed = Rc<dyn Fn(&WindowName, &str)>;
 
 type Hooks = Rc<RefCell<Option<PairHooks>>>;
 
-/// Runs a closure once `Duration` has passed, on the main loop.
-pub type After = Rc<dyn Fn(Duration, Box<dyn FnOnce()>)>;
 /// Makes the two ends of a new link: this window's, then the started window's.
 pub type LinkEnds = Rc<dyn Fn() -> io::Result<(OwnedFd, OwnedFd)>>;
 
-/// How this window starts another window of the group: the executable it runs, how long a window it starts has for
-/// its handshake, measured by `after`, and how the link is made. A window runs its own build ([`Starts::default`]);
-/// the tests run stand-ins with timers of their own, and keep a copy of the started end to speak for them.
-#[derive(Clone)]
-pub struct Starts {
+/// What the host supplies when it constructs a pair.
+pub struct PairEnv {
+    /// The executable this window uses to start another window of the group.
     pub exe: PathBuf,
-    pub handshake_within: Duration,
-    pub after: After,
-    pub link_ends: LinkEnds,
+    /// The build fingerprint this window sends in a hello and expects from a peer.
+    pub build: String,
+    /// Time since this process received its first end signal, or zero before one arrives.
+    pub since_first_signal: fn() -> Duration,
+    /// The host loop that watches links, schedules work and holds the application during an ending.
+    pub clock: Rc<dyn PairClock>,
 }
 
-impl Default for Starts {
-    fn default() -> Starts {
-        Starts {
-            // The running executable, not the installed path: an upgrade that replaced the file still starts this build.
-            exe: PathBuf::from("/proc/self/exe"),
-            handshake_within: HANDSHAKE_WITHIN,
-            after: Rc::new(|within, run| {
-                gtk4::glib::timeout_add_local_once(within, run);
-            }),
-            link_ends: Rc::new(fdpass::seqpacket_pair),
-        }
+#[cfg(test)]
+pub(crate) const TEST_BUILD: &str = "eitri-test-build";
+
+#[cfg(test)]
+impl PairEnv {
+    /// An env whose executable is a test path, whose build is [`TEST_BUILD`], that has seen no end signal, and whose
+    /// clock is a manual one nothing fires but the test.
+    pub(crate) fn for_tests() -> Rc<Self> {
+        Self::for_tests_with(|_| {})
     }
+
+    /// [`PairEnv::for_tests`] with the fields `change` sets.
+    pub(crate) fn for_tests_with(change: impl FnOnce(&mut Self)) -> Rc<Self> {
+        let mut env = Self {
+            exe: PathBuf::from("/eitri-test-stand-in"),
+            build: TEST_BUILD.into(),
+            since_first_signal: || Duration::ZERO,
+            clock: Rc::new(super::host_loop::tests::ManualClock::default()),
+        };
+        change(&mut env);
+        Rc::new(env)
+    }
+}
+
+/// The handshake budget and socket pair factory. Tests can keep a copy of the started end to speak for it.
+#[derive(Clone)]
+pub(crate) struct Starts {
+    pub handshake_within: Duration,
+    pub link_ends: LinkEnds,
 }
 
 /// The window's role and what it needs to carry out the window verbs: the pair lock while it holds one, and the
 /// project root window 2 is started for.
 pub struct Pair {
+    env: Rc<PairEnv>,
     role: RefCell<WindowRole>,
     lock: Option<Rc<PairLock>>,
     root: PathBuf,
@@ -261,7 +279,7 @@ pub struct Pair {
     relinked_modules: std::cell::Cell<bool>,
     /// Window 1's claim on the group, held for as long as this window runs.
     group_claim: RefCell<Option<GroupClaim>>,
-    /// How a window this one starts is started.
+    /// The handshake budget and socket pair factory for windows this one starts.
     starts: RefCell<Starts>,
     /// Window 2 only: the editor window it started that has neither linked nor ended yet, so a second key press
     /// does not start another.
@@ -277,52 +295,73 @@ pub struct Pair {
 /// An orphan's listener and the connection it is answering, if one is.
 struct Orphan {
     socket: Rc<OrphanSocket>,
-    watch: Option<gtk4::glib::SourceId>,
+    watch: Option<Box<dyn Armed>>,
     held: HeldNow,
     /// A connection that has not said a matching hello yet. One at a time: another arriving meanwhile is closed,
     /// unless this one's handshake is overdue.
     candidate: Option<LinkDriver>,
 }
 
+impl Drop for Orphan {
+    fn drop(&mut self) {
+        // Disarm before closing the socket, since another descriptor can reuse its number.
+        if let Some(watch) = self.watch.take() {
+            watch.disarm();
+        }
+    }
+}
+
 impl Pair {
     /// A full window: window 1 of the pair with the lock `taken`, else unpaired or alone
     /// ([`WindowRole::of_full_window`]). `legacy_backend`: this launch's chats run the legacy backend; `clean`: this
     /// launch is `--clean`.
-    pub fn full(taken: io::Result<Option<PairLock>>, root: &Path, legacy_backend: bool, clean: bool) -> Rc<Pair> {
+    pub fn full(
+        env: Rc<PairEnv>,
+        taken: io::Result<Option<PairLock>>,
+        root: &Path,
+        legacy_backend: bool,
+        clean: bool,
+    ) -> Rc<Pair> {
         let (role, lock) = WindowRole::of_full_window(taken);
-        let pair = Pair::new(role, lock, root);
+        let pair = Pair::new(env, role, lock, root);
         pair.legacy_backend.set(legacy_backend);
         pair.clean.set(clean);
         pair
     }
 
     /// Window 2, on its checked link end: says `hello` at once and links on `welcome`.
-    pub fn second(sock: OwnedFd, root: &Path) -> io::Result<Rc<Pair>> {
+    pub fn second(env: Rc<PairEnv>, sock: OwnedFd, root: &Path) -> io::Result<Rc<Pair>> {
         let hooks: Hooks = Rc::default();
         let lock: Rc<RefCell<Option<PairLock>>> = Rc::default();
         let name = WindowName::Second;
         let stamp: Rc<StampSlot> = Rc::default();
         let made = linked_hook(&hooks, name.clone(), HUB_PEER);
-        let link = link_second(sock, &name, made, lock.clone(), stamp.clone())?;
+        let link = link_second(&env, sock, &name, made, lock.clone(), stamp.clone())?;
         // The link's handler fills the slots once `welcome` comes.
-        let pair = Pair::with_hooks(WindowRole::Second { link }, None, root, hooks, lock, stamp);
+        let pair = Pair::with_hooks(env, WindowRole::Second { link }, None, root, hooks, lock, stamp);
         Ok(pair)
     }
 
     /// The page window `name` beside the person's own nvim (`eitri page`), with `link` to that nvim: no window 1, no
     /// pair lock and no link to another window of Eitri's, so nothing on the pair's side is wired.
-    pub fn beside(name: WindowName, root: &Path, link: Rc<eitri_core::companion::link::CompanionLink>) -> Rc<Pair> {
-        Pair::new(WindowRole::Beside { name, link }, None, root)
+    pub fn beside(
+        env: Rc<PairEnv>,
+        name: WindowName,
+        root: &Path,
+        link: Rc<eitri_core::companion::link::CompanionLink>,
+    ) -> Rc<Pair> {
+        Pair::new(env, WindowRole::Beside { name, link }, None, root)
     }
 
     /// The module window `name`, on its checked link end: says `hello` under that name at once and links on `welcome`.
-    pub fn module(sock: OwnedFd, name: WindowName, root: &Path) -> io::Result<Rc<Pair>> {
+    pub fn module(env: Rc<PairEnv>, sock: OwnedFd, name: WindowName, root: &Path) -> io::Result<Rc<Pair>> {
         let hooks: Hooks = Rc::default();
         let lock: Rc<RefCell<Option<PairLock>>> = Rc::default();
         let stamp: Rc<StampSlot> = Rc::default();
         let made = linked_hook(&hooks, name.clone(), HUB_PEER);
-        let link = link_second(sock, &name, made, lock.clone(), stamp.clone())?;
+        let link = link_second(&env, sock, &name, made, lock.clone(), stamp.clone())?;
         Ok(Pair::with_hooks(
+            env,
             WindowRole::Module { name, link },
             None,
             root,
@@ -334,7 +373,7 @@ impl Pair {
 
     /// A window 1 that found the pair lock held and linked to the orphaned window 2 holding it ([`relink::relink`]):
     /// window 1 of the pair, with that lock and that link. Its `linked` hook runs once the window sets its hooks.
-    pub fn relinked(relinked: Relinked, root: &Path, legacy_backend: bool, clean: bool) -> Rc<Pair> {
+    pub fn relinked(env: Rc<PairEnv>, relinked: Relinked, root: &Path, legacy_backend: bool, clean: bool) -> Rc<Pair> {
         let Relinked {
             name: _,
             handle,
@@ -350,7 +389,7 @@ impl Pair {
         link.set_partner(partner);
         link.set_partner_running(running);
         link.set_linked();
-        let pair = Pair::new(WindowRole::Main { link: Some(link) }, Some(lock), root);
+        let pair = Pair::new(env, WindowRole::Main { link: Some(link) }, Some(lock), root);
         pair.legacy_backend.set(legacy_backend);
         pair.clean.set(clean);
         *pair.relinked.borrow_mut() = Some(holders);
@@ -363,7 +402,13 @@ impl Pair {
     /// ([`relink::relink_all`]): window 1 of the group, with no window 2 and each orphan in the registry under a fresh
     /// peer. One copy of the lock is kept, the first; every copy is one open file description, so closing the others
     /// keeps it held. Their `linked` hooks run once the window sets its hooks. With nobody to link to it runs unpaired.
-    pub fn relinked_group(relinked: Vec<Relinked>, root: &Path, legacy_backend: bool, clean: bool) -> Rc<Pair> {
+    pub fn relinked_group(
+        env: Rc<PairEnv>,
+        relinked: Vec<Relinked>,
+        root: &Path,
+        legacy_backend: bool,
+        clean: bool,
+    ) -> Rc<Pair> {
         let mut lock = None;
         let mut holders = BTreeMap::new();
         let mut links = Vec::with_capacity(relinked.len());
@@ -378,9 +423,9 @@ impl Pair {
             links.push((one.name, one.partner, link));
         }
         let Some(lock) = lock else {
-            return Pair::full(Ok(None), root, legacy_backend, clean);
+            return Pair::full(env, Ok(None), root, legacy_backend, clean);
         };
-        let pair = Pair::new(WindowRole::Main { link: None }, Some(lock), root);
+        let pair = Pair::new(env, WindowRole::Main { link: None }, Some(lock), root);
         pair.legacy_backend.set(legacy_backend);
         pair.clean.set(clean);
         for (name, partner, link) in links {
@@ -415,11 +460,12 @@ impl Pair {
         pair
     }
 
-    fn new(role: WindowRole, lock: Option<PairLock>, root: &Path) -> Rc<Pair> {
-        Pair::with_hooks(role, lock, root, Rc::default(), Rc::default(), Rc::default())
+    fn new(env: Rc<PairEnv>, role: WindowRole, lock: Option<PairLock>, root: &Path) -> Rc<Pair> {
+        Pair::with_hooks(env, role, lock, root, Rc::default(), Rc::default(), Rc::default())
     }
 
     fn with_hooks(
+        env: Rc<PairEnv>,
         role: WindowRole,
         lock: Option<PairLock>,
         root: &Path,
@@ -429,6 +475,7 @@ impl Pair {
     ) -> Rc<Pair> {
         let modules: Rc<RefCell<ModuleWindows>> = Rc::default();
         let pair = Rc::new(Pair {
+            env,
             role: RefCell::new(role),
             lock: lock.map(Rc::new),
             root: root.to_path_buf(),
@@ -459,7 +506,10 @@ impl Pair {
             relink_unannounced: std::cell::Cell::new(false),
             relinked_modules: std::cell::Cell::new(false),
             group_claim: RefCell::default(),
-            starts: RefCell::new(Starts::default()),
+            starts: RefCell::new(Starts {
+                handshake_within: HANDSHAKE_WITHIN,
+                link_ends: Rc::new(fdpass::seqpacket_pair),
+            }),
             editor_start: RefCell::new(None),
             ide_port: Rc::default(),
             port_on_command_line: std::cell::Cell::new(None),
@@ -535,7 +585,7 @@ impl Pair {
         }
     }
 
-    /// How a window this one starts is started: stand-ins in the tests.
+    /// Overrides the handshake budget or socket pair factory for stand-ins.
     #[cfg(test)]
     pub(crate) fn set_starts(&self, starts: Starts) {
         *self.starts.borrow_mut() = starts;
@@ -604,8 +654,8 @@ impl Pair {
         let link = self.link().filter(LinkDriver::linked);
         if self.tab_reports.changed(tabs, link.as_ref()) {
             let pair = Rc::downgrade(self);
-            let after = self.starts.borrow().after.clone();
-            after(
+            let clock = self.env.clock.clone();
+            clock.after(
                 REPORT_AFTER,
                 Box::new(move || {
                     if let Some(pair) = pair.upgrade() {
@@ -697,8 +747,15 @@ impl Pair {
 
     /// Starts watching the links of the module windows this window came back for.
     pub fn watch_module_links(&self) {
-        for module in self.modules.borrow().links() {
-            module.link.watch();
+        let clock = self.env.clock.clone();
+        let links: Vec<_> = self
+            .modules
+            .borrow()
+            .links()
+            .map(|module| module.link.clone())
+            .collect();
+        for link in links {
+            link.watch(&*clock);
         }
     }
 
@@ -951,13 +1008,13 @@ impl Pair {
         let window = name.clone();
         let failed = self.module_failed.clone();
         let closes = self.closes.clone();
-        let after = self.starts.borrow().after.clone();
+        let clock = self.env.clock.clone();
         link.on_end(move |link, end| {
             if forget_module(&modules, peer).is_some() && !was_linked.get() {
                 module_failed(&failed, &window, &format!("its link ended before it linked ({end:?})"));
             }
             if was_linked.get() && end.closed_for_good() {
-                closes.window_closed(window.clone(), &after);
+                closes.window_closed(window.clone(), &clock);
             }
             let hook = hooks.borrow().as_ref().map(|h| h.ended.clone());
             if let Some(ended) = hook {
@@ -1080,6 +1137,7 @@ impl Pair {
                 };
                 let starts = self.starts.borrow().clone();
                 let (link, second) = start_second(
+                    &self.env,
                     &starts,
                     &self.root,
                     token.as_deref(),
@@ -1134,6 +1192,7 @@ impl Pair {
         };
         let starts = self.starts.borrow().clone();
         let (link, second) = start_second(
+            &self.env,
             &starts,
             &self.root,
             None,
@@ -1219,10 +1278,11 @@ impl Pair {
         let refused = {
             let modules = Rc::downgrade(&self.modules);
             let (failed, name) = (self.module_failed.clone(), name.clone());
+            let clock = self.env.clock.clone();
             Rc::new(move || {
                 if let Some(module) = forget_module(&modules, peer) {
-                    if let Some(ending) = end_second(&module.process, END_GRACE) {
-                        hold_until_finished(ending);
+                    if let Some(ending) = end_second(&module.process, END_GRACE, &*clock) {
+                        hold_until_finished(ending, &*clock);
                     }
                     module_failed(&failed, &name, "its hello was refused");
                 }
@@ -1247,6 +1307,7 @@ impl Pair {
         };
         let starts = self.starts.borrow().clone();
         let (link, process) = start_window(
+            &self.env,
             &starts,
             &self.root,
             &name,
@@ -1323,8 +1384,8 @@ impl Pair {
 
     /// Window 1 was asked to close: a module window that goes around now went with it, and stays for the next start.
     pub fn group_asked(&self) {
-        let after = self.starts.borrow().after.clone();
-        self.closes.group_asked(&after);
+        let clock = self.env.clock.clone();
+        self.closes.group_asked(&clock);
     }
 
     /// What window 1 keeps for a closed window goes with it: `hook` hears each one, when that is settled.
@@ -1348,16 +1409,19 @@ impl Pair {
             return;
         }
         *self.last_tabs_wait.borrow_mut() = Some(None);
-        self.await_last_tabs(Instant::now() + LAST_TABS_WITHIN, hold_application());
+        let clock = self.env.clock.clone();
+        let until = clock.now() + LAST_TABS_WITHIN;
+        let hold = clock.hold();
+        self.await_last_tabs(until, move || drop(hold));
     }
 
     /// Comes back on a timer until every window asked has answered or `until` has passed: a window that cannot answer
     /// costs only what it had not said.
-    fn await_last_tabs(self: &Rc<Self>, until: Instant, hold: Option<gtk4::gio::ApplicationHoldGuard>) {
-        if self.modules.borrow_mut().last_tabs_owed() && Instant::now() < until {
+    fn await_last_tabs(self: &Rc<Self>, until: Instant, release: impl FnOnce() + 'static) {
+        let clock = self.env.clock.clone();
+        if self.modules.borrow_mut().last_tabs_owed() && clock.now() < until {
             let pair = self.clone();
-            let after = self.starts.borrow().after.clone();
-            after(LAST_TABS_POLL, Box::new(move || pair.await_last_tabs(until, hold)));
+            clock.after(LAST_TABS_POLL, Box::new(move || pair.await_last_tabs(until, release)));
             return;
         }
         let announce = self.last_tabs_wait.borrow_mut().take().flatten();
@@ -1378,19 +1442,24 @@ impl Pair {
             }
             (None, _) => {}
         }
+        release();
     }
 
     fn end_group_now(&self) {
-        let told = eitri_core::wm::end_signals::told_within(END_GRACE, crate::end_signals::since_first_signal());
-        self.end_group_within(END_GRACE, told);
+        self.end_group_within(END_GRACE, self.group_told_within());
+    }
+
+    fn group_told_within(&self) -> Duration {
+        eitri_core::wm::end_signals::told_within(END_GRACE, (self.env.since_first_signal)())
     }
 
     /// Every module window hears `bye` and is seen off, with [`SecondProcess::end_unless_closed`]'s two bounds.
     pub(crate) fn end_group_within(&self, grace: Duration, told: Duration) {
+        let clock = self.env.clock.clone();
         let windows = ModuleWindows::end_group(&self.modules, &self.closed_words());
         for process in windows {
-            if let Some(ending) = end_closing(&process, grace, told) {
-                hold_until_finished(ending);
+            if let Some(ending) = end_closing(&process, grace, told, &*clock) {
+                hold_until_finished(ending, &*clock);
             }
         }
     }
@@ -1417,17 +1486,20 @@ impl Pair {
         let name = self.link_name();
         let socket = Rc::new(OrphanSocket::bind_as(dir, &self.root, &name)?);
         let me = Rc::downgrade(self);
-        let watch = neovide_editor::fd_watch::add_local(
+        let clock = self.env.clock.clone();
+        let watch = clock.arm(
             socket.raw_fd(),
-            gtk4::glib::IOCondition::IN,
-            gtk4::glib::ffi::G_PRIORITY_DEFAULT,
-            move |_| match me.upgrade() {
+            Interest::Readable,
+            Priority::Default,
+            Box::new(move || match me.upgrade() {
                 Some(pair) => {
                     pair.accept_relink();
-                    gtk4::glib::ControlFlow::Continue
+                    Flow::Continue
                 }
-                None => gtk4::glib::ControlFlow::Break,
-            },
+                // The pair's drop disarms this watch (`Orphan`'s `Drop`), so the host stops delivering before the pair
+                // is gone; this arm runs only if an event still reaches it, and then nothing is left to accept for.
+                None => Flow::Stop,
+            }),
         );
         let watch = match watch {
             Ok(id) => Some(id),
@@ -1453,6 +1525,7 @@ impl Pair {
     /// Takes the connections waiting on the orphan's socket: the first is answered once it says hello, and any
     /// other is closed while it is being answered, unless its handshake is overdue.
     pub fn accept_relink(self: &Rc<Self>) {
+        let clock = self.env.clock.clone();
         loop {
             let Some(socket) = self.orphan.borrow().as_ref().map(|orphan| orphan.socket.clone()) else {
                 return;
@@ -1471,7 +1544,7 @@ impl Pair {
                 .as_ref()
                 .and_then(|orphan| orphan.candidate.clone());
             if let Some(busy) = busy {
-                if !busy.handshake_overdue(Instant::now()) {
+                if !busy.handshake_overdue(clock.now()) {
                     eprintln!("[window] a window 1 is being linked already; another connection is closed");
                     continue;
                 }
@@ -1488,7 +1561,7 @@ impl Pair {
             };
             let link = LinkDriver::new(handle, inbound);
             link.set_presence(presence);
-            link.set_handshake_deadline(Instant::now() + relink::RELINK_WITHIN);
+            link.set_handshake_deadline(clock.now() + relink::RELINK_WITHIN);
             let me = Rc::downgrade(self);
             link.on("hello", move |link, msg, _| {
                 if let Some(pair) = me.upgrade() {
@@ -1501,7 +1574,7 @@ impl Pair {
                     pair.forget_candidate(link);
                 }
             });
-            link.watch();
+            link.watch(&*clock);
             if let Some(orphan) = self.orphan.borrow_mut().as_mut() {
                 orphan.candidate = Some(link);
             }
@@ -1515,6 +1588,11 @@ impl Pair {
             .borrow()
             .as_ref()
             .and_then(|orphan| orphan.candidate.clone())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn orphan_fd(&self) -> Option<std::os::fd::RawFd> {
+        self.orphan.borrow().as_ref().map(|orphan| orphan.socket.raw_fd())
     }
 
     fn forget_candidate(&self, link: &LinkDriver) {
@@ -1563,7 +1641,7 @@ impl Pair {
             .unwrap_or_default();
         let welcome = relink::relink_welcome_as(&self.link_name(), &held, running);
         let answered = match self.second_lock.borrow().as_ref() {
-            Some(lock) => relink::answer_relink_hello(link, msg, &crate::version::fingerprint(), peer, lock, welcome),
+            Some(lock) => relink::answer_relink_hello(link, msg, &self.env.build, peer, lock, welcome),
             None => {
                 link.close("this window holds no pair lock to hand over");
                 Err("no pair lock".to_string())
@@ -1583,12 +1661,8 @@ impl Pair {
 
     /// The re-link is made: the socket goes, and the link is this window's, wired and announced as any link is.
     fn promote(self: &Rc<Self>, link: &LinkDriver) {
-        if let Some(orphan) = self.orphan.borrow_mut().take() {
-            // The watch goes before the socket it watches is closed.
-            if let Some(watch) = orphan.watch {
-                watch.remove();
-            }
-        }
+        let orphan = self.orphan.borrow_mut().take();
+        drop(orphan);
         let name = self.link_name();
         *self.role.borrow_mut() = match name.clone() {
             WindowName::Second => WindowRole::Second { link: link.clone() },
@@ -1633,8 +1707,9 @@ impl crate::gtk_host::LinkedWindows for Pair {
             "[window] ending the window in process {}, which is not answering",
             process.pid()
         );
-        if let Some(ending) = end_second(&process, END_GRACE) {
-            hold_until_finished(ending);
+        let clock = self.env.clock.clone();
+        if let Some(ending) = end_second(&process, END_GRACE, &*clock) {
+            hold_until_finished(ending, &*clock);
         }
         Ok(())
     }
@@ -1754,12 +1829,11 @@ impl crate::gtk_host::LinkedWindows for Pair {
                 started.pid()
             ));
         }
-        let exe = self.starts.borrow().exe.clone();
         let flags = relink::EditorFlags {
             legacy: self.legacy_backend.get(),
             clean: self.clean.get(),
         };
-        let started = relink::start_editor(&exe, &self.root, flags)
+        let started = relink::start_editor(&self.env.exe, &self.root, flags)
             .map_err(|e| format!("the editor window could not be started: {e}"))?;
         println!("[window] the editor window is started as process {}", started.pid());
         *self.editor_start.borrow_mut() = Some(started);
@@ -1817,7 +1891,7 @@ pub fn watch_moved_child(pid: u32, report: impl FnOnce(u64, Option<i32>) + Send 
             };
             while !pidfd.wait_exited(Duration::from_secs(3600)) {}
             let status = match pidfd.try_reap() {
-                Ok(Some(code)) => Some(crate::terminal::moving::raw_status(code)),
+                Ok(Some(code)) => Some(code.raw_status()),
                 Ok(None) | Err(_) => None,
             };
             println!("[terminal] the shell {pid} that moved ended ({status:?})");
@@ -1912,7 +1986,7 @@ pub const END_GRACE: Duration = Duration::from_secs(2);
 pub const LAST_TABS_WITHIN: Duration = Duration::from_millis(300);
 
 /// How often that wait looks.
-const LAST_TABS_POLL: Duration = Duration::from_millis(5);
+pub(super) const LAST_TABS_POLL: Duration = Duration::from_millis(5);
 
 /// A window's process as window 1 holds it. The pidfd names that process and no other: once it has ended, a signal
 /// through it reaches nothing, even after its pid is reused. For a window this one started it is opened while the
@@ -1926,6 +2000,9 @@ pub struct SecondProcess {
     reaped: Arc<Reaped>,
     #[cfg(test)]
     end_requests: std::sync::atomic::AtomicUsize,
+    /// The `(grace, told)` of each [`SecondProcess::end_unless_closed`] asked of this process.
+    #[cfg(test)]
+    closing_bounds: Mutex<Vec<(Duration, Duration)>>,
 }
 
 /// The reaped child's status, once its reaper has it.
@@ -1952,14 +2029,14 @@ impl SecondProcess {
     /// Takes the child just spawned: reads its start time, opens its pidfd and starts its reaper. On an error the
     /// child is killed, since without those it could not be told from a later holder of its pid, and reaped without
     /// a wait on the caller (see [`reap_without_waiting`]).
-    pub fn started(mut child: Child) -> io::Result<SecondProcess> {
+    pub fn started(mut child: Child, clock: &dyn PairClock) -> io::Result<SecondProcess> {
         let pid = child.id();
         let named = agent::child::start_time(pid).and_then(|start| Ok((start, PidFd::open(pid, start)?)));
         let (start, pidfd) = match named {
             Ok(named) => named,
             Err(err) => {
                 let _ = child.kill();
-                reap_without_waiting(child);
+                reap_without_waiting(child, clock);
                 return Err(err);
             }
         };
@@ -1988,7 +2065,7 @@ impl SecondProcess {
         if let Err(err) = spawned {
             if let Some(mut child) = slot.lock().unwrap_or_else(|e| e.into_inner()).take() {
                 let _ = child.kill();
-                reap_without_waiting(child);
+                reap_without_waiting(child, clock);
             }
             return Err(err);
         }
@@ -1999,6 +2076,8 @@ impl SecondProcess {
             reaped,
             #[cfg(test)]
             end_requests: Default::default(),
+            #[cfg(test)]
+            closing_bounds: Default::default(),
         })
     }
 
@@ -2012,6 +2091,8 @@ impl SecondProcess {
             reaped: Arc::default(),
             #[cfg(test)]
             end_requests: Default::default(),
+            #[cfg(test)]
+            closing_bounds: Default::default(),
         })
     }
 
@@ -2047,7 +2128,10 @@ impl SecondProcess {
     /// forces a close that is under way.
     pub fn end_unless_closed(&self, grace: Duration, told: Duration) -> io::Result<JoinHandle<Ending>> {
         #[cfg(test)]
-        self.end_requests.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        {
+            self.end_requests.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.closing_bounds.lock().unwrap().push((grace, told));
+        }
         let pidfd = self.pidfd.clone();
         let pid = self.pid;
         std::thread::Builder::new().name("window-ender".into()).spawn(move || {
@@ -2059,6 +2143,11 @@ impl SecondProcess {
             report_ending(pid, &ending);
             ending
         })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn closing_bounds(&self) -> Vec<(Duration, Duration)> {
+        self.closing_bounds.lock().unwrap().clone()
     }
 
     #[cfg(test)]
@@ -2126,17 +2215,20 @@ const REAP_RETRY: Duration = Duration::from_millis(100);
 /// Reaps `child` with no wait on the caller, for when no thread can be started to wait for it: at once if it has
 /// ended, else from the main loop once it has. A killed child can still take a while to end (one in uninterruptible
 /// I/O ends only when that I/O does), and the caller is the GTK thread.
-fn reap_without_waiting(mut child: Child) {
+fn reap_without_waiting(mut child: Child, clock: &dyn PairClock) {
     if reaped_now(&mut child) {
         return;
     }
-    gtk4::glib::timeout_add_local(REAP_RETRY, move || {
-        if reaped_now(&mut child) {
-            gtk4::glib::ControlFlow::Break
-        } else {
-            gtk4::glib::ControlFlow::Continue
-        }
-    });
+    clock.every(
+        REAP_RETRY,
+        Box::new(move || {
+            if reaped_now(&mut child) {
+                Flow::Stop
+            } else {
+                Flow::Continue
+            }
+        }),
+    );
 }
 
 /// One look that never waits: whether `child` is reaped now, or can never be (its status cannot be read).
@@ -2147,73 +2239,56 @@ fn reaped_now(child: &mut Child) -> bool {
 /// Ends the process from the main loop, for when no thread can be started for the grace: SIGTERM now, and a timer
 /// that sends SIGKILL once the grace has passed if it still runs. Nothing waits on the caller. The application is
 /// held until the timer has run, so closing the last window during the grace does not end this process first.
-fn end_from_main_loop(pidfd: Arc<PidFd>, pid: u32, grace: Duration) {
-    end_from_main_loop_scheduled(pidfd, pid, grace, |within, run| {
-        gtk4::glib::timeout_add_local_once(within, run);
-    });
-}
-
-fn end_from_main_loop_scheduled(
-    pidfd: Arc<PidFd>,
-    pid: u32,
-    grace: Duration,
-    schedule: impl FnOnce(Duration, Box<dyn FnOnce()>),
-) {
+fn end_from_main_loop(pidfd: Arc<PidFd>, pid: u32, grace: Duration, clock: &dyn PairClock) {
     if let Some(done) = terminate(&pidfd) {
         report_ending(pid, &done);
         return;
     }
-    let hold = hold_application();
-    schedule(
+    let hold = clock.hold();
+    clock.after(
         grace,
         Box::new(move || {
             report_ending(pid, &kill_if_running(&pidfd));
-            // Released here, after the SIGKILL, rather than whenever GLib frees the finished source.
+            // Dropped here, right after the SIGKILL, rather than left to the host: it may free the finished closure
+            // (and the hold in it) later than this.
             drop(hold);
         }),
     );
 }
 
-/// A hold on the running application, so it stays in its main loop with no window left. Once window 1's last
-/// window closes the process would otherwise exit, and with it the thread or timer that still owes a window 2 its
-/// SIGKILL: one that ignores SIGTERM would be left running. `None` when no application runs (the unit tests), where
-/// nothing exits under the ending.
-fn hold_application() -> Option<gtk4::gio::ApplicationHoldGuard> {
-    use gtk4::prelude::*;
-    gtk4::gio::Application::default().map(|app| app.hold())
-}
-
 /// Holds the application until the ending thread has finished; the thread itself is bounded by its grace.
-fn hold_until_finished(ending: JoinHandle<Ending>) {
-    let Some(hold) = hold_application() else {
+fn hold_until_finished(ending: JoinHandle<Ending>, clock: &dyn PairClock) {
+    let Some(hold) = clock.hold() else {
         return;
     };
-    release_when_finished(ending, move || drop(hold));
+    release_when_finished(ending, move || drop(hold), clock);
 }
 
-/// Runs `release` on the main loop as soon as `ending` has finished. The join happens on GLib's worker pool and wakes
-/// the main loop when it returns, so nothing waits on the caller and nothing polls: a window that is already gone lets
-/// the process exit at once, not at the next look of a timer (which cost every close in compositor mode about 100
-/// ms).
-fn release_when_finished<T: Send + 'static>(ending: JoinHandle<T>, release: impl FnOnce() + 'static) {
-    let joined = gtk4::gio::spawn_blocking(move || {
-        let _ = ending.join();
-    });
-    gtk4::glib::spawn_future_local(async move {
-        let _ = joined.await;
-        release();
-    });
+/// Runs `release` on the loop's thread as soon as `ending` has finished. The join runs on a worker and wakes the loop
+/// when it returns, so nothing waits on the caller and nothing polls: a window that is already gone lets the process
+/// exit at once, not at the next look of a timer (which cost every close in compositor mode about 100 ms).
+pub(crate) fn release_when_finished<T: Send + 'static>(
+    ending: JoinHandle<T>,
+    release: impl FnOnce() + 'static,
+    clock: &dyn PairClock,
+) {
+    clock.blocking(
+        Box::new(move || {
+            let _ = ending.join();
+        }),
+        Box::new(release),
+    );
 }
 
 /// Ends `second` with `grace` to go: on a thread when one can be started (the thread, returned), else from the main
 /// loop, so a window that ignores SIGTERM is still killed either way.
-fn end_second(second: &SecondProcess, grace: Duration) -> Option<JoinHandle<Ending>> {
+fn end_second(second: &SecondProcess, grace: Duration, clock: &dyn PairClock) -> Option<JoinHandle<Ending>> {
     match second.end(grace) {
         Ok(ending) => Some(ending),
         Err(err) => {
             // With no thread for the grace, the main loop keeps it.
             eprintln!("[window] the window could not be ended on a thread ({err}); the main loop ends it");
-            end_from_main_loop(second.pidfd.clone(), second.pid, grace);
+            end_from_main_loop(second.pidfd.clone(), second.pid, grace, clock);
             None
         }
     }
@@ -2231,12 +2306,17 @@ fn last_tabs(held: &dyn TabHolder, keep: bool) -> Option<SavedTabs> {
 
 /// [`SecondProcess::end_unless_closed`], and with no thread for it, the main loop's end at once: the window was told to
 /// close, so SIGTERM asks nothing new of it.
-fn end_closing(window: &SecondProcess, grace: Duration, told: Duration) -> Option<JoinHandle<Ending>> {
+fn end_closing(
+    window: &SecondProcess,
+    grace: Duration,
+    told: Duration,
+    clock: &dyn PairClock,
+) -> Option<JoinHandle<Ending>> {
     match window.end_unless_closed(grace, told) {
         Ok(ending) => Some(ending),
         Err(err) => {
             eprintln!("[window] the window could not be ended on a thread ({err}); the main loop ends it");
-            end_from_main_loop(window.pidfd.clone(), window.pid, told);
+            end_from_main_loop(window.pidfd.clone(), window.pid, told, clock);
             None
         }
     }
@@ -2255,23 +2335,24 @@ fn report_ending(pid: u32, ending: &Ending) {
 fn end_if_overdue(
     link: &LinkDriver,
     second: &SecondProcess,
-    now: Instant,
     grace: Duration,
+    clock: &dyn PairClock,
 ) -> Option<JoinHandle<Ending>> {
-    if !link.handshake_overdue(now) {
+    if !link.handshake_overdue(clock.now()) {
         return None;
     }
     eprintln!(
         "[window] the window in process {} did not finish its handshake; it is ended",
         second.pid
     );
-    end_second(second, grace)
+    end_second(second, grace, clock)
 }
 
 /// Window 1 starts window 2 ([`start_window`]); a window 2 refused at its hello ends by itself, once it reads the
 /// `bye`.
 #[allow(clippy::too_many_arguments)]
-pub fn start_second(
+pub(crate) fn start_second(
+    env: &PairEnv,
     starts: &Starts,
     root: &Path,
     token: Option<&str>,
@@ -2282,16 +2363,19 @@ pub fn start_second(
     overdue: Option<Rc<dyn Fn()>>,
 ) -> io::Result<(LinkDriver, Rc<SecondProcess>)> {
     let name = WindowName::Second;
-    start_window(starts, root, &name, token, flags, lock, linked, running, overdue, None)
+    start_window(
+        env, starts, root, &name, token, flags, lock, linked, running, overdue, None,
+    )
 }
 
-/// Window 1: makes the link, starts the window `name` from `starts`' executable (this one's, in a window) with the
+/// Window 1: makes the link, starts the window `name` from the executable in `env` with the
 /// other end and `flags`, and links when its `hello` matches. `linked` runs once `welcome` is sent. The child is
 /// reaped on a thread of its own, and ended if it has not finished the handshake in `starts`' time
 /// ([`HANDSHAKE_WITHIN`] in a window); `overdue`, when given, runs then if the link is not linked. `refused`, when
 /// given, runs once a `hello` has been refused and the link closed.
 #[allow(clippy::too_many_arguments)]
 fn start_window(
+    env: &PairEnv,
     starts: &Starts,
     root: &Path,
     name: &WindowName,
@@ -2304,14 +2388,9 @@ fn start_window(
     refused: Option<Rc<dyn Fn()>>,
 ) -> io::Result<(LinkDriver, Rc<SecondProcess>)> {
     let (mine, theirs) = (starts.link_ends)()?;
-    let second = Rc::new(SecondProcess::started(spawn_linked(
-        &starts.exe,
-        theirs,
-        root,
-        name,
-        token,
-        flags,
-    )?)?);
+    let clock = env.clock.clone();
+    let child = spawn_linked(&env.exe, theirs, root, name, token, flags)?;
+    let second = Rc::new(SecondProcess::started(child, &*clock)?);
     let (pid, start) = (second.pid(), second.start());
     let presence = not_yet_confirmed();
     let (handle, inbound) = match LinkHandle::start(mine, presence.clone()) {
@@ -2320,8 +2399,8 @@ fn start_window(
             // No link means no handshake and no deadline to end it by: a window hung before its toolkit came up
             // would never see its socket close, so it is ended here.
             eprintln!("[window] the link to process {pid} could not be started ({err}); it is ended");
-            if let Some(ending) = end_second(&second, END_GRACE) {
-                hold_until_finished(ending);
+            if let Some(ending) = end_second(&second, END_GRACE, &*clock) {
+                hold_until_finished(ending, &*clock);
             }
             return Err(err);
         }
@@ -2329,7 +2408,7 @@ fn start_window(
     let link = LinkDriver::new(handle, inbound);
     link.set_presence(presence);
     let expected = Expected {
-        build: crate::version::fingerprint(),
+        build: env.build.clone(),
         name: name.clone(),
         pid,
         start,
@@ -2344,20 +2423,21 @@ fn start_window(
             }
         }
     });
-    link.watch();
+    link.watch(&*clock);
     // A window that never says hello (it hung before its toolkit came up, or died in a way the link does not see)
     // would otherwise leave this link up for good, and it could never be started again; its process, left running,
     // would keep whatever it opened.
-    link.set_handshake_deadline(Instant::now() + starts.handshake_within);
+    link.set_handshake_deadline(clock.now() + starts.handshake_within);
     {
         let link = link.clone();
         let second = second.clone();
-        (starts.after)(
+        let ending_clock = clock.clone();
+        clock.after(
             starts.handshake_within,
             Box::new(move || {
                 // The ending thread is bounded by the grace; the application is held until it has finished.
-                if let Some(ending) = end_if_overdue(&link, &second, Instant::now(), END_GRACE) {
-                    hold_until_finished(ending);
+                if let Some(ending) = end_if_overdue(&link, &second, END_GRACE, &*ending_clock) {
+                    hold_until_finished(ending, &*ending_clock);
                 }
                 if !link.linked() {
                     if let Some(overdue) = &overdue {
@@ -2429,6 +2509,7 @@ fn answer_hello(
 /// adopting the pair lock it carries into `lock`, which the window keeps, so the lock is held for as long as this
 /// window lives, after the link ended too, and starting `stamp` on it. `linked` runs once linked.
 pub fn link_second(
+    env: &PairEnv,
     sock: OwnedFd,
     name: &WindowName,
     linked: LinkMade,
@@ -2449,9 +2530,9 @@ pub fn link_second(
             take_welcome(link, &msg, fds, parent, &lock, &stamp, &linked);
         });
     }
-    link.send(hello(crate::version::fingerprint(), name, pid, start), Vec::new())
+    link.send(hello(env.build.clone(), name, pid, start), Vec::new())
         .map_err(|e| io::Error::other(e.to_string()))?;
-    link.watch();
+    link.watch(&*env.clock);
     Ok(link)
 }
 
@@ -2502,8 +2583,9 @@ fn take_welcome(
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
-    use crate::ide_wiring::ShellPort;
     use crate::linked_window::driver::tests::{pair, pump_until};
+    use crate::linked_window::host_loop::tests::ManualClock;
+    use crate::linked_window::registry::tests::keeping;
     use eitri_core::window_link::link::Inbound;
     use std::ffi::OsString;
     use std::time::Duration;
@@ -2515,6 +2597,62 @@ pub(crate) mod tests {
             pid: 4242,
             start: 99,
         }
+    }
+
+    #[test]
+    fn window_2_sends_the_pairs_build_in_its_hello() {
+        let env = PairEnv::for_tests_with(|env| env.build = "x".into());
+        let (one, two) = fdpass::seqpacket_pair().unwrap();
+        let _pair = Pair::second(env, two, Path::new("/p")).unwrap();
+        let (_hub, inbound) = LinkHandle::start(one, PresenceFlag::default()).unwrap();
+        let first = inbound.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(
+            matches!(&first, Inbound::Msg { msg: Msg::Hello { build, window, .. }, .. }
+                if build == "x" && window == SECOND_WINDOW),
+            "{first:?}"
+        );
+    }
+
+    /// What window 1 gives a module window to close in is what is left of the watchdog's [`CLOSE_WITHIN`] after the
+    /// grace before its SIGTERM and the margin ahead of the exit: 44 s less 2 s less 1 s with no signal seen.
+    #[test]
+    fn the_group_is_told_to_close_within_what_the_close_bound_leaves() {
+        let group = keeping("told-bound");
+        let chat = WindowName::Chat(1);
+        let (_, _their, _) = group.link(&chat);
+        let process = group.pair.module_process(&chat).unwrap();
+
+        group.pair.end_group_now();
+
+        assert_eq!(
+            process.closing_bounds(),
+            [(Duration::from_secs(2), Duration::from_secs(41))]
+        );
+    }
+
+    /// The time since the host's first signal comes off the bound: one seen at the watchdog's limit leaves none, one seen
+    /// 10 s ago leaves 31 s.
+    #[test]
+    fn the_group_told_bound_counts_time_since_the_hosts_first_signal() {
+        use eitri_core::wm::end_signals::CLOSE_WITHIN;
+
+        let root = Path::new("/p");
+        let signalled = Pair::full(
+            PairEnv::for_tests_with(|env| env.since_first_signal = || CLOSE_WITHIN),
+            Ok(None),
+            root,
+            false,
+            false,
+        );
+        assert_eq!(signalled.group_told_within(), Duration::ZERO);
+        let seen_10s_ago = Pair::full(
+            PairEnv::for_tests_with(|env| env.since_first_signal = || Duration::from_secs(10)),
+            Ok(None),
+            root,
+            false,
+            false,
+        );
+        assert_eq!(seen_10s_ago.group_told_within(), Duration::from_secs(31));
     }
 
     #[test]
@@ -2623,7 +2761,7 @@ pub(crate) mod tests {
         }
     }
 
-    /// A stand-in for window 2 that never says hello: `sleep`, through the seam window 1 starts window 2 by.
+    /// A stand-in for window 2 that never says hello.
     /// `ignore_term`: it ignores SIGTERM, as a window hung with that signal blocked would.
     fn stand_in(ignore_term: bool) -> SecondProcess {
         use std::os::unix::process::CommandExt;
@@ -2638,7 +2776,7 @@ pub(crate) mod tests {
                 });
             }
         }
-        SecondProcess::started(command.spawn().unwrap()).unwrap()
+        SecondProcess::started(command.spawn().unwrap(), &ManualClock::default()).unwrap()
     }
 
     fn signal_of(status: std::process::ExitStatus) -> Option<i32> {
@@ -2647,29 +2785,29 @@ pub(crate) mod tests {
 
     #[test]
     fn a_window_2_that_misses_its_handshake_is_ended_and_reaped() {
-        use std::time::Instant;
         // A process that heeds SIGTERM gets a long grace, since ending returns as soon as it has gone: a slow machine
         // must not turn its SIGTERM into a SIGKILL. Only the one that ignores SIGTERM waits out a short grace.
         let grace = Duration::from_secs(10);
         let short_grace = Duration::from_millis(300);
-        let start = Instant::now();
-        let overdue = start + HANDSHAKE_WITHIN;
+        let clock = ManualClock::default();
+        let overdue = clock.now() + HANDSHAKE_WITHIN;
 
         // A window that never said hello: its link is closed, and the process gets SIGTERM.
         let (driver, _theirs, _their_inbound) = pair();
         driver.set_handshake_deadline(overdue);
         let second = stand_in(false);
-        assert!(
-            end_if_overdue(&driver, &second, overdue - Duration::from_millis(1), grace).is_none(),
-            "before the deadline the start is still waited for"
-        );
-        let ending = end_if_overdue(&driver, &second, overdue, grace).expect("ended once overdue");
+        let step = Duration::from_millis(1);
+        clock.advance(HANDSHAKE_WITHIN - step);
+        assert!(end_if_overdue(&driver, &second, grace, &clock).is_none());
+        clock.advance(step);
+        let ending = end_if_overdue(&driver, &second, grace, &clock).expect("ended once overdue");
         assert_eq!(ending.join().unwrap(), Ending::Terminated);
         assert!(!driver.is_up(), "its link is closed too");
         let status = second.wait_reaped(Duration::from_secs(10)).expect("reaped");
         assert_eq!(signal_of(status), Some(libc::SIGTERM), "{status:?}");
+        clock.advance(HANDSHAKE_WITHIN);
         assert!(
-            end_if_overdue(&driver, &second, overdue + HANDSHAKE_WITHIN, grace).is_none(),
+            end_if_overdue(&driver, &second, grace, &clock).is_none(),
             "it is ended once"
         );
 
@@ -2678,7 +2816,7 @@ pub(crate) mod tests {
         driver.set_handshake_deadline(overdue);
         let stubborn = stand_in(true);
         // `spawn` returns once the child has exec'd, so the disposition is already in place.
-        let ending = end_if_overdue(&driver, &stubborn, overdue, short_grace).expect("ended once overdue");
+        let ending = end_if_overdue(&driver, &stubborn, short_grace, &clock).expect("ended once overdue");
         assert_eq!(ending.join().unwrap(), Ending::Killed);
         let status = stubborn.wait_reaped(Duration::from_secs(10)).expect("reaped");
         assert_eq!(signal_of(status), Some(libc::SIGKILL), "{status:?}");
@@ -2686,10 +2824,10 @@ pub(crate) mod tests {
         // One that already exited is only reaped: nothing is signalled.
         let (driver, _theirs, _their_inbound) = pair();
         driver.set_handshake_deadline(overdue);
-        let gone = SecondProcess::started(std::process::Command::new("true").spawn().unwrap()).unwrap();
+        let gone = SecondProcess::started(std::process::Command::new("true").spawn().unwrap(), &clock).unwrap();
         let status = gone.wait_reaped(Duration::from_secs(10)).expect("reaped on its own");
         assert_eq!(status.code(), Some(0));
-        let ending = end_if_overdue(&driver, &gone, overdue, grace).expect("its link is still closed");
+        let ending = end_if_overdue(&driver, &gone, grace, &clock).expect("its link is still closed");
         assert_eq!(ending.join().unwrap(), Ending::AlreadyEnded);
 
         // A linked window is never signalled, whatever the clock says.
@@ -2697,7 +2835,8 @@ pub(crate) mod tests {
         driver.set_handshake_deadline(overdue);
         driver.set_linked();
         let linked = stand_in(false);
-        assert!(end_if_overdue(&driver, &linked, overdue + HANDSHAKE_WITHIN, grace).is_none());
+        clock.advance(HANDSHAKE_WITHIN);
+        assert!(end_if_overdue(&driver, &linked, grace, &clock).is_none());
         assert!(driver.linked());
         assert_eq!(linked.ending_requests(), 0, "a linked window schedules no ending");
         // The test's own clean-up of its stand-in.
@@ -2706,18 +2845,89 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn without_a_thread_sigkill_still_follows_and_the_child_is_reaped_by_looks_that_never_wait() {
-        // The two halves the main loop runs when no thread can be started, the grace's timer between them.
-        let stubborn = stand_in(true);
-        assert_eq!(
-            terminate(&stubborn.pidfd),
-            None,
-            "SIGTERM is sent, and SIGKILL may still have to follow"
-        );
-        assert_eq!(kill_if_running(&stubborn.pidfd), Ending::Killed);
-        let status = stubborn.wait_reaped(Duration::from_secs(10)).expect("reaped");
-        assert_eq!(signal_of(status), Some(libc::SIGKILL), "{status:?}");
+    fn the_last_tabs_hold_is_released_on_the_poll_after_the_answer() {
+        let group = keeping("hold-last-tabs-answer");
+        let chat = WindowName::Chat(1);
+        let (_, their, _) = group.link(&chat);
+        let link = group.pair.module_link(&chat).unwrap();
+        let clock = &group.clock;
 
+        group.pair.end_group();
+        assert_eq!(clock.holds_taken(), 1);
+        assert_eq!(clock.holds_released(), 0);
+        for _ in 0..3 {
+            clock.advance(LAST_TABS_POLL);
+            assert!(group.pair.modules.borrow_mut().last_tabs_owed());
+            assert_eq!(clock.holds_released(), 0);
+        }
+
+        their.handle.send(Msg::TabsSaid {}, Vec::new()).unwrap();
+        assert!(pump_until(&link, || !group.pair.modules.borrow_mut().last_tabs_owed()));
+        assert_eq!(clock.holds_released(), 0);
+        clock.advance(LAST_TABS_POLL);
+        assert!(group.pair.module_names().is_empty());
+        assert_eq!(clock.holds_taken(), 2, "closing the module takes its own hold");
+        assert_eq!(clock.holds_released(), 1);
+        clock.advance(LAST_TABS_WITHIN);
+        assert_eq!(clock.holds_released(), 1);
+    }
+
+    #[test]
+    fn the_last_tabs_hold_is_released_at_the_deadline_without_an_answer() {
+        let group = keeping("hold-last-tabs-timeout");
+        let chat = WindowName::Chat(1);
+        let (_, _their, _) = group.link(&chat);
+        let clock = &group.clock;
+
+        group.pair.end_group();
+        assert_eq!(clock.holds_taken(), 1);
+        assert_eq!(clock.holds_released(), 0);
+        let step = Duration::from_millis(1);
+        clock.advance(LAST_TABS_WITHIN - step);
+        assert!(group.pair.modules.borrow_mut().last_tabs_owed());
+        assert_eq!(clock.holds_released(), 0);
+        clock.advance(step * 2);
+        assert!(group.pair.module_names().is_empty());
+        assert_eq!(clock.holds_taken(), 2, "closing the module takes its own hold");
+        assert_eq!(clock.holds_released(), 1);
+        clock.advance(LAST_TABS_POLL);
+        assert_eq!(clock.holds_released(), 1);
+    }
+
+    #[test]
+    fn the_main_loop_ending_holds_the_application_through_its_grace() {
+        let clock = ManualClock::default();
+        let stubborn = stand_in(true);
+        let pid = stubborn.pid();
+        let grace = Duration::from_secs(2);
+        end_from_main_loop(stubborn.pidfd.clone(), pid, grace, &clock);
+        let taken = clock.holds_taken();
+        let released_at_start = clock.holds_released();
+        clock.advance(grace - Duration::from_millis(1));
+        let survived = !stubborn.pidfd.exited();
+        let released_before_grace = clock.holds_released();
+        clock.advance(Duration::from_millis(1));
+        let released_at_grace = clock.holds_released();
+        let killed = stubborn.pidfd.wait_exited(Duration::from_secs(10));
+        if !killed {
+            let _ = stubborn.pidfd.signal(libc::SIGKILL);
+        }
+        let status = stubborn.wait_reaped(Duration::from_secs(10)).expect("reaped");
+        assert_eq!(*clock.after_delays.borrow(), [grace]);
+        assert_eq!(taken, 1);
+        assert_eq!(released_at_start, 0);
+        assert_eq!(released_before_grace, 0);
+        assert!(survived, "the child survived until the grace boundary");
+        assert!(killed, "the grace timer did not kill process {pid}");
+        assert_eq!(signal_of(status), Some(libc::SIGKILL), "{status:?}");
+        assert_eq!(released_at_grace, 1);
+        clock.advance(grace);
+        assert_eq!(clock.holds_released(), 1);
+    }
+
+    #[test]
+    fn without_a_reaper_thread_the_child_is_reaped_by_looks_that_never_wait() {
+        let clock = ManualClock::default();
         let polite = stand_in(false);
         assert_eq!(terminate(&polite.pidfd), None);
         let status = polite.wait_reaped(Duration::from_secs(10)).expect("reaped");
@@ -2729,7 +2939,22 @@ pub(crate) mod tests {
         );
         assert_eq!(terminate(&polite.pidfd), Some(Ending::AlreadyEnded));
 
-        // A child killed with no reaper thread is reaped by repeated looks, none of which waits.
+        // A child with no reaper thread is reaped by repeated looks, none of which waits.
+        let child = std::process::Command::new("sleep").arg("30").spawn().unwrap();
+        let pid = child.id();
+        let pidfd = PidFd::open(pid, agent::child::start_time(pid).unwrap()).unwrap();
+        reap_without_waiting(child, &clock);
+        clock.advance(REAP_RETRY);
+        let pending_while_running = clock.pending_timers();
+        pidfd.signal(libc::SIGKILL).unwrap();
+        assert!(pidfd.wait_exited(Duration::from_secs(10)));
+        clock.advance(REAP_RETRY);
+        assert_eq!(*clock.every_delays.borrow(), [REAP_RETRY]);
+        assert_eq!(pending_while_running, 1, "the timer repeats while the child runs");
+        assert!(reaped(pid), "the timer reaped the child");
+        assert_eq!(clock.pending_timers(), 0, "the timer stopped after reaping");
+
+        // The same looks, driven directly, keep the status of a child they reap.
         let mut child = std::process::Command::new("sleep").arg("30").spawn().unwrap();
         assert!(!reaped_now(&mut child), "a look does not reap a child that still runs");
         child.kill().unwrap();
@@ -2745,121 +2970,90 @@ pub(crate) mod tests {
         assert_eq!(signal_of(status), Some(libc::SIGKILL), "{status:?}");
     }
 
-    /// The main loop keeps the hold while the ending thread is parked, then releases it after the join.
     #[test]
-    fn a_finished_ending_is_released_without_waiting_for_a_timer() {
-        use std::cell::Cell;
-        use std::sync::mpsc;
-        let context = gtk4::glib::MainContext::new();
-        let released = Rc::new(Cell::new(false));
-        context
-            .with_thread_default(|| {
-                let (finish, held) = mpsc::channel();
-                let ending = std::thread::spawn(move || {
-                    held.recv_timeout(Duration::from_secs(10))
-                        .expect("the test releases the ending");
-                });
-                {
-                    let released = released.clone();
-                    release_when_finished(ending, move || released.set(true));
-                }
-                let (marked, marker_seen) = mpsc::channel();
-                let marker = gtk4::glib::idle_source_new(None, gtk4::glib::Priority::DEFAULT_IDLE, move || {
-                    marked.send(()).unwrap();
-                    gtk4::glib::ControlFlow::Break
-                });
-                marker.attach(Some(&context));
-                let deadline = Instant::now() + Duration::from_secs(10);
-                while marker_seen.try_recv().is_err() {
-                    assert!(Instant::now() < deadline, "the main loop never dispatched the marker");
-                    context.iteration(false);
-                    std::thread::yield_now();
-                }
-                assert!(!released.get(), "the hold cannot go before the ending finishes");
-                finish.send(()).unwrap();
-                while !released.get() {
-                    assert!(Instant::now() < deadline, "the finished ending never released its hold");
-                    context.iteration(false);
-                    std::thread::yield_now();
-                }
-            })
-            .unwrap();
-        assert!(released.get());
+    fn the_ending_thread_holds_the_application_until_the_blocking_join() {
+        let clock = ManualClock::default();
+        let (finish, wait) = std::sync::mpsc::channel();
+        let ending = std::thread::spawn(move || {
+            wait.recv_timeout(Duration::from_secs(10)).unwrap();
+            Ending::Terminated
+        });
+
+        hold_until_finished(ending, &clock);
+        assert_eq!(clock.holds_taken(), 1);
+        assert_eq!(clock.holds_released(), 0);
+        finish.send(()).unwrap();
+        clock.advance(END_GRACE);
+        assert_eq!(clock.holds_released(), 0);
+        assert_eq!(clock.pending_jobs(), 1);
+        clock.run_blocking();
+        assert_eq!(clock.holds_released(), 1);
+        clock.run_blocking();
+        assert_eq!(clock.holds_released(), 1);
     }
 
-    /// An application whose last window has closed must not exit while a window 2 still waits for its SIGKILL: `run`
-    /// returns only once the ending is done, on the thread and on the main-loop timer alike.
-    ///
-    /// Ignored because `g_application_run` iterates the default main context, which two tests in two threads would
-    /// fight over. Run it alone:
-    /// `cargo test -p shell --bin shell linked_window::spawn::tests::the_application_outlives_an_ending_in_its_grace -- --ignored --exact`.
     #[test]
-    #[ignore = "runs a real gio main loop on the default main context; must not race the rest of the suite"]
-    fn the_application_outlives_an_ending_in_its_grace() {
-        let _turn = crate::layout_state::default_context_turn();
-        use gtk4::gio;
-        use gtk4::prelude::*;
-        let grace = Duration::from_secs(400);
-        for on_timer in [false, true] {
-            let app = gio::Application::new(None, gio::ApplicationFlags::NON_UNIQUE);
-            let second = Rc::new(stand_in(true));
-            let completed = Rc::new(std::cell::Cell::new(false));
-            let (activating, observed) = (second.clone(), completed.clone());
-            app.connect_activate(move |_| {
-                if on_timer {
-                    let observed = observed.clone();
-                    end_from_main_loop_scheduled(
-                        activating.pidfd.clone(),
-                        activating.pid,
-                        grace,
-                        move |within, run| {
-                            assert_eq!(within, grace);
-                            gtk4::glib::idle_add_local_once(move || {
-                                run();
-                                observed.set(true);
-                            });
-                        },
-                    );
-                } else {
-                    let pidfd = activating.pidfd.clone();
-                    let (release, held) = std::sync::mpsc::channel();
-                    let (entered, entering) = std::sync::mpsc::channel();
-                    let ending = std::thread::spawn(move || {
-                        end_process_with_wait(&pidfd, grace, |within| {
-                            assert_eq!(within, grace);
-                            entered.send(()).unwrap();
-                            held.recv_timeout(Duration::from_secs(60))
-                                .expect("the application dispatched the release");
-                            false
-                        })
-                    });
-                    entering
-                        .recv_timeout(Duration::from_secs(60))
-                        .expect("inside the grace wait");
-                    hold_until_finished(ending);
-                    let observed = observed.clone();
-                    gtk4::glib::idle_add_local_once(move || {
-                        observed.set(true);
-                        release.send(()).unwrap();
-                    });
-                }
-            });
-            let expired = Rc::new(std::cell::Cell::new(false));
-            let expired_in_timer = expired.clone();
-            let quitting = app.clone();
-            let guard = gtk4::glib::timeout_add_local_once(Duration::from_secs(60), move || {
-                expired_in_timer.set(true);
-                quitting.quit();
-            });
-            app.run_with_args(&["shell-ending-hold"]);
-            if let Some(source) = gtk4::glib::MainContext::default().find_source_by_id(&guard) {
-                source.destroy();
+    fn release_is_dispatched_only_after_the_blocking_join() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let clock = ManualClock::default();
+        let finished = Arc::new(AtomicBool::new(false));
+        let ending = std::thread::spawn({
+            let finished = finished.clone();
+            move || {
+                // Long enough that only a join that waits for the thread sees `finished` set.
+                std::thread::sleep(Duration::from_millis(50));
+                finished.store(true, Ordering::SeqCst)
             }
-            assert!(!expired.get(), "the application never released its hold");
-            assert!(completed.get(), "the application returned before the grace boundary");
-            let status = second.wait_reaped(Duration::from_secs(60)).expect("reaped");
-            assert_eq!(signal_of(status), Some(libc::SIGKILL));
+        });
+        let released = Rc::new(std::cell::Cell::new(false));
+        release_when_finished(
+            ending,
+            {
+                let released = released.clone();
+                move || {
+                    assert!(finished.load(Ordering::SeqCst));
+                    released.set(true);
+                }
+            },
+            &clock,
+        );
+        assert!(!released.get());
+        assert_eq!(clock.pending_jobs(), 1);
+        clock.run_blocking();
+        assert!(released.get());
+        assert_eq!(clock.pending_jobs(), 0);
+    }
+
+    /// Starts a child that survives SIGTERM and ends it with `grace` to go: from the main loop's timer, armed with the
+    /// whole `grace` on `clock`, when `on_timer`, else on a thread whose grace wait the returned sender releases.
+    pub(crate) fn end_stand_in_in_grace(
+        clock: &dyn PairClock,
+        grace: Duration,
+        on_timer: bool,
+    ) -> (SecondProcess, Option<std::sync::mpsc::Sender<()>>) {
+        let second = stand_in(true);
+        let pidfd = second.pidfd.clone();
+        if on_timer {
+            end_from_main_loop(pidfd, second.pid, grace, clock);
+            return (second, None);
         }
+        let (release, held) = std::sync::mpsc::channel();
+        let (entered, entering) = std::sync::mpsc::channel();
+        let ending = std::thread::spawn(move || {
+            end_process_with_wait(&pidfd, grace, |within| {
+                assert_eq!(within, grace);
+                entered.send(()).unwrap();
+                held.recv_timeout(Duration::from_secs(60))
+                    .expect("the application dispatched the release");
+                false
+            })
+        });
+        entering
+            .recv_timeout(Duration::from_secs(60))
+            .expect("inside the grace wait");
+        hold_until_finished(ending, clock);
+        (second, Some(release))
     }
 
     #[test]
@@ -2870,7 +3064,7 @@ pub(crate) mod tests {
         let path = dir.0.join(eitri_core::window_link::pair::pair_lock_name(root));
 
         for taken in [Ok(None), Err(io::Error::other("no state directory"))] {
-            let pair = Pair::full(taken, root, false, false);
+            let pair = Pair::full(PairEnv::for_tests(), taken, root, false, false);
             pair.start_stamp(Some(root.to_path_buf()));
             assert!(
                 !pair.stamp().started(),
@@ -2879,7 +3073,12 @@ pub(crate) mod tests {
         }
 
         let adopted = PairLock::adopt(lock.share().unwrap()).unwrap();
-        let pair = Pair::new(WindowRole::Main { link: None }, Some(adopted), root);
+        let pair = Pair::new(
+            PairEnv::for_tests(),
+            WindowRole::Main { link: None },
+            Some(adopted),
+            root,
+        );
         pair.start_stamp(None);
         assert!(pair.stamp().started());
         assert_eq!(
@@ -2897,7 +3096,7 @@ pub(crate) mod tests {
         let lock = PairLock::try_take(&dir.0, root).unwrap().unwrap();
         let path = dir.0.join(eitri_core::window_link::pair::pair_lock_name(root));
         let (one, two) = fdpass::seqpacket_pair().unwrap();
-        let pair = Pair::module(two, WindowName::Chat(2), root).unwrap();
+        let pair = Pair::module(PairEnv::for_tests(), two, WindowName::Chat(2), root).unwrap();
         let at = std::time::SystemTime::now() + Duration::from_secs(3600);
         pair.stamp().activated(at);
         assert!(!pair.stamp().started());
@@ -2933,6 +3132,7 @@ pub(crate) mod tests {
         use crate::gtk_host::LinkedWindows;
         use eitri_core::wm::WinId;
         let pair = Pair::beside(
+            PairEnv::for_tests(),
             WindowName::Page("notes".into()),
             Path::new("/p"),
             idle_beside_link("notes"),
@@ -2968,13 +3168,13 @@ pub(crate) mod tests {
 
     #[test]
     fn window_other_without_a_linked_window_is_refused() {
-        let pair = Pair::new(WindowRole::Unpaired, None, Path::new("/p"));
+        let pair = Pair::new(PairEnv::for_tests(), WindowRole::Unpaired, None, Path::new("/p"));
         assert_eq!(pair.window_other(None), Err(NO_OTHER_WINDOW.to_string()));
         assert_eq!(
             pair.window_new(None),
             Err(crate::linked_window::UNPAIRED_REFUSAL.to_string())
         );
-        let alone = Pair::new(WindowRole::Alone, None, Path::new("/p"));
+        let alone = Pair::new(PairEnv::for_tests(), WindowRole::Alone, None, Path::new("/p"));
         assert_eq!(
             alone.window_new(None),
             Err(crate::linked_window::ALONE_REFUSAL.to_string())
@@ -2985,7 +3185,12 @@ pub(crate) mod tests {
     fn window_other_in_a_linked_window_asks_the_other_window_to_take_the_keys() {
         let (driver, _theirs, their_inbound) = pair();
         driver.set_linked();
-        let pair = Pair::new(WindowRole::Second { link: driver }, None, Path::new("/p"));
+        let pair = Pair::new(
+            PairEnv::for_tests(),
+            WindowRole::Second { link: driver },
+            None,
+            Path::new("/p"),
+        );
         assert_eq!(pair.window_new(Some("tok".into())), Ok(WindowNew::Raise));
         pair.window_other(None).unwrap();
         let mut got = Vec::new();
@@ -3022,7 +3227,7 @@ pub(crate) mod tests {
                     link: Some(driver.clone()),
                 }
             };
-            let pair = Pair::new(role, None, Path::new("/p"));
+            let pair = Pair::new(PairEnv::for_tests(), role, None, Path::new("/p"));
             let posted = Rc::new(RefCell::new(Vec::new()));
             let saved = posted.clone();
             pair.set_hooks(PairHooks {
@@ -3225,6 +3430,7 @@ pub(crate) mod tests {
             &wm,
         );
         let pair = Pair::new(
+            PairEnv::for_tests(),
             WindowRole::Main {
                 link: Some(driver.clone()),
             },
@@ -3273,40 +3479,39 @@ pub(crate) mod tests {
         );
     }
 
-    /// A window 1 holding a pair, whose window 2 is the stand-in `script` (a shell script ignoring its arguments),
-    /// with `within` for its handshake and the handshake's timer held for the test to fire. What the restore's
-    /// take-back and the window's own `ended` hook were called with is recorded.
+    /// A window 1 holding a pair, whose window 2 runs the stand-in script when present. The test controls the
+    /// handshake timer and records calls to the restore take-back and the window's own `ended` hook.
     struct Restoring {
         pair: Rc<Pair>,
-        timers: Rc<RefCell<Vec<Box<dyn FnOnce()>>>>,
+        clock: Rc<ManualClock>,
         failed: Rc<RefCell<Vec<String>>>,
         ended: Rc<RefCell<Vec<LinkEnd>>>,
         report: PathBuf,
         _dir: crate::linked_window::tests::Scratch,
     }
 
-    fn restoring(label: &str, script: &str, within: Duration) -> Restoring {
+    fn restoring(label: &str, script: Option<&str>, within: Duration) -> Restoring {
         let dir = crate::linked_window::tests::Scratch::new(label);
         let report = dir.1.join("pid");
         let exe = dir.1.join("window-2-stand-in");
-        script_fixture::write_executable_script(
-            &exe,
-            format!("#!/bin/sh\necho $$ > '{}'\n{script}\n", report.display()),
-            0o700,
-        )
-        .unwrap();
+        if let Some(script) = script {
+            script_fixture::write_executable_script(
+                &exe,
+                format!("#!/bin/sh\necho $$ > '{}'\n{script}\n", report.display()),
+                0o700,
+            )
+            .unwrap();
+        }
         let lock = PairLock::try_take(&dir.0, Path::new("/p")).unwrap().unwrap();
-        let pair = Pair::full(Ok(Some(lock)), &dir.1, false, false);
-        let timers: Rc<RefCell<Vec<Box<dyn FnOnce()>>>> = Rc::default();
-        let after: After = {
-            let timers = timers.clone();
-            Rc::new(move |_, run| timers.borrow_mut().push(run))
-        };
+        let clock = Rc::new(ManualClock::default());
+        let env = PairEnv::for_tests_with(|env| {
+            env.exe = exe;
+            env.clock = clock.clone();
+        });
+        let pair = Pair::full(env, Ok(Some(lock)), &dir.1, false, false);
         pair.set_starts(Starts {
-            exe,
             handshake_within: within,
-            after,
-            ..Starts::default()
+            link_ends: Rc::new(fdpass::seqpacket_pair),
         });
         let failed: Rc<RefCell<Vec<String>>> = Rc::default();
         {
@@ -3324,7 +3529,7 @@ pub(crate) mod tests {
         }
         Restoring {
             pair,
-            timers,
+            clock,
             failed,
             ended,
             report,
@@ -3347,12 +3552,11 @@ pub(crate) mod tests {
                 std::thread::sleep(Duration::from_millis(10));
             }
         }
+    }
 
-        fn fire_timers(&self) {
-            let timers: Vec<_> = self.timers.borrow_mut().drain(..).collect();
-            for timer in timers {
-                timer();
-            }
+    impl Drop for Restoring {
+        fn drop(&mut self) {
+            self.clock.clear_timers();
         }
     }
 
@@ -3363,10 +3567,7 @@ pub(crate) mod tests {
 
     #[test]
     fn a_restore_whose_start_fails_takes_window_2s_part_back_once() {
-        let restoring = restoring("restore-start-fails", "exit 0", HANDSHAKE_WITHIN);
-        let mut starts = restoring.pair.starts.borrow().clone();
-        starts.exe = restoring.report.with_file_name("no-such-executable");
-        restoring.pair.set_starts(starts);
+        let restoring = restoring("restore-start-fails", None, HANDSHAKE_WITHIN);
         let err = restoring.pair.restore().unwrap_err();
         assert!(err.contains("could not be started"), "{err}");
         assert_eq!(restoring.failed.borrow().len(), 1, "taken back at once");
@@ -3380,14 +3581,18 @@ pub(crate) mod tests {
 
     #[test]
     fn a_restored_window_2_that_never_says_hello_is_taken_back_once_its_handshake_is_overdue() {
-        let restoring = restoring("restore-overdue", "exec sleep 30", Duration::ZERO);
+        let within = Duration::from_millis(40);
+        let restoring = restoring("restore-overdue", Some("exec sleep 30"), within);
         restoring.pair.restore().unwrap();
         let pid = restoring.stand_in_pid();
+        assert_eq!(*restoring.clock.after_delays.borrow(), [within]);
+        let step = Duration::from_millis(1);
+        restoring.clock.advance(within - step);
         assert!(
             restoring.failed.borrow().is_empty(),
             "nothing is taken back before the deadline"
         );
-        restoring.fire_timers();
+        restoring.clock.advance(step);
         assert_eq!(
             *restoring.failed.borrow(),
             ["window 2 did not finish its handshake"],
@@ -3407,7 +3612,7 @@ pub(crate) mod tests {
 
     #[test]
     fn a_restored_window_2_that_ends_before_hello_is_taken_back_and_window_1_keeps_the_pair_file() {
-        let restoring = restoring("restore-ends-early", "exit 0", HANDSHAKE_WITHIN);
+        let restoring = restoring("restore-ends-early", Some("exit 0"), HANDSHAKE_WITHIN);
         let dir = restoring.report.parent().unwrap().join("pair-files");
         restoring
             .pair
@@ -3421,7 +3626,7 @@ pub(crate) mod tests {
             "the take-back runs instead of the window's own end of a link"
         );
         // The handshake's timer still fires later, and finds the restore handled.
-        restoring.fire_timers();
+        restoring.clock.advance(HANDSHAKE_WITHIN);
         assert_eq!(restoring.failed.borrow().len(), 1);
         // A window 2 that never linked never held the pair file: window 1 goes on writing it.
         restoring.pair.window2_link_ended(&link, &LinkEnd::Eof);
@@ -3434,7 +3639,7 @@ pub(crate) mod tests {
     fn only_a_window_2_that_linked_and_ended_without_a_goodbye_keeps_the_pair_file() {
         let dir = crate::linked_window::tests::Scratch::new("link-ended-files");
         let lock = PairLock::try_take(&dir.0, Path::new("/p")).unwrap().unwrap();
-        let pair = Pair::full(Ok(Some(lock)), &dir.1, false, false);
+        let pair = Pair::full(PairEnv::for_tests(), Ok(Some(lock)), &dir.1, false, false);
         let writing = |pair: &Pair| {
             let mut writing = false;
             pair.with_pair_writer(|writer| writing = writer.writing());
@@ -3483,7 +3688,7 @@ pub(crate) mod tests {
             .unwrap()
             .unwrap();
         let (one, two) = eitri_core::window_link::fdpass::seqpacket_pair().unwrap();
-        let pair = Pair::module(two, WindowName::Chat(2), root).unwrap();
+        let pair = Pair::module(PairEnv::for_tests(), two, WindowName::Chat(2), root).unwrap();
         type Heard = Vec<(String, Vec<(String, serde_json::Value)>)>;
         let heard: Rc<RefCell<Heard>> = Rc::default();
         {
@@ -3515,15 +3720,15 @@ pub(crate) mod tests {
         );
     }
 
-    const PORT: u16 = 23456;
+    pub(crate) const PORT: u16 = 23456;
 
-    fn port_env(port: u16) -> Vec<(OsString, OsString)> {
+    pub(crate) fn port_env(port: u16) -> Vec<(OsString, OsString)> {
         vec![(OsString::from("CLAUDE_CODE_SSE_PORT"), OsString::from(port.to_string()))]
     }
 
     /// A window 1 and a window 2 on one link that is up, as a handshake or a re-link leaves them. Neither has hooks:
     /// what is held here is the pair's own part.
-    fn two_windows() -> (Rc<Pair>, Rc<Pair>) {
+    pub(crate) fn two_windows() -> (Rc<Pair>, Rc<Pair>) {
         let (one, two) = fdpass::seqpacket_pair().unwrap();
         let (one, one_in) = LinkHandle::start(one, PresenceFlag::default()).unwrap();
         let (two, two_in) = LinkHandle::start(two, PresenceFlag::default()).unwrap();
@@ -3531,50 +3736,25 @@ pub(crate) mod tests {
         one.set_linked();
         two.set_linked();
         (
-            Pair::new(WindowRole::Main { link: Some(one) }, None, Path::new("/p")),
-            Pair::new(WindowRole::Second { link: two }, None, Path::new("/p")),
+            Pair::new(
+                PairEnv::for_tests(),
+                WindowRole::Main { link: Some(one) },
+                None,
+                Path::new("/p"),
+            ),
+            Pair::new(
+                PairEnv::for_tests(),
+                WindowRole::Second { link: two },
+                None,
+                Path::new("/p"),
+            ),
         )
     }
 
     /// Pumps window 2 until its next shell's port reads `want`.
-    fn wait_for_port(two: &Pair, want: Option<u16>) {
+    pub(crate) fn wait_for_port(two: &Pair, want: Option<u16>) {
         let link = two.link().unwrap();
         assert!(pump_until(&link, || two.ide_port() == want), "{:?}", two.ide_port());
-    }
-
-    #[test]
-    fn a_window_2_restored_with_a_terminal_shown_has_the_port_on_its_first_shell() {
-        let (_window1, two) = fdpass::seqpacket_pair().unwrap();
-        let second = Pair::second(two, Path::new("/p")).unwrap();
-        second.set_ide_port(Some(PORT));
-        assert!(!second.link().unwrap().linked(), "no welcome has come");
-        assert_eq!(ShellPort::shared(second.ide_port_cell()).env(), port_env(PORT));
-    }
-
-    #[test]
-    fn a_relink_brings_the_new_port() {
-        let (window1, window2) = two_windows();
-        let shell = ShellPort::shared(window2.ide_port_cell());
-        assert_eq!(shell.env(), Vec::new(), "welcome said nothing of a port");
-
-        window1.set_ide_port(Some(PORT));
-        window1.say_ide_port(&window1.link().unwrap());
-
-        wait_for_port(&window2, Some(PORT));
-        assert_eq!(shell.env(), port_env(PORT));
-    }
-
-    #[test]
-    fn a_shell_started_while_orphaned_has_no_port() {
-        let (window1, window2) = two_windows();
-        window2.set_ide_port(Some(PORT));
-        let shell = ShellPort::shared(window2.ide_port_cell());
-        let link = window2.link().unwrap();
-
-        window1.link().unwrap().close("window 1 closed");
-
-        assert!(pump_until(&link, || link.ended().is_some()));
-        assert_eq!(shell.env(), Vec::new());
     }
 
     #[test]
@@ -3585,20 +3765,6 @@ pub(crate) mod tests {
         window2.link().unwrap().close("window 2 closed");
         assert!(pump_until(&link, || link.ended().is_some()));
         assert_eq!(window1.ide_port(), Some(PORT));
-    }
-
-    #[test]
-    fn a_port_message_changes_no_running_shell() {
-        let (window1, window2) = two_windows();
-        window2.set_ide_port(Some(PORT));
-        let shell = ShellPort::shared(window2.ide_port_cell());
-        let running = shell.env();
-
-        window1.ide_port_changed(Some(PORT + 1));
-        wait_for_port(&window2, Some(PORT + 1));
-
-        assert_eq!(running, port_env(PORT), "a shell keeps what it started with");
-        assert_eq!(shell.env(), port_env(PORT + 1), "the next one has the new port");
     }
 
     #[test]
@@ -3649,7 +3815,12 @@ pub(crate) mod tests {
     #[test]
     fn a_link_in_its_handshake_hears_no_port_until_it_is_up() {
         let (one, _theirs, their_inbound) = pair();
-        let window1 = Pair::new(WindowRole::Main { link: Some(one) }, None, Path::new("/p"));
+        let window1 = Pair::new(
+            PairEnv::for_tests(),
+            WindowRole::Main { link: Some(one) },
+            None,
+            Path::new("/p"),
+        );
 
         window1.ide_port_changed(Some(PORT));
         window1
@@ -3707,7 +3878,7 @@ pub(crate) mod tests {
     fn a_restored_window_2_is_started_with_the_port_as_it_stands() {
         let restoring = restoring(
             "restore-port",
-            r#"echo "$*" > "$0.args.tmp"; mv "$0.args.tmp" "$0.args""#,
+            Some(r#"echo "$*" > "$0.args.tmp"; mv "$0.args.tmp" "$0.args""#),
             HANDSHAKE_WITHIN,
         );
         let args = restoring.report.with_file_name("window-2-stand-in.args");

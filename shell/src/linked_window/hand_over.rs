@@ -28,7 +28,7 @@ use eitri_core::wm::{ChatEvent, Controller, Driver, HostEvent, WinId};
 use serde_json::Value;
 
 use super::driver::LinkDriver;
-use crate::agent_panel::{AgentPanelHandle, TabAnswer};
+use eitri_panel::agent_panel::{AgentPanelHandle, TabAnswer};
 
 /// A message for one module window.
 pub type Outgoing = (WindowName, Msg);

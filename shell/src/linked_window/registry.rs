@@ -259,4 +259,4 @@ pub fn peer_action(
 }
 
 #[cfg(test)]
-mod tests;
+pub(super) mod tests;
