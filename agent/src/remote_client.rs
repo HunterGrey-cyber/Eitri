@@ -82,11 +82,12 @@ pub struct SidecarStart {
 }
 
 pub use eitri_server_proto::{
-    ExecInput, ExecOutput, GitConfigRequest, GitConfigResponse, ListTreeEntry, ListTreeRequest, PathSizesRequest,
-    PathSizesResponse, ProjectActivityRequest, ProjectActivityResponse, ReadFileChunk, ReadFileRequest,
-    RemoveFileIfRequest, RemoveFileIfResponse, ReplaceFileIfRequest, ReplaceFileIfResponse, SyncIgnoresRequest,
-    SyncIgnoresResponse, WaitFileHashRequest, WaitFileHashResponse, WatchModesRequest, WatchModesResponse, CAP_EXEC,
-    CAP_GIT_CONFIG, CAP_INSTALLATION_ARGS, CAP_SYNC_FILES, CAP_SYNC_IGNORES, CAP_SYNC_MODES,
+    exec_input, exec_output, ExecExit, ExecInput, ExecOutput, ExecPurpose, ExecStart, GitConfigRequest,
+    GitConfigResponse, ListTreeEntry, ListTreeRequest, PathSizesRequest, PathSizesResponse, ProjectActivityRequest,
+    ProjectActivityResponse, ReadFileChunk, ReadFileRequest, RemoveFileIfRequest, RemoveFileIfResponse,
+    ReplaceFileIfRequest, ReplaceFileIfResponse, SyncIgnoresRequest, SyncIgnoresResponse, WaitFileHashRequest,
+    WaitFileHashResponse, WatchModesRequest, WatchModesResponse, CAP_EXEC, CAP_GIT_CONFIG, CAP_INSTALLATION_ARGS,
+    CAP_SYNC_FILES, CAP_SYNC_IGNORES, CAP_SYNC_MODES,
 };
 
 /// A checked START proved that an older installation was collected with no surviving agents.
@@ -803,6 +804,36 @@ impl HelperClient {
         self.call(HELPER_RPC_TIMEOUT, async move { service.exec(input).await })
     }
 
+    /// Opens one execution stream without retrying the request. The bounded queues apply backpressure
+    /// independently in each direction, so a child can write while its stdin is still being supplied.
+    pub fn exec_stream(&self, start: ExecStart) -> Result<HelperExec, Status> {
+        self.require_pin()?;
+        let (input, receive) = tokio::sync::mpsc::channel(8);
+        input
+            .blocking_send(ExecInput {
+                input: Some(exec_input::Input::Start(start)),
+            })
+            .map_err(|_| Status::unavailable("execution input closed"))?;
+        let stream = self.exec(tonic::codegen::tokio_stream::wrappers::ReceiverStream::new(receive))?;
+        let (send, output) = tokio::sync::mpsc::channel(8);
+        let task = self.inner.runtime.handle().spawn(async move {
+            let mut stream = stream;
+            loop {
+                let item = stream.message().await;
+                let done = !matches!(&item, Ok(Some(_)));
+                if send.send(item).await.is_err() || done {
+                    break;
+                }
+            }
+        });
+        Ok(HelperExec {
+            input: Some(input),
+            output,
+            task: Some(task.abort_handle()),
+            _client: Some(self.clone()),
+        })
+    }
+
     /// Collects a sync response on this connection's runtime with caller-owned memory bounds.
     /// A stream is dropped on overflow or timeout, so an unfinished response is never returned as complete.
     pub fn collect_sync_stream<T: Send + 'static>(
@@ -817,6 +848,100 @@ impl HelperClient {
                 .await
                 .map(tonic::Response::new)
         })
+    }
+}
+
+/// A single helper execution. Dropping it cancels observation and closes input; it never reconnects or replays.
+pub struct HelperExec {
+    input: Option<tokio::sync::mpsc::Sender<ExecInput>>,
+    output: tokio::sync::mpsc::Receiver<Result<Option<ExecOutput>, Status>>,
+    task: Option<tokio::task::AbortHandle>,
+    _client: Option<HelperClient>,
+}
+
+impl HelperExec {
+    /// A stream fixture that acknowledges close by ending without an exit, without any network channel.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn test_link_loss_after_close() -> (Self, std::sync::mpsc::Receiver<()>) {
+        let (input, mut receive) = tokio::sync::mpsc::channel::<ExecInput>(8);
+        let (send, output) = tokio::sync::mpsc::channel(8);
+        let (observed, closed) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let first = receive.blocking_recv().expect("close message");
+            assert!(matches!(first.input, Some(exec_input::Input::Close(true))));
+            let _ = observed.send(());
+            let _ = send.blocking_send(Ok(None));
+        });
+        (
+            Self {
+                input: Some(input),
+                output,
+                task: None,
+                _client: None,
+            },
+            closed,
+        )
+    }
+
+    pub fn take_input(&mut self) -> Option<tokio::sync::mpsc::Sender<ExecInput>> {
+        self.input.take()
+    }
+    /// Copies both output streams while a separate reader supplies stdin. Close is sent only on EOF.
+    pub fn copy_stdio(
+        &mut self,
+        mut stdin: Box<dyn io::Read + Send>,
+        stdout: &mut dyn io::Write,
+        stderr: &mut dyn io::Write,
+    ) -> Result<ExecExit, String> {
+        let input = self.take_input().ok_or("execution input already taken")?;
+        std::thread::spawn(move || {
+            let mut bytes = vec![0; 64 * 1024];
+            loop {
+                let message = match stdin.read(&mut bytes) {
+                    Ok(0) => exec_input::Input::Close(true),
+                    Ok(n) => exec_input::Input::Stdin(bytes[..n].to_vec()),
+                    Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                    Err(_) => return,
+                };
+                let closed = matches!(message, exec_input::Input::Close(_));
+                if input.blocking_send(ExecInput { input: Some(message) }).is_err() || closed {
+                    return;
+                }
+            }
+        });
+        loop {
+            match self
+                .next_output()?
+                .ok_or("execution ended without an exit status")?
+                .output
+            {
+                Some(exec_output::Output::Stdout(bytes)) => {
+                    stdout.write_all(&bytes).map_err(|e| e.to_string())?;
+                    stdout.flush().map_err(|e| e.to_string())?;
+                }
+                Some(exec_output::Output::Stderr(bytes)) => {
+                    stderr.write_all(&bytes).map_err(|e| e.to_string())?;
+                    stderr.flush().map_err(|e| e.to_string())?;
+                }
+                Some(exec_output::Output::Exit(exit)) => return Ok(exit),
+                None => return Err("execution output is empty".into()),
+            }
+        }
+    }
+
+    pub fn next_output(&mut self) -> Result<Option<ExecOutput>, String> {
+        self.output
+            .blocking_recv()
+            .ok_or_else(|| "execution link closed".to_owned())?
+            .map_err(|error| error.to_string())
+    }
+}
+
+impl Drop for HelperExec {
+    fn drop(&mut self) {
+        if let Some(task) = &self.task {
+            task.abort();
+        }
     }
 }
 
@@ -1687,6 +1812,158 @@ mod tests {
                 pinned: Some("SHA256:example".into()),
             }),
         }
+    }
+
+    fn fake_exec(
+        body: impl FnOnce(
+            tokio::sync::mpsc::Receiver<ExecInput>,
+            tokio::sync::mpsc::Sender<Result<Option<ExecOutput>, Status>>,
+        ) -> Pin<Box<dyn std::future::Future<Output = ()> + Send>>,
+    ) -> HelperExec {
+        struct Never;
+        impl ChannelLauncher for Never {
+            fn spawn(&self, _: &[OsString]) -> io::Result<Child> {
+                panic!("the execution fake must not open a channel")
+            }
+        }
+        let client = lazy_test_client(Arc::new(Never));
+        let (input, receive) = tokio::sync::mpsc::channel(8);
+        let (send, output) = tokio::sync::mpsc::channel(8);
+        let task = client.inner.runtime.handle().spawn(body(receive, send));
+        HelperExec {
+            input: Some(input),
+            output,
+            task: Some(task.abort_handle()),
+            _client: Some(client),
+        }
+    }
+
+    #[test]
+    fn helper_exec_stream_closes_only_after_eof_and_streams_while_stdin_is_held() {
+        struct HeldInput {
+            release: std::sync::mpsc::Receiver<()>,
+            sent: bool,
+        }
+        impl io::Read for HeldInput {
+            fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
+                if self.sent {
+                    return Ok(0);
+                }
+                self.release
+                    .recv_timeout(Duration::from_secs(60))
+                    .expect("output must arrive while input is held");
+                out[..5].copy_from_slice(b"patch");
+                self.sent = true;
+                Ok(5)
+            }
+        }
+        struct ReleasingOutput {
+            release: Option<std::sync::mpsc::Sender<()>>,
+            bytes: Vec<u8>,
+        }
+        impl io::Write for ReleasingOutput {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                self.bytes.extend_from_slice(bytes);
+                if let Some(release) = self.release.take() {
+                    release.send(()).unwrap();
+                }
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        let mut stream = fake_exec(|mut input, output| {
+            Box::pin(async move {
+                output
+                    .send(Ok(Some(ExecOutput {
+                        output: Some(exec_output::Output::Stdout(b"ready".to_vec())),
+                    })))
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    input.recv().await.unwrap().input,
+                    Some(exec_input::Input::Stdin(b"patch".to_vec()))
+                );
+                assert_eq!(input.recv().await.unwrap().input, Some(exec_input::Input::Close(true)));
+                assert!(input.recv().await.is_none(), "EOF must close the sending half");
+                output
+                    .send(Ok(Some(ExecOutput {
+                        output: Some(exec_output::Output::Stderr(b"diagnostic".to_vec())),
+                    })))
+                    .await
+                    .unwrap();
+                output
+                    .send(Ok(Some(ExecOutput {
+                        output: Some(exec_output::Output::Exit(ExecExit {
+                            code: 1,
+                            signal: 0,
+                            refusal: String::new(),
+                        })),
+                    })))
+                    .await
+                    .unwrap();
+            })
+        });
+        let (release, receive) = std::sync::mpsc::channel();
+        let mut stdout = ReleasingOutput {
+            release: Some(release),
+            bytes: vec![],
+        };
+        let mut stderr = vec![];
+        let exit = stream
+            .copy_stdio(
+                Box::new(HeldInput {
+                    release: receive,
+                    sent: false,
+                }),
+                &mut stdout,
+                &mut stderr,
+            )
+            .unwrap();
+        assert_eq!(exit.code, 1);
+        assert_eq!(stdout.bytes, b"ready");
+        assert_eq!(stderr, b"diagnostic");
+    }
+
+    #[test]
+    fn helper_exec_stream_input_failure_never_sends_close() {
+        struct Broken;
+        impl io::Read for Broken {
+            fn read(&mut self, _: &mut [u8]) -> io::Result<usize> {
+                Err(io::Error::other("broken input"))
+            }
+        }
+        let mut stream = fake_exec(|mut input, output| {
+            Box::pin(async move {
+                assert!(input.recv().await.is_none(), "a failed read is not close");
+                output
+                    .send(Err(Status::cancelled("input dropped before close")))
+                    .await
+                    .unwrap();
+            })
+        });
+        assert!(stream
+            .copy_stdio(Box::new(Broken), &mut vec![], &mut vec![])
+            .unwrap_err()
+            .contains("input dropped before close"));
+    }
+
+    #[test]
+    fn helper_exec_stream_link_loss_after_close_has_no_exit_and_no_retry() {
+        let mut stream = fake_exec(|mut input, output| {
+            Box::pin(async move {
+                assert_eq!(input.recv().await.unwrap().input, Some(exec_input::Input::Close(true)));
+                output
+                    .send(Err(Status::unavailable("link lost after close")))
+                    .await
+                    .unwrap();
+            })
+        });
+        assert!(stream
+            .copy_stdio(Box::new(io::empty()), &mut vec![], &mut vec![])
+            .unwrap_err()
+            .contains("link lost after close"));
     }
 
     #[test]

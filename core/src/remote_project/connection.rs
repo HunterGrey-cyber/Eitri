@@ -203,6 +203,29 @@ impl RemoteConnection {
         check_capability(self.host(), &capabilities, capability)
     }
 
+    /// Runs one git command with streaming stdio. Commands that do not consume stdin close it immediately;
+    /// after close, a missing exit status leaves the command's outcome unknown.
+    pub fn exec_git(
+        &self,
+        cwd: &std::path::Path,
+        args: &[std::ffi::OsString],
+        stdin: Box<dyn std::io::Read + Send>,
+        stdout: &mut dyn std::io::Write,
+        stderr: &mut dyn std::io::Write,
+    ) -> Result<i32, String> {
+        self.require_capability(wire::CAP_EXEC)?;
+        exec_git_with(
+            self.host(),
+            cwd,
+            args,
+            unsafe { libc::isatty(0) } == 1,
+            stdin,
+            stdout,
+            stderr,
+            |start| self.client.exec_stream(start).map_err(|e| e.to_string()),
+        )
+    }
+
     pub fn sync_ignores(&self, request: wire::SyncIgnoresRequest) -> Result<wire::SyncIgnoresResponse, String> {
         self.require_capability(wire::CAP_SYNC_IGNORES)?;
         self.client.sync_ignores(request).map_err(|error| error.to_string())
@@ -279,6 +302,64 @@ impl RemoteConnection {
             None => Ok(()),
         }
     }
+}
+
+fn exec_git_with(
+    host: &str,
+    cwd: &std::path::Path,
+    args: &[std::ffi::OsString],
+    is_tty: bool,
+    stdin: Box<dyn std::io::Read + Send>,
+    stdout: &mut dyn std::io::Write,
+    stderr: &mut dyn std::io::Write,
+    open: impl FnOnce(wire::ExecStart) -> Result<agent::remote_client::HelperExec, String>,
+) -> Result<i32, String> {
+    let cwd = cwd
+        .to_str()
+        .ok_or("remote git cwd is not UTF-8; nothing was run")?
+        .to_owned();
+    let argv = std::iter::once(Ok("git".to_owned()))
+        .chain(args.iter().map(|arg| {
+            arg.to_str()
+                .map(str::to_owned)
+                .ok_or("remote git argument is not UTF-8; nothing was run")
+        }))
+        .collect::<Result<Vec<_>, _>>()?;
+    let unknown = || {
+        format!(
+            "the outcome on {} is unknown; check with `git status` in the terminal",
+            host
+        )
+    };
+    let mut stream = open(wire::ExecStart {
+        cwd,
+        argv,
+        purpose: wire::ExecPurpose::Git as i32,
+    })
+    .map_err(|_| unknown())?;
+    // A TTY must never hold the helper's start barrier open.
+    let stdin = git_input(args, is_tty, stdin);
+    let exit = git_stream_result(host, stream.copy_stdio(stdin, stdout, stderr))?;
+    if !exit.refusal.is_empty() {
+        return Err(exit.refusal);
+    }
+    Ok(if exit.signal != 0 { 128 + exit.signal } else { exit.code })
+}
+
+fn git_input(
+    args: &[std::ffi::OsString],
+    is_tty: bool,
+    input: Box<dyn std::io::Read + Send>,
+) -> Box<dyn std::io::Read + Send> {
+    if crate::remote_sync::git_shim::reads_stdin(args, is_tty) {
+        input
+    } else {
+        Box::new(std::io::empty())
+    }
+}
+
+fn git_stream_result(host: &str, result: Result<wire::ExecExit, String>) -> Result<wire::ExecExit, String> {
+    result.map_err(|_| format!("the outcome on {host} is unknown; check with `git status` in the terminal"))
 }
 
 fn check_capability(host: &str, capabilities: &[String], capability: &str) -> Result<(), String> {
@@ -962,5 +1043,62 @@ mod tests {
             missing.contains("1234567") && missing.contains("example-host"),
             "{missing}"
         );
+    }
+}
+
+#[cfg(test)]
+mod exec_git_tests {
+    use super::*;
+    use std::ffi::OsString;
+    use std::path::Path;
+    struct NeverEof;
+    impl std::io::Read for NeverEof {
+        fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+            panic!("stdin must not be read before close");
+        }
+    }
+    #[test]
+    fn exec_git_maps_a_stream_ending_after_close_to_unknown_outcome() {
+        for (args, tty) in [
+            (vec![OsString::from("commit"), "-mrelease".into()], false),
+            (vec!["apply".into()], true),
+        ] {
+            let (stream, closed) = agent::remote_client::HelperExec::test_link_loss_after_close();
+            let result = exec_git_with(
+                "example-host",
+                Path::new("/srv/project"),
+                &args,
+                tty,
+                Box::new(NeverEof),
+                &mut vec![],
+                &mut vec![],
+                |start| {
+                    assert_eq!(start.cwd, "/srv/project");
+                    Ok(stream)
+                },
+            );
+            closed
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .expect("close must be the first input");
+            assert_eq!(
+                result.unwrap_err(),
+                "the outcome on example-host is unknown; check with `git status` in the terminal"
+            );
+        }
+    }
+    #[test]
+    fn exec_git_non_utf8_argument_says_nothing_was_run() {
+        use std::os::unix::ffi::OsStringExt;
+        let result = exec_git_with(
+            "example-host",
+            Path::new("/srv/project"),
+            &["add".into(), OsString::from_vec(vec![255])],
+            false,
+            Box::new(std::io::empty()),
+            &mut vec![],
+            &mut vec![],
+            |_| panic!("must refuse before opening Exec"),
+        );
+        assert!(result.unwrap_err().contains("nothing was run"));
     }
 }

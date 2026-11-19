@@ -150,6 +150,12 @@ fn followed_chunk_check() -> neovide_editor::ChunkCheck {
     })
 }
 
+std::thread_local! {
+    // Prepared before GTK; the window reads only its in-memory environment contribution.
+    static GIT_SHIM_PROBLEM: RefCell<Option<String>> = const { RefCell::new(None) };
+    static GIT_SHIM: RefCell<Option<eitri_core::remote_sync::shim_dir::ShimDir>> = const { RefCell::new(None) };
+}
+
 fn main() -> glib::ExitCode {
     // `eitri attachment-decoder` is the child one composer image is decoded in (`eitri_core::attachments`): it is
     // started with an empty environment, the request on stdin and its result pipe on descriptor 3, and serves before
@@ -436,6 +442,10 @@ fn main() -> glib::ExitCode {
     // The launch's origin, for what finds this project's windows by it: a window 2 waiting for its window 1 is found
     // only by a window 1 of the same origin.
     linked_window::relink::set_origin(&origin);
+    match host_command::prepare_git_shim(&origin) {
+        Ok(shim) => GIT_SHIM.with(|slot| *slot.borrow_mut() = shim),
+        Err(error) => GIT_SHIM_PROBLEM.with(|slot| *slot.borrow_mut() = Some(error)),
+    }
     // What this window starts opens this root as the same copy; every other origin clears inherited copy state.
     let copy = std::env::var_os(remote_window::LOCAL_COPY_ENV);
     match remote_window::copy_root_for_children(&origin, &project_root) {
@@ -654,7 +664,11 @@ fn main() -> glib::ExitCode {
             None,
         )
     });
-    app.run_with_args::<&str>(&[])
+    let code = app.run_with_args::<&str>(&[]);
+    GIT_SHIM.with(|slot| {
+        slot.borrow_mut().take();
+    });
+    code
 }
 
 /// `NON_UNIQUE`, deliberately, and this is the one decision in this file that changes what a
@@ -801,6 +815,15 @@ fn build_ui(
     // embeds nvim has one.
     let tutor = owns_editor.then(tutor::Tutor::new);
     let mut nvim_child_env = pane_switch.as_ref().map(|ps| ps.child_env()).unwrap_or_default();
+    GIT_SHIM.with(|slot| {
+        if let Some(shim) = slot.borrow().as_ref() {
+            if let Err(error) =
+                compose_git_shim_env(shim, origin, &mut nvim_child_env, std::env::var_os("PATH").as_deref())
+            {
+                GIT_SHIM_PROBLEM.with(|slot| *slot.borrow_mut() = Some(format!("git shim unavailable: {error}")));
+            }
+        }
+    });
     nvim_child_env.extend(theme_feed.as_ref().map(|feed| feed.child_env()).unwrap_or_default());
     nvim_child_env.extend(context_feed.as_ref().map(|feed| feed.child_env()).unwrap_or_default());
     nvim_child_env.extend(nvim_keys_feed.as_ref().map(|feed| feed.child_env()).unwrap_or_default());
@@ -1120,6 +1143,34 @@ fn build_ui(
         lua_engine.panels.borrow_mut().hold_views();
     }
     driver.start(WinId::MAIN, StartStep::Kernel);
+    GIT_SHIM_PROBLEM.with(|slot| {
+        if let Some(problem) = slot.borrow_mut().take() {
+            lua_engine.report_problem(problem);
+        }
+    });
+    let git_shim_settings = GIT_SHIM.with(|slot| {
+        slot.borrow().as_ref().map(|shim| {
+            let (options, problems) = host_command::git_shim_options(&lua_engine.config.borrow());
+            for problem in problems {
+                lua_engine.report_problem(problem);
+            }
+            let path = shim.options_path();
+            let (send, receive) = std::sync::mpsc::channel();
+            // File publication stays off the GTK thread; until it exists invocations refuse with a visible line.
+            std::thread::spawn(move || {
+                let result = serde_json::to_vec(&options)
+                    .map_err(|e| e.to_string())
+                    .and_then(|bytes| {
+                        let dir = agent::private_fs::open_dir(path.parent().unwrap()).map_err(|e| e.to_string())?;
+                        agent::private_fs::publish_private_file(&dir, path.file_name().unwrap(), &bytes)
+                            .map(|_| ())
+                            .map_err(|e| e.to_string())
+                    });
+                let _ = send.send(result);
+            });
+            receive
+        })
+    });
     // A page window's own plugin, loaded by its id when `init.lua` did not load it; nothing in any other window.
     if let Err(message) = lua_engine.settle_page() {
         if let Some(start) = &beside {
@@ -3106,6 +3157,20 @@ fn build_ui(
         if let Some(text) = eitri_core::init_notice::saved_state_text(&saved_state_problems) {
             toast.show_notice_when_free_for(text, toast::PROBLEM_FOR);
         }
+    }
+    if let Some(receive) = git_shim_settings {
+        let engine = lua_engine.clone();
+        let toast = toast.clone();
+        glib::timeout_add_local(std::time::Duration::from_millis(20), move || match receive.try_recv() {
+            Err(std::sync::mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
+            Ok(Ok(())) => glib::ControlFlow::Break,
+            result => {
+                let problem = format!("git shim settings unavailable: {result:?}");
+                engine.report_problem(problem.clone());
+                toast.show_notice_when_free_for(problem, toast::PROBLEM_FOR);
+                glib::ControlFlow::Break
+            }
+        });
     }
     // What `init.lua` got wrong is said every start while it holds, after the notices above have had their time; the
     // default keys it took over, once and again only when that set changes. A chat or page window or a second window
@@ -5312,6 +5377,60 @@ mod server_helper_hash_tests {
             "build_application(kind)",
         ] {
             assert!(arm + end < body.find(later).unwrap(), "hash probe must precede {later}");
+        }
+    }
+}
+
+fn compose_git_shim_env(
+    shim: &eitri_core::remote_sync::shim_dir::ShimDir,
+    origin: &eitri_core::remote_project::WindowOrigin,
+    env: &mut Vec<(String, String)>,
+    inherited: Option<&std::ffi::OsStr>,
+) -> Result<(), String> {
+    if !matches!(origin, eitri_core::remote_project::WindowOrigin::Local) {
+        let path = shim
+            .options_path()
+            .into_os_string()
+            .into_string()
+            .map_err(|_| "git shim settings path is not UTF-8")?;
+        shim.compose_child_env(origin, env, inherited)?;
+        env.retain(|(k, _)| k != eitri_core::remote_sync::shim_dir::OPTIONS_FILE_ENV);
+        env.push((eitri_core::remote_sync::shim_dir::OPTIONS_FILE_ENV.into(), path));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod main_tests {
+    #[test]
+    fn nvim_child_env_has_shim_and_pane_switch_for_remote_and_local_copy() {
+        agent::state_dirs::redirect_state_to_a_test_root();
+        use eitri_core::remote_project::{RemoteProject, WindowOrigin};
+        use eitri_core::remote_sync::shim_dir::{ShimDir, ShimOptions};
+        let shim = ShimDir::prepare("/usr/bin/eitri".into(), "/usr/bin/git".into(), ShimOptions::default()).unwrap();
+        let remote: RemoteProject = serde_json::from_value(serde_json::json!({"version":1,"host":"example-host","host_key_sha256":"SHA256:example","root":"/srv/project","helper_version":"0.4.0","created_at":0})).unwrap();
+        for origin in [
+            WindowOrigin::Remote(remote),
+            WindowOrigin::LocalCopy {
+                host: "example-host".into(),
+            },
+        ] {
+            let mut env = vec![("PATH".into(), "/srv/pane-switch/bin:/usr/bin".into())];
+            super::compose_git_shim_env(&shim, &origin, &mut env, None).unwrap();
+            let paths: Vec<_> = env.iter().filter(|(k, _)| k == "PATH").collect();
+            assert_eq!(paths.len(), 1);
+            assert!(paths[0].1.ends_with(":/srv/pane-switch/bin:/usr/bin"));
+            assert!(paths[0].1.split(':').next().unwrap().ends_with("/bin"));
+            let source = eitri_core::source_scan::read_required("shell/src/main.rs");
+            let body: String = eitri_core::source_scan::functions(&source.text, "build_ui")[0]
+                .split_whitespace()
+                .collect();
+            assert!(
+                body.find("pane_switch.as_ref().map(|ps|ps.child_env())").unwrap()
+                    < body.find("compose_git_shim_env(shim").unwrap()
+            );
+            assert!(body.find("compose_git_shim_env(shim").unwrap() < body.find("env:nvim_child_env").unwrap());
+            assert!(body.contains("spawn:editor_spawn.clone()"));
         }
     }
 }

@@ -3,10 +3,12 @@
 pub mod daemon;
 pub mod engine;
 pub mod git_replica;
+pub mod git_shim;
 pub mod ignores;
 pub mod local_git;
 pub mod mutagen;
 pub mod mutagen_json;
+pub mod shim_dir;
 pub mod status_schema;
 
 use sha2::{Digest, Sha256};
