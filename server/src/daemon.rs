@@ -110,6 +110,8 @@ struct Service {
     /// Runs started by Exec that have not ended: the daemon does not exit for idleness under them, and stopping kills
     /// the ones whose input is unfinished and waits a while for the rest.
     runs: Arc<exec::Runs>,
+    /// The roots whose file modes are kept; a running keeper holds the daemon past its idle exit.
+    modes: Arc<sync::modes::Keepers>,
 }
 
 type Streamed<T> = Pin<Box<dyn tokio_stream::Stream<Item = Result<T, Status>> + Send>>;
@@ -194,6 +196,8 @@ impl Helper for Service {
         if request.get_ref().protocol_major != PROTOCOL_MAJOR {
             return Err(Status::failed_precondition("unsupported helper protocol major"));
         }
+        let modes = self.modes.clone();
+        let mode_warnings = off_runtime(move || modes.hello_warnings()).await?;
         Ok(Response::new(HelloResponse {
             protocol_major: PROTOCOL_MAJOR,
             protocol_minor: PROTOCOL_MINOR,
@@ -206,6 +210,7 @@ impl Helper for Service {
                 CAP_SYNC_IGNORES,
                 CAP_GIT_CONFIG,
                 CAP_SYNC_FILES,
+                CAP_SYNC_MODES,
                 CAP_EXEC,
             ]
             .map(str::to_owned)
@@ -220,6 +225,17 @@ impl Helper for Service {
                 .chain(self.serving.warnings())
                 .collect(),
             login_env: self.sidecars.login_env_state() as i32,
+            mode_warnings: mode_warnings
+                .into_iter()
+                .map(|warning| SyncModeWarning {
+                    host: warning.host,
+                    root: warning.root,
+                    text: warning.text,
+                    paths: warning.paths,
+                    sequence: warning.sequence,
+                    epoch: warning.epoch,
+                })
+                .collect(),
         }))
     }
 
@@ -472,8 +488,17 @@ impl Helper for Service {
         )))
     }
 
-    async fn watch_modes(&self, _request: Request<WatchModesRequest>) -> Result<Response<WatchModesResponse>, Status> {
-        Err(Status::unimplemented("WatchModes is not built yet"))
+    async fn watch_modes(&self, request: Request<WatchModesRequest>) -> Result<Response<WatchModesResponse>, Status> {
+        mark_activity(&request);
+        let request = request.into_inner();
+        let modes = self.modes.clone();
+        let host = modes.host().to_owned();
+        let refusal =
+            off_runtime(move || modes.set(&request.root, request.patterns, &request.staging_name, request.on))
+                .await?
+                .err()
+                .unwrap_or_default();
+        Ok(Response::new(WatchModesResponse { refusal, host }))
     }
 
     type ExecStream = Streamed<ExecOutput>;
@@ -588,6 +613,12 @@ pub async fn run_with_environment(
     }));
     let owned = Arc::new(tokio::sync::Mutex::new(sidecars));
     let runs = Arc::new(exec::Runs::default());
+    let modes = Arc::new(sync::modes::Keepers::new(&paths.state, mode_options(), &paths.key));
+    {
+        // Registrations outlive the daemon: every one on disk is taken up again (or left to the daemon keeping it).
+        let modes = modes.clone();
+        let _ = tokio::task::spawn_blocking(move || modes.resume()).await;
+    }
     let tracked = connections.clone();
     let incoming = futures_util::stream::unfold(listener, move |listener| {
         let tracked = tracked.clone();
@@ -626,6 +657,7 @@ pub async fn run_with_environment(
                 sync_ignores: sync_ignores.clone(),
                 paths: paths.clone(),
                 runs: runs.clone(),
+                modes: modes.clone(),
             }))
             .add_service(serve::Proxy(serving.clone()))
             .serve_with_incoming(incoming);
@@ -635,7 +667,10 @@ pub async fn run_with_environment(
                 tokio::time::sleep(idle.min(Duration::from_millis(100))).await;
                 owned.lock().await.reap_exited(&paths.state);
                 managed.observe_exits();
-                let empty = owned.lock().await.children.is_empty() && !managed.any_alive() && runs.running() == 0;
+                let empty = owned.lock().await.children.is_empty()
+                    && !managed.any_alive()
+                    && runs.running() == 0
+                    && !modes.holds();
                 let state = connections.lock().expect("connection state");
                 if empty && state.active == 0 && state.last_closed.elapsed() >= idle {
                     break;
@@ -656,6 +691,9 @@ pub async fn run_with_environment(
                 if let Err(error) = serving.adopt().await {
                     let _ = crate::audit::record(&paths.state, "watch-adoption", &error.to_string());
                 }
+                // A root another daemon kept, or one that could not be kept, is tried again.
+                let keepers = modes.clone();
+                let _ = tokio::task::spawn_blocking(move || keepers.resume()).await;
             }
         };
         tokio::pin!(maintenance);
@@ -672,6 +710,10 @@ pub async fn run_with_environment(
     // others get a little time to finish and are audited if they do not.
     runs.kill_unclosed();
     runs.settle(&paths.state, exec::STOP_GRACE).await;
+    {
+        let modes = modes.clone();
+        let _ = tokio::task::spawn_blocking(move || modes.stop_all()).await;
+    }
     let (result, terminate) = result;
     let managed_stopped = if terminate { managed.stop_all().await } else { Ok(()) };
     let mut sidecars = owned.lock().await;
@@ -686,6 +728,17 @@ pub async fn run_with_environment(
         &format!("version={} pid={}", paths.version, info.pid),
     );
     result.and(managed_stopped).and(stopped).and(audited)
+}
+
+/// The account's umask (as the helper inherited it), the server's name and half the account's inotify watches, for
+/// the mode keepers (who share that budget).
+fn mode_options() -> sync::modes::Options {
+    sync::modes::Options {
+        umask: crate::run_dir::inherited_umask() as u32,
+        host: sync::modes::host_name(),
+        watch_limit: sync::modes::watch_budget(),
+        watches: Default::default(),
+    }
 }
 
 fn mark_activity<T>(request: &Request<T>) {
@@ -768,6 +821,7 @@ mod tests {
         paths.prepare().unwrap();
         let sidecars = Arc::new(sidecars::Sidecars::new(paths.clone()).unwrap());
         let serving = serve::Serving::new(paths.clone(), sidecars.clone());
+        let modes = Arc::new(sync::modes::Keepers::new(&paths.state, mode_options(), &paths.key));
         (
             Service {
                 sidecars,
@@ -775,13 +829,14 @@ mod tests {
                 sync_ignores: Arc::new(sync::ignores::SyncIgnores::default()),
                 paths,
                 runs: Default::default(),
+                modes,
             },
             scratch,
         )
     }
 
     #[tokio::test]
-    async fn hello_lists_no_m2_capability_until_its_handler_is_built() {
+    async fn hello_lists_each_m2_capability_once_its_handler_is_built() {
         let (service, _scratch) = contract_service();
         let hello = service
             .hello(Request::new(HelloRequest {
@@ -791,25 +846,32 @@ mod tests {
             .await
             .unwrap()
             .into_inner();
-        for capability in [CAP_SYNC_IGNORES, CAP_GIT_CONFIG, CAP_SYNC_FILES, CAP_EXEC] {
+        for capability in [
+            CAP_SYNC_IGNORES,
+            CAP_GIT_CONFIG,
+            CAP_SYNC_FILES,
+            CAP_SYNC_MODES,
+            CAP_EXEC,
+        ] {
             assert!(hello.capabilities.iter().any(|cap| cap == capability), "{capability}");
         }
-        assert!(!hello.capabilities.iter().any(|cap| cap == CAP_SYNC_MODES));
         assert_eq!(hello.protocol_minor, 2);
     }
 
     #[tokio::test]
-    async fn new_rpcs_answer_unimplemented_with_their_name() {
+    async fn watch_modes_refuses_a_root_that_is_not_one() {
         let (service, _scratch) = contract_service();
-        let modes = service
+        let response = service
             .watch_modes(Request::new(WatchModesRequest {
-                root: "/srv/project".into(),
+                root: "relative/project".into(),
+                on: true,
                 ..Default::default()
             }))
             .await
-            .unwrap_err();
-        assert_eq!(modes.code(), tonic::Code::Unimplemented);
-        assert_eq!(modes.message(), "WatchModes is not built yet");
+            .unwrap()
+            .into_inner();
+        assert!(!response.refusal.is_empty());
+        assert!(!service.modes.holds());
     }
 
     #[tokio::test]

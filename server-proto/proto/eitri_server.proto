@@ -36,6 +36,8 @@ message HelloResponse {
   string helper_version = 4; string helper_build = 5; string sidecar_revision = 6;
   repeated string warnings = 7;
   LoginEnvState login_env = 8;
+  // The mode keepers' lines, per root; they are not in `warnings`.
+  repeated SyncModeWarning mode_warnings = 9;
 }
 message StartSidecarRequest {
   string root = 1; string account = 2; map<string, string> env = 3; string command_id = 4;
@@ -89,8 +91,17 @@ message PathSizesResponse { repeated PathSize sizes = 1; bool truncated = 2; str
 message ProjectActivityRequest { string root = 1; }
 // `tasks_running`: background tasks (not ambient) the sessions' last rosters list; they write outside any turn.
 message ProjectActivityResponse { uint32 turns_running = 1; bool unknown = 2; string refusal = 3; uint32 tasks_running = 4; }
-message WatchModesRequest { string root = 1; repeated string patterns = 2; bool on = 3; }
-message WatchModesResponse { string refusal = 1; }
+// `staging_name`: the tree session's neighbouring staging directory (`.mutagen-temporary-staging-<session>-beta`).
+message WatchModesRequest { string root = 1; repeated string patterns = 2; bool on = 3; string staging_name = 4; }
+// `host` is the server's own name, which `refusal` uses; the laptop shows the host as the person typed it.
+message WatchModesResponse { string refusal = 1; string host = 2; }
+// A mode keeper's line, with the server's own name and the root apart from the text, and the paths it names.
+// `sequence` grows with each write the keeper counts (0 on other lines) and `epoch` is new at every keeper start:
+// every Hello repeats a line, and the laptop shows a (host, root)'s counted line only when its (epoch, sequence)
+// differs from the last one it showed.
+message SyncModeWarning {
+  string host = 1; string root = 2; string text = 3; repeated string paths = 4; uint64 sequence = 5; uint64 epoch = 6;
+}
 enum ExecPurpose {
   EXEC_PURPOSE_UNSPECIFIED = 0;
   EXEC_PURPOSE_GIT = 1;

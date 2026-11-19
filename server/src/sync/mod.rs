@@ -9,6 +9,7 @@ pub mod files;
 pub mod git_config;
 pub mod ignores;
 pub mod listing;
+pub mod modes;
 
 use std::fs::File;
 
