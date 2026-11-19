@@ -23,3 +23,6 @@ end, {
   complete = function(lead, line, pos) return require("eitri").complete_pages(lead, line, pos) end,
   desc = "Open an Eitri page beside this nvim",
 })
+local remote = require("eitri.remote")
+vim.api.nvim_create_user_command("EitriSync", remote.open, { desc = "Show project sync and resolve conflicts" })
+remote.setup()

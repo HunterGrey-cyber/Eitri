@@ -837,6 +837,8 @@ _ICON_HICOLOR = {
 _PLUGIN_FILES = {
     "plugin-eitri-lua": "plugin/eitri.lua",
     "plugin-module": "lua/eitri/init.lua",
+    "plugin-remote-init": "lua/eitri/remote/init.lua",
+    "plugin-remote-sync": "lua/eitri/remote/sync.lua",
     "plugin-health": "lua/eitri/health.lua",
     "plugin-doc": "doc/eitri.txt",
 }

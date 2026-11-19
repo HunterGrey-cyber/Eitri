@@ -264,6 +264,24 @@ impl SyncEngine for MutagenEngine {
         }
     }
 
+    fn start(&self) -> Result<(), SyncError> {
+        // A listing with recovery: an absent daemon is started (once) with Eitri's environment, then asked.
+        let args = words(&[
+            "sync",
+            "list",
+            "--template",
+            "{{json .}}",
+            "--label-selector",
+            "eitri-key",
+        ]);
+        self.run(&args, true).map(|_| ())
+    }
+
+    fn is_missing(&self, error: &SyncError) -> bool {
+        let text = error.to_string();
+        super::daemon::no_such_session(&text) || text.contains("no such session")
+    }
+
     fn monitor(&self, name: &str) -> Result<Box<dyn Iterator<Item = SessionStatus> + Send>, SyncError> {
         check_name(name)?;
         Ok(Box::new(Monitor::spawn(

@@ -1795,6 +1795,19 @@ impl AgentPanelHandle {
         });
     }
 
+    /// The window's sync actor reports its status (a remote window only): kept for the project bar's chip.
+    pub fn set_sync_status(&self, chip: eitri_core::remote_sync::status_schema::SyncChip) {
+        self.wake();
+        let payload = chip.page_payload();
+        self.state.borrow_mut().sync_chip = Some(chip);
+        self.dispatch_every(payload);
+    }
+
+    /// The last sync status [`Self::set_sync_status`] gave.
+    pub fn sync_chip(&self) -> Option<eitri_core::remote_sync::status_schema::SyncChip> {
+        self.state.borrow().sync_chip.clone()
+    }
+
     /// Startup supplies the recorded host when the window was opened on its local copy.
     pub fn set_local_copy_host(&self, host: Option<String>) {
         self.wake();
@@ -3328,6 +3341,26 @@ mod tests {
     }
 
     #[test]
+    fn sync_status_reaches_the_page_and_is_replayed_after_reload() {
+        let (handle, page, _) = handle_with_recording_page();
+        handle.page_message(ViewId::BASE, READY);
+        page.sent.borrow_mut().clear();
+        let chip = eitri_core::remote_sync::status_schema::SyncChip {
+            host: "example-host".into(),
+            phase: "history".into(),
+            git_pct: 41,
+            conflicts: 0,
+            paused_reason: None,
+        };
+        let payload = chip.page_payload();
+        handle.set_sync_status(chip);
+        assert_eq!(*page.sent.borrow(), [payload.clone()]);
+        page.sent.borrow_mut().clear();
+        handle.page_message(ViewId::BASE, READY);
+        assert_eq!(page.sent.borrow().iter().filter(|s| **s == payload).count(), 1);
+    }
+
+    #[test]
     fn pages_are_opt_in_sent_now_and_resent_on_every_ready() {
         let (handle, page, _) = handle_with_recording_page();
         handle.page_message(ViewId::BASE, READY);
@@ -3963,6 +3996,8 @@ mod tests {
             // Reads: what a socket bound off the GTK thread raises, and whether the panel holds one.
             "remote_waker",
             "has_remote",
+            // A read of the sync chip the window last set.
+            "sync_chip",
         ];
         // Calls that wake only when what they changed needs the tick: a key that starts a typing window.
         const WAKES_WHEN: &[&str] = &["note_editor_key"];

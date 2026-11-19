@@ -79,6 +79,21 @@ pub trait Reach {
     fn plan(&mut self) -> Result<InstallPlan, String>;
     /// The agents the helper at `helper` runs on the connected host, through a connection pinned to `key`.
     fn agents(&mut self, host: &str, key: &str, helper: &Path) -> Result<Vec<Agent>, String>;
+    /// Eitri's Mutagen engine, for the sync verbs and for `stop` (pause) and `uninstall` (terminate).
+    fn sync_engine(&mut self) -> Result<Arc<dyn crate::remote_sync::engine::SyncEngine>, String> {
+        Err("sync is not available here".into())
+    }
+    /// A connection to `project`'s helper, for `eitri host sync watch`.
+    fn sync_helper(
+        &mut self,
+        _project: &RemoteProject,
+    ) -> Result<Arc<dyn crate::remote_sync::sessions::SyncHelper>, String> {
+        Err("sync is not available here".into())
+    }
+    /// `remote_dev.*` as `init.lua` sets them.
+    fn sync_settings(&self) -> super::cli_sync::SyncSettings {
+        super::cli_sync::SyncSettings::default()
+    }
 }
 
 /// What a command reads and writes besides its arguments.
@@ -731,6 +746,7 @@ fn recover_recorded(cx: &mut Context<'_>, host: &str, reached: &Reached, before:
 /// `stop <host>`: every helper daemon on `host` this build may stop, with the agents each runs. Returns whether a
 /// daemon was left running (a newer Eitri's).
 fn stop(cx: &mut Context<'_>, host: &str) -> Result<bool, String> {
+    super::cli_sync::pause_host_sessions(cx, host);
     let reached = reach_host(cx, host)?;
     let before = running(cx, &reached);
     let mut recovery = recover_recorded(
@@ -828,6 +844,8 @@ fn stop_running(
 /// itself refuses while any daemon holds its lifetime lock or a recorded sidecar may still be alive. This waits
 /// up to `wait` for stopped daemons to release their locks; uncertain sidecars retain their records and helper.
 fn uninstall(cx: &mut Context<'_>, host: &str, wait: Duration) -> Result<(), String> {
+    // Paused first, so nothing syncs while the helper goes; terminated once it is gone.
+    super::cli_sync::pause_host_sessions(cx, host);
     let reached = reach_host(cx, host)?;
     let before = running(cx, &reached);
     let recovery = recover_recorded(
@@ -906,6 +924,7 @@ fn uninstall(cx: &mut Context<'_>, host: &str, wait: Duration) -> Result<(), Str
     .map_err(|why: String| {
         format!("{why}; stopped {stopped} daemon(s) and their agents; the helper was not removed")
     })?;
+    super::cli_sync::terminate_host_sessions(cx, host, &reached.key);
     let mut forgotten = 0;
     for project in &reached.projects {
         if cx.store.forget(&project.root).map_err(|e| e.to_string())? {
@@ -926,6 +945,8 @@ pub struct SshReach {
     exe: PathBuf,
     known_hosts: PathBuf,
     master: Option<ControlMaster>,
+    sync: super::cli_sync::SyncSettings,
+    engine: Option<Arc<dyn crate::remote_sync::engine::SyncEngine>>,
 }
 
 impl SshReach {
@@ -937,7 +958,24 @@ impl SshReach {
             exe,
             known_hosts,
             master: None,
+            sync: Default::default(),
+            engine: None,
         }
+    }
+
+    /// `remote_dev.*` as `init.lua` sets them, for the sync verbs.
+    pub fn with_sync_settings(mut self, settings: super::cli_sync::SyncSettings) -> Self {
+        self.sync = settings;
+        self
+    }
+
+    /// The state home the masters' directory (`<state home>/eitri/ssh`) is under.
+    fn state_home(&self) -> Result<PathBuf, String> {
+        self.ssh_dir
+            .parent()
+            .and_then(Path::parent)
+            .map(Path::to_owned)
+            .ok_or_else(|| "no state home".to_owned())
     }
 
     fn master(&self) -> Result<&ControlMaster, String> {
@@ -982,6 +1020,45 @@ impl Reach for SshReach {
         let probe = super::probe_step::probe(master).map_err(|e| format!("probing {}: {e}", master.host))?;
         let sidecar = agent::sidecar_for_upload()?;
         install::plan_connection(&probe, &sidecar.path).map_err(|e| e.to_string())
+    }
+
+    fn sync_engine(&mut self) -> Result<Arc<dyn crate::remote_sync::engine::SyncEngine>, String> {
+        if let Some(engine) = &self.engine {
+            return Ok(engine.clone());
+        }
+        let state_home = self.state_home()?;
+        let engine: Arc<dyn crate::remote_sync::engine::SyncEngine> = Arc::new(
+            crate::remote_sync::mutagen::MutagenEngine::open(
+                &state_home,
+                self.sync.mutagen.as_deref(),
+                &state_home.join("eitri/mutagen/transport"),
+            )
+            .map_err(|error| error.to_string())?,
+        );
+        self.engine = Some(engine.clone());
+        Ok(engine)
+    }
+
+    fn sync_helper(
+        &mut self,
+        project: &RemoteProject,
+    ) -> Result<Arc<dyn crate::remote_sync::sessions::SyncHelper>, String> {
+        let state_home = self.state_home()?;
+        let store = RemoteProjects::new(Some(state_home.as_os_str()), None);
+        let master = ControlMaster::ensure(&project.host, &self.ssh_dir, &self.exe)
+            .map_err(|error| format!("connecting to {}: {error}", project.host))?;
+        let connection = crate::remote_project::RemoteConnection::open_over_ssh(
+            &master,
+            &store,
+            project,
+            &project.helper_version,
+            agent::BUNDLED_SIDECAR_REVISION,
+        )?;
+        Ok(Arc::new(connection))
+    }
+
+    fn sync_settings(&self) -> super::cli_sync::SyncSettings {
+        self.sync.clone()
     }
 
     fn agents(&mut self, host: &str, key: &str, helper: &Path) -> Result<Vec<Agent>, String> {
@@ -1126,17 +1203,22 @@ mod tests {
     // Runs the Linux server scripts here as the server; macOS lacks flock(1) and GNU stat.
     #[cfg(target_os = "linux")]
     #[test]
-    fn host_sync_and_git_verbs_exit_64_until_built() {
+    fn host_sync_and_git_verbs_need_a_verb_and_never_connect() {
         let root = ScratchDir::new("remote", "sync-cli");
         let store = RemoteProjects::new(Some(root.as_os_str()), None);
         let mut reach = fixture(&root, true);
         let mut term = Scripted::default();
-        for args in [vec!["sync"], vec!["sync", "status"], vec!["git"], vec!["git", "status"]] {
+        for args in [
+            vec!["sync"],
+            vec!["sync", "nonsense"],
+            vec!["git"],
+            vec!["git", "status"],
+        ] {
             assert_eq!(run_with(&store, &mut reach, &mut term, &args), 64);
         }
         assert_eq!(reach.connects, 0);
         assert!(term.asked.is_empty());
-        assert!(term.said.is_empty(), "the stubs report on stderr");
+        assert!(term.said.iter().any(|line| line.starts_with("usage: eitri host sync")));
     }
 
     #[test]

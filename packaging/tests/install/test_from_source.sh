@@ -213,7 +213,7 @@ t_from_source_clone_head_match_builds_and_installs() {
 	expect_file "$(data_of)/applications/cn.huntergrey.eitri.desktop"
 	expect_file "$(data_of)/applications/cn.huntergrey.eitri.Panel.desktop"
 	expect_file "$(data_of)/applications/cn.huntergrey.eitri.Page.desktop"
-	for f in plugin/eitri.lua lua/eitri/init.lua lua/eitri/health.lua doc/eitri.txt; do
+	for f in plugin/eitri.lua lua/eitri/init.lua lua/eitri/health.lua lua/eitri/remote/init.lua lua/eitri/remote/sync.lua doc/eitri.txt; do
 		if ! cmp -s "$PKG/../nvim/eitri.nvim/$f" "$(data_of)/eitri/eitri.nvim/$f"; then fail "the plugin file $f was not installed from the checkout"; fi
 	done
 	for f in metadata.json extension.js direction.js policy.js; do

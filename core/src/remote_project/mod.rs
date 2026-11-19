@@ -40,7 +40,7 @@ pub struct RemoteProject {
 }
 
 /// The sync engine's durable session identities and decisions awaiting the person.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SyncRecord {
     pub engine: String,
     #[serde(default)]
@@ -48,6 +48,8 @@ pub struct SyncRecord {
     #[serde(default)]
     pub git_session: Option<String>,
     pub host_key_sha256: String,
+    /// The digest of the effective ignore patterns (the server's translated ignores with this record's excludes and
+    /// includes) the tree session was created with; a different one re-creates it.
     #[serde(default)]
     pub ignore_digest: String,
     #[serde(default)]
@@ -62,6 +64,27 @@ pub struct SyncRecord {
     pub copied_back: Vec<String>,
     #[serde(default)]
     pub git_ready: bool,
+    /// The host key the person accepted with `eitri host sync resume` after it changed: the sessions are re-created
+    /// under it, and `host_key_sha256` becomes it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub accepted_host_key: Option<String>,
+    /// `eitri host sync allow` with no path: the tripwire lets the current batch through, until its next cycle ends.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub tripwire_allow_batch: bool,
+    /// Whether the tree session has finished a cycle since it was first created; until then the size tripwire leaves
+    /// it alone (the person was shown the first sync's size).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub tree_synced: bool,
+    /// How many more paths than `copied_back` holds were copied back by the last re-creation.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub copied_back_more: u64,
+    /// Paths the last ignore change left out of sync while this laptop still holds them.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub kept_here: Vec<String>,
+}
+
+fn is_zero(value: &u64) -> bool {
+    *value == 0
 }
 
 /// A pause remains visible across restarts until the person settles it.
@@ -70,6 +93,10 @@ pub struct PauseRecord {
     pub reason: String,
     pub detail: String,
     pub since_unix_ms: u64,
+    /// The path a tripwire pause names (relative to the root), which `eitri host sync allow` and `exclude` take
+    /// when given none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
 }
 
 impl RemoteProject {
@@ -143,6 +170,12 @@ impl RemoteProjects {
     /// Where the windows of these projects keep their saved tabs: `<state home>/eitri/tabs`, beside the records.
     pub fn saved_tabs_dir(&self) -> Option<PathBuf> {
         Some(self.dir.as_deref()?.parent()?.join("tabs"))
+    }
+
+    /// The state home these records are kept under (`<state home>/eitri/hosts`'s grandparent): where sync keeps
+    /// its directories and Mutagen's data.
+    pub fn state_home(&self) -> Option<PathBuf> {
+        Some(self.dir.as_deref()?.parent()?.parent()?.to_owned())
     }
 
     fn dir(&self) -> io::Result<&Path> {
@@ -461,9 +494,15 @@ mod tests {
                 reason: "tripwire".into(),
                 detail: "large batch".into(),
                 since_unix_ms: 123,
+                path: Some("large".into()),
             }),
             copied_back: vec!["restored".into()],
             git_ready: true,
+            accepted_host_key: Some("SHA256:accepted".into()),
+            tripwire_allow_batch: true,
+            tree_synced: true,
+            copied_back_more: 3,
+            kept_here: vec!["now-ignored".into()],
         }
     }
 

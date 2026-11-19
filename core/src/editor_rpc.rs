@@ -139,6 +139,7 @@ pub const CHUNKS: &[(&str, ChunkSide)] = &[
     #[cfg(target_os = "linux")]
     (crate::ide_server::mention::IDE_MENTION_OUTSIDE, ChunkSide::OneShot),
     (crate::turn_review::revert::BUFFER_STATE_LUA, ChunkSide::OneShot),
+    (crate::remote_sync::quiet::UNSAVED_UNDER_LUA, ChunkSide::OneShot),
     (crate::nvim_keys::rescan::KEYS_RESCAN_LUA, ChunkSide::OneShot),
     (crate::companion::TEARDOWN_LUA, ChunkSide::OneShot),
     (crate::companion::PAGE_TEARDOWN_LUA, ChunkSide::OneShot),

@@ -68,6 +68,9 @@ EXPECTED_TREE='./.local d
 ./.local/share/eitri/eitri.nvim/lua/eitri d
 ./.local/share/eitri/eitri.nvim/lua/eitri/health.lua f
 ./.local/share/eitri/eitri.nvim/lua/eitri/init.lua f
+./.local/share/eitri/eitri.nvim/lua/eitri/remote d
+./.local/share/eitri/eitri.nvim/lua/eitri/remote/init.lua f
+./.local/share/eitri/eitri.nvim/lua/eitri/remote/sync.lua f
 ./.local/share/eitri/eitri.nvim/plugin d
 ./.local/share/eitri/eitri.nvim/plugin/eitri.lua f
 ./.local/share/gnome-shell d

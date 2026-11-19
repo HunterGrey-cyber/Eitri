@@ -503,6 +503,8 @@ struct AgentPanelState {
     remote_prompts: remote_tabs::RemotePrompts,
     /// Stops of agents on this window's server kept for when it can be reached, and what sends them.
     remote_stops: remote_tabs::RemoteStops,
+    /// The window's sync with its server as the sync actor last reported it (a remote window only).
+    sync_chip: Option<eitri_core::remote_sync::status_schema::SyncChip>,
     /// Saved remote tabs read at launch and not taken up yet: kept in the file by every write until a window with a
     /// connection to their server takes them up.
     unclaimed_remote: Vec<eitri_core::saved_tabs::SavedRemoteTab>,
@@ -611,6 +613,7 @@ impl AgentPanelState {
             server: None,
             remote_prompts: remote_tabs::RemotePrompts::default(),
             remote_stops: remote_tabs::RemoteStops::default(),
+            sync_chip: None,
             unclaimed_remote: Vec::new(),
             chat_moves: chat_moves::ChatMoves::default(),
             hand_overs: hand_over::HandOvers::default(),

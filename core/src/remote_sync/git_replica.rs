@@ -161,13 +161,74 @@ pub fn config_digest(entries: &[(String, String)]) -> String {
     format!("{:x}", hash.finalize())
 }
 
-/// Writes the laptop's `<git_dir>/config` (mode 0600) from `entries`, keeping only what [`sanitize`] keeps.
+/// The laptop's own hooks directory, `<state home>/eitri/remote/hooks`: outside every mirror, so no sync reaches it.
+pub fn refuse_hooks_dir(state_home: &Path) -> PathBuf {
+    state_home.join("eitri/remote/hooks")
+}
+
+/// The only hook in [`refuse_hooks_dir`]. A commit made in the laptop's copy would be undone by the next replica
+/// cycle (the server's `.git` is the source), so a plain `git commit` there, one run by full path or from a terminal
+/// that has no shim, is refused before it writes anything. Eitri's own git never reaches it: forwarded commands run on
+/// the server and local reads run with hooks off.
+pub const REFUSE_PRE_COMMIT: &str = "#!/bin/sh\n\
+echo \"eitri: this .git is a read-only copy of the server's history; a commit made here would be undone by the next \
+sync. Commit on the server: from an Eitri window or an nvim with eitri.nvim (git there goes to the server), or in a \
+terminal on the server.\" >&2\n\
+exit 1\n";
+
+/// Writes [`REFUSE_PRE_COMMIT`] as `pre-commit` (0700) into [`refuse_hooks_dir`] (0700) and returns the directory. A
+/// hook that already has that text and mode is left alone; anything else there is replaced through a rename, so
+/// every connection repairs a changed one.
+pub fn install_refuse_hooks(state_home: &Path) -> io::Result<PathBuf> {
+    use std::io::Write;
+    if !state_home.is_absolute() {
+        return Err(io::Error::other("the state home is not absolute"));
+    }
+    let root = state_home.join("eitri");
+    agent::private_fs::require_safe_state_parent(&root, "git hooks for remote mirrors")?;
+    let dir = refuse_hooks_dir(state_home);
+    agent::private_fs::create_private_dir_all(&dir, &root)?;
+    let hook = dir.join("pre-commit");
+    use std::os::unix::fs::MetadataExt;
+    if std::fs::symlink_metadata(&hook).is_ok_and(|meta| meta.is_file() && meta.mode() & 0o7777 == 0o700)
+        && agent::private_fs::read_private_nofollow_capped(&hook, REFUSE_PRE_COMMIT.len() as u64)
+            .is_ok_and(|text| text == REFUSE_PRE_COMMIT)
+    {
+        return Ok(dir);
+    }
+    let temporary = dir.join(format!(".pre-commit-{}", uuid::Uuid::new_v4()));
+    let written = (|| {
+        let mut file = agent::private_fs::open_private(&temporary)?;
+        file.write_all(REFUSE_PRE_COMMIT.as_bytes())?;
+        file.set_permissions(std::fs::Permissions::from_mode(0o700))?;
+        file.sync_all()?;
+        drop(file);
+        std::fs::rename(&temporary, &hook)
+    })();
+    if written.is_err() {
+        let _ = std::fs::remove_file(&temporary);
+    }
+    written.map(|()| dir)
+}
+
+/// The transports git knows, each refused by name in the laptop's config.
+const PROTOCOLS: &[&str] = &["file", "git", "ssh", "http", "https", "ext"];
+
+/// Writes the laptop's `<git_dir>/config` (mode 0600) from `entries`, keeping only what [`sanitize`] keeps, then
+/// Eitri's own two entries: `core.hookspath` naming `hooks_dir` (laptop-local, holding only [`REFUSE_PRE_COMMIT`];
+/// see [`install_refuse_hooks`]) and `protocol.allow=never`, so a git run on the copy by full path fetches and pushes
+/// nothing and commits nothing.
 ///
 /// Each entry goes through `git config --file <temporary> --add`, so git does the quoting; the temporary file is
 /// synced and renamed over `config`, so a reader sees the old file or the new one. Its name ends in `.lock`, which the
 /// replica ignores, so a replica cycle running meanwhile leaves it alone. `git_dir` is created (0700) when the replica
 /// has not made it yet.
-pub fn write_laptop_config(local_git: &LocalGit, git_dir: &Path, entries: &[(String, String)]) -> io::Result<()> {
+pub fn write_laptop_config(
+    local_git: &LocalGit,
+    git_dir: &Path,
+    entries: &[(String, String)],
+    hooks_dir: &Path,
+) -> io::Result<()> {
     static NEXT: AtomicU64 = AtomicU64::new(0);
     let root = git_dir
         .parent()
@@ -180,7 +241,19 @@ pub fn write_laptop_config(local_git: &LocalGit, git_dir: &Path, entries: &[(Str
     if !std::fs::symlink_metadata(git_dir)?.is_dir() {
         return Err(io::Error::other(format!("{} is not a directory", git_dir.display())));
     }
-    let entries = sanitize(entries);
+    if !hooks_dir.is_absolute() {
+        return Err(io::Error::other("the hooks directory is not absolute"));
+    }
+    let mut entries: Vec<(OsString, OsString)> = sanitize(entries)
+        .into_iter()
+        .map(|(key, value)| (key.into(), value.into()))
+        .collect();
+    entries.push(("core.hookspath".into(), hooks_dir.into()));
+    entries.push(("protocol.allow".into(), "never".into()));
+    // A person's global `protocol.<name>.allow` beats the general key, so each transport is named too.
+    for name in PROTOCOLS {
+        entries.push((format!("protocol.{name}.allow").into(), "never".into()));
+    }
     let temporary = git_dir.join(format!(
         "eitri-config-{}-{}.lock",
         std::process::id(),
@@ -204,7 +277,7 @@ fn fill_and_replace(
     root: &Path,
     git_dir: &Path,
     temporary: &Path,
-    entries: &[(String, String)],
+    entries: &[(OsString, OsString)],
 ) -> io::Result<()> {
     for (key, value) in entries {
         let args: Vec<OsString> = vec![
@@ -213,8 +286,8 @@ fn fill_and_replace(
             temporary.into(),
             "--add".into(),
             "--".into(),
-            key.into(),
-            value.into(),
+            key.clone(),
+            value.clone(),
         ];
         let output = local_git
             .command(root, &args)?
@@ -223,7 +296,8 @@ fn fill_and_replace(
             .output()?;
         if !output.status.success() {
             return Err(io::Error::other(format!(
-                "git config could not write {key}: {}",
+                "git config could not write {}: {}",
+                key.to_string_lossy(),
                 String::from_utf8_lossy(&output.stderr).trim()
             )));
         }
@@ -239,6 +313,12 @@ fn fill_and_replace(
 #[cfg(test)]
 #[path = "git_replica_red_team.rs"]
 mod red_team;
+
+/// The git the replica's tests run (the first on `PATH`).
+#[cfg(test)]
+pub(crate) fn red_team_git_binary() -> PathBuf {
+    red_team::git_binary()
+}
 
 #[cfg(test)]
 mod tests {
@@ -413,8 +493,17 @@ mod tests {
             ("core.fsmonitor", "/tmp/run"),
             ("remote.a\"]\n[core]\nfsmonitor=x.url", "v"),
         ]);
+        let hooks = install_refuse_hooks(&scratch.path().join("state")).unwrap();
+        let eitri = |mut kept: Vec<(String, String)>| {
+            kept.push(("core.hookspath".into(), hooks.to_str().unwrap().into()));
+            kept.push(("protocol.allow".into(), "never".into()));
+            for name in PROTOCOLS {
+                kept.push((format!("protocol.{name}.allow"), "never".into()));
+            }
+            kept
+        };
         // No `.git` yet (the replica has not arrived): it is made 0700.
-        write_laptop_config(&git, &git_dir, &entries).unwrap();
+        write_laptop_config(&git, &git_dir, &entries, &hooks).unwrap();
         assert_eq!(std::fs::metadata(&git_dir).unwrap().mode() & 0o777, 0o700);
         let config = git_dir.join("config");
         assert_eq!(std::fs::metadata(&config).unwrap().mode() & 0o777, 0o600);
@@ -427,7 +516,16 @@ mod tests {
             .output()
             .unwrap();
         assert!(listed.status.success());
-        assert_eq!(parse_config_list(&listed.stdout), sanitize(&entries));
+        // git files each key under its section, so Eitri's own two land among the kept ones.
+        let (own, kept): (Vec<_>, Vec<_>) = parse_config_list(&listed.stdout)
+            .into_iter()
+            .partition(|(key, _)| key == "core.hookspath" || key.starts_with("protocol."));
+        assert_eq!(kept, sanitize(&entries));
+        let mut own = own;
+        own.sort();
+        let mut expected = eitri(vec![]);
+        expected.sort();
+        assert_eq!(own, expected);
         // Nothing but the config is left behind in `.git`.
         let names: Vec<_> = std::fs::read_dir(&git_dir)
             .unwrap()
@@ -435,18 +533,58 @@ mod tests {
             .collect();
         assert_eq!(names, vec![OsString::from("config")]);
 
-        // A rewrite replaces the file (a new inode) rather than editing it, and an empty list leaves an empty file.
+        // A rewrite replaces the file (a new inode) rather than editing it, and an empty list leaves Eitri's own two.
         let before = std::fs::metadata(&config).unwrap().ino();
         std::fs::set_permissions(&config, std::fs::Permissions::from_mode(0o644)).unwrap();
-        write_laptop_config(&git, &git_dir, &[]).unwrap();
+        write_laptop_config(&git, &git_dir, &[], &hooks).unwrap();
         let after = std::fs::metadata(&config).unwrap();
         assert_ne!(after.ino(), before);
         assert_eq!(after.mode() & 0o777, 0o600);
-        assert_eq!(std::fs::read(&config).unwrap(), b"");
+        let own = format!(
+            "[core]\n\thookspath = {}\n[protocol]\n\tallow = never\n[protocol \"file\"]\n\tallow = never\n\
+             [protocol \"git\"]\n\tallow = never\n[protocol \"ssh\"]\n\tallow = never\n[protocol \"http\"]\n\
+             \tallow = never\n[protocol \"https\"]\n\tallow = never\n[protocol \"ext\"]\n\tallow = never\n",
+            hooks.display()
+        );
+        assert_eq!(std::fs::read_to_string(&config).unwrap(), own);
 
         // A replaced config is not read back: the file is built from the entries alone.
         std::fs::write(&config, "[core]\n\tfsmonitor = /tmp/run\n").unwrap();
-        write_laptop_config(&git, &git_dir, &pairs(&[("user.name", "Someone")])).unwrap();
-        assert_eq!(std::fs::read_to_string(&config).unwrap(), "[user]\n\tname = Someone\n");
+        write_laptop_config(&git, &git_dir, &pairs(&[("user.name", "Someone")]), &hooks).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&config).unwrap(),
+            format!("[user]\n\tname = Someone\n{own}")
+        );
+        assert!(write_laptop_config(&git, &git_dir, &[], Path::new("relative/hooks")).is_err());
+    }
+
+    #[test]
+    fn refuse_hooks_hold_only_the_pre_commit_hook_and_are_repaired() {
+        let scratch = red_team::Scratch::new("hooks");
+        let state = scratch.path().join("state");
+        let dir = install_refuse_hooks(&state).unwrap();
+        assert_eq!(dir, state.join("eitri/remote/hooks"));
+        assert_eq!(std::fs::metadata(&dir).unwrap().mode() & 0o777, 0o700);
+        let hook = dir.join("pre-commit");
+        assert_eq!(std::fs::metadata(&hook).unwrap().mode() & 0o7777, 0o700);
+        assert_eq!(std::fs::read_to_string(&hook).unwrap(), REFUSE_PRE_COMMIT);
+        let names: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(names, vec![OsString::from("pre-commit")]);
+        // The hook refuses with its line, whatever it is given.
+        // Through sh: exec'ing a file just written can meet ETXTBSY while another test thread's fork still holds it.
+        let run = std::process::Command::new("/bin/sh").arg(&hook).output().unwrap();
+        assert_eq!(run.status.code(), Some(1));
+        assert!(String::from_utf8_lossy(&run.stderr).contains("read-only copy"));
+        // An unchanged hook is left alone; a changed one is replaced.
+        let ino = std::fs::metadata(&hook).unwrap().ino();
+        install_refuse_hooks(&state).unwrap();
+        assert_eq!(std::fs::metadata(&hook).unwrap().ino(), ino);
+        std::fs::write(&hook, "#!/bin/sh\nexit 0\n").unwrap();
+        install_refuse_hooks(&state).unwrap();
+        assert_eq!(std::fs::read_to_string(&hook).unwrap(), REFUSE_PRE_COMMIT);
+        assert!(install_refuse_hooks(Path::new("relative")).is_err());
     }
 }

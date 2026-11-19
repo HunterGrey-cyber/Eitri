@@ -829,6 +829,16 @@ fn build_ui(
     nvim_child_env.extend(nvim_keys_feed.as_ref().map(|feed| feed.child_env()).unwrap_or_default());
     let mut nvim_extra_args = theme_feed.as_ref().map(|feed| feed.nvim_args()).unwrap_or_default();
     nvim_extra_args.extend(context_feed.as_ref().map(|feed| feed.nvim_args()).unwrap_or_default());
+    if owns_editor && !matches!(origin, eitri_core::remote_project::WindowOrigin::Local) {
+        let program = nvim_child_env
+            .iter()
+            .find(|(key, _)| key == "EITRI_GIT_SHIM_EXE")
+            .map(|(_, value)| value.as_str())
+            .unwrap_or("eitri");
+        // The embedded editor can start without the optional plugin on its runtimepath.
+        let loader = eitri_core::remote_sync::nvim_loader(project_root, program);
+        nvim_extra_args.extend(["--cmd".into(), loader]);
+    }
     nvim_extra_args.extend(nvim_keys_feed.as_ref().map(|feed| feed.nvim_args()).unwrap_or_default());
     // The nav fallback's loader, from the pane-switch channel's own directory,
     // so `Ctrl+h/j/k/l` leave the editor without vim-tmux-navigator and from Visual mode. Only
@@ -1148,6 +1158,13 @@ fn build_ui(
             lua_engine.report_problem(problem);
         }
     });
+    if !matches!(origin, eitri_core::remote_project::WindowOrigin::Local) {
+        let (settings, problems) = host_command::sync_settings(&lua_engine.config.borrow());
+        for problem in problems {
+            lua_engine.report_problem(problem);
+        }
+        remote_window::set_sync_settings(settings);
+    }
     let git_shim_settings = GIT_SHIM.with(|slot| {
         slot.borrow().as_ref().map(|shim| {
             let (options, problems) = host_command::git_shim_options(&lua_engine.config.borrow());
@@ -2585,6 +2602,7 @@ fn build_ui(
             None => Rc::new(linked_window::NoEditor),
         },
     };
+    remote_window::set_editor(editor_rpc.clone());
     // A plugin page loaded into the running window (`plugin_load`): only a full window 1 in Eitri's own tiling takes
     // one, and only there does the empty tab offer the shipped pages. The window's follow socket, bound above when a
     // plugin from `init.lua` wants it, is kept in one slot with whatever a later page binds, for the teardown.

@@ -260,6 +260,8 @@ pub(super) fn panel_tab_handoff(state: &AgentPanelState, tab: TabId) -> Result<P
         remote_prompts: _,
         // The stops this window keeps are its server's, sent by its own sender.
         remote_stops: _,
+        // The sync with the window's server is the window's.
+        sync_chip: _,
         unclaimed_remote: _,
         restore_policy: _,
         tab_files: _,

@@ -81,6 +81,7 @@ mod remote_sync {
                     paused: None,
                     copied_back: vec![],
                     git_ready: true,
+                    ..Default::default()
                 });
                 let env = ShimEnv {
                     cwd: root,
@@ -118,6 +119,11 @@ mod remote_sync {
                 copied_back: vec![],
                 paused: None,
                 written_unix_ms: 0,
+                kept_here: vec![],
+                notice: None,
+                copied_back_more: 0,
+                conflicts_more: 0,
+                problems_more: 0,
             }
         }
         struct Fake {

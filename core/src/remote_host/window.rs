@@ -122,12 +122,14 @@ pub fn start_server<T>(
 /// `ssh_dir` holding its socket and the record of the key it verified), the key it verified compared with the
 /// record's, the helper this build needs on the host, and the connection to it. `exe` is this Eitri, which ssh runs
 /// to record the key. Blocking: a worker's.
+/// `sync` runs once the connection is open, on this worker: the window starts its sync actor there.
 pub fn open_window(
     project: &RemoteProject,
     ssh_dir: &Path,
     exe: &Path,
     store: &RemoteProjects,
     band: &dyn Fn(String),
+    sync: &dyn Fn(&RemoteConnection, &RemoteProject),
 ) -> Result<Opened, String> {
     let host = project.host.clone();
     band(connecting_text(&host));
@@ -136,6 +138,10 @@ pub fn open_window(
     let (project, key_changed) = reconcile_host_key(store, project, &verified).map_err(|e| e.to_string())?;
     if let Some(notice) = &key_changed {
         band(notice.clone());
+        // Sync waits for the person: its sessions run under the old key until they resume it.
+        if let Some(line) = crate::remote_sync::sessions::note_key_change(store, &project) {
+            band(line);
+        }
     }
     let record = store.host(&verified).map_err(|e| e.to_string())?.ok_or_else(|| {
         format!(
@@ -189,6 +195,7 @@ pub fn open_window(
         }
         RemoteConnection::open_over_ssh(&master, store, &project, plan.version(), plan.revision())
     })?;
+    sync(&connection, &project);
     Ok(Opened {
         connection,
         project,

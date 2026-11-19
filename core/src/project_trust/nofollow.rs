@@ -165,6 +165,11 @@ fn fstat_fd(fd: libc::c_int) -> Result<libc::stat, Refusal> {
 }
 
 impl DirHandle {
+    /// Pass the checked directory to another descriptor-relative operation.
+    pub(crate) fn into_fd(self) -> OwnedFd {
+        self.fd
+    }
+
     fn open_with(dirfd: libc::c_int, name: &CString, flags: libc::c_int) -> io::Result<OwnedFd> {
         // SAFETY: `dirfd` is an open directory descriptor and `name` a valid NUL-terminated string,
         // both alive for the call.

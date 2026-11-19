@@ -143,6 +143,7 @@ export type PageModel = {
    *  `ready`, right after the theme). `prefix` is `Ctrl+b`, the stock tmux default, and the panel table has no
    *  bindings until that envelope arrives. */
   keymapHelp: KeymapHelp;
+  syncChip: import("./syncChip").SyncStatus | null;
   pages: PageLine[];
   /** The trust question Rust sent last, held until it can take the keys. It is not drawn on arrival: Rust asks
    *  again whenever a tab waiting for the answer is on screen without its question, including the moment after a
@@ -267,6 +268,7 @@ function chipOf(value: DraftImage): DraftImage {
 export function initialPageModel(): PageModel {
   return {
     answerEpoch: 0, inputRequest: 0, arriveRequest: 0, permissionRequest: 0, navKey: null,
+    syncChip: null,
     pages: [],
     keymapHelp: { prefix: "Ctrl+b", window: [], prefixKeys: [], panel: EMPTY_PANEL_TABLE, newTabChord: "" },
     heldTrust: null, heldRemote: new Map(), confirm: null, renaming: null, queueTaken: null, queueTakenSequence: 0,
@@ -363,6 +365,8 @@ function reduceEnvelope(model: PageModel, envelope: Envelope): PageModel {
       return { ...model, review: null, chooser: null };
     case "nav_key":
       return { ...model, navKey: { seq: (model.navKey?.seq ?? 0) + 1, direction: envelope.direction } };
+    case "sync_status":
+      return { ...model, syncChip: envelope.chip };
     case "pages":
       return { ...model, pages: envelope.pages };
     case "keymap":

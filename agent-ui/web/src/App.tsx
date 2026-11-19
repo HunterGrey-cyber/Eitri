@@ -280,7 +280,7 @@ export default function App() {
     state, hello, tabs, fatalError, handoff, handoffRequests, commandNotice, rootNote, tabRootNotes, turnClock, turnDurations, thinkingDisplay, paneFocused,
     queue, queueError, queueNote, queueSteers, shellRunning, history, ruleOffers, editorContext, editorLink, scratchEditing,
     review, reviewHints, reviewRecovery, reviewSettings, chooser,
-    inputRequest, arriveRequest, permissionRequest, navKey, keymapHelp, pages, heldTrust, heldRemote, confirm, renaming,
+    inputRequest, arriveRequest, permissionRequest, navKey, keymapHelp, pages, syncChip, heldTrust, heldRemote, confirm, renaming,
     queueTaken, draftImages,
   } = page;
   const {
@@ -5569,7 +5569,7 @@ export default function App() {
         {commandLineOverlay}
         <DeviceList desk={remoteDesk} covered={remoteCovered} />
         <RemoteEnroll desk={remoteDesk} covered={remoteCovered} />
-        <StatusBand
+        <StatusBand syncChip={syncChip}
           facts={{
             mode: emptyMode,
             pill: planPill(null, activeTab?.mode ?? "auto", activeTab?.planOnStart === true) ?? modePill(activeTab?.mode ?? "auto", true, true),
@@ -8061,7 +8061,7 @@ export default function App() {
           now taking the whole band right of the mode section rather than one slot
           among several, so the question is never cut. Backend has no segment here at all (it
           carries nothing in a release build): `prefix i` only. */}
-      <StatusBand
+      <StatusBand syncChip={syncChip}
         facts={{
           mode,
           // `true` for `cycleOffered`: ignored entirely in short form (`modePill`'s own doc

@@ -3,7 +3,7 @@ local M = {}
 function M.check()
   local health = vim.health
   health.start("Eitri launcher")
-  health.info("Nothing of Eitri runs in this nvim until a command is used.")
+  health.info("Opening a recorded remote project starts its sync watch. Use :EitriSync to inspect it.")
   local cmd = require("eitri").program()
   local path = vim.fn.exepath(cmd)
   if path == "" then

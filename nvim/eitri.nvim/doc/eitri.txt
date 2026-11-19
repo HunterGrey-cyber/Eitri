@@ -4,7 +4,7 @@
 CONTENTS                                                        *eitri-contents*
 
   1. Install ............................ |eitri-install|
-  2. Commands ........................... |:EitriPanel|, |:EitriOpen|
+  2. Commands ............. |:EitriPanel|, |:EitriOpen|, |:EitriPage|, |:EitriSync|
   3. Setup .............................. |eitri-setup|
   4. Navigators ......................... |eitri.edge()|
   5. Inside tmux ........................ |eitri-tmux|
@@ -75,6 +75,16 @@ Without a plugin manager, add the directory to 'runtimepath':
 require("eitri").open({dir})
 
 The Lua form of :EitriOpen; {dir} is optional.
+
+                                                                  *:EitriSync*
+:EitriSync              Show conflicts, scan problems, copied-back files and
+                        exclusions for this remote project. Press <Enter> on
+                        an action. Merge opens a diff against the read-only
+                        server copy. Use :write in the laptop buffer to save
+                        the merge. Eitri backs up each version it replaces.
+
+require("eitri.remote").status() returns the current buffer's project sync
+status for a statusline, or an empty string outside an attached project.
 
                                                                   *:EitriPage*
 :EitriPage {id} [dir]   Open a plugin page beside this nvim, following its
@@ -226,9 +236,8 @@ The panel closes when that Neovide exits; closing the panel leaves Neovide.
 
 Finds the configured cmd (or eitri on PATH), prints its version, and lists the
 page ids returned by `eitri page --list`. It reports an older Eitri without
-page support. The health module loads only when called. Eager loading the
-plugin registers two commands and one loaded flag; no maps, autocommands or
-timers are installed until requested. Nothing of Eitri runs in this nvim
-until a command is used.
+page support. The health module loads only when called. Opening a buffer
+under a recorded remote root starts one sync watch for that project and
+reports the editor's modified buffers to it.
 
 vim:tw=78:ts=8:ft=help:norl:

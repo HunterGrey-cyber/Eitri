@@ -138,6 +138,42 @@ fn real_flush_returns_after_a_save() {
     );
 }
 
+/// Re-creation after a delete made while no session ran: Mutagen's new session has no ancestor, copies the file
+/// back, and the before/after listings name it, so the person is told.
+#[test]
+#[ignore = "requires EITRI_TEST_MUTAGEN and permission to bind a private daemon socket"]
+fn real_recreate_after_a_one_sided_delete_lists_it() {
+    use eitri_core::remote_sync::ignores::Matcher;
+    use eitri_core::remote_sync::recreate;
+    let real = Real::open();
+    let spec = real.spec();
+    fs::write(real.laptop.join("kept.txt"), "both\n").unwrap();
+    fs::write(real.laptop.join("deleted-on-server.txt"), "both\n").unwrap();
+    real.engine.create(&spec).unwrap();
+    real.flush(&spec.name);
+    assert!(real.server.join("deleted-on-server.txt").exists());
+    real.engine.terminate(&spec.name).unwrap();
+    // In the gap: deleted on one side only.
+    fs::remove_file(real.server.join("deleted-on-server.txt")).unwrap();
+    let none = Matcher::new(&[]);
+    let laptop = recreate::list_laptop(&real.laptop, &none, &none, 1000).unwrap();
+    let server = recreate::laptop_files(&real.server, &none, 1000).unwrap();
+    let before = recreate::one_sided(&laptop.files, &server);
+    assert_eq!(before, (vec!["deleted-on-server.txt".to_owned()], vec![]));
+    real.engine.create(&spec).unwrap();
+    real.flush(&spec.name);
+    assert!(
+        real.server.join("deleted-on-server.txt").exists(),
+        "Mutagen copies the one-sided file back"
+    );
+    let after_laptop = recreate::laptop_files(&real.laptop, &none, 1000).unwrap();
+    let after_server = recreate::laptop_files(&real.server, &none, 1000).unwrap();
+    assert_eq!(
+        recreate::copied_back(&before, &after_laptop, &after_server),
+        vec!["deleted-on-server.txt".to_owned()]
+    );
+}
+
 #[test]
 #[ignore = "requires EITRI_TEST_MUTAGEN and permission to bind a private daemon socket"]
 fn real_pause_holds_changes_and_resume_delivers_them() {

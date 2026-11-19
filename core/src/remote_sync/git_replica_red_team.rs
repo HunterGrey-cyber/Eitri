@@ -284,7 +284,8 @@ impl Lab {
         let entries = parse_config_list(&listed.stdout);
         let plan = git_session_plan(&SyncKey::new("SHA256:test", &self.server), &self.laptop, &self.server);
         let git_dir = plan.laptop_git_dir.clone();
-        write_laptop_config(&isolated_local_git(&self.home), &git_dir, &entries).unwrap();
+        let hooks = super::install_refuse_hooks(&self.home.join("state")).unwrap();
+        write_laptop_config(&isolated_local_git(&self.home), &git_dir, &entries, &hooks).unwrap();
         let written = std::fs::read(git_dir.join("config")).unwrap();
         let ignores: Vec<&str> = plan.ignores.iter().map(String::as_str).collect();
         replicator.git(&plan.server_root, &git_dir, &ignores, plan.symlink_mode);
@@ -843,6 +844,42 @@ fn gitfile_scenario(replicator: &Replicator) {
     );
     assert!(exists(&lab.laptop.join("nested/a.txt")), "the rest of the tree arrives");
     lab.assert_laptop_runs_nothing(&lab.laptop.join("nested"));
+}
+
+/// A commit made on the copy would be undone by the next replica cycle, and git by full path (a plugin, a terminal
+/// without the shim) does not go through Eitri: the laptop config's own hooks directory refuses the commit before it
+/// writes anything, and `protocol.allow=never` stops a fetch or push from it.
+#[test]
+fn a_plain_commit_fetch_or_push_on_the_copy_is_refused() {
+    let lab = Lab::new("refuse");
+    lab.mirror(&Replicator::Model);
+    let head = lab.plain_git(&lab.laptop, &["rev-parse", "HEAD"]);
+    assert!(head.status.success());
+    std::fs::write(lab.laptop.join("a.txt"), "changed on the laptop\n").unwrap();
+    let commit = lab
+        .setup_command(&lab.laptop, &["commit", "-q", "-a", "-m", "on the copy"])
+        .output()
+        .unwrap();
+    assert!(!commit.status.success(), "a commit on the copy went through");
+    let said = String::from_utf8_lossy(&commit.stderr);
+    assert!(said.contains("read-only copy of the server's history"), "{said}");
+    assert!(said.contains("Commit on the server"), "{said}");
+    assert_eq!(lab.plain_git(&lab.laptop, &["rev-parse", "HEAD"]).stdout, head.stdout);
+    let server = lab.server.to_str().unwrap();
+    let fetch = lab.plain_git(&lab.laptop, &["fetch", "-q", server, "main"]);
+    assert!(!fetch.status.success(), "a fetch from the copy ran");
+    let push = lab.plain_git(&lab.laptop, &["push", "-q", server, "HEAD:refs/heads/from-the-copy"]);
+    assert!(!push.status.success(), "a push from the copy ran");
+    assert!(!lab
+        .plain_git(
+            &lab.server,
+            &["rev-parse", "--verify", "-q", "refs/heads/from-the-copy"]
+        )
+        .status
+        .success());
+    // The hook is laptop-local: nothing under `.git` holds it.
+    assert!(!exists(&lab.laptop.join(".git/hooks")));
+    assert!(!lab.ran());
 }
 
 #[test]

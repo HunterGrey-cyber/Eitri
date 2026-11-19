@@ -12,13 +12,26 @@
 //! The band says how far it is
 //! ("connecting… / ready"); once it is open the panel gets it and its saved remote tabs come back, and resume and
 //! network changes reach its master (`remote_resume`).
+//!
+//! **Sync.** On the same worker, once the connection is open, the window attaches to its project's sync
+//! (`remote_sync::actor`): it holds the project's sync lock, or observes when another window holds it. Its status goes
+//! to the panel (`set_sync_status`) and its lines to the band. Its editor is asked through the window's editor link
+//! on the GTK thread ([`WindowEditor`]). When the application shuts down the attachment is let go on a worker, with
+//! a bounded wait, which pauses the sessions when this window held them.
 
 use std::cell::RefCell;
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
-    Arc,
+    Arc, Mutex,
 };
+use std::time::Duration;
+
+use eitri_core::remote_host::cli_sync::SyncSettings;
+use eitri_core::remote_project::RemoteConnection;
+use eitri_core::remote_sync::actor::{self, ActorConfig, HolderKind, SyncActor, SyncEvent};
+use eitri_core::remote_sync::quiet::{EditorAnswer, EditorState, UNSAVED_UNDER_LUA};
 
 use eitri_core::project_root::Launch;
 use eitri_core::remote_host::window::{open_window, Opened};
@@ -151,6 +164,7 @@ fn carry_saved_roles(base: &Path, keyed: &Path, root: &Path, host_key: &str) {
 /// What the worker tells the window.
 enum Report {
     Band(String),
+    Sync(SyncEvent),
     Opened(Box<Opened>, Option<eitri_core::open_socket::OpenServer>),
     Failed(String),
     Replaced(String),
@@ -159,6 +173,178 @@ enum Report {
 thread_local! {
     /// The resume and network listener of this window's connection, for as long as the window lives.
     static LISTENER: RefCell<Option<crate::remote_resume::Listener>> = const { RefCell::new(None) };
+    /// The window's editor, for the sync actor's questions (asked on the GTK thread).
+    static EDITOR: RefCell<Option<Rc<dyn eitri_core::editor_rpc::EditorRpc>>> = const { RefCell::new(None) };
+}
+
+/// The window's attachment to its project's sync, for as long as the window lives; `closed` once the application
+/// shut down, after which an attachment made late is let go at once.
+static SYNC: Mutex<SyncSlot> = Mutex::new(SyncSlot {
+    closed: false,
+    attached: None,
+});
+
+struct SyncSlot {
+    closed: bool,
+    attached: Option<SyncActor>,
+}
+
+/// `remote_dev.*` as the window's `init.lua` left them; set once the kernel ran, before the connection opens.
+static SYNC_SETTINGS: Mutex<Option<SyncSettings>> = Mutex::new(None);
+
+/// How long the application's shutdown waits for the sync actor to let go (pausing its sessions).
+const SYNC_RELEASE_WAIT: Duration = Duration::from_secs(10);
+
+/// `main.rs` gives the settings once `init.lua` ran.
+pub(crate) fn set_sync_settings(settings: SyncSettings) {
+    *SYNC_SETTINGS.lock().unwrap() = Some(settings);
+}
+
+/// `main.rs` gives the window's editor link once it exists.
+pub(crate) fn set_editor(rpc: Rc<dyn eitri_core::editor_rpc::EditorRpc>) {
+    EDITOR.with(|slot| *slot.borrow_mut() = Some(rpc));
+}
+
+/// The window's own nvim, asked from the actor's worker: the question is sent to the GTK thread, and the answer
+/// waited for here, at most two seconds each way. No answer (no editor, nvim not running, too slow) is "cannot
+/// tell", which the actor takes as not quiet.
+struct WindowEditor {
+    root: PathBuf,
+}
+
+impl WindowEditor {
+    fn ask(&self) -> Option<EditorAnswer> {
+        let root = self.root.to_str()?.to_owned();
+        let (send, receive) = std::sync::mpsc::channel();
+        glib::MainContext::default().invoke(move || {
+            let pending = EDITOR.with(|slot| {
+                slot.borrow()
+                    .as_ref()
+                    .map(|rpc| rpc.exec_lua(UNSAVED_UNDER_LUA, vec![rmpv::Value::from(root)]))
+            });
+            let _ = send.send(pending);
+        });
+        let pending = receive.recv_timeout(Duration::from_secs(2)).ok()??;
+        let value = pending.wait(Duration::from_secs(2))?.ok()?;
+        EditorAnswer::from_value(&value)
+    }
+}
+
+impl EditorState for WindowEditor {
+    fn unsaved_under(&self, root: &Path) -> Option<Vec<PathBuf>> {
+        self.ask().map(|answer| {
+            answer
+                .unsaved
+                .into_iter()
+                .filter(|path| path.starts_with(root))
+                .collect()
+        })
+    }
+
+    fn saves_since(&self, generation: u64) -> (u64, Vec<PathBuf>) {
+        match self.ask() {
+            Some(answer) => (answer.generation().max(generation), answer.saved_after(generation)),
+            None => (generation, vec![]),
+        }
+    }
+}
+
+/// Attaches the window to its project's sync, on the open worker. Mutagen missing, or anything else that keeps sync
+/// from starting, is a band line; the window's tabs work without sync.
+fn start_sync(connection: &RemoteConnection, project: &RemoteProject, tell: &UnboundedSender<Report>) {
+    {
+        let slot = SYNC.lock().unwrap();
+        if slot.closed || slot.attached.is_some() {
+            return;
+        }
+    }
+    let band = |line: String| {
+        let _ = tell.unbounded_send(Report::Band(line));
+    };
+    let settings = SYNC_SETTINGS.lock().unwrap().clone().unwrap_or_default();
+    let Some(state_home) = store().state_home() else {
+        band("sync not started: no state home".into());
+        return;
+    };
+    let engine = match eitri_core::remote_sync::mutagen::MutagenEngine::open(
+        &state_home,
+        settings.mutagen.as_deref(),
+        &state_home.join("eitri/mutagen/transport"),
+    ) {
+        Ok(engine) => engine,
+        Err(error) => {
+            band(format!("sync not started: {error}"));
+            return;
+        }
+    };
+    let (events, received) = std::sync::mpsc::channel();
+    let config = ActorConfig::new(
+        state_home,
+        HolderKind::Window,
+        settings.tripwire_mib,
+        settings.flush_cap,
+    );
+    let attached = actor::attach(
+        project.clone(),
+        actor::Deps {
+            engine: Arc::new(engine),
+            helper: Arc::new(connection.clone()),
+            editor: Arc::new(WindowEditor {
+                root: project.root.clone(),
+            }),
+            events,
+        },
+        config,
+    );
+    match attached {
+        Ok(attached) => {
+            let mut slot = SYNC.lock().unwrap();
+            if slot.closed {
+                // The application ended while this attached: let it go here, on the worker.
+                drop(slot);
+                drop(attached);
+                return;
+            }
+            slot.attached = Some(attached);
+        }
+        Err(error) => {
+            band(format!("sync not started: {error}"));
+            return;
+        }
+    }
+    let tell = tell.clone();
+    let _ = std::thread::Builder::new()
+        .name("eitri-sync-events".into())
+        .spawn(move || {
+            for event in received {
+                if tell.unbounded_send(Report::Sync(event)).is_err() {
+                    return;
+                }
+            }
+        });
+}
+
+/// Lets the window's sync attachment go on a worker (pausing the sessions when it held them), waiting at most
+/// [`SYNC_RELEASE_WAIT`]: the window is already gone, only the process's exit waits.
+fn release_sync() {
+    let attached = {
+        let mut slot = SYNC.lock().unwrap();
+        slot.closed = true;
+        slot.attached.take()
+    };
+    let Some(attached) = attached else {
+        return;
+    };
+    let (done, finished) = std::sync::mpsc::channel();
+    let _ = std::thread::Builder::new()
+        .name("eitri-sync-release".into())
+        .spawn(move || {
+            // Paused first, so the sessions stop even if the actor's thread is in a long step past the wait.
+            attached.pause_now();
+            drop(attached);
+            let _ = done.send(());
+        });
+    let _ = finished.recv_timeout(SYNC_RELEASE_WAIT);
 }
 
 /// Opens a remote window's connection, on a worker each time: what [`start`] runs first, and again after a failed
@@ -190,8 +376,9 @@ impl Opener {
                 return;
             }
         };
+        let sync = |connection: &RemoteConnection, project: &RemoteProject| start_sync(connection, project, &self.tell);
         let Some(result) = attempt_until_open(&self.opened, || {
-            open_window(&project, &self.ssh_dir, &self.exe, &store, &band)
+            open_window(&project, &self.ssh_dir, &self.exe, &store, &band, &sync)
         }) else {
             return;
         };
@@ -283,6 +470,11 @@ pub(crate) fn start(
     match origin {
         WindowOrigin::Local | WindowOrigin::LocalCopy { .. } => {}
         WindowOrigin::Remote(project) => {
+            if let Some(app) = gtk4::gio::Application::default() {
+                use gtk4::prelude::*;
+                // The sync attachment, once one exists, is let go as the application ends.
+                app.connect_shutdown(|_| release_sync());
+            }
             let Some(ssh_dir) = eitri_core::remote_host::cli::ssh_dir(
                 std::env::var_os("XDG_STATE_HOME").as_deref(),
                 std::env::var_os("HOME").as_deref(),
@@ -321,6 +513,13 @@ pub(crate) fn start(
                     match report {
                         Report::Band(line) => {
                             println!("[remote] {line}");
+                            panel.show_notice(&line);
+                        }
+                        Report::Sync(SyncEvent::Status(status)) => {
+                            panel.set_sync_status(eitri_core::remote_sync::status_file::chip(&status));
+                        }
+                        Report::Sync(SyncEvent::Line(line)) => {
+                            println!("[sync] {line}");
                             panel.show_notice(&line);
                         }
                         Report::Replaced(why) => {

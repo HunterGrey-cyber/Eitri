@@ -18,6 +18,15 @@ pub trait SyncEngine: Send + Sync {
     fn status(&self, labels: &Labels) -> Result<Vec<SessionStatus>, SyncError>;
     fn flush(&self, name: &str, cap: Duration) -> FlushOutcome;
     fn monitor(&self, name: &str) -> Result<Box<dyn Iterator<Item = SessionStatus> + Send>, SyncError>;
+    /// Makes sure the engine can answer: a holder calls it before its first listing, since a status call alone never
+    /// starts an absent daemon.
+    fn start(&self) -> Result<(), SyncError> {
+        Ok(())
+    }
+    /// Whether an engine error says the named session does not exist.
+    fn is_missing(&self, error: &SyncError) -> bool {
+        error.to_string().contains("no such session")
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -150,10 +159,15 @@ impl SessionSpec {
             } else {
                 Mode::OneWayReplica
             },
-            ignores: if role == Role::Tree {
-                vec![".git".into()]
-            } else {
-                vec![]
+            ignores: match role {
+                Role::Tree => super::git_replica::TREE_VCS_IGNORES
+                    .iter()
+                    .map(|pattern| (*pattern).to_owned())
+                    .collect(),
+                Role::Git => super::git_replica::GIT_SESSION_IGNORES
+                    .iter()
+                    .map(|pattern| (*pattern).to_owned())
+                    .collect(),
             },
             ignore_vcs: role == Role::Tree,
             staging: if role == Role::Tree {
@@ -201,6 +215,8 @@ pub struct SessionStatus {
     pub excluded_scan_problems: SideCounts,
     pub excluded_transition_problems: SideCounts,
     pub staging: Option<Staging>,
+    /// What the laptop side held at its last scan (Mutagen's `totalFileSize`), in bytes.
+    pub laptop_bytes: u64,
     pub last_error: Option<String>,
 }
 
@@ -218,6 +234,7 @@ impl SessionStatus {
             excluded_scan_problems: SideCounts::default(),
             excluded_transition_problems: SideCounts::default(),
             staging: None,
+            laptop_bytes: 0,
             last_error: Some(reason),
         }
     }
@@ -301,6 +318,7 @@ pub struct Staging {
     pub expected_bytes: u64,
     pub received_bytes: u64,
     pub total_received_bytes: u64,
+    pub received_files: u64,
     pub expected_files: u64,
     pub path: Option<String>,
 }

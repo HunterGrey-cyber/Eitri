@@ -1,5 +1,7 @@
 //! GTK-free identities and shared contracts for remote project sync.
 
+pub mod actor;
+pub mod conflicts;
 pub mod daemon;
 pub mod engine;
 pub mod git_replica;
@@ -8,14 +10,32 @@ pub mod ignores;
 pub mod local_git;
 pub mod mutagen;
 pub mod mutagen_json;
+pub mod quiet;
+pub mod recreate;
+pub mod sessions;
 pub mod shim_dir;
+pub mod status_file;
 pub mod status_schema;
 pub mod transport;
+pub mod tripwire;
 
 use sha2::{Digest, Sha256};
 use std::fmt;
 use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
+
+/// The embedded editor's early startup command, including both modules for a plugin-free runtimepath.
+pub fn nvim_loader(root: &Path, program: &str) -> String {
+    use crate::onboarding::lua_text::quote_bytes;
+    format!(
+        "lua package.preload['eitri.remote']=function()\n{}\nend; package.preload['eitri.remote.sync']=function()\n{}\nend; \
+         require('eitri.remote').setup({{embedded=true,root={},cmd={}}})",
+        include_str!("../../../nvim/eitri.nvim/lua/eitri/remote/init.lua"),
+        include_str!("../../../nvim/eitri.nvim/lua/eitri/remote/sync.lua"),
+        quote_bytes(root.as_os_str().as_bytes()),
+        quote_bytes(program.as_bytes()),
+    )
+}
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct SyncKey(String);

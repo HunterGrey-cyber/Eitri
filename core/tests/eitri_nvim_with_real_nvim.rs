@@ -317,7 +317,7 @@ assert(jobs == 0 and #argv() == 0)
 
 #[test]
 #[ignore = "needs a real nvim with serverstart() socket access"]
-fn the_plugin_file_defines_three_commands_and_one_global() {
+fn the_plugin_file_defines_four_commands_and_one_global() {
     check(
         "load",
         r#"
@@ -328,7 +328,7 @@ for name in pairs(commands_after) do
   if commands_before[name] == nil then table.insert(added, name) end
 end
 table.sort(added)
-assert(vim.deep_equal(added, {'EitriOpen', 'EitriPage', 'EitriPanel'}), vim.inspect(added))
+assert(vim.deep_equal(added, {'EitriOpen', 'EitriPage', 'EitriPanel', 'EitriSync'}), vim.inspect(added))
 for name in pairs(commands_before) do assert(commands_after[name] ~= nil, name) end
 assert(vim.g.loaded_eitri == 1)
 local globals_after = vim.fn.eval('copy(g:)')
@@ -336,7 +336,8 @@ globals_after.loaded_eitri = nil
 assert(vim.deep_equal(globals_before, globals_after), vim.inspect(globals_after))
 assert(vim.deep_equal(maps_before, all_maps()))
 assert(#vim.fn.timer_info() == 0)
-assert(vim.deep_equal(autocmds_before, vim.api.nvim_get_autocmds({})))
+local other = vim.tbl_filter(function(a) return a.group_name ~= "EitriRemote" end, vim.api.nvim_get_autocmds({}))
+assert(vim.deep_equal(autocmds_before, other))
 vim.cmd('runtime plugin/eitri.lua')
 assert(jobs == 0 and #argv() == 0)
 "#,
@@ -352,7 +353,7 @@ fn checkhealth_names_the_program_and_its_page_ids() {
 require('eitri').setup({cmd = vim.fn.exepath('eitri')})
 vim.cmd('checkhealth eitri')
 local text = table.concat(vim.api.nvim_buf_get_lines(0, 0, -1, false), '\n')
-for _, word in ipairs({vim.fn.exepath('eitri'), 'eitri 9.8.7', 'notes', 'preview', 'until a command'}) do
+for _, word in ipairs({vim.fn.exepath('eitri'), 'eitri 9.8.7', 'notes', 'preview', ':EitriSync'}) do
   assert(text:find(word, 1, true), text)
 end
 assert(vim.deep_equal(argv(), {'--version', 'page', '--list'}), vim.inspect(argv()))

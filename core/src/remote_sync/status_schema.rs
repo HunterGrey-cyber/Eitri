@@ -18,6 +18,21 @@ pub struct StatusFile {
     pub copied_back: Vec<String>,
     pub paused: Option<PauseRecord>,
     pub written_unix_ms: u64,
+    /// Paths the last ignore change left out of sync while this laptop still holds them.
+    #[serde(default)]
+    pub kept_here: Vec<String>,
+    /// A line the person should see while it holds (re-creation waiting for quiet, sync not started, ...).
+    #[serde(default)]
+    pub notice: Option<String>,
+    /// How many more paths than `copied_back` lists were copied back.
+    #[serde(default)]
+    pub copied_back_more: u64,
+    /// Conflicts Mutagen counted but did not list.
+    #[serde(default)]
+    pub conflicts_more: u64,
+    /// Scan and transition problems Mutagen counted but did not list.
+    #[serde(default)]
+    pub problems_more: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -57,7 +72,15 @@ pub struct SyncChip {
     pub host: String,
     pub phase: String,
     pub conflicts: u32,
+    #[serde(default)]
+    pub git_pct: u8,
     pub paused_reason: Option<String>,
+}
+
+impl SyncChip {
+    pub fn page_payload(&self) -> String {
+        serde_json::json!({"kind":"sync_status", "chip":self}).to_string()
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -95,8 +118,14 @@ mod tests {
                 reason: "tripwire".into(),
                 detail: "large batch".into(),
                 since_unix_ms: 123,
+                path: None,
             }),
             written_unix_ms: 456,
+            kept_here: vec!["dist".into()],
+            notice: Some("ignore rules changed; applying when idle".into()),
+            copied_back_more: 0,
+            conflicts_more: 2,
+            problems_more: 3,
         };
         assert_eq!(read_status(&serde_json::to_vec(&status).unwrap()).unwrap(), status);
         status.version += 1;
@@ -105,6 +134,7 @@ mod tests {
             .contains("version 2"));
         assert!(read_status(b"{}").is_err());
         let chip = SyncChip {
+            git_pct: 0,
             host: "example-host".into(),
             phase: "paused".into(),
             conflicts: 1,

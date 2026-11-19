@@ -48,6 +48,8 @@ struct Endpoint {
     excluded_scan_problems: u64,
     #[serde(default, deserialize_with = "null_default")]
     excluded_transition_problems: u64,
+    #[serde(default, deserialize_with = "null_default")]
+    total_file_size: u64,
 }
 
 #[derive(Default, Deserialize)]
@@ -58,9 +60,8 @@ struct Progress {
     received_size: u64,
     #[serde(default, deserialize_with = "null_default")]
     expected_size: u64,
-    #[serde(rename = "receivedFiles")]
     #[serde(default, deserialize_with = "null_default")]
-    _received_files: u64,
+    received_files: u64,
     #[serde(default, deserialize_with = "null_default")]
     expected_files: u64,
     #[serde(default, deserialize_with = "null_default")]
@@ -141,6 +142,7 @@ fn convert(raw: Session) -> Result<SessionStatus, SyncError> {
                 expected_bytes: progress.expected_size,
                 received_bytes: progress.received_size,
                 total_received_bytes: progress.total_received_size,
+                received_files: progress.received_files,
                 expected_files: progress.expected_files,
                 path: progress.path.clone(),
             });
@@ -201,6 +203,11 @@ fn convert(raw: Session) -> Result<SessionStatus, SyncError> {
             raw.beta.excluded_transition_problems,
         ),
         staging,
+        laptop_bytes: if role.alpha_side() == Side::Laptop {
+            raw.alpha.total_file_size
+        } else {
+            raw.beta.total_file_size
+        },
         last_error: raw.last_error.filter(|s| !s.is_empty()),
     })
 }

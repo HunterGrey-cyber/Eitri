@@ -1,3 +1,4 @@
+import { SyncChip, type SyncStatus } from "../syncChip";
 import { useLayoutEffect, useRef, useState } from "react";
 import { afterPaint } from "../afterPaint";
 import { lookOnScreen } from "../lookOnScreen";
@@ -15,6 +16,7 @@ function cellsStyle(seg: Seg): CSSProperties | undefined {
 
 type Props = {
   facts: BandFacts;
+  syncChip?: SyncStatus | null;
   /** Dim, never hidden, while the pane lacks the keys. */
   paneFocused: boolean;
   /** The key that brings the keyboard into this panel (`panelEntryKey`), named in the dim mode block's title.
@@ -104,7 +106,7 @@ function renderLeftSeg(
 /** One bottom statusline, rendered from `bandLayout`'s segments. Measure its content-box width
  *  and the mono character width to decide what fits. Re-measure the hidden `.band-measure` span
  *  when its box changes, including font or theme pushes, then turn each segment into markup. */
-export function StatusBand({ facts, paneFocused, entryKey, onOpenDetail, onJump, onOpenTasks, onPickModel, onPickEffort, onLookMeasured, messageElRef }: Props) {
+export function StatusBand({ facts, syncChip, paneFocused, entryKey, onOpenDetail, onJump, onOpenTasks, onPickModel, onPickEffort, onLookMeasured, messageElRef }: Props) {
   const bandRef = useRef<HTMLDivElement>(null);
   const measureRef = useRef<HTMLSpanElement>(null);
   const [widthPx, setWidthPx] = useState(0);
@@ -213,6 +215,7 @@ export function StatusBand({ facts, paneFocused, entryKey, onOpenDetail, onJump,
         <div className="band-open">{detailLeft.map((seg) => renderLeftSeg(seg, facts, paneFocused, glyphMode, entryKey, messageRef))}</div>
       )}
       {background && <button type="button" className="band-seg band-background" onClick={onOpenTasks}>{background.text}</button>}
+      {syncChip && <SyncChip chip={syncChip} />}
       <span className="band-spacer" />
       <div className="band-right">
         {right.map((seg) => {

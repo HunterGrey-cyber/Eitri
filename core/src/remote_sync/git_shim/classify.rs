@@ -409,7 +409,8 @@ pub(super) fn classify_invocation(args: &[OsString], allow_local: bool) -> Route
     };
     paths.extend(output_files.into_iter().flatten());
     let whole = match cmd {
-        "commit" => paths.is_empty() || short('a') || has("--all"),
+        // `--include` commits what the index already holds as well as the named paths.
+        "commit" => paths.is_empty() || short('a') || has("--all") || short('i') || has("--include"),
         "add" => paths.is_empty() || paths.iter().any(|p| p == Path::new(".")),
         "stash" => true,
         "checkout" => paths.is_empty(),

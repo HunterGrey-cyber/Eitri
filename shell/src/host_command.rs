@@ -68,6 +68,10 @@ pub(crate) fn run(args: impl IntoIterator<Item = OsString>) -> Option<glib::Exit
         .map(|home| PathBuf::from(home).join(".ssh/known_hosts"))
         .unwrap_or_default();
     let mut reach = cli::SshReach::new(ssh_dir, exe, known_hosts);
+    // The sync verbs, and `stop`/`uninstall` (which pause or end sync sessions), use `remote_dev.*` from `init.lua`.
+    if matches!(rest.first().map(String::as_str), Some("sync" | "stop" | "uninstall")) {
+        reach = reach.with_sync_settings(init_sync_settings());
+    }
     let mut term = Stdio;
     let enabled = remote_dev_enabled;
     let now = std::time::SystemTime::now()
@@ -105,6 +109,22 @@ pub(crate) fn remote_dev_enabled() -> bool {
         eprintln!("eitri: {why}; remote development stays off");
         false
     })
+}
+
+/// `remote_dev.*` for the sync verbs, read from `init.lua` the way [`remote_dev_enabled`] reads its key.
+fn init_sync_settings() -> eitri_core::remote_host::cli_sync::SyncSettings {
+    let Ok(config_dir) = eitri_core::config_dir::resolve(&|key| std::env::var_os(key)) else {
+        return Default::default();
+    };
+    let Ok(kernel) = Kernel::new(config_dir.clone(), refuse_panels) else {
+        return Default::default();
+    };
+    kernel.load_init_file(&config_dir.join("init.lua"));
+    let (settings, problems) = sync_settings(&kernel.config.borrow());
+    for problem in problems {
+        eprintln!("eitri: {problem}");
+    }
+    settings
 }
 
 /// The terminal `eitri host` runs in: lines to stdout, questions answered on stdin.
@@ -168,6 +188,40 @@ pub(crate) fn git_shim_options(
             enabled,
             flush_cap,
             mutagen,
+        },
+        problems,
+    )
+}
+
+/// `remote_dev.mutagen`, `remote_dev.tripwire_mib` and `remote_dev.flush_cap` for the sync actor and the sync verbs;
+/// a value that does not parse leaves the default, with the problem said.
+pub(crate) fn sync_settings(
+    config: &eitri_core::lua::config::ConfigStore,
+) -> (eitri_core::remote_host::cli_sync::SyncSettings, Vec<String>) {
+    use eitri_core::lua::config::*;
+    let mut problems = vec![];
+    let mut fallback = |error: String| problems.push(format!("{error}; sync uses the default"));
+    let defaults = eitri_core::remote_host::cli_sync::SyncSettings::default();
+    let mutagen = parse_remote_dev_mutagen(config.get(REMOTE_DEV_MUTAGEN_KEY)).unwrap_or_else(|e| {
+        fallback(e);
+        None
+    });
+    let tripwire_mib = parse_remote_dev_tripwire_mib(config.get(REMOTE_DEV_TRIPWIRE_MIB_KEY)).unwrap_or_else(|e| {
+        fallback(e);
+        defaults.tripwire_mib
+    });
+    let flush_cap = parse_remote_dev_flush_cap(config.get(REMOTE_DEV_FLUSH_CAP_KEY))
+        .map(std::time::Duration::from_secs_f64)
+        .unwrap_or_else(|e| {
+            fallback(e);
+            defaults.flush_cap
+        });
+    (
+        eitri_core::remote_host::cli_sync::SyncSettings {
+            enabled: parse_remote_dev_enabled(config.get(REMOTE_DEV_ENABLED_KEY)).unwrap_or(false),
+            mutagen,
+            tripwire_mib,
+            flush_cap,
         },
         problems,
     )

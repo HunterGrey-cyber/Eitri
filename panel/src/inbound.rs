@@ -780,6 +780,7 @@ pub(super) fn handle_inbound_message(
                 );
                 // Whether the page may speak of a turn's changes, before the tabs it would speak of.
                 window.insert(1, review_settings_payload(state));
+                window.extend(state.sync_chip.as_ref().map(|chip| chip.page_payload()));
                 if view.is_base() {
                     if let Some(pages) = &state.page_lines {
                         window.push(eitri_core::agent_bridge::serialize_pages_for_js(pages));

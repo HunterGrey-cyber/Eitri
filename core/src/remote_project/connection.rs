@@ -269,6 +269,22 @@ impl RemoteConnection {
         self.client.watch_modes(request).map_err(|error| error.to_string())
     }
 
+    /// The mode keepers' lines from a fresh Hello (every Hello repeats them; the caller keeps what it showed).
+    pub fn mode_lines(&self) -> Result<Vec<crate::remote_sync::sessions::ModeLine>, String> {
+        self.require_capability(wire::CAP_SYNC_MODES)?;
+        let hello = self.client.hello().map_err(|error| error.to_string())?;
+        Ok(hello
+            .mode_warnings
+            .into_iter()
+            .map(|line| crate::remote_sync::sessions::ModeLine {
+                root: line.root,
+                text: line.text,
+                sequence: line.sequence,
+                epoch: line.epoch,
+            })
+            .collect())
+    }
+
     pub fn list_tree(
         &self,
         request: wire::ListTreeRequest,

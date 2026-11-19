@@ -4,7 +4,7 @@ use serde_json::{json, Value};
 use std::fs;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::PermissionsExt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 struct Fake {
     root: PathBuf,
@@ -242,6 +242,38 @@ fn a_halted_or_missing_session_is_never_ready() {
         SyncState::Disconnected(_)
     ));
     assert!(parse_sessions(b"{}").is_err());
+}
+
+/// The replica's description and the engine's spec are one session: same name, endpoints, ignores and symlink mode.
+#[test]
+fn git_spec_matches_the_replica_plan() {
+    let key = tree().key;
+    let spec = SessionSpec::git(key.clone(), "/srv/project-laptop".into(), "/srv/project".into());
+    let plan = crate::remote_sync::git_replica::git_session_plan(
+        &key,
+        Path::new("/srv/project-laptop"),
+        Path::new("/srv/project"),
+    );
+    assert_eq!(spec.name, plan.name);
+    assert_eq!(
+        spec.alpha,
+        Endpoint::Server {
+            key: key.clone(),
+            root: plan.server_root.clone()
+        }
+    );
+    assert_eq!(spec.beta, Endpoint::Laptop(plan.laptop_git_dir.clone()));
+    assert_eq!(spec.ignores, plan.ignores);
+    assert_eq!(spec.symlink_mode, Some(SymlinkMode::Ignore));
+    assert_eq!(plan.symlink_mode, "ignore");
+    let args = arg_strings(create_args(&spec).unwrap());
+    for ignore in &plan.ignores {
+        assert!(
+            args.windows(2).any(|w| w[0] == "-i" && w[1] == csv_value(ignore)),
+            "{ignore}"
+        );
+    }
+    assert!(!args.contains(&"--ignore-vcs".to_owned()));
 }
 
 #[test]
@@ -743,6 +775,7 @@ fn null_flags_counts_and_endpoints_default_without_making_a_session_ready() {
                 expected_bytes: 0,
                 received_bytes: 0,
                 total_received_bytes: 0,
+                received_files: 0,
                 expected_files: 0,
                 path: None,
             })

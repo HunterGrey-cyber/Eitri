@@ -82,12 +82,12 @@ pub struct SidecarStart {
 }
 
 pub use eitri_server_proto::{
-    exec_input, exec_output, ExecExit, ExecInput, ExecOutput, ExecPurpose, ExecStart, GitConfigRequest,
-    GitConfigResponse, ListTreeEntry, ListTreeRequest, PathSizesRequest, PathSizesResponse, ProjectActivityRequest,
-    ProjectActivityResponse, ReadFileChunk, ReadFileRequest, RemoveFileIfRequest, RemoveFileIfResponse,
-    ReplaceFileIfRequest, ReplaceFileIfResponse, SyncIgnoresRequest, SyncIgnoresResponse, WaitFileHashRequest,
-    WaitFileHashResponse, WatchModesRequest, WatchModesResponse, CAP_EXEC, CAP_GIT_CONFIG, CAP_INSTALLATION_ARGS,
-    CAP_SYNC_FILES, CAP_SYNC_IGNORES, CAP_SYNC_MODES,
+    exec_input, exec_output, ExecExit, ExecInput, ExecOutput, ExecPurpose, ExecStart, GitConfigEntry, GitConfigRequest,
+    GitConfigResponse, ListTreeEntry, ListTreeRequest, PathSize, PathSizesRequest, PathSizesResponse,
+    ProjectActivityRequest, ProjectActivityResponse, ReadFileChunk, ReadFileRequest, RemoveFileIfRequest,
+    RemoveFileIfResponse, ReplaceFileIfRequest, ReplaceFileIfResponse, SyncIgnoresRequest, SyncIgnoresResponse,
+    WaitFileHashRequest, WaitFileHashResponse, WatchModesRequest, WatchModesResponse, CAP_EXEC, CAP_GIT_CONFIG,
+    CAP_INSTALLATION_ARGS, CAP_SYNC_FILES, CAP_SYNC_IGNORES, CAP_SYNC_MODES,
 };
 
 /// A checked START proved that an older installation was collected with no surviving agents.
