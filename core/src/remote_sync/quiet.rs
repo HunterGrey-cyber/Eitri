@@ -106,17 +106,8 @@ pub fn write_report(state_home: &Path, sync_dir: &Path, report: &EditorReport) -
     agent::private_fs::create_private_dir_all(&dir, &state_home.join("eitri"))?;
     let bytes = serde_json::to_vec(report).map_err(io::Error::other)?;
     let temporary = dir.join(format!(".{}-{}.tmp", report.pid, uuid::Uuid::new_v4()));
-    let written = (|| {
-        use std::io::Write;
-        let mut file = agent::private_fs::open_private(&temporary)?;
-        file.write_all(&bytes)?;
-        drop(file);
-        std::fs::rename(&temporary, dir.join(format!("{}.json", report.pid)))
-    })();
-    if written.is_err() {
-        let _ = std::fs::remove_file(&temporary);
-    }
-    written
+    let path = dir.join(format!("{}.json", report.pid));
+    agent::private_fs::replace_private(&temporary, &path, &bytes, agent::private_fs::Flush::Nothing)
 }
 
 /// Removes this process's report, when it stops reporting.

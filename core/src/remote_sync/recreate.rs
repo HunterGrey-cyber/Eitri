@@ -186,23 +186,14 @@ pub fn read_created_patterns(sync_dir: &Path) -> Option<Vec<String>> {
 }
 
 pub fn write_created_patterns(sync_dir: &Path, patterns: &[String]) -> io::Result<()> {
-    use std::io::Write;
     #[cfg(test)]
     if test_failures::UNWRITABLE.lock().unwrap().contains(sync_dir) {
         return Err(io::Error::other("the disk is full"));
     }
     let bytes = serde_json::to_vec(patterns).map_err(io::Error::other)?;
     let temporary = sync_dir.join(format!(".ignores-{}.tmp", uuid::Uuid::new_v4()));
-    let written = (|| {
-        let mut file = agent::private_fs::open_private(&temporary)?;
-        file.write_all(&bytes)?;
-        drop(file);
-        std::fs::rename(&temporary, sync_dir.join("ignores.json"))
-    })();
-    if written.is_err() {
-        let _ = std::fs::remove_file(&temporary);
-    }
-    written
+    let path = sync_dir.join("ignores.json");
+    agent::private_fs::replace_private(&temporary, &path, &bytes, agent::private_fs::Flush::Nothing)
 }
 
 /// Tests make the ignore list's write fail for one sync directory while the old list stays readable.
@@ -230,20 +221,10 @@ pub fn read_progress(sync_dir: &Path) -> Option<Progress> {
 }
 
 pub fn write_progress(sync_dir: &Path, progress: &Progress) -> io::Result<()> {
-    use std::io::Write;
     let bytes = serde_json::to_vec(progress).map_err(io::Error::other)?;
     let temporary = sync_dir.join(format!(".recreate-{}.tmp", uuid::Uuid::new_v4()));
-    let written = (|| {
-        let mut file = agent::private_fs::open_private(&temporary)?;
-        file.write_all(&bytes)?;
-        file.sync_all()?;
-        drop(file);
-        std::fs::rename(&temporary, sync_dir.join("recreate.json"))
-    })();
-    if written.is_err() {
-        let _ = std::fs::remove_file(&temporary);
-    }
-    written
+    let path = sync_dir.join("recreate.json");
+    agent::private_fs::replace_private(&temporary, &path, &bytes, agent::private_fs::Flush::File)
 }
 
 pub fn clear_progress(sync_dir: &Path) {

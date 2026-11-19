@@ -4,7 +4,7 @@
 //! The file is written whole to a private temporary beside it and renamed over, so a reader sees the old file or the
 //! new one, never a part.
 
-use std::io::{self, Write};
+use std::io;
 use std::path::{Path, PathBuf};
 
 use super::engine::{EntryKind, SessionStatus, Side, SyncState};
@@ -30,17 +30,7 @@ pub fn prepare_dir(state_home: &Path, dir: &Path) -> io::Result<()> {
 pub fn write_status(dir: &Path, status: &StatusFile) -> io::Result<()> {
     let bytes = serde_json::to_vec_pretty(status).map_err(io::Error::other)?;
     let temporary = dir.join(format!(".status-{}.tmp", uuid::Uuid::new_v4()));
-    let written = (|| {
-        let mut file = agent::private_fs::open_private(&temporary)?;
-        file.write_all(&bytes)?;
-        file.sync_all()?;
-        drop(file);
-        std::fs::rename(&temporary, status_path(dir))
-    })();
-    if written.is_err() {
-        let _ = std::fs::remove_file(&temporary);
-    }
-    written
+    agent::private_fs::replace_private(&temporary, &status_path(dir), &bytes, agent::private_fs::Flush::File)
 }
 
 /// Reads `status.json`; a missing, unreadable or other-version file is an error naming why.
@@ -287,5 +277,68 @@ mod tests {
         let chip = chip(&status);
         assert_eq!(chip.phase, "paused");
         assert!(chip.paused_reason.unwrap().contains("70 MiB"));
+    }
+
+    /// The sync directory's state files go through `replace_private`: each is 0600, no temporary is left, and the
+    /// status and a re-creation in progress are flushed before their rename while an editor's report and the
+    /// ignore list are not.
+    #[test]
+    fn sync_state_files_are_replaced_whole_with_their_flush() {
+        use crate::remote_sync::{quiet, recreate};
+        use agent::private_fs::replace_test_hooks::syncs;
+        use std::os::unix::fs::MetadataExt;
+        let state = agent::state_dirs::test_workspace_dir("sync-state-files");
+        let dir = sync_dir(&state, &SyncKey::new("SHA256:example", Path::new("/srv/project")));
+        prepare_dir(&state, &dir).unwrap();
+        let flushes = |write: &dyn Fn() -> io::Result<()>| {
+            let before = syncs();
+            write().unwrap();
+            syncs() - before
+        };
+        let status = compose("example-host", &SyncRecord::default(), None, None, None, 1);
+        assert_eq!(flushes(&|| write_status(&dir, &status)), 1, "the status");
+        let progress = recreate::Progress {
+            why: "the ignores changed".into(),
+            one_sided: None,
+        };
+        assert_eq!(
+            flushes(&|| recreate::write_progress(&dir, &progress)),
+            1,
+            "the progress"
+        );
+        let patterns = ["/target/".to_owned()];
+        assert_eq!(
+            flushes(&|| recreate::write_created_patterns(&dir, &patterns)),
+            0,
+            "the ignores"
+        );
+        let report = quiet::EditorReport {
+            pid: 4242,
+            written_unix_ms: 1,
+            answer: None,
+        };
+        assert_eq!(flushes(&|| quiet::write_report(&state, &dir, &report)), 0, "the report");
+        let editors = quiet::editors_dir(&dir);
+        for path in [
+            status_path(&dir),
+            dir.join("recreate.json"),
+            dir.join("ignores.json"),
+            editors.join("4242.json"),
+        ] {
+            assert_eq!(
+                std::fs::metadata(&path).unwrap().mode() & 0o777,
+                0o600,
+                "{}",
+                path.display()
+            );
+        }
+        for listed in [&dir, &editors] {
+            let temporaries: Vec<_> = std::fs::read_dir(listed)
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name())
+                .filter(|name| name.to_string_lossy().ends_with(".tmp"))
+                .collect();
+            assert!(temporaries.is_empty(), "{temporaries:?} left in {}", listed.display());
+        }
     }
 }
