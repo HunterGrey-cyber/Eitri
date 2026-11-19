@@ -171,7 +171,17 @@ pub struct Host {
     /// (`settle_input_method`).
     page_loaded: Cell<bool>,
     input_method_settled: Cell<bool>,
+    /// What the turns and the page's refused focus requests did, with when (ms since the host was made), for the
+    /// acceptance build's state.
+    input_method_log: RefCell<Vec<String>>,
+    made_at: Instant,
+    /// Turns that failed since the last that held, each tried again a little later, up to `INPUT_METHOD_RETRIES`.
+    input_method_retries: Cell<u8>,
 }
+
+/// How many times a failed turn through the web view is tried again, and how far apart.
+const INPUT_METHOD_RETRIES: u8 = 3;
+const INPUT_METHOD_RETRY_AFTER: Duration = Duration::from_millis(300);
 
 impl Host {
     /// Whether the panel has a timer armed, including its fallback steady timer.
@@ -211,6 +221,9 @@ impl Host {
             extra_windows: Cell::new(0),
             page_loaded: Cell::new(false),
             input_method_settled: Cell::new(false),
+            input_method_log: RefCell::new(Vec::new()),
+            made_at: Instant::now(),
+            input_method_retries: Cell::new(0),
         });
         host.observe_termination();
         HOST_FOR_LATER.with(|h| *h.borrow_mut() = Rc::downgrade(&host));
@@ -228,9 +241,11 @@ impl Host {
         let weak = Rc::downgrade(&host);
         host.panel_view.gate().on_refused(move || {
             if let Some(host) = weak.upgrade() {
+                host.note_input_method("the page's focus refused");
                 host.reconcile("the page asked for the keys");
                 // The page's refused focus leaves the editor unable to compose (`settle_input_method`).
                 host.input_method_settled.set(false);
+                host.input_method_retries.set(0);
                 host.settle_input_method();
             }
         });
@@ -610,14 +625,28 @@ impl Host {
         }
     }
 
+    fn note_input_method(&self, what: &str) {
+        let at = self.made_at.elapsed().as_millis();
+        self.input_method_log.borrow_mut().push(format!("{at} ms {what}"));
+    }
+
+    /// The input method's state for the acceptance build: the page loaded, the turn settled, what happened when.
+    pub(crate) fn input_method_state(&self) -> (bool, bool, Vec<String>) {
+        (
+            self.page_loaded.get(),
+            self.input_method_settled.get(),
+            self.input_method_log.borrow().clone(),
+        )
+    }
+
     /// The editor composes with an input method (Pinyin) only while the page's own focus requests have been met: once
     /// the page has focused its composer with the editor holding the keys (it does at every load, and the gate
     /// refuses it), Pinyin hands winit its letters uncomposed, the editor's view first responder and its input context
     /// current all the while. Measured on macOS 26.7 with the product's page (the acceptance item `pinyin-switch`):
     /// blurring the composer, reactivating the editor's input context, or resigning and retaking first responder do
     /// not mend it; one turn of the keys through the web view does, and holds through input source changes. So after
-    /// a load and after each refused focus, once the window is key and the panel on screen, the web view takes the
-    /// keys and gives them straight back to the editor: the pane stays the editor's, and neither nvim nor the panel is
+    /// a load and after each refused focus, once the window is key (the panel shown for the turn alone if it is hidden), the
+    /// web view takes the keys and gives them straight back to the editor: the pane stays the editor's, and neither nvim nor the panel is
     /// told of a move. With the keys in the panel, the web view has them and nothing is needed.
     fn settle_input_method(&self) {
         if self.input_method_settled.get() || !self.page_loaded.get() {
@@ -630,19 +659,43 @@ impl Host {
             self.input_method_settled.set(true);
             return;
         }
-        if !window.isKeyWindow() || self.web_view().isHidden() || self.pane.get() != Pane::Editor {
+        if !window.isKeyWindow() || self.pane.get() != Pane::Editor {
             return;
+        }
+        // A hidden view cannot take the keys, and a refusal while the panel is hidden breaks the editor the same way
+        // (measured: `pinyin-hidden`): the view is shown for the turn alone and hidden again before this returns, so
+        // AppKit, which draws after the run loop's turn, never draws it, and no key arrives in between.
+        let web = self.web_view();
+        let was_hidden = web.isHidden();
+        if was_hidden {
+            // Not reported shown: the open tab's news would count as seen.
+            self.panel_view.show_unreported(true);
+            web.setHidden(false);
         }
         let gate = self.panel_view.gate();
         gate.set_editor_has_keys(false);
-        let took = window.makeFirstResponder(Some(self.web_view()));
+        let took = window.makeFirstResponder(Some(web));
         gate.set_editor_has_keys(true);
         let back = window.makeFirstResponder(Some(&editor));
+        if was_hidden {
+            web.setHidden(true);
+            self.panel_view.show_unreported(false);
+        }
         // Settled only by a whole turn: a view that kept the keys goes back to the pane's, and the turn is tried again.
         self.input_method_settled.set(took && back);
         crate::log_line!("[mac] the input method's turn through the web view: taken {took}, given back {back}");
+        self.note_input_method(&format!("turn: taken {took}, given back {back}"));
         if !back {
             self.reconcile("the input method's turn could not give the editor the keys back");
+        }
+        if took && back {
+            self.input_method_retries.set(0);
+        } else if self.input_method_retries.get() < INPUT_METHOD_RETRIES {
+            // Nothing else would try again: the editor's own keys find the first responder agreeing with the pane.
+            self.input_method_retries.set(self.input_method_retries.get() + 1);
+            if let Some(host) = HOST_FOR_LATER.with(|h| h.borrow().upgrade()) {
+                after(self.mtm, INPUT_METHOD_RETRY_AFTER, move || host.settle_input_method());
+            }
         }
     }
 

@@ -90,6 +90,9 @@ struct Bridge {
     disconnected: Cell<bool>,
     /// Told each time the newest load has ended, finished or failed.
     on_loaded: RefCell<Option<Rc<dyn Fn()>>>,
+    /// Set while the window shows the view for a moment nobody sees (`PanelView::show_unreported`): it is not reported
+    /// shown then, which would mark the open tab's news as seen.
+    unreported_show: Cell<bool>,
     #[cfg(any(test, debug_assertions, feature = "test-support"))]
     navigation_cancellations: Cell<u64>,
 }
@@ -404,7 +407,7 @@ impl GuardedWebView {
     }
 
     fn report_if_shown(&self) {
-        if !self.is_on_screen() {
+        if !self.is_on_screen() || self.ivars().bridge.unreported_show.get() {
             return;
         }
         if let Some(events) = self.ivars().bridge.events() {
@@ -645,6 +648,12 @@ impl PanelView {
             self.view
                 .evaluateJavaScript_completionHandler(&NSString::from_str(script), Some(&done));
         }
+    }
+
+    /// While `on`, the view being shown is not reported to the panel: the window shows it for a moment it hides again
+    /// within the same call, and a report would mark what nobody saw as seen.
+    pub fn show_unreported(&self, on: bool) {
+        self.bridge.unreported_show.set(on);
     }
 
     /// Calls `f` each time the newest document load has ended (finished or failed).

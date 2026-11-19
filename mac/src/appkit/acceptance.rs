@@ -255,7 +255,8 @@ fn resize_request(request: &Value) -> Option<(f64, f64)> {
 
 fn editor_input_context(host: &Host) -> Value {
     let (source, current) = host.editor_input_context();
-    json!({"source": source, "current": current})
+    let (loaded, settled, log) = host.input_method_state();
+    json!({"source": source, "current": current, "page_loaded": loaded, "settled": settled, "log": log})
 }
 
 fn state(host: &Host) -> Value {
