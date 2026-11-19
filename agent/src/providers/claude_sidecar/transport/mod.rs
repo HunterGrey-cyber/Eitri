@@ -97,7 +97,9 @@ pub(crate) trait SidecarTransport: Send {
         let _ = (session_id, last_folded_sequence);
         None
     }
-    /// The server helper's version as its Hello stated it; `None` for a sidecar on this machine.
+    /// The server helper's version as its Hello stated it; `None` for a sidecar on this machine. Read only by a
+    /// chat's move to another window (`moving.rs`), which is Linux-only.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     fn helper_version(&self) -> Option<String> {
         None
     }

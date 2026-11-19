@@ -43,7 +43,8 @@ impl ThroughHelper {
 
 impl ThroughHelper {
     /// The same transport for a sidecar whose helper's Hello another window heard: its version and
-    /// warnings as that window recorded them.
+    /// warnings as that window recorded them. Only a chat's move (`moving.rs`, Linux-only) makes one.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     pub(crate) fn known(
         client: HelperClient,
         sidecar_id: String,

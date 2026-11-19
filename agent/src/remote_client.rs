@@ -331,7 +331,9 @@ impl HelperClient {
 
     /// A move is adopted on the UI thread. It can reuse a known owner without I/O; unresolved
     /// ownership must be settled by the worker reattachment before this tab can move. A default
-    /// connection without an installation inventory retains its default helper route.
+    /// connection without an installation inventory retains its default helper route. Called by a chat's move
+    /// (`moving.rs`, Linux-only) and this file's tests.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     pub(crate) fn for_known_owner(&self, daemon: &str) -> io::Result<Self> {
         let installations = self.inner.installations.lock().expect("helper installations");
         if daemon.is_empty() && self.daemon().is_empty() && installations.is_none() {

@@ -345,7 +345,7 @@ fn canonical(path: &Path) -> PathBuf {
 /// (to [`Kind::link_depth`]) leads. `None` when one of those could not be established.
 fn spellings(places: &[(PathBuf, Kind)]) -> Option<Vec<Vec<String>>> {
     let mut out: Vec<Vec<String>> = Vec::new();
-    let mut add = |path: &Path, out: &mut Vec<Vec<String>>| {
+    let add = |path: &Path, out: &mut Vec<Vec<String>>| {
         let folded = folded_components(path);
         if !folded.is_empty() && !out.contains(&folded) {
             out.push(folded);
