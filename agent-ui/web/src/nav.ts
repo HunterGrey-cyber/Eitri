@@ -86,6 +86,9 @@ export function webLinks(row: HTMLElement): { el: HTMLAnchorElement; url: string
   const seen = new Set<string>();
   const out: { el: HTMLAnchorElement; url: string }[] = [];
   for (const el of row.querySelectorAll<HTMLAnchorElement>("a[href]")) {
+    // A table drawn as a list keeps its grid beside it, `hidden` (`tableLayout.ts`): the copy a reader sees is the one
+    // that counts. Nothing else is skipped here: a link a reply hides is exactly what the pick must show.
+    if (el.closest(".table-scroll > table[hidden]") !== null) continue;
     const url = webUrl(el.getAttribute("href"));
     if (url === null || seen.has(url)) continue;
     seen.add(url);

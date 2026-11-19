@@ -14,6 +14,7 @@ import toml from "highlight.js/lib/languages/ini";
 import typescript from "highlight.js/lib/languages/typescript";
 import yaml from "highlight.js/lib/languages/yaml";
 import { escapeText, isHiddenChar } from "./revealHidden";
+import { breakTableCode } from "./tableCodeBreaks";
 
 /* The eleven languages the panel highlights, registered from `lib/core` rather than the default bundle
    so the single-file `dist` carries these and not all 190. `tsx` is typescript's own alias, and
@@ -413,6 +414,7 @@ function draw(text: string, ended = true): string {
       ...SANITIZE_CONFIG, RETURN_DOM_FRAGMENT: true,
     });
     revealCodeText(fragment);
+    breakTableCode(fragment);
     const container = document.createElement("div");
     container.append(fragment);
     return container.innerHTML;

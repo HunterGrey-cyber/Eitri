@@ -460,6 +460,21 @@ describe("webUrl and webLinks", () => {
     ]);
   });
 
+  it("skips a link in the hidden grid beside a table's list form, which holds the same links", () => {
+    const row = rowWithLinks(["https://example.com/"]);
+    const wrapper = document.createElement("div");
+    wrapper.className = "table-scroll";
+    wrapper.innerHTML = '<table hidden><tbody><tr><td><a id="g" href="https://example.com/grid">grid</a></td></tr></tbody></table>';
+    row.prepend(wrapper);
+    expect(webLinks(row).map((l) => l.el.id)).toEqual(["a0"]);
+    const loose = document.createElement("a");
+    loose.id = "h";
+    loose.hidden = true;
+    loose.setAttribute("href", "https://hidden.example/");
+    row.append(loose);
+    expect(webLinks(row).map((l) => l.el.id)).toEqual(["a0", "h"]);
+  });
+
   it("writes an internationalized host the way the browser will send it (punycode), never as typed", () => {
     // A Cyrillic "a" (U+0430) in place of the Latin one: the address that opens is the punycode one.
     const row = rowWithLinks(["https://\u0430pple.com/"]);

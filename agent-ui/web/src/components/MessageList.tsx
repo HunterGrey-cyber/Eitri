@@ -1,4 +1,5 @@
 import { attachDiagrams, detachDiagrams } from "../diagrams";
+import { forgetTables, layoutTables } from "../tableLayout";
 /// <reference types="vite/client" />
 import { rowCardLine, rowAgentCard, agentCard, isAgentCall } from "../display";
 import { Fragment, memo, useContext, useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactElement, type ReactNode } from "react";
@@ -1462,8 +1463,16 @@ const MarkdownBody = memo(function MarkdownBody({ text }: { text: string }) {
   const boxRef = useRef<HTMLDivElement>(null);
   useLayoutEffect(() => {
     const box = boxRef.current;
-    if (box) attachDiagrams(box);
-    return () => { if (box) detachDiagrams(box); };
+    if (box) {
+      attachDiagrams(box);
+      layoutTables(box);
+    }
+    return () => {
+      if (box) {
+        detachDiagrams(box);
+        forgetTables(box);
+      }
+    };
   }, [html]);
   // The text this row last put on screen, and the dropping of the one before it, happen in an effect:
   // effects run only for a render React committed, so a render it threw away cannot drop a text that
@@ -1531,6 +1540,8 @@ const StreamingMarkdown = memo(function StreamingMarkdown({ text, streaming, sel
     }
     if (next.tail !== "") box.insertAdjacentHTML("beforeend", next.tail);
     attachDiagrams(box);
+    // Only the blocks the stream has completed: a table still being written is not decided on its rows so far.
+    layoutTables(box, held.lastSettled);
     const now = performance.now();
     const spent = now - started;
     held.restUntil = spent > SLOW_TAIL_MS ? now + spent * SLOW_TAIL_REST : 0;
@@ -1553,7 +1564,10 @@ const StreamingMarkdown = memo(function StreamingMarkdown({ text, streaming, sel
       const whole = renderMarkdown(text);
       const box = boxRef.current;
       if (box !== null && (held.stream?.text !== text || held.settled + held.stream.tail !== whole)) box.innerHTML = whole;
-      if (box !== null) attachDiagrams(box);
+      if (box !== null) {
+        attachDiagrams(box);
+        layoutTables(box);
+      }
       held.stream = null;
       held.settled = "";
       held.lastSettled = null;
@@ -1570,7 +1584,12 @@ const StreamingMarkdown = memo(function StreamingMarkdown({ text, streaming, sel
   }, [text, streaming, selecting]);
   useLayoutEffect(() => {
     const box = boxRef.current;
-    return () => { if (box) detachDiagrams(box); };
+    return () => {
+      if (box) {
+        detachDiagrams(box);
+        forgetTables(box);
+      }
+    };
   }, []);
   useEffect(() => stopResting, []);
   return <div ref={boxRef} />;

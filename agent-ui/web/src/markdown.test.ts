@@ -4,7 +4,7 @@ import { describe, expect, it } from "vitest";
 import css from "./index.css?raw";
 import {
   CODE_TEXT_ATTR, codeBlockText, markdownParseCount, MAX_PROSE_ESCAPES, renderedText, renderMarkdown, renderMarkdownRevealed,
-  setMarkdownCacheChars,
+  setMarkdownCacheChars, streamMarkdown, type StreamedMarkdown,
 } from "./markdown";
 
 describe("renderMarkdown", () => {
@@ -659,5 +659,43 @@ describe("renderMarkdownRevealed: what the page holds is what is revealed", () =
   it("the escape cap counts what the page holds", () => {
     expect(renderMarkdownRevealed(`# Plan\n\n${"a&#x200b;".repeat(MAX_PROSE_ESCAPES + 1)}`) === null, "past the cap").toBe(true);
     expect(escapesIn(renderMarkdownRevealed(`# Plan\n\n${"a&#x200b;".repeat(3)}`))).toHaveLength(3);
+  });
+});
+
+describe("renderMarkdown: code in a table cell", () => {
+  const owner = "| 想了解 | 从这里读 |\n|---|---|\n| Agent 对话怎么跑 | `agent/src/providers/{claude_sidecar,codex,acp}/` |";
+
+  it("may break after a slash, and after a comma inside braces, and its text stays the same", () => {
+    const html = renderMarkdown(owner);
+    expect(html).toContain("<code>agent/<wbr>src/<wbr>providers/<wbr>{claude_sidecar,<wbr>codex,<wbr>acp}/</code>");
+    const box = document.createElement("div");
+    box.innerHTML = html;
+    expect(box.querySelector("code")!.textContent).toBe("agent/src/providers/{claude_sidecar,codex,acp}/");
+  });
+
+  it("adds no break to code outside a table or to a fenced block, and none shows in a reply's own text", () => {
+    expect(renderMarkdown("see `agent/src/x` here")).not.toContain("<wbr>");
+    expect(renderMarkdown("```\nagent/src/x\n```")).not.toContain("<wbr>");
+    expect(renderMarkdown("| a |\n|---|\n| agent/src/x |")).not.toContain("<wbr>");
+  });
+
+  it("keeps the sanitizer's allowed tags: the break is the only element added, and a reply's markup still goes", () => {
+    const html = renderMarkdown("| a |\n|---|\n| `x/y` <script>alert(1)</script><img src=x onerror=alert(1)> |");
+    expect(html).not.toMatch(/<script|<img|onerror/);
+    expect(html.match(/<wbr>/g)).toHaveLength(1);
+  });
+
+  it("a streamed table draws the same HTML as one rendering", () => {
+    const text = "intro\n\n" + owner + "\n\nafter\n";
+    const whole = renderMarkdown(text);
+    let held: StreamedMarkdown | null = null;
+    let settled = "";
+    for (let at = 0; at <= text.length; at += 7) {
+      held = streamMarkdown(held, text.slice(0, at));
+      settled = (held.restarted ? "" : settled) + held.added;
+    }
+    held = streamMarkdown(held, text);
+    settled = (held.restarted ? "" : settled) + held.added;
+    expect(settled + held.tail).toBe(whole);
   });
 });

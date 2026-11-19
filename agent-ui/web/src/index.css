@@ -358,7 +358,7 @@ pre {
   border-radius: 4px;
   font-size: var(--fs-md);
 }
-.row-assistant .table-scroll code:not(pre code) {
+.row-assistant .table-scroll table code:not(pre code) {
   overflow-wrap: normal;
   max-width: none;
 }
@@ -415,6 +415,26 @@ pre {
   overflow-wrap: normal;
 }
 .table-scroll th {
+  font-weight: 600;
+}
+/* The list form of a table the grid does not suit (`tableLayout.ts`): one block of `Header: value` lines per row,
+   which wraps at any width. It sits in the same box as the grid, which is `hidden` while this shows. The selectors
+   carry `.row-assistant` to outweigh the reply's own list rules (indent, margins) above. */
+.table-list {
+  font-size: var(--fs-prose);
+}
+.row-assistant .table-list-row {
+  list-style: none;
+  margin: 0;
+  padding: 10px 0;
+  border-bottom: 1px solid var(--rule-soft);
+}
+.row-assistant .table-list-cell {
+  list-style: none;
+  margin: 0;
+  padding: 2px 0;
+}
+.table-list-label {
   font-weight: 600;
 }
 /* Process lines are compact enough to scan; opened evidence gets its own reading space. */

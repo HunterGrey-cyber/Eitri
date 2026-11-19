@@ -16,6 +16,7 @@ import { createElement } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
 import { renderToolCall } from "./toolRegistry";
 import { renderMarkdown } from "./markdown";
+import { buildTableList } from "./tableLayout";
 import { PermissionCard } from "./components/PermissionCard";
 import { KeymapOverlay } from "./components/KeymapOverlay";
 import { WhichKeyBox } from "./components/WhichKeyBox";
@@ -3081,6 +3082,33 @@ describe("inline code keeps its cell's words and its links' decoration", () => {
     expect(code.closest(".table-scroll td")).not.toBeNull();
     expect(winningDeclarationOn(code, "overflow-wrap")).toBe("normal");
     expect(winningDeclarationOn(code, "max-width")).toBe("none");
+  });
+
+  it("in a table's list form the span wraps like prose, since nothing there scrolls", () => {
+    const [grid] = mount("| a | b |\n|---|---|\n| x | `agent/src/providers/{claude_sidecar,codex,acp}/` |");
+    const wrapper = grid.closest<HTMLElement>(".table-scroll")!;
+    wrapper.append(buildTableList(wrapper.querySelector("table")!));
+    const code = wrapper.querySelector<HTMLElement>(".table-list code")!;
+    expect(code.closest("table")).toBeNull();
+    expect(winningDeclarationOn(code, "overflow-wrap")).toBe("anywhere");
+    expect(winningDeclarationOn(code, "max-width")).toBe("100%");
+    expect(winningDeclarationOn(grid, "overflow-wrap")).toBe("normal");
+  });
+
+  it("the list form's rows are bordered blocks with no bullets and a bold label", () => {
+    const [grid] = mount("| a | b |\n|---|---|\n| x | `y` |");
+    const wrapper = grid.closest<HTMLElement>(".table-scroll")!;
+    wrapper.append(buildTableList(wrapper.querySelector("table")!));
+    const row = wrapper.querySelector<HTMLElement>(".table-list-row")!;
+    expect(winningDeclarationOn(row, "list-style")).toBe("none");
+    expect(winningDeclarationOn(row, "border-bottom")).toContain("1px solid");
+    expect(winningDeclarationOn(wrapper.querySelector<HTMLElement>(".table-list-cell")!, "list-style")).toBe("none");
+    expect(winningDeclarationOn(wrapper.querySelector<HTMLElement>(".table-list-label")!, "font-weight")).toBe("600");
+    // Inside a reply the list is not indented or spaced like the reply's own bullet lists.
+    expect(winningDeclarationOn(row, "margin")).toMatch(/^0(px)?$/);
+    expect(winningDeclarationOn(row, "padding")).toContain("10px 0");
+    // The second cell: `.row-assistant li + li` only matches a cell that follows another.
+    expect(winningDeclarationOn(wrapper.querySelectorAll<HTMLElement>(".table-list-cell")[1], "margin")).toMatch(/^0(px)?$/);
   });
 
   it("outside a table the span is still capped at the row and broken only when longer than it", () => {

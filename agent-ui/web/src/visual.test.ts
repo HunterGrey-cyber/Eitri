@@ -21,6 +21,8 @@ import {
   type SelectionLike,
   type VisualModel,
 } from "./visual";
+import { renderMarkdown } from "./markdown";
+import { buildTableList } from "./tableLayout";
 
 /** A `SelectionLike` whose `modify()` walks a fixed, caller-supplied path of carets (one step per
  *  call, clamped at the last), and records every call it saw. It has no idea what "forward word"
@@ -447,6 +449,18 @@ describe("visual.ts: entry caret and caret ordering", () => {
     const row = document.createElement("div");
     row.innerHTML = '<button>Approve</button><input />';
     expect(firstSelectableCaret(row)).toBeNull();
+  });
+
+  it("a table drawn as a list: the caret starts and ends in the list, never in the grid beside it", () => {
+    const row = document.createElement("div");
+    row.innerHTML = renderMarkdown("| a | b |\n|---|---|\n| one | `x/y` |");
+    const wrapper = row.querySelector<HTMLElement>(".table-scroll")!;
+    wrapper.append(buildTableList(wrapper.querySelector("table")!));
+    wrapper.querySelector("table")!.hidden = true;
+    expect(firstSelectableCaret(row)?.node.textContent).toBe("a");
+    const last = lastSelectableCaret(row);
+    expect(last?.node.textContent).toBe("y");
+    expect(wrapper.querySelector(".table-list")!.contains(last!.node)).toBe(true);
   });
 
   it("compareCarets orders two carets in the same text node by offset", () => {
