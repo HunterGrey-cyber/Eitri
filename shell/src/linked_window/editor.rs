@@ -34,7 +34,7 @@ use eitri_core::review_editor::OverlayCall;
 use eitri_core::scratch::{EditDone, PendingEdit, ScratchDir, ScratchRequest};
 use eitri_core::tabs::TabId;
 use eitri_core::theme::payload::NvimThemePayload;
-use eitri_core::window_link::editor_ops::{dispatch, CheckedOpen, Dispatch, LiveNote, OpContext, OpRefused, OpenCheck};
+use eitri_core::window_link::editor_ops::{dispatch, CheckedOp, Dispatch, LiveNote, OpCheck, OpContext, OpRefused};
 use eitri_core::window_link::names::WindowName;
 use eitri_core::window_link::{DraftEnd, EditorOp, EditorRequest, LinkError, Msg, ReplyResult};
 use eitri_core::wm::PeerId;
@@ -643,9 +643,9 @@ pub struct Window1Editor {
     draft_here: RefCell<Option<DraftHere>>,
     token: RefCell<Option<TokenSource>>,
     inflight: RefCell<Vec<(PeerId, u64, Pending)>>,
-    /// Plugin opens from another window whose file is being checked on a worker: the GTK thread never waits for a
-    /// disk. Oldest first; each asks the editor once its check passes, in the order they came.
-    checking: RefCell<Vec<CheckingOpen>>,
+    /// Ops from another window whose files are being looked at on a worker (the GTK thread never waits for a disk),
+    /// and the ops of the same window behind them. Oldest first; each is carried out in the order they came.
+    checking: RefCell<Vec<HeldOp>>,
     /// The one worker those checks run on, started with the first: one thread however many checks a hung disk holds
     /// up, and a bounded queue in front of it.
     check_jobs: RefCell<Option<mpsc::SyncSender<CheckJob>>>,
@@ -666,46 +666,137 @@ pub struct Window1Editor {
     polling: Cell<bool>,
 }
 
-/// A plugin open another window sent, its file being checked on a worker thread.
-/// The most plugin opens waiting for the check worker; one more is refused at once.
+/// The most checks waiting for the check worker; one more is refused at once.
 const CHECK_QUEUE: usize = 8;
 
-/// How long window 1 waits for a check: under the asking window's own [`OP_DEADLINE`], which started when that window
-/// sent the op, so a check done in time here still leaves the delivery and the editor's answer room inside it.
-const CHECK_DEADLINE: Duration = Duration::from_millis(OP_DEADLINE.as_millis() as u64 / 2);
+/// The most ops held in [`Window1Editor::checking`], checks and the ops queued behind them; one more is refused.
+const CHECKING_MAX: usize = 32;
+
+/// How long window 1 holds an op from another window before carrying it out: under the asking window's own
+/// deadline for it ([`OP_DEADLINE`], [`AGENT_OP_DEADLINE`] for a tab's editor tools), which started when that window
+/// sent the op, so an op done in time here still leaves the delivery and the editor's answer room inside it.
+fn hold_deadline(op: &EditorOp) -> Duration {
+    let asked = match op {
+        EditorOp::AgentOpen { .. }
+        | EditorOp::AgentEditorState { .. }
+        | EditorOp::AgentReadBuffer { .. }
+        | EditorOp::AgentDiagnostics { .. }
+        | EditorOp::AgentLspAsk { .. }
+        | EditorOp::AgentLspCollect { .. }
+        | EditorOp::AgentBaseline { .. } => AGENT_OP_DEADLINE,
+        _ => OP_DEADLINE,
+    };
+    asked / 2
+}
+
+/// Whether `op` opens a file in the editor: such ops reach the editor one at a time, so the file asked for last is
+/// the one shown.
+fn opens_a_file(op: &EditorOp) -> bool {
+    matches!(op, EditorOp::PluginOpen { .. } | EditorOp::PluginOpenLink { .. })
+}
 
 /// A check for the worker: skipped once nobody waits for it (`wanted` cleared) or its deadline has passed, so checks
 /// already given up do not hold up the ones behind them on a hung disk.
 struct CheckJob {
-    check: OpenCheck,
+    check: OpCheck,
     until: Instant,
     wanted: Arc<AtomicBool>,
-    answer: mpsc::Sender<Result<CheckedOpen, OpRefused>>,
+    answer: mpsc::Sender<CheckedOp>,
 }
 
-struct CheckingOpen {
+/// What an op held in [`Window1Editor::checking`] waits for.
+enum Holding {
+    /// Its files, being looked at on the worker.
+    Check {
+        rx: mpsc::Receiver<CheckedOp>,
+        /// Cleared when this entry goes, answered or not: the worker then skips the check if it has not started it.
+        wanted: Arc<AtomicBool>,
+    },
+    /// Its turn: an op from a window with an earlier op still held, carried out once that one is.
+    Turn(EditorOp),
+}
+
+/// An op from another window that window 1 holds before carrying it out, with what window 1's records said when it
+/// came: what it is carried out against must still be that.
+struct HeldOp {
     peer: PeerId,
     id: u64,
-    /// The plugin whose page asked, which that window must still hold when the check is done.
-    plugin: String,
-    /// The holding of the page that asked (`HeldPage::held`).
-    held: u64,
+    name: &'static str,
+    /// The deadline from [`hold_deadline`], from when it came; an op past it is answered and forgotten, so polling
+    /// stops, and a worker's late answer goes nowhere.
+    until: Instant,
+    /// One that opens a file ([`opens_a_file`]).
+    opens: bool,
+    /// For a plugin's op, the plugin and the holding of the page that asked (`HeldPage::held`).
+    page: Option<(String, u64)>,
     /// The editor the op came in for, and the session it was running: if either was replaced meanwhile, the new one
-    /// is not asked on the old one's behalf.
+    /// is not asked on the old one's behalf ([`asks_the_editor`]).
     rpc: Rc<dyn EditorRpc>,
     session: Option<u64>,
-    /// Cleared when this entry goes, answered or not: the worker then skips the check if it has not started it.
-    wanted: Arc<AtomicBool>,
-    rx: mpsc::Receiver<Result<CheckedOpen, OpRefused>>,
-    /// [`CHECK_DEADLINE`] after it came; a check stuck on a hung disk is then answered and forgotten, so polling
-    /// stops, and the worker's late answer goes nowhere.
-    until: Instant,
+    /// Whether the editor check applies ([`asks_the_editor`]).
+    editor_bound: bool,
+    holding: Holding,
 }
 
-impl Drop for CheckingOpen {
+/// Whether `op` is carried out by asking the editor on window 2's behalf, and so is not carried out for an editor
+/// replaced since it came. The review ops go to window 1's review driver, which follows the editor's restarts itself;
+/// refusing them would lose a drawing or a turn's end.
+fn asks_the_editor(op: &EditorOp) -> bool {
+    !matches!(
+        op,
+        EditorOp::ReviewShow { .. }
+            | EditorOp::ReviewOpenAndShow { .. }
+            | EditorOp::ReviewClear { .. }
+            | EditorOp::ReviewClearMine {}
+            | EditorOp::ReviewLiveNote { .. }
+            | EditorOp::ReviewLiveShow { .. }
+            | EditorOp::ReviewLiveClear { .. }
+    )
+}
+
+impl Drop for HeldOp {
     fn drop(&mut self) {
-        self.wanted.store(false, Ordering::Relaxed);
+        if let Holding::Check { wanted, .. } = &self.holding {
+            wanted.store(false, Ordering::Relaxed);
+        }
     }
+}
+
+/// The plugin a plugin's op names.
+fn plugin_of(op: &EditorOp) -> Option<&str> {
+    match op {
+        EditorOp::PluginOpen { plugin, .. }
+        | EditorOp::PluginOpenLink { plugin, .. }
+        | EditorOp::PluginAssistApply { plugin, .. }
+        | EditorOp::PluginInstall { plugin }
+        | EditorOp::PluginFollow { plugin, .. }
+        | EditorOp::PluginText { plugin, .. }
+        | EditorOp::PluginReveal { plugin, .. }
+        | EditorOp::PluginJump { plugin, .. }
+        | EditorOp::PluginAssistClear { plugin } => Some(plugin),
+        _ => None,
+    }
+}
+
+/// An op's own data while it is carried out: the [`HeldOp`] fields but its holding.
+struct OpAtHand {
+    peer: PeerId,
+    id: u64,
+    name: &'static str,
+    until: Instant,
+    opens: bool,
+    page: Option<(String, u64)>,
+    rpc: Rc<dyn EditorRpc>,
+    session: Option<u64>,
+    editor_bound: bool,
+}
+
+/// What the next held op does, as [`Window1Editor::poll_checks`] finds it.
+enum Step {
+    Expired,
+    Turn,
+    Checked(CheckedOp),
+    Stopped,
 }
 
 /// A view another window sent, its file being written on a worker thread: a view's text may be a megabyte, and
@@ -816,9 +907,11 @@ impl Window1Editor {
         };
         // A check the page's earlier holding asked for will open nothing: the worker need not start it.
         let held = plugins.get(owner).map(|page| page.held);
-        for check in self.checking.borrow().iter() {
-            if check.plugin == owner && Some(check.held) != held {
-                check.wanted.store(false, Ordering::Relaxed);
+        for op in self.checking.borrow().iter() {
+            if let (Some((plugin, was)), Holding::Check { wanted, .. }) = (&op.page, &op.holding) {
+                if plugin == owner && Some(*was) != held {
+                    wanted.store(false, Ordering::Relaxed);
+                }
             }
         }
     }
@@ -1011,9 +1104,107 @@ impl Window1Editor {
     }
 
     fn op(&self, peer: PeerId, id: u64, op: EditorOp) {
-        let rpc: Rc<dyn EditorRpc> = self.rpc.borrow().clone().unwrap_or_else(|| Rc::new(super::NoEditor));
         let name = op.name();
+        let until = Instant::now() + hold_deadline(&op);
+        let opens = opens_a_file(&op);
+        let rpc: Rc<dyn EditorRpc> = self.rpc.borrow().clone().unwrap_or_else(|| Rc::new(super::NoEditor));
+        let session = rpc.target();
+        let page = self.page_of(&op);
+        let editor_bound = asks_the_editor(&op);
+        // Behind an op of the same window still held, this one waits its turn: a window's ops are carried out in the
+        // order it sent them.
+        if self.checking.borrow().iter().any(|held| held.peer == peer) {
+            self.hold(HeldOp {
+                peer,
+                id,
+                name,
+                until,
+                opens,
+                page,
+                rpc,
+                session,
+                editor_bound,
+                holding: Holding::Turn(op),
+            });
+            return;
+        }
         let dispatched = dispatch(id, op, &Ctx { one: self, peer }, &*rpc);
+        let held = OpAtHand {
+            peer,
+            id,
+            name,
+            until,
+            opens,
+            page,
+            rpc,
+            session,
+            editor_bound,
+        };
+        self.carried_out(held, dispatched, None);
+    }
+
+    /// The plugin and the page's holding, for a plugin's op.
+    fn page_of(&self, op: &EditorOp) -> Option<(String, u64)> {
+        plugin_of(op).map(|plugin| {
+            let held = self.plugins.borrow().get(plugin).map_or(0, |page| page.held);
+            (plugin.to_owned(), held)
+        })
+    }
+
+    /// Why an op held since it came may no longer be carried out: its page let go of or held anew, or, for one that
+    /// asks the editor, its editor replaced. `None` when it may.
+    fn gone_since(&self, op: &OpAtHand) -> Option<OpRefused> {
+        let OpAtHand {
+            peer,
+            page,
+            rpc,
+            session,
+            editor_bound,
+            ..
+        } = op;
+        let (peer, session) = (*peer, *session);
+        if let Some((plugin, was)) = page {
+            let held_now = self.plugins.borrow().get(plugin).map(|page| (page.peer, page.held));
+            if held_now != Some((peer, *was)) {
+                return Some(OpRefused::PluginNotHeld(plugin.clone()));
+            }
+        }
+        if !editor_bound {
+            return None;
+        }
+        let current = self.rpc.borrow().clone();
+        let same = current.is_some_and(|current| Rc::ptr_eq(&current, rpc));
+        if !same || rpc.target() != session {
+            return Some(OpRefused::Outside("the editor restarted".into()));
+        }
+        None
+    }
+
+    /// Holds `op` at the end of [`Self::checking`], or answers that too many are held.
+    fn hold(&self, op: HeldOp) {
+        if self.checking.borrow().len() >= CHECKING_MAX {
+            let why = "too many operations are waiting".to_string();
+            self.reply(op.peer, op.id, ReplyResult::Err { why });
+            return;
+        }
+        self.checking.borrow_mut().push(op);
+        self.poll_soon();
+    }
+
+    /// What `dispatched` asks: an answer to send, an editor call to follow, a call on the review driver, or a check
+    /// to start, held at `place` in [`Self::checking`] (its own place, when it was held already), else at the end.
+    fn carried_out(&self, op: OpAtHand, dispatched: Result<Dispatch, OpRefused>, place: Option<usize>) {
+        let OpAtHand {
+            peer,
+            id,
+            name,
+            until,
+            opens,
+            page,
+            rpc,
+            session,
+            editor_bound,
+        } = op;
         match dispatched {
             Err(refused) => {
                 println!("[link] {}'s {name} was refused: {refused}", self.window_text(peer));
@@ -1026,40 +1217,45 @@ impl Window1Editor {
                 );
             }
             Ok(Dispatch::Rpc(pending)) => {
+                if opens {
+                    self.opening.borrow_mut().push((peer, id));
+                }
                 self.inflight.borrow_mut().push((peer, id, pending));
                 self.poll_soon();
             }
             Ok(Dispatch::Check(check)) => {
-                let plugin = check.plugin().to_owned();
-                let held = self.plugins.borrow().get(&plugin).map_or(0, |page| page.held);
                 let (tx, rx) = mpsc::channel();
                 let wanted = Arc::new(AtomicBool::new(true));
-                let until = Instant::now() + CHECK_DEADLINE;
                 let job = CheckJob {
                     check,
                     until,
                     wanted: wanted.clone(),
                     answer: tx,
                 };
-                let queued = if self.checking.borrow().len() >= CHECK_QUEUE {
-                    Err("too many file checks are waiting".to_string())
+                let full = self.checking.borrow().len() >= CHECKING_MAX;
+                let queued = if full {
+                    Err("too many operations are waiting".to_string())
                 } else {
                     self.queue_check(job)
                 };
                 match queued {
                     Ok(()) => {
-                        let session = rpc.target();
-                        self.checking.borrow_mut().push(CheckingOpen {
+                        let held = HeldOp {
                             peer,
                             id,
-                            plugin,
-                            held,
+                            name,
+                            until,
+                            opens,
+                            page,
                             rpc,
                             session,
-                            wanted,
-                            rx,
-                            until,
-                        });
+                            editor_bound,
+                            holding: Holding::Check { rx, wanted },
+                        };
+                        match place {
+                            Some(at) => self.checking.borrow_mut().insert(at, held),
+                            None => self.checking.borrow_mut().push(held),
+                        }
                         self.poll_soon();
                     }
                     Err(why) => self.reply(peer, id, ReplyResult::Err { why }),
@@ -1281,29 +1477,13 @@ impl Window1Editor {
             || !self.views.borrow().is_empty()
     }
 
-    /// Answers every open past its deadline, its check done or not, with `why`, and forgets it.
-    fn expire_checks(&self, why: &str) {
-        let now = Instant::now();
-        let expired: Vec<CheckingOpen> = {
-            let mut checking = self.checking.borrow_mut();
-            let (gone, kept) = std::mem::take(&mut *checking)
-                .into_iter()
-                .partition(|check| now >= check.until);
-            *checking = kept;
-            gone
-        };
-        for check in expired {
-            self.reply(check.peer, check.id, ReplyResult::Err { why: why.to_owned() });
-        }
-    }
-
-    /// Hands `check` to the check worker, starting it the first time.
+    /// Hands `job` to the check worker, starting it the first time.
     fn queue_check(&self, job: CheckJob) -> Result<(), String> {
         let mut jobs = self.check_jobs.borrow_mut();
         if jobs.is_none() {
             let (tx, rx) = mpsc::sync_channel::<CheckJob>(CHECK_QUEUE);
             std::thread::Builder::new()
-                .name("linked open checks".into())
+                .name("linked op checks".into())
                 .spawn(move || {
                     // Ends when the window drops its sender. An answer whose receiver is gone goes nowhere.
                     for job in rx {
@@ -1313,7 +1493,7 @@ impl Window1Editor {
                         let _ = job.answer.send(job.check.run());
                     }
                 })
-                .map_err(|e| format!("the file could not be checked: {e}"))?;
+                .map_err(|e| format!("the files could not be checked: {e}"))?;
             *jobs = Some(tx);
         }
         match jobs.as_ref().expect("started above").try_send(job) {
@@ -1326,71 +1506,108 @@ impl Window1Editor {
         }
     }
 
-    /// Hands the editor each plugin open whose check passed, oldest first and never one before an older one still
-    /// being checked (the editor ends on the file asked for last), and answers each refused one. A check done after
-    /// the asking window gave up, for a page that window no longer holds, or for an editor since replaced opens
-    /// nothing.
+    /// Carries out the held ops a window's oldest first, never one before an older op of the same window still
+    /// held, and answers each refused one; one window's ops never wait for another's. A file open waits while an
+    /// earlier one is still out to the editor, so the file asked for last is the one shown. An op held past its
+    /// deadline, a plugin's op whose page the asking window let go of or holds anew, and an op for an editor since
+    /// replaced are answered, not carried out.
     fn poll_checks(&self) {
         loop {
-            // The editor takes one checked open at a time, so two cannot overtake each other on its link; while one
-            // is out, the checks behind it still run out their time and are answered.
-            if !self.opening.borrow().is_empty() {
-                self.expire_checks("an earlier open is still waiting for the editor");
-                return;
-            }
-            let (check, result) = {
-                let mut checking = self.checking.borrow_mut();
-                let Some(first) = checking.first() else { return };
-                let now = Instant::now();
-                let result = match first.rx.try_recv() {
-                    Ok(_) if now >= first.until => {
-                        Err(OpRefused::Outside("the file check did not finish in time".into()))
+            let now = Instant::now();
+            let open_out = !self.opening.borrow().is_empty();
+            let next = {
+                let checking = self.checking.borrow();
+                let mut blocked: Vec<PeerId> = Vec::new();
+                let mut next = None;
+                for (at, held) in checking.iter().enumerate() {
+                    // Past its deadline an op is answered even behind its own window's blocked one: a refusal does not
+                    // change what the editor shows, so the order does not matter for it.
+                    if now >= held.until {
+                        next = Some((at, Step::Expired));
+                        break;
                     }
-                    Ok(result) => result,
-                    Err(mpsc::TryRecvError::Empty) if now < first.until => return,
-                    Err(mpsc::TryRecvError::Empty) => {
-                        Err(OpRefused::Outside("the file check did not finish in time".into()))
+                    if blocked.contains(&held.peer) {
+                        continue;
                     }
-                    Err(mpsc::TryRecvError::Disconnected) => Err(OpRefused::Outside("the file check stopped".into())),
-                };
-                (checking.remove(0), result)
-            };
-            let result = result.and_then(|checked| {
-                let ctx = Ctx {
-                    one: self,
-                    peer: check.peer,
-                };
-                let held_now = self.plugins.borrow().get(&check.plugin).map(|page| page.held);
-                if ctx.plugin_roots_in_window2(&check.plugin).is_none() || held_now != Some(check.held) {
-                    return Err(OpRefused::PluginNotHeld(check.plugin.clone()));
-                }
-                let current = self.rpc.borrow().clone();
-                let same = current.is_some_and(|current| Rc::ptr_eq(&current, &check.rpc));
-                if !same || check.rpc.target() != check.session {
-                    return Err(OpRefused::Outside("the editor restarted".into()));
-                }
-                Ok(checked)
-            });
-            match result {
-                Ok(checked) => {
-                    let pending = checked.open(&*check.rpc);
-                    self.opening.borrow_mut().push((check.peer, check.id));
-                    self.inflight.borrow_mut().push((check.peer, check.id, pending));
-                }
-                Err(refused) => {
-                    println!(
-                        "[link] {}'s plugin_open was refused: {refused}",
-                        self.window_text(check.peer)
-                    );
-                    self.reply(
-                        check.peer,
-                        check.id,
-                        ReplyResult::Err {
-                            why: refused.to_string(),
+                    if held.opens && open_out {
+                        blocked.push(held.peer);
+                        continue;
+                    }
+                    match &held.holding {
+                        Holding::Turn(_) => {
+                            next = Some((at, Step::Turn));
+                            break;
+                        }
+                        Holding::Check { rx, .. } => match rx.try_recv() {
+                            Ok(checked) => {
+                                next = Some((at, Step::Checked(checked)));
+                                break;
+                            }
+                            Err(mpsc::TryRecvError::Empty) => blocked.push(held.peer),
+                            Err(mpsc::TryRecvError::Disconnected) => {
+                                next = Some((at, Step::Stopped));
+                                break;
+                            }
                         },
-                    );
+                    }
                 }
-            }
+                next
+            };
+            let Some((at, step)) = next else { return };
+            let mut held = self.checking.borrow_mut().remove(at);
+            let holding = std::mem::replace(&mut held.holding, Holding::Turn(EditorOp::ReviewClearMine {}));
+            // An op that does not ask the editor goes to the review driver of the editor there is now.
+            let rpc = if held.editor_bound {
+                held.rpc.clone()
+            } else {
+                self.rpc.borrow().clone().unwrap_or_else(|| held.rpc.clone())
+            };
+            let op = OpAtHand {
+                peer: held.peer,
+                id: held.id,
+                name: held.name,
+                until: held.until,
+                opens: held.opens,
+                page: held.page.clone(),
+                rpc,
+                session: held.session,
+                editor_bound: held.editor_bound,
+            };
+            drop(held);
+            let ctx = Ctx {
+                one: self,
+                peer: op.peer,
+            };
+            let dispatched = match (step, holding) {
+                (Step::Expired, holding) => Err(OpRefused::Outside(
+                    if op.opens && open_out {
+                        "an earlier open is still waiting for the editor"
+                    } else if matches!(holding, Holding::Turn(_)) {
+                        "the operation waited too long behind an earlier one"
+                    } else {
+                        "the file check did not finish in time"
+                    }
+                    .into(),
+                )),
+                (Step::Stopped, _) => Err(OpRefused::Outside("the file check stopped".into())),
+                (Step::Turn, Holding::Turn(turn)) => {
+                    match self.gone_since(&op) {
+                        Some(gone) => Err(gone),
+                        // A check it starts keeps its place, ahead of the window's ops that came after it.
+                        None => {
+                            let dispatched = dispatch(op.id, turn, &ctx, &*op.rpc);
+                            self.carried_out(op, dispatched, Some(at));
+                            continue;
+                        }
+                    }
+                }
+                (Step::Checked(checked), _) => match self.gone_since(&op) {
+                    Some(gone) => Err(gone),
+                    None => checked.finish(&ctx, &*op.rpc),
+                },
+                (Step::Turn, Holding::Check { .. }) => unreachable!("a turn is held as one"),
+            };
+            self.carried_out(op, dispatched, None);
         }
     }
 
@@ -3613,6 +3830,125 @@ mod tests {
             got.borrow().is_some()
         }));
         assert_eq!(got.into_inner(), Some(Ok(rmpv::Value::from(0u64))));
+    }
+
+    #[test]
+    fn an_op_behind_one_being_checked_waits_for_it() {
+        /// Logs each Lua call as it is made, into the log the overlay hook writes to too.
+        struct Logged(Rc<RefCell<Vec<&'static str>>>);
+        impl EditorRpc for Logged {
+            fn exec_lua(&self, _code: &'static str, _args: Vec<rmpv::Value>) -> Pending {
+                self.0.borrow_mut().push("buffer_state");
+                let (answer, pending) = Pending::pair();
+                answer.send(Ok(rmpv::Value::Nil));
+                pending
+            }
+            fn target(&self) -> Option<u64> {
+                Some(1)
+            }
+        }
+        let w = windows("op-order");
+        let log = Rc::new(RefCell::new(Vec::new()));
+        w.one.set_rpc(Rc::new(Logged(log.clone())));
+        let overlay_log = log.clone();
+        w.one
+            .set_overlay(Rc::new(move |_: PeerId, _: u64, _: Vec<OverlayCall>| {
+                overlay_log.borrow_mut().push("clear_mine");
+                Some(ReplyResult::Ok { value: Value::Null })
+            }));
+        // The first looks at the disk on the worker; the second needs nothing from it, and still comes after.
+        w.one.op(
+            SECOND_PEER,
+            1,
+            EditorOp::BufferState {
+                path: "src/a.rs".into(),
+                lines: None,
+            },
+        );
+        w.one.op(SECOND_PEER, 2, EditorOp::ReviewClearMine {});
+        assert!(
+            log.borrow().is_empty(),
+            "nothing is carried out before the check is collected"
+        );
+        assert!(w.settle(|| log.borrow().len() == 2));
+        assert_eq!(*log.borrow(), vec!["buffer_state", "clear_mine"]);
+    }
+
+    #[test]
+    fn an_op_waiting_its_turn_is_not_carried_out_for_a_page_or_editor_gone_since() {
+        use eitri_core::plugin::editor::PLUGIN_FOLLOW_LUA;
+        let answering = || {
+            Rc::new(Answering {
+                calls: RefCell::default(),
+                answer: rmpv::Value::Nil,
+                session: Cell::new(1),
+            })
+        };
+        for gone in ["page", "editor", "session"] {
+            let w = windows(&format!("turn-gone-{gone}"));
+            let roots = || BTreeMap::from([("work".to_string(), w.root.join("src"))]);
+            w.one.set_plugin_in_window("markdown", Some(SECOND_PEER), Some(roots()));
+            let first = answering();
+            w.one.set_rpc(first.clone());
+            // A check, then a plugin open that waits its turn behind it.
+            w.one.op(
+                SECOND_PEER,
+                1,
+                EditorOp::BufferState {
+                    path: "src/a.rs".into(),
+                    lines: None,
+                },
+            );
+            // One that needs no check of its own: only its turn's look at the page and the editor stops it.
+            w.one.op(
+                SECOND_PEER,
+                2,
+                EditorOp::PluginReveal {
+                    plugin: "markdown".into(),
+                    buf: 3,
+                    line: 1,
+                    token: 1,
+                    cursor: None,
+                    row: None,
+                },
+            );
+            // A review op behind them goes to window 1's review driver, which follows the editor's restarts itself.
+            let cleared = Rc::new(Cell::new(0));
+            let seen = cleared.clone();
+            w.one
+                .set_overlay(Rc::new(move |_: PeerId, _: u64, _: Vec<OverlayCall>| {
+                    seen.set(seen.get() + 1);
+                    Some(ReplyResult::Ok { value: Value::Null })
+                }));
+            w.one.op(SECOND_PEER, 3, EditorOp::ReviewClearMine {});
+            assert_eq!(w.one.checking.borrow().len(), 3);
+            let second = answering();
+            match gone {
+                // Away and back: another page holds it now.
+                "page" => {
+                    w.one.set_plugin_in_window("markdown", None, None);
+                    w.one.set_plugin_in_window("markdown", Some(SECOND_PEER), Some(roots()));
+                }
+                "editor" => w.one.set_rpc(second.clone()),
+                _ => first.session.set(2),
+            }
+            assert!(w.settle(|| w.one.checking.borrow().is_empty()));
+            let revealed = |rpc: &Answering| {
+                rpc.calls
+                    .borrow()
+                    .iter()
+                    .any(|code| std::ptr::eq(*code, PLUGIN_FOLLOW_LUA))
+            };
+            assert!(
+                !revealed(&first) && !revealed(&second),
+                "{gone}: the waiting reveal was carried out"
+            );
+            assert_eq!(
+                cleared.get(),
+                1,
+                "{gone}: the review op behind them was not carried out"
+            );
+        }
     }
 
     #[test]

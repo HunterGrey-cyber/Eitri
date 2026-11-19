@@ -100,94 +100,227 @@ pub enum Dispatch {
     /// A note for window 1's driver, and, while the turn runs, the editor's answer to which of its files a
     /// window shows, which is the op's reply.
     LiveNote { note: LiveNote, shown: Option<Pending> },
-    /// A plugin page's file, still to be checked on disk. [`OpenCheck::run`] reads the filesystem, which can stall on
-    /// a hung mount, so the caller runs it off the GTK thread and asks the editor with [`CheckedOpen::open`].
-    Check(OpenCheck),
+    /// An op whose files must be looked at first. [`OpCheck::run`] reads the filesystem, which can stall on a hung
+    /// mount, so the caller runs it off the GTK thread and carries the op out with [`CheckedOp::finish`].
+    Check(OpCheck),
 }
 
-/// A plugin page's open as window 1 checks it: what to look at on disk, taken from window 1's own records and the
-/// op. Plain data, so it can go to a worker thread.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct OpenCheck {
-    plugin: String,
-    target: OpenTarget,
-    line: Option<u32>,
-    col: Option<u32>,
+/// An op whose files must be looked at before it is carried out, with what window 1's own records said when it came
+/// (the project root, a plugin's roots, home). Plain data, so it can go to a worker thread.
+#[derive(Debug, Clone)]
+pub struct OpCheck {
+    id: u64,
+    op: EditorOp,
+    root: PathBuf,
+    plugin_roots: BTreeMap<String, PathBuf>,
+    home: Option<PathBuf>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum OpenTarget {
-    /// `rel` in the work tree `tree` of the plugin.
-    Tree { tree: PathBuf, rel: String },
-    /// The canonical path a document's link resolved to in window 2. It must still be that, unchanged (a directory
-    /// on the way swapped for a link since moves it, and is refused rather than followed), and a regular file of
-    /// that document's project, found by the rule window 2's own check used ([`crate::plugin::doc_route::project_dir`]
-    /// with this window's root and home); a sender that named no document is held to this window's root.
-    Link {
-        path: String,
-        document: Option<PathBuf>,
-        window_root: PathBuf,
-        home: Option<PathBuf>,
-    },
+/// What [`OpCheck::run`] found, for [`CheckedOp::finish`] to carry the op out with.
+#[derive(Debug)]
+pub struct CheckedOp {
+    id: u64,
+    op: EditorOp,
+    found: Found,
 }
 
-/// A checked plugin open: a canonical regular file, and where the cursor goes.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CheckedOpen {
-    file: PathBuf,
-    line: Option<u32>,
-    col: Option<u32>,
+/// The disk's answers to what an op's arm asks, by what it asks. The arm asks the same questions after the check as
+/// [`needs_disk`] and [`OpCheck::run`] say it will; one it did not answer is refused, never looked up then.
+#[derive(Debug, Default)]
+struct Found {
+    project: BTreeMap<String, Result<PathBuf, OpRefused>>,
+    loadable: BTreeMap<PathBuf, Result<(), OpRefused>>,
+    plugin: BTreeMap<(PathBuf, String), Result<PathBuf, OpRefused>>,
+    link: BTreeMap<String, Result<PathBuf, OpRefused>>,
 }
 
-impl OpenCheck {
-    /// Looks at the filesystem: call it on a worker thread, never on the GTK thread.
-    pub fn run(self) -> Result<CheckedOpen, OpRefused> {
-        let OpenCheck {
-            plugin,
-            target,
-            line,
-            col,
+/// Where an arm's questions to the disk go: [`Found`] after a check, [`NoDisk`] for an op that asks none.
+trait Disk {
+    /// A project path from window 2, as window 1's absolute path ([`project_path_under`]).
+    fn project(&self, rel: &str) -> Result<PathBuf, OpRefused>;
+    /// That `path` may be loaded now: a regular file not too large ([`crate::editor_tools::paths::file_check`]).
+    fn loadable(&self, path: &Path) -> Result<(), OpRefused>;
+    /// `rel` in the work tree `tree` of a plugin ([`plugin_file`]).
+    fn plugin_file(&self, tree: &Path, rel: &str) -> Result<PathBuf, OpRefused>;
+    /// The canonical path a forwarded link resolved to, held to its document's project ([`link_file`]).
+    fn link_file(&self, path: &str) -> Result<PathBuf, OpRefused>;
+}
+
+fn not_checked(what: impl fmt::Display) -> OpRefused {
+    OpRefused::Outside(format!("{what} was not checked"))
+}
+
+impl Disk for Found {
+    fn project(&self, rel: &str) -> Result<PathBuf, OpRefused> {
+        self.project.get(rel).cloned().unwrap_or_else(|| Err(not_checked(rel)))
+    }
+    fn loadable(&self, path: &Path) -> Result<(), OpRefused> {
+        self.loadable
+            .get(path)
+            .cloned()
+            .unwrap_or_else(|| Err(not_checked(path.display())))
+    }
+    fn plugin_file(&self, tree: &Path, rel: &str) -> Result<PathBuf, OpRefused> {
+        self.plugin
+            .get(&(tree.to_path_buf(), rel.to_owned()))
+            .cloned()
+            .unwrap_or_else(|| Err(not_checked(rel)))
+    }
+    fn link_file(&self, path: &str) -> Result<PathBuf, OpRefused> {
+        self.link.get(path).cloned().unwrap_or_else(|| Err(not_checked(path)))
+    }
+}
+
+/// The disk for an op [`needs_disk`] says asks it nothing: every question is refused.
+struct NoDisk;
+
+impl Disk for NoDisk {
+    fn project(&self, rel: &str) -> Result<PathBuf, OpRefused> {
+        Err(not_checked(rel))
+    }
+    fn loadable(&self, path: &Path) -> Result<(), OpRefused> {
+        Err(not_checked(path.display()))
+    }
+    fn plugin_file(&self, _tree: &Path, rel: &str) -> Result<PathBuf, OpRefused> {
+        Err(not_checked(rel))
+    }
+    fn link_file(&self, path: &str) -> Result<PathBuf, OpRefused> {
+        Err(not_checked(path))
+    }
+}
+
+/// Whether carrying `op` out looks at the disk: a project path, a file to load, a plugin's file or a link.
+fn needs_disk(op: &EditorOp) -> bool {
+    match op {
+        EditorOp::ReviewShow { .. }
+        | EditorOp::ReviewOpenAndShow { .. }
+        | EditorOp::ReviewClear { .. }
+        | EditorOp::ReviewLiveShow { .. }
+        | EditorOp::ReviewLiveClear { .. }
+        | EditorOp::BufferState { .. }
+        | EditorOp::PluginOpen { .. }
+        | EditorOp::PluginOpenLink { .. }
+        | EditorOp::AgentOpen { .. }
+        | EditorOp::AgentReadBuffer { .. } => true,
+        EditorOp::AgentDiagnostics { path, .. } | EditorOp::AgentLspAsk { path, .. } => path.is_some(),
+        EditorOp::ReviewClearMine {}
+        | EditorOp::ReviewLiveNote { .. }
+        | EditorOp::PluginAssistApply { .. }
+        | EditorOp::PluginInstall { .. }
+        | EditorOp::PluginFollow { .. }
+        | EditorOp::PluginText { .. }
+        | EditorOp::PluginReveal { .. }
+        | EditorOp::PluginJump { .. }
+        | EditorOp::PluginAssistClear { .. }
+        | EditorOp::AgentEditorState { .. }
+        | EditorOp::AgentLspCollect { .. }
+        | EditorOp::AgentBaseline { .. } => false,
+    }
+}
+
+impl OpCheck {
+    /// Looks at the filesystem: call it on a worker thread, never on the GTK thread. Never fails: what it finds,
+    /// refusals too, is the op's to report in its own order.
+    pub fn run(self) -> CheckedOp {
+        let OpCheck {
+            id,
+            op,
+            root,
+            plugin_roots,
+            home,
         } = self;
-        let file = match target {
-            OpenTarget::Tree { tree, rel } => plugin_file(&plugin, &tree, &rel)?,
-            OpenTarget::Link {
-                path,
-                document,
-                window_root,
-                home,
-            } => {
-                let project = match document {
-                    Some(doc) => crate::plugin::doc_route::project_dir(&doc, Some(&window_root), home.as_deref())
-                        .ok_or_else(|| OpRefused::Outside(format!("{} has no project to open from", doc.display())))?,
-                    None => window_root,
-                };
-                let roots = Roots::new(BTreeMap::from([("project".into(), project)]));
-                let file = file_inside(&roots, &path).map_err(|e| OpRefused::Outside(e.message(&path)))?;
-                if file != Path::new(&path) {
-                    return Err(OpRefused::Outside(format!("{path} no longer resolves to itself")));
-                }
-                file
-            }
+        let mut found = Found::default();
+        let project = |found: &mut Found, rel: &str| {
+            let path = project_path_under(&root, rel);
+            found.project.insert(rel.to_owned(), path.clone());
+            path
         };
-        Ok(CheckedOpen { file, line, col })
-    }
-
-    /// The plugin whose page asked: the asking window must still hold it when the check is done.
-    pub fn plugin(&self) -> &str {
-        &self.plugin
+        let loadable = |found: &mut Found, path: &Path| {
+            let checked = crate::editor_tools::paths::file_check(path).map_err(|refused| OpRefused::Outside(refused.0));
+            found.loadable.insert(path.to_path_buf(), checked);
+        };
+        match &op {
+            EditorOp::ReviewShow { path, .. }
+            | EditorOp::ReviewOpenAndShow { path, .. }
+            | EditorOp::ReviewClear { path }
+            | EditorOp::ReviewLiveShow { path, .. }
+            | EditorOp::ReviewLiveClear { path }
+            | EditorOp::BufferState { path, .. }
+            | EditorOp::AgentReadBuffer { path, .. } => {
+                let _ = project(&mut found, path);
+            }
+            EditorOp::AgentDiagnostics { path: Some(path), .. } => {
+                let _ = project(&mut found, path);
+            }
+            EditorOp::AgentOpen { path, load, .. } => {
+                if let (Ok(path), true) = (project(&mut found, path), *load) {
+                    loadable(&mut found, &path);
+                }
+            }
+            EditorOp::AgentLspAsk {
+                path: Some(path), load, ..
+            } => {
+                if let (Ok(path), true) = (project(&mut found, path), *load) {
+                    loadable(&mut found, &path);
+                }
+            }
+            EditorOp::PluginOpen {
+                plugin,
+                root: name,
+                path,
+                ..
+            } => {
+                if let Some(tree) = plugin_roots.get(name) {
+                    let file = plugin_file(plugin, tree, path);
+                    found.plugin.insert((tree.clone(), path.clone()), file);
+                }
+            }
+            EditorOp::PluginOpenLink { path, document, .. } => {
+                // A document that is not absolute is the arm's to refuse; nothing is looked at for it.
+                if let Ok(document) = linked_document(document.as_deref()) {
+                    let file = link_file(path, document.as_deref(), &root, home.as_deref());
+                    found.link.insert(path.clone(), file);
+                }
+            }
+            _ => {}
+        }
+        CheckedOp { id, op, found }
     }
 }
 
-impl CheckedOpen {
-    /// The canonical file the check found.
-    pub fn file(&self) -> &Path {
-        &self.file
+impl CheckedOp {
+    /// Carries the op out with what the check found, on the GTK thread: window 1's records are asked again (the
+    /// session, the plugin and its roots), the paths are what the check found.
+    pub fn finish(self, ctx: &dyn OpContext, rpc: &dyn EditorRpc) -> Result<Dispatch, OpRefused> {
+        carry_out(self.id, self.op, ctx, rpc, &self.found)
     }
+}
 
-    /// Asks the editor to open the checked file: the plugin host's own open, whose snippet checks the file again.
-    pub fn open(&self, rpc: &dyn EditorRpc) -> Pending {
-        crate::plugin::editor::open(rpc, &self.file, self.line, self.col)
+/// A forwarded link's document: `None` when the link named none, refused unless absolute.
+fn linked_document(document: Option<&str>) -> Result<Option<PathBuf>, OpRefused> {
+    match document {
+        Some(doc) if Path::new(doc).is_absolute() => Ok(Some(PathBuf::from(doc))),
+        Some(doc) => Err(OpRefused::Outside(format!("{doc:?} is not an absolute document path"))),
+        None => Ok(None),
     }
+}
+
+/// The canonical path a document's link resolved to in window 2. It must still be that, unchanged (a directory on
+/// the way swapped for a link since moves it, and is refused rather than followed), and a regular file of that
+/// document's project, found by the rule window 2's own check used ([`crate::plugin::doc_route::project_dir`] with
+/// the root both windows share and home); a link that names no document is held to that root.
+fn link_file(path: &str, document: Option<&Path>, root: &Path, home: Option<&Path>) -> Result<PathBuf, OpRefused> {
+    let project = match document {
+        Some(doc) => crate::plugin::doc_route::project_dir(doc, Some(root), home)
+            .ok_or_else(|| OpRefused::Outside(format!("{} has no project to open from", doc.display())))?,
+        None => root.to_path_buf(),
+    };
+    let roots = Roots::new(BTreeMap::from([("project".into(), project)]));
+    let file = file_inside(&roots, path).map_err(|e| OpRefused::Outside(e.message(path)))?;
+    if file != Path::new(path) {
+        return Err(OpRefused::Outside(format!("{path} no longer resolves to itself")));
+    }
+    Ok(file)
 }
 
 impl fmt::Debug for Dispatch {
@@ -233,12 +366,53 @@ impl fmt::Display for OpRefused {
 impl std::error::Error for OpRefused {}
 
 /// Checks `op` and carries it out. `id` is the `editor_op` message's id: an overlay call's request id is built
-/// from it, so window 1 can route the driver's answer back to the message that asked.
+/// from it, so window 1 can route the driver's answer back to the message that asked. Runs on the GTK thread and
+/// never looks at the disk: an op that must is answered with [`Dispatch::Check`], after only what window 1's own
+/// records refuse (a plugin window 2 does not hold).
 pub fn dispatch(id: u64, op: EditorOp, ctx: &dyn OpContext, rpc: &dyn EditorRpc) -> Result<Dispatch, OpRefused> {
+    if !needs_disk(&op) {
+        return carry_out(id, op, ctx, rpc, &NoDisk);
+    }
+    // What window 1's records refuse is refused when the op comes, and asked again when it is carried out: a session
+    // or page window 2 does not hold now is not one the wait could make it hold.
+    match &op {
+        EditorOp::ReviewShow { meta, .. } | EditorOp::ReviewOpenAndShow { meta, .. } => {
+            held_session(ctx, &meta.session)?
+        }
+        EditorOp::ReviewLiveShow { meta, .. } => held_session(ctx, &meta.session)?,
+        EditorOp::AgentOpen { session, .. }
+        | EditorOp::AgentReadBuffer { session, .. }
+        | EditorOp::AgentDiagnostics { session, .. }
+        | EditorOp::AgentLspAsk { session, .. } => held_session(ctx, session)?,
+        _ => {}
+    }
+    let plugin_roots = match &op {
+        EditorOp::PluginOpen { plugin, .. } | EditorOp::PluginOpenLink { plugin, .. } => {
+            held_plugin_roots(ctx, plugin)?
+        }
+        _ => BTreeMap::new(),
+    };
+    Ok(Dispatch::Check(OpCheck {
+        id,
+        op,
+        root: ctx.project_root().to_owned(),
+        plugin_roots,
+        home: std::env::var_os("HOME").filter(|h| !h.is_empty()).map(PathBuf::from),
+    }))
+}
+
+/// Every op's own checks and what it becomes, with the disk's answers from `disk`.
+fn carry_out(
+    id: u64,
+    op: EditorOp,
+    ctx: &dyn OpContext,
+    rpc: &dyn EditorRpc,
+    disk: &dyn Disk,
+) -> Result<Dispatch, OpRefused> {
     match op {
         EditorOp::ReviewShow { path, meta, hunks } => {
             held_session(ctx, &meta.session)?;
-            let path = project_path(ctx, &path)?;
+            let path = disk.project(&path)?;
             Ok(Dispatch::Overlay(vec![OverlayCall::Show {
                 path,
                 meta: ShowMeta::from(meta),
@@ -252,7 +426,7 @@ pub fn dispatch(id: u64, op: EditorOp, ctx: &dyn OpContext, rpc: &dyn EditorRpc)
             hunks,
         } => {
             held_session(ctx, &meta.session)?;
-            let path = project_path(ctx, &path)?;
+            let path = disk.project(&path)?;
             Ok(Dispatch::Overlay(vec![OverlayCall::OpenAndShow {
                 request_id: linked_request_id(ctx.peer(), id),
                 path,
@@ -262,7 +436,7 @@ pub fn dispatch(id: u64, op: EditorOp, ctx: &dyn OpContext, rpc: &dyn EditorRpc)
             }]))
         }
         EditorOp::ReviewClear { path: rel } => {
-            let path = project_path(ctx, &rel)?;
+            let path = disk.project(&rel)?;
             if !ctx.drawn_for_window2().contains(&path) {
                 return Err(OpRefused::NotDrawnByWindow2(rel));
             }
@@ -311,7 +485,7 @@ pub fn dispatch(id: u64, op: EditorOp, ctx: &dyn OpContext, rpc: &dyn EditorRpc)
         }
         EditorOp::ReviewLiveShow { path, meta, hunks } => {
             held_session(ctx, &meta.session)?;
-            let path = project_path(ctx, &path)?;
+            let path = disk.project(&path)?;
             Ok(Dispatch::Overlay(vec![OverlayCall::LiveShow {
                 path,
                 meta: LiveMeta::from(meta),
@@ -321,11 +495,11 @@ pub fn dispatch(id: u64, op: EditorOp, ctx: &dyn OpContext, rpc: &dyn EditorRpc)
         // Names no session: window 1's driver takes off only a live drawing this window made, and a live clear
         // leaves any other drawing there.
         EditorOp::ReviewLiveClear { path } => {
-            let path = project_path(ctx, &path)?;
+            let path = disk.project(&path)?;
             Ok(Dispatch::Overlay(vec![OverlayCall::LiveClear { path }]))
         }
         EditorOp::BufferState { path, lines } => {
-            let path = project_path(ctx, &path)?;
+            let path = disk.project(&path)?;
             Ok(Dispatch::Rpc(
                 rpc.exec_lua(BUFFER_STATE_LUA, buffer_state_args(&path, lines)),
             ))
@@ -341,15 +515,8 @@ pub fn dispatch(id: u64, op: EditorOp, ctx: &dyn OpContext, rpc: &dyn EditorRpc)
             let tree = roots
                 .get(&root)
                 .ok_or_else(|| OpRefused::Outside(format!("plugin {plugin} has no declared root named {root}")))?;
-            Ok(Dispatch::Check(OpenCheck {
-                plugin,
-                target: OpenTarget::Tree {
-                    tree: tree.clone(),
-                    rel: path,
-                },
-                line,
-                col,
-            }))
+            let file = disk.plugin_file(tree, &path)?;
+            Ok(Dispatch::Rpc(crate::plugin::editor::open(rpc, &file, line, col)))
         }
         // The op names only the plugin; the owner the editor records and the root it applies to are window 1's
         // own: the name it found in its table and that plugin's work tree.
@@ -449,22 +616,9 @@ pub fn dispatch(id: u64, op: EditorOp, ctx: &dyn OpContext, rpc: &dyn EditorRpc)
             document,
         } => {
             held_plugin(ctx, &plugin)?;
-            let document = match document {
-                Some(doc) if Path::new(&doc).is_absolute() => Some(PathBuf::from(doc)),
-                Some(doc) => return Err(OpRefused::Outside(format!("{doc:?} is not an absolute document path"))),
-                None => None,
-            };
-            Ok(Dispatch::Check(OpenCheck {
-                plugin,
-                target: OpenTarget::Link {
-                    path,
-                    document,
-                    window_root: ctx.project_root().to_owned(),
-                    home: std::env::var_os("HOME").filter(|h| !h.is_empty()).map(PathBuf::from),
-                },
-                line,
-                col: None,
-            }))
+            linked_document(document.as_deref())?;
+            let file = disk.link_file(&path)?;
+            Ok(Dispatch::Rpc(crate::plugin::editor::open(rpc, &file, line, None)))
         }
         EditorOp::PluginAssistClear { plugin } => {
             held_plugin(ctx, &plugin)?;
@@ -479,12 +633,12 @@ pub fn dispatch(id: u64, op: EditorOp, ctx: &dyn OpContext, rpc: &dyn EditorRpc)
             stamp,
         } => {
             held_session(ctx, &session)?;
-            let path = project_path(ctx, &path)?;
+            let path = disk.project(&path)?;
             let stamp = checked_stamp(stamp)?;
             // Loading is what could block on a FIFO or take in a huge file, and window 2 looked at the file a while
             // ago and from another process: only what is there now counts.
             if load {
-                crate::editor_tools::paths::file_check(&path).map_err(|refused| OpRefused::Outside(refused.0))?;
+                disk.loadable(&path)?;
             }
             Ok(Dispatch::Rpc(crate::editor_tools::tools::open_file::send(
                 rpc, &stamp, &path, line, end_line, load,
@@ -507,7 +661,7 @@ pub fn dispatch(id: u64, op: EditorOp, ctx: &dyn OpContext, rpc: &dyn EditorRpc)
             stamp,
         } => {
             held_session(ctx, &session)?;
-            let path = project_path(ctx, &path)?;
+            let path = disk.project(&path)?;
             let stamp = checked_stamp(stamp)?;
             Ok(Dispatch::Rpc(crate::editor_tools::tools::read_buffer::send(
                 rpc, &stamp, &path, start, end,
@@ -521,7 +675,7 @@ pub fn dispatch(id: u64, op: EditorOp, ctx: &dyn OpContext, rpc: &dyn EditorRpc)
             stamp,
         } => {
             held_session(ctx, &session)?;
-            let path = path.map(|path| project_path(ctx, &path)).transpose()?;
+            let path = path.map(|path| disk.project(&path)).transpose()?;
             let stamp = checked_stamp(stamp)?;
             let min_severity = severity_from_wire(min_severity)
                 .ok_or_else(|| OpRefused::Outside(format!("{min_severity} is not a severity")))?;
@@ -571,10 +725,10 @@ pub fn dispatch(id: u64, op: EditorOp, ctx: &dyn OpContext, rpc: &dyn EditorRpc)
             if path.is_none() && kind != WireLspKind::WorkspaceSymbols {
                 return Err(OpRefused::Outside("only a workspace search names no file".into()));
             }
-            let path = path.map(|path| project_path(ctx, &path)).transpose()?;
+            let path = path.map(|path| disk.project(&path)).transpose()?;
             // As for `AgentOpen`: what window 2 saw a while ago says nothing of what a load would read now.
             if let (true, Some(path)) = (load, &path) {
-                crate::editor_tools::paths::file_check(path).map_err(|refused| OpRefused::Outside(refused.0))?;
+                disk.loadable(path)?;
             }
             Ok(Dispatch::Rpc(crate::editor_tools::tools::lsp::ask(
                 rpc,
@@ -692,8 +846,8 @@ fn checked_under(root: &Path, rel: &str) -> Result<PathBuf, String> {
 /// A project path from window 2, as window 1's absolute path. Its last component may be missing (a file a turn
 /// deleted) but may not be a link: the editor follows one, so a link inside the project would name a file anywhere,
 /// and turn review itself never follows a link in that place either.
-fn project_path(ctx: &dyn OpContext, rel: &str) -> Result<PathBuf, OpRefused> {
-    let path = checked_under(ctx.project_root(), rel).map_err(OpRefused::Outside)?;
+fn project_path_under(root: &Path, rel: &str) -> Result<PathBuf, OpRefused> {
+    let path = checked_under(root, rel).map_err(OpRefused::Outside)?;
     match std::fs::symlink_metadata(&path) {
         Ok(meta) if meta.file_type().is_symlink() => Err(OpRefused::Outside(format!(
             "{rel} is not inside the project: it is a link"
@@ -1067,7 +1221,7 @@ mod tests {
     /// then asked.
     fn dispatch_now(id: u64, op: EditorOp, ctx: &dyn OpContext, rpc: &dyn EditorRpc) -> Result<Dispatch, OpRefused> {
         match dispatch(id, op, ctx, rpc)? {
-            Dispatch::Check(check) => Ok(Dispatch::Rpc(check.run()?.open(rpc))),
+            Dispatch::Check(check) => check.run().finish(ctx, rpc),
             other => Ok(other),
         }
     }
@@ -1101,6 +1255,95 @@ mod tests {
     }
 
     #[test]
+    fn every_op_that_looks_at_the_disk_is_handed_to_its_check() {
+        let f = fixture("disk-later");
+        let rpc = Recorder::default();
+        let disk = vec![
+            show("src/a.rs", "s-held"),
+            open_and_show("src/a.rs", "s-held"),
+            EditorOp::ReviewClear {
+                path: "src/a.rs".into(),
+            },
+            EditorOp::ReviewLiveShow {
+                path: "src/a.rs".into(),
+                meta: live_meta("s-held"),
+                hunks: vec![hunk()],
+            },
+            EditorOp::ReviewLiveClear {
+                path: "src/a.rs".into(),
+            },
+            EditorOp::BufferState {
+                path: "src/a.rs".into(),
+                lines: None,
+            },
+            agent_open("s-held", "src/a.rs", true, stamp()),
+            agent_open("s-held", "src/a.rs", false, stamp()),
+            agent_read("s-held", "src/a.rs"),
+            agent_diagnostics("s-held", Some("src/a.rs")),
+            lsp_ask("s-held", "src/a.rs", true, stamp()),
+            plugin_open("snotra", "real.rs"),
+        ];
+        for op in disk {
+            let name = op.name();
+            // On the GTK thread: window 1's own records only, nothing asked of the editor, the disk not looked at.
+            assert!(
+                matches!(dispatch(1, op, &f.ctx, &rpc), Ok(Dispatch::Check(_))),
+                "{name} looks at the disk in dispatch"
+            );
+        }
+        assert!(rpc.calls().is_empty());
+        // A session window 2 does not hold is refused when the op comes, before any check: the wait cannot make it
+        // window 2's.
+        for op in [show("src/a.rs", "s-other"), agent_read("s-other", "src/a.rs")] {
+            assert_eq!(
+                dispatch(1, op, &f.ctx, &rpc).unwrap_err(),
+                OpRefused::SessionNotHeld("s-other".into())
+            );
+        }
+        // The ops that name no file the disk is asked about are carried out at once.
+        for op in [
+            EditorOp::ReviewClearMine {},
+            agent_state("s-held"),
+            agent_diagnostics("s-held", None),
+            lsp_search("needle", "q1"),
+            lsp_collect("s-held", "q1"),
+            agent_baseline("s-held"),
+            live_note("s-held", None, &["src/a.rs"]),
+        ] {
+            let name = op.name();
+            assert!(
+                !matches!(dispatch(1, op, &f.ctx, &rpc), Ok(Dispatch::Check(_))),
+                "{name} waits for a check it does not need"
+            );
+        }
+    }
+
+    #[test]
+    fn a_checked_op_is_refused_for_what_its_own_checks_find_first() {
+        let f = fixture("check-order");
+        let rpc = Recorder::default();
+        // The session is looked at before the path, after the check as before it: a path outside the project from a
+        // session window 2 does not hold is refused for the session.
+        assert_eq!(
+            dispatch_now(1, show("../x", "s-other"), &f.ctx, &rpc).unwrap_err(),
+            OpRefused::SessionNotHeld("s-other".into())
+        );
+        assert!(matches!(
+            dispatch_now(1, show("../x", "s-held"), &f.ctx, &rpc),
+            Err(OpRefused::Outside(_))
+        ));
+        // A file that became a FIFO is not loaded: what the check found is what the op is held to.
+        let fifo = std::ffi::CString::new(f.ctx.root.join("src/pipe").as_os_str().as_encoded_bytes()).unwrap();
+        // SAFETY: a terminated path in the fixture's own scratch directory.
+        assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+        assert!(matches!(
+            dispatch_now(1, agent_open("s-held", "src/pipe", true, stamp()), &f.ctx, &rpc),
+            Err(OpRefused::Outside(_))
+        ));
+        assert!(rpc.calls().is_empty());
+    }
+
+    #[test]
     fn a_plugin_open_is_looked_at_on_disk_only_by_its_check() {
         let f = fixture("open-check-later");
         let rpc = Recorder::default();
@@ -1115,15 +1358,17 @@ mod tests {
             let Ok(Dispatch::Check(check)) = dispatch(1, op, &f.ctx, &rpc) else {
                 panic!("a plugin open is handed on to its check");
             };
-            assert!(matches!(check.run(), Err(OpRefused::Outside(_))));
+            assert!(matches!(check.run().finish(&f.ctx, &rpc), Err(OpRefused::Outside(_))));
         }
         assert!(rpc.calls().is_empty());
         let Ok(Dispatch::Check(check)) = dispatch(1, plugin_open("snotra", "real.rs"), &f.ctx, &rpc) else {
             panic!("a plugin open is handed on to its check");
         };
+        assert!(matches!(check.run().finish(&f.ctx, &rpc), Ok(Dispatch::Rpc(_))));
+        let real = std::fs::canonicalize(f.tree.join("real.rs")).unwrap();
         assert_eq!(
-            check.run().unwrap().file(),
-            std::fs::canonicalize(f.tree.join("real.rs")).unwrap()
+            opened_path(&rpc.calls().last().unwrap().1),
+            Value::Binary(real.as_os_str().as_encoded_bytes().to_vec())
         );
         // A plugin window 2 does not hold is refused at once: that needs no disk.
         assert_eq!(
@@ -1183,7 +1428,7 @@ mod tests {
             Err(OpRefused::Outside(_))
         ));
         assert!(matches!(
-            dispatch(1, link(&other.join("x.rs"), Some(Path::new("doc.md"))), &f.ctx, &rpc),
+            dispatch_now(1, link(&other.join("x.rs"), Some(Path::new("doc.md"))), &f.ctx, &rpc),
             Err(OpRefused::Outside(_))
         ));
         assert_eq!(rpc.calls().len(), 1);

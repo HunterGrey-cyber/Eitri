@@ -3653,7 +3653,12 @@ mod live_review {
                     root: &self.root,
                     drawn: self.overlay.linked_paths(PEER).iter().cloned().collect(),
                 };
-                match dispatch(id, op, &ctx, &self.editor) {
+                // An op that looks at the disk is checked here at once, as window 1's worker checks it.
+                let dispatched = match dispatch(id, op, &ctx, &self.editor) {
+                    Ok(Dispatch::Check(check)) => check.run().finish(&ctx, &self.editor),
+                    other => other,
+                };
+                match dispatched {
                     Ok(Dispatch::Overlay(calls)) => {
                         for call in calls {
                             self.overlay
@@ -3675,7 +3680,8 @@ mod live_review {
                             });
                         }
                     }
-                    Ok(Dispatch::Rpc(_)) | Ok(Dispatch::Check(_)) => {}
+                    Ok(Dispatch::Rpc(_)) => {}
+                    Ok(Dispatch::Check(_)) => unreachable!("a check was carried out above"),
                     Err(refused) => {
                         if let Some(answer) = answer {
                             answer.send(Err(RpcError::Nvim(refused.to_string())));
