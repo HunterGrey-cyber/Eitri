@@ -542,7 +542,7 @@ struct Slot {
     /// The next write first reads the file on disk for what this window never knew of (window 1's monitor, for an
     /// orphaned window 2), and every write from then on keeps it.
     inherit: bool,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     written: usize,
 }
 
@@ -567,9 +567,9 @@ pub struct PairWriter {
     writing: bool,
     shared: Arc<Shared>,
     thread: Option<std::thread::JoinHandle<()>>,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     clock: Option<Box<dyn Fn() -> Instant>>,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     flush_wait: Option<Box<dyn Fn(Duration)>>,
 }
 
@@ -586,20 +586,20 @@ impl PairWriter {
                 changed: Condvar::new(),
             }),
             thread: None,
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-support"))]
             clock: None,
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-support"))]
             flush_wait: None,
         }
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub fn file(&self) -> &PairFile {
         &self.file
     }
 
     /// Whether this window writes the pair file now.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub fn writing(&self) -> bool {
         self.writing
     }
@@ -738,7 +738,7 @@ impl PairWriter {
     }
 
     fn now(&self) -> Instant {
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         if let Some(clock) = &self.clock {
             return clock();
         }
@@ -754,7 +754,7 @@ impl PairWriter {
             if left.is_zero() {
                 return false;
             }
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-support"))]
             if let Some(wait) = &self.flush_wait {
                 wait(left);
                 continue;
@@ -769,7 +769,7 @@ impl PairWriter {
         true
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     fn writes(&self) -> usize {
         self.shared.lock().written
     }
@@ -812,7 +812,7 @@ fn write_loop(shared: &Shared, dir: &Path, root: &Path) {
         }
         let mut slot = shared.lock();
         slot.busy = false;
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         {
             slot.written += 1;
         }
@@ -824,7 +824,7 @@ fn write_loop(shared: &Shared, dir: &Path, root: &Path) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::linked_window::tests::{id, two_workspaces, window, Scratch};
+    use crate::linked::tests::{id, two_workspaces, window, Scratch};
     use eitri_core::layout::persist::{self, Loaded};
     use eitri_core::window_link::pair::{pair_file_name, read_pair};
 
@@ -1430,14 +1430,14 @@ mod tests {
         let mut workspaces = two_workspaces(layout.clone());
         // Window 2's start in its order: every page held away as window 1's, then what the pair file gives it.
         let frame = eitri_core::layout::Frame::new(NOMINAL_GRID, 1);
-        crate::linked_window::start_second(&mut layout, &mut workspaces, &frame).unwrap();
+        crate::linked::start_second(&mut layout, &mut workspaces, &frame).unwrap();
         second_start_away(
             &mut layout,
             &mut workspaces,
             &BTreeSet::from([id("lua:notes"), id("terminal#2")]),
         );
         assert_eq!(
-            crate::linked_window::away_everywhere(&layout, &workspaces),
+            crate::linked::away_everywhere(&layout, &workspaces),
             BTreeSet::from([id("lua:other")]),
             "a page the pair gives window 2 is built there, in every workspace"
         );
@@ -1449,7 +1449,7 @@ mod tests {
         let mut layout = window(&["lua:notes"]);
         let mut workspaces = two_workspaces(layout.clone());
         let frame = eitri_core::layout::Frame::new(NOMINAL_GRID, 1);
-        crate::linked_window::start_second(&mut layout, &mut workspaces, &frame).unwrap();
+        crate::linked::start_second(&mut layout, &mut workspaces, &frame).unwrap();
         let given = BTreeSet::from([id("terminal#2"), id("lua:notes")]);
         second_start_away(&mut layout, &mut workspaces, &given);
         let keys = layout.focus().clone();
@@ -1756,7 +1756,7 @@ mod tests {
 
         // The layouts' half, as the window controller carries it out at the same moment.
         let back = eitri_core::window_link::end::end_plan(
-            &crate::linked_window::away_everywhere(&layout, &workspaces),
+            &crate::linked::away_everywhere(&layout, &workspaces),
             eitri_core::window_link::end::EndKind::RestoreFailed,
         );
         eitri_core::window_link::end::apply_end(&back, &mut layout, &mut workspaces);

@@ -70,11 +70,15 @@ fn the_scan_sees_a_word_in_a_literal_and_in_a_comment() {
 
 /// A file's text before its unit tests. A `#[cfg(test)]` higher up gates one line, not the rest of the file.
 fn before_tests(text: &str) -> &str {
-    let end = ["#[cfg(test)]\nmod tests", "#[cfg(test)]\npub(crate) mod tests"]
-        .iter()
-        .filter_map(|marker| text.find(marker))
-        .min()
-        .unwrap_or(text.len());
+    let end = [
+        "#[cfg(test)]\nmod tests",
+        "#[cfg(test)]\npub(crate) mod tests",
+        "#[cfg(any(test, feature = \"test-support\"))]\npub mod tests",
+    ]
+    .iter()
+    .filter_map(|marker| text.find(marker))
+    .min()
+    .unwrap_or(text.len());
     &text[..end]
 }
 

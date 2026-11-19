@@ -34,7 +34,6 @@ mod launch;
 mod launch_env;
 mod layout;
 mod layout_state;
-mod linked_window;
 mod linked_window_glue;
 mod lua;
 mod module_grid;
@@ -52,7 +51,6 @@ mod prefix_strip;
 mod process_memory;
 mod project_host;
 mod project_reader;
-mod project_stamp;
 mod project_start;
 #[cfg(target_os = "linux")]
 mod remote_presence;
@@ -94,10 +92,14 @@ mod gtk_host_services;
 mod gtk_host_surfaces;
 mod xft_dpi;
 
+// The linked windows live in `eitri-desk`; these names keep the paths this binary's own code writes.
+pub(crate) use eitri_desk::linked as linked_window;
+pub(crate) use eitri_desk::linked::project_stamp;
+
 // The panel's crash guard lives in `eitri-panel`; the alias keeps `crate::webview_crash_guard::` working.
 use eitri_panel::webview_crash_guard;
 use launch::*;
-use linked_window::focus::PairRaise;
+use linked_window_glue::focus::PairRaise;
 use window_services::*;
 
 use std::cell::RefCell;
@@ -2259,7 +2261,7 @@ fn build_ui(
     let (module_layout, workspaces) = parts.views();
     let cm_start = cm_record_kept(hub_cm_start, want_clean);
     let cm_session = cm_start.zip(cm_layout_dir.as_deref()).and_then(|(file, dir)| {
-        linked_window::focus::CmSession::new(dir, project_root, file)
+        linked_window_glue::focus::CmSession::new(dir, project_root, file)
             .inspect_err(|err| eprintln!("[layout] compositor layout writer: {err}"))
             .ok()
             .map(|session| Rc::new(RefCell::new(session)))
@@ -3881,7 +3883,7 @@ fn build_ui(
         let reports = RefCell::new(linked_window::pair_files::MonitorReports::default());
         let pair_for_monitor = Rc::downgrade(&pair);
         let cm_session = cm_session.clone();
-        linked_window::focus::watch(
+        linked_window_glue::focus::watch(
             &window,
             WinId::MAIN,
             Rc::new(move |event| {

@@ -15,15 +15,13 @@ use eitri_core::window_link::{FocusTarget, Msg};
 use eitri_core::wm::{Controller, Driver, PeerId, WinId};
 
 use super::{ModuleWindows, OpenModule, MODULE_WINDOWS_ARE_WINDOW_1S};
-use crate::gtk_host::LinkedWindows;
-use crate::linked_window::driver::tests::{controller, pump_until};
-use crate::linked_window::group_tabs::GroupTabs;
-use crate::linked_window::host_loop::tests::ManualClock;
-use crate::linked_window::spawn::{
-    hello, LinkEnds, Pair, PairEnv, PairHooks, SecondProcess, Starts, HUB_PEER, TEST_BUILD,
-};
-use crate::linked_window::tests::Scratch;
-use crate::linked_window::{LinkDriver, LinkEnd};
+use crate::host_traits::LinkedWindows;
+use crate::linked::driver::tests::{controller, pump_until};
+use crate::linked::group_tabs::GroupTabs;
+use crate::linked::host_loop::tests::ManualClock;
+use crate::linked::spawn::{hello, LinkEnds, Pair, PairEnv, PairHooks, SecondProcess, Starts, HUB_PEER, TEST_BUILD};
+use crate::linked::tests::Scratch;
+use crate::linked::{LinkDriver, LinkEnd};
 
 /// A stand-in for a module window: it closes its copy of the link, so the test's copy of that end is the only one
 /// and the test speaks for the window, then sleeps. Its arguments are written where `report` says.
@@ -35,18 +33,18 @@ fn stand_in(report: &Path) -> String {
 }
 
 /// The window's side of one link, in the test's hands.
-pub(in crate::linked_window) struct Their {
-    pub(in crate::linked_window) handle: LinkHandle,
+pub(in crate::linked) struct Their {
+    pub(in crate::linked) handle: LinkHandle,
     inbound: Receiver<Inbound>,
 }
 
 /// A window 1 holding the group lock, whose module windows are stand-ins. What its hooks were called with is
 /// recorded, and the handshakes' timers are held for the test to fire.
-pub(in crate::linked_window) struct Group {
-    pub(in crate::linked_window) pair: Rc<Pair>,
+pub(in crate::linked) struct Group {
+    pub(in crate::linked) pair: Rc<Pair>,
     wm: Rc<Driver<Controller>>,
     window_ends: Rc<RefCell<Vec<OwnedFd>>>,
-    pub(in crate::linked_window) clock: Rc<ManualClock>,
+    pub(in crate::linked) clock: Rc<ManualClock>,
     linked: Rc<RefCell<Vec<(WindowName, PeerId)>>>,
     ended: Rc<RefCell<Vec<(WindowName, PeerId)>>>,
     /// The windows reported as never linked, with why.
@@ -122,7 +120,7 @@ fn group_with_env(label: &str, within: Duration, change: impl FnOnce(&mut PairEn
 }
 
 /// A group whose window 1 keeps its tabs under the group's scratch directory.
-pub(in crate::linked_window) fn keeping(label: &str) -> Group {
+pub(in crate::linked) fn keeping(label: &str) -> Group {
     let group = group(label, Duration::from_secs(30));
     group
         .pair
@@ -178,7 +176,7 @@ impl Group {
     }
 
     /// Opens `name` and finishes its handshake; the descriptors its `welcome` carried.
-    pub(in crate::linked_window) fn link(&self, name: &WindowName) -> (PeerId, Their, Vec<OwnedFd>) {
+    pub(in crate::linked) fn link(&self, name: &WindowName) -> (PeerId, Their, Vec<OwnedFd>) {
         let (peer, their) = self.open(name);
         self.say_hello(&their, name, name);
         let link = self.pair.module_link(name).unwrap();
@@ -648,7 +646,7 @@ fn each_module_window_hears_what_this_window_holds_once() {
 
 #[test]
 fn a_module_windows_held_set_goes_to_the_controller_and_not_the_pair_file() {
-    use crate::linked_window::pair_files::PairWriter;
+    use crate::linked::pair_files::PairWriter;
     use eitri_core::layout::ModuleId;
     use eitri_core::wm::PeerEvent;
     let group = group("module-away", Duration::from_secs(30));
@@ -732,7 +730,7 @@ fn a_module_window_says_hello_with_its_name_and_links_on_welcome() {
     );
     handle
         .send(
-            crate::linked_window::spawn::welcome(Default::default(), Vec::new()),
+            crate::linked::spawn::welcome(Default::default(), Vec::new()),
             vec![lock.share().unwrap()],
         )
         .unwrap();
@@ -754,7 +752,7 @@ fn hub_with_a_chat_window() -> (
     LinkHandle,
     Receiver<Inbound>,
 ) {
-    use crate::linked_window::driver::tests::{controller_in, pair};
+    use crate::linked::driver::tests::{controller_in, pair};
     let (wm, host) = controller_in(eitri_core::wm::window::Tiling::Hub);
     let (driver, theirs, their_inbound) = pair();
     driver.attach_controller(WinId::MAIN, PeerId(16), chat(1), &wm);
@@ -855,7 +853,7 @@ fn focus_in_of_a_module_window_tells_window_1() {
     pair.say_window_focused();
     handle
         .send(
-            crate::linked_window::spawn::welcome(Default::default(), Vec::new()),
+            crate::linked::spawn::welcome(Default::default(), Vec::new()),
             vec![lock.share().unwrap()],
         )
         .unwrap();
@@ -1097,7 +1095,7 @@ fn each_window_says_its_own_close() {
 mod hand_over;
 mod tabs;
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 mod script_fixture {
     include!(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/support/executable.rs"));
 }

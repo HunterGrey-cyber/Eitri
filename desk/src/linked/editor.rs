@@ -1892,14 +1892,14 @@ struct WaitingDraft {
 type Consumer<T> = RefCell<Option<Rc<dyn Fn(T)>>>;
 
 /// A plugin host in window 2 translates its fixed local calls into typed requests; no Lua crosses the link.
-pub(crate) struct PluginEditorRpc {
+pub struct PluginEditorRpc {
     owner: String,
     roots: eitri_core::plugin::roots::Roots,
     ops: Rc<EditorOps>,
 }
 
 impl PluginEditorRpc {
-    pub(crate) fn new(owner: String, roots: eitri_core::plugin::roots::Roots, ops: Rc<EditorOps>) -> Self {
+    pub fn new(owner: String, roots: eitri_core::plugin::roots::Roots, ops: Rc<EditorOps>) -> Self {
         Self { owner, roots, ops }
     }
 
@@ -2295,7 +2295,7 @@ impl Window2Editor {
 
     /// The panel's request for nvim, sent to window 1 as an editor request with `token` (an activation token, so
     /// window 1 may come forward). `Err` says why it was not sent, for the panel to show.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub fn request(&self, request: &ScratchRequest, token: &dyn Fn() -> Option<String>) -> Result<(), String> {
         self.ask(request, token, false).map(|_| ())
     }
@@ -2577,8 +2577,8 @@ fn write_marker(done: &Path, text: &str) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::linked_window::spawn::SECOND_PEER;
-    use crate::linked_window::tests::Scratch;
+    use crate::linked::spawn::SECOND_PEER;
+    use crate::linked::tests::Scratch;
     use agent::setting_sources::ProjectTrust;
     use agent::PermissionMode;
     use eitri_core::editor_context::Selection;

@@ -12,11 +12,12 @@
 pub mod closes;
 pub mod driver;
 pub mod editor;
-pub(crate) mod focus;
 pub mod group_tabs;
 pub mod hand_over;
 pub mod host_loop;
 pub mod pair_files;
+pub mod peer;
+pub mod project_stamp;
 pub mod registry;
 pub mod relink;
 pub mod review;
@@ -379,18 +380,18 @@ impl HeldSaid {
     }
 }
 
-#[cfg(test)]
-pub(crate) mod tests {
+#[cfg(any(test, feature = "test-support"))]
+pub mod tests {
     use super::*;
     use eitri_core::layout::{ModuleDecl, Placement, Size};
     use std::collections::BTreeMap;
 
     /// A layout directory of the test's own, `<scratch>/eitri/layout` as a state directory is laid out (its
     /// parents are this user's, which the private directory rule checks), removed when the test ends.
-    pub(crate) struct Scratch(pub(crate) PathBuf, pub(crate) PathBuf);
+    pub struct Scratch(pub PathBuf, pub PathBuf);
 
     impl Scratch {
-        pub(crate) fn new(label: &str) -> Scratch {
+        pub fn new(label: &str) -> Scratch {
             let top = std::env::temp_dir().join(format!(
                 "eitri-linked-window-{}-{label}-{}",
                 std::process::id(),
@@ -422,7 +423,7 @@ pub(crate) mod tests {
         }
     }
 
-    pub(crate) fn id(text: &str) -> ModuleId {
+    pub fn id(text: &str) -> ModuleId {
         ModuleId::parse(text).unwrap()
     }
 
@@ -432,7 +433,7 @@ pub(crate) mod tests {
 
     /// The editor and chat in a row, a terminal and a terminal instance below the editor, a Lua panel and a
     /// plugin page at the side.
-    pub(crate) fn window(extra: &[&str]) -> Layout {
+    pub fn window(extra: &[&str]) -> Layout {
         let mut decls = vec![ModuleDecl {
             id: ModuleId::terminal(),
             placement: Placement::BelowEditor,
@@ -662,7 +663,7 @@ pub(crate) mod tests {
 
     #[test]
     fn what_a_window_holds_is_said_again_to_every_new_link() {
-        use crate::linked_window::driver::tests::pair;
+        use crate::linked::driver::tests::pair;
         use eitri_core::window_link::link::Inbound;
         use eitri_core::window_link::Msg;
         use std::time::Duration;

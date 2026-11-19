@@ -258,5 +258,5 @@ pub fn peer_action(
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub(super) mod tests;

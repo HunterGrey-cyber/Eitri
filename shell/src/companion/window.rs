@@ -182,7 +182,7 @@ impl CompanionAgents {
     fn present(&self, token: Option<&str>) {
         if let Some(window) = self.window.upgrade() {
             if token.is_some() || !window.is_active() {
-                crate::linked_window::focus::present_with_token(&window, token);
+                crate::linked_window_glue::focus::present_with_token(&window, token);
                 self.runner.raise_pid(std::process::id());
             }
         }

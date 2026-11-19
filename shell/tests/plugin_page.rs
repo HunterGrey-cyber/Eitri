@@ -93,12 +93,14 @@ mod wheel_zoom;
 mod layout;
 
 // The link driver is written against the watch contract of `host_loop`, which it reaches as `super::host_loop`.
-#[allow(dead_code, unused_imports)]
-#[path = "../src/linked_window/host_loop.rs"]
+// `test-support` is `eitri-desk`'s feature; compiled here, its gates are simply off.
+#[allow(dead_code, unused_imports, unexpected_cfgs)]
+#[path = "../../desk/src/linked/host_loop.rs"]
 mod host_loop;
 // The terminal's compiled move-test helpers refer to the link driver; this run creates no link.
-#[allow(dead_code, unused_imports)]
-#[path = "../src/linked_window/driver.rs"]
+// `test-support` is `eitri-desk`'s feature; compiled here, its gates are simply off.
+#[allow(dead_code, unused_imports, unexpected_cfgs)]
+#[path = "../../desk/src/linked/driver.rs"]
 pub(crate) mod link_driver;
 #[allow(dead_code)]
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -107,7 +109,14 @@ pub(crate) enum LinkEnd {
     Eof,
 }
 mod linked_window {
+    #[allow(unused_imports)]
     pub(crate) use super::link_driver as driver;
+}
+// The driver names the link's peer end and its own siblings through `crate::linked`.
+mod linked {
+    #[allow(unused_imports)]
+    pub(crate) use super::link_driver as driver;
+    pub(crate) use eitri_desk::linked::peer;
 }
 
 const INDEX: &str = r#"<!doctype html><html><head><meta charset="utf-8"><title>t</title>

@@ -1094,9 +1094,9 @@ mod tests {
         );
     }
 
-    use crate::linked_window::driver::Partner as LinkPartner;
-    use crate::linked_window::editor::Window2Editor;
-    use crate::linked_window::tests::Scratch;
+    use crate::linked::driver::Partner as LinkPartner;
+    use crate::linked::editor::Window2Editor;
+    use crate::linked::tests::Scratch;
     use agent::{AgentConversation, AgentDomainEvent, TurnOutcome};
     use eitri_core::agent_backend::{AgentBackend, AgentId, BackendKind};
     use eitri_core::agent_bridge::{parse_inbound_message, InboundMessage, SessionModeChoice};
@@ -1723,7 +1723,7 @@ mod tests {
             }
             let two_editor = Window2Editor::new(&project, None, steps.repeat());
             one_editor.linked(
-                crate::linked_window::spawn::SECOND_PEER,
+                crate::linked::spawn::SECOND_PEER,
                 eitri_core::window_link::names::WindowName::Second,
                 &one_link,
             );

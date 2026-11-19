@@ -174,8 +174,8 @@ impl GroupTabs {
     }
 
     /// Waits until the file holds what it was handed, for a test to read it.
-    #[cfg(test)]
-    pub(crate) fn wait_written(&self) -> bool {
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn wait_written(&self) -> bool {
         self.writer.wait_written(Duration::from_secs(5))
     }
 }
@@ -260,7 +260,7 @@ mod tests {
     use eitri_core::agent_bridge::SessionModeChoice;
     use eitri_core::saved_tabs::{file_name_as, load, save, save_as, Loaded, SavedTab};
 
-    use crate::linked_window::tests::Scratch;
+    use crate::linked::tests::Scratch;
 
     fn root() -> PathBuf {
         PathBuf::from("/p")

@@ -27,7 +27,7 @@ use eitri_core::window_link::{LinkError, Msg, TurnEdge};
 use eitri_core::wm::{Controller, Driver, PeerId, WinId};
 
 use super::LinkEnd;
-use crate::gtk_host::peer::{self, LinkPort, LinkSend};
+use crate::linked::peer::{self, LinkPort, LinkSend};
 
 /// How long a window started here has to finish the handshake. Its `hello` comes once its toolkit is up, which a
 /// loaded machine can take several seconds for; past this the start has failed, and a window that never says hello
@@ -51,7 +51,7 @@ type WakeHandler = Rc<dyn Fn(&LinkDriver)>;
 struct Inner {
     handle: RefCell<Option<LinkHandle>>,
     inbound: Receiver<Inbound>,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     queued_for_test: RefCell<std::collections::VecDeque<Inbound>>,
     handlers: RefCell<BTreeMap<&'static str, Handler>>,
     on_end: RefCell<Vec<EndHandler>>,
@@ -90,7 +90,7 @@ impl LinkDriver {
             inner: Rc::new(Inner {
                 handle: RefCell::new(Some(handle)),
                 inbound,
-                #[cfg(test)]
+                #[cfg(any(test, feature = "test-support"))]
                 queued_for_test: RefCell::default(),
                 handlers: RefCell::default(),
                 on_end: RefCell::default(),
@@ -111,8 +111,8 @@ impl LinkDriver {
     }
 
     /// The link's wake descriptor, while the link is up.
-    #[cfg(test)]
-    pub(crate) fn wake_fd(&self) -> Option<std::os::fd::RawFd> {
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn wake_fd(&self) -> Option<std::os::fd::RawFd> {
         self.inner
             .handle
             .borrow()
@@ -213,7 +213,7 @@ impl LinkDriver {
         }
         let mut handed = false;
         loop {
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-support"))]
             let incoming = self
                 .inner
                 .queued_for_test
@@ -221,7 +221,7 @@ impl LinkDriver {
                 .pop_front()
                 .map(Ok)
                 .unwrap_or_else(|| self.inner.inbound.try_recv());
-            #[cfg(not(test))]
+            #[cfg(not(any(test, feature = "test-support")))]
             let incoming = self.inner.inbound.try_recv();
             match incoming {
                 Ok(Inbound::Msg { msg, fds }) => {
@@ -250,7 +250,7 @@ impl LinkDriver {
 
     /// Reads through a marker sent after all earlier packets, keeping those packets for the next ordinary drain.
     /// The marker has no handler and never reaches a window's state.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn read_through_for_test(&self, sender: &LinkDriver) {
         if !self.is_up() || !sender.is_up() {
             return;
@@ -259,7 +259,7 @@ impl LinkDriver {
         self.read_handle_through_for_test(handle.as_ref().unwrap());
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn read_handle_through_for_test(&self, sender: &LinkHandle) {
         sender
             .send(Msg::IdePort { port: Some(u16::MAX) }, Vec::new())
@@ -512,8 +512,8 @@ impl LinkSend for LinkDriver {
     }
 }
 
-#[cfg(test)]
-pub(crate) mod tests {
+#[cfg(any(test, feature = "test-support"))]
+pub mod tests {
     use super::super::host_loop::tests::RecordingWatch;
     use super::*;
     use eitri_core::window_link::fdpass;
@@ -521,7 +521,7 @@ pub(crate) mod tests {
     use std::time::{Duration, Instant};
 
     /// Two linked ends: a driver on one, the bare handle of the other window on the other.
-    pub(crate) fn pair() -> (LinkDriver, LinkHandle, Receiver<Inbound>) {
+    pub fn pair() -> (LinkDriver, LinkHandle, Receiver<Inbound>) {
         let (a, b) = fdpass::seqpacket_pair().unwrap();
         let (mine, inbound) = LinkHandle::start(a, PresenceFlag::default()).unwrap();
         let (theirs, their_inbound) = LinkHandle::start(b, PresenceFlag::default()).unwrap();
@@ -529,7 +529,7 @@ pub(crate) mod tests {
     }
 
     /// Pumps until `done` holds, for at most five seconds: the link thread delivers on its own schedule.
-    pub(crate) fn pump_until(driver: &LinkDriver, done: impl Fn() -> bool) -> bool {
+    pub fn pump_until(driver: &LinkDriver, done: impl Fn() -> bool) -> bool {
         let deadline = Instant::now() + Duration::from_secs(5);
         while Instant::now() < deadline {
             driver.pump();
@@ -679,7 +679,7 @@ pub(crate) mod tests {
 
     #[test]
     fn a_handshake_not_done_by_its_deadline_drops_the_link_so_another_window_can_start() {
-        use crate::linked_window::{WindowNew, WindowRole};
+        use crate::linked::{WindowNew, WindowRole};
         // A clock of the test's own: instants it makes up, never the time it takes to run.
         let start = Instant::now();
         let (driver, _theirs, _their_inbound) = pair();
@@ -735,7 +735,7 @@ pub(crate) mod tests {
         driver.on("hello", |link, _, _| link.set_linked());
         theirs
             .send(
-                crate::linked_window::spawn::hello("0.4.0+abc".into(), &WindowName::Second, 4242, 99),
+                crate::linked::spawn::hello("0.4.0+abc".into(), &WindowName::Second, 4242, 99),
                 Vec::new(),
             )
             .unwrap();
@@ -783,7 +783,7 @@ pub(crate) mod tests {
     }
 
     /// A window controller holding one window, on the fake host, for the link to attach to.
-    pub(crate) fn controller() -> (Rc<Driver<Controller>>, Rc<eitri_core::wm::fake::FakeHost>) {
+    pub fn controller() -> (Rc<Driver<Controller>>, Rc<eitri_core::wm::fake::FakeHost>) {
         controller_in(eitri_core::wm::window::Tiling::Eitri)
     }
 

@@ -23,7 +23,7 @@ use eitri_core::wm::moves::MoveKind;
 use eitri_core::wm::{Descriptors, Handoff, HostEvent, PeerEvent, PeerId, PeerPort};
 
 /// The kinds of message the controller hears from the other window: the move protocol's.
-pub(crate) const MOVE_KINDS: [&str; 9] = [
+pub const MOVE_KINDS: [&str; 9] = [
     "move_offer",
     "move_ready",
     "move_refused",
@@ -40,7 +40,7 @@ pub(crate) const MOVE_KINDS: [&str; 9] = [
 const SESSION_MAX: usize = 256;
 
 /// One window's end of the link as the port sends on it: the link's handle, or what wraps it on the GTK thread.
-pub(crate) trait LinkSend {
+pub trait LinkSend {
     /// Queues `msg` with `fds`, which are closed once written.
     fn send(&self, msg: Msg, fds: Vec<OwnedFd>) -> Result<(), LinkError>;
     /// As `send`, and the receiver answers once the packet is on the socket, or never will be.
@@ -58,17 +58,17 @@ impl LinkSend for LinkHandle {
 }
 
 /// The handoff a terminal pane gives for `fds`: what [`LinkPort`] sends with the `move` that carries it.
-pub(crate) fn handoff_of(fds: Vec<OwnedFd>) -> Handoff {
+pub fn handoff_of(fds: Vec<OwnedFd>) -> Handoff {
     Handoff::new(Rc::new(Descriptors::new(fds)))
 }
 
 /// The controller's [`PeerPort`] over one link.
-pub(crate) struct LinkPort<L> {
+pub struct LinkPort<L> {
     link: L,
 }
 
 impl<L: LinkSend> LinkPort<L> {
-    pub(crate) fn new(link: L) -> LinkPort<L> {
+    pub fn new(link: L) -> LinkPort<L> {
         LinkPort { link }
     }
 }
@@ -93,7 +93,7 @@ impl<L: LinkSend> PeerPort for LinkPort<L> {
 
 /// What the link thread passed on, as the event the controller hears from `peer`; `None` for what is not the
 /// controller's. Takes the packet by value, so a `move`'s descriptors move into its event.
-pub(crate) fn inbound_event(peer: PeerId, inbound: Inbound) -> Option<HostEvent> {
+pub fn inbound_event(peer: PeerId, inbound: Inbound) -> Option<HostEvent> {
     let (msg, fds) = match inbound {
         Inbound::Msg { msg, fds } => (msg, fds),
         Inbound::Closed => return Some(HostEvent::Peer(PeerEvent::LinkClosed { peer })),
@@ -201,7 +201,7 @@ fn asked(peer: PeerId, module: Option<String>, session: Option<String>, follow: 
 
 /// The refusal the other window gets for an offer this window cannot read (a module or a kind this build does not
 /// know), so its move ends at once rather than at its deadline; `None` for any other message.
-pub(crate) fn unreadable_offer(msg: &Msg) -> Option<Msg> {
+pub fn unreadable_offer(msg: &Msg) -> Option<Msg> {
     let Msg::MoveOffer { mv, module, kind, .. } = msg else {
         return None;
     };
@@ -215,7 +215,7 @@ fn offered(module: &str, kind: &str) -> Result<(ModuleId, MoveKind), String> {
 }
 
 /// Pair messages retain their single link handler and report their facts to the controller through it.
-pub(crate) fn pair_event(peer: PeerId, msg: &Msg) -> Option<PeerEvent> {
+pub fn pair_event(peer: PeerId, msg: &Msg) -> Option<PeerEvent> {
     match msg {
         Msg::Summary(summary) => Some(PeerEvent::Summary {
             peer,
@@ -259,7 +259,7 @@ pub(crate) fn pair_event(peer: PeerId, msg: &Msg) -> Option<PeerEvent> {
 }
 
 /// The event posted once a wake of `peer`'s link has been drained: a confirmed send may have been answered.
-pub(crate) fn woke(peer: PeerId) -> HostEvent {
+pub fn woke(peer: PeerId) -> HostEvent {
     HostEvent::Peer(PeerEvent::Woke { peer })
 }
 

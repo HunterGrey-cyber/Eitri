@@ -11,10 +11,10 @@ use eitri_core::saved_tabs::{load, Loaded, SavedTab, SavedTabs};
 use serde_json::Value;
 
 use super::*;
-use crate::linked_window::group_tabs::REPORT_AFTER;
-use crate::linked_window::hand_over::TabHolder;
-use crate::linked_window::spawn::{welcome, LAST_TABS_POLL, LAST_TABS_WITHIN};
-use crate::linked_window::KEPT_WORDS;
+use crate::linked::group_tabs::REPORT_AFTER;
+use crate::linked::hand_over::TabHolder;
+use crate::linked::spawn::{welcome, LAST_TABS_POLL, LAST_TABS_WITHIN};
+use crate::linked::KEPT_WORDS;
 
 fn c(n: u8) -> WindowName {
     WindowName::Chat(n)
@@ -359,8 +359,8 @@ fn a_closing_group_hears_each_chat_windows_last_tabs_before_its_bye() {
 
 /// A window that stopped reading holds its link's close for the whole flush, and a group can have several.
 #[test]
-fn a_groups_links_close_off_the_gtk_thread() {
-    let text = eitri_core::source_scan::read_required("shell/src/linked_window/registry.rs").text;
+fn a_groups_links_close_off_the_ui_thread() {
+    let text = eitri_core::source_scan::read_required("desk/src/linked/registry.rs").text;
     let code = eitri_core::source_scan::code_only(&text);
     assert!(code.contains(concat!("module.link.close_", "detached(why)")));
 }

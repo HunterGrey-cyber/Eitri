@@ -420,10 +420,10 @@ fn no_panel_hook_decides_in_build_ui() {
     assert!(editor_drive_returns_outcome(drive), "{drive}");
 }
 
-/// Every function named `name` in the linked editor (`shell/src/linked_window/editor.rs`, its tests cut), each from
+/// Every function named `name` in the linked editor (`desk/src/linked/editor.rs`, its tests cut), each from
 /// its name on, whitespace removed.
 fn linked_editor_fns(name: &str) -> Vec<String> {
-    let source = scan::read_required("shell/src/linked_window/editor.rs");
+    let source = scan::read_required("desk/src/linked/editor.rs");
     let code = scan::code_only(&source.text);
     let code = scan::without(&code, &scan::modules(&code, "tests"));
     scan::functions(&code, name)
@@ -1577,7 +1577,7 @@ fn the_link_ended_hook_loads_again_every_page_that_comes_back() {
 /// own chat goes through, so the two can never drift apart; its column is judged by the rule a page's column is.
 #[test]
 fn window_2s_paths_follow_the_panels_own_rule() {
-    let code = file_code("shell/src/linked_window/editor.rs");
+    let code = file_code("desk/src/linked/editor.rs");
     let open = arm(
         &code,
         "EditorRequest::OpenPath{path,line,col,unit}=>",

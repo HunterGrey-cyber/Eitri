@@ -1,6 +1,8 @@
 //! The GTK half of the linked windows: what the toolkit-free pair code is given by this binary: its scheduling and
 //! readiness watches, application holds, the stamp of each activation, and the reload of a returned page's webview.
 
+pub(crate) mod focus;
+
 use std::os::fd::RawFd;
 use std::path::PathBuf;
 use std::rc::Rc;

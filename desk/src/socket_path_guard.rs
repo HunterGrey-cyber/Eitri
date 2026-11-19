@@ -6,9 +6,25 @@
 
 use eitri_core::source_scan::{code_only, require_anchors, rust_sources, without_line_comments, word_ends};
 
-/// `(file, a substring of the line)`: each one a `.sock` mention that is never a bound or connected path.
-/// None yet: the crate holds no socket code.
-const NEVER_BOUND: &[(&str, &str)] = &[];
+/// `(file, a substring of the line)`: each one a `.sock` mention that is never a bound or connected path: the orphan
+/// listener's name read back from a directory listing, and the tests that compare a path `in_dir` built.
+const NEVER_BOUND: &[(&str, &str)] = &[
+    ("desk/src/linked/relink.rs", "rest.strip_suffix(\".sock\")"),
+    ("desk/src/linked/relink/tests.rs", "name.ends_with(\".sock\")"),
+    ("desk/src/linked/relink/tests.rs", "dir.join(format!(\"w-{key}.sock\"))"),
+    (
+        "desk/src/linked/relink/tests.rs",
+        "dir.join(format!(\"w-{key}-c3.sock\"))",
+    ),
+    (
+        "desk/src/linked/relink/tests.rs",
+        "dir.join(format!(\"w-{key}-{page}.sock\"))",
+    ),
+    (
+        "desk/src/linked/relink/tests.rs",
+        "ends_with(&format!(\"-{form}.sock\"))",
+    ),
+];
 
 #[test]
 fn every_sock_path_in_this_crate_is_built_through_agent_socket_path() {

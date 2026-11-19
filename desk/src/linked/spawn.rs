@@ -54,7 +54,7 @@ use super::pair_files::PairWriter;
 use super::registry::{ModuleLink, ModuleWindows, OpenModule, MODULE_WINDOWS_ARE_WINDOW_1S};
 use super::relink::{self, HeldNow, OrphanSocket, Relinked};
 use super::{LinkEnd, WindowNew, WindowRole, KEPT_WORDS, NO_OTHER_WINDOW};
-use crate::project_stamp::{ProjectStamp, StampSlot};
+use crate::linked::project_stamp::{ProjectStamp, StampSlot};
 use eitri_core::saved_tabs::{SavedTab, SavedTabs};
 use eitri_panel::agent_panel::TabAnswer;
 
@@ -186,14 +186,14 @@ pub struct PairEnv {
     pub clock: Rc<dyn PairClock>,
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub(crate) const TEST_BUILD: &str = "eitri-test-build";
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 impl PairEnv {
     /// An env whose executable is a test path, whose build is [`TEST_BUILD`], that has seen no end signal, and whose
     /// clock is a manual one nothing fires but the test.
-    pub(crate) fn for_tests() -> Rc<Self> {
+    pub fn for_tests() -> Rc<Self> {
         Self::for_tests_with(|_| {})
     }
 
@@ -212,7 +212,7 @@ impl PairEnv {
 
 /// The handshake budget and socket pair factory. Tests can keep a copy of the started end to speak for it.
 #[derive(Clone)]
-pub(crate) struct Starts {
+pub struct Starts {
     pub handshake_within: Duration,
     pub link_ends: LinkEnds,
 }
@@ -550,7 +550,7 @@ impl Pair {
         self.ide_port.clone()
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub fn ide_port(&self) -> Option<u16> {
         self.ide_port.get()
     }
@@ -586,7 +586,7 @@ impl Pair {
     }
 
     /// Overrides the handshake budget or socket pair factory for stand-ins.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn set_starts(&self, starts: Starts) {
         *self.starts.borrow_mut() = starts;
     }
@@ -703,7 +703,7 @@ impl Pair {
     }
 
     /// A release queued on a link, for a test that gives its answer itself.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn hold_released(&self, written: std::sync::mpsc::Receiver<io::Result<()>>, tab: SavedTab) {
         self.unwritten.hold(written, tab);
     }
@@ -770,14 +770,14 @@ impl Pair {
 
     /// Starts the stamp of the lock this window started with, if it has one: `root` for the window that took the lock,
     /// `None` for one that adopted a copy. An unpaired or lone window has none and does nothing.
-    pub(crate) fn start_stamp(&self, root: Option<PathBuf>) {
+    pub fn start_stamp(&self, root: Option<PathBuf>) {
         if let Some(lock) = &self.lock {
             self.stamp.fill(ProjectStamp::start(lock, root));
         }
     }
 
     /// What this window's activations go to.
-    pub(crate) fn stamp(&self) -> Rc<StampSlot> {
+    pub fn stamp(&self) -> Rc<StampSlot> {
         self.stamp.clone()
     }
 
@@ -926,13 +926,13 @@ impl Pair {
     }
 
     /// The module window `name`'s link, for a test that steps it.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn module_link(&self, name: &WindowName) -> Option<LinkDriver> {
         self.modules.borrow().get(name).map(|module| module.link.clone())
     }
 
     /// The module window `name`'s process, for a test that speaks for it.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn module_process(&self, name: &WindowName) -> Option<Rc<SecondProcess>> {
         self.modules.borrow().get(name).map(|module| module.process.clone())
     }
@@ -1051,7 +1051,7 @@ impl Pair {
     fn post_kind(&self, link: &LinkDriver, kind: &'static str, peer: PeerId) {
         let hooks = self.hooks.clone();
         link.on(kind, move |_, msg, _| {
-            post_event(&hooks, crate::gtk_host::peer::pair_event(peer, &msg));
+            post_event(&hooks, crate::linked::peer::pair_event(peer, &msg));
         });
     }
 
@@ -1100,7 +1100,7 @@ impl Pair {
                     None => eprintln!("[link] the other window names a monitor {connector:?}; not kept"),
                 }
             }
-            post_event(&hooks, crate::gtk_host::peer::pair_event(peer, &msg));
+            post_event(&hooks, crate::linked::peer::pair_event(peer, &msg));
         });
         // What window 2 holds is what the pair file names it the holder of; window 2 hears window 1's held set
         // only to keep its own numbers apart.
@@ -1108,7 +1108,7 @@ impl Pair {
         let pair_writer = self.pair_writer.clone();
         let hooks = self.hooks.clone();
         link.on("away", move |_, msg, _| {
-            let event = crate::gtk_host::peer::pair_event(peer, &msg);
+            let event = crate::linked::peer::pair_event(peer, &msg);
             if let Msg::Away { ids } = msg {
                 println!("[link] the other window holds {}", ids.join(", "));
                 if records_holders {
@@ -1394,7 +1394,7 @@ impl Pair {
     }
 
     /// The closes heard so far as they stand at `now`, for a test that has no wish to wait out the burst.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn settle_closes_at(&self, now: std::time::Instant) {
         self.closes.settle(now);
     }
@@ -1582,7 +1582,7 @@ impl Pair {
     }
 
     /// The connection being answered, for a test that steps it.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn relink_candidate(&self) -> Option<LinkDriver> {
         self.orphan
             .borrow()
@@ -1590,7 +1590,7 @@ impl Pair {
             .and_then(|orphan| orphan.candidate.clone())
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn orphan_fd(&self) -> Option<std::os::fd::RawFd> {
         self.orphan.borrow().as_ref().map(|orphan| orphan.socket.raw_fd())
     }
@@ -1681,7 +1681,7 @@ impl Pair {
 
 /// The window controller's `window.new`, carried out by the GTK host: what the pair started or raised is not the
 /// controller's to know, since a window 2 it starts becomes its peer only once its `hello` links it.
-impl crate::gtk_host::LinkedWindows for Pair {
+impl crate::host_traits::LinkedWindows for Pair {
     fn open(&self, _win: eitri_core::wm::WinId, name: &WindowName, token: Option<String>) -> Result<(), String> {
         if *name == WindowName::Second {
             let plan = self.window_new(token)?;
@@ -1775,7 +1775,7 @@ impl crate::gtk_host::LinkedWindows for Pair {
         if !self.is_second() {
             return Err("window 1 has no window 1 to ask".to_string());
         }
-        crate::gtk_host::LinkedWindows::send(self, win, HUB_PEER, msg)
+        crate::host_traits::LinkedWindows::send(self, win, HUB_PEER, msg)
     }
 
     /// Hands a tab from the module window `from` to `to`, which is started or raised first. A hand-over that cannot
@@ -1998,10 +1998,10 @@ pub struct SecondProcess {
     pidfd: Arc<PidFd>,
     #[cfg_attr(not(test), allow(dead_code))] // The window only logs the reap; the tests wait for it.
     reaped: Arc<Reaped>,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     end_requests: std::sync::atomic::AtomicUsize,
     /// The `(grace, told)` of each [`SecondProcess::end_unless_closed`] asked of this process.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     closing_bounds: Mutex<Vec<(Duration, Duration)>>,
 }
 
@@ -2074,9 +2074,9 @@ impl SecondProcess {
             start,
             pidfd: Arc::new(pidfd),
             reaped,
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-support"))]
             end_requests: Default::default(),
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-support"))]
             closing_bounds: Default::default(),
         })
     }
@@ -2089,9 +2089,9 @@ impl SecondProcess {
             start: partner.start,
             pidfd: Arc::new(PidFd::open(partner.pid, partner.start)?),
             reaped: Arc::default(),
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-support"))]
             end_requests: Default::default(),
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-support"))]
             closing_bounds: Default::default(),
         })
     }
@@ -2108,7 +2108,7 @@ impl SecondProcess {
     /// else SIGTERM, and SIGKILL once `grace` has passed with it still running. Only this process is signalled,
     /// never its group or anything it started.
     pub fn end(&self, grace: Duration) -> io::Result<JoinHandle<Ending>> {
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         self.end_requests.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let pidfd = self.pidfd.clone();
         let pid = self.pid;
@@ -2127,7 +2127,7 @@ impl SecondProcess {
     /// that stopped answering is ended sooner, by its own watchdog, which the SIGTERM wakes. One signal only: a second
     /// forces a close that is under way.
     pub fn end_unless_closed(&self, grace: Duration, told: Duration) -> io::Result<JoinHandle<Ending>> {
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         {
             self.end_requests.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             self.closing_bounds.lock().unwrap().push((grace, told));
@@ -2145,19 +2145,19 @@ impl SecondProcess {
         })
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn closing_bounds(&self) -> Vec<(Duration, Duration)> {
         self.closing_bounds.lock().unwrap().clone()
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn ending_requests(&self) -> usize {
         self.end_requests.load(std::sync::atomic::Ordering::SeqCst)
     }
 
     /// The reaped status, waiting at most `timeout` for it.
-    #[cfg(test)]
-    pub(crate) fn wait_reaped(&self, timeout: Duration) -> Option<ExitStatus> {
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn wait_reaped(&self, timeout: Duration) -> Option<ExitStatus> {
         let status = self.reaped.status.lock().unwrap();
         let (status, _) = self
             .reaped
@@ -2267,7 +2267,7 @@ fn hold_until_finished(ending: JoinHandle<Ending>, clock: &dyn PairClock) {
 /// Runs `release` on the loop's thread as soon as `ending` has finished. The join runs on a worker and wakes the loop
 /// when it returns, so nothing waits on the caller and nothing polls: a window that is already gone lets the process
 /// exit at once, not at the next look of a timer (which cost every close in compositor mode about 100 ms).
-pub(crate) fn release_when_finished<T: Send + 'static>(
+pub fn release_when_finished<T: Send + 'static>(
     ending: JoinHandle<T>,
     release: impl FnOnce() + 'static,
     clock: &dyn PairClock,
@@ -2351,7 +2351,7 @@ fn end_if_overdue(
 /// Window 1 starts window 2 ([`start_window`]); a window 2 refused at its hello ends by itself, once it reads the
 /// `bye`.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn start_second(
+pub fn start_second(
     env: &PairEnv,
     starts: &Starts,
     root: &Path,
@@ -2580,12 +2580,12 @@ fn take_welcome(
     linked(link);
 }
 
-#[cfg(test)]
-pub(crate) mod tests {
+#[cfg(any(test, feature = "test-support"))]
+pub mod tests {
     use super::*;
-    use crate::linked_window::driver::tests::{pair, pump_until};
-    use crate::linked_window::host_loop::tests::ManualClock;
-    use crate::linked_window::registry::tests::keeping;
+    use crate::linked::driver::tests::{pair, pump_until};
+    use crate::linked::host_loop::tests::ManualClock;
+    use crate::linked::registry::tests::keeping;
     use eitri_core::window_link::link::Inbound;
     use std::ffi::OsString;
     use std::time::Duration;
@@ -2684,7 +2684,7 @@ pub(crate) mod tests {
     #[test]
     fn a_refused_hello_is_answered_with_bye_and_the_link_closes() {
         let (driver, theirs, their_inbound) = pair();
-        let dir = crate::linked_window::tests::Scratch::new("refused-hello");
+        let dir = crate::linked::tests::Scratch::new("refused-hello");
         let lock = Rc::new(PairLock::try_take(&dir.0, Path::new("/p")).unwrap().unwrap());
         let linked_calls: Rc<std::cell::Cell<u32>> = Rc::default();
         let linked: LinkMade = {
@@ -2720,7 +2720,7 @@ pub(crate) mod tests {
     #[test]
     fn a_matching_hello_is_welcomed_with_the_pair_lock() {
         let (driver, theirs, their_inbound) = pair();
-        let dir = crate::linked_window::tests::Scratch::new("welcome");
+        let dir = crate::linked::tests::Scratch::new("welcome");
         let root = Path::new("/p");
         let lock = Rc::new(PairLock::try_take(&dir.0, root).unwrap().unwrap());
         let linked_calls: Rc<std::cell::Cell<u32>> = Rc::default();
@@ -3027,7 +3027,7 @@ pub(crate) mod tests {
 
     /// Starts a child that survives SIGTERM and ends it with `grace` to go: from the main loop's timer, armed with the
     /// whole `grace` on `clock`, when `on_timer`, else on a thread whose grace wait the returned sender releases.
-    pub(crate) fn end_stand_in_in_grace(
+    pub fn end_stand_in_in_grace(
         clock: &dyn PairClock,
         grace: Duration,
         on_timer: bool,
@@ -3058,7 +3058,7 @@ pub(crate) mod tests {
 
     #[test]
     fn only_a_window_with_the_lock_starts_a_stamp() {
-        let dir = crate::linked_window::tests::Scratch::new("stamp-roles");
+        let dir = crate::linked::tests::Scratch::new("stamp-roles");
         let root = Path::new("/home/someone/project");
         let lock = PairLock::try_take(&dir.0, root).unwrap().unwrap();
         let path = dir.0.join(eitri_core::window_link::pair::pair_lock_name(root));
@@ -3091,7 +3091,7 @@ pub(crate) mod tests {
     /// A chat window's lock comes in `welcome`, after its window may already have taken activation.
     #[test]
     fn a_window_that_adopts_its_lock_in_welcome_stamps_its_activations() {
-        let dir = crate::linked_window::tests::Scratch::new("stamp-welcome");
+        let dir = crate::linked::tests::Scratch::new("stamp-welcome");
         let root = Path::new("/home/someone/project");
         let lock = PairLock::try_take(&dir.0, root).unwrap().unwrap();
         let path = dir.0.join(eitri_core::window_link::pair::pair_lock_name(root));
@@ -3117,7 +3117,7 @@ pub(crate) mod tests {
     }
 
     /// A link to no nvim yet: a beside pair for a test that never polls it.
-    pub(crate) fn idle_beside_link(id: &str) -> Rc<eitri_core::companion::link::CompanionLink> {
+    pub fn idle_beside_link(id: &str) -> Rc<eitri_core::companion::link::CompanionLink> {
         Rc::new(eitri_core::companion::link::CompanionLink::new(
             None,
             eitri_core::companion::Sockets::default(),
@@ -3129,7 +3129,7 @@ pub(crate) mod tests {
     /// each says so rather than doing something else.
     #[test]
     fn a_beside_pair_refuses_start_editor_send_to_hub_send_and_focus_other() {
-        use crate::gtk_host::LinkedWindows;
+        use crate::host_traits::LinkedWindows;
         use eitri_core::wm::WinId;
         let pair = Pair::beside(
             PairEnv::for_tests(),
@@ -3154,10 +3154,7 @@ pub(crate) mod tests {
             );
         }
         assert_eq!(pair.window_other(None), Err(NO_OTHER_WINDOW.to_string()));
-        assert_eq!(
-            pair.window_new(None),
-            Err(crate::linked_window::BESIDE_REFUSAL.to_string())
-        );
+        assert_eq!(pair.window_new(None), Err(crate::linked::BESIDE_REFUSAL.to_string()));
         assert_eq!(
             pair.open_module(WindowName::Chat(2), None).map(|_| ()),
             Err(MODULE_WINDOWS_ARE_WINDOW_1S.to_string())
@@ -3170,15 +3167,9 @@ pub(crate) mod tests {
     fn window_other_without_a_linked_window_is_refused() {
         let pair = Pair::new(PairEnv::for_tests(), WindowRole::Unpaired, None, Path::new("/p"));
         assert_eq!(pair.window_other(None), Err(NO_OTHER_WINDOW.to_string()));
-        assert_eq!(
-            pair.window_new(None),
-            Err(crate::linked_window::UNPAIRED_REFUSAL.to_string())
-        );
+        assert_eq!(pair.window_new(None), Err(crate::linked::UNPAIRED_REFUSAL.to_string()));
         let alone = Pair::new(PairEnv::for_tests(), WindowRole::Alone, None, Path::new("/p"));
-        assert_eq!(
-            alone.window_new(None),
-            Err(crate::linked_window::ALONE_REFUSAL.to_string())
-        );
+        assert_eq!(alone.window_new(None), Err(crate::linked::ALONE_REFUSAL.to_string()));
     }
 
     #[test]
@@ -3421,7 +3412,7 @@ pub(crate) mod tests {
     fn a_focus_for_a_module_from_the_other_window_reaches_the_controller() {
         use eitri_core::wm::fake::Logged;
         use eitri_core::wm::{ActivationToken, HostOp, WinId};
-        let (wm, host) = crate::linked_window::driver::tests::controller();
+        let (wm, host) = crate::linked::driver::tests::controller();
         let (driver, theirs, _inbound) = pair();
         driver.attach_controller(
             WinId::MAIN,
@@ -3487,11 +3478,11 @@ pub(crate) mod tests {
         failed: Rc<RefCell<Vec<String>>>,
         ended: Rc<RefCell<Vec<LinkEnd>>>,
         report: PathBuf,
-        _dir: crate::linked_window::tests::Scratch,
+        _dir: crate::linked::tests::Scratch,
     }
 
     fn restoring(label: &str, script: Option<&str>, within: Duration) -> Restoring {
-        let dir = crate::linked_window::tests::Scratch::new(label);
+        let dir = crate::linked::tests::Scratch::new(label);
         let report = dir.1.join("pid");
         let exe = dir.1.join("window-2-stand-in");
         if let Some(script) = script {
@@ -3637,7 +3628,7 @@ pub(crate) mod tests {
 
     #[test]
     fn only_a_window_2_that_linked_and_ended_without_a_goodbye_keeps_the_pair_file() {
-        let dir = crate::linked_window::tests::Scratch::new("link-ended-files");
+        let dir = crate::linked::tests::Scratch::new("link-ended-files");
         let lock = PairLock::try_take(&dir.0, Path::new("/p")).unwrap().unwrap();
         let pair = Pair::full(PairEnv::for_tests(), Ok(Some(lock)), &dir.1, false, false);
         let writing = |pair: &Pair| {
@@ -3645,7 +3636,7 @@ pub(crate) mod tests {
             pair.with_pair_writer(|writer| writing = writer.writing());
             writing
         };
-        let (never_linked, _theirs, _their_inbound) = crate::linked_window::driver::tests::pair();
+        let (never_linked, _theirs, _their_inbound) = crate::linked::driver::tests::pair();
         pair.set_pair_writer(PairWriter::new(&dir.0, Path::new("/p"), Default::default(), true));
         pair.window2_link_ended(&never_linked, &LinkEnd::Eof);
         assert!(
@@ -3653,7 +3644,7 @@ pub(crate) mod tests {
             "a window 2 that never linked leaves the file to window 1"
         );
 
-        let (linked, _theirs, _their_inbound) = crate::linked_window::driver::tests::pair();
+        let (linked, _theirs, _their_inbound) = crate::linked::driver::tests::pair();
         linked.set_partner(Partner { pid: 4242, start: 99 });
         pair.window2_link_ended(&linked, &LinkEnd::Eof);
         assert!(
@@ -3667,7 +3658,7 @@ pub(crate) mod tests {
         use eitri_core::keymap::{Action, TabAction};
         let panels = vec!["notes".to_string()];
         assert_eq!(
-            crate::linked_window::registry::peer_action("tab.select", &[("n".into(), 3.into())], &panels),
+            crate::linked::registry::peer_action("tab.select", &[("n".into(), 3.into())], &panels),
             Some(Action::Tab(TabAction::Select(3)))
         );
         for (name, opts) in [
@@ -3676,13 +3667,13 @@ pub(crate) mod tests {
             ("module.missing", vec![]),
         ] {
             assert_eq!(
-                crate::linked_window::registry::peer_action(name, &opts, &panels),
+                crate::linked::registry::peer_action(name, &opts, &panels),
                 None,
                 "{name}"
             );
         }
         // Over the link: the module window's hook hears the name and options, and a window without a hook drops it.
-        let dir = crate::linked_window::tests::Scratch::new("run-action");
+        let dir = crate::linked::tests::Scratch::new("run-action");
         let root = Path::new("/p");
         let lock = eitri_core::window_link::pair::PairLock::try_take(&dir.0, root)
             .unwrap()
@@ -3720,15 +3711,15 @@ pub(crate) mod tests {
         );
     }
 
-    pub(crate) const PORT: u16 = 23456;
+    pub const PORT: u16 = 23456;
 
-    pub(crate) fn port_env(port: u16) -> Vec<(OsString, OsString)> {
+    pub fn port_env(port: u16) -> Vec<(OsString, OsString)> {
         vec![(OsString::from("CLAUDE_CODE_SSE_PORT"), OsString::from(port.to_string()))]
     }
 
     /// A window 1 and a window 2 on one link that is up, as a handshake or a re-link leaves them. Neither has hooks:
     /// what is held here is the pair's own part.
-    pub(crate) fn two_windows() -> (Rc<Pair>, Rc<Pair>) {
+    pub fn two_windows() -> (Rc<Pair>, Rc<Pair>) {
         let (one, two) = fdpass::seqpacket_pair().unwrap();
         let (one, one_in) = LinkHandle::start(one, PresenceFlag::default()).unwrap();
         let (two, two_in) = LinkHandle::start(two, PresenceFlag::default()).unwrap();
@@ -3752,7 +3743,7 @@ pub(crate) mod tests {
     }
 
     /// Pumps window 2 until its next shell's port reads `want`.
-    pub(crate) fn wait_for_port(two: &Pair, want: Option<u16>) {
+    pub fn wait_for_port(two: &Pair, want: Option<u16>) {
         let link = two.link().unwrap();
         assert!(pump_until(&link, || two.ide_port() == want), "{:?}", two.ide_port());
     }
@@ -3899,7 +3890,7 @@ pub(crate) mod tests {
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 mod script_fixture {
     include!(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/support/executable.rs"));
 }

@@ -291,7 +291,7 @@ impl ReclaimLock {
 }
 
 /// A test's look at the moment between the orphan socket's bind and its chmod, when the name could be replaced.
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 mod before_socket_chmod {
     use std::cell::RefCell;
 
@@ -321,7 +321,7 @@ pub struct OrphanSocket {
 
 impl OrphanSocket {
     /// Binds window 2's socket.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub fn bind(dir: &Path, project_root: &Path) -> Result<OrphanSocket, String> {
         OrphanSocket::bind_as(dir, project_root, &WindowName::Second)
     }
@@ -374,7 +374,7 @@ impl OrphanSocket {
             dev: bound.0,
             ino: bound.1,
         };
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         before_socket_chmod::run();
         // `bind` leaves the umask's mode on the file.
         if let Err(e) = eitri_core::panel_control::make_control_socket_private(dir, &path, held) {
@@ -452,7 +452,7 @@ pub fn another_build_text(who: &str, theirs: &str, ours: &str) -> String {
 }
 
 /// [`check_relink_hello_to`] for window 2.
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub fn check_relink_hello(msg: &Msg, build: &str, peer: Option<Partner>) -> Result<Partner, String> {
     check_relink_hello_to("window 2", msg, build, peer)
 }
@@ -794,11 +794,11 @@ pub fn relink_at_start(
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 static TEST_WAITS: std::sync::OnceLock<std::sync::Mutex<BTreeMap<PathBuf, mpsc::Sender<&'static str>>>> =
     std::sync::OnceLock::new();
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 fn observed_wait(path: &Path, how: &'static str) {
     if let Some(send) = TEST_WAITS.get_or_init(Default::default).lock().unwrap().get(path) {
         let _ = send.send(how);
@@ -815,7 +815,7 @@ fn relink_on(
 ) -> Result<Relinked, String> {
     let who = waiting.who();
     let conn = connect_to(path).map_err(|e| {
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         observed_wait(path, "connect_failed");
         match e.raw_os_error() {
             Some(libc::ENOENT) | Some(libc::ECONNREFUSED) => NO_ORPHAN_TEXT.to_string(),
@@ -838,7 +838,7 @@ fn relink_on(
         .map_err(|e| format!("hello could not be sent ({e})"))?;
     let left = || deadline.saturating_duration_since(Instant::now());
     let answer = inbound.recv_timeout(left());
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     observed_wait(
         path,
         match &answer {

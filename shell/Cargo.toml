@@ -19,7 +19,7 @@ agent = { path = "../agent" }
 eitri-core = { path = "../core" }
 eitri-remote = { path = "../remote" }
 eitri-panel = { path = "../panel" }
-# The toolkit-free half of a window, shared by the hosts; nothing moves into it from here yet.
+# The toolkit-free half of a window, shared by the hosts: the linked windows (`eitri_desk::linked`) live there.
 eitri-desk = { path = "../desk" }
 gtk4 = { version = "0.11.4", features = ["v4_14"] }
 webkit6 = "0.6"
@@ -73,6 +73,8 @@ alacritty_terminal = "0.26.0"
 # `eitri_core::test_providers::RecordingProvider`, for the agent panel's per-tab routing tests
 # (the session tabs). Tests only: the normal dependency above stays feature-free.
 eitri-core = { path = "../core", features = ["test-support"] }
+# The test helpers of the linked windows' code (`eitri_desk::linked::tests`, ...), which this crate's own unit tests use.
+eitri-desk = { path = "../desk", features = ["test-support"] }
 # `tests/end_signals.rs` needs only GLib's main context, no display: it names the crate directly so the
 # display-guard scan (`tests/own_display_scan.rs`) does not read it as opening one. The version gtk4
 # 0.11.4 already resolves, so it adds no crate to the graph and ships in no binary.

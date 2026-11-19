@@ -140,7 +140,7 @@ pub(crate) fn chat_move_event(win: WinId, event: agent_panel::ChatMoveEvent) -> 
 }
 
 pub(crate) struct PanelServices {
-    pub(crate) cm_session: Option<(Rc<RefCell<linked_window::focus::CmSession>>, gtk4::Application)>,
+    pub(crate) cm_session: Option<(Rc<RefCell<linked_window_glue::focus::CmSession>>, gtk4::Application)>,
     pub(crate) inner: gtk_host_services::Services,
 }
 

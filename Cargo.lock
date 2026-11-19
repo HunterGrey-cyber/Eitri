@@ -966,6 +966,11 @@ dependencies = [
  "agent",
  "eitri-core",
  "eitri-panel",
+ "eitri-terminal",
+ "libc",
+ "rmpv",
+ "serde_json",
+ "uuid",
 ]
 
 [[package]]

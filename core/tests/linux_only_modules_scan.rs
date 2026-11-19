@@ -4,7 +4,8 @@
 
 use eitri_core::source_scan::{code_only, read_required, rust_sources};
 
-/// Each Linux-only module: the file that declares it, its name, its own source.
+/// Each Linux-only module: the file that declares it, its name, its own source. A module whose own source is a
+/// `mod.rs` is a whole directory: every file under that directory may name Linux-only calls.
 const LINUX_ONLY: &[(&str, &str, &str)] = &[
     (
         "core/src/window_link/mod.rs",
@@ -17,6 +18,7 @@ const LINUX_ONLY: &[(&str, &str, &str)] = &[
     ("core/src/lib.rs", "run_guard", "core/src/run_guard.rs"),
     ("core/src/lib.rs", "attachments", "core/src/attachments/isolate.rs"),
     ("core/src/lib.rs", "ide_server", "core/src/ide_server/channels.rs"),
+    ("desk/src/lib.rs", "linked", "desk/src/linked/mod.rs"),
 ];
 
 /// Names that exist only on Linux among the calls these modules make.
@@ -31,6 +33,17 @@ const LINUX_CALLS: &[&str] = &[
 
 /// The directories whose modules must be portable unless listed above.
 const PORTABLE_DIRS: &[&str] = &["core/src/window_link", "desk/src"];
+
+/// Whether `path` is exempt from the second test: it is a Linux-only module's own file, or lies under the directory of
+/// a Linux-only module whose own source is a `mod.rs`.
+fn exempt(path: &str, entries: &[(&str, &str, &str)]) -> bool {
+    entries.iter().any(|(_, _, file)| {
+        *file == path
+            || file
+                .strip_suffix("mod.rs")
+                .is_some_and(|dir| dir.ends_with('/') && path.starts_with(dir))
+    })
+}
 
 fn squeezed(text: &str) -> String {
     text.split_whitespace().collect::<Vec<_>>().join(" ")
@@ -59,7 +72,7 @@ fn each_linux_only_module_is_declared_for_linux_only() {
 #[test]
 fn no_other_module_there_names_a_linux_only_call() {
     for source in rust_sources(PORTABLE_DIRS) {
-        if LINUX_ONLY.iter().any(|(_, _, file)| *file == source.path) {
+        if exempt(&source.path, LINUX_ONLY) {
             continue;
         }
         let code = code_only(&source.text);
@@ -71,4 +84,20 @@ fn no_other_module_there_names_a_linux_only_call() {
             );
         }
     }
+}
+
+#[test]
+fn a_linux_only_module_with_a_directory_exempts_the_whole_directory() {
+    let entries = [
+        ("core/src/lib.rs", "run_guard", "core/src/run_guard.rs"),
+        ("desk/src/lib.rs", "linked", "desk/src/linked/mod.rs"),
+    ];
+    assert!(exempt("core/src/run_guard.rs", &entries));
+    assert!(exempt("desk/src/linked/mod.rs", &entries));
+    assert!(exempt("desk/src/linked/spawn.rs", &entries));
+    assert!(exempt("desk/src/linked/registry/tests/tabs.rs", &entries));
+    // A single-file module does not exempt its neighbours, and a sibling directory with a shared prefix is not inside.
+    assert!(!exempt("core/src/other.rs", &entries));
+    assert!(!exempt("desk/src/linked_other/mod.rs", &entries));
+    assert!(!exempt("desk/src/lib.rs", &entries));
 }

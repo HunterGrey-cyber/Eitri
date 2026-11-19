@@ -488,7 +488,7 @@ pub(crate) struct Wiring {
     pub(crate) link: Rc<CompanionLink>,
     pub(crate) start: BesideStart,
     pub(crate) project: PathBuf,
-    pub(crate) pair_raise: crate::linked_window::focus::PairRaise,
+    pub(crate) pair_raise: crate::linked_window_glue::focus::PairRaise,
     pub(crate) wm: eitri_core::compositor::WmChoice,
 }
 

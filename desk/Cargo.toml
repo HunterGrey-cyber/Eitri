@@ -8,13 +8,28 @@ publish.workspace = true
 # `eitri-panel` and below the hosts. No GTK, GLib, WebKitGTK, AppKit or windowing crate may appear here, directly or
 # transitively (`src/manifest_guard.rs`, `core/tests/f1_no_toolkit_below_shell.rs`), and `core`, `panel`, `remote` and
 # `terminal/*` never depend on this crate (`src/direction_guard.rs`). `eitri-terminal` joins when the terminal model
-# arrives and `eitri-remote` when the remote wiring does, each after it builds and tests on macOS.
+# arrives and `eitri-remote` when the remote wiring does, each after it builds and tests on macOS. The linked windows
+# (`src/linked/`) are declared for Linux only; the one test there that starts a terminal session reaches the terminal
+# engine through a Linux-only dev-dependency.
 
 [dependencies]
 agent = { path = "../agent" }
 eitri-core = { path = "../core" }
 eitri-panel = { path = "../panel" }
+libc = "0.2"
+rmpv = "1"
+serde_json = "1"
+uuid = { version = "1", features = ["v4"] }
+
+[features]
+# What the moved code's `#[cfg(test)]` helpers give another crate's tests: `shell`'s dev-dependency turns it on.
+test-support = ["eitri-core/test-support"]
 
 [dev-dependencies]
 # `source_scan`, which the guards read the sources and manifests through.
 eitri-core = { path = "../core", features = ["test-support"] }
+# `AgentPanelHandle::for_host_test_without_pages`, which the linked windows' tests build their panels with.
+eitri-panel = { path = "../panel", features = ["test-support"] }
+
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+eitri-terminal = { path = "../terminal/engine" }

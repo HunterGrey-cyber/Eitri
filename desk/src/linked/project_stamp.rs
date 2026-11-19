@@ -14,7 +14,7 @@ use std::time::{Duration, SystemTime};
 use eitri_core::window_link::pair::PairLock;
 
 /// One window's stamping thread, which ends with this and owns a copy of the lock's descriptor until it does.
-pub(crate) struct ProjectStamp {
+pub struct ProjectStamp {
     activations: Sender<SystemTime>,
     /// Never sent on: the thread's end closes it.
     ended: Receiver<()>,
@@ -23,7 +23,7 @@ pub(crate) struct ProjectStamp {
 impl ProjectStamp {
     /// `root` is `Some` only for the window that took the lock: only the holder names the project, and a window that
     /// adopted a copy finds it named. `None`, with a line in the log, when the thread cannot be had.
-    pub(crate) fn start(lock: &PairLock, root: Option<PathBuf>) -> Option<ProjectStamp> {
+    pub fn start(lock: &PairLock, root: Option<PathBuf>) -> Option<ProjectStamp> {
         let fd = lock
             .share()
             .inspect_err(|err| eprintln!("[project] the lock could not be shared for its stamp: {err}"))
@@ -43,7 +43,7 @@ impl ProjectStamp {
     }
 
     /// Queues the window's activation at `at`. Never blocks, so it is safe on the GTK thread.
-    pub(crate) fn activated(&self, at: SystemTime) {
+    pub fn activated(&self, at: SystemTime) {
         // The thread ends only when this sender goes.
         let _ = self.activations.send(at);
     }
@@ -77,20 +77,20 @@ fn stamp_until_gone(fd: OwnedFd, root: Option<PathBuf>, started: SystemTime, que
 /// A window's stamp, once it has one. A window that gets its lock in `welcome` can gain activation first, so the newest
 /// activation waits here for the stamp: no activation is lost to the order those two arrive in.
 #[derive(Default)]
-pub(crate) struct StampSlot {
+pub struct StampSlot {
     stamp: RefCell<Option<ProjectStamp>>,
     waiting: Cell<Option<SystemTime>>,
 }
 
 impl StampSlot {
-    pub(crate) fn fill(&self, stamp: Option<ProjectStamp>) {
+    pub fn fill(&self, stamp: Option<ProjectStamp>) {
         if let (Some(stamp), Some(at)) = (&stamp, self.waiting.take()) {
             stamp.activated(at);
         }
         *self.stamp.borrow_mut() = stamp;
     }
 
-    pub(crate) fn activated(&self, at: SystemTime) {
+    pub fn activated(&self, at: SystemTime) {
         match &*self.stamp.borrow() {
             Some(stamp) => stamp.activated(at),
             None => self.waiting.set(Some(at)),
@@ -98,13 +98,13 @@ impl StampSlot {
     }
 
     /// The window is closing: see [`ProjectStamp::finish`]. True with no stamp to wait for.
-    pub(crate) fn finish(&self, within: Duration) -> bool {
+    pub fn finish(&self, within: Duration) -> bool {
         let stamp = self.stamp.borrow_mut().take();
         stamp.is_none_or(|stamp| stamp.finish(within))
     }
 
-    #[cfg(test)]
-    pub(crate) fn started(&self) -> bool {
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn started(&self) -> bool {
         self.stamp.borrow().is_some()
     }
 }
@@ -112,7 +112,7 @@ impl StampSlot {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::linked_window::tests::Scratch;
+    use crate::linked::tests::Scratch;
     use eitri_core::window_link::pair::pair_lock_name;
     use std::path::Path;
     use std::time::{Duration, Instant, UNIX_EPOCH};

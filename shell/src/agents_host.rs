@@ -848,7 +848,7 @@ pub(crate) struct AgentsWindow {
     pub(crate) window: gtk4::ApplicationWindow,
     pub(crate) driver: Weak<eitri_core::wm::Driver<eitri_core::wm::Controller>>,
     pub(crate) win: eitri_core::wm::WinId,
-    pub(crate) raise: crate::linked_window::focus::PairRaise,
+    pub(crate) raise: crate::linked_window_glue::focus::PairRaise,
     /// `None` for the hub, which holds no tab.
     pub(crate) panel: Option<AgentPanelHandle>,
     pub(crate) enabled: bool,

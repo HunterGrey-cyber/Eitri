@@ -1,40 +1,24 @@
-//! The code bound for the toolkit-free crate `eitri-desk` names no toolkit and no other `shell` module.
+//! The linked windows' code in `eitri-desk` names no toolkit and no other `shell` module.
 //!
-//! The moving set is every file under `shell/src/linked_window/` except `focus.rs`, plus `gtk_host/peer.rs` and
-//! `project_stamp.rs`. Until the move, each of them may name only itself and the few `shell` paths the move
-//! carries along; a toolkit name or any other `crate::` path in them would stop the code compiling in `desk`.
+//! The set is every file under `desk/src/linked/`: each of them may name only itself and `crate::host_traits`; a
+//! toolkit name or any other `crate::` path in them would stop the code compiling in a crate that has no toolkit and
+//! no `shell`. (`eitri-desk`'s own `toolkit_names_guard` names the toolkit fragments; this scan also reads the `crate::`
+//! paths and the `super::` climbs.)
 //!
 //! Read through `eitri_core::source_scan`, which fails on a missing or empty directory. The checker works on
 //! code text (comments and string literals blanked) and on tokens, so a path split over several lines, or
 //! written with spaces around `::`, is read the same as one on a single line.
 
-use eitri_core::source_scan::{code_only, read_required, rust_sources, Source};
+use eitri_core::source_scan::{code_only, rust_sources, Source};
 
 /// Names of the toolkits (and the forked renderer built on one) that `eitri-desk` must not reach.
 const TOOLKIT_NAMES: &[&str] = &["gtk4", "gtk", "glib", "gio", "gdk", "gdk4", "webkit6", "neovide_editor"];
 
-/// The `crate::` paths the moving set may name: its own modules and the three items of `gtk_host` that move with it.
-const ALLOWED_CRATE_PATHS: &[&str] = &[
-    "crate::linked_window",
-    "crate::gtk_host::peer",
-    "crate::gtk_host::LinkedWindows",
-    "crate::gtk_host::NOT_CARRIED_OUT",
-    "crate::project_stamp",
-];
+/// The `crate::` paths the set may name: its own modules and the host traits.
+const ALLOWED_CRATE_PATHS: &[&str] = &["crate::linked", "crate::host_traits"];
 
-/// The directory whose files move, read recursively.
-const MOVING_DIR: &str = "shell/src/linked_window";
-
-/// The one file of [`MOVING_DIR`] that stays: it raises GTK windows, so it belongs to the binary.
-const STAYS: &str = "shell/src/linked_window/focus.rs";
-
-/// Files outside [`MOVING_DIR`] that move with it, each named because the directory read does not hold it.
-const MOVING_EXTRA: &[&str] = &[
-    // The peer end of the link: the part of `gtk_host` the pair code is written against.
-    "shell/src/gtk_host/peer.rs",
-    // The project stamp the pair files record.
-    "shell/src/project_stamp.rs",
-];
+/// The directory the set is read from, recursively.
+const MOVING_DIR: &str = "desk/src/linked";
 
 /// One place the moving set reaches outside itself.
 #[derive(Debug, PartialEq, Eq)]
@@ -95,9 +79,9 @@ fn tokens(code: &str) -> Vec<Token<'_>> {
     out
 }
 
-/// How many modules deep the file's own module sits below `linked_window`: `mod.rs` is `linked_window` itself
+/// How many modules deep the file's own module sits below `linked`: `mod.rs` is `linked` itself
 /// (0), `spawn.rs` is one level down, `registry/tests/tabs.rs` three. A file outside the directory is the root
-/// of its own moving unit.
+/// of its own unit.
 fn module_depth(path: &str) -> usize {
     let Some(inside) = path.strip_prefix(&format!("{MOVING_DIR}/")) else {
         return 0;
@@ -168,13 +152,7 @@ fn violations(path: &str, text: &str) -> Vec<Violation> {
                     path_text.push_str(segment);
                     j += 2;
                 }
-                if path_text == "crate::linked_window::focus" || path_text.starts_with("crate::linked_window::focus::")
-                {
-                    found.push(Violation {
-                        line: tok.line,
-                        reason: format!("`{path_text}` names `focus`, which stays in the binary"),
-                    });
-                } else if !allowed_crate_path(&path_text) {
+                if !allowed_crate_path(&path_text) {
                     let group = kind_at(j) == Some(&Kind::PathSep) && kind_at(j + 1) == Some(&Kind::Open);
                     found.push(Violation {
                         line: tok.line,
@@ -186,10 +164,6 @@ fn violations(path: &str, text: &str) -> Vec<Violation> {
                     });
                 }
             }
-            Kind::Ident("focus") if focus_is_named(path, &toks, i) => found.push(Violation {
-                line: tok.line,
-                reason: "`focus` stays in the binary: nothing bound for the crate may name it".to_owned(),
-            }),
             Kind::Ident("super") if i == 0 || kind_at(i - 1) != Some(&Kind::PathSep) => {
                 let mut climbs = 0;
                 let mut j = i;
@@ -201,7 +175,7 @@ fn violations(path: &str, text: &str) -> Vec<Violation> {
                 if climbs > depth {
                     found.push(Violation {
                         line: tok.line,
-                        reason: format!("{climbs} `super::` climb out of a module {depth} below `linked_window`"),
+                        reason: format!("{climbs} `super::` climb out of a module {depth} below `linked`"),
                     });
                 }
             }
@@ -209,21 +183,6 @@ fn violations(path: &str, text: &str) -> Vec<Violation> {
         }
     }
     found
-}
-
-/// Whether the `focus` at `i` names `linked_window::focus`, the one module under the directory that stays in the
-/// binary: reached through `super::`/`self::`, as a bare `focus::` path from the module that declares it, or declared
-/// with `mod focus` anywhere but that one line of `mod.rs`, which leaves with the move.
-fn focus_is_named(path: &str, toks: &[Token<'_>], i: usize) -> bool {
-    let kind_at = |i: usize| toks.get(i).map(|t| &t.kind);
-    let after_sep = i >= 1 && kind_at(i - 1) == Some(&Kind::PathSep);
-    if after_sep {
-        return matches!(kind_at(i.wrapping_sub(2)), Some(Kind::Ident("super" | "self")));
-    }
-    if i >= 1 && kind_at(i - 1) == Some(&Kind::Ident("mod")) {
-        return path != "shell/src/linked_window/mod.rs";
-    }
-    path == "shell/src/linked_window/mod.rs" && kind_at(i + 1) == Some(&Kind::PathSep)
 }
 
 /// `violations` rendered as `file:line: <source line> (reason)`.
@@ -238,16 +197,10 @@ fn report(path: &str, text: &str) -> Vec<String> {
         .collect()
 }
 
-/// Every file of the moving set, read through `source_scan`.
+/// Every file of the set, read through `source_scan`.
 fn moving_set() -> Vec<Source> {
-    let in_dir = rust_sources(&[MOVING_DIR]);
-    assert!(
-        in_dir.iter().any(|s| s.path == STAYS),
-        "{STAYS} is no longer in {MOVING_DIR}: the exclusion is out of date"
-    );
-    let mut set: Vec<Source> = in_dir.into_iter().filter(|s| s.path != STAYS).collect();
-    assert!(!set.is_empty(), "{MOVING_DIR} holds nothing besides {STAYS}");
-    set.extend(MOVING_EXTRA.iter().map(read_required));
+    let set = rust_sources(&[MOVING_DIR]);
+    assert!(!set.is_empty(), "{MOVING_DIR} holds no source");
     set
 }
 
@@ -256,8 +209,8 @@ fn the_moving_set_names_no_toolkit_and_no_other_shell_module() {
     let offenders: Vec<String> = moving_set().iter().flat_map(|s| report(&s.path, &s.text)).collect();
     assert!(
         offenders.is_empty(),
-        "the code that moves into eitri-desk must stay free of toolkit names and of `crate::` paths outside \
-         {ALLOWED_CRATE_PATHS:?} until the move; {} violation(s):\n{}",
+        "the linked windows' code in eitri-desk must stay free of toolkit names and of `crate::` paths outside \
+         {ALLOWED_CRATE_PATHS:?}; {} violation(s):\n{}",
         offenders.len(),
         offenders.join("\n")
     );
@@ -274,8 +227,8 @@ fn the_reader_reports_a_planted_violation_of_each_kind_and_nothing_else() {
         "const S: &str = \"gio webkit6 crate::version\";", // 6: none
         "/* neovide_editor::x,",                           // 7: none
         "   crate::version::Y */",                         // 8: none
-        "use crate::linked_window::Thing;",                // 9: none
-        "use crate::gtk_host::peer::Peer;",                // 10: none
+        "use crate::linked::Thing;",                       // 9: none
+        "use crate::host_traits::LinkedWindows;",          // 10: none
         "use crate::gtk_host::{LinkedWindows, X};",        // 11: group under a path that is not itself allowed
         "use crate::linked_window_glue::G;",               // 12: a name that only starts like an allowed one
         "use super::super::elsewhere;",                    // 13: climbs out of a depth-1 file
@@ -285,15 +238,9 @@ fn the_reader_reports_a_planted_violation_of_each_kind_and_nothing_else() {
         "let gtk4_ok = webkit6_ok::<crate",                // 17: none: not whole words
         "    ::version::Y>();",                            // 18: `crate` at 17, spaces around `::`
         "pub(crate) fn f() {}",                            // 19: none
-        "use super::focus::raise;",                        // 20: focus through super
-        "crate::linked_window::focus::present();",         // 21: focus through crate
-        "mod focus;",                                      // 22: declared outside mod.rs
-        "let f = eitri_core::wm::focus::Target::Up;",      // 23: none: another crate's focus
-        "focus::raise();",                                 // 24: none: outside mod.rs it is another `focus`
-        "let focus = 1;",                                  // 25: none: a local
     ]
     .join("\n");
-    let got = violations("shell/src/linked_window/sample.rs", &sample);
+    let got = violations("desk/src/linked/sample.rs", &sample);
     let want = [
         (1, "toolkit name `gtk4`"),
         (1, "toolkit name `glib`"),
@@ -302,21 +249,9 @@ fn the_reader_reports_a_planted_violation_of_each_kind_and_nothing_else() {
         (4, "`crate::{` group: write the paths out"),
         (11, "`crate::gtk_host::{` is not an allowed path (write each path out)"),
         (12, "`crate::linked_window_glue::G` is not an allowed path"),
-        (13, "2 `super::` climb out of a module 1 below `linked_window`"),
+        (13, "2 `super::` climb out of a module 1 below `linked`"),
         (15, "`crate::end_signals::Z` is not an allowed path"),
         (17, "`crate::version::Y` is not an allowed path"),
-        (
-            20,
-            "`focus` stays in the binary: nothing bound for the crate may name it",
-        ),
-        (
-            21,
-            "`crate::linked_window::focus::present` names `focus`, which stays in the binary",
-        ),
-        (
-            22,
-            "`focus` stays in the binary: nothing bound for the crate may name it",
-        ),
     ];
     let want: Vec<Violation> = want
         .into_iter()
@@ -330,20 +265,17 @@ fn the_reader_reports_a_planted_violation_of_each_kind_and_nothing_else() {
 
 #[test]
 fn a_file_outside_the_directory_may_not_climb_out_with_super() {
-    assert!(violations("shell/src/project_stamp.rs", "mod tests { use super::*; }").is_empty());
-    assert_eq!(violations("shell/src/project_stamp.rs", "use super::X;").len(), 1);
-    assert!(violations("shell/src/linked_window/mod.rs", "mod tests { use super::*; }").is_empty());
-    assert_eq!(violations("shell/src/linked_window/mod.rs", "use super::X;").len(), 1);
-    assert!(violations(
-        "shell/src/linked_window/registry/tests/tabs.rs",
-        "use super::super::super::X;"
-    )
-    .is_empty());
-    assert!(violations("shell/src/linked_window/mod.rs", "pub(crate) mod focus;").is_empty());
-    assert_eq!(violations("shell/src/linked_window/mod.rs", "focus::raise();").len(), 1);
+    assert!(violations("desk/src/linked/project_stamp.rs", "mod tests { use super::*; }").is_empty());
+    assert_eq!(
+        violations("desk/src/linked/project_stamp.rs", "use super::super::X;").len(),
+        1
+    );
+    assert!(violations("desk/src/linked/mod.rs", "mod tests { use super::*; }").is_empty());
+    assert_eq!(violations("desk/src/linked/mod.rs", "use super::X;").len(), 1);
+    assert!(violations("desk/src/linked/registry/tests/tabs.rs", "use super::super::super::X;").is_empty());
     assert_eq!(
         violations(
-            "shell/src/linked_window/registry/tests/tabs.rs",
+            "desk/src/linked/registry/tests/tabs.rs",
             "use super::super::super::super::X;"
         )
         .len(),

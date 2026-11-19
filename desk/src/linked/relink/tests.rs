@@ -1,10 +1,10 @@
 use super::*;
-use crate::linked_window::driver::tests::pump_until;
-use crate::linked_window::host_loop::tests::ManualClock;
-use crate::linked_window::host_loop::{Flow, Interest, Priority};
-use crate::linked_window::spawn::{welcome, Pair, PairEnv, PairHooks, TEST_BUILD};
-use crate::linked_window::tests::Scratch;
-use crate::linked_window::LinkEnd;
+use crate::linked::driver::tests::pump_until;
+use crate::linked::host_loop::tests::ManualClock;
+use crate::linked::host_loop::{Flow, Interest, Priority};
+use crate::linked::spawn::{welcome, Pair, PairEnv, PairHooks, TEST_BUILD};
+use crate::linked::tests::Scratch;
+use crate::linked::LinkEnd;
 use eitri_core::compositor::mode::{resolve_mode, Mode, ModeFacts, TilingChoice, Why};
 use eitri_core::compositor::Wm;
 use eitri_core::window_link::pair::Role;
@@ -352,7 +352,7 @@ fn linked_by_hub(pair: Rc<Pair>, one: OwnedFd, lock: &PairLock, run: &RunDir) ->
     let ends: Rc<RefCell<Vec<LinkEnd>>> = Rc::default();
     let waited: Rc<RefCell<Vec<Result<(), String>>>> = Rc::default();
     let linked: Rc<Cell<u32>> = Rc::default();
-    let ended: crate::linked_window::spawn::OnEnded = {
+    let ended: crate::linked::spawn::OnEnded = {
         let (ends, waited) = (ends.clone(), waited.clone());
         let pair = Rc::downgrade(&pair);
         let dir = run.dir.clone();
@@ -366,7 +366,7 @@ fn linked_by_hub(pair: Rc<Pair>, one: OwnedFd, lock: &PairLock, run: &RunDir) ->
         })
     };
     let linked_as: Rc<RefCell<Vec<WindowName>>> = Rc::default();
-    let on_linked: crate::linked_window::spawn::OnLinked = {
+    let on_linked: crate::linked::spawn::OnLinked = {
         let (linked, linked_as) = (linked.clone(), linked_as.clone());
         Rc::new(move |name, _, _| {
             linked.set(linked.get() + 1);
@@ -507,8 +507,8 @@ fn a_pair_dropped_while_waiting_for_a_relink_disarms_the_orphan_watch() {
 
 #[test]
 fn a_relinked_window_1_takes_the_orphans_pages_as_away() {
-    use crate::linked_window::pair_files::{apply_main_restore, relink_restore};
-    use crate::linked_window::tests::{id, window};
+    use crate::linked::pair_files::{apply_main_restore, relink_restore};
+    use crate::linked::tests::{id, window};
     use eitri_core::layout::workspace::Workspaces;
     use eitri_core::layout::OpenRules;
     use eitri_core::window_link::pair::{PairFile, ReadPair};
@@ -734,7 +734,7 @@ fn a_turn_the_orphan_started_just_before_the_relink_is_seen_by_the_new_window_1(
 
     // The link was made before the window had hooks: they hear of it once they are set.
     let linked: Rc<Cell<u32>> = Rc::default();
-    let on_linked: crate::linked_window::spawn::OnLinked = {
+    let on_linked: crate::linked::spawn::OnLinked = {
         let linked = linked.clone();
         Rc::new(move |_, _, _| linked.set(linked.get() + 1))
     };
@@ -830,7 +830,7 @@ fn start_editor_detaches_eitri_for_the_root() {
 
 #[test]
 fn window_2_starts_one_editor_window_until_that_one_links_or_ends() {
-    use crate::gtk_host::LinkedWindows;
+    use crate::host_traits::LinkedWindows;
     let scratch = Scratch::new("one-editor");
     let project = scratch.1.join("project");
     std::fs::create_dir_all(&project).unwrap();
@@ -901,7 +901,7 @@ fn window_2_starts_one_editor_window_until_that_one_links_or_ends() {
 
 #[test]
 fn a_second_hello_on_a_relinked_link_leaves_the_pair_file_to_the_new_window_1() {
-    use crate::linked_window::pair_files::PairWriter;
+    use crate::linked::pair_files::PairWriter;
     let (layout, lock) = held_pair("relink-hello-twice");
     let run = RunDir::new();
     let mut second = linked_second(PairEnv::for_tests(), &lock, &run);
@@ -958,7 +958,7 @@ fn a_second_hello_on_a_relinked_link_leaves_the_pair_file_to_the_new_window_1() 
 
 #[test]
 fn a_busy_pair_file_leaves_window_two_orphaned_and_answers_bye_instead_of_welcome() {
-    use crate::linked_window::pair_files::PairWriter;
+    use crate::linked::pair_files::PairWriter;
     let (layout, lock) = held_pair("relink-busy-file");
     let run = RunDir::new();
     let mut second = linked_second(PairEnv::for_tests(), &lock, &run);
@@ -975,7 +975,7 @@ fn a_busy_pair_file_leaves_window_two_orphaned_and_answers_bye_instead_of_welcom
     second
         .pair
         .set_pair_writer(PairWriter::new(&layout.0, &root(), Default::default(), false));
-    let (candidate, _window_one, inbound) = crate::linked_window::driver::tests::pair();
+    let (candidate, _window_one, inbound) = crate::linked::driver::tests::pair();
     let pid = std::process::id();
     let start = agent::child::start_time(pid).unwrap();
     let hello = hello_as_window_1(TEST_BUILD.to_string(), pid, start);
@@ -1160,11 +1160,11 @@ fn a_window_1_that_relinks_two_module_orphans_is_main_and_holds_the_lock() {
     assert_ne!(peers.0, peers.1, "each window has a peer of its own");
     assert!(pair.module_process(&c(1)).is_some());
     assert_eq!(pair.page_peer("markdown"), peers.1, "a page window holds its own page");
-    assert_eq!(pair.page_peer("snotra"), crate::linked_window::spawn::SECOND_PEER);
+    assert_eq!(pair.page_peer("snotra"), crate::linked::spawn::SECOND_PEER);
 
     // Announced to the hooks once each, as a link made before the window was built.
     let announced: Rc<RefCell<Vec<WindowName>>> = Rc::default();
-    let on_linked: crate::linked_window::spawn::OnLinked = {
+    let on_linked: crate::linked::spawn::OnLinked = {
         let announced = announced.clone();
         Rc::new(move |name, _, link| {
             assert!(link.linked());
@@ -1302,7 +1302,7 @@ fn a_module_window_that_loses_its_hub_without_bye_waits_on_its_own_name() {
 /// the latest set, and the tabs in between are gone with no harm.
 #[test]
 fn an_orphan_chat_windows_tabs_survive_window_1s_restart() {
-    use crate::linked_window::group_tabs::GroupTabs;
+    use crate::linked::group_tabs::GroupTabs;
     use eitri_core::saved_tabs::{load, Loaded, SavedTab, SavedTabs};
     let tabs = |sessions: &[&str]| {
         let saved = |session: &&str| SavedTab {
@@ -1332,7 +1332,7 @@ fn an_orphan_chat_windows_tabs_survive_window_1s_restart() {
 
     module.pair.tabs_changed(tabs(&["s-early"]));
     module.pair.tabs_changed(tabs(&["s-1", "s-2"]));
-    clock.advance(crate::linked_window::group_tabs::REPORT_AFTER);
+    clock.advance(crate::linked::group_tabs::REPORT_AFTER);
     drop(lock);
 
     let (dir, layout_dir) = (run.dir.clone(), layout.0.clone());

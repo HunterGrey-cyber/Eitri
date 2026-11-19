@@ -6,7 +6,19 @@
 //! on it. The Mac CI job builds and tests it, so "neutral" is proved on a Mac. A module that cannot build there yet
 //! is declared for Linux only, in its own file named in `core/tests/linux_only_modules_scan.rs`, never inline.
 //!
-//! The crate holds nothing yet but its guards; each lands before the code they cover.
+//! It holds the linked windows (`linked`, Linux only for now) with the host traits they are written against
+//! (`host_traits`), and the guards that cover them.
+
+/// What the linked windows' code asks of the host that carries it.
+pub mod host_traits;
+
+/// The linked windows: the project's second window, the chat and page windows, and the link between them. Linux-only
+/// as a whole, because `core::window_link::{fdpass, link, start}` and `agent::child` are Linux-only on purpose;
+/// making the transport portable is later work.
+// With `test-support` (another crate's tests) the test helpers are compiled without the tests that use them.
+#[cfg_attr(all(not(test), feature = "test-support"), allow(dead_code, unused_imports))]
+#[cfg(target_os = "linux")]
+pub mod linked;
 
 /// The crate's own `Cargo.toml` never grows a toolkit or host crate.
 #[cfg(test)]

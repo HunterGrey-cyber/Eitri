@@ -78,7 +78,7 @@ impl WindowCloses {
         );
     }
 
-    pub(crate) fn settle(&self, now: Instant) {
+    pub fn settle(&self, now: Instant) {
         let closed = self.burst.borrow_mut().settle(now);
         self.forget_all(closed);
     }

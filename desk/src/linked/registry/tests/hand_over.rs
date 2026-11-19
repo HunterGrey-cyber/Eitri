@@ -9,7 +9,7 @@ use eitri_core::saved_tabs::{SavedTab, SavedTabs};
 use eitri_core::tab_set::AgentId;
 
 use super::*;
-use crate::linked_window::hand_over::{answer_message, serve, HandOvers, TabHolder, TabHolderSlot};
+use crate::linked::hand_over::{answer_message, serve, HandOvers, TabHolder, TabHolderSlot};
 use eitri_panel::agent_panel::TabAnswer;
 
 /// What every window did, in one order.
@@ -444,7 +444,7 @@ fn a_tab_let_go_on_a_link_whose_end_has_not_reached_this_thread_comes_back() {
     }));
     handle
         .send(
-            crate::linked_window::spawn::welcome(Default::default(), Vec::new()),
+            crate::linked::spawn::welcome(Default::default(), Vec::new()),
             vec![lock.share().unwrap()],
         )
         .unwrap();
@@ -472,7 +472,7 @@ fn a_tab_let_go_on_a_link_whose_end_has_not_reached_this_thread_comes_back() {
 #[test]
 fn a_tab_let_go_is_held_until_its_release_is_known_to_be_on_the_socket() {
     use std::sync::mpsc;
-    let unwritten = crate::linked_window::hand_over::UnwrittenTabs::default();
+    let unwritten = crate::linked::hand_over::UnwrittenTabs::default();
     let (written, write_answer) = mpsc::channel();
     unwritten.hold(write_answer, saved("written"));
     let (failed, failed_answer) = mpsc::channel();
@@ -517,7 +517,7 @@ fn a_release_that_was_queued_and_never_written_gives_the_tab_back_on_the_links_w
     }));
     handle
         .send(
-            crate::linked_window::spawn::welcome(Default::default(), Vec::new()),
+            crate::linked::spawn::welcome(Default::default(), Vec::new()),
             vec![lock.share().unwrap()],
         )
         .unwrap();
@@ -576,7 +576,7 @@ fn a_chat_windows_answers_reach_window_1_and_what_stays_is_said_there() {
 
     handle
         .send(
-            crate::linked_window::spawn::welcome(Default::default(), Vec::new()),
+            crate::linked::spawn::welcome(Default::default(), Vec::new()),
             vec![lock.share().unwrap()],
         )
         .unwrap();

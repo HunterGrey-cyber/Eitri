@@ -61,8 +61,8 @@ pub trait PairClock: LinkWatch {
     fn hold(&self) -> Option<Box<dyn HoldGuard>>;
 }
 
-#[cfg(test)]
-pub(crate) mod tests {
+#[cfg(any(test, feature = "test-support"))]
+pub mod tests {
     use super::*;
     use std::cell::{Cell, RefCell};
     use std::rc::Rc;
@@ -72,9 +72,9 @@ pub(crate) mod tests {
     /// Records registrations and disarms without dispatching callbacks on its own.
     #[derive(Default)]
     pub(crate) struct RecordingWatch {
-        pub(crate) arms: RefCell<Vec<(RawFd, Interest, Priority)>>,
-        pub(crate) callbacks: RefCell<Vec<Ready>>,
-        pub(crate) disarms: Rc<RefCell<Vec<RawFd>>>,
+        pub arms: RefCell<Vec<(RawFd, Interest, Priority)>>,
+        pub callbacks: RefCell<Vec<Ready>>,
+        pub disarms: Rc<RefCell<Vec<RawFd>>>,
     }
 
     impl LinkWatch for RecordingWatch {
@@ -131,7 +131,7 @@ pub(crate) mod tests {
         holds_released: Rc<Cell<usize>>,
         pub(crate) after_delays: RefCell<Vec<Duration>>,
         pub(crate) every_delays: RefCell<Vec<Duration>>,
-        pub(crate) watches: RecordingWatch,
+        pub watches: RecordingWatch,
     }
 
     impl Default for ManualClock {
@@ -158,7 +158,7 @@ pub(crate) mod tests {
             self.holds_released.get()
         }
 
-        pub(crate) fn advance(&self, duration: Duration) {
+        pub fn advance(&self, duration: Duration) {
             let until = self.now() + duration;
             loop {
                 let next = {
