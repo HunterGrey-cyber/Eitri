@@ -122,6 +122,7 @@ impl Helper for Service {
                 CAP_PENDING,
                 CAP_TRUST_SCAN,
                 CAP_INSTALLATION_ARGS,
+                CAP_GIT_CONFIG,
             ]
             .map(str::to_owned)
             .to_vec(),
@@ -209,8 +210,10 @@ impl Helper for Service {
         Err(Status::unimplemented("SyncIgnores is not built yet"))
     }
 
-    async fn git_config(&self, _request: Request<GitConfigRequest>) -> Result<Response<GitConfigResponse>, Status> {
-        Err(Status::unimplemented("GitConfig is not built yet"))
+    async fn git_config(&self, request: Request<GitConfigRequest>) -> Result<Response<GitConfigResponse>, Status> {
+        mark_activity(&request);
+        let root = request.into_inner().root;
+        Ok(Response::new(sync::git_config::answer(&root).await))
     }
 
     type ListTreeStream = Pin<Box<dyn tokio_stream::Stream<Item = Result<ListTreeEntry, Status>> + Send>>;
@@ -521,15 +524,10 @@ mod tests {
             .await
             .unwrap()
             .into_inner();
-        for capability in [
-            CAP_SYNC_IGNORES,
-            CAP_GIT_CONFIG,
-            CAP_SYNC_FILES,
-            CAP_SYNC_MODES,
-            CAP_EXEC,
-        ] {
+        for capability in [CAP_SYNC_IGNORES, CAP_SYNC_FILES, CAP_SYNC_MODES, CAP_EXEC] {
             assert!(!hello.capabilities.iter().any(|cap| cap == capability), "{capability}");
         }
+        assert!(hello.capabilities.iter().any(|cap| cap == CAP_GIT_CONFIG));
         assert_eq!(hello.protocol_minor, 2);
     }
 

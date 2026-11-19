@@ -1,5 +1,7 @@
 //! GTK-free identities and shared contracts for remote project sync.
 
+pub mod git_replica;
+pub mod local_git;
 pub mod status_schema;
 
 use sha2::{Digest, Sha256};
