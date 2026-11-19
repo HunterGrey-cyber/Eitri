@@ -156,20 +156,64 @@ fn scan_problems_are_parsed_with_their_paths() {
 }
 
 #[test]
+fn session_status_reports_list_failure_after_successful_flush() {
+    let fake = Fake::new(vec![
+        json!({"match":["sync","list"],"exit":1,"stderr":"daemon socket absent\n"}),
+    ]);
+    let engine = fake.engine().unwrap();
+    let name = tree().name;
+    assert_eq!(engine.flush(&name, Duration::from_secs(5)), FlushOutcome::Flushed);
+    assert_eq!(
+        engine.session_status(&name).unwrap_err().to_string(),
+        "daemon socket absent"
+    );
+}
+
+#[test]
+fn session_status_reports_empty_listing_as_missing() {
+    let fake = Fake::new(vec![json!({"match":["sync","list"],"stdout":"[]\n"})]);
+    let name = tree().name;
+    let error = fake.engine().unwrap().session_status(&name).unwrap_err().to_string();
+    assert!(error.contains("no such session") && error.contains(&name), "{error}");
+}
+
+#[test]
+fn session_status_maps_reported_disconnected_state_with_no_conflicts() {
+    let name = tree().name;
+    let listing = json!([{"name":name,"status":"disconnected","lastError":"connection lost"}]);
+    let fake = Fake::new(vec![json!({"match":["sync","list"],"stdout":listing.to_string()})]);
+    let status = fake.engine().unwrap().session_status(&name).unwrap();
+    assert_eq!(status.state, SyncState::Disconnected("connection lost".into()));
+    assert!(status.conflicts.is_empty());
+}
+
+#[test]
+fn session_status_keeps_conflicts_for_a_reported_disconnection() {
+    let name = tree().name;
+    let mut raw: Value = serde_json::from_slice(&fixture("list-conflicts.json")).unwrap();
+    raw[0]["name"] = json!(name);
+    raw[0]["beta"]["connected"] = json!(false);
+    let fake = Fake::new(vec![json!({"match":["sync","list"],"stdout":raw.to_string()})]);
+    let status = fake.engine().unwrap().session_status(&name).unwrap();
+    assert_eq!(status.state, SyncState::Disconnected("endpoint disconnected".into()));
+    assert!(status.conflicts.iter().any(|conflict| conflict.path == "both.txt"));
+}
+
+#[test]
 fn a_halted_or_missing_session_is_never_ready() {
     let halted = parse_sessions(&fixture("list-halted.json")).unwrap().remove(0);
     assert!(matches!(halted.state, SyncState::Halted(ref text) if text == "halted-on-root-emptied"));
     let fake = Fake::new(vec![]);
     let engine = fake.engine().unwrap();
-    let status = engine.session_status("eitri-missing-tree").unwrap();
-    assert_eq!(status.state, SyncState::Disconnected("no such session".into()));
+    let error = engine.session_status("eitri-missing-tree").unwrap_err();
+    assert!(no_such_session(&error.to_string()));
     let status = engine.status(&tree().labels).unwrap().remove(0);
     assert_eq!(status.state, SyncState::Disconnected("no such session".into()));
     let fake = Fake::new(vec![
         json!({"match":["sync","list"],"exit":1,"stderr":"daemon socket absent\n"}),
     ]);
-    let status = fake.engine().unwrap().session_status("eitri-missing-tree").unwrap();
-    assert_eq!(status.state, SyncState::Disconnected("daemon socket absent".into()));
+    let error = fake.engine().unwrap().session_status("eitri-missing-tree").unwrap_err();
+    assert_eq!(error.to_string(), "daemon socket absent");
     let fake = Fake::new(vec![json!({"match":["sync","monitor"],"stdout":"[]\n"})]);
     let mut monitor = fake.engine().unwrap().monitor("eitri-missing-tree").unwrap();
     assert_eq!(
@@ -761,13 +805,11 @@ fn duplicate_names_are_refused_for_create_and_status() {
 }
 
 #[test]
-fn absent_name_errors_from_list_and_monitor_are_disconnected() {
+fn absent_name_errors_refuse_list_and_disconnect_monitor() {
     let fake = Fake::new(vec![]);
     let engine = fake.engine().unwrap();
-    assert_eq!(
-        engine.session_status(&tree().name).unwrap().state,
-        SyncState::Disconnected("no such session".into())
-    );
+    let error = engine.session_status(&tree().name).unwrap_err();
+    assert!(no_such_session(&error.to_string()));
     assert_eq!(
         engine.monitor(&tree().name).unwrap().next().unwrap().state,
         SyncState::Disconnected("no such session".into())
@@ -831,10 +873,8 @@ fn a_status_only_open_does_not_start_or_recover_an_absent_daemon() {
         "stderr":"unable to connect to daemon: connection timed out (is the daemon running?)"})]);
     let engine = fake.engine().unwrap();
     assert!(engine.status(&Labels::new()).is_err());
-    assert!(matches!(
-        engine.session_status(&tree().name).unwrap().state,
-        SyncState::Disconnected(_)
-    ));
+    let error = engine.session_status(&tree().name).unwrap_err();
+    assert!(error.to_string().contains("unable to connect to daemon"));
     assert!(!fake.log().iter().any(|entry| entry["argv"][0] == "daemon"));
 }
 

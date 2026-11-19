@@ -130,30 +130,17 @@ impl MutagenEngine {
     pub fn session_status(&self, name: &str) -> Result<SessionStatus, SyncError> {
         check_name(name)?;
         let args = words(&["sync", "list", "--template", "{{json .}}", name]);
-        match self.run(&args, false) {
-            Ok(output) => {
-                let mut sessions: Vec<_> = parse_sessions(&output.stdout)?
-                    .into_iter()
-                    .filter(|s| s.name == name)
-                    .collect();
-                if sessions.len() > 1 {
-                    return Err(SyncError::Engine(format!("multiple Mutagen sessions named {name}")));
-                }
-                Ok(sessions
-                    .pop()
-                    .unwrap_or_else(|| SessionStatus::disconnected(name, role_for_name(name), "no such session")))
-            }
-            Err(error) if is_command_timeout(&error) => Err(error),
-            Err(error) => Ok(SessionStatus::disconnected(
-                name,
-                role_for_name(name),
-                if no_such_session(&error.to_string()) {
-                    "no such session".into()
-                } else {
-                    error.to_string()
-                },
-            )),
+        let output = self.run(&args, false)?;
+        let mut sessions = parse_sessions(&output.stdout)?
+            .into_iter()
+            .filter(|session| session.name == name);
+        let session = sessions
+            .next()
+            .ok_or_else(|| SyncError::Engine(format!("no such session: {name}")))?;
+        if sessions.next().is_some() {
+            return Err(SyncError::Engine(format!("multiple Mutagen sessions named {name}")));
         }
+        Ok(session)
     }
 
     /// The flock excludes start/create in other processes throughout the list-and-stop transaction.

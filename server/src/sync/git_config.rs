@@ -44,9 +44,24 @@ pub async fn answer_with(root: &str, environment: Environment) -> GitConfigRespo
         return entries(Vec::new());
     };
     match list(&config, environment).await {
+        Ok(listed) if declares_partial_clone(&listed) => refused(format!(
+            "{root}/.git/config contains partial clone settings, so the copy may be missing objects; {FORWARDED}"
+        )),
         Ok(listed) => entries(sanitize(&parse_config_list(&listed))),
         Err(refusal) => refused(refusal),
     }
+}
+
+fn declares_partial_clone(listed: &[u8]) -> bool {
+    // The allow-list drops these settings, and a promisor remote's subsection name can contain non-UTF-8 bytes.
+    listed.split(|&byte| byte == 0).any(|record| {
+        let key = record.split(|&byte| byte == b'\n').next().unwrap_or_default();
+        key == b"extensions.partialclone"
+            || key
+                .strip_prefix(b"remote.")
+                .and_then(|name| name.strip_suffix(b".promisor"))
+                .is_some_and(|name| !name.is_empty())
+    })
 }
 
 fn refused(refusal: String) -> GitConfigResponse {
@@ -111,6 +126,15 @@ fn mirrorable_config(root: &str) -> Result<Option<PathBuf>, String> {
         return Err(format!(
             "{root}/.git borrows objects from another repository (objects/info/alternates), so a copy of it would \
              be incomplete; {FORWARDED}"
+        ));
+    }
+    // Git can skip an empty .git directory and discover a repository above it. A replica needs its own HEAD
+    // and objects directory, and the sync excludes symbolic links.
+    if !std::fs::symlink_metadata(git_dir.join("HEAD")).is_ok_and(|meta| meta.is_file())
+        || !std::fs::symlink_metadata(git_dir.join("objects")).is_ok_and(|meta| meta.is_dir())
+    {
+        return Err(format!(
+            "{root}/.git requires a regular HEAD file and an objects directory to be mirrored; {FORWARDED}"
         ));
     }
     let config = git_dir.join("config");
@@ -343,6 +367,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn subdir_with_an_empty_git_directory_is_refused() {
+        let scratch = scratch("empty-git");
+        let root = repository(&scratch, "repo");
+        let subdir = root.join("sub");
+        std::fs::create_dir_all(subdir.join(".git")).unwrap();
+
+        let response = ask(&scratch, &subdir).await;
+        assert!(response.refusal.contains(FORWARDED), "{response:?}");
+        assert!(response.entries.is_empty() && response.digest.is_empty());
+    }
+
+    #[tokio::test]
+    async fn partial_clone_configs_are_refused() {
+        let scratch = scratch("partial");
+        let root = repository(&scratch, "repo");
+        for config in [
+            b"[remote \"origin.with.dots\"]\n\tPromisor = true\n\tpartialCloneFilter = blob:none\n".as_slice(),
+            b"[extensions]\n\tpartialClone = origin\n",
+            b"[remote \"origin-\xff\"]\n\tpromisor\n",
+        ] {
+            std::fs::write(root.join(".git/config"), config).unwrap();
+
+            let response = ask(&scratch, &root).await;
+            assert!(response.refusal.contains("partial clone"), "{response:?}");
+            assert!(response.refusal.contains(FORWARDED), "{response:?}");
+            assert!(response.entries.is_empty() && response.digest.is_empty());
+        }
+    }
+
+    #[tokio::test]
     async fn linked_worktree_commondir_and_subdir_roots_are_refused_with_the_reason() {
         let scratch = scratch("refused");
         let root = repository(&scratch, "repo");
@@ -377,9 +431,17 @@ mod tests {
             (common.clone(), "(commondir)".to_owned()),
             (borrowed.clone(), "(objects/info/alternates)".to_owned()),
             (linked_git.clone(), ".git is not a directory".to_owned()),
-            (plain.clone(), "is not a git repository".to_owned()),
             (linked_config.clone(), ".git/config is a symbolic link".to_owned()),
         ];
+        // The scratch directory is not a repository, but another process may make one of its ancestors one for a
+        // moment (temporary directories are shared); either answer names why it cannot be mirrored.
+        let response = ask(&scratch, &plain).await;
+        assert!(
+            response.refusal.contains("is not a git repository") || response.refusal.contains("below its top level"),
+            "{}: {:?}",
+            plain.display(),
+            response.refusal
+        );
         for (dir, reason) in cases {
             let response = ask(&scratch, &dir).await;
             assert!(

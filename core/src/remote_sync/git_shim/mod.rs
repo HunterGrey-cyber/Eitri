@@ -64,12 +64,14 @@ impl ShimEnv {
 }
 
 pub fn run(args: Vec<OsString>, mut env: ShimEnv) -> i32 {
-    let parsed = classify::Invocation::parse(&args, &env.cwd, None);
+    let Some(parsed) = classify::Invocation::parse(&args, &env.cwd) else {
+        return exec_real_git(&args, &env.real_git);
+    };
     if select_project(&parsed, &env).is_none() && unreadable_record(&parsed, &env).is_none() {
         return exec_real_git(&args, &env.real_git);
     }
     if select_project(&parsed, &env)
-        .is_some_and(|project| matches!(project_invocation(&args, &env, project).1, Route::Forward { .. }))
+        .is_some_and(|project| matches!(project_invocation(&parsed, project).1, Route::Forward { .. }))
     {
         let options = super::shim_dir::ShimOptions::from_process().unwrap_or_else(|error| {
             eprintln!("Eitri: {error}; using default git shim settings");
@@ -103,7 +105,9 @@ pub fn run_with(
     stdout: &mut dyn Write,
     stderr: &mut dyn Write,
 ) -> i32 {
-    let initial = classify::Invocation::parse(args, &env.cwd, None);
+    let Some(initial) = classify::Invocation::parse(args, &env.cwd) else {
+        return plain_git(&env.real_git, args, &env.cwd, stdout, stderr);
+    };
     if let Some(path) = unreadable_record(&initial, env) {
         return refuse(
             stderr,
@@ -114,7 +118,7 @@ pub fn run_with(
     let Some(project) = select_project(&initial, env) else {
         return plain_git(&env.real_git, args, &env.cwd, stdout, stderr);
     };
-    let (parsed, route) = project_invocation(args, env, project);
+    let (parsed, route) = project_invocation(&initial, project);
     if matches!(route, Route::Forward { .. }) {
         if let Some(name) = moving_environment(env, project, &initial.cwd) {
             return refuse(
@@ -128,22 +132,18 @@ pub fn run_with(
         }
     }
     match route {
+        Route::RefuseEditor if parsed.args.first().is_some_and(|arg| arg == "revert") => refuse(
+            stderr,
+            1,
+            &format!("run git revert from the terminal (it runs on {})", project.host),
+        ),
         Route::RefuseEditor => refuse(
             stderr,
             1,
             &format!("commit from the terminal (it runs on {}) or with -m", project.host),
         ),
         Route::Forward { whole_tree, paths } => forward::forward(
-            env,
-            project,
-            &parsed.cwd,
-            &parsed.forwarded_args(),
-            whole_tree,
-            &paths,
-            services,
-            stdin,
-            stdout,
-            stderr,
+            env, project, &parsed, whole_tree, &paths, services, stdin, stdout, stderr,
         ),
         Route::Local { extra } => {
             let start = services.now();
@@ -217,17 +217,11 @@ pub fn run_with(
     }
 }
 
-fn project_invocation(args: &[OsString], env: &ShimEnv, project: &RemoteProject) -> (classify::Invocation, Route) {
-    let mut parsed = classify::Invocation::parse(args, &env.cwd, Some(&project.root));
+fn project_invocation(initial: &classify::Invocation, project: &RemoteProject) -> (classify::Invocation, Route) {
+    let mut parsed = initial.clone().for_project(&project.root);
     let relative = relative_to(&parsed.cwd, &project.root).unwrap_or_default();
     parsed.cwd = project.root.join(relative);
-    let mut route = classify(&parsed.args, &project.root);
-    if !matches!(route, Route::RefuseEditor) && (parsed.foreign || !has_history(project)) {
-        route = Route::Forward {
-            whole_tree: true,
-            paths: vec![],
-        };
-    }
+    let route = classify::classify_invocation(&parsed.args, !parsed.foreign && has_history(project));
     (parsed, route)
 }
 

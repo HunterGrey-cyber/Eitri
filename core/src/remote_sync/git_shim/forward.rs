@@ -1,21 +1,23 @@
-use super::{read_disk_status, ShimEnv};
+use super::{classify::Invocation, read_disk_status, ShimEnv};
 use crate::remote_project::RemoteProject;
-use crate::remote_sync::engine::FlushOutcome;
+use crate::remote_sync::engine::{FlushOutcome, SessionStatus, SyncState};
 use crate::remote_sync::status_schema::StatusFile;
 use std::ffi::OsString;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct Conflicts {
+    pub state: SyncState,
     pub paths: Vec<String>,
     pub excluded: u64,
 }
 
-impl From<crate::remote_sync::engine::SessionStatus> for Conflicts {
-    fn from(status: crate::remote_sync::engine::SessionStatus) -> Self {
+impl From<SessionStatus> for Conflicts {
+    fn from(status: SessionStatus) -> Self {
         Self {
+            state: status.state,
             paths: status.conflicts.into_iter().map(|c| c.path).collect(),
             excluded: status.excluded_conflicts,
         }
@@ -52,8 +54,7 @@ pub trait Services {
 pub(super) fn forward(
     env: &ShimEnv,
     project: &RemoteProject,
-    cwd: &Path,
-    args: &[OsString],
+    invocation: &Invocation,
     whole_tree: bool,
     paths: &[PathBuf],
     services: &mut dyn Services,
@@ -61,6 +62,7 @@ pub(super) fn forward(
     stdout: &mut dyn Write,
     stderr: &mut dyn Write,
 ) -> i32 {
+    let cwd = &invocation.cwd;
     let unknown = || format!("sync state for {} is unknown; nothing was run", project.root.display());
     if !env.enabled {
         return refuse(stderr, 1, &crate::remote_project::remote_dev_off("git forwarding"));
@@ -86,6 +88,23 @@ pub(super) fn forward(
         Ok(conflicts) => conflicts,
         Err(error) => return refuse(stderr, 1, &format!("{} ({error})", unknown())),
     };
+    // Mutagen can clear conflicts on reconnect, and a scanning status does not say whether a cycle has completed.
+    let non_current = match conflicts.state {
+        SyncState::Watching | SyncState::Staging | SyncState::Applying => None,
+        SyncState::Disconnected(_) => Some("disconnected"),
+        SyncState::Connecting => Some("connecting"),
+        SyncState::Halted(_) => Some("halted"),
+        SyncState::Paused => Some("paused"),
+        SyncState::Other(_) => Some("in an unknown state"),
+        SyncState::Scanning => Some("scanning"),
+    };
+    if let Some(state) = non_current {
+        return refuse(
+            stderr,
+            1,
+            &format!("sync with {} is {state}; nothing was run", project.host),
+        );
+    }
     let affected: Vec<_> = conflicts
         .paths
         .iter()
@@ -99,8 +118,8 @@ pub(super) fn forward(
                 let text = path.to_string_lossy();
                 text.contains(['*', '?', '[', ':'])
                     || !path.starts_with(&project.root)
-                    || conflict.starts_with(&path)
-                    || path.starts_with(&conflict)
+                    || path_has_prefix(&conflict, &path, invocation.icase_pathspecs)
+                    || path_has_prefix(&path, &conflict, invocation.icase_pathspecs)
             })
         })
         .map(String::as_str)
@@ -122,12 +141,13 @@ pub(super) fn forward(
             ),
         );
     }
-    let stdin: Box<dyn Read + Send> = if super::reads_stdin(args, false) {
+    let args = invocation.forwarded_args();
+    let stdin: Box<dyn Read + Send> = if super::reads_stdin(&args, false) {
         stdin
     } else {
         Box::new(std::io::empty())
     };
-    let result = services.exec(project, cwd, args, stdin, stdout, stderr);
+    let result = services.exec(project, cwd, &args, stdin, stdout, stderr);
     // A failed post-command flush is visible even when the server returned success. Both sessions are tried.
     let _ = flush(services, tree, env.flush_cap, &project.host, stderr, false);
     let _ = record
@@ -138,6 +158,21 @@ pub(super) fn forward(
         Ok(code) => code,
         Err(error) => refuse(stderr, if error.contains("nothing was run") { 1 } else { 128 }, &error),
     }
+}
+
+fn path_has_prefix(path: &Path, prefix: &Path, icase: bool) -> bool {
+    if !icase {
+        return path.starts_with(prefix);
+    }
+    let mut components = path.components();
+    prefix.components().all(|expected| {
+        components.next().is_some_and(|actual| {
+            actual
+                .as_os_str()
+                .as_encoded_bytes()
+                .eq_ignore_ascii_case(expected.as_os_str().as_encoded_bytes())
+        })
+    })
 }
 
 fn flush(

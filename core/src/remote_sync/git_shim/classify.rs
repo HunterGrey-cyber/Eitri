@@ -1,4 +1,6 @@
-use std::ffi::OsString;
+use std::borrow::Cow;
+use std::ffi::{OsStr, OsString};
+use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -9,23 +11,25 @@ pub enum Route {
     NotRemote,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub(super) struct Invocation {
     pub cwd: PathBuf,
     pub globals: Vec<OsString>,
     pub args: Vec<OsString>,
     pub foreign: bool,
+    pub icase_pathspecs: bool,
     pub git_dir: Option<PathBuf>,
     pub work_tree: Option<PathBuf>,
 }
 
 impl Invocation {
-    pub fn parse(args: &[OsString], cwd: &Path, root: Option<&Path>) -> Self {
+    pub fn parse(args: &[OsString], cwd: &Path) -> Option<Self> {
         let mut parsed = Self {
             cwd: cwd.into(),
             globals: vec![],
             args: vec![],
             foreign: false,
+            icase_pathspecs: false,
             git_dir: None,
             work_tree: None,
         };
@@ -34,19 +38,22 @@ impl Invocation {
             let arg = args[i].to_string_lossy();
             if arg == "-C" {
                 i += 1;
-                if let Some(dir) = args.get(i) {
-                    parsed.cwd = parsed.cwd.join(dir);
-                    parsed.cwd = parsed.cwd.canonicalize().unwrap_or_else(|_| normalize(&parsed.cwd));
-                } else {
-                    parsed.foreign = true;
+                let dir = args.get(i)?;
+                if !dir.is_empty() {
+                    let target = parsed.cwd.join(dir);
+                    std::fs::metadata(target.join(".")).ok()?;
+                    parsed.cwd = target.canonicalize().ok()?;
                 }
+            } else if arg == "--" {
+                return None;
             } else if arg == "--git-dir"
                 || arg == "--work-tree"
                 || arg.starts_with("--git-dir=")
                 || arg.starts_with("--work-tree=")
             {
-                let (name, value) = if let Some((name, value)) = arg.split_once('=') {
-                    (name.to_owned(), Some(OsString::from(value)))
+                let (name, value) = if let Some((name, _)) = arg.split_once('=') {
+                    let value = OsStr::from_bytes(&args[i].as_bytes()[name.len() + 1..]);
+                    (name.to_owned(), Some(value.to_owned()))
                 } else {
                     i += 1;
                     (arg.into_owned(), args.get(i).cloned())
@@ -54,9 +61,9 @@ impl Invocation {
                 parsed.globals.push(name.clone().into());
                 if let Some(value) = value {
                     if name == "--git-dir" {
-                        parsed.git_dir = Some(parsed.cwd.join(&value));
+                        parsed.git_dir = Some(PathBuf::from(&value));
                     } else {
-                        parsed.work_tree = Some(parsed.cwd.join(&value));
+                        parsed.work_tree = Some(PathBuf::from(&value));
                     }
                     parsed.globals.push(value);
                 } else {
@@ -90,60 +97,65 @@ impl Invocation {
                     | "--noglob-pathspecs"
                     | "--icase-pathspecs"
                     | "--no-optional-locks"
+                    | "--no-replace-objects"
             ) || arg.starts_with("-c") && arg.len() > 2
             {
+                parsed.icase_pathspecs |= arg == "--icase-pathspecs";
                 parsed.globals.push(args[i].clone());
             } else {
                 break;
             }
             i += 1;
         }
-        if let Some(root) = root {
-            let mut globals = Vec::new();
-            let mut values = parsed.globals.into_iter();
-            while let Some(arg) = values.next() {
-                if arg == "--git-dir" || arg == "--work-tree" {
-                    let value = values.next();
-                    let expected = if arg == "--git-dir" {
-                        root.join(".git")
-                    } else {
-                        root.to_path_buf()
-                    };
-                    let equal = value.as_ref().is_some_and(|value| {
-                        parsed
-                            .cwd
-                            .join(value)
-                            .canonicalize()
-                            .ok()
-                            .zip(expected.canonicalize().ok())
-                            .is_some_and(|(a, b)| a == b)
-                    });
-                    if !equal {
-                        parsed.foreign = true;
-                        globals.push(arg);
-                        if let Some(value) = value {
-                            globals.push(value);
-                        }
-                    }
+        parsed.git_dir = parsed.git_dir.map(|path| parsed.cwd.join(path));
+        parsed.work_tree = parsed.work_tree.map(|path| parsed.cwd.join(path));
+        parsed.args = args.get(i..).unwrap_or_default().to_vec();
+        Some(parsed)
+    }
+
+    pub fn for_project(mut self, root: &Path) -> Self {
+        let mut globals = Vec::new();
+        let mut values = self.globals.into_iter();
+        while let Some(arg) = values.next() {
+            if arg == "--git-dir" || arg == "--work-tree" {
+                let value = values.next();
+                let expected = if arg == "--git-dir" {
+                    root.join(".git")
                 } else {
-                    let takes_value = arg == "-c"
-                        || arg == "--config-env"
-                        || arg == "--namespace"
-                        || arg == "--super-prefix"
-                        || arg == "--attr-source"
-                        || arg == "--list-cmds";
+                    root.to_path_buf()
+                };
+                let equal = value.as_ref().is_some_and(|value| {
+                    self.cwd
+                        .join(value)
+                        .canonicalize()
+                        .ok()
+                        .zip(expected.canonicalize().ok())
+                        .is_some_and(|(a, b)| a == b)
+                });
+                if !equal {
+                    self.foreign = true;
                     globals.push(arg);
-                    if takes_value {
-                        if let Some(value) = values.next() {
-                            globals.push(value);
-                        }
+                    if let Some(value) = value {
+                        globals.push(value);
+                    }
+                }
+            } else {
+                let takes_value = arg == "-c"
+                    || arg == "--config-env"
+                    || arg == "--namespace"
+                    || arg == "--super-prefix"
+                    || arg == "--attr-source"
+                    || arg == "--list-cmds";
+                globals.push(arg);
+                if takes_value {
+                    if let Some(value) = values.next() {
+                        globals.push(value);
                     }
                 }
             }
-            parsed.globals = globals;
         }
-        parsed.args = args.get(i..).unwrap_or_default().to_vec();
-        parsed
+        self.globals = globals;
+        self
     }
 
     pub fn forwarded_args(&self) -> Vec<OsString> {
@@ -167,40 +179,52 @@ pub(super) fn normalize(path: &Path) -> PathBuf {
 
 /// Classifies a subcommand and its arguments. Unknown options on conditional read forms forward conservatively.
 pub fn classify(args: &[OsString], _root: &Path) -> Route {
+    classify_invocation(args, true)
+}
+
+pub(super) fn classify_invocation(args: &[OsString], allow_local: bool) -> Route {
     let words: Vec<_> = args.iter().map(|s| s.to_string_lossy()).collect();
     let Some(cmd) = words.first().map(|s| s.as_ref()) else {
-        return forward(true, vec![]);
+        return forward(false, vec![]);
     };
-    let end = words.iter().position(|s| s == "--").unwrap_or(words.len());
+    if cmd == "--" {
+        return Route::NotRemote;
+    }
+    let parsed = CommandOptions::parse(cmd, &words);
+    let end = parsed.end;
     let options = &words[1..end];
-    let has = |flag: &str| options.iter().any(|s| s == flag || s.starts_with(&format!("{flag}=")));
-    let short = |flag: char| {
-        options.iter().any(|s| {
-            if !s.starts_with('-') || s.starts_with("--") {
-                return false;
-            }
-            for ch in s[1..].chars() {
-                if ch == flag {
-                    return true;
-                }
-                if short_takes_value(cmd, ch) {
-                    break;
-                }
-            }
-            false
-        })
-    };
+    let trailing_operands = end + 1 < words.len();
+    let has = |flag: &str| parsed.long.iter().any(|(name, _)| *name == flag);
+    let short = |flag: char| parsed.short.contains(&flag);
     let message = has("--message") || has("--file") || short('m') || short('F');
-    let commit_message =
-        message || has("--reuse-message") || short('C') || has("--no-edit") || has("--fixup") || has("--squash");
+    let plain_fixup = parsed
+        .long
+        .iter()
+        .rev()
+        .find(|(name, _)| *name == "--fixup")
+        .and_then(|(_, value)| *value)
+        .is_some_and(|value| !value.starts_with("amend:") && !value.starts_with("reword:"));
+    let commit_message = message || has("--reuse-message") || short('C') || has("--no-edit") || plain_fixup;
     let interactive = match cmd {
         "commit" => !commit_message || has("--edit") || short('e'),
-        "revert" => !has("--no-edit") && !has("--abort") && !has("--quit"),
+        "revert" => {
+            has("--continue")
+                || !(short('n')
+                    || ["--no-edit", "--no-commit", "--abort", "--quit", "--skip"]
+                        .into_iter()
+                        .any(has))
+        }
         "merge" | "cherry-pick" => has("--continue") || has("--edit") || short('e'),
         "rebase" => has("--continue") || has("--interactive") || short('i') || has("--edit-todo"),
         "tag" => (short('a') || short('s') || has("--annotate") || has("--sign")) && !message,
         "pull" => has("--edit") || short('e'),
-        "notes" => options.first().is_some_and(|s| s == "add" || s == "append") && !message,
+        "notes" => {
+            parsed
+                .operands
+                .first()
+                .is_some_and(|&index| matches!(words[index].as_ref(), "add" | "append"))
+                && !message
+        }
         "add" => short('p') || short('i') || short('e') || has("--patch") || has("--interactive") || has("--edit"),
         "checkout" | "reset" | "restore" => short('p') || has("--patch"),
         "stash" => {
@@ -214,32 +238,21 @@ pub fn classify(args: &[OsString], _root: &Path) -> Route {
     if interactive {
         return Route::RefuseEditor;
     }
-    if options.iter().any(|s| {
-        matches!(s.as_ref(), "--ext-diff" | "--textconv" | "--filters")
-            || s.starts_with("--ext-diff=")
-            || s.starts_with("--textconv=")
-            || s.starts_with("--filters=")
-    }) {
-        return forward(true, vec![]);
-    }
-    if matches!(
-        cmd,
-        "diff" | "log" | "show" | "diff-files" | "diff-index" | "diff-tree" | "reflog" | "stash"
-    ) && options.iter().any(|s| s.starts_with("--output"))
-        || cmd == "grep"
-            && (short('O')
-                || options.iter().any(|s| {
-                    let option = s.split('=').next().unwrap();
-                    option.len() > 2 && "--open-files-in-pager".starts_with(option)
-                }))
-    {
-        return forward(true, vec![]);
-    }
+    let output_files = revision_output_files(cmd, args);
+    let external = words[1..].iter().take_while(|word| *word != "--").any(|word| {
+        let name = word.split('=').next().unwrap_or(word);
+        matches!(name, "--ext-diff" | "--textconv" | "--filters")
+    });
+    let grep_pager = cmd == "grep"
+        && (short('O')
+            || parsed
+                .long
+                .iter()
+                .any(|(name, _)| name.len() > 2 && "--open-files-in-pager".starts_with(name)));
     let local = match cmd {
         "status" | "diff" | "diff-files" | "diff-index" | "diff-tree" | "log" | "shortlog" | "show" | "blame"
         | "annotate" | "grep" | "rev-parse" | "rev-list" | "ls-files" | "ls-tree" | "for-each-ref" | "show-ref"
-        | "merge-base" | "name-rev" | "describe" | "check-ignore" | "check-attr" | "var" | "--version" => true,
-        "help" => options == ["-a"],
+        | "merge-base" | "name-rev" | "describe" | "check-ignore" | "check-attr" | "var" | "--version" | "help" => true,
         "cat-file" => cat_file_read(options),
         "symbolic-ref" => {
             options.iter().filter(|s| !s.starts_with('-')).count() == 1
@@ -249,21 +262,24 @@ pub fn classify(args: &[OsString], _root: &Path) -> Route {
         }
         "branch" => {
             options.first().is_some_and(|s| s == "--list") && options[1..].iter().all(|s| !s.starts_with('-'))
-                || options.is_empty()
-                || options.iter().all(|s| {
-                    matches!(
-                        s.as_ref(),
-                        "-l" | "--list"
-                            | "-a"
-                            | "--all"
-                            | "-r"
-                            | "--remotes"
-                            | "-v"
-                            | "-vv"
-                            | "--verbose"
-                            | "--show-current"
-                    ) || s.starts_with("--contains=")
-                })
+                || (!trailing_operands
+                    || options
+                        .iter()
+                        .any(|s| !matches!(s.as_ref(), "-v" | "-vv" | "--verbose")))
+                    && options.iter().all(|s| {
+                        matches!(
+                            s.as_ref(),
+                            "-l" | "--list"
+                                | "-a"
+                                | "--all"
+                                | "-r"
+                                | "--remotes"
+                                | "-v"
+                                | "-vv"
+                                | "--verbose"
+                                | "--show-current"
+                        ) || s.starts_with("--contains=")
+                    })
                 || options.first().is_some_and(|s| s == "--contains")
                     && (options.len() == 1 || options.len() == 2 && !options[1].starts_with('-'))
         }
@@ -281,7 +297,7 @@ pub fn classify(args: &[OsString], _root: &Path) -> Route {
         "config" => config_read(options),
         _ => false,
     };
-    if local {
+    if local && allow_local && output_files.is_empty() && !external && !grep_pager {
         let diff = matches!(
             cmd,
             "diff"
@@ -303,22 +319,29 @@ pub fn classify(args: &[OsString], _root: &Path) -> Route {
             },
         };
     }
-    // Options with values are consumed before collecting paths, so a message or revision is never mistaken for a file.
-    let paths = path_arguments(cmd, args);
+    let path_separator = if words.get(end).is_some_and(|word| word == "--") {
+        end
+    } else {
+        args.len()
+    };
+    let mut paths = if cmd == "commit" {
+        commit_paths(args, &parsed)
+    } else {
+        path_arguments(cmd, args, path_separator)
+    };
+    paths.extend(output_files.into_iter().flatten());
     let whole = match cmd {
         "commit" => paths.is_empty() || short('a') || has("--all"),
-        "add" => paths.is_empty() || paths.iter().any(|p| p == Path::new(".")) || short('A') || has("--all"),
+        "add" => paths.is_empty() || paths.iter().any(|p| p == Path::new(".")),
         "stash" => true,
-        "checkout" => !args.iter().any(|s| s == "--"),
+        "checkout" => path_separator == args.len(),
         "switch" => true,
         "restore" => paths.is_empty(),
-        "reset" => {
-            !args.iter().any(|s| s == "--") || has("--hard") || has("--merge") || has("--keep") || paths.is_empty()
-        }
+        "reset" => path_separator == args.len() || has("--hard") || has("--merge") || has("--keep") || paths.is_empty(),
         "merge" | "rebase" | "pull" | "cherry-pick" | "revert" | "am" => true,
         "apply" => !has("--cached"),
         "rm" | "mv" => paths.is_empty(),
-        _ => true,
+        _ => false,
     };
     forward(whole || has("--pathspec-from-file"), paths)
 }
@@ -346,9 +369,111 @@ fn config_read(words: &[std::borrow::Cow<'_, str>]) -> bool {
     }
 }
 
-fn path_arguments(cmd: &str, args: &[OsString]) -> Vec<PathBuf> {
-    if let Some(i) = args.iter().position(|s| s == "--") {
-        return args[i + 1..].iter().map(PathBuf::from).collect();
+struct CommandOptions<'a> {
+    long: Vec<(&'a str, Option<&'a str>)>,
+    short: Vec<char>,
+    operands: Vec<usize>,
+    end: usize,
+}
+
+impl<'a> CommandOptions<'a> {
+    fn parse(cmd: &str, words: &'a [Cow<'_, str>]) -> Self {
+        let mut parsed = Self {
+            long: vec![],
+            short: vec![],
+            operands: vec![],
+            end: words.len(),
+        };
+        let mut args = words.iter().enumerate().skip(1);
+        while let Some((index, arg)) = args.next() {
+            if matches!(arg.as_ref(), "--" | "--end-of-options") {
+                parsed.end = index;
+                break;
+            }
+            if arg.starts_with("--") {
+                let (name, mut value) = arg.split_once('=').map_or((arg.as_ref(), None), |(n, v)| (n, Some(v)));
+                if value.is_none() && long_takes_value(cmd, name) {
+                    value = args.next().map(|(_, arg)| arg.as_ref());
+                }
+                parsed.long.push((name, value));
+            } else if let Some(group) = arg.strip_prefix('-').filter(|group| !group.is_empty()) {
+                for (offset, flag) in group.char_indices() {
+                    parsed.short.push(flag);
+                    if short_takes_value(cmd, flag) {
+                        if offset + flag.len_utf8() == group.len() && !short_value_optional(cmd, flag) {
+                            args.next();
+                        }
+                        break;
+                    }
+                }
+            } else {
+                parsed.operands.push(index);
+            }
+        }
+        parsed
+    }
+}
+
+fn commit_paths(args: &[OsString], options: &CommandOptions<'_>) -> Vec<PathBuf> {
+    // An unrecognized option may take a separate value, so its following operand cannot narrow the conflict check.
+    if options.long.iter().any(|&(name, _)| !commit_option_known(name))
+        || options
+            .short
+            .iter()
+            .any(|&flag| !"aqvseiponz".contains(flag) && !short_takes_value("commit", flag))
+    {
+        return vec![];
+    }
+    options
+        .operands
+        .iter()
+        .map(|&index| PathBuf::from(&args[index]))
+        .chain(args.iter().skip(options.end + 1).map(PathBuf::from))
+        .collect()
+}
+
+fn commit_option_known(name: &str) -> bool {
+    let name = name.strip_prefix("--no-").unwrap_or(name.trim_start_matches("--"));
+    commit_long_value(name)
+        || matches!(
+            name,
+            "quiet"
+                | "verbose"
+                | "reset-author"
+                | "signoff"
+                | "edit"
+                | "status"
+                | "gpg-sign"
+                | "all"
+                | "include"
+                | "interactive"
+                | "patch"
+                | "only"
+                | "verify"
+                | "dry-run"
+                | "short"
+                | "branch"
+                | "ahead-behind"
+                | "porcelain"
+                | "long"
+                | "null"
+                | "amend"
+                | "post-rewrite"
+                | "untracked-files"
+                | "pathspec-file-nul"
+                | "allow-empty"
+                | "allow-empty-message"
+        )
+}
+
+fn path_arguments(cmd: &str, args: &[OsString], end: usize) -> Vec<PathBuf> {
+    if matches!(cmd, "push" | "fetch" | "tag" | "branch" | "remote" | "config" | "help") {
+        return vec![];
+    }
+    let (before_separator, after_separator) = args.split_at(end);
+    let explicit_paths = after_separator.iter().skip(1).map(PathBuf::from);
+    if !after_separator.is_empty() && cmd != "add" {
+        return explicit_paths.collect();
     }
     if matches!(
         cmd,
@@ -362,7 +487,7 @@ fn path_arguments(cmd: &str, args: &[OsString]) -> Vec<PathBuf> {
     }
     let mut paths = vec![];
     let mut skip = false;
-    for arg in &args[1..] {
+    for arg in &before_separator[1..] {
         if skip {
             skip = false;
             continue;
@@ -372,23 +497,21 @@ fn path_arguments(cmd: &str, args: &[OsString]) -> Vec<PathBuf> {
             skip = true;
             continue;
         }
-        if s.starts_with('-') {
+        if s.starts_with('-') && (cmd != "add" || s != "-") {
             let known = match cmd {
-                "add" => matches!(
-                    s.as_ref(),
-                    "-u" | "--update"
-                        | "-A"
-                        | "--all"
-                        | "-f"
-                        | "--force"
-                        | "-v"
-                        | "--verbose"
-                        | "-N"
-                        | "--intent-to-add"
-                        | "--ignore-errors"
-                        | "--ignore-missing"
-                        | "--sparse"
-                ),
+                "add" => {
+                    matches!(
+                        s.as_ref(),
+                        "--update"
+                            | "--all"
+                            | "--force"
+                            | "--verbose"
+                            | "--intent-to-add"
+                            | "--ignore-errors"
+                            | "--ignore-missing"
+                            | "--sparse"
+                    ) || s[1..].chars().all(|flag| matches!(flag, 'u' | 'A' | 'f' | 'v' | 'N'))
+                }
                 "restore" => {
                     matches!(
                         s.as_ref(),
@@ -412,12 +535,15 @@ fn path_arguments(cmd: &str, args: &[OsString]) -> Vec<PathBuf> {
             paths.push(PathBuf::from(arg));
         }
     }
+    paths.extend(explicit_paths);
     paths
 }
 
 fn short_takes_value(cmd: &str, ch: char) -> bool {
     match cmd {
-        "commit" => "mFCcUt".contains(ch),
+        "commit" => "mFCcUtSu".contains(ch),
+        "rebase" => "CSrsxX".contains(ch),
+        "revert" | "cherry-pick" => "mSX".contains(ch),
         "tag" => "mFu".contains(ch),
         "notes" => "mFCc".contains(ch),
         "stash" => ch == 'm',
@@ -428,6 +554,58 @@ fn short_takes_value(cmd: &str, ch: char) -> bool {
         "grep" => "efmABC".contains(ch),
         _ => false,
     }
+}
+
+fn short_value_optional(cmd: &str, ch: char) -> bool {
+    matches!(
+        (cmd, ch),
+        ("commit", 'S' | 'u') | ("rebase", 'S' | 'r') | ("revert" | "cherry-pick", 'S')
+    )
+}
+
+fn revision_output_option(cmd: &str) -> bool {
+    matches!(
+        cmd,
+        "diff"
+            | "log"
+            | "show"
+            | "diff-files"
+            | "diff-index"
+            | "diff-tree"
+            | "reflog"
+            | "stash"
+            | "rev-list"
+            | "shortlog"
+            | "blame"
+            | "annotate"
+    )
+}
+
+fn revision_output_files(cmd: &str, args: &[OsString]) -> Vec<Option<PathBuf>> {
+    if !revision_output_option(cmd) {
+        return vec![];
+    }
+    // Revision parsing can open output files before rejecting unknown arguments. Shortlog and blame's
+    // option parser can also consume a bare `--` as a value before reaching a later `--output`.
+    let mut files = vec![];
+    let parses_options = matches!(cmd, "shortlog" | "blame" | "annotate");
+    for (index, arg) in args.iter().enumerate().skip(1) {
+        if arg == "--" {
+            let previous = &args[index - 1];
+            let could_be_value = parses_options
+                && previous.as_bytes().starts_with(b"-")
+                && !previous.as_bytes().contains(&b'=')
+                && previous != "--end-of-options";
+            if !could_be_value {
+                break;
+            }
+        } else if arg == "--output" {
+            files.push(args.get(index + 1).map(PathBuf::from));
+        } else if let Some(path) = arg.as_bytes().strip_prefix(b"--output=") {
+            files.push(Some(PathBuf::from(OsStr::from_bytes(path))));
+        }
+    }
+    files
 }
 
 fn cat_file_read(options: &[std::borrow::Cow<'_, str>]) -> bool {
@@ -456,22 +634,39 @@ fn cat_file_read(options: &[std::borrow::Cow<'_, str>]) -> bool {
     })
 }
 
-fn stdin_long_takes_value(cmd: &str, option: &str) -> bool {
+fn commit_long_value(name: &str) -> bool {
+    matches!(
+        name,
+        "message"
+            | "file"
+            | "author"
+            | "date"
+            | "trailer"
+            | "cleanup"
+            | "template"
+            | "reuse-message"
+            | "reedit-message"
+            | "fixup"
+            | "squash"
+            | "unified"
+            | "inter-hunk-context"
+            | "pathspec-from-file"
+    )
+}
+
+fn long_takes_value(cmd: &str, option: &str) -> bool {
+    if matches!(option, "--file" | "--pathspec-from-file") || option == "--output" && revision_output_option(cmd) {
+        return true;
+    }
     match cmd {
-        "commit" => matches!(
+        "commit" => option.strip_prefix("--").is_some_and(commit_long_value),
+        "notes" => matches!(option, "--ref" | "--message" | "--reuse-message" | "--reedit-message"),
+        "rebase" => matches!(
             option,
-            "--message"
-                | "--author"
-                | "--date"
-                | "--trailer"
-                | "--cleanup"
-                | "--template"
-                | "--reuse-message"
-                | "--reedit-message"
-                | "--fixup"
-                | "--squash"
+            "--onto" | "--whitespace" | "--empty" | "--exec" | "--strategy" | "--strategy-option" | "--trailer"
         ),
-        "tag" | "notes" | "stash" | "merge" => matches!(option, "--message"),
+        "revert" | "cherry-pick" => matches!(option, "--mainline" | "--strategy" | "--strategy-option"),
+        "tag" | "stash" | "merge" => option == "--message",
         "grep" => matches!(option, "--regexp"),
         "restore" => option == "--source",
         "apply" | "am" => matches!(
@@ -487,15 +682,17 @@ pub fn reads_stdin(args: &[OsString], is_tty: bool) -> bool {
     if is_tty {
         return false;
     }
-    let parsed = Invocation::parse(args, Path::new("/"), None);
+    let Some(parsed) = Invocation::parse(args, Path::new("/")) else {
+        return false;
+    };
     let words: Vec<_> = parsed.args.iter().map(|s| s.to_string_lossy()).collect();
-    let end = words.iter().position(|s| s == "--").unwrap_or(words.len());
-    let options = &words[..end];
     let cmd = words.first().map(|s| s.as_ref()).unwrap_or("");
-    let mut values = options.iter().skip(1);
+    let mut values = words.iter().skip(1);
     while let Some(option) = values.next() {
         match option.as_ref() {
+            "--" | "--end-of-options" => break,
             "--stdin" | "--stdin-paths" | "--index-info" => return true,
+            option if cmd == "show-ref" && show_ref_reads_stdin(option) => return true,
             "-F" | "--file" | "--pathspec-from-file" => {
                 if values.next().is_some_and(|v| v == "-") {
                     return true;
@@ -506,7 +703,7 @@ pub fn reads_stdin(args: &[OsString], is_tty: bool) -> bool {
                 for (offset, ch) in option[1..].char_indices() {
                     if short_takes_value(cmd, ch) {
                         let attached = &option[1 + offset + ch.len_utf8()..];
-                        let value = if attached.is_empty() {
+                        let value = if attached.is_empty() && !short_value_optional(cmd, ch) {
                             values.next().map(|s| s.as_ref())
                         } else {
                             Some(attached)
@@ -518,7 +715,7 @@ pub fn reads_stdin(args: &[OsString], is_tty: bool) -> bool {
                     }
                 }
             }
-            option if stdin_long_takes_value(cmd, option) => {
+            option if long_takes_value(cmd, option) => {
                 values.next();
             }
             _ => {}
@@ -556,10 +753,17 @@ pub fn reads_stdin(args: &[OsString], is_tty: bool) -> bool {
         "add" | "commit" | "reset" | "checkout" | "switch" | "restore" | "rm" | "mv" | "merge" | "rebase"
         | "revert" | "cherry-pick" | "stash" | "push" | "fetch" | "pull" | "tag" | "branch" | "config" | "remote"
         | "worktree" | "notes" | "hash-object" | "update-index" | "status" | "diff" | "diff-files" | "diff-index"
-        | "diff-tree" | "log" | "shortlog" | "show" | "blame" | "annotate" | "grep" | "rev-parse" | "rev-list"
-        | "ls-files" | "ls-tree" | "for-each-ref" | "show-ref" | "merge-base" | "name-rev" | "describe"
-        | "check-ignore" | "check-attr" | "var" | "help" | "reflog" | "symbolic-ref" => false,
+        | "diff-tree" | "log" | "show" | "blame" | "annotate" | "grep" | "rev-parse" | "rev-list" | "ls-files"
+        | "ls-tree" | "for-each-ref" | "show-ref" | "merge-base" | "name-rev" | "describe" | "check-ignore"
+        | "check-attr" | "var" | "help" | "reflog" | "symbolic-ref" => false,
+        // The server resolves the revisions. With none selected, shortlog reads the piped log.
+        "shortlog" => true,
         "cat-file" => words.iter().any(|s| s.starts_with("--batch")),
         _ => true,
     }
+}
+
+fn show_ref_reads_stdin(option: &str) -> bool {
+    let name = option.split('=').next().unwrap_or(option);
+    name.starts_with("--exc") && "--exclude-existing".starts_with(name)
 }

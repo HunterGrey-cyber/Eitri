@@ -709,8 +709,9 @@ mod tests {
         assert_eq!(lua_sites_outside_the_builder(&sources), Vec::<String>::new());
         // Legacy text reaches a Lua manager as Lua too, so no command text, in either form, is written outside the
         // builder: `hyprctl clients -j` is the one argv of hyprctl built elsewhere, and it holds no dispatch. No
-        // other literal is allowed today (the git `--batch-check=` format is not a hyprctl flag).
-        let allowed: &[(&str, &str)] = &[];
+        // other literal is allowed except git's own `--batch` options, which the git shim's classifier names (they
+        // are `git cat-file` flags, not hyprctl's).
+        let allowed: &[(&str, &str)] = &[("core/src/remote_sync/git_shim/classify.rs", "--batch")];
         assert_eq!(
             command_text_outside_the_builder(&sources, allowed),
             Vec::<String>::new()
