@@ -856,8 +856,10 @@ fn the_editor_op_dispatcher_names_only_its_table() {
             rest.strip_prefix(name)
                 .is_some_and(|after| !after.chars().next().is_some_and(is_ident))
         });
+        // A forwarded link is held to its document's project, found by the rule the page's own check used.
+        let project = rest.starts_with("doc_route::project_dir(");
         assert!(
-            rest.starts_with("editor::") || rest.starts_with("roots::") || bound,
+            rest.starts_with("editor::") || rest.starts_with("roots::") || project || bound,
             "the dispatcher reaches into the plugin host beyond its editor functions, path checks and bounds: {}",
             &rest[..rest.len().min(40)]
         );

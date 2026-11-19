@@ -8,8 +8,12 @@ use rmpv::Value;
 use crate::editor_rpc::EditorRpc;
 use crate::nvim_rpc::Pending;
 
+/// The checks and the edit both file-opening chunks share (`editor_open.lua`, `plugin/plugin_open.lua`): each chunk is
+/// this text followed by its own, so a check added for one is the other's too.
+pub static OPEN_CHECKED_LUA: &str = include_str!("open_checked.lua");
+
 /// A `pub static`, so tests can compare it by address; `core/tests/editor_rpc_scan.rs` accepts the call as it is.
-pub static EDITOR_OPEN_LUA: &str = include_str!("editor_open.lua");
+pub static EDITOR_OPEN_LUA: &str = concat!(include_str!("open_checked.lua"), include_str!("editor_open.lua"));
 
 /// Asks the editor to open `path`, at `line` and `col` when given. `line` and `col` count from one, `col` in bytes;
 /// a line past the end is the last line. The answer is `{how = edit | split | current, line, col}`, with `col` from
@@ -71,6 +75,23 @@ mod tests {
             panic!("options are one map")
         };
         assert_eq!(opts.len(), 1, "an absent value never reaches nvim as vim.NIL");
+    }
+
+    #[test]
+    fn both_file_opening_chunks_start_with_the_same_checks() {
+        for chunk in [EDITOR_OPEN_LUA, crate::plugin::editor::PLUGIN_OPEN_LUA] {
+            assert!(chunk.starts_with(OPEN_CHECKED_LUA));
+            let own = &chunk[OPEN_CHECKED_LUA.len()..];
+            // Each chunk's own part checks and opens only through the shared functions.
+            assert!(own.contains("check_path(path, "), "{own}");
+            assert!(
+                own.contains("open_checked(path, ") || own.contains("pcall(open_checked, path, "),
+                "{own}"
+            );
+            for repeated in ["nvim_cmd", "fs_realpath", "fs_stat", "buftype"] {
+                assert!(!own.contains(repeated), "the chunk's own part holds {repeated:?} again");
+            }
+        }
     }
 
     #[test]

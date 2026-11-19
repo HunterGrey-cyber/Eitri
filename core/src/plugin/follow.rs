@@ -65,6 +65,9 @@ pub enum FollowOp {
     OpenLink {
         path: PathBuf,
         line: Option<u32>,
+        /// The document whose link it is: a window that opens it on this one's behalf checks it against that
+        /// document's project again.
+        document: PathBuf,
         re: u64,
     },
     Teardown,
@@ -647,6 +650,7 @@ mod tests {
         let link = FollowOp::OpenLink {
             path: PathBuf::from("/p/a.md"),
             line: None,
+            document: PathBuf::from("/p/doc.md"),
             re: 2,
         };
         assert_eq!(f.park(jump(1)), Parked::Queued);
@@ -666,6 +670,7 @@ mod tests {
         let link = |re| FollowOp::OpenLink {
             path: PathBuf::from("/p/a.md"),
             line: None,
+            document: PathBuf::from("/p/doc.md"),
             re,
         };
         for re in 1..=16 {
@@ -696,6 +701,7 @@ mod tests {
         f.park(FollowOp::OpenLink {
             path: PathBuf::from("/p/a.md"),
             line: None,
+            document: PathBuf::from("/p/doc.md"),
             re: 2,
         });
         f.park(FollowOp::Jump {

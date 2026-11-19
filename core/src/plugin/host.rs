@@ -452,6 +452,8 @@ enum Then {
         target: String,
         line: Option<u32>,
         session: Option<u64>,
+        /// The document the link is in.
+        doc: PathBuf,
     },
     /// A `terminal.at`: the directory as the page sent it.
     TerminalAt { raw: String },
@@ -1874,7 +1876,12 @@ impl PluginHost {
                 re,
                 ..
             } => (editor::follow_jump(&*editor, id, *buf, *line, *col, *select), Some(*re)),
-            FollowOp::OpenLink { path, line, re } => (editor::open(&*editor, path, *line, None), Some(*re)),
+            FollowOp::OpenLink {
+                path,
+                line,
+                document,
+                re,
+            } => (editor::open_link(&*editor, path, *line, Some(document)), Some(*re)),
             FollowOp::Teardown => (editor::follow_teardown(&*editor, id), None),
         };
         let mut st = self.state.borrow_mut();
@@ -2515,7 +2522,7 @@ impl PluginHost {
                     from_root,
                 },
                 None => CheckJob::LinkWithProjectLookup {
-                    doc,
+                    doc: doc.clone(),
                     window_root: st.window_root.clone(),
                     home: st.home.clone(),
                     path: rel.to_owned(),
@@ -2527,6 +2534,7 @@ impl PluginHost {
             target: args.target.clone(),
             line,
             session: self.state.borrow().follow.current_session(),
+            doc,
         };
         self.check_then(re, job, then, now)
     }
@@ -3190,7 +3198,7 @@ impl PluginHost {
                     (Then::TerminalAt { .. }, Checked::Path(Ok(dir))) => {
                         self.terminal_at_checked(re, dir, now, replies)
                     }
-                    (Then::Link { line, session, .. }, Checked::Path(Ok(path))) => {
+                    (Then::Link { line, session, doc, .. }, Checked::Path(Ok(path))) => {
                         let current_session = self.state.borrow().follow.current_session();
                         if current_session != session {
                             // The editor the link was clicked against is gone; a new one is not asked to
@@ -3199,7 +3207,13 @@ impl PluginHost {
                         } else {
                             // Sent by the follow queue, after the call out and any parked before it, within what
                             // is left of the request's deadline. A link replaces nothing.
-                            drop(self.park_page_op(FollowOp::OpenLink { path, line, re }, re, c.deadline, replies));
+                            let op = FollowOp::OpenLink {
+                                path,
+                                line,
+                                document: doc,
+                                re,
+                            };
+                            drop(self.park_page_op(op, re, c.deadline, replies));
                         }
                     }
                     _ => {}

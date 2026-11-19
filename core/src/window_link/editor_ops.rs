@@ -100,6 +100,94 @@ pub enum Dispatch {
     /// A note for window 1's driver, and, while the turn runs, the editor's answer to which of its files a
     /// window shows, which is the op's reply.
     LiveNote { note: LiveNote, shown: Option<Pending> },
+    /// A plugin page's file, still to be checked on disk. [`OpenCheck::run`] reads the filesystem, which can stall on
+    /// a hung mount, so the caller runs it off the GTK thread and asks the editor with [`CheckedOpen::open`].
+    Check(OpenCheck),
+}
+
+/// A plugin page's open as window 1 checks it: what to look at on disk, taken from window 1's own records and the
+/// op. Plain data, so it can go to a worker thread.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OpenCheck {
+    plugin: String,
+    target: OpenTarget,
+    line: Option<u32>,
+    col: Option<u32>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum OpenTarget {
+    /// `rel` in the work tree `tree` of the plugin.
+    Tree { tree: PathBuf, rel: String },
+    /// The canonical path a document's link resolved to in window 2. It must still be that, unchanged (a directory
+    /// on the way swapped for a link since moves it, and is refused rather than followed), and a regular file of
+    /// that document's project, found by the rule window 2's own check used ([`crate::plugin::doc_route::project_dir`]
+    /// with this window's root and home); a sender that named no document is held to this window's root.
+    Link {
+        path: String,
+        document: Option<PathBuf>,
+        window_root: PathBuf,
+        home: Option<PathBuf>,
+    },
+}
+
+/// A checked plugin open: a canonical regular file, and where the cursor goes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CheckedOpen {
+    file: PathBuf,
+    line: Option<u32>,
+    col: Option<u32>,
+}
+
+impl OpenCheck {
+    /// Looks at the filesystem: call it on a worker thread, never on the GTK thread.
+    pub fn run(self) -> Result<CheckedOpen, OpRefused> {
+        let OpenCheck {
+            plugin,
+            target,
+            line,
+            col,
+        } = self;
+        let file = match target {
+            OpenTarget::Tree { tree, rel } => plugin_file(&plugin, &tree, &rel)?,
+            OpenTarget::Link {
+                path,
+                document,
+                window_root,
+                home,
+            } => {
+                let project = match document {
+                    Some(doc) => crate::plugin::doc_route::project_dir(&doc, Some(&window_root), home.as_deref())
+                        .ok_or_else(|| OpRefused::Outside(format!("{} has no project to open from", doc.display())))?,
+                    None => window_root,
+                };
+                let roots = Roots::new(BTreeMap::from([("project".into(), project)]));
+                let file = file_inside(&roots, &path).map_err(|e| OpRefused::Outside(e.message(&path)))?;
+                if file != Path::new(&path) {
+                    return Err(OpRefused::Outside(format!("{path} no longer resolves to itself")));
+                }
+                file
+            }
+        };
+        Ok(CheckedOpen { file, line, col })
+    }
+
+    /// The plugin whose page asked: the asking window must still hold it when the check is done.
+    pub fn plugin(&self) -> &str {
+        &self.plugin
+    }
+}
+
+impl CheckedOpen {
+    /// The canonical file the check found.
+    pub fn file(&self) -> &Path {
+        &self.file
+    }
+
+    /// Asks the editor to open the checked file: the plugin host's own open, whose snippet checks the file again.
+    pub fn open(&self, rpc: &dyn EditorRpc) -> Pending {
+        crate::plugin::editor::open(rpc, &self.file, self.line, self.col)
+    }
 }
 
 impl fmt::Debug for Dispatch {
@@ -112,6 +200,7 @@ impl fmt::Debug for Dispatch {
                 .field("note", note)
                 .field("shown", &shown.as_ref().map(|_| ".."))
                 .finish(),
+            Dispatch::Check(check) => f.debug_tuple("Check").field(check).finish(),
         }
     }
 }
@@ -252,8 +341,15 @@ pub fn dispatch(id: u64, op: EditorOp, ctx: &dyn OpContext, rpc: &dyn EditorRpc)
             let tree = roots
                 .get(&root)
                 .ok_or_else(|| OpRefused::Outside(format!("plugin {plugin} has no declared root named {root}")))?;
-            let file = plugin_file(&plugin, tree, &path)?;
-            Ok(Dispatch::Rpc(crate::plugin::editor::open(rpc, &file, line, col)))
+            Ok(Dispatch::Check(OpenCheck {
+                plugin,
+                target: OpenTarget::Tree {
+                    tree: tree.clone(),
+                    rel: path,
+                },
+                line,
+                col,
+            }))
         }
         // The op names only the plugin; the owner the editor records and the root it applies to are window 1's
         // own: the name it found in its table and that plugin's work tree.
@@ -346,11 +442,29 @@ pub fn dispatch(id: u64, op: EditorOp, ctx: &dyn OpContext, rpc: &dyn EditorRpc)
                 rpc, &plugin, buf, line, col, select,
             )))
         }
-        EditorOp::PluginOpenLink { plugin, path, line } => {
+        EditorOp::PluginOpenLink {
+            plugin,
+            path,
+            line,
+            document,
+        } => {
             held_plugin(ctx, &plugin)?;
-            let roots = Roots::new(BTreeMap::from([("project".into(), ctx.project_root().to_owned())]));
-            let file = file_inside(&roots, &path).map_err(|e| OpRefused::Outside(e.message(&path)))?;
-            Ok(Dispatch::Rpc(crate::plugin::editor::open(rpc, &file, line, None)))
+            let document = match document {
+                Some(doc) if Path::new(&doc).is_absolute() => Some(PathBuf::from(doc)),
+                Some(doc) => return Err(OpRefused::Outside(format!("{doc:?} is not an absolute document path"))),
+                None => None,
+            };
+            Ok(Dispatch::Check(OpenCheck {
+                plugin,
+                target: OpenTarget::Link {
+                    path,
+                    document,
+                    window_root: ctx.project_root().to_owned(),
+                    home: std::env::var_os("HOME").filter(|h| !h.is_empty()).map(PathBuf::from),
+                },
+                line,
+                col: None,
+            }))
         }
         EditorOp::PluginAssistClear { plugin } => {
             held_plugin(ctx, &plugin)?;
@@ -791,6 +905,7 @@ mod tests {
                 plugin: "snotra".into(),
                 path: f.ctx.root.join("src/a.rs").to_str().unwrap().into(),
                 line: Some(2),
+                document: None,
             },
         ];
         for op in ops {
@@ -798,7 +913,7 @@ mod tests {
             let value = serde_json::to_value(&op).unwrap();
             assert_eq!(value["op"], name);
             let back = serde_json::from_value(value).unwrap();
-            assert!(matches!(dispatch(1, back, &f.ctx, &rpc), Ok(Dispatch::Rpc(_))));
+            assert!(matches!(dispatch_now(1, back, &f.ctx, &rpc), Ok(Dispatch::Rpc(_))));
         }
         let calls = rpc.0.borrow();
         assert_eq!(calls.len(), 7);
@@ -856,6 +971,7 @@ mod tests {
                 plugin: "snotra".into(),
                 path: "/etc/passwd".into(),
                 line: None,
+                document: None,
             },
             EditorOp::PluginJump {
                 plugin: "snotra".into(),
@@ -869,7 +985,7 @@ mod tests {
                 }),
             },
         ] {
-            assert!(dispatch(1, op, &f.ctx, &rpc).is_err());
+            assert!(dispatch_now(1, op, &f.ctx, &rpc).is_err());
         }
         assert_eq!(rpc.0.borrow().len(), 7, "a refused call never reaches nvim");
         for op in [
@@ -898,7 +1014,7 @@ mod tests {
                 cursor,
                 row,
             };
-            assert!(matches!(dispatch(1, op, &f.ctx, &rpc), Err(OpRefused::Outside(message)) if message == why));
+            assert!(matches!(dispatch_now(1, op, &f.ctx, &rpc), Err(OpRefused::Outside(message)) if message == why));
         }
         assert!(rpc.0.borrow().is_empty(), "a refused row never reaches nvim");
     }
@@ -947,6 +1063,15 @@ mod tests {
         }
     }
 
+    /// [`dispatch`], with a plugin open's file check run at once, as the shell's worker runs it, and the editor
+    /// then asked.
+    fn dispatch_now(id: u64, op: EditorOp, ctx: &dyn OpContext, rpc: &dyn EditorRpc) -> Result<Dispatch, OpRefused> {
+        match dispatch(id, op, ctx, rpc)? {
+            Dispatch::Check(check) => Ok(Dispatch::Rpc(check.run()?.open(rpc))),
+            other => Ok(other),
+        }
+    }
+
     fn plugin_open(plugin: &str, path: &str) -> EditorOp {
         EditorOp::PluginOpen {
             plugin: plugin.into(),
@@ -976,6 +1101,95 @@ mod tests {
     }
 
     #[test]
+    fn a_plugin_open_is_looked_at_on_disk_only_by_its_check() {
+        let f = fixture("open-check-later");
+        let rpc = Recorder::default();
+        let link = |path: &str| EditorOp::PluginOpenLink {
+            plugin: "snotra".into(),
+            path: path.into(),
+            line: None,
+            document: None,
+        };
+        for op in [plugin_open("snotra", "leak.rs"), link("/etc/passwd")] {
+            // What a dispatch on the GTK thread decides from window 1's own records alone: nothing refused yet.
+            let Ok(Dispatch::Check(check)) = dispatch(1, op, &f.ctx, &rpc) else {
+                panic!("a plugin open is handed on to its check");
+            };
+            assert!(matches!(check.run(), Err(OpRefused::Outside(_))));
+        }
+        assert!(rpc.calls().is_empty());
+        let Ok(Dispatch::Check(check)) = dispatch(1, plugin_open("snotra", "real.rs"), &f.ctx, &rpc) else {
+            panic!("a plugin open is handed on to its check");
+        };
+        assert_eq!(
+            check.run().unwrap().file(),
+            std::fs::canonicalize(f.tree.join("real.rs")).unwrap()
+        );
+        // A plugin window 2 does not hold is refused at once: that needs no disk.
+        assert_eq!(
+            dispatch(1, plugin_open("other", "real.rs"), &f.ctx, &rpc).unwrap_err(),
+            OpRefused::PluginNotHeld("other".into())
+        );
+    }
+
+    #[test]
+    fn a_forwarded_link_is_checked_against_its_documents_project() {
+        let f = fixture("link-document");
+        let rpc = Recorder::default();
+        // A document of another repository, open in this window's editor: its links reach that repository.
+        let other = f.ctx.root.parent().unwrap().join("other");
+        std::fs::create_dir_all(other.join(".git")).unwrap();
+        std::fs::write(other.join("doc.md"), "[x](x.rs)\n").unwrap();
+        std::fs::write(other.join("x.rs"), "x\n").unwrap();
+        let link = |path: &Path, document: Option<&Path>| EditorOp::PluginOpenLink {
+            plugin: "snotra".into(),
+            path: path.to_str().unwrap().into(),
+            line: Some(1),
+            document: document.map(|d| d.to_str().unwrap().into()),
+        };
+        let doc = other.join("doc.md");
+        assert!(matches!(
+            dispatch_now(1, link(&other.join("x.rs"), Some(&doc)), &f.ctx, &rpc),
+            Ok(Dispatch::Rpc(_))
+        ));
+        assert_eq!(
+            opened_path(&rpc.calls().last().unwrap().1),
+            Value::Binary(other.join("x.rs").as_os_str().as_encoded_bytes().to_vec())
+        );
+        // Not this window's project, then: a file of it is outside that document's.
+        assert!(matches!(
+            dispatch_now(1, link(&f.ctx.root.join("src/a.rs"), Some(&doc)), &f.ctx, &rpc),
+            Err(OpRefused::Outside(_))
+        ));
+        // A directory on the way swapped for a link since window 2's check: the path no longer names itself, and the
+        // file the link leads to now is not opened in its place.
+        let elsewhere = f.ctx.root.parent().unwrap().join("elsewhere");
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        std::fs::write(elsewhere.join("x.rs"), "elsewhere\n").unwrap();
+        symlink(&elsewhere, other.join("sub")).unwrap();
+        let refused = dispatch_now(
+            1,
+            link(&other.join("sub/x.rs"), Some(&other.join("sub/doc.md"))),
+            &f.ctx,
+            &rpc,
+        );
+        assert!(
+            matches!(&refused, Err(OpRefused::Outside(why)) if why.contains("no longer resolves to itself")),
+            "{refused:?}"
+        );
+        // A sender that names no document is held to this window's root, as before.
+        assert!(matches!(
+            dispatch_now(1, link(&other.join("x.rs"), None), &f.ctx, &rpc),
+            Err(OpRefused::Outside(_))
+        ));
+        assert!(matches!(
+            dispatch(1, link(&other.join("x.rs"), Some(Path::new("doc.md"))), &f.ctx, &rpc),
+            Err(OpRefused::Outside(_))
+        ));
+        assert_eq!(rpc.calls().len(), 1);
+    }
+
+    #[test]
     fn plugin_open_uses_the_named_root_even_when_the_relative_path_exists_in_both() {
         let f = fixture("named-root");
         let rpc = Recorder::default();
@@ -992,7 +1206,7 @@ mod tests {
                 line: Some(2),
                 col: None,
             };
-            assert!(matches!(dispatch(1, op, &f.ctx, &rpc), Ok(Dispatch::Rpc(_))));
+            assert!(matches!(dispatch_now(1, op, &f.ctx, &rpc), Ok(Dispatch::Rpc(_))));
             assert_eq!(
                 opened_path(&rpc.calls().last().unwrap().1),
                 Value::Binary(
@@ -1018,7 +1232,7 @@ mod tests {
                 line: None,
                 col: None,
             };
-            let result = dispatch(1, op, &f.ctx, &rpc);
+            let result = dispatch_now(1, op, &f.ctx, &rpc);
             assert!(matches!(result, Err(OpRefused::Outside(_))), "{result:?}");
             if root == "unknown" {
                 assert!(result
@@ -1060,7 +1274,7 @@ mod tests {
             ];
             for op in ops {
                 let name = op.name();
-                let result = dispatch(1, op, &f.ctx, &rpc);
+                let result = dispatch_now(1, op, &f.ctx, &rpc);
                 assert!(
                     matches!(result, Err(OpRefused::Outside(_))),
                     "{name} of {path:?} was not refused as outside: {result:?}"
@@ -1068,7 +1282,7 @@ mod tests {
             }
         }
         for path in ["../../src/a.rs", "/etc/passwd", "ch01//main.rs", "./real.rs", ""] {
-            let result = dispatch(1, plugin_open("snotra", path), &f.ctx, &rpc);
+            let result = dispatch_now(1, plugin_open("snotra", path), &f.ctx, &rpc);
             assert!(
                 matches!(result, Err(OpRefused::Outside(_))),
                 "plugin_open of {path:?} was not refused as outside: {result:?}"
@@ -1082,7 +1296,7 @@ mod tests {
         let f = fixture("leak");
         let rpc = Recorder::default();
         for path in ["leak.rs", "dir/passwd", "ch01", "missing.rs"] {
-            let result = dispatch(1, plugin_open("snotra", path), &f.ctx, &rpc);
+            let result = dispatch_now(1, plugin_open("snotra", path), &f.ctx, &rpc);
             assert!(
                 matches!(result, Err(OpRefused::Outside(_))),
                 "plugin_open of {path:?} was not refused as outside: {result:?}"
@@ -1096,7 +1310,7 @@ mod tests {
         let f = fixture("alias");
         let rpc = Recorder::default();
         assert!(matches!(
-            dispatch(1, plugin_open("snotra", "alias.rs"), &f.ctx, &rpc),
+            dispatch_now(1, plugin_open("snotra", "alias.rs"), &f.ctx, &rpc),
             Ok(Dispatch::Rpc(_))
         ));
         let calls = rpc.calls();
@@ -1113,7 +1327,7 @@ mod tests {
     #[test]
     fn the_overlay_request_id_is_built_from_the_messages_id() {
         let f = fixture("request-id");
-        let calls = overlay(dispatch(
+        let calls = overlay(dispatch_now(
             42,
             open_and_show("src/a.rs", "s-held"),
             &f.ctx,
@@ -1131,7 +1345,7 @@ mod tests {
         let rpc = Recorder::default();
         for op in [show("src/a.rs", "s-other"), open_and_show("src/a.rs", "s-other")] {
             assert_eq!(
-                dispatch(1, op, &f.ctx, &rpc).unwrap_err(),
+                dispatch_now(1, op, &f.ctx, &rpc).unwrap_err(),
                 OpRefused::SessionNotHeld("s-other".into())
             );
         }
@@ -1144,7 +1358,7 @@ mod tests {
         let mine = vec![f.ctx.root.join("src/a.rs"), f.ctx.root.join("a/b")];
         f.ctx.drawn = mine.clone();
         let rpc = Recorder::default();
-        let calls = overlay(dispatch(1, EditorOp::ReviewClearMine {}, &f.ctx, &rpc));
+        let calls = overlay(dispatch_now(1, EditorOp::ReviewClearMine {}, &f.ctx, &rpc));
         assert_eq!(
             calls,
             mine.iter()
@@ -1157,12 +1371,15 @@ mod tests {
         );
 
         f.ctx.drawn.clear();
-        assert_eq!(overlay(dispatch(1, EditorOp::ReviewClearMine {}, &f.ctx, &rpc)), vec![]);
+        assert_eq!(
+            overlay(dispatch_now(1, EditorOp::ReviewClearMine {}, &f.ctx, &rpc)),
+            vec![]
+        );
 
         // One path at a time: only a path recorded for window 2.
         f.ctx.drawn = vec![f.ctx.root.join("a/b")];
         assert_eq!(
-            dispatch(
+            dispatch_now(
                 1,
                 EditorOp::ReviewClear {
                     path: "src/a.rs".into()
@@ -1174,7 +1391,12 @@ mod tests {
             OpRefused::NotDrawnByWindow2("src/a.rs".into())
         );
         assert_eq!(
-            overlay(dispatch(1, EditorOp::ReviewClear { path: "a/b".into() }, &f.ctx, &rpc)),
+            overlay(dispatch_now(
+                1,
+                EditorOp::ReviewClear { path: "a/b".into() },
+                &f.ctx,
+                &rpc
+            )),
             vec![OverlayCall::Clear {
                 path: f.ctx.root.join("a/b")
             }]
@@ -1188,7 +1410,7 @@ mod tests {
         let rpc = Recorder::default();
         let abs = f.ctx.root.join("src/a.rs");
         assert_eq!(
-            overlay(dispatch(5, show("src/a.rs", "s-held"), &f.ctx, &rpc)),
+            overlay(dispatch_now(5, show("src/a.rs", "s-held"), &f.ctx, &rpc)),
             vec![OverlayCall::Show {
                 path: abs.clone(),
                 meta: ShowMeta::from(meta("s-held")),
@@ -1196,7 +1418,7 @@ mod tests {
             }]
         );
         assert_eq!(
-            overlay(dispatch(6, open_and_show("src/a.rs", "s-held"), &f.ctx, &rpc)),
+            overlay(dispatch_now(6, open_and_show("src/a.rs", "s-held"), &f.ctx, &rpc)),
             vec![OverlayCall::OpenAndShow {
                 request_id: "w2:6".into(),
                 path: abs.clone(),
@@ -1213,7 +1435,7 @@ mod tests {
             hunks: None,
         };
         assert_eq!(
-            overlay(dispatch(7, only_open, &f.ctx, &rpc)),
+            overlay(dispatch_now(7, only_open, &f.ctx, &rpc)),
             vec![OverlayCall::OpenAndShow {
                 request_id: "w2:7".into(),
                 path: f.ctx.root.join("new/dir/b.rs"),
@@ -1233,19 +1455,19 @@ mod tests {
             path: "src/a.rs".into(),
             lines: Some((3, 2)),
         };
-        assert!(matches!(dispatch(1, op, &f.ctx, &rpc), Ok(Dispatch::Rpc(_))));
+        assert!(matches!(dispatch_now(1, op, &f.ctx, &rpc), Ok(Dispatch::Rpc(_))));
         let op = plugin_open("snotra", "ch01/main.rs");
-        assert!(matches!(dispatch(2, op, &f.ctx, &rpc), Ok(Dispatch::Rpc(_))));
+        assert!(matches!(dispatch_now(2, op, &f.ctx, &rpc), Ok(Dispatch::Rpc(_))));
         let op = EditorOp::PluginAssistApply {
             plugin: "snotra".into(),
             diagnostics: true,
             inlay_hints: false,
         };
-        assert!(matches!(dispatch(3, op, &f.ctx, &rpc), Ok(Dispatch::Rpc(_))));
+        assert!(matches!(dispatch_now(3, op, &f.ctx, &rpc), Ok(Dispatch::Rpc(_))));
         let op = EditorOp::PluginAssistClear {
             plugin: "snotra".into(),
         };
-        assert!(matches!(dispatch(4, op, &f.ctx, &rpc), Ok(Dispatch::Rpc(_))));
+        assert!(matches!(dispatch_now(4, op, &f.ctx, &rpc), Ok(Dispatch::Rpc(_))));
 
         // What window 1's own callers would send for the same file and plugin.
         let expected = Recorder::default();
@@ -1325,7 +1547,7 @@ mod tests {
         ];
         for op in ops {
             assert_eq!(
-                dispatch(1, op, &f.ctx, &rpc).unwrap_err(),
+                dispatch_now(1, op, &f.ctx, &rpc).unwrap_err(),
                 OpRefused::PluginNotHeld("other".into())
             );
         }
@@ -1455,7 +1677,7 @@ mod tests {
         let rpc = Recorder::default();
         let wire = stamp();
         let op = agent_open("s-held", "src/a.rs", true, wire.clone());
-        assert!(matches!(dispatch(1, op, &f.ctx, &rpc), Ok(Dispatch::Rpc(_))));
+        assert!(matches!(dispatch_now(1, op, &f.ctx, &rpc), Ok(Dispatch::Rpc(_))));
         let expected = Recorder::default();
         let _ = open_file::send(
             &expected,
@@ -1496,7 +1718,7 @@ mod tests {
                 stamp: wire.clone(),
             },
         ] {
-            assert!(matches!(dispatch(1, op, &f.ctx, &rpc), Ok(Dispatch::Rpc(_))));
+            assert!(matches!(dispatch_now(1, op, &f.ctx, &rpc), Ok(Dispatch::Rpc(_))));
         }
         let expected = Recorder::default();
         let _ = editor_state::send(&expected, &local, &f.ctx.root);
@@ -1524,7 +1746,7 @@ mod tests {
             agent_read("s-held", "new/b.rs"),
             agent_diagnostics("s-held", Some("new/b.rs")),
         ] {
-            assert!(matches!(dispatch(1, op, &f.ctx, &rpc), Ok(Dispatch::Rpc(_))));
+            assert!(matches!(dispatch_now(1, op, &f.ctx, &rpc), Ok(Dispatch::Rpc(_))));
         }
         assert_eq!(rpc.calls().len(), 3);
     }
@@ -1541,7 +1763,7 @@ mod tests {
             lsp_ask("s-held", path, true, stamp()),
         ] {
             let name = op.name();
-            let result = dispatch(1, op, &f.ctx, &rpc);
+            let result = dispatch_now(1, op, &f.ctx, &rpc);
             assert!(
                 matches!(result, Err(OpRefused::Outside(_))),
                 "{name} of {path:?}: {result:?}"
@@ -1587,7 +1809,7 @@ mod tests {
             agent_baseline("s-other"),
         ] {
             assert_eq!(
-                dispatch(1, op, &f.ctx, &rpc).unwrap_err(),
+                dispatch_now(1, op, &f.ctx, &rpc).unwrap_err(),
                 OpRefused::SessionNotHeld("s-other".into())
             );
         }
@@ -1623,7 +1845,7 @@ mod tests {
                 stamp: bad(),
             },
         ] {
-            let result = dispatch(1, op, &f.ctx, &rpc);
+            let result = dispatch_now(1, op, &f.ctx, &rpc);
             assert!(matches!(result, Err(OpRefused::Outside(_))), "{result:?}");
         }
         assert!(rpc.calls().is_empty(), "a refused op reached the editor");
@@ -1639,7 +1861,7 @@ mod tests {
             ..stamp()
         };
         assert!(matches!(
-            dispatch(1, agent_open("s-held", "src/a.rs", false, far), &f.ctx, &rpc),
+            dispatch_now(1, agent_open("s-held", "src/a.rs", false, far), &f.ctx, &rpc),
             Ok(Dispatch::Rpc(_))
         ));
         let after = wall_ms();
@@ -1659,20 +1881,20 @@ mod tests {
         let name = std::ffi::CString::new(path.to_str().unwrap()).unwrap();
         assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
         let rpc = Recorder::default();
-        let result = dispatch(1, agent_open("s-held", "src/pipe", true, stamp()), &f.ctx, &rpc);
+        let result = dispatch_now(1, agent_open("s-held", "src/pipe", true, stamp()), &f.ctx, &rpc);
         assert!(matches!(result, Err(OpRefused::Outside(_))), "{result:?}");
         assert!(rpc.calls().is_empty(), "a refused op reached the editor");
         // Without a load the chunk only looks among the editor's buffers, so no file is touched.
         assert!(matches!(
-            dispatch(2, agent_open("s-held", "src/pipe", false, stamp()), &f.ctx, &rpc),
+            dispatch_now(2, agent_open("s-held", "src/pipe", false, stamp()), &f.ctx, &rpc),
             Ok(Dispatch::Rpc(_))
         ));
         let calls = rpc.calls().len();
-        let result = dispatch(3, lsp_ask("s-held", "src/pipe", true, stamp()), &f.ctx, &rpc);
+        let result = dispatch_now(3, lsp_ask("s-held", "src/pipe", true, stamp()), &f.ctx, &rpc);
         assert!(matches!(result, Err(OpRefused::Outside(_))), "{result:?}");
         assert_eq!(rpc.calls().len(), calls, "a refused op reached the editor");
         assert!(matches!(
-            dispatch(4, lsp_ask("s-held", "src/pipe", false, stamp()), &f.ctx, &rpc),
+            dispatch_now(4, lsp_ask("s-held", "src/pipe", false, stamp()), &f.ctx, &rpc),
             Ok(Dispatch::Rpc(_))
         ));
     }
@@ -1683,7 +1905,7 @@ mod tests {
         let rpc = Recorder::default();
         let wire = stamp();
         let op = lsp_ask("s-held", "src/a.rs", true, wire.clone());
-        assert!(matches!(dispatch(1, op, &f.ctx, &rpc), Ok(Dispatch::Rpc(_))));
+        assert!(matches!(dispatch_now(1, op, &f.ctx, &rpc), Ok(Dispatch::Rpc(_))));
         let expected = Recorder::default();
         let _ = lsp::ask(
             &expected,
@@ -1729,7 +1951,7 @@ mod tests {
             if let EditorOp::AgentLspAsk { query_for, .. } = &mut op {
                 *query_for = queries.clone();
             }
-            let result = dispatch(1, op, &f.ctx, &rpc);
+            let result = dispatch_now(1, op, &f.ctx, &rpc);
             assert_eq!(result.is_ok(), allowed, "{result:?}");
             if allowed {
                 let expected = Value::Map(
@@ -1769,7 +1991,7 @@ mod tests {
                 load: false,
                 stamp: stamp(),
             };
-            assert!(matches!(dispatch(1, op, &f.ctx, &rpc), Ok(Dispatch::Rpc(_))));
+            assert!(matches!(dispatch_now(1, op, &f.ctx, &rpc), Ok(Dispatch::Rpc(_))));
             assert_eq!(sent_field(&rpc.calls()[0].1, "kind").as_str(), Some(word));
         }
     }
@@ -1785,7 +2007,7 @@ mod tests {
             last: true,
             stamp: wire.clone(),
         };
-        assert!(matches!(dispatch(1, op, &f.ctx, &rpc), Ok(Dispatch::Rpc(_))));
+        assert!(matches!(dispatch_now(1, op, &f.ctx, &rpc), Ok(Dispatch::Rpc(_))));
         let expected = Recorder::default();
         let _ = lsp::collect(&expected, &Stamp::from(wire), "abc-3-1", true);
         assert_eq!(rpc.calls(), expected.calls());
@@ -1797,7 +2019,7 @@ mod tests {
         let f = fixture("agent-collect-session");
         let rpc = Recorder::default();
         assert_eq!(
-            dispatch(1, lsp_collect("s-other", "abc-3-1"), &f.ctx, &rpc).unwrap_err(),
+            dispatch_now(1, lsp_collect("s-other", "abc-3-1"), &f.ctx, &rpc).unwrap_err(),
             OpRefused::SessionNotHeld("s-other".into())
         );
         assert!(rpc.calls().is_empty(), "a refused op reached the editor");
@@ -1810,7 +2032,7 @@ mod tests {
         let longest = "a".repeat(LSP_ID_MAX);
         for id in [longest.as_str(), "0123abcdef-7-1"] {
             assert!(matches!(
-                dispatch(1, lsp_collect("s-held", id), &f.ctx, &rpc),
+                dispatch_now(1, lsp_collect("s-held", id), &f.ctx, &rpc),
                 Ok(Dispatch::Rpc(_))
             ));
         }
@@ -1818,7 +2040,7 @@ mod tests {
         let long = "a".repeat(LSP_ID_MAX + 1);
         for id in ["", "Abc", "a_b", "a b", "a:b", "a\nb", "é", long.as_str()] {
             for op in [lsp_collect("s-held", id), lsp_search("frob", id)] {
-                let result = dispatch(1, op, &f.ctx, &rpc);
+                let result = dispatch_now(1, op, &f.ctx, &rpc);
                 assert!(matches!(result, Err(OpRefused::Outside(_))), "{id:?}: {result:?}");
             }
         }
@@ -1845,11 +2067,11 @@ mod tests {
             stamp: stamp(),
         };
         assert!(matches!(
-            dispatch(1, with_budget(limit), &f.ctx, &rpc),
+            dispatch_now(1, with_budget(limit), &f.ctx, &rpc),
             Ok(Dispatch::Rpc(_))
         ));
         for budget_ms in [limit + 1, u32::MAX] {
-            let result = dispatch(1, with_budget(budget_ms), &f.ctx, &rpc);
+            let result = dispatch_now(1, with_budget(budget_ms), &f.ctx, &rpc);
             assert!(matches!(result, Err(OpRefused::Outside(_))), "{result:?}");
         }
         assert_eq!(rpc.calls().len(), 1, "a refused op reached the editor");
@@ -1874,19 +2096,19 @@ mod tests {
             stamp: stamp(),
         };
         assert!(matches!(
-            dispatch(1, with_symbol("a".repeat(SYMBOL_MAX)), &f.ctx, &rpc),
+            dispatch_now(1, with_symbol("a".repeat(SYMBOL_MAX)), &f.ctx, &rpc),
             Ok(Dispatch::Rpc(_))
         ));
         for symbol in ["a\nb".to_owned(), "a\u{7}".to_owned(), "a".repeat(SYMBOL_MAX + 1)] {
-            let result = dispatch(1, with_symbol(symbol), &f.ctx, &rpc);
+            let result = dispatch_now(1, with_symbol(symbol), &f.ctx, &rpc);
             assert!(matches!(result, Err(OpRefused::Outside(_))), "{result:?}");
         }
         assert!(matches!(
-            dispatch(1, lsp_search(&"q".repeat(QUERY_MAX), "abc-3-1"), &f.ctx, &rpc),
+            dispatch_now(1, lsp_search(&"q".repeat(QUERY_MAX), "abc-3-1"), &f.ctx, &rpc),
             Ok(Dispatch::Rpc(_))
         ));
         for query in ["a\rb".to_owned(), "q".repeat(QUERY_MAX + 1)] {
-            let result = dispatch(1, lsp_search(&query, "abc-3-1"), &f.ctx, &rpc);
+            let result = dispatch_now(1, lsp_search(&query, "abc-3-1"), &f.ctx, &rpc);
             assert!(matches!(result, Err(OpRefused::Outside(_))), "{result:?}");
         }
         assert_eq!(rpc.calls().len(), 2, "a refused op reached the editor");
@@ -1911,7 +2133,7 @@ mod tests {
                 load: true,
                 stamp: stamp(),
             };
-            let result = dispatch(1, op, &f.ctx, &rpc);
+            let result = dispatch_now(1, op, &f.ctx, &rpc);
             assert!(matches!(result, Err(OpRefused::Outside(_))), "{kind:?}: {result:?}");
         }
         assert!(rpc.calls().is_empty(), "a refused op reached the editor");
@@ -1938,7 +2160,7 @@ mod tests {
                 stamp: bad(),
             },
         ] {
-            let result = dispatch(1, op, &f.ctx, &rpc);
+            let result = dispatch_now(1, op, &f.ctx, &rpc);
             assert!(matches!(result, Err(OpRefused::Outside(_))), "{result:?}");
         }
         assert!(rpc.calls().is_empty(), "a refused op reached the editor");
@@ -2020,7 +2242,7 @@ mod tests {
         for op in ops {
             let name = op.name();
             assert!(
-                matches!(dispatch(1, op, &f.ctx, &rpc), Ok(Dispatch::Rpc(_))),
+                matches!(dispatch_now(1, op, &f.ctx, &rpc), Ok(Dispatch::Rpc(_))),
                 "window 1 refused {name}"
             );
         }
@@ -2053,7 +2275,7 @@ mod tests {
         let f = fixture("agent-query");
         let rpc = Recorder::default();
         assert!(matches!(
-            dispatch(1, lsp_search("frob", "abc-3-1"), &f.ctx, &rpc),
+            dispatch_now(1, lsp_search("frob", "abc-3-1"), &f.ctx, &rpc),
             Ok(Dispatch::Rpc(_))
         ));
         let calls = rpc.calls();
@@ -2074,7 +2296,7 @@ mod tests {
             session: "s-held".into(),
             stamp: wire.clone(),
         };
-        assert!(matches!(dispatch(1, op, &f.ctx, &rpc), Ok(Dispatch::Rpc(_))));
+        assert!(matches!(dispatch_now(1, op, &f.ctx, &rpc), Ok(Dispatch::Rpc(_))));
         assert_eq!(rpc.calls()[0].0, diagnostics::DIAGNOSTICS_LUA);
         assert_eq!(
             sent_field(&rpc.calls()[0].1, "limit"),
@@ -2101,7 +2323,7 @@ mod tests {
     fn a_file_gone_since_window_2_looked_is_refused_for_a_load() {
         let f = fixture("agent-gone");
         let rpc = Recorder::default();
-        let result = dispatch(1, agent_open("s-held", "src/gone.rs", true, stamp()), &f.ctx, &rpc);
+        let result = dispatch_now(1, agent_open("s-held", "src/gone.rs", true, stamp()), &f.ctx, &rpc);
         assert!(matches!(result, Err(OpRefused::Outside(_))), "{result:?}");
         assert!(rpc.calls().is_empty(), "a refused op reached the editor");
     }
@@ -2111,11 +2333,11 @@ mod tests {
         let f = fixture("agent-root");
         let rpc = Recorder::default();
         assert!(matches!(
-            dispatch(1, agent_state("s-held"), &f.ctx, &rpc),
+            dispatch_now(1, agent_state("s-held"), &f.ctx, &rpc),
             Ok(Dispatch::Rpc(_))
         ));
         assert!(matches!(
-            dispatch(2, agent_diagnostics("s-held", None), &f.ctx, &rpc),
+            dispatch_now(2, agent_diagnostics("s-held", None), &f.ctx, &rpc),
             Ok(Dispatch::Rpc(_))
         ));
         let calls = rpc.calls();
@@ -2145,7 +2367,7 @@ mod tests {
                 limit: 1,
                 stamp: stamp(),
             };
-            let result = dispatch(1, op, &f.ctx, &rpc);
+            let result = dispatch_now(1, op, &f.ctx, &rpc);
             assert!(matches!(result, Err(OpRefused::Outside(_))), "{result:?}");
         }
         assert!(rpc.calls().is_empty(), "a refused op reached the editor");
@@ -2162,7 +2384,7 @@ mod tests {
             limit: u32::MAX,
             stamp: stamp(),
         };
-        assert!(matches!(dispatch(1, op, &f.ctx, &rpc), Ok(Dispatch::Rpc(_))));
+        assert!(matches!(dispatch_now(1, op, &f.ctx, &rpc), Ok(Dispatch::Rpc(_))));
         let limit = rpc.calls()[0].1[1]
             .as_map()
             .unwrap()
@@ -2209,11 +2431,11 @@ mod tests {
         let f = fixture("live-note-refused");
         let rpc = Recorder::default();
         assert_eq!(
-            dispatch(1, live_note("s-other", None, &["src/a.rs"]), &f.ctx, &rpc).unwrap_err(),
+            dispatch_now(1, live_note("s-other", None, &["src/a.rs"]), &f.ctx, &rpc).unwrap_err(),
             OpRefused::SessionNotHeld("s-other".into())
         );
         for path in ["../x", "/etc/passwd", "", "./src/a.rs", "src/../a/b", "a\0b"] {
-            let result = dispatch(1, live_note("s-held", None, &["src/a.rs", path]), &f.ctx, &rpc);
+            let result = dispatch_now(1, live_note("s-held", None, &["src/a.rs", path]), &f.ctx, &rpc);
             assert!(
                 matches!(result, Err(OpRefused::Outside(_))),
                 "a note naming {path:?} was not refused as outside: {result:?}"
@@ -2222,13 +2444,13 @@ mod tests {
         let many: Vec<String> = (0..=MAX_SHOWN_PATHS).map(|n| format!("src/{n}.rs")).collect();
         let many: Vec<&str> = many.iter().map(String::as_str).collect();
         assert!(matches!(
-            dispatch(1, live_note("s-held", None, &many), &f.ctx, &rpc),
+            dispatch_now(1, live_note("s-held", None, &many), &f.ctx, &rpc),
             Err(OpRefused::Outside(_))
         ));
         assert!(rpc.calls().is_empty(), "a refused note reached the editor");
 
         // One batch is what a note may carry; window 1 asks about all of it.
-        let (note, shown) = noted(dispatch(1, live_note("s-held", None, &many[1..]), &f.ctx, &rpc));
+        let (note, shown) = noted(dispatch_now(1, live_note("s-held", None, &many[1..]), &f.ctx, &rpc));
         assert_eq!(note.paths.len(), MAX_SHOWN_PATHS);
         assert!(shown.is_some());
         let calls = rpc.calls();
@@ -2243,7 +2465,7 @@ mod tests {
             hunks: vec![hunk()],
         };
         assert_eq!(
-            dispatch(1, show, &f.ctx, &rpc).unwrap_err(),
+            dispatch_now(1, show, &f.ctx, &rpc).unwrap_err(),
             OpRefused::SessionNotHeld("s-other".into())
         );
         for path in ["../x", "out/passwd", "src/secret.rs", "src/alias.rs", ""] {
@@ -2255,7 +2477,7 @@ mod tests {
             let clear = EditorOp::ReviewLiveClear { path: path.into() };
             for op in [show, clear] {
                 let name = op.name();
-                let result = dispatch(1, op, &f.ctx, &rpc);
+                let result = dispatch_now(1, op, &f.ctx, &rpc);
                 assert!(
                     matches!(result, Err(OpRefused::Outside(_))),
                     "{name} of {path:?} was not refused as outside: {result:?}"
@@ -2269,7 +2491,7 @@ mod tests {
     fn live_note_after_the_end_asks_nothing() {
         let f = fixture("live-note-ended");
         let rpc = Recorder::default();
-        let (note, shown) = noted(dispatch(
+        let (note, shown) = noted(dispatch_now(
             1,
             live_note("s-held", Some(250), &["src/a.rs", "a/b"]),
             &f.ctx,
@@ -2291,7 +2513,7 @@ mod tests {
         );
 
         // While the turn runs the same note asks, and the arguments are window 1's own.
-        let (note, shown) = noted(dispatch(1, live_note("s-held", None, &["src/a.rs"]), &f.ctx, &rpc));
+        let (note, shown) = noted(dispatch_now(1, live_note("s-held", None, &["src/a.rs"]), &f.ctx, &rpc));
         assert!(shown.is_some());
         assert_eq!(note.ended_ns, None);
         let calls = rpc.calls();
@@ -2300,7 +2522,7 @@ mod tests {
         assert_eq!(calls[0].1, live_shown_args(&[f.ctx.root.join("src/a.rs")]));
 
         // A running turn's note with no path has nothing to ask.
-        let (_, shown) = noted(dispatch(1, live_note("s-held", None, &[]), &f.ctx, &rpc));
+        let (_, shown) = noted(dispatch_now(1, live_note("s-held", None, &[]), &f.ctx, &rpc));
         assert!(shown.is_none());
         assert_eq!(rpc.calls().len(), 1);
     }
@@ -2324,7 +2546,7 @@ mod tests {
             "dir with space/\u{4e2d}.rs",
             "new\nline.rs",
         ];
-        let (note, shown) = noted(dispatch(1, live_note("s-held", None, &paths), &ctx, &rpc));
+        let (note, shown) = noted(dispatch_now(1, live_note("s-held", None, &paths), &ctx, &rpc));
         assert!(shown.is_some(), "answered, not refused");
         assert_eq!(
             note.paths,
@@ -2344,7 +2566,7 @@ mod tests {
             hunks: vec![hunk()],
         };
         assert_eq!(
-            overlay(dispatch(5, show, &f.ctx, &rpc)),
+            overlay(dispatch_now(5, show, &f.ctx, &rpc)),
             vec![OverlayCall::LiveShow {
                 path: abs.clone(),
                 meta: LiveMeta::from(live_meta("s-held")),
@@ -2353,7 +2575,7 @@ mod tests {
         );
         // A clear names no session: window 1's driver takes off only a live drawing this window made.
         assert_eq!(
-            overlay(dispatch(
+            overlay(dispatch_now(
                 6,
                 EditorOp::ReviewLiveClear {
                     path: "src/a.rs".into()

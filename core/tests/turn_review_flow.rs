@@ -3675,7 +3675,7 @@ mod live_review {
                             });
                         }
                     }
-                    Ok(Dispatch::Rpc(_)) => {}
+                    Ok(Dispatch::Rpc(_)) | Ok(Dispatch::Check(_)) => {}
                     Err(refused) => {
                         if let Some(answer) = answer {
                             answer.send(Err(RpcError::Nvim(refused.to_string())));

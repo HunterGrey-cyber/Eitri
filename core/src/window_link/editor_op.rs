@@ -108,11 +108,14 @@ pub enum EditorOp {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         select: Option<crate::plugin::protocol::JumpSelect>,
     },
-    /// An already resolved Markdown link, checked again against window 1's project before opening.
+    /// An already resolved Markdown link, checked again against its document's project before opening. A sender
+    /// from before `document` was sent names none; its link is then held to window 1's root.
     PluginOpenLink {
         plugin: String,
         path: String,
         line: Option<u32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        document: Option<String>,
     },
     PluginAssistClear {
         plugin: String,

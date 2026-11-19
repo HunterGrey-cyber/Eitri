@@ -211,6 +211,12 @@ pub enum Msg {
     Keys {
         payload: Value,
     },
+    /// Window 1's editor operations it takes beyond the first set, sent once on each new link: `documents`, that a
+    /// forwarded link may name its document. A window 2 that never hears it (an older window 1) sends what such a
+    /// window takes; an older window 2 refuses the unknown kind and goes on.
+    EditorCaps {
+        documents: bool,
+    },
     EditorOp {
         id: u64,
         op: EditorOp,
@@ -420,6 +426,7 @@ pub const KINDS: &[&str] = &[
     "context",
     "theme",
     "keys",
+    "editor_caps",
     "editor_op",
     "editor_reply",
     "review_events",
@@ -473,6 +480,7 @@ impl Msg {
             Msg::Context { .. } => "context",
             Msg::Theme { .. } => "theme",
             Msg::Keys { .. } => "keys",
+            Msg::EditorCaps { .. } => "editor_caps",
             Msg::EditorOp { .. } => "editor_op",
             Msg::EditorReply { .. } => "editor_reply",
             Msg::ReviewEvents { .. } => "review_events",
@@ -792,6 +800,7 @@ mod tests {
             Msg::Keys {
                 payload: serde_json::json!([]),
             },
+            Msg::EditorCaps { documents: true },
             Msg::EditorOp {
                 id: 1,
                 op: EditorOp::ReviewClearMine {},

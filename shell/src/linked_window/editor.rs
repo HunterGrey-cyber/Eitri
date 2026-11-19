@@ -18,7 +18,8 @@ use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::rc::{Rc, Weak};
-use std::sync::mpsc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{mpsc, Arc};
 use std::time::{Duration, Instant};
 
 use eitri_core::editor_context::{ContextSource, EditorContext};
@@ -33,7 +34,7 @@ use eitri_core::review_editor::OverlayCall;
 use eitri_core::scratch::{EditDone, PendingEdit, ScratchDir, ScratchRequest};
 use eitri_core::tabs::TabId;
 use eitri_core::theme::payload::NvimThemePayload;
-use eitri_core::window_link::editor_ops::{dispatch, Dispatch, LiveNote, OpContext};
+use eitri_core::window_link::editor_ops::{dispatch, CheckedOpen, Dispatch, LiveNote, OpContext, OpRefused, OpenCheck};
 use eitri_core::window_link::names::WindowName;
 use eitri_core::window_link::{DraftEnd, EditorOp, EditorRequest, LinkError, Msg, ReplyResult};
 use eitri_core::wm::PeerId;
@@ -616,6 +617,9 @@ pub type PageRoots = Rc<dyn Fn(&str) -> Option<BTreeMap<String, PathBuf>>>;
 struct HeldPage {
     peer: PeerId,
     roots: BTreeMap<String, PathBuf>,
+    /// Which holding this is: a page that left the window and came back is another page, and an open the earlier
+    /// one asked for is not carried out for it.
+    held: u64,
 }
 
 /// Window 1's side: the feeds told to each linked window, its operations answered and its requests carried out.
@@ -639,6 +643,16 @@ pub struct Window1Editor {
     draft_here: RefCell<Option<DraftHere>>,
     token: RefCell<Option<TokenSource>>,
     inflight: RefCell<Vec<(PeerId, u64, Pending)>>,
+    /// Plugin opens from another window whose file is being checked on a worker: the GTK thread never waits for a
+    /// disk. Oldest first; each asks the editor once its check passes, in the order they came.
+    checking: RefCell<Vec<CheckingOpen>>,
+    /// The one worker those checks run on, started with the first: one thread however many checks a hung disk holds
+    /// up, and a bounded queue in front of it.
+    check_jobs: RefCell<Option<mpsc::SyncSender<CheckJob>>>,
+    /// The checked opens the editor was asked and has not answered: the next is asked only after them.
+    opening: RefCell<Vec<(PeerId, u64)>>,
+    /// The last `HeldPage::held` given out.
+    holdings: Cell<u64>,
     /// Window 1's own scratch directory, under which window 2's drafts get one of their own: the editor-context
     /// feed already leaves out every buffer under it.
     scratch_parent: Option<PathBuf>,
@@ -650,6 +664,48 @@ pub struct Window1Editor {
     /// The generation the next link gets (`LinkState::generation`).
     link_generations: Cell<u64>,
     polling: Cell<bool>,
+}
+
+/// A plugin open another window sent, its file being checked on a worker thread.
+/// The most plugin opens waiting for the check worker; one more is refused at once.
+const CHECK_QUEUE: usize = 8;
+
+/// How long window 1 waits for a check: under the asking window's own [`OP_DEADLINE`], which started when that window
+/// sent the op, so a check done in time here still leaves the delivery and the editor's answer room inside it.
+const CHECK_DEADLINE: Duration = Duration::from_millis(OP_DEADLINE.as_millis() as u64 / 2);
+
+/// A check for the worker: skipped once nobody waits for it (`wanted` cleared) or its deadline has passed, so checks
+/// already given up do not hold up the ones behind them on a hung disk.
+struct CheckJob {
+    check: OpenCheck,
+    until: Instant,
+    wanted: Arc<AtomicBool>,
+    answer: mpsc::Sender<Result<CheckedOpen, OpRefused>>,
+}
+
+struct CheckingOpen {
+    peer: PeerId,
+    id: u64,
+    /// The plugin whose page asked, which that window must still hold when the check is done.
+    plugin: String,
+    /// The holding of the page that asked (`HeldPage::held`).
+    held: u64,
+    /// The editor the op came in for, and the session it was running: if either was replaced meanwhile, the new one
+    /// is not asked on the old one's behalf.
+    rpc: Rc<dyn EditorRpc>,
+    session: Option<u64>,
+    /// Cleared when this entry goes, answered or not: the worker then skips the check if it has not started it.
+    wanted: Arc<AtomicBool>,
+    rx: mpsc::Receiver<Result<CheckedOpen, OpRefused>>,
+    /// [`CHECK_DEADLINE`] after it came; a check stuck on a hung disk is then answered and forgotten, so polling
+    /// stops, and the worker's late answer goes nowhere.
+    until: Instant,
+}
+
+impl Drop for CheckingOpen {
+    fn drop(&mut self) {
+        self.wanted.store(false, Ordering::Relaxed);
+    }
 }
 
 /// A view another window sent, its file being written on a worker thread: a view's text may be a megabyte, and
@@ -685,6 +741,10 @@ impl Window1Editor {
             draft_here: RefCell::default(),
             token: RefCell::default(),
             inflight: RefCell::default(),
+            checking: RefCell::default(),
+            check_jobs: RefCell::default(),
+            opening: RefCell::default(),
+            holdings: Cell::new(0),
             scratch_parent,
             scratch: RefCell::default(),
             drafts: RefCell::default(),
@@ -740,9 +800,27 @@ impl Window1Editor {
     pub fn set_plugin_in_window(&self, owner: &str, peer: Option<PeerId>, roots: Option<BTreeMap<String, PathBuf>>) {
         let mut plugins = self.plugins.borrow_mut();
         match (peer, roots) {
-            (Some(peer), Some(roots)) => plugins.insert(owner.to_owned(), HeldPage { peer, roots }),
+            (Some(peer), Some(roots)) => {
+                // The same window re-registering the same roots keeps the holding; other roots are another one, and
+                // an open checked against the old roots opens nothing.
+                let held = match plugins.get(owner) {
+                    Some(page) if page.peer == peer && page.roots == roots => page.held,
+                    _ => {
+                        self.holdings.set(self.holdings.get() + 1);
+                        self.holdings.get()
+                    }
+                };
+                plugins.insert(owner.to_owned(), HeldPage { peer, roots, held })
+            }
             _ => plugins.remove(owner),
         };
+        // A check the page's earlier holding asked for will open nothing: the worker need not start it.
+        let held = plugins.get(owner).map(|page| page.held);
+        for check in self.checking.borrow().iter() {
+            if check.plugin == owner && Some(check.held) != held {
+                check.wanted.store(false, Ordering::Relaxed);
+            }
+        }
     }
 
     /// Where the roots of a page window's plugin come from, when that window links.
@@ -888,6 +966,8 @@ impl Window1Editor {
                 generation,
             },
         );
+        // Ahead of the feeds: window 2 may forward a link the moment it hears them.
+        self.send(peer, Msg::EditorCaps { documents: true });
         for msg in heard {
             self.send(peer, msg);
         }
@@ -901,6 +981,8 @@ impl Window1Editor {
         self.links.borrow_mut().remove(&peer);
         self.plugins.borrow_mut().retain(|_, page| page.peer != peer);
         self.inflight.borrow_mut().retain(|(asking, ..)| *asking != peer);
+        self.checking.borrow_mut().retain(|check| check.peer != peer);
+        self.opening.borrow_mut().retain(|(asking, _)| *asking != peer);
     }
 
     /// The owners whose follow lines go to another window.
@@ -946,6 +1028,42 @@ impl Window1Editor {
             Ok(Dispatch::Rpc(pending)) => {
                 self.inflight.borrow_mut().push((peer, id, pending));
                 self.poll_soon();
+            }
+            Ok(Dispatch::Check(check)) => {
+                let plugin = check.plugin().to_owned();
+                let held = self.plugins.borrow().get(&plugin).map_or(0, |page| page.held);
+                let (tx, rx) = mpsc::channel();
+                let wanted = Arc::new(AtomicBool::new(true));
+                let until = Instant::now() + CHECK_DEADLINE;
+                let job = CheckJob {
+                    check,
+                    until,
+                    wanted: wanted.clone(),
+                    answer: tx,
+                };
+                let queued = if self.checking.borrow().len() >= CHECK_QUEUE {
+                    Err("too many file checks are waiting".to_string())
+                } else {
+                    self.queue_check(job)
+                };
+                match queued {
+                    Ok(()) => {
+                        let session = rpc.target();
+                        self.checking.borrow_mut().push(CheckingOpen {
+                            peer,
+                            id,
+                            plugin,
+                            held,
+                            rpc,
+                            session,
+                            wanted,
+                            rx,
+                            until,
+                        });
+                        self.poll_soon();
+                    }
+                    Err(why) => self.reply(peer, id, ReplyResult::Err { why }),
+                }
             }
             Ok(Dispatch::Overlay(calls)) => {
                 let hook = self.overlay.borrow().clone();
@@ -1114,6 +1232,7 @@ impl Window1Editor {
     /// Answers every operation whose editor call came back and routes every draft written back. Whether anything
     /// is still out.
     pub fn poll(&self) -> bool {
+        self.poll_checks();
         let answered: Vec<(PeerId, u64, ReplyResult)> = {
             let mut inflight = self.inflight.borrow_mut();
             let mut answered = Vec::new();
@@ -1134,8 +1253,11 @@ impl Window1Editor {
             answered
         };
         for (peer, id, result) in answered {
+            self.opening.borrow_mut().retain(|open| *open != (peer, id));
             self.reply(peer, id, result);
         }
+        // An answered checked open lets the next one go to the editor.
+        self.poll_checks();
         let done: Vec<(OutDraft, EditDone)> = {
             let mut drafts = self.drafts.borrow_mut();
             let mut done = Vec::new();
@@ -1153,7 +1275,123 @@ impl Window1Editor {
             self.draft_written(draft, result);
         }
         self.show_written_views();
-        !self.inflight.borrow().is_empty() || !self.drafts.borrow().is_empty() || !self.views.borrow().is_empty()
+        !self.inflight.borrow().is_empty()
+            || !self.checking.borrow().is_empty()
+            || !self.drafts.borrow().is_empty()
+            || !self.views.borrow().is_empty()
+    }
+
+    /// Answers every open past its deadline, its check done or not, with `why`, and forgets it.
+    fn expire_checks(&self, why: &str) {
+        let now = Instant::now();
+        let expired: Vec<CheckingOpen> = {
+            let mut checking = self.checking.borrow_mut();
+            let (gone, kept) = std::mem::take(&mut *checking)
+                .into_iter()
+                .partition(|check| now >= check.until);
+            *checking = kept;
+            gone
+        };
+        for check in expired {
+            self.reply(check.peer, check.id, ReplyResult::Err { why: why.to_owned() });
+        }
+    }
+
+    /// Hands `check` to the check worker, starting it the first time.
+    fn queue_check(&self, job: CheckJob) -> Result<(), String> {
+        let mut jobs = self.check_jobs.borrow_mut();
+        if jobs.is_none() {
+            let (tx, rx) = mpsc::sync_channel::<CheckJob>(CHECK_QUEUE);
+            std::thread::Builder::new()
+                .name("linked open checks".into())
+                .spawn(move || {
+                    // Ends when the window drops its sender. An answer whose receiver is gone goes nowhere.
+                    for job in rx {
+                        if !job.wanted.load(Ordering::Relaxed) || Instant::now() >= job.until {
+                            continue;
+                        }
+                        let _ = job.answer.send(job.check.run());
+                    }
+                })
+                .map_err(|e| format!("the file could not be checked: {e}"))?;
+            *jobs = Some(tx);
+        }
+        match jobs.as_ref().expect("started above").try_send(job) {
+            Ok(()) => Ok(()),
+            Err(mpsc::TrySendError::Full(_)) => Err("too many file checks are waiting".into()),
+            Err(mpsc::TrySendError::Disconnected(_)) => {
+                *jobs = None;
+                Err("the file checks stopped".into())
+            }
+        }
+    }
+
+    /// Hands the editor each plugin open whose check passed, oldest first and never one before an older one still
+    /// being checked (the editor ends on the file asked for last), and answers each refused one. A check done after
+    /// the asking window gave up, for a page that window no longer holds, or for an editor since replaced opens
+    /// nothing.
+    fn poll_checks(&self) {
+        loop {
+            // The editor takes one checked open at a time, so two cannot overtake each other on its link; while one
+            // is out, the checks behind it still run out their time and are answered.
+            if !self.opening.borrow().is_empty() {
+                self.expire_checks("an earlier open is still waiting for the editor");
+                return;
+            }
+            let (check, result) = {
+                let mut checking = self.checking.borrow_mut();
+                let Some(first) = checking.first() else { return };
+                let now = Instant::now();
+                let result = match first.rx.try_recv() {
+                    Ok(_) if now >= first.until => {
+                        Err(OpRefused::Outside("the file check did not finish in time".into()))
+                    }
+                    Ok(result) => result,
+                    Err(mpsc::TryRecvError::Empty) if now < first.until => return,
+                    Err(mpsc::TryRecvError::Empty) => {
+                        Err(OpRefused::Outside("the file check did not finish in time".into()))
+                    }
+                    Err(mpsc::TryRecvError::Disconnected) => Err(OpRefused::Outside("the file check stopped".into())),
+                };
+                (checking.remove(0), result)
+            };
+            let result = result.and_then(|checked| {
+                let ctx = Ctx {
+                    one: self,
+                    peer: check.peer,
+                };
+                let held_now = self.plugins.borrow().get(&check.plugin).map(|page| page.held);
+                if ctx.plugin_roots_in_window2(&check.plugin).is_none() || held_now != Some(check.held) {
+                    return Err(OpRefused::PluginNotHeld(check.plugin.clone()));
+                }
+                let current = self.rpc.borrow().clone();
+                let same = current.is_some_and(|current| Rc::ptr_eq(&current, &check.rpc));
+                if !same || check.rpc.target() != check.session {
+                    return Err(OpRefused::Outside("the editor restarted".into()));
+                }
+                Ok(checked)
+            });
+            match result {
+                Ok(checked) => {
+                    let pending = checked.open(&*check.rpc);
+                    self.opening.borrow_mut().push((check.peer, check.id));
+                    self.inflight.borrow_mut().push((check.peer, check.id, pending));
+                }
+                Err(refused) => {
+                    println!(
+                        "[link] {}'s plugin_open was refused: {refused}",
+                        self.window_text(check.peer)
+                    );
+                    self.reply(
+                        check.peer,
+                        check.id,
+                        ReplyResult::Err {
+                            why: refused.to_string(),
+                        },
+                    );
+                }
+            }
+        }
     }
 
     /// Hands the editor each view whose file is written, in the order the views came: one written early waits for
@@ -1291,6 +1529,8 @@ pub struct EditorOps {
     next: Cell<u64>,
     waiting: RefCell<BTreeMap<u64, (Answer, Instant)>>,
     expiring: Cell<bool>,
+    /// Whether this link's window 1 said it takes a link's document (`editor_caps`); false until it says so.
+    takes_documents: Cell<bool>,
 }
 
 impl EditorOps {
@@ -1302,7 +1542,13 @@ impl EditorOps {
             next: Cell::new(1),
             waiting: RefCell::default(),
             expiring: Cell::new(false),
+            takes_documents: Cell::new(false),
         })
+    }
+
+    /// Whether the window 1 of the current link takes a forwarded link's document.
+    pub fn takes_documents(&self) -> bool {
+        self.takes_documents.get()
     }
 
     pub fn send(&self, op: EditorOp) -> Pending {
@@ -1392,16 +1638,25 @@ impl EditorOps {
 
     fn linked(&self, link: &LinkDriver) {
         *self.link.borrow_mut() = Some(link.clone());
+        // A new link's window 1 takes only the first set until it says otherwise.
+        self.takes_documents.set(false);
         let me = self.me.clone();
         link.on("editor_reply", move |_, msg, _| {
             if let (Some(me), Msg::EditorReply { id, result }) = (me.upgrade(), msg) {
                 me.answered(id, result);
             }
         });
+        let me = self.me.clone();
+        link.on("editor_caps", move |_, msg, _| {
+            if let (Some(me), Msg::EditorCaps { documents }) = (me.upgrade(), msg) {
+                me.takes_documents.set(documents);
+            }
+        });
     }
 
     fn unlinked(&self) {
         self.link.borrow_mut().take();
+        self.takes_documents.set(false);
         let waiting = std::mem::take(&mut *self.waiting.borrow_mut());
         for (_, (answer, _)) in waiting {
             answer.send(Err(RpcError::Unavailable(UNLINKED_NOTE.into())));
@@ -1467,6 +1722,29 @@ impl PluginEditorRpc {
                 .or_else(|| value.as_str().map(str::as_bytes))
                 .ok_or("invalid path")?;
             let path = std::str::from_utf8(bytes).map_err(|e| e.to_string())?;
+            // A document whose name is not UTF-8 cannot go on the wire: its link goes without it, held to the root.
+            let document = get("document")
+                .and_then(|value| value.as_slice().or_else(|| value.as_str().map(str::as_bytes)))
+                .and_then(|bytes| std::str::from_utf8(bytes).ok())
+                .map(str::to_owned);
+            // A document's link is held to that document's project, even when it lies under a declared root too,
+            // by a window 1 that said it takes the document. One that did not (an older one, whose ops have a closed
+            // set of fields) is sent what it took before: a file under a declared root as a page's open, any other
+            // link without its document, held to the root both windows share.
+            let link = document.is_some() || get("link").and_then(rmpv::Value::as_bool) == Some(true);
+            let (link, document) = if self.ops.takes_documents() {
+                (link, document)
+            } else {
+                (false, None)
+            };
+            if link {
+                return Ok(EditorOp::PluginOpenLink {
+                    plugin,
+                    path: path.into(),
+                    line: line()?,
+                    document,
+                });
+            }
             if let Some((name, root)) = self.roots.iter().find(|(_, root)| Path::new(path).starts_with(root)) {
                 let path = Path::new(path)
                     .strip_prefix(root)
@@ -1490,6 +1768,7 @@ impl PluginEditorRpc {
                 plugin,
                 path: path.into(),
                 line: line()?,
+                document,
             });
         }
         if std::ptr::eq(code, PLUGIN_ASSIST_LUA) {
@@ -2778,9 +3057,24 @@ mod tests {
     }
 
     /// Records every Lua call and answers each with a value of its own.
+    /// Keeps every call's chunk and arguments and answers none.
+    #[derive(Default)]
+    struct Recording(RefCell<Vec<(&'static str, Vec<rmpv::Value>)>>);
+
+    impl EditorRpc for Recording {
+        fn exec_lua(&self, code: &'static str, args: Vec<rmpv::Value>) -> Pending {
+            self.0.borrow_mut().push((code, args));
+            Pending::pair().1
+        }
+        fn target(&self) -> Option<u64> {
+            Some(1)
+        }
+    }
+
     struct Answering {
         calls: RefCell<Vec<&'static str>>,
         answer: rmpv::Value,
+        session: Cell<u64>,
     }
 
     impl EditorRpc for Answering {
@@ -2791,7 +3085,7 @@ mod tests {
             pending
         }
         fn target(&self) -> Option<u64> {
-            Some(1)
+            Some(self.session.get())
         }
     }
 
@@ -2876,6 +3170,7 @@ mod tests {
         let rpc = Rc::new(Answering {
             calls: RefCell::default(),
             answer: rmpv::Value::Nil,
+            session: Cell::new(1),
         });
         w.one.set_rpc(rpc.clone());
         // Give window 1 a valid holding: a refusal must come from the missing operation itself.
@@ -2992,6 +3287,7 @@ mod tests {
         let rpc = Rc::new(Answering {
             calls: RefCell::default(),
             answer: rmpv::Value::from(true),
+            session: Cell::new(1),
         });
         w.one.set_rpc(rpc.clone());
         let proxy = PluginEditorRpc::new(
@@ -3043,9 +3339,188 @@ mod tests {
             assert!(got.into_inner().unwrap().is_ok());
         }
         assert_eq!(rpc.calls.borrow().len(), 10);
-        assert!(rpc.calls.borrow()[3..]
-            .iter()
-            .all(|code| std::ptr::eq(*code, editor::PLUGIN_FOLLOW_LUA)));
+        // The open asks the editor only once its file is checked on a worker, so it can come after the calls sent
+        // behind it.
+        let count = |chunk: &'static str| {
+            rpc.calls
+                .borrow()
+                .iter()
+                .filter(|code| std::ptr::eq(**code, chunk))
+                .count()
+        };
+        assert_eq!(count(editor::PLUGIN_OPEN_LUA), 1);
+        assert_eq!(count(editor::PLUGIN_FOLLOW_LUA), 7);
+    }
+
+    #[test]
+    fn a_link_window_2_forwards_opens_in_window_1_against_its_documents_project() {
+        use eitri_core::plugin::{editor, roots::Roots};
+        let w = windows("plugin-link");
+        w.one.set_plugin_in_window(
+            "markdown",
+            Some(SECOND_PEER),
+            Some(BTreeMap::from([("work".into(), w.root.join("src"))])),
+        );
+        let rpc = Rc::new(Answering {
+            calls: RefCell::default(),
+            answer: rmpv::Value::from(true),
+            session: Cell::new(1),
+        });
+        w.one.set_rpc(rpc.clone());
+        let proxy = PluginEditorRpc::new(
+            "markdown".into(),
+            Roots::new(BTreeMap::from([("work".into(), w.root.join("src"))])),
+            w.two.ops(),
+        );
+        // A document of another repository beside the project, and a file of it its link resolved to.
+        let other = w.root.parent().unwrap().join("other");
+        std::fs::create_dir_all(other.join(".git")).unwrap();
+        std::fs::write(other.join("doc.md"), "[x](x.rs)\n").unwrap();
+        std::fs::write(other.join("x.rs"), "x\n").unwrap();
+        std::fs::write(w.root.join("README.md"), "readme\n").unwrap();
+        let answer = |request: Pending| {
+            let got = RefCell::new(None);
+            assert!(w.settle(|| {
+                if got.borrow().is_none() {
+                    *got.borrow_mut() = request.try_take();
+                }
+                got.borrow().is_some()
+            }));
+            got.into_inner().unwrap()
+        };
+        let doc = other.join("doc.md");
+        assert!(
+            w.settle(|| w.two.ops().takes_documents()),
+            "window 1 says it takes a link's document"
+        );
+        assert!(answer(editor::open_link(&proxy, &other.join("x.rs"), Some(1), Some(&doc))).is_ok());
+        assert_eq!(rpc.calls.borrow().len(), 1);
+        // The window's own project is not that document's.
+        let refused = answer(editor::open_link(&proxy, &w.root.join("README.md"), None, Some(&doc)));
+        assert!(refused.is_err(), "{refused:?}");
+        assert_eq!(rpc.calls.borrow().len(), 1);
+    }
+
+    #[test]
+    fn a_checked_plugin_open_asks_the_editor_only_while_its_page_and_its_editor_stay() {
+        let answering = || {
+            Rc::new(Answering {
+                calls: RefCell::default(),
+                answer: rmpv::Value::from(true),
+                session: Cell::new(1),
+            })
+        };
+        for gone in ["nothing", "page", "page-back", "page-roots", "editor", "session"] {
+            let w = windows(&format!("open-gone-{gone}"));
+            let roots = BTreeMap::from([("work".to_string(), w.root.join("src"))]);
+            w.one.set_plugin_in_window("markdown", Some(SECOND_PEER), Some(roots));
+            let first = answering();
+            w.one.set_rpc(first.clone());
+            let op = EditorOp::PluginOpen {
+                plugin: "markdown".into(),
+                root: "work".into(),
+                path: "a.rs".into(),
+                line: None,
+                col: None,
+            };
+            // Taken in and handed to the check worker; nothing is asked before the check is collected.
+            w.one.op(SECOND_PEER, 7, op);
+            assert_eq!(w.one.checking.borrow().len(), 1);
+            let second = answering();
+            match gone {
+                "page" => w.one.set_plugin_in_window("markdown", None, None),
+                "page-back" => {
+                    // Away to this window and back over the same link: another page asks now.
+                    w.one.set_plugin_in_window("markdown", None, None);
+                    let roots = BTreeMap::from([("work".to_string(), w.root.join("src"))]);
+                    w.one.set_plugin_in_window("markdown", Some(SECOND_PEER), Some(roots));
+                }
+                "page-roots" => {
+                    let roots = BTreeMap::from([("work".to_string(), w.root.clone())]);
+                    w.one.set_plugin_in_window("markdown", Some(SECOND_PEER), Some(roots));
+                }
+                "editor" => w.one.set_rpc(second.clone()),
+                "nothing" => {}
+                // The same editor object, a new nvim behind it.
+                _ => first.session.set(2),
+            }
+            assert!(w.settle(|| w.one.checking.borrow().is_empty()));
+            if gone == "nothing" {
+                assert_eq!(
+                    first.calls.borrow().len(),
+                    1,
+                    "the editor is asked once the check passes"
+                );
+                continue;
+            }
+            assert!(first.calls.borrow().is_empty(), "{gone}: the old editor was asked");
+            assert!(second.calls.borrow().is_empty(), "{gone}: the new editor was asked");
+        }
+    }
+
+    #[test]
+    fn a_document_link_goes_as_a_link_with_its_document_only_to_a_window_1_that_takes_it() {
+        use eitri_core::plugin::{editor, roots::Roots};
+        let w = windows("link-under-root");
+        let proxy = PluginEditorRpc::new(
+            "markdown".into(),
+            Roots::new(BTreeMap::from([("work".into(), w.root.clone())])),
+            w.two.ops(),
+        );
+        let target = w.root.join("src/a.rs");
+        let doc = w.root.join("doc.md");
+        let calls = Rc::new(Recording::default());
+        editor::open_link(&*calls, &target, Some(3), Some(&doc));
+        let (code, args) = calls.0.borrow()[0].clone();
+        // Before window 1 said it takes the document (an older window 1 never does): what main sent, a file under a
+        // declared root as a page's open, and no field such a window 1 does not know.
+        assert!(!w.two.ops().takes_documents());
+        let before = proxy.operation(code, &args).unwrap();
+        assert_eq!(
+            before,
+            EditorOp::PluginOpen {
+                plugin: "markdown".into(),
+                root: "work".into(),
+                path: "src/a.rs".into(),
+                line: Some(3),
+                col: None,
+            }
+        );
+        let outside = w.root.parent().unwrap().join("x.rs");
+        let calls = Rc::new(Recording::default());
+        editor::open_link(&*calls, &outside, None, Some(&doc));
+        let (code_out, args_out) = calls.0.borrow()[0].clone();
+        let wire = serde_json::to_value(proxy.operation(code_out, &args_out).unwrap()).unwrap();
+        assert_eq!(wire["op"], "plugin_open_link");
+        assert!(wire.get("document").is_none(), "{wire}");
+        // Once it has said so, the link goes as a link, with its document.
+        assert!(w.settle(|| w.two.ops().takes_documents()));
+        // A document whose name is not UTF-8 cannot go on the wire; its link still goes, without it.
+        let latin1 = Path::new(<std::ffi::OsStr as std::os::unix::ffi::OsStrExt>::from_bytes(
+            b"/doc/caf\xe9.md",
+        ))
+        .to_path_buf();
+        let calls = Rc::new(Recording::default());
+        editor::open_link(&*calls, &target, None, Some(&latin1));
+        let (code_l1, args_l1) = calls.0.borrow()[0].clone();
+        assert_eq!(
+            proxy.operation(code_l1, &args_l1).unwrap(),
+            EditorOp::PluginOpenLink {
+                plugin: "markdown".into(),
+                path: target.to_str().unwrap().into(),
+                line: None,
+                document: None,
+            }
+        );
+        assert_eq!(
+            proxy.operation(code, &args).unwrap(),
+            EditorOp::PluginOpenLink {
+                plugin: "markdown".into(),
+                path: target.to_str().unwrap().into(),
+                line: Some(3),
+                document: Some(doc.to_str().unwrap().into()),
+            }
+        );
     }
 
     #[test]
@@ -3054,6 +3529,7 @@ mod tests {
         let rpc = Rc::new(Answering {
             calls: RefCell::default(),
             answer: buffer_state_answer(),
+            session: Cell::new(1),
         });
         w.one.set_rpc(rpc.clone());
         let ops = w.two.ops();
@@ -3106,6 +3582,7 @@ mod tests {
         let nil = Rc::new(Answering {
             calls: RefCell::default(),
             answer: rmpv::Value::Nil,
+            session: Cell::new(1),
         });
         w.one.set_rpc(nil);
         let asked = ops.send(EditorOp::BufferState {
@@ -4372,6 +4849,7 @@ mod tests {
         let rpc = Rc::new(Answering {
             calls: RefCell::default(),
             answer: rmpv::Value::Nil,
+            session: Cell::new(1),
         });
         g.one.set_rpc(rpc.clone());
         let roots = g.roots();
@@ -4455,6 +4933,7 @@ mod tests {
         let rpc = Rc::new(Answering {
             calls: RefCell::default(),
             answer: rmpv::Value::Nil,
+            session: Cell::new(1),
         });
         g.one.set_rpc(rpc.clone());
         let (a, b) = (g.link(A, WindowName::Chat(1)), g.link(B, WindowName::Chat(2)));

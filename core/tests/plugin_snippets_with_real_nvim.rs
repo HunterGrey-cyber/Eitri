@@ -501,6 +501,100 @@ fn open_refuses_a_checked_file_replaced_by_a_symlink() {
     assert_eq!(field(&opened, "how").as_str(), Some("edit"));
 }
 
+/// Writes a line into the FIFO at `path` once something opens it for reading, trying for `for_how_long`: an editor
+/// that reads the FIFO is let go again instead of hanging the test, and reads what this wrote.
+fn release_a_fifo_reader(path: &Path, for_how_long: Duration) -> std::thread::JoinHandle<bool> {
+    let name = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+    std::thread::spawn(move || {
+        let deadline = std::time::Instant::now() + for_how_long;
+        while std::time::Instant::now() < deadline {
+            // SAFETY: `name` is a terminated path in the test's own scratch directory; the descriptor is closed below.
+            let fd = unsafe { libc::open(name.as_ptr(), libc::O_WRONLY | libc::O_NONBLOCK) };
+            if fd >= 0 {
+                // SAFETY: `fd` was just opened for writing and is written once, then closed.
+                unsafe {
+                    libc::write(fd, b"x\n".as_ptr().cast(), 2);
+                    libc::close(fd);
+                }
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        false
+    })
+}
+
+#[test]
+#[ignore = "needs a real nvim on PATH; spends no tokens and needs no display"]
+fn open_refuses_a_checked_file_replaced_by_a_fifo_and_the_editor_stays_responsive() {
+    let mut c = case("open-fifo");
+    let (a, b) = (c.a.clone(), c.b.clone());
+    std::fs::remove_file(&a).unwrap();
+    let name = std::ffi::CString::new(a.as_os_str().as_bytes()).unwrap();
+    // SAFETY: `name` is a terminated path in this test's private scratch directory.
+    assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+    let writer = release_a_fifo_reader(&a, Duration::from_secs(3));
+    let answer = c.nvim.lua(
+        "local code, path = ... local ok, err = pcall(function() return assert(loadstring(code))({ path = path }) end) \
+         return { ok, tostring(err) }",
+        vec![PLUGIN_OPEN_LUA.into(), s(&a)],
+    );
+    let answer = answer.as_array().unwrap();
+    assert_eq!(answer[0], Value::from(false), "a FIFO is not opened: {answer:?}");
+    assert!(answer[1].as_str().unwrap().contains("not a regular file"), "{answer:?}");
+    assert!(!writer.join().unwrap(), "nothing opened the FIFO for reading");
+    assert_eq!(c.nvim.eval("1 + 1"), Value::from(2));
+    let names = c.nvim.lua(
+        "local names = {} for _, b in ipairs(vim.api.nvim_list_bufs()) do names[#names + 1] = vim.api.nvim_buf_get_name(b) end return names",
+        vec![],
+    );
+    assert!(!names.as_array().unwrap().contains(&s(&a)));
+    let opened = c.nvim.lua(PLUGIN_OPEN_LUA, vec![opts_map(&[("path", s(&b))])]);
+    assert_eq!(field(&opened, "how").as_str(), Some("edit"));
+}
+
+#[test]
+#[ignore = "needs a real nvim on PATH; spends no tokens and needs no display"]
+fn open_from_a_terminal_window_splits_and_the_terminal_keeps_its_window() {
+    let mut c = case("open-terminal");
+    let b = c.b.clone();
+    // A terminal buffer with no process behind it: nothing runs on the test's machine.
+    let terminal = c.nvim.lua(
+        "vim.api.nvim_open_term(0, {}) return vim.api.nvim_get_current_buf()",
+        vec![],
+    );
+    let opened = c.nvim.lua(PLUGIN_OPEN_LUA, vec![opts_map(&[("path", s(&b))])]);
+    assert_eq!(field(&opened, "how").as_str(), Some("split"));
+    assert_eq!(c.nvim.lua("return #vim.api.nvim_list_wins()", vec![]), Value::from(2));
+    assert_eq!(
+        c.nvim.lua("return #vim.fn.win_findbuf(...)", vec![terminal]),
+        Value::from(1),
+        "the terminal keeps its window"
+    );
+}
+
+#[test]
+#[ignore = "needs a real nvim on PATH; spends no tokens and needs no display"]
+fn open_from_a_scratch_window_splits_and_the_scratch_text_stays() {
+    let mut c = case("open-scratch");
+    let b = c.b.clone();
+    // A plugin's scratch buffer that is wiped once hidden: an :edit over it would lose its text.
+    let scratch = c.nvim.lua(
+        "vim.bo.buftype = 'nofile' vim.bo.bufhidden = 'wipe' \
+         vim.api.nvim_buf_set_lines(0, 0, -1, false, { 'notes' }) return vim.api.nvim_get_current_buf()",
+        vec![],
+    );
+    let opened = c.nvim.lua(PLUGIN_OPEN_LUA, vec![opts_map(&[("path", s(&b))])]);
+    assert_eq!(field(&opened, "how").as_str(), Some("split"));
+    assert_eq!(
+        c.nvim.lua(
+            "local b = ... return vim.api.nvim_buf_is_valid(b) and vim.api.nvim_buf_get_lines(b, 0, -1, false)[1] or ''",
+            vec![scratch],
+        ),
+        Value::from("notes")
+    );
+}
+
 #[test]
 #[ignore = "needs a real nvim on PATH; spends no tokens and needs no display"]
 fn open_checks_the_edited_buffer_and_wipes_only_a_new_buffer() {
@@ -3010,6 +3104,26 @@ fn editor_open_from_an_owners_diff_tab_opens_in_its_origin_tab() {
             .lua("local t = ... return #vim.api.nvim_tabpage_list_wins(t)", vec![tab]),
         Value::from(2)
     );
+}
+
+#[test]
+#[ignore = "needs real nvim; no display or tokens"]
+fn a_refused_open_from_an_owners_diff_tab_leaves_the_person_in_that_tab() {
+    let mut c = case("diff-open-refused");
+    let (a, b, outside) = (c.a.clone(), c.b.clone(), c.outside.clone());
+    let tab = field(&diff_sides(&mut c, text_side(), file_side(&a)), "tab").clone();
+    // The file passes the first check and becomes a link to a file outside while nvim reads it.
+    c.nvim.lua(
+        "local path, target = ... vim.api.nvim_create_autocmd('BufReadPost', { once = true, callback = function() \
+           local uv = vim.uv or vim.loop assert(uv.fs_unlink(path)) assert(uv.fs_symlink(target, path)) end })",
+        vec![s(&b), s(&outside)],
+    );
+    let refused = c.nvim.lua(
+        "local code, path = ... return pcall(function() return assert(loadstring(code))({ owner = 'demo', path = path }) end)",
+        vec![PLUGIN_OPEN_LUA.into(), s(&b)],
+    );
+    assert_eq!(refused, Value::from(false));
+    assert_eq!(c.nvim.lua("return vim.api.nvim_get_current_tabpage()", vec![]), tab);
 }
 
 #[test]

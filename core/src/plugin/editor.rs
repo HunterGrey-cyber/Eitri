@@ -57,7 +57,8 @@ if registry then __takeover_adopt('cwd:' .. opts.owner, function()
 end) end
 "#
 );
-pub static PLUGIN_OPEN_LUA: &str = include_str!("plugin_open.lua");
+/// Starts with [`crate::editor_open::OPEN_CHECKED_LUA`], as `EDITOR_OPEN_LUA` does: the same checks and edit.
+pub static PLUGIN_OPEN_LUA: &str = concat!(include_str!("../open_checked.lua"), include_str!("plugin_open.lua"));
 pub static PLUGIN_ASSIST_LUA: &str = crate::editor_rpc::takeover_chunk!(
     include_str!("plugin_assist.lua"),
     r#"
@@ -102,6 +103,25 @@ pub fn open_owned(rpc: &dyn EditorRpc, owner: &str, path: &Path, line: Option<u3
     }
     if let Some(col) = col {
         opts.push((Value::from("col"), Value::from(col)));
+    }
+    rpc.exec_lua(PLUGIN_OPEN_LUA, vec![Value::Map(opts)])
+}
+
+/// A document's link, already checked to be a regular file of the document's project. `document`, when given, goes
+/// along for a linked window that opens it in its own editor and checks it again against that project; the snippet
+/// does not read it. `link` marks it as a link for a window that forwards the call: it goes over as a link, never as
+/// a page's open of a file in its roots.
+pub fn open_link(rpc: &dyn EditorRpc, path: &Path, line: Option<u32>, document: Option<&Path>) -> Pending {
+    let mut opts = vec![
+        (Value::from("path"), path_value(path)),
+        (Value::from("owner"), Value::from("")),
+        (Value::from("link"), Value::from(true)),
+    ];
+    if let Some(document) = document {
+        opts.push((Value::from("document"), path_value(document)));
+    }
+    if let Some(line) = line {
+        opts.push((Value::from("line"), Value::from(line)));
     }
     rpc.exec_lua(PLUGIN_OPEN_LUA, vec![Value::Map(opts)])
 }
