@@ -72,36 +72,64 @@ async fn route(serving: Arc<Serving>, request: http::Request<Body>) -> Result<ht
     let (parts, mut body) = response.into_parts();
     let mut frames = Vec::new();
     let mut bytes = Vec::new();
-    let mut success = parts.headers.get("grpc-status").is_none_or(|status| status == "0");
+    let mut overflow = false;
+    let mut status_ok = parts.headers.get("grpc-status").is_none_or(|status| status == "0");
     while let Some(frame) = body.frame().await {
         let frame = frame.map_err(unavailable)?;
         if let Some(data) = frame.data_ref() {
-            if success && bytes.len().saturating_add(data.len()) <= 4 * 1024 * 1024 + 5 {
+            if !overflow && bytes.len().saturating_add(data.len()) <= 4 * 1024 * 1024 + 5 {
                 bytes.extend_from_slice(data);
             } else {
-                success = false;
+                overflow = true;
                 bytes.clear();
             }
         }
         if let Some(trailers) = frame.trailers_ref() {
-            success &= trailers.get("grpc-status").is_some_and(|status| status == "0");
+            status_ok &= trailers.get("grpc-status").is_some_and(|status| status == "0");
         }
         frames.push(Ok::<_, Status>(frame));
     }
-    if success && bytes.len() >= 5 && bytes[0] == 0 {
-        let length = u32::from_be_bytes(bytes[1..5].try_into().expect("frame length")) as usize;
-        if bytes.len() == length + 5 {
-            if let Ok(created) = CreateSessionResponse::decode(&bytes[5..]) {
-                // A failure is audited by `observe` and answers this session's watches with a retryable refusal
-                // until a maintenance pass observes it; the sidecar's response goes back unchanged either way.
-                let _ = serving.observe(&sidecar, &created.session_id).await;
-            }
+    match created_session(status_ok, overflow, &bytes) {
+        Created::Session(id) => {
+            // A failure is audited by `observe` and answers this session's watches with a retryable refusal
+            // until a maintenance pass observes it; the sidecar's response goes back unchanged either way.
+            let _ = serving.observe(&sidecar, &id).await;
         }
+        Created::Unread => serving.unlearned(&sidecar),
+        Created::Nothing => {}
     }
     Ok(http::Response::from_parts(
         parts,
         Body::new(StreamBody::new(futures_util::stream::iter(frames))),
     ))
+}
+
+/// What a CreateSession answer says about a new session.
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum Created {
+    Session(String),
+    /// The call succeeded but its answer could not be read: a session exists that the daemon does not know.
+    Unread,
+    /// The call failed: no session.
+    Nothing,
+}
+
+/// Reads a CreateSession answer: its gRPC status, whether its data overflowed what is kept, and the data (one
+/// uncompressed gRPC frame).
+pub(super) fn created_session(status_ok: bool, overflow: bool, bytes: &[u8]) -> Created {
+    if !status_ok {
+        return Created::Nothing;
+    }
+    if overflow || bytes.len() < 5 || bytes[0] != 0 {
+        return Created::Unread;
+    }
+    let length = u32::from_be_bytes(bytes[1..5].try_into().expect("frame length")) as usize;
+    match CreateSessionResponse::decode(&bytes[5..]) {
+        Ok(created) if bytes.len() == length + 5 && !created.session_id.is_empty() => {
+            Created::Session(created.session_id)
+        }
+        _ => Created::Unread,
+    }
 }
 
 async fn forward<S>(
@@ -271,5 +299,36 @@ mod tests {
         .await
         .expect("keepalive must end a silent peer");
         assert_eq!(result.unwrap_err().code(), tonic::Code::Unavailable);
+    }
+
+    #[test]
+    fn a_created_session_the_daemon_cannot_read_is_recorded_as_unread() {
+        let framed = |message: &[u8]| {
+            let mut bytes = vec![0];
+            bytes.extend_from_slice(&(message.len() as u32).to_be_bytes());
+            bytes.extend_from_slice(message);
+            bytes
+        };
+        let created = CreateSessionResponse {
+            session_id: "s1".into(),
+            ..Default::default()
+        }
+        .encode_to_vec();
+        assert_eq!(
+            created_session(true, false, &framed(&created)),
+            Created::Session("s1".into())
+        );
+        assert_eq!(created_session(false, false, &framed(&created)), Created::Nothing);
+        assert_eq!(created_session(true, true, &[]), Created::Unread);
+        assert_eq!(created_session(true, false, &[]), Created::Unread);
+        assert_eq!(created_session(true, false, &framed(b"\xff\xff")), Created::Unread);
+        let mut compressed = framed(&created);
+        compressed[0] = 1;
+        assert_eq!(created_session(true, false, &compressed), Created::Unread);
+        assert_eq!(
+            created_session(true, false, &framed(&[])),
+            Created::Unread,
+            "an answer without an id"
+        );
     }
 }

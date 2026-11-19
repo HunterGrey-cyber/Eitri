@@ -269,6 +269,15 @@ impl ProjectDir {
         })
     }
 
+    /// A project root from a descriptor the caller opened and checked itself. No path is resolved again, so a
+    /// directory above the root that is swapped for a link afterwards cannot redirect what is reached from it.
+    pub fn from_fd(fd: OwnedFd) -> io::Result<ProjectDir> {
+        if fstat(fd.as_raw_fd())?.st_mode & libc::S_IFMT != libc::S_IFDIR {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "not a directory"));
+        }
+        Ok(ProjectDir { root: Arc::new(fd) })
+    }
+
     /// The file at `rel` (relative to the project root): each parent component is opened from the
     /// previous one with `O_DIRECTORY|O_NOFOLLOW`, so a link or a non-directory among them is
     /// [`WriteError::Outside`]. `rel` must be made of plain names: an absolute path, `..`, `.`, an
@@ -716,6 +725,256 @@ pub fn replace(
                 WriteMode::InPlace(_) => {}
             }
             in_place(parent, target, &st, bytes, *mode, note, journal, shadow, &fault)
+        }
+    }
+}
+
+/// The permission bits a file made where nothing was gets, whatever the umask: the bits a synchronized new file has.
+const NEW_FILE_MODE: u32 = 0o600;
+
+/// Extended attributes a file renamed into place has anyway: the security label, which the system gives every new
+/// file by its policy. Any other attribute (an ACL among them) would be lost by a rename.
+const GIVEN_TO_EVERY_NEW_FILE: &[&[u8]] = &[b"security.selinux"];
+
+/// How many of a file's extended attributes a file renamed over it would not have.
+fn lost_by_rename(names: &[Vec<u8>]) -> usize {
+    names
+        .iter()
+        .filter(|name| !GIVEN_TO_EVERY_NEW_FILE.contains(&name.as_slice()))
+        .count()
+}
+
+/// Makes `target` a regular file holding `bytes`, but only while it is exactly what the caller last read: a regular
+/// file whose bytes hash (SHA-256) to `expected_sha256`, or nothing at all when that is `None`. This is for a caller
+/// that keeps its own record of what it read (a sync copy settling a conflict), not for a review's revert: it takes
+/// no journal, stored copy or review state.
+///
+/// A file that is replaced keeps its own permission bits and group, through a temporary renamed over it after the
+/// last look (same inode, size and times before and after its bytes are hashed, the same hash, and the parent still
+/// reached from the root). One that a rename would hurt (another owner, extended attributes other than the security
+/// label every new file gets, a group the new file cannot be given) or that has other hard links is refused, since a
+/// write in place could not be taken back without the review's journal. A file put where nothing was gets
+/// [`NEW_FILE_MODE`] through a temporary and `linkat`, which never replaces what appeared meanwhile
+/// ([`WriteError::Appeared`]).
+///
+/// Anything other than what was expected (a different hash, a file where nothing was expected, nothing where a file
+/// was, a directory or a link, a file that grew while it was read) is [`WriteError::Changed`] and nothing is written.
+pub fn compare_and_replace(target: &Target, expected_sha256: Option<[u8; 32]>, bytes: &[u8]) -> Result<(), WriteError> {
+    let shown = target.rel.display().to_string();
+    let io_err = |e: io::Error| WriteError::Io(format!("{shown}: {e}"));
+    let no_fault = |_: Stage| Ok(());
+    let Some(parent) = &target.parent else {
+        return Err(match expected_sha256 {
+            Some(_) => WriteError::Changed,
+            None => WriteError::Io(format!("{shown}: a parent directory is missing")),
+        });
+    };
+    let st = match stat_at(parent, &target.leaf) {
+        Ok(st) => Some(st),
+        Err(e) if e.raw_os_error() == Some(libc::ENOENT) => None,
+        Err(e) => return Err(io_err(e)),
+    };
+    let st = match (expected_sha256, st) {
+        (None, Some(_)) | (Some(_), None) => return Err(WriteError::Changed),
+        (Some(expected), Some(st)) => {
+            if !still_hashes(parent, &target.leaf, &st, &expected).map_err(io_err)? {
+                return Err(WriteError::Changed);
+            }
+            Some((expected, st))
+        }
+        (None, None) => None,
+    };
+    let need = 2 * bytes.len() as u64;
+    let free = free_bytes_of(target).map_err(io_err)?;
+    if free < need {
+        return Err(WriteError::NoSpace { need, free });
+    }
+    let Some((expected, st)) = st else {
+        let made = make_temp(parent, &target.leaf).map_err(io_err)?;
+        return match fill_temp(&made, bytes, NEW_FILE_MODE, None, &no_fault) {
+            Ok(_) => link_into_place(target, parent, &made.name, &target.leaf, &no_fault, &shown),
+            Err(e) => {
+                let _ = unlink_at(parent, &made.name, 0);
+                Err(io_err(e))
+            }
+        };
+    };
+    let (file, fst) = open_leaf(parent, &target.leaf, libc::O_RDONLY, &st).map_err(io_err)?;
+    let lost = lost_by_rename(&xattr_names(file.as_raw_fd()).map_err(io_err)?);
+    drop(file);
+    // SAFETY: `geteuid` has no preconditions and cannot fail.
+    let own_uid = unsafe { libc::geteuid() };
+    #[allow(clippy::unnecessary_cast)] // `nlink_t` is 32 bits on some targets
+    let how = decide_mode(fst.st_nlink as u64, fst.st_uid, own_uid, lost);
+    let kept = || {
+        WriteError::Io(format!(
+            "{shown}: a new file could not keep its owner, group or extended attributes, and a rewrite in place \
+             could not be taken back; it was not written"
+        ))
+    };
+    match how {
+        WriteMode::HardLinked(links) => Err(WriteError::HardLinked { links }),
+        WriteMode::InPlace(_) => Err(kept()),
+        WriteMode::Atomic => {
+            let unchanged = || -> io::Result<bool> {
+                Ok(target.parent_is_reached()? && still_hashes(parent, &target.leaf, &st, &expected)?)
+            };
+            let mode = fst.st_mode as u32 & 0o7777;
+            match atomic(
+                parent,
+                &target.leaf,
+                bytes,
+                mode,
+                Some(&fst),
+                &no_fault,
+                Some(&unchanged),
+            )? {
+                Renamed::Done => Ok(()),
+                Renamed::GroupWouldChange => Err(kept()),
+            }
+        }
+    }
+}
+
+/// Removes the regular file at `target`, but only while it is exactly what the caller last read: its bytes hash
+/// (SHA-256) to `expected_sha256`, it is the same inode with the same size and times before and after the hash, and
+/// its parent is still reached from the root. A directory, a link, nothing at all or other bytes are
+/// [`WriteError::Changed`] and nothing is removed. Like [`compare_and_replace`] it takes no review state.
+///
+/// On Linux the name is first renamed aside (`RENAME_NOREPLACE`, beside it) and only the very inode that was hashed is
+/// unlinked: a file renamed over the name after the last look is put back under its name, never removed.
+pub fn compare_and_remove(target: &Target, expected_sha256: [u8; 32]) -> Result<(), WriteError> {
+    let shown = target.rel.display().to_string();
+    let io_err = |e: io::Error| WriteError::Io(format!("{shown}: {e}"));
+    let Some(parent) = &target.parent else {
+        return Err(WriteError::Changed);
+    };
+    let st = match stat_at(parent, &target.leaf) {
+        Ok(st) => st,
+        Err(e) if e.raw_os_error() == Some(libc::ENOENT) => return Err(WriteError::Changed),
+        Err(e) => return Err(io_err(e)),
+    };
+    if !target.parent_is_reached().map_err(io_err)?
+        || !still_hashes(parent, &target.leaf, &st, &expected_sha256).map_err(io_err)?
+    {
+        return Err(WriteError::Changed);
+    }
+    #[cfg(test)]
+    tests::run_hook(&tests::BEFORE_REMOVE);
+    remove_hashed(parent, &target.leaf, &st, &shown)
+}
+
+/// Unlinks `leaf` when it is still the inode `st` describes: moved aside first, so what is unlinked is what was
+/// checked, and moved back when it is not.
+#[cfg(target_os = "linux")]
+fn remove_hashed(parent: &OwnedFd, leaf: &CString, st: &libc::stat, shown: &str) -> Result<(), WriteError> {
+    let io_err = |e: io::Error| WriteError::Io(format!("{shown}: {e}"));
+    let aside = temp_name(leaf).map_err(io_err)?;
+    match rename_noreplace(parent, leaf, &aside) {
+        Ok(()) => {}
+        Err(e) if e.raw_os_error() == Some(libc::ENOENT) => return Err(WriteError::Changed),
+        Err(e) => return Err(io_err(e)),
+    }
+    // A rename changes the inode's ctime, so only its identity and kind are compared here.
+    let moved = stat_at(parent, &aside);
+    let same = moved.as_ref().is_ok_and(|moved| {
+        moved.st_mode & libc::S_IFMT == libc::S_IFREG && (moved.st_dev, moved.st_ino) == (st.st_dev, st.st_ino)
+    });
+    if same {
+        unlink_at(parent, &aside, 0).map_err(io_err)?;
+        return sync_fd(parent.as_raw_fd()).map_err(io_err);
+    }
+    // Another file took the name after the last look: it goes back where it was, never over something newer.
+    match rename_noreplace(parent, &aside, leaf) {
+        Ok(()) => Err(WriteError::Changed),
+        Err(e) => Err(WriteError::Io(format!(
+            "{shown} changed while it was being removed, and the file now there could not be put back ({e}); it is \
+             kept beside it as {}",
+            aside.to_string_lossy()
+        ))),
+    }
+}
+
+/// Elsewhere there is no rename that refuses to replace on a directory descriptor; the last look is the check.
+#[cfg(not(target_os = "linux"))]
+fn remove_hashed(parent: &OwnedFd, leaf: &CString, _st: &libc::stat, shown: &str) -> Result<(), WriteError> {
+    let io_err = |e: io::Error| WriteError::Io(format!("{shown}: {e}"));
+    unlink_at(parent, leaf, 0).map_err(io_err)?;
+    sync_fd(parent.as_raw_fd()).map_err(io_err)
+}
+
+/// `renameat2(RENAME_NOREPLACE)` within `parent`: fails with `EEXIST` rather than replace what is at `to`.
+#[cfg(target_os = "linux")]
+fn rename_noreplace(parent: &OwnedFd, from: &CString, to: &CString) -> io::Result<()> {
+    let fd = parent.as_raw_fd();
+    // SAFETY: both names are NUL-terminated strings that outlive the call; the descriptor is open.
+    retry(|| unsafe { libc::renameat2(fd, from.as_ptr(), fd, to.as_ptr(), libc::RENAME_NOREPLACE) }).map(|_| ())
+}
+
+/// The largest file a compare-and-act call compares: what one sync read (the helper's ReadFile) may cover. A larger
+/// file was never read whole, so no expected hash can name it; it answers `Changed` without being hashed.
+pub const MAX_COMPARED_BYTES: u64 = 256 * 1024 * 1024;
+
+/// Whether two stats describe the same regular file unchanged: inode, size and times.
+fn same_regular(now: &libc::stat, then: &libc::stat) -> bool {
+    now.st_mode & libc::S_IFMT == libc::S_IFREG
+        && then.st_mode & libc::S_IFMT == libc::S_IFREG
+        && (now.st_dev, now.st_ino) == (then.st_dev, then.st_ino)
+        && now.st_size == then.st_size
+        && (now.st_mtime, now.st_mtime_nsec) == (then.st_mtime, then.st_mtime_nsec)
+        && (now.st_ctime, now.st_ctime_nsec) == (then.st_ctime, then.st_ctime_nsec)
+}
+
+/// Whether `leaf` is still the very regular file `st` described and its bytes hash to `expected`. The bytes are read
+/// only up to the size `st` gave (a file that grows is not what was read), and after the hash both the descriptor and
+/// the name are looked at again: a file renamed over the name while the bytes were read is not the one hashed.
+fn still_hashes(parent: &OwnedFd, leaf: &CString, st: &libc::stat, expected: &[u8; 32]) -> io::Result<bool> {
+    let now = match stat_at(parent, leaf) {
+        Ok(now) => now,
+        Err(e) if e.raw_os_error() == Some(libc::ENOENT) => return Ok(false),
+        Err(e) => return Err(e),
+    };
+    // An expected hash can only come from a read of the file, and no read covers more than this.
+    if !same_regular(&now, st) || st.st_size as u64 > MAX_COMPARED_BYTES {
+        return Ok(false);
+    }
+    let mut file = match open_leaf(parent, leaf, libc::O_RDONLY, st) {
+        Ok((file, _)) => file,
+        // Gone, replaced or not a regular file any more: not what was read.
+        Err(_) => return Ok(false),
+    };
+    let hashed = sha256_up_to(&mut file, st.st_size as u64)?;
+    #[cfg(test)]
+    tests::run_hook(&tests::AFTER_HASH);
+    let held = fstat(file.as_raw_fd())?;
+    let named = match stat_at(parent, leaf) {
+        Ok(named) => named,
+        Err(e) if e.raw_os_error() == Some(libc::ENOENT) => return Ok(false),
+        Err(e) => return Err(e),
+    };
+    Ok(hashed == Some(*expected) && same_regular(&held, st) && same_regular(&named, st))
+}
+
+/// The SHA-256 of `file`'s first `size` bytes, read in bounded chunks; `None` when the file holds more than `size`.
+fn sha256_up_to(file: &mut File, size: u64) -> io::Result<Option<[u8; 32]>> {
+    use sha2::{Digest, Sha256};
+    file.seek(SeekFrom::Start(0))?;
+    let mut hasher = Sha256::new();
+    let mut chunk = vec![0u8; IN_PLACE_CHUNK];
+    let mut total = 0u64;
+    let mut reader = file.take(size.saturating_add(1));
+    loop {
+        match reader.read(&mut chunk) {
+            Ok(0) => return Ok(Some(hasher.finalize().into())),
+            Ok(read) => {
+                total += read as u64;
+                if total > size {
+                    return Ok(None);
+                }
+                hasher.update(&chunk[..read]);
+            }
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(e),
         }
     }
 }
@@ -1487,6 +1746,129 @@ mod tests {
         /// A permission bit lost despite a successful chmod.
         pub(super) static AFTER_CHMOD: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
             const { std::cell::RefCell::new(None) };
+        /// A change right after a compare-and-act look hashed the file: runs at the call after skipping this many.
+        pub(super) static AFTER_HASH: Hook = const { std::cell::RefCell::new(None) };
+        /// A change after a compare-and-remove's last look, before the file is moved aside.
+        pub(super) static BEFORE_REMOVE: Hook = const { std::cell::RefCell::new(None) };
+    }
+
+    pub(super) type Hook = std::cell::RefCell<Option<(usize, Box<dyn FnOnce()>)>>;
+
+    /// Runs the hook in `slot` once its skip count reaches zero.
+    pub(super) fn run_hook(slot: &'static std::thread::LocalKey<Hook>) {
+        let ready = slot.with(|hook| {
+            let mut hook = hook.borrow_mut();
+            match hook.as_mut() {
+                Some((0, _)) => hook.take().map(|(_, run)| run),
+                Some((skip, _)) => {
+                    *skip -= 1;
+                    None
+                }
+                None => None,
+            }
+        });
+        if let Some(run) = ready {
+            run();
+        }
+    }
+
+    fn set_hook(slot: &'static std::thread::LocalKey<Hook>, skip: usize, run: impl FnOnce() + 'static) {
+        slot.with(|hook| *hook.borrow_mut() = Some((skip, Box::new(run))));
+    }
+
+    /// A project with `file` holding `ours`, and `theirs` beside it ready to be renamed over it.
+    fn race(label: &str) -> (ScratchDir, ProjectDir, PathBuf, [u8; 32]) {
+        use sha2::Digest;
+        let scratch = ScratchDir::new("eitri-write", label);
+        std::fs::write(scratch.join("file"), b"ours\n").unwrap();
+        std::fs::write(scratch.join("theirs"), b"theirs\n").unwrap();
+        let root = ProjectDir::open(&scratch).unwrap();
+        let file = scratch.join("file");
+        (scratch, root, file, sha2::Sha256::digest(b"ours\n").into())
+    }
+
+    fn rename_theirs_over(scratch: &ScratchDir) -> impl FnOnce() + 'static {
+        let (from, to) = (scratch.join("theirs"), scratch.join("file"));
+        move || std::fs::rename(from, to).unwrap()
+    }
+
+    #[test]
+    fn compare_and_replace_refuses_a_file_renamed_over_while_its_last_look_hashed() {
+        let (scratch, root, file, expected) = race("replace-race");
+        let target = root.target(Path::new("file"), false).unwrap();
+        // The first look passes; the rename lands while the last look, right before the rename, reads the bytes.
+        set_hook(&AFTER_HASH, 1, rename_theirs_over(&scratch));
+        assert_eq!(
+            compare_and_replace(&target, Some(expected), b"new\n"),
+            Err(WriteError::Changed)
+        );
+        assert_eq!(std::fs::read(&file).unwrap(), b"theirs\n");
+    }
+
+    #[test]
+    fn compare_and_remove_refuses_a_file_renamed_over_while_it_was_hashed() {
+        let (scratch, root, file, expected) = race("remove-race");
+        let target = root.target(Path::new("file"), false).unwrap();
+        set_hook(&AFTER_HASH, 0, rename_theirs_over(&scratch));
+        assert_eq!(compare_and_remove(&target, expected), Err(WriteError::Changed));
+        assert_eq!(std::fs::read(&file).unwrap(), b"theirs\n");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn compare_and_remove_puts_back_a_file_renamed_over_after_its_last_look() {
+        let (scratch, root, file, expected) = race("remove-aside");
+        let target = root.target(Path::new("file"), false).unwrap();
+        set_hook(&BEFORE_REMOVE, 0, rename_theirs_over(&scratch));
+        assert_eq!(compare_and_remove(&target, expected), Err(WriteError::Changed));
+        assert_eq!(std::fs::read(&file).unwrap(), b"theirs\n");
+        let names: Vec<_> = std::fs::read_dir(&*scratch)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert_eq!(names, ["file"], "nothing is left aside");
+        // Untouched, the same call removes the file.
+        std::fs::write(&file, b"ours\n").unwrap();
+        let target = root.target(Path::new("file"), false).unwrap();
+        compare_and_remove(&target, expected).unwrap();
+        assert!(std::fs::read_dir(&*scratch).unwrap().next().is_none());
+    }
+
+    #[test]
+    fn a_file_larger_than_any_read_is_changed_without_being_hashed() {
+        use sha2::Digest;
+        let scratch = ScratchDir::new("eitri-write", "too-large");
+        let file = std::fs::File::create(scratch.join("file")).unwrap();
+        file.set_len(MAX_COMPARED_BYTES + 1).unwrap();
+        let root = ProjectDir::open(&scratch).unwrap();
+        let target = root.target(Path::new("file"), false).unwrap();
+        let any: [u8; 32] = sha2::Sha256::digest(b"x").into();
+        // Nothing is read: a hook after the hash would run if it were hashed.
+        set_hook(&AFTER_HASH, 0, || panic!("a file over the cap was hashed"));
+        assert_eq!(compare_and_remove(&target, any), Err(WriteError::Changed));
+        AFTER_HASH.with(|hook| hook.borrow_mut().take());
+        assert!(scratch.join("file").exists());
+    }
+
+    #[test]
+    fn a_file_longer_than_its_looked_at_size_never_matches() {
+        let scratch = ScratchDir::new("eitri-write", "grown");
+        std::fs::write(scratch.join("file"), b"0123456789").unwrap();
+        let mut file = std::fs::File::open(scratch.join("file")).unwrap();
+        assert_eq!(sha256_up_to(&mut file, 5).unwrap(), None);
+        assert!(sha256_up_to(&mut file, 10).unwrap().is_some());
+    }
+
+    #[test]
+    fn the_security_label_does_not_stop_a_rename_but_other_attributes_do() {
+        let label = b"security.selinux".to_vec();
+        assert_eq!(lost_by_rename(std::slice::from_ref(&label)), 0);
+        assert_eq!(lost_by_rename(&[label.clone(), b"user.origin".to_vec()]), 1);
+        assert_eq!(lost_by_rename(&[b"system.posix_acl_access".to_vec(), label]), 1);
+        assert_eq!(
+            decide_mode(1, 1000, 1000, lost_by_rename(&[b"security.selinux".to_vec()])),
+            WriteMode::Atomic
+        );
     }
 
     #[test]

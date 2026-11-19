@@ -592,6 +592,11 @@ async fn collect(
 
 fn answer(translated: Translated, tracked_ignored: Vec<String>, mut problems: Vec<String>) -> SyncIgnoresResponse {
     problems.extend(translated.problems);
+    // Lines that say a whole directory is left out matter most; a shortened list keeps them first.
+    let (mut excluded, rest): (Vec<String>, Vec<String>) =
+        problems.into_iter().partition(|line| line.contains("excluded"));
+    excluded.extend(rest);
+    let mut problems = excluded;
     if problems.len() > 50 {
         let remaining = problems.len() - 50;
         problems.truncate(50);
@@ -635,7 +640,12 @@ fn sync_name(name: &OsStr, dir: &str, problems: &mut Vec<String>, forced: &mut V
             "{} is not synced: its name contains control characters or unsupported path components",
             rel.escape_debug()
         ));
-        forced.push(format!("/{}", literal(&rel)));
+        // A control character cannot appear in an ignore pattern; `?` stands for it and matches a little more.
+        let pattern: String = literal(&rel)
+            .chars()
+            .map(|c| if c.is_control() { '?' } else { c })
+            .collect();
+        forced.push(format!("/{pattern}"));
         return None;
     }
     Some(rel)
@@ -648,4 +658,38 @@ fn sync_paths(bytes: Vec<u8>, problems: &mut Vec<String>, forced: &mut Vec<Strin
         .filter(|p| !p.is_empty())
         .filter_map(|path| sync_name(OsStr::from_bytes(path), "", problems, forced))
         .collect()
+}
+
+#[cfg(test)]
+mod name_tests {
+    use super::*;
+
+    #[test]
+    fn a_name_with_a_newline_is_excluded_by_a_pattern_without_one() {
+        let (mut problems, mut forced) = (Vec::new(), Vec::new());
+        assert_eq!(
+            sync_name(OsStr::new("bad\nname"), "dir", &mut problems, &mut forced),
+            None
+        );
+        assert_eq!(forced, vec!["/dir/bad?name".to_owned()]);
+        assert_eq!(problems.len(), 1);
+    }
+
+    #[test]
+    fn a_shortened_problem_list_keeps_excluded_directories_first() {
+        let translated = Translated {
+            patterns: Vec::new(),
+            problems: vec!["deep: ignore pattern cannot be represented safely; its directory is excluded".to_owned()],
+            digest: String::new(),
+        };
+        let many = (0..60).map(|i| format!("name {i} is not synced")).collect();
+        let answer = answer(translated, Vec::new(), many);
+        assert!(
+            answer.problems[0].contains("its directory is excluded"),
+            "{:?}",
+            answer.problems
+        );
+        assert_eq!(answer.problems.len(), 51);
+        assert_eq!(answer.problems[50], "and 11 more");
+    }
 }

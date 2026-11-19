@@ -87,7 +87,8 @@ message PathSizesRequest { string root = 1; repeated string rels = 2; repeated s
 message PathSize { string rel = 1; uint64 bytes = 2; }
 message PathSizesResponse { repeated PathSize sizes = 1; bool truncated = 2; string refusal = 3; }
 message ProjectActivityRequest { string root = 1; }
-message ProjectActivityResponse { uint32 turns_running = 1; bool unknown = 2; string refusal = 3; }
+// `tasks_running`: background tasks (not ambient) the sessions' last rosters list; they write outside any turn.
+message ProjectActivityResponse { uint32 turns_running = 1; bool unknown = 2; string refusal = 3; uint32 tasks_running = 4; }
 message WatchModesRequest { string root = 1; repeated string patterns = 2; bool on = 3; }
 message WatchModesResponse { string refusal = 1; }
 enum ExecPurpose {

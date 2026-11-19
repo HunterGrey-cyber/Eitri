@@ -18,6 +18,7 @@ use sha2::{Digest, Sha256};
 use tonic::Status;
 
 use super::sidecars::Sidecars;
+use super::sync::activity::{Facts, SessionFacts, Tasks, Turn};
 use crate::run_dir::Paths;
 
 pub use proxy::Proxy;
@@ -33,11 +34,20 @@ pub(super) struct Session {
     refresh_needed: bool,
     refresh_terminal: Option<Status>,
     changed: tokio::sync::watch::Sender<u64>,
+    /// Whether a turn is running, from the journal when the session is opened and from every event after.
+    turn: Turn,
+    /// How many background tasks the session's last roster lists that are not ambient, the same way.
+    tasks: Tasks,
 }
 
 impl Session {
     fn new(identity: (String, String), journal: Journal, pending: Pending, closed: bool) -> Self {
         let (changed, _) = tokio::sync::watch::channel(journal.head());
+        let (turn, tasks) = if closed {
+            (Turn::Idle, Tasks::Known(0))
+        } else {
+            state_at_head(&journal)
+        };
         Self {
             identity,
             journal,
@@ -47,8 +57,109 @@ impl Session {
             refresh_needed: false,
             refresh_terminal: None,
             changed,
+            turn,
+            tasks,
         }
     }
+}
+
+/// Where a session stands after `event`, given where it stood: a turn's start or end decides it; events missing just
+/// before it (`gap`) leave it unknown until the next start or end.
+pub(super) fn advance(turn: Turn, gap: bool, event: &claude_runtime_protocol::v1::SessionEvent) -> Turn {
+    use claude_runtime_protocol::v1::session_event::Event;
+    match event.event {
+        Some(Event::TurnStarted(_)) => Turn::Running,
+        Some(Event::TurnCompleted(_) | Event::SessionClosed(_)) => Turn::Idle,
+        _ if gap => Turn::Unknown,
+        _ => turn,
+    }
+}
+
+/// The session's background tasks after `event`: a roster replaces what was held; a closed session has none; events
+/// missing just before it (`gap`) may have changed the roster, which is then unknown until the next one.
+pub(super) fn advance_tasks(tasks: Tasks, gap: bool, event: &claude_runtime_protocol::v1::SessionEvent) -> Tasks {
+    use claude_runtime_protocol::v1::session_event::Event;
+    match &event.event {
+        Some(Event::BackgroundTasksChanged(roster)) => {
+            Tasks::Known(roster.tasks.iter().filter(|task| !task.ambient).count() as u32)
+        }
+        Some(Event::SessionClosed(_)) => Tasks::Known(0),
+        _ if gap => Tasks::Unknown,
+        _ => tasks,
+    }
+}
+
+/// Where a session stands at its journal's head: the journal is read back from the head, in windows that grow, until
+/// the last turn start or end and the last background-task roster (or the journal's beginning) decide it. A gap after
+/// the last of either, or a journal that cannot be read, leaves that part unknown.
+fn state_at_head(journal: &Journal) -> (Turn, Tasks) {
+    let head = journal.head();
+    let mut span = 64u64;
+    loop {
+        let from = head.saturating_sub(span);
+        match state_after(journal, from) {
+            Ok((Some(turn), Some(tasks))) => return (turn, tasks),
+            Ok((turn, tasks)) if from == 0 => return (turn.unwrap_or(Turn::Idle), tasks.unwrap_or(Tasks::Known(0))),
+            Ok(_) => span = span.saturating_mul(4),
+            Err(_) => return (Turn::Unknown, Tasks::Unknown),
+        }
+    }
+}
+
+#[cfg(test)]
+fn turn_at_head(journal: &Journal) -> Turn {
+    state_at_head(journal).0
+}
+
+/// What the journal's records after `after` decide of the turn and the background-task roster; `None` for a part they
+/// hold neither an event for nor a gap after.
+fn state_after(journal: &Journal, after: u64) -> io::Result<(Option<Turn>, Option<Tasks>)> {
+    use claude_runtime_protocol::v1::{session_event::Event, SessionEvent};
+    use eitri_server::journal::{ReadError, Record};
+    use prost::Message;
+    let mut cursor = after;
+    let (mut turn, mut tasks) = (None, None);
+    loop {
+        match journal.read_after(cursor, replay::BATCH_BYTES) {
+            Ok(records) if records.is_empty() => return Ok((turn, tasks)),
+            Ok(records) => {
+                for record in records {
+                    match record {
+                        Record::Event { sequence, bytes } => {
+                            let event = SessionEvent::decode(bytes.as_slice()).map_err(io::Error::other)?;
+                            if is_boundary(&event) {
+                                turn = Some(advance(Turn::Unknown, false, &event));
+                            }
+                            if matches!(
+                                event.event,
+                                Some(Event::BackgroundTasksChanged(_) | Event::SessionClosed(_))
+                            ) {
+                                tasks = Some(advance_tasks(Tasks::Unknown, false, &event));
+                            }
+                            cursor = sequence;
+                        }
+                        Record::Gap { last, .. } => {
+                            (turn, tasks) = (Some(Turn::Unknown), Some(Tasks::Unknown));
+                            cursor = last;
+                        }
+                    }
+                }
+            }
+            Err(ReadError::Gap { last, .. }) => {
+                (turn, tasks) = (Some(Turn::Unknown), Some(Tasks::Unknown));
+                cursor = last;
+            }
+            Err(ReadError::Io(error)) => return Err(error),
+        }
+    }
+}
+
+fn is_boundary(event: &claude_runtime_protocol::v1::SessionEvent) -> bool {
+    use claude_runtime_protocol::v1::session_event::Event;
+    matches!(
+        event.event,
+        Some(Event::TurnStarted(_) | Event::TurnCompleted(_) | Event::SessionClosed(_))
+    )
 }
 
 type SharedSession = Arc<SessionLock>;
@@ -57,6 +168,9 @@ type SharedSession = Arc<SessionLock>;
 pub(super) struct SessionLock {
     state: Mutex<Session>,
     info: Mutex<SessionInfo>,
+    /// Whether the session's watch is connected and has delivered everything the sidecar had sent: only then does its
+    /// recorded state say what the session is doing now.
+    current: AtomicBool,
 }
 
 impl SessionLock {
@@ -70,6 +184,7 @@ impl SessionLock {
         Self {
             state: Mutex::new(state),
             info: Mutex::new(info),
+            current: AtomicBool::new(false),
         }
     }
 
@@ -144,6 +259,9 @@ pub struct Serving {
     tasks: Mutex<Vec<tokio::task::JoinHandle<()>>>,
     retrying: Mutex<HashMap<String, (String, String)>>,
     warning: Mutex<Option<String>>,
+    /// Sidecars that created a session whose id the daemon could not read from the answer: it is not followed, so
+    /// what those sidecars do is never judged known.
+    unlearned: Mutex<std::collections::HashSet<String>>,
 }
 
 impl Drop for Serving {
@@ -214,6 +332,7 @@ impl Serving {
             tasks: Default::default(),
             retrying: Default::default(),
             warning: Default::default(),
+            unlearned: Default::default(),
         })
     }
 
@@ -667,6 +786,58 @@ impl Serving {
                 .collect())
         })
         .await
+    }
+
+    /// Records that `sidecar` created a session the daemon could not learn the id of.
+    pub(super) fn unlearned(&self, sidecar: &str) {
+        self.unlearned
+            .lock()
+            .expect("unlearned sessions")
+            .insert(sidecar.to_owned());
+    }
+
+    /// What the daemon knows of its followed sessions' turns, for a project-activity question.
+    pub async fn activity_facts(&self) -> Result<Facts, Status> {
+        let sessions: Vec<(String, SharedSession)> = self
+            .sessions
+            .lock()
+            .await
+            .iter()
+            .map(|((sidecar, _), session)| (sidecar.clone(), session.clone()))
+            .collect();
+        let mut unobserved: Vec<String> = self
+            .retrying
+            .lock()
+            .expect("retry identities")
+            .values()
+            .map(|(sidecar, _)| sidecar.clone())
+            .collect();
+        unobserved.extend(self.unlearned.lock().expect("unlearned sessions").iter().cloned());
+        let adopted = self.adopted.load(Ordering::Acquire);
+        // A session's lock is held across journal writes, so it is taken off the runtime.
+        let sessions = blocking(move || {
+            Ok(sessions
+                .into_iter()
+                .map(|(sidecar, session)| {
+                    let current = session.current.load(Ordering::Acquire);
+                    let state = session.lock().expect("session");
+                    SessionFacts {
+                        sidecar,
+                        closed: state.closed,
+                        ended: state.error.as_ref().map(Status::code),
+                        current,
+                        turn: state.turn,
+                        tasks: state.tasks,
+                    }
+                })
+                .collect())
+        })
+        .await?;
+        Ok(Facts {
+            adopted,
+            sessions,
+            unobserved,
+        })
     }
 
     pub async fn sessions(&self, sidecar: &str) -> Vec<SessionInfo> {
@@ -2152,5 +2323,102 @@ mod tests {
         std::fs::remove_file(&file).unwrap();
         drop(open_session(&paths, &name, identity.clone()).unwrap());
         assert_eq!(std::fs::read(&file).unwrap(), serde_json::to_vec(&identity).unwrap());
+    }
+
+    #[test]
+    fn a_reopened_journal_knows_whether_a_turn_is_running() {
+        use claude_runtime_protocol::v1::{session_event::Event, SessionEvent};
+        use prost::Message;
+        let root = scratch("turn");
+        let event = |sequence: u64, event: Event| SessionEvent {
+            session_id: "session".into(),
+            sequence,
+            event: Some(event),
+            ..Default::default()
+        };
+        let started = || Event::TurnStarted(Default::default());
+        let completed = || Event::TurnCompleted(Default::default());
+        let other = || Event::PermissionRequested(Default::default());
+        let journal = |name: &str, events: &[(u64, Event)]| {
+            let mut journal = Journal::open(&root.join(name), &JournalConfig::default()).unwrap();
+            for (sequence, kind) in events {
+                journal
+                    .append(*sequence, &event(*sequence, kind.clone()).encode_to_vec())
+                    .unwrap();
+            }
+            journal.turn_ended().unwrap();
+            drop(journal);
+            turn_at_head(&Journal::open(&root.join(name), &JournalConfig::default()).unwrap())
+        };
+        assert_eq!(journal("empty", &[]), Turn::Idle);
+        assert_eq!(journal("never-started", &[(1, other()), (2, other())]), Turn::Idle);
+        // The start lies further back than the first window read from the head.
+        let mut long = vec![(1, started())];
+        long.extend((2..=300).map(|sequence| (sequence, other())));
+        assert_eq!(journal("running", &long), Turn::Running);
+        assert_eq!(
+            journal("ended", &[(1, started()), (2, other()), (3, completed())]),
+            Turn::Idle
+        );
+        // Events 2..=4 were never observed: one of them may have ended the turn, or started another.
+        assert_eq!(journal("gap", &[(1, started()), (5, other())]), Turn::Unknown);
+        assert_eq!(
+            journal("gap-then-start", &[(1, completed()), (5, started())]),
+            Turn::Running
+        );
+        assert_eq!(journal("gap-then-end", &[(1, started()), (5, completed())]), Turn::Idle);
+
+        // The background-task roster is folded the same way: the last one counts its tasks that are not ambient.
+        use claude_runtime_protocol::v1::{BackgroundTask, BackgroundTasksChanged};
+        let roster = |ambient: &[bool]| {
+            Event::BackgroundTasksChanged(BackgroundTasksChanged {
+                tasks: ambient
+                    .iter()
+                    .map(|ambient| BackgroundTask {
+                        ambient: *ambient,
+                        ..Default::default()
+                    })
+                    .collect(),
+            })
+        };
+        let tasks = |name: &str, events: &[(u64, Event)]| {
+            let mut journal = Journal::open(&root.join(name), &JournalConfig::default()).unwrap();
+            for (sequence, kind) in events {
+                journal
+                    .append(*sequence, &event(*sequence, kind.clone()).encode_to_vec())
+                    .unwrap();
+            }
+            journal.turn_ended().unwrap();
+            drop(journal);
+            state_at_head(&Journal::open(&root.join(name), &JournalConfig::default()).unwrap()).1
+        };
+        assert_eq!(tasks("no-roster", &[(1, started())]), Tasks::Known(0));
+        let mut roster_far_back = vec![(1, roster(&[false, false, true]))];
+        roster_far_back.extend((2..=300).map(|sequence| (sequence, other())));
+        assert_eq!(tasks("roster", &roster_far_back), Tasks::Known(2));
+        assert_eq!(
+            tasks("roster-then-gap", &[(1, roster(&[false])), (5, other())]),
+            Tasks::Unknown
+        );
+        assert_eq!(
+            tasks("gap-then-roster", &[(1, other()), (5, roster(&[]))]),
+            Tasks::Known(0)
+        );
+
+        let live = |kind: Event| event(9, kind);
+        assert_eq!(advance_tasks(Tasks::Known(1), true, &live(other())), Tasks::Unknown);
+        assert_eq!(
+            advance_tasks(Tasks::Unknown, true, &live(roster(&[true]))),
+            Tasks::Known(0)
+        );
+        assert_eq!(advance(Turn::Idle, false, &live(started())), Turn::Running);
+        assert_eq!(advance(Turn::Running, false, &live(other())), Turn::Running);
+        assert_eq!(advance(Turn::Running, true, &live(other())), Turn::Unknown);
+        assert_eq!(advance(Turn::Unknown, true, &live(completed())), Turn::Idle);
+        assert_eq!(
+            advance(Turn::Running, false, &live(Event::SessionClosed(Default::default()))),
+            Turn::Idle
+        );
+        let _ = std::fs::remove_dir_all(root);
     }
 }

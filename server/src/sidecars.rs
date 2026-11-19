@@ -175,6 +175,15 @@ impl Sidecars {
         self.environment_with(login_env::capture).await
     }
 
+    /// The login environment sidecars start in (captured once, retried after a failure), for other children the
+    /// daemon runs as the account.
+    pub(crate) async fn login_environment(&self) -> Result<Arc<Captured>, Status> {
+        if self.shutting_down.load(Ordering::SeqCst) {
+            return Err(Status::unavailable("daemon is stopping"));
+        }
+        self.environment().await
+    }
+
     async fn environment_with<F, Fut>(&self, capture: F) -> Result<Arc<Captured>, Status>
     where
         F: FnOnce() -> Fut,
@@ -1127,6 +1136,42 @@ fn recorded_alive_with(run: &Path, stat: impl Fn(u32) -> io::Result<u64>) -> io:
 
 pub(crate) fn refusing_records_in(run: &Path) -> io::Result<Vec<RefusingRecord>> {
     refusing_records_with(run, identity_start_time)
+}
+
+/// The roots of the sidecars another daemon's run directory records as still running: `None` for a record that names
+/// a live process but cannot be read or judged, since that sidecar may run anywhere.
+pub(crate) fn live_roots_in(run: &Path) -> io::Result<Vec<Option<String>>> {
+    let entries = match std::fs::read_dir(run) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error),
+    };
+    let mut roots = Vec::new();
+    for entry in entries {
+        let entry = entry?;
+        let name = entry.file_name();
+        let Some(id) = name
+            .to_str()
+            .and_then(|name| name.strip_prefix("sc-"))
+            .and_then(|name| name.strip_suffix(".pid"))
+        else {
+            continue;
+        };
+        if id.len() != 16 || !id.bytes().all(|b| b.is_ascii_hexdigit()) {
+            continue;
+        }
+        let judged = (|| {
+            let bytes = private_fs::read_private_nofollow_bytes_capped(&entry.path(), 64 * 1024)?;
+            let record: Record = serde_json::from_slice(&bytes)?;
+            Ok::<_, io::Error>(record_alive_with(&record, &identity_start_time)?.then_some(record.root))
+        })();
+        match judged {
+            Ok(Some(root)) => roots.push(Some(root)),
+            Ok(None) => {}
+            Err(_) => roots.push(None),
+        }
+    }
+    Ok(roots)
 }
 
 fn refusing_records_with(run: &Path, stat: impl Fn(u32) -> io::Result<u64>) -> io::Result<Vec<RefusingRecord>> {

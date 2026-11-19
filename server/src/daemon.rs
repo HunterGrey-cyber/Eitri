@@ -106,6 +106,86 @@ struct Service {
     sidecars: Arc<sidecars::Sidecars>,
     serving: Arc<serve::Serving>,
     sync_ignores: Arc<sync::ignores::SyncIgnores>,
+    paths: Paths,
+    /// Runs started by Exec that have not ended: the daemon does not exit for idleness under them, and stopping kills
+    /// the ones whose input is unfinished and waits a while for the rest.
+    runs: Arc<exec::Runs>,
+}
+
+type Streamed<T> = Pin<Box<dyn tokio_stream::Stream<Item = Result<T, Status>> + Send>>;
+
+fn streamed<T: Send + 'static>(receiver: tokio::sync::mpsc::Receiver<Result<T, Status>>) -> Streamed<T> {
+    Box::pin(tokio_stream::wrappers::ReceiverStream::new(receiver))
+}
+
+/// The most a request may carry: a ReplaceFileIf's 8 MiB of contents and room for its other fields and framing.
+pub const MAX_REQUEST_BYTES: usize = sync::MAX_REPLACE_BYTES + 64 * 1024;
+
+/// A streamed answer filled from a blocking thread: items go through a bounded channel, each waiting at most until
+/// the call's deadline for the laptop to take it, and the last message (a refusal, or what ends the stream) goes into
+/// a slot of its own that never waits, so a laptop that stopped reading still finds it after what it had not read.
+struct Outbox<T> {
+    sender: tokio::sync::mpsc::Sender<Result<T, Status>>,
+    last: Option<tokio::sync::oneshot::Sender<Result<T, Status>>>,
+    runtime: tokio::runtime::Handle,
+    deadline: tokio::time::Instant,
+    /// The deadline passed before everything was sent.
+    late: bool,
+}
+
+impl<T: Send + 'static> Outbox<T> {
+    fn new(within: Duration) -> (Self, Streamed<T>) {
+        use futures_util::StreamExt;
+        let (sender, receiver) = tokio::sync::mpsc::channel(16);
+        let (last, final_receiver) = tokio::sync::oneshot::channel();
+        let stream = tokio_stream::wrappers::ReceiverStream::new(receiver)
+            .chain(futures_util::stream::once(final_receiver).filter_map(|last| async move { last.ok() }));
+        let outbox = Outbox {
+            sender,
+            last: Some(last),
+            runtime: tokio::runtime::Handle::current(),
+            deadline: tokio::time::Instant::now() + within,
+            late: false,
+        };
+        (outbox, Box::pin(stream))
+    }
+
+    /// Sends one item from a blocking thread; `false` when nobody reads any more or the deadline passed.
+    fn send(&mut self, item: T) -> bool {
+        let sent = self
+            .runtime
+            .block_on(tokio::time::timeout_at(self.deadline, self.sender.send(Ok(item))));
+        match sent {
+            Ok(Ok(())) => true,
+            Ok(Err(_)) => false,
+            Err(_) => {
+                self.late = true;
+                false
+            }
+        }
+    }
+
+    /// Ends the stream with `last`, after everything already sent.
+    fn finish(mut self, last: T) {
+        if let Some(slot) = self.last.take() {
+            let _ = slot.send(Ok(last));
+        }
+    }
+}
+
+/// A walk's budget: at least one entry, and never more than the helper's own cap.
+fn budget_of(asked: u64) -> Result<u64, String> {
+    if asked == 0 {
+        return Err("a budget of at least one entry is needed".to_owned());
+    }
+    Ok(asked.min(sync::MAX_BUDGET))
+}
+
+/// Runs blocking file work off the runtime.
+async fn off_runtime<T: Send + 'static>(work: impl FnOnce() -> T + Send + 'static) -> Result<T, Status> {
+    tokio::task::spawn_blocking(work)
+        .await
+        .map_err(|error| Status::internal(error.to_string()))
 }
 
 #[tonic::async_trait]
@@ -125,6 +205,8 @@ impl Helper for Service {
                 CAP_INSTALLATION_ARGS,
                 CAP_SYNC_IGNORES,
                 CAP_GIT_CONFIG,
+                CAP_SYNC_FILES,
+                CAP_EXEC,
             ]
             .map(str::to_owned)
             .to_vec(),
@@ -221,56 +303,215 @@ impl Helper for Service {
         Ok(Response::new(sync::git_config::answer(&root).await))
     }
 
-    type ListTreeStream = Pin<Box<dyn tokio_stream::Stream<Item = Result<ListTreeEntry, Status>> + Send>>;
-    async fn list_tree(&self, _request: Request<ListTreeRequest>) -> Result<Response<Self::ListTreeStream>, Status> {
-        Err(Status::unimplemented("ListTree is not built yet"))
+    type ListTreeStream = Streamed<ListTreeEntry>;
+    async fn list_tree(&self, request: Request<ListTreeRequest>) -> Result<Response<Self::ListTreeStream>, Status> {
+        mark_activity(&request);
+        let request = request.into_inner();
+        let (mut outbox, stream) = Outbox::new(sync::LIST_DEADLINE);
+        tokio::task::spawn_blocking(move || {
+            let listed = (|| {
+                let budget = budget_of(request.budget)?;
+                let root = sync::root(&request.root)?;
+                let ignored = sync::listing::ignore_predicate(&request.patterns);
+                sync::listing::list_tree(&root.dir, &*ignored, budget, &mut |listed| {
+                    outbox.send(match listed {
+                        sync::listing::Listed::Entry(visit) => ListTreeEntry {
+                            rel: visit.rel,
+                            kind: visit.kind.wire().to_owned(),
+                            size: visit.size,
+                            ..Default::default()
+                        },
+                        sync::listing::Listed::Truncated => ListTreeEntry {
+                            truncated: true,
+                            ..Default::default()
+                        },
+                    })
+                })
+            })();
+            let refusal = match listed {
+                Err(refusal) => refusal,
+                Ok(()) if outbox.late => format!("the listing took longer than {} s", sync::LIST_DEADLINE.as_secs()),
+                Ok(()) => return,
+            };
+            outbox.finish(ListTreeEntry {
+                refusal,
+                ..Default::default()
+            });
+        });
+        Ok(Response::new(stream))
     }
 
-    type ReadFileStream = Pin<Box<dyn tokio_stream::Stream<Item = Result<ReadFileChunk, Status>> + Send>>;
-    async fn read_file(&self, _request: Request<ReadFileRequest>) -> Result<Response<Self::ReadFileStream>, Status> {
-        Err(Status::unimplemented("ReadFile is not built yet"))
+    type ReadFileStream = Streamed<ReadFileChunk>;
+    async fn read_file(&self, request: Request<ReadFileRequest>) -> Result<Response<Self::ReadFileStream>, Status> {
+        mark_activity(&request);
+        let request = request.into_inner();
+        let (mut outbox, stream) = Outbox::new(sync::READ_DEADLINE);
+        tokio::task::spawn_blocking(move || {
+            let last = match sync::root(&request.root) {
+                Ok(root) => sync::files::read_file(&root, &request.rel, request.limit, &mut |chunk| outbox.send(chunk)),
+                Err(refusal) => Some(ReadFileChunk {
+                    refusal,
+                    ..Default::default()
+                }),
+            };
+            let last = match last {
+                Some(last) if !outbox.late => last,
+                _ if outbox.late => ReadFileChunk {
+                    refusal: format!("the read took longer than {} s", sync::READ_DEADLINE.as_secs()),
+                    ..Default::default()
+                },
+                // Nobody reads any more.
+                _ => return,
+            };
+            outbox.finish(last);
+        });
+        Ok(Response::new(stream))
     }
 
     async fn replace_file_if(
         &self,
-        _request: Request<ReplaceFileIfRequest>,
+        request: Request<ReplaceFileIfRequest>,
     ) -> Result<Response<ReplaceFileIfResponse>, Status> {
-        Err(Status::unimplemented("ReplaceFileIf is not built yet"))
+        mark_activity(&request);
+        let request = request.into_inner();
+        let state = self.paths.state.clone();
+        let response = off_runtime(move || match sync::root(&request.root) {
+            Ok(root) => sync::files::replace_if(&state, &root, &request),
+            Err(refusal) => ReplaceFileIfResponse {
+                replaced: false,
+                refusal,
+            },
+        })
+        .await?;
+        Ok(Response::new(response))
     }
 
     async fn remove_file_if(
         &self,
-        _request: Request<RemoveFileIfRequest>,
+        request: Request<RemoveFileIfRequest>,
     ) -> Result<Response<RemoveFileIfResponse>, Status> {
-        Err(Status::unimplemented("RemoveFileIf is not built yet"))
+        mark_activity(&request);
+        let request = request.into_inner();
+        let state = self.paths.state.clone();
+        let response = off_runtime(move || match sync::root(&request.root) {
+            Ok(root) => sync::files::remove_if(&state, &root, &request),
+            Err(refusal) => RemoveFileIfResponse {
+                removed: false,
+                refusal,
+            },
+        })
+        .await?;
+        Ok(Response::new(response))
     }
 
     async fn wait_file_hash(
         &self,
-        _request: Request<WaitFileHashRequest>,
+        request: Request<WaitFileHashRequest>,
     ) -> Result<Response<WaitFileHashResponse>, Status> {
-        Err(Status::unimplemented("WaitFileHash is not built yet"))
+        mark_activity(&request);
+        let request = request.into_inner();
+        let response = off_runtime(move || match sync::root(&request.root) {
+            Ok(root) => sync::files::wait_hash(&root, &request),
+            Err(refusal) => WaitFileHashResponse {
+                refusal,
+                ..Default::default()
+            },
+        })
+        .await?;
+        Ok(Response::new(response))
     }
 
-    async fn path_sizes(&self, _request: Request<PathSizesRequest>) -> Result<Response<PathSizesResponse>, Status> {
-        Err(Status::unimplemented("PathSizes is not built yet"))
+    async fn path_sizes(&self, request: Request<PathSizesRequest>) -> Result<Response<PathSizesResponse>, Status> {
+        mark_activity(&request);
+        let request = request.into_inner();
+        let response = off_runtime(move || {
+            let measured = (|| {
+                let budget = budget_of(request.budget)?;
+                let root = sync::root(&request.root)?;
+                let ignored = sync::listing::ignore_predicate(&request.patterns);
+                let deadline = std::time::Instant::now() + sync::LIST_DEADLINE;
+                sync::listing::path_sizes(&root.dir, &request.rels, &*ignored, budget, deadline)
+            })();
+            match measured {
+                Ok((sizes, truncated)) => PathSizesResponse {
+                    sizes: sizes.into_iter().map(|(rel, bytes)| PathSize { rel, bytes }).collect(),
+                    truncated,
+                    refusal: String::new(),
+                },
+                Err(refusal) => PathSizesResponse {
+                    refusal,
+                    ..Default::default()
+                },
+            }
+        })
+        .await?;
+        Ok(Response::new(response))
     }
 
     async fn project_activity(
         &self,
-        _request: Request<ProjectActivityRequest>,
+        request: Request<ProjectActivityRequest>,
     ) -> Result<Response<ProjectActivityResponse>, Status> {
-        Err(Status::unimplemented("ProjectActivity is not built yet"))
+        mark_activity(&request);
+        let request = request.into_inner();
+        let canonical = match off_runtime(move || sync::root(&request.root).map(|root| root.canonical)).await? {
+            Ok(canonical) => canonical,
+            Err(refusal) => {
+                return Ok(Response::new(ProjectActivityResponse {
+                    refusal,
+                    ..Default::default()
+                }))
+            }
+        };
+        let facts = self.serving.activity_facts().await?;
+        let sidecars = self.sidecars.list().sidecars;
+        let (state, own_run, root) = (self.paths.state.clone(), self.paths.metadata_run(), canonical.clone());
+        let others = off_runtime(move || sync::activity::other_daemons_at(&state, &own_run, &root)).await?;
+        Ok(Response::new(sync::activity::judge(
+            &canonical, &facts, &sidecars, others,
+        )))
     }
 
     async fn watch_modes(&self, _request: Request<WatchModesRequest>) -> Result<Response<WatchModesResponse>, Status> {
         Err(Status::unimplemented("WatchModes is not built yet"))
     }
 
-    type ExecStream = Pin<Box<dyn tokio_stream::Stream<Item = Result<ExecOutput, Status>> + Send>>;
-    async fn exec(&self, _request: Request<tonic::Streaming<ExecInput>>) -> Result<Response<Self::ExecStream>, Status> {
-        Err(Status::unimplemented("Exec is not built yet"))
+    type ExecStream = Streamed<ExecOutput>;
+    async fn exec(&self, request: Request<tonic::Streaming<ExecInput>>) -> Result<Response<Self::ExecStream>, Status> {
+        mark_activity(&request);
+        let started_ms = crate::run_dir::unix_ms();
+        let mut input = request.into_inner();
+        let start = match input.message().await? {
+            Some(ExecInput {
+                input: Some(exec_input::Input::Start(start)),
+            }) => start,
+            _ => {
+                return Ok(Response::new(streamed(exec::refused(
+                    "the first message must start the command".to_owned(),
+                ))))
+            }
+        };
+        let captured = match self.sidecars.login_environment().await {
+            Ok(captured) => captured,
+            Err(status) => {
+                return Ok(Response::new(streamed(exec::refused(format!(
+                    "the login environment is unavailable: {}",
+                    status.message()
+                )))))
+            }
+        };
+        let prepared = match off_runtime(move || exec::git::prepare(&start, &captured.env)).await? {
+            Ok(prepared) => prepared,
+            Err(refusal) => return Ok(Response::new(streamed(exec::refused(refusal)))),
+        };
+        let (output, _ended) = exec::run(prepared, input, self.paths.state.clone(), started_ms, self.runs.clone());
+        Ok(Response::new(streamed(output)))
     }
+}
+
+/// The helper service with the transport limits its requests need.
+fn helper_server(service: Service) -> HelperServer<Service> {
+    HelperServer::new(service).max_decoding_message_size(MAX_REQUEST_BYTES)
 }
 
 pub async fn run(paths: Paths, idle: Duration) -> io::Result<()> {
@@ -346,6 +587,7 @@ pub async fn run_with_environment(
         last_closed: Instant::now(),
     }));
     let owned = Arc::new(tokio::sync::Mutex::new(sidecars));
+    let runs = Arc::new(exec::Runs::default());
     let tracked = connections.clone();
     let incoming = futures_util::stream::unfold(listener, move |listener| {
         let tracked = tracked.clone();
@@ -378,10 +620,12 @@ pub async fn run_with_environment(
         let server = tonic::transport::Server::builder()
             .http2_keepalive_interval(Some(Duration::from_secs(10)))
             .http2_keepalive_timeout(Some(Duration::from_secs(20)))
-            .add_service(HelperServer::new(Service {
+            .add_service(helper_server(Service {
                 sidecars: managed.clone(),
                 serving: serving.clone(),
                 sync_ignores: sync_ignores.clone(),
+                paths: paths.clone(),
+                runs: runs.clone(),
             }))
             .add_service(serve::Proxy(serving.clone()))
             .serve_with_incoming(incoming);
@@ -391,7 +635,7 @@ pub async fn run_with_environment(
                 tokio::time::sleep(idle.min(Duration::from_millis(100))).await;
                 owned.lock().await.reap_exited(&paths.state);
                 managed.observe_exits();
-                let empty = owned.lock().await.children.is_empty() && !managed.any_alive();
+                let empty = owned.lock().await.children.is_empty() && !managed.any_alive() && runs.running() == 0;
                 let state = connections.lock().expect("connection state");
                 if empty && state.active == 0 && state.last_closed.elapsed() >= idle {
                     break;
@@ -424,6 +668,10 @@ pub async fn run_with_environment(
         // Dropping the server stops acceptance without waiting for open RPC streams.
     };
     environment.abort();
+    // A run whose laptop has not closed its input is killed before the daemon's end closes that input for it; the
+    // others get a little time to finish and are audited if they do not.
+    runs.kill_unclosed();
+    runs.settle(&paths.state, exec::STOP_GRACE).await;
     let (result, terminate) = result;
     let managed_stopped = if terminate { managed.stop_all().await } else { Ok(()) };
     let mut sidecars = owned.lock().await;
@@ -519,12 +767,14 @@ mod tests {
         let paths = Paths::new(crate::VERSION, &root.join("data"), &root.join("state"), &root).unwrap();
         paths.prepare().unwrap();
         let sidecars = Arc::new(sidecars::Sidecars::new(paths.clone()).unwrap());
-        let serving = serve::Serving::new(paths, sidecars.clone());
+        let serving = serve::Serving::new(paths.clone(), sidecars.clone());
         (
             Service {
                 sidecars,
                 serving,
                 sync_ignores: Arc::new(sync::ignores::SyncIgnores::default()),
+                paths,
+                runs: Default::default(),
             },
             scratch,
         )
@@ -541,27 +791,97 @@ mod tests {
             .await
             .unwrap()
             .into_inner();
-        assert!(hello.capabilities.iter().any(|cap| cap == CAP_SYNC_IGNORES));
-        for capability in [CAP_SYNC_FILES, CAP_SYNC_MODES, CAP_EXEC] {
-            assert!(!hello.capabilities.iter().any(|cap| cap == capability), "{capability}");
+        for capability in [CAP_SYNC_IGNORES, CAP_GIT_CONFIG, CAP_SYNC_FILES, CAP_EXEC] {
+            assert!(hello.capabilities.iter().any(|cap| cap == capability), "{capability}");
         }
-        assert!(hello.capabilities.iter().any(|cap| cap == CAP_GIT_CONFIG));
+        assert!(!hello.capabilities.iter().any(|cap| cap == CAP_SYNC_MODES));
         assert_eq!(hello.protocol_minor, 2);
     }
 
     #[tokio::test]
     async fn new_rpcs_answer_unimplemented_with_their_name() {
         let (service, _scratch) = contract_service();
-        let streaming = service
-            .list_tree(Request::new(ListTreeRequest {
+        let modes = service
+            .watch_modes(Request::new(WatchModesRequest {
                 root: "/srv/project".into(),
                 ..Default::default()
             }))
             .await
-            .err()
+            .unwrap_err();
+        assert_eq!(modes.code(), tonic::Code::Unimplemented);
+        assert_eq!(modes.message(), "WatchModes is not built yet");
+    }
+
+    #[tokio::test]
+    async fn a_replacement_of_eight_mib_passes_the_transport() {
+        let (service, scratch) = contract_service();
+        let project = scratch.0.join("project");
+        std::fs::create_dir(&project).unwrap();
+        let socket = scratch.0.join("t.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let incoming = futures_util::stream::unfold(listener, |listener| async move {
+            Some((listener.accept().await.map(|(stream, _)| stream), listener))
+        });
+        let server = tokio::spawn(
+            tonic::transport::Server::builder()
+                .add_service(helper_server(service))
+                .serve_with_incoming(incoming),
+        );
+        let channel = tonic::transport::Endpoint::from_static("http://localhost")
+            .connect_with_connector(tower::service_fn(move |_| {
+                let socket = socket.clone();
+                async move { Ok::<_, io::Error>(hyper_util::rt::TokioIo::new(UnixStream::connect(socket).await?)) }
+            }))
+            .await
             .unwrap();
-        assert_eq!(streaming.code(), tonic::Code::Unimplemented);
-        assert_eq!(streaming.message(), "ListTree is not built yet");
+        let mut client = helper_client::HelperClient::new(channel);
+        // Over tonic's default 4 MiB, within the contract's 8 MiB.
+        let data = vec![7u8; 5 * 1024 * 1024];
+        let response = client
+            .replace_file_if(ReplaceFileIfRequest {
+                root: project.to_str().unwrap().into(),
+                rel: "big.bin".into(),
+                expected_sha256: String::new(),
+                data: data.clone(),
+            })
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(response.replaced, "{response:?}");
+        assert_eq!(std::fs::read(project.join("big.bin")).unwrap(), data);
+        server.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_stream_that_runs_out_of_time_ends_with_its_refusal_after_what_was_sent() {
+        use tokio_stream::StreamExt;
+        let (outbox, mut stream) = Outbox::<ListTreeEntry>::new(Duration::from_millis(200));
+        let filled = tokio::task::spawn_blocking(move || {
+            let mut outbox = outbox;
+            let mut sent = 0;
+            // Nobody reads: the channel fills, and the next send waits until the deadline.
+            while outbox.send(ListTreeEntry {
+                rel: format!("f{sent}"),
+                ..Default::default()
+            }) {
+                sent += 1;
+            }
+            assert!(outbox.late);
+            outbox.finish(ListTreeEntry {
+                refusal: "the listing took longer than 0 s".into(),
+                ..Default::default()
+            });
+            sent
+        })
+        .await
+        .unwrap();
+        let mut seen = Vec::new();
+        while let Some(entry) = stream.next().await {
+            seen.push(entry.unwrap());
+        }
+        assert_eq!(seen.len(), filled + 1);
+        assert!(seen[..filled].iter().all(|entry| entry.refusal.is_empty()));
+        assert_eq!(seen[filled].refusal, "the listing took longer than 0 s");
     }
 
     #[tokio::test]

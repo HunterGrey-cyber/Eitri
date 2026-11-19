@@ -140,7 +140,12 @@ impl Lab {
         let base = scratch.path().to_owned();
         let home = base.join("home");
         std::fs::create_dir_all(home.join(".config")).unwrap();
-        std::fs::write(home.join(".gitconfig"), "").unwrap();
+        // A detached automatic gc or maintenance run would repack objects while a scenario copies them.
+        std::fs::write(
+            home.join(".gitconfig"),
+            "[gc]\n\tauto = 0\n[maintenance]\n\tauto = false\n",
+        )
+        .unwrap();
         let marker = base.join("marker");
         let payload = base.join("payload.sh");
         write_exec(

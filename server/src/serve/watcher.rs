@@ -191,7 +191,19 @@ async fn watch(
             .map(tonic::Response::into_inner)
     })
     .await?;
-    while let Some(bytes) = events.message().await? {
+    // From here until this watch ends, the session's state is current whenever nothing more is waiting on the stream.
+    let _current = Current(session);
+    loop {
+        use futures_util::FutureExt;
+        let next = match events.message().now_or_never() {
+            Some(next) => next,
+            None => {
+                // Everything the sidecar had sent has been taken in; what follows comes live.
+                session.current.store(true, std::sync::atomic::Ordering::Release);
+                events.message().await
+            }
+        };
+        let Some(bytes) = next? else { break };
         let event = SessionEvent::decode(bytes.clone()).map_err(|error| Status::internal(error.to_string()))?;
         if event.session_id != id || event.sequence == 0 {
             return Err(Status::internal("watch returned an invalid event identity"));
@@ -203,6 +215,10 @@ async fn watch(
             if event.sequence <= state.journal.head() {
                 return Ok((state.closed, None, None));
             }
+            // Events skipped before this one may have started or ended a turn.
+            let gap = event.sequence > state.journal.head() + 1;
+            state.turn = super::advance(state.turn, gap, &event);
+            state.tasks = super::advance_tasks(state.tasks, gap, &event);
             // A journal that cannot write records the loss as a WriteFailed gap and keeps its head moving; the
             // watch goes on with the same stream, and Pending follows every event whatever the journal did.
             let mut journal_failure = state.journal.append(event.sequence, &bytes).err();
@@ -240,6 +256,15 @@ async fn watch(
         }
     }
     Ok(())
+}
+
+/// Marks the session not current when the watch that made it current ends, however it ends.
+struct Current<'a>(&'a SharedSession);
+
+impl Drop for Current<'_> {
+    fn drop(&mut self) {
+        self.0.current.store(false, std::sync::atomic::Ordering::Release);
+    }
 }
 
 /// Audits a write failure under `kind` when it is the first of a run of failures.
@@ -768,5 +793,24 @@ mod tests {
         assert!(Pending::open(&path).unwrap().list().is_empty());
         drop(pending);
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_session_is_current_only_while_its_watch_is_connected_and_caught_up() {
+        use std::sync::atomic::Ordering::Acquire;
+        let sidecar = FakeSidecar::start(vec![Reply::Events(vec![text(1), text(2)], End::Hold)]).await;
+        let session = observed(&sidecar, Arc::new(Disk));
+        assert!(
+            !session.current.load(Acquire),
+            "nothing is known before the watch connects"
+        );
+        let watch = follow(&sidecar, &session, running());
+        until(|| head(&session) == 2 && session.current.load(Acquire)).await;
+        watch.abort();
+        let _ = watch.await;
+        assert!(
+            !session.current.load(Acquire),
+            "a watch that ended leaves the session not current"
+        );
     }
 }
