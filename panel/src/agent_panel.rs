@@ -1316,6 +1316,8 @@ mod tests {
         pub(super) held_when_first_asked: Option<Vec<bool>>,
         pub(super) client_tools: Vec<Option<agent::ClientToolSet>>,
         pub(super) all: Vec<String>,
+        /// Each resume's early-history sink, in the order asked: a test hands a history over through it.
+        pub(super) earlies: Vec<agent::EarlyHistory>,
     }
 
     impl FakeResumes {
@@ -1387,9 +1389,11 @@ mod tests {
                 lease,
                 project,
                 client_tools,
+                early,
             } => {
                 let mut fake = fake.borrow_mut();
                 fake.client_tools.push(client_tools);
+                fake.earlies.push(early);
                 let mut spawn = fake.spawner(canonical.clone());
                 spawn(&id, lease, project)
             }

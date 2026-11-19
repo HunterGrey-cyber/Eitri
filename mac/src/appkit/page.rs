@@ -88,6 +88,8 @@ struct Bridge {
     /// Set for good by `PanelView::disconnect`: from then on every navigation is cancelled, a link click
     /// included, and nothing reaches the panel.
     disconnected: Cell<bool>,
+    /// Told each time the newest load has ended, finished or failed.
+    on_loaded: RefCell<Option<Rc<dyn Fn()>>>,
     #[cfg(any(test, debug_assertions, feature = "test-support"))]
     navigation_cancellations: Cell<u64>,
 }
@@ -107,6 +109,11 @@ impl Bridge {
     fn newest_load_ended(&self) {
         self.awaited_loads.borrow_mut().clear();
         *self.latest_load.borrow_mut() = None;
+        // Cloned out first: what it runs may load a document, which comes back here.
+        let on_loaded = self.on_loaded.borrow().clone();
+        if let Some(on_loaded) = on_loaded {
+            on_loaded();
+        }
     }
 
     /// Cloned out of the cell, so no borrow is held while the panel runs (it may load a document, which
@@ -608,6 +615,41 @@ impl PanelView {
     #[cfg(any(test, debug_assertions, feature = "test-support"))]
     pub fn document_loading(&self) -> bool {
         self.bridge.latest_load.borrow().is_some()
+    }
+
+    /// Asks the page to cancel a composition its composer has open (`window.__eitriImeCancel`, in the page's
+    /// `imeCancel.ts`): WebKit composes in the web process, where the host cannot see it, and confirms the raw letters
+    /// when the view gives up the keys. Sent before the keys move, so it reaches the page before the blur.
+    pub fn cancel_composition(&self) {
+        self.call_ime_cancel("window.__eitriImeCancel ? window.__eitriImeCancel() : 'no hook'");
+    }
+
+    /// The move [`cancel_composition`](Self::cancel_composition) was for did not happen: the composition goes on as
+    /// the person's own.
+    pub fn keep_composition(&self) {
+        self.call_ime_cancel("window.__eitriImeCancel ? window.__eitriImeCancel(false) : 'no hook'");
+    }
+
+    fn call_ime_cancel(&self, script: &str) {
+        let done = RcBlock::new(|result: *mut AnyObject, _error: *mut NSError| {
+            // SAFETY: WebKit passes the script's value or null, alive for the length of this call.
+            let answer = unsafe { result.as_ref() }
+                .and_then(|value| value.downcast_ref::<NSString>())
+                .map(|value| value.to_string());
+            if answer.as_deref() == Some("armed") {
+                crate::log_line!("[mac] the page's composition is cancelled as the keys leave it");
+            }
+        });
+        // SAFETY: asynchronous by contract, as `send` is.
+        unsafe {
+            self.view
+                .evaluateJavaScript_completionHandler(&NSString::from_str(script), Some(&done));
+        }
+    }
+
+    /// Calls `f` each time the newest document load has ended (finished or failed).
+    pub fn on_loaded(&self, f: impl Fn() + 'static) {
+        *self.bridge.on_loaded.borrow_mut() = Some(Rc::new(f));
     }
 
     /// What the window sets when it moves the keys.

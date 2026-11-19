@@ -48,7 +48,29 @@ fn forbidden(name: &str) -> bool {
 }
 
 fn offenders(manifest: &str) -> Vec<String> {
-    manifest_dependency_offenders(manifest, forbidden)
+    manifest_dependency_offenders(manifest, include_str!("../../Cargo.toml"), forbidden)
+}
+
+fn assert_inherited_dependencies(newline: &str) {
+    let workspace = "[workspace.dependencies]\nui = { package = 'gtk4', version = '1' }\n".replace('\n', newline);
+    let member = "[dependencies]\nui = { workspace = true }\n[target.'cfg(unix)'.build-dependencies]\nui.workspace = true\n[dev-dependencies]\nui = '1'\n".replace('\n', newline);
+    assert_eq!(
+        manifest_dependency_offenders(&member, &workspace, forbidden),
+        [
+            "[dependencies] ui (package gtk4)",
+            "[target.\"cfg(unix)\".build-dependencies] ui (package gtk4)",
+        ]
+    );
+}
+
+#[test]
+fn workspace_inherited_dependency_with_a_banned_package_is_an_offender() {
+    assert_inherited_dependencies("\n");
+}
+
+#[test]
+fn workspace_inherited_dependency_with_a_banned_package_is_an_offender_crlf() {
+    assert_inherited_dependencies("\r\n");
 }
 
 #[test]

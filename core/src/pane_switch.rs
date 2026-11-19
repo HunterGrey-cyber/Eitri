@@ -497,8 +497,10 @@ pub enum PaneMessage {
     Reopen(ReopenLine),
     /// nvim will say when it leaves: from here an exit with no [`Self::EditorLeaving`] is a crash.
     EditorWatched,
-    /// nvim is quitting on purpose, not on a deadly signal.
-    EditorLeaving,
+    /// nvim is quitting on purpose, not on a deadly signal, from a buffer of `filetype` (empty: none, or not said).
+    EditorLeaving {
+        filetype: String,
+    },
     /// `count` project files have unsaved changes in swap files; `newest` is the latest of them.
     Recoverable {
         count: u32,
@@ -865,6 +867,19 @@ impl PaneSwitchReader {
 /// by name) and `A <token> <word>` (the editor left reopening to [`AsideWord`]). The token is 16
 /// lowercase hex characters, the counts plain ASCII digits; a name keeps its spaces, as the `S`
 /// form's does.
+/// The longest filetype a `nvim-leaving` line carries; `editor_watch.lua` cuts to the same length.
+const FILETYPE_MAX_BYTES: usize = 40;
+
+/// A filetype as one word: ASCII letters, digits, `_`, `.` and `-`, at most [`FILETYPE_MAX_BYTES`] of them.
+fn parse_filetype(word: &str) -> Option<String> {
+    let valid = !word.is_empty()
+        && word.len() <= FILETYPE_MAX_BYTES
+        && word
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b'-'));
+    valid.then(|| word.to_string())
+}
+
 fn parse_message(line: &str) -> Option<PaneMessage> {
     if let Some(report) = parse_reopen_line(line) {
         return Some(PaneMessage::Reopen(report));
@@ -879,8 +894,15 @@ fn parse_message(line: &str) -> Option<PaneMessage> {
         "U" => return Some(PaneMessage::Direction('U')),
         "D" => return Some(PaneMessage::Direction('D')),
         "nvim-watched" => return Some(PaneMessage::EditorWatched),
-        "nvim-leaving" => return Some(PaneMessage::EditorLeaving),
+        "nvim-leaving" => {
+            return Some(PaneMessage::EditorLeaving {
+                filetype: String::new(),
+            })
+        }
         _ => {}
+    }
+    if let Some(filetype) = trimmed.strip_prefix("nvim-leaving ") {
+        return parse_filetype(filetype).map(|filetype| PaneMessage::EditorLeaving { filetype });
     }
     if let Some(rest) = trimmed.strip_prefix("S ") {
         return parse_recoverable(rest);
@@ -1443,7 +1465,24 @@ mod tests {
     #[test]
     fn the_editor_watchs_lines_are_read_strictly() {
         assert_eq!(parse_message("nvim-watched\n"), Some(PaneMessage::EditorWatched));
-        assert_eq!(parse_message("nvim-leaving\n"), Some(PaneMessage::EditorLeaving));
+        assert_eq!(
+            parse_message("nvim-leaving\n"),
+            Some(PaneMessage::EditorLeaving {
+                filetype: String::new()
+            })
+        );
+        assert_eq!(
+            parse_message("nvim-leaving snacks_dashboard\n"),
+            Some(PaneMessage::EditorLeaving {
+                filetype: "snacks_dashboard".to_string()
+            })
+        );
+        assert_eq!(
+            parse_message("nvim-leaving c.sharp-2\n"),
+            Some(PaneMessage::EditorLeaving {
+                filetype: "c.sharp-2".to_string()
+            })
+        );
         assert_eq!(
             parse_message("S 2 src/a b.txt\n"),
             Some(PaneMessage::Recoverable {
@@ -1460,7 +1499,10 @@ mod tests {
             "S 0 a",
             "S 4294967296 a",
             "S 1 a\tb",
-            "nvim-leaving now",
+            "nvim-leaving two words",
+            "nvim-leaving a\tb",
+            "nvim-leaving \u{e9}",
+            &format!("nvim-leaving {}", "f".repeat(FILETYPE_MAX_BYTES + 1)),
             &format!("S 1 {long}"),
         ] {
             assert_eq!(parse_message(line), None, "{line:?}");

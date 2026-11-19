@@ -724,8 +724,7 @@ mod macos {
             counted.get() < 3
         });
         let fired = spin_until(Duration::from_secs(60), || calls.get() >= 3);
-        // SAFETY: a timer retained on this main thread.
-        let stopped = unsafe { !timer.isValid() };
+        let stopped = !timer.isValid();
         checks.check(
             "a repeating timer stops when it says so",
             fired && stopped && calls.get() == 3,

@@ -4,9 +4,9 @@
 //! toolkit dependency added to the manifest. A GTK dependency, used or not, prevents the macOS host from building on
 //! this crate. This scan makes that boundary a test failure; it lives apart from the code it checks. The manifest is
 //! read as TOML through `source_scan::manifest_dependency_offenders`, so a dependency in any table of either spelling,
-//! a `[dependencies.gtk4]` sub-table, a dotted key and a rename (`ui = { package = "gtk4" }`) are caught. A rename
-//! inherited from the root's `[workspace.dependencies]` is not: this manifest names only the key. `cargo tree -p
-//! eitri-core -e normal | grep -E 'gtk|gdk|glib|webkit'` is the check for a toolkit arriving transitively through
+//! a `[dependencies.gtk4]` sub-table, a dotted key and a rename (`ui = { package = "gtk4" }`) are caught, and so is a
+//! rename inherited from the root's `[workspace.dependencies]`: the root manifest is read with this one. `cargo tree
+//! -p eitri-core -e normal | grep -E 'gtk|gdk|glib|webkit'` is the check for a toolkit arriving transitively through
 //! another dependency.
 
 use crate::source_scan::{is_package_in_family, manifest_dependency_offenders};
@@ -14,6 +14,8 @@ use crate::source_scan::{is_package_in_family, manifest_dependency_offenders};
 use crate::source_scan::{AWKWARD_DEPENDENCY_SPELLINGS, NAMES_INSIDE_OTHER_WORDS};
 
 const MANIFEST: &str = include_str!("../Cargo.toml");
+/// The root manifest, whose `[workspace.dependencies]` an inherited dependency of this crate resolves through.
+const WORKSPACE: &str = include_str!("../../Cargo.toml");
 
 /// Package names (or the start of one, for a `gtk4-sys`-shaped transitive) that must never appear
 /// as a dependency of this crate. `gdk4` needs its own entry: neither `gdk` nor `gdk-` matches it.
@@ -21,7 +23,7 @@ const FORBIDDEN: &[&str] = &["gtk4", "webkit6", "glib", "gio", "gdk", "gdk4", "g
 
 /// Every dependency of `manifest` that is, or renames, a forbidden package, as `[table] name`.
 fn forbidden_dependencies(manifest: &str) -> Vec<String> {
-    manifest_dependency_offenders(manifest, |name| is_package_in_family(name, FORBIDDEN))
+    manifest_dependency_offenders(manifest, WORKSPACE, |name| is_package_in_family(name, FORBIDDEN))
 }
 
 #[test]

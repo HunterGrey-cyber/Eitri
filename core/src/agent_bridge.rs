@@ -2687,6 +2687,18 @@ pub fn serialize_snapshot_with_link_for_js(
     cards: &[crate::editor_tools::cards::EditorCardWire],
     link_state: Option<&agent::RemoteLinkState>,
 ) -> String {
+    snapshot_envelope(tab, view, turn_started_at_ms, notes, cards, link_state).to_string()
+}
+
+/// [`serialize_snapshot_with_link_for_js`]'s envelope, before it is written out.
+fn snapshot_envelope(
+    tab: crate::tabs::TabId,
+    view: &SnapshotView<'_>,
+    turn_started_at_ms: Option<u64>,
+    notes: &CallNotes,
+    cards: &[crate::editor_tools::cards::EditorCardWire],
+    link_state: Option<&agent::RemoteLinkState>,
+) -> Value {
     let projection = &*view.projection;
     // Written out for the same stated reason as `transcript` just below: both field names happen
     // to be single lowercase words today, so the derive would produce the same JSON, but this
@@ -3072,7 +3084,16 @@ pub fn serialize_snapshot_with_link_for_js(
         // its whole table with this list, so a turn absent here shows no duration.
         "turnTimes": notes.turn_times.iter().map(TurnTime::to_json).collect::<Vec<_>>(),
     })
-    .to_string()
+}
+
+/// The snapshot of a resume's history drawn before its session is live (`TabSet::collect_early_histories`):
+/// [`serialize_snapshot_for_js`] marked `"early": true`. The page draws it under its starting tab, keeps it
+/// only while that tab is starting, and never keeps it as a lost conversation when the start fails: no
+/// session took it up.
+pub fn serialize_early_snapshot_for_js(tab: crate::tabs::TabId, view: &SnapshotView<'_>) -> String {
+    let mut envelope = snapshot_envelope(tab, view, None, &CallNotes::default(), &[], None);
+    envelope["early"] = Value::Bool(true);
+    envelope.to_string()
 }
 
 fn turn_start_json(start: &agent::TurnStartRecord) -> Value {

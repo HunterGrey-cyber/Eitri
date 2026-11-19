@@ -568,19 +568,31 @@ fn called_functions(text: &str) -> Vec<String> {
 
 /// The keys a text hands to `eitri.config.set("…"` or `eitri.config.get("…"`.
 fn configured_keys(text: &str) -> Vec<String> {
-    let mut keys = Vec::new();
-    for call in ["eitri.config.set(", "eitri.config.get("] {
-        for (at, _) in text.match_indices(call) {
-            if let Some(rest) = text[at + call.len()..].trim_start().strip_prefix('"') {
-                keys.push(rest[..rest.find('"').expect("a closed key")].to_owned());
-            }
-        }
-    }
-    keys
+    crate::source_scan::word_ends(text, "eitri")
+        .into_iter()
+        .filter_map(|end| {
+            let method = [".", "config", "."]
+                .into_iter()
+                .try_fold(&text[end..], |tail, token| tail.trim_start().strip_prefix(token))?
+                .trim_start();
+            let tail = method.strip_prefix("get").or_else(|| method.strip_prefix("set"))?;
+            let key = tail.trim_start().strip_prefix('(')?.trim_start().strip_prefix('"')?;
+            Some(key.split_once('"').expect("a closed key").0.to_owned())
+        })
+        .collect()
 }
 
 /// The settings tables' header: the guide lists every setting in a table that starts with it.
 const SETTINGS_TABLE_HEADER: &str = "| key | value | default | what it does |";
+
+#[test]
+fn guide_keys_include_split_config_calls() {
+    for newline in ["\n", "\r\n"] {
+        let example = "eitri.config\n  .get(\n\"window.typo\")\neitri . config . set\n(\"editor.typo\", 1)"
+            .replace('\n', newline);
+        assert_eq!(configured_keys(&example), ["window.typo", "editor.typo"]);
+    }
+}
 
 /// The first column of every settings table in a page.
 fn settings_table_keys(page: &str) -> Vec<String> {

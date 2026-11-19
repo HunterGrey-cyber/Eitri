@@ -1224,6 +1224,58 @@ fn a_start_that_fails_after_the_sidecar_started_stops_it() {
     }
 }
 
+/// The link breaks after the helper started the sidecar and before the tab's handshake answered: the start fails, the
+/// stop sent after the failed handshake cannot go out either, and the failure names the sidecar left running.
+#[test]
+fn a_link_cut_during_the_handshake_names_the_sidecar_left_running_for_its_stop() {
+    let gate = std::env::temp_dir().join(format!(
+        "handshake-gate-{}",
+        &uuid::Uuid::new_v4().simple().to_string()[..8]
+    ));
+    agent::private_fs::create_private_dir_all(&gate, &gate).unwrap();
+    let server = Server::new(&[&format!("EITRI_STANDIN_HANDSHAKE_GATE={}", gate.display())]);
+    let flaky = Flaky::new(&server);
+    let client = server.client(flaky.clone());
+    let start = server.start(None);
+    let starting = std::thread::spawn(move || {
+        agent::remote_client::open_remote_session(client, HOST_KEY, &start, ProjectTrust::Untrusted, None)
+    });
+    wait_for("the tab's handshake", || gate.join("handshaking").exists());
+    flaky.cut();
+    std::fs::write(gate.join("release"), b"").unwrap();
+    let failed = starting
+        .join()
+        .unwrap()
+        .err()
+        .expect("the start fails with the link cut");
+    assert!(
+        failed.info.is_none() && failed.message.contains("did not answer"),
+        "the handshake failed, not a later step: {}",
+        failed.message
+    );
+    let sidecar = failed.unstopped.expect("the sidecar left running is named");
+    let direct = server.direct();
+    assert_eq!(server.alive(&direct), 1, "the sidecar still runs: {}", failed.message);
+    assert!(direct
+        .list()
+        .unwrap()
+        .iter()
+        .any(|listed| listed.sidecar_id == sidecar.sidecar_id));
+    flaky.restore();
+    let (daemon, id) = sidecar
+        .stop_key()
+        .split_once('/')
+        .map_or((String::new(), sidecar.stop_key()), |(d, i)| {
+            (d.to_string(), i.to_string())
+        });
+    server
+        .client(Arc::new(server.launcher()))
+        .stop_saved(&daemon, &id)
+        .unwrap();
+    wait_for("the sidecar stopped", || server.alive(&direct) == 0);
+    let _ = std::fs::remove_dir_all(&gate);
+}
+
 /// The link breaks while the session is being created: the start fails, the stop it then sends cannot go out, and
 /// the failure names the sidecar left running, whose kept stop stops it once the server can be reached again.
 #[test]

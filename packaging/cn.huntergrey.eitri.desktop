@@ -1,8 +1,8 @@
 [Desktop Entry]
 Type=Application
 Name=Eitri
-Comment=Your Neovim, tiled with your agents, terminals and the web pages you build.
-Comment[zh_CN]=你的 Neovim，和 agent、终端、你自己做的网页平铺在一起。
+Comment=A workspace for your own Neovim: coding agents, rendered Markdown and terminals, tiled in one window
+Comment[zh_CN]=给你自己的 Neovim 一个工作环境：编程 agent、渲染好的 Markdown 和终端，平铺在一个窗口里
 Exec=/usr/bin/eitri --quiet --from-desktop %F
 Icon=cn.huntergrey.eitri
 StartupWMClass=cn.huntergrey.eitri

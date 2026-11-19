@@ -442,6 +442,27 @@ impl ReviewTicket {
     }
 }
 
+/// A resume's history drawn before its session is live: what the connect worker hands over once it has
+/// loaded it (`agent::EarlyHistory`), ahead of the provider's resume and its verdict wait. Drawn only
+/// while the tab is starting, as a snapshot marked early; the backend that installs replaces it with
+/// its own projection, which starts from the same history, and a start that fails drops it.
+#[derive(Default)]
+struct EarlyView {
+    arriving: Option<mpsc::Receiver<agent::AgentSessionProjection>>,
+    shown: Option<Box<agent::AgentSessionProjection>>,
+}
+
+/// The two ends of a resume's early history: the sink its connect worker hands the loaded history to, and
+/// the receiver [`TabSet::expect_early_history`] gives the tab.
+pub fn early_history_channel() -> (agent::EarlyHistory, mpsc::Receiver<agent::AgentSessionProjection>) {
+    let (tx, rx) = mpsc::channel();
+    let sink = agent::EarlyHistory::new(move |history| {
+        // The tab may be gone (closed, or reset into a new start): nothing waits for it then.
+        let _ = tx.send(history);
+    });
+    (sink, rx)
+}
+
 pub struct Tab {
     /// Fixed when the tab is opened and preserved when it moves between windows.
     origin: TabOrigin,
@@ -526,6 +547,8 @@ pub struct Tab {
     /// The composer's draft images and the image bytes this tab's turns carried ([`TabAttachments`]). On the tab,
     /// not its session state, so a first message's images survive the start of its session.
     pub attachments: TabAttachments,
+    /// A resume's history drawn while the tab is still starting ([`EarlyView`]).
+    early: EarlyView,
     /// The tab's mode when its session left executing for plan mode, while it is planning or moving into or
     /// out of it. The tab keeps that mode underneath; the page shows it as where plan mode started.
     plan_origin: Option<SessionModeChoice>,
@@ -984,6 +1007,7 @@ impl Tab {
             plan_cycle: PlanCycle::default(),
             plan_start: None,
             attachments: TabAttachments::default(),
+            early: EarlyView::default(),
         }
     }
 
@@ -1579,6 +1603,9 @@ pub enum StartCollected {
         tab: TabId,
         request_id: String,
         first_turn: Option<FirstTurn>,
+        /// The page was drawing the resume's early history ([`TabSet::collect_early_histories`]): it
+        /// already shows the conversation, and its composer is the one the person may be typing in.
+        early: bool,
     },
     Failed {
         tab: TabId,
@@ -3940,6 +3967,43 @@ impl TabSet {
             return;
         }
         t.backend = TabBackend::Starting(pending);
+        // A new start draws no history of an earlier one; its own arrives through `expect_early_history`.
+        t.early = EarlyView::default();
+    }
+
+    /// The tab's start will hand its loaded history to `arriving` before its session is live
+    /// ([`early_history_channel`]); [`TabSet::collect_early_histories`] takes it from there. Called after
+    /// [`TabSet::start`], which clears any earlier one.
+    pub fn expect_early_history(&mut self, tab: TabId, arriving: mpsc::Receiver<agent::AgentSessionProjection>) {
+        if let Some(t) = self.get_mut(tab) {
+            t.early.arriving = Some(arriving);
+        }
+    }
+
+    /// The starting tabs whose early history arrived since the last call: their pages are owed it.
+    /// `try_recv` only, as [`TabSet::collect_starts`]: this runs on the GTK main loop.
+    pub fn collect_early_histories(&mut self) -> Vec<TabId> {
+        let mut arrived = Vec::new();
+        for tab in &mut self.tabs {
+            if !matches!(tab.backend, TabBackend::Starting(_)) {
+                continue;
+            }
+            let Some(arriving) = &tab.early.arriving else {
+                continue;
+            };
+            match arriving.try_recv() {
+                Ok(history) => {
+                    tab.early = EarlyView {
+                        arriving: None,
+                        shown: Some(Box::new(history)),
+                    };
+                    arrived.push(tab.id);
+                }
+                Err(mpsc::TryRecvError::Empty) => {}
+                Err(mpsc::TryRecvError::Disconnected) => tab.early.arriving = None,
+            }
+        }
+        arrived
     }
 
     fn take_start(&mut self, tab: TabId) -> Option<DeferredStart> {
@@ -5078,6 +5142,8 @@ impl TabSet {
             let TabBackend::Starting(pending) = std::mem::replace(&mut tab.backend, TabBackend::NotStarted) else {
                 unreachable!("matched Starting above")
             };
+            // Installed, the backend's own projection replaces it; failed, no session took it up.
+            let early = std::mem::take(&mut tab.early).shown.is_some();
             match result {
                 Ok(mut backend) => {
                     // A rename given while it connected is the newer one and is written to the
@@ -5113,6 +5179,7 @@ impl TabSet {
                         tab: tab.id,
                         request_id: pending.request_id,
                         first_turn: pending.first_turn,
+                        early,
                     });
                 }
                 Err(error) => {
@@ -5233,6 +5300,21 @@ impl TabSet {
                     .iter()
                     .map(|command| serialize_handoff_for_js(tab.id, command)),
             ),
+            TabBackend::Starting(pending) => {
+                if let Some(history) = &tab.early.shown {
+                    let view = SnapshotView {
+                        backend: crate::agent_backend::BackendKind::Sidecar.as_str(),
+                        conversation_id: None,
+                        session_id: None,
+                        provider_session_id: pending.resume.clone(),
+                        capabilities: agent::ProviderCapabilities::default(),
+                        provider: None,
+                        projection: crate::agent_backend::ProjectionRef::Borrowed(history),
+                        hidden_pending: None,
+                    };
+                    payloads.push(crate::agent_bridge::serialize_early_snapshot_for_js(tab.id, &view));
+                }
+            }
             _ => {}
         }
         payloads.push(crate::agent_bridge::serialize_queue_for_js(
@@ -7259,6 +7341,43 @@ impl TabSet {
         }
     }
 
+    /// What `tab` holds that no session took up: its queue, oldest first, then its draft, as one text (blank lines
+    /// between), with the queued images; the queue is emptied. `None` for a tab it does not have.
+    fn take_unsent(&mut self, tab: TabId) -> Option<(String, Vec<ReadyImage>)> {
+        let t = self.get_mut(tab)?;
+        let mut parts = Vec::new();
+        let mut images = Vec::new();
+        for queued in std::mem::take(&mut t.session.queue) {
+            parts.push(queued.text);
+            images.extend(queued.attachments);
+        }
+        if !t.session.draft.trim().is_empty() {
+            parts.push(t.draft().to_string());
+        }
+        t.session.queue_note = None;
+        t.session.queue_error = None;
+        Some((parts.join("\n\n"), images))
+    }
+
+    /// A start that will not happen (its trust question was answered no, or it was put off): what was queued behind
+    /// it comes back as the tab's draft, ahead of what the draft held, as `r` returns a failed tab's queue. Left
+    /// queued, it would go to whatever session the tab starts next, which is not the one it was typed for. Whether
+    /// anything was queued.
+    pub fn queue_back_to_draft(&mut self, tab: TabId) -> bool {
+        if self.get(tab).is_none_or(|t| t.session.queue.is_empty()) {
+            return false;
+        }
+        let Some((unsent, images)) = self.take_unsent(tab) else {
+            return false;
+        };
+        if let Some(t) = self.get_mut(tab) {
+            t.replace_draft(unsent);
+        }
+        self.images_back_to_draft(tab, images);
+        self.draft_changed(tab);
+        true
+    }
+
     /// A restored tab whose resume failed. `back_to` is [`RestoreRun::back_to`]: an empty tab again, in
     /// the mode it had before the restore and under a fresh row key, if it is the one the restore began in; gone if
     /// the restore made it. What went wrong is reported once for the whole restore, not left as a dead tab each.
@@ -7266,6 +7385,12 @@ impl TabSet {
         if !matches!(self.get(tab).map(|t| &t.backend), Some(TabBackend::Failed { .. })) {
             return;
         }
+        // What was typed while the tab was starting reached no session: the session it was queued for never
+        // came back. It returns as text in a composer, oldest first, as `r` returns a failed tab's queue, and is
+        // never left queued where a fresh session started later would take it up as its own.
+        let Some((unsent, images)) = self.take_unsent(tab) else {
+            return;
+        };
         match back_to {
             Some((mode, agent)) => {
                 if let Some(at) = self.position(tab) {
@@ -7276,13 +7401,19 @@ impl TabSet {
                     // The restore gave this tab the record's key, and the record goes back unrestored (a hand-over
                     // returns it to its source, which takes the key up again): the empty tab is named afresh.
                     t.row_key = RowKey::new();
+                    t.replace_draft(unsent);
                     self.give_mode(at, mode);
                 }
+                self.images_back_to_draft(tab, images);
+                self.draft_changed(tab);
             }
             None => {
-                let draft = self.get(tab).map(|t| t.draft().to_string());
+                // The text goes to the tab on screen's composer, after what it holds, and is sent only if the
+                // person sends it there. The queued images go with the closed tab, whose close lets go of what
+                // its draft holds: a composer's images are its own tab's files.
+                self.images_back_to_draft(tab, images);
                 self.remove(tab);
-                self.give_restored_draft(self.active, draft.filter(|text| !text.trim().is_empty()));
+                self.give_restored_draft(self.active, Some(unsent).filter(|text| !text.trim().is_empty()));
             }
         }
         debug_assert!(self.v1_holds());

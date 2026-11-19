@@ -28,6 +28,7 @@ import {
 import type { CompletionCommand, SlashAction } from "../slashCommands";
 import { HistorySearch } from "./HistorySearch";
 import { atToken, atInsertion, withEditorMentions } from "../atMenu";
+import { CompositionGuard, registerImeCancel } from "../imeCancel";
 import { AtMenu } from "./AtMenu";
 import { SlashMenu } from "./SlashMenu";
 import { NO_TEXT_ASSIST } from "../textField";
@@ -315,6 +316,17 @@ export function Composer({
      box reads as lag. That is only acceptable if a refused send puts the text back — otherwise the
      message is gone with no trace, which is the one outcome this must never produce. */
   const textareaRef = useRef<HTMLTextAreaElement>(null);
+  // The host's cancel of an open input-method composition, when it moves the keys to the editor (`imeCancel.ts`).
+  const imeGuard = useRef<CompositionGuard | null>(null);
+  if (imeGuard.current === null) imeGuard.current = new CompositionGuard();
+  useEffect(
+    () =>
+      registerImeCancel({
+        arm: () => imeGuard.current?.arm() ?? false,
+        disarm: () => imeGuard.current?.disarm(),
+      }),
+    [],
+  );
   /** The whole box, chips included: where ← at the text's start finds the last chip. */
   const rootRef = useRef<HTMLDivElement>(null);
   /** Where the caret goes on focus: the end, unless the user left it elsewhere in the same text. */
@@ -931,7 +943,31 @@ export function Composer({
                 onModeChange("browse");
               }
             }}
-            onKeyDown={onKeyDown}
+            onKeyDown={(e) => {
+              if (!e.nativeEvent.isComposing) imeGuard.current?.key();
+              onKeyDown(e);
+            }}
+            onCompositionStart={(e) =>
+              imeGuard.current?.start({
+                text: e.currentTarget.value,
+                selectionStart: e.currentTarget.selectionStart,
+                selectionEnd: e.currentTarget.selectionEnd,
+              })
+            }
+            onCompositionEnd={(e) => {
+              const back = imeGuard.current?.end(e.currentTarget.value);
+              if (!back) return;
+              // The confirm's own input has already set the raw letters: the text before the composition replaces it.
+              setText(back.text);
+              onDraftChange?.(back.text);
+              const field = textareaRef.current;
+              if (field) {
+                // Not once the person is back in the box: their own caret wins.
+                requestAnimationFrame(() => {
+                  if (document.activeElement !== field) field.setSelectionRange(back.selectionStart, back.selectionEnd);
+                });
+              }
+            }}
             onPaste={onPaste}
             onKeyUp={(e) => {
               caretRef.current = e.currentTarget.selectionStart;

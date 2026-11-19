@@ -336,7 +336,11 @@ ran is still sent when that turn ends, even when it ended at a limit.
 
 If nvim itself goes without being asked, killed or crashed, the window stays and says so:
 `nvim stopped unexpectedly — <prefix> e starts it again and says what can be recovered`. `:q` of the last buffer still
-closes the window, as it does in plain Neovim. When a start finds this project's files with unsaved changes in swap
+closes the window, as it does in plain Neovim. The exception is a quit from a start screen (the buffer is a
+LazyVim dashboard, `alpha`, `dashboard`, `ministarter` or `starter`) in a window that also holds a chat, the terminal or
+a page: that asks `close Eitri? (y/n)` first, because a second `q` pressed in a plugin's float (Lazy's update screen,
+say) quits through the dashboard behind it. `n` ends the editor in place, the window stays, and the editor's key starts
+nvim again; `y` closes. `:qa`, `:wqa` and `ZZ` from a real buffer still close at once. When a start finds this project's files with unsaved changes in swap
 files, it says so once: `unsaved changes kept for long.txt — :e the file, then r recovers them or d deletes them`.
 Nothing is recovered unless you do that, and the line comes back at each start until the swap file is gone.
 

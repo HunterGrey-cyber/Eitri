@@ -167,10 +167,30 @@ async fn remove_stale_socket(paths: &Paths) -> io::Result<()> {
     }
 }
 
-/// The account's passwd name, for the linger check. The lookup runs on a thread of its own and gets a second: a
-/// directory service that does not answer (NSS can outlive any deadline) counts as not lingering, the placement that
-/// is safe while KillUserProcesses is off, rather than holding the start lock.
+/// The account's passwd name, for the linger check. The lookup runs on a thread of its own and gets a second; when a
+/// directory service does not answer in time (NSS can outlive any deadline), the name sshd gave the login (`USER`,
+/// else `LOGNAME`) stands in rather than the start lock being held. A forged one can only choose where the daemon
+/// is placed.
 fn account_name() -> Option<std::ffi::OsString> {
+    name_or_login(
+        passwd_name(Duration::from_secs(1)),
+        std::env::var_os("USER"),
+        std::env::var_os("LOGNAME"),
+    )
+}
+
+fn name_or_login(
+    passwd: Option<std::ffi::OsString>,
+    user: Option<std::ffi::OsString>,
+    logname: Option<std::ffi::OsString>,
+) -> Option<std::ffi::OsString> {
+    [passwd, user, logname]
+        .into_iter()
+        .flatten()
+        .find(|name| !name.is_empty())
+}
+
+fn passwd_name(wait: Duration) -> Option<std::ffi::OsString> {
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::Builder::new()
         .name("eitri-passwd".into())
@@ -181,7 +201,7 @@ fn account_name() -> Option<std::ffi::OsString> {
             let _ = tx.send(name);
         })
         .ok()?;
-    rx.recv_timeout(Duration::from_secs(1)).ok().flatten()
+    rx.recv_timeout(wait).ok().flatten()
 }
 
 /// Where logind keeps one empty file per lingering account (`loginctl enable-linger` creates it).
@@ -362,6 +382,19 @@ mod tests {
         agent::private_fs::write_private(&root.join("systemd/private"), b"").unwrap();
         assert!(super::use_systemd_scope(Some(&root), true));
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_passwd_lookup_that_does_not_answer_falls_back_to_the_logins_name() {
+        let name = |text: &str| Some(std::ffi::OsString::from(text));
+        assert_eq!(super::name_or_login(name("pw"), name("user"), name("log")), name("pw"));
+        assert_eq!(super::name_or_login(None, name("user"), name("log")), name("user"));
+        assert_eq!(super::name_or_login(None, name(""), name("log")), name("log"));
+        assert_eq!(super::name_or_login(None, None, None), None);
+        // An account with a passwd entry answers within the wait (a container's arbitrary uid has none).
+        if crate::daemon::login_env::minimal_environment().is_ok() {
+            assert!(super::passwd_name(std::time::Duration::from_secs(10)).is_some());
+        }
     }
 
     #[test]

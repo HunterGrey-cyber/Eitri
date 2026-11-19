@@ -29,6 +29,9 @@ def no_source_names_the_supervisor():
         if path in (
             "packaging/tests/install/fixtures/install-0.2.0.sh",
             "packaging/release-notes.md.in",
+            # The release pages say, once, that the dashboard is gone (the release notes' own line).
+            "publish/files/docs/releases/0.4.md",
+            "publish/files/docs/releases/0.4.zh-CN.md",
             # The placeholder 0.2.0's installer wants in the tarball (packaging/legacy/README.md).
             "packaging/legacy/README.md",
             "packaging/release.sh",

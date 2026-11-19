@@ -61,6 +61,12 @@ export type EmptyTabProps = {
   /** Bumped by App's `arrive` handling: lands BROWSE with the
    *  cursor on the dashboard's `New session` item, the same reversal a live tab's arrival gets. */
   arriveRequest: number;
+  /** Bumped when a refused restore hands this tab back empty while the box may be taking keys: the screen leaves
+   *  INPUT, keeping the box's text, so a key on its way does not send it. Optional, a counter like `arriveRequest`. */
+  leaveInputRequest?: number;
+  /** Set by the page when that happened (this screen may mount just after it): until a key stands alone, an Enter is
+   *  the end of what was being typed, not a choice on this screen. Cleared here by the first Enter that may act. */
+  leftUnderTyping?: { current: boolean };
   /** Bumped by `App`'s own `[keysRequest]` effect when this is the empty layout -- a `pane_focus`
    *  round trip, or an overlay closing, must never leave the keys on `document.body`. Landed on the composer (INPUT)
    *  or this screen's own root (BROWSE), whichever currently has the live control. */
@@ -196,6 +202,9 @@ export function EmptyTab(props: EmptyTabProps) {
   const focusAtMount = useRef(props.focusRequest);
   const editReturnAtMount = useRef(props.editReturnRequest);
   const arriveAtMount = useRef(props.arriveRequest);
+  const leaveInputAtMount = useRef(props.leaveInputRequest ?? 0);
+  const ownLeftUnderTyping = useRef(false);
+  const leftUnderTypingRef = props.leftUnderTyping ?? ownLeftUnderTyping;
   /** A start put off until the trust question is answered. Everything that treats a starting tab as busy
    *  (the composer queues behind it, no dashboard, no focus request) applies to it too, so `starting` stays
    *  true for it; only what the screen SAYS differs. */
@@ -403,6 +412,27 @@ export function EmptyTab(props: EmptyTabProps) {
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [props.arriveRequest]);
+  useEffect(() => {
+    if ((props.leaveInputRequest ?? 0) === leaveInputAtMount.current) return;
+    leaveInputAtMount.current = props.leaveInputRequest ?? 0;
+    // The root first, as `arrive` does: `setMode("browse")` unmounts the focused textarea. An overlay drawn over
+    // this screen (a rename, the chooser) keeps the keys.
+    if (!props.overlayOpen) rootRef.current?.focus({ preventScroll: true });
+    setMode("browse");
+    leftUnderTypingRef.current = true;
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [props.leaveInputRequest]);
+  /* The guard is about the keys that were on their way: another tab, or a deliberate return to INPUT, ends it. */
+  useEffect(() => {
+    if (mode === "input") leftUnderTypingRef.current = false;
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [mode]);
+  const guardTab = useRef(tab.id);
+  useEffect(() => {
+    if (tab.id !== guardTab.current) leftUnderTypingRef.current = false;
+    guardTab.current = tab.id;
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [tab.id]);
   /* A tab that fails while its composer has the keys disables the focused
      textarea, and WebKit's focus fix-up drops the keys on <body> -- a failed tab's `r` then depended
      on the document replay alone. The root takes the keys first, then BROWSE (the same ordering as
@@ -764,6 +794,15 @@ export function EmptyTab(props: EmptyTabProps) {
     }
     if (event.key === "Enter") {
       event.preventDefault();
+      // An Enter ending what was being typed when the box left INPUT under it acts on no item: only one standing alone
+      // does (`mayAnswerNow`; no motion exception, since a `j` typed into the box was a letter), and it ends that state.
+      if (leftUnderTypingRef.current) {
+        if (!typingGuard.mayAnswerNow(typedAt, event.repeat)) {
+          if (cancelled === null) props.onFlash?.(TYPE_HINT_FLASH);
+          return;
+        }
+        leftUnderTypingRef.current = false;
+      }
       const item = items[dashCursor];
       if (item !== undefined) runItem(item);
       else {

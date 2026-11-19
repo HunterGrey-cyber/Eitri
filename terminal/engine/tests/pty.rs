@@ -89,6 +89,9 @@ fn the_child_gets_exactly_the_hosts_environment_minus_tmux_plus_three() {
         child_environment(std::env::vars_os())
             .into_iter()
             .map(|(k, v)| (k, OsString::from(text(&v.into_vec()))))
+            // macOS removes `DYLD_*` from the environment of a protected binary such as `/usr/bin/env` (System
+            // Integrity Protection) when it starts, so the child cannot show them; cargo sets one for tests.
+            .filter(|(k, _)| !(cfg!(target_os = "macos") && k.to_string_lossy().starts_with("DYLD_")))
             .collect(),
     );
     assert_eq!(got, want);
@@ -127,7 +130,13 @@ fn the_child_runs_in_the_requested_directory_on_a_tty_of_the_requested_size() {
     let lines: Vec<&str> = out.lines().collect();
     assert_eq!(std::path::Path::new(lines[0]).canonicalize().unwrap(), cwd);
     assert_eq!(lines[1], "30 100");
-    assert!(lines[2].starts_with("/dev/pts/"), "a real controlling tty: {out:?}");
+    // Linux names a pty's follower `/dev/pts/N`, macOS `/dev/ttysNNN`.
+    let tty_prefix = if cfg!(target_os = "macos") {
+        "/dev/ttys"
+    } else {
+        "/dev/pts/"
+    };
+    assert!(lines[2].starts_with(tty_prefix), "a real controlling tty: {out:?}");
     assert_eq!(lines[3], "iutf8", "IUTF8 should be set on the tty: {out:?}");
     child.wait().unwrap();
 }

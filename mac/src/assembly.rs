@@ -15,10 +15,11 @@ use eitri_core::agent_backend::BackendKind;
 use eitri_core::keymap::companion::{self as companion_prefix, CompanionVerb};
 use eitri_core::keymap::prefix::{literal_for, PrefixCommand};
 use eitri_core::keymap::{Action, Keymap, TabAction, TextChange};
-use eitri_core::layout::{ModuleKeys, ModuleKind};
+use eitri_core::layout::{ModuleId, ModuleKeys, ModuleKind};
 use eitri_core::lua::kernel::{refuse_panels, Kernel};
 use eitri_core::tabs::{plan, TabVerb};
 use eitri_core::theme::ThemeTokens;
+use eitri_core::wm::feedback::{editor_crashed_text, editor_ended_text, recoverable_text};
 use eitri_panel::agent_panel::{AgentPanelHandle, HintInbound, PanelInit, ViewId};
 use eitri_panel::keys_help::{HelpScope, KeysHelp};
 use eitri_panel::panel_document::PanelDocument;
@@ -56,6 +57,14 @@ pub trait HostActions {
     /// the editor. A panel that is not on screen must never get the keys: a plain `a` or `y` would answer a
     /// permission card nobody can see.
     fn panel_visible(&self) -> bool;
+    /// Whether nvim has ended and the window stayed without it.
+    fn editor_ended(&self) -> bool {
+        false
+    }
+    /// Starts nvim again in a window whose editor ended. `false`: the editor had not ended, nothing was done.
+    fn restart_editor(&self) -> bool {
+        false
+    }
 }
 
 /// Text size steps, as the one-pane companion case of the full window's rule: the panel alone is scaled
@@ -225,10 +234,23 @@ impl Shared {
                 return;
             }
         };
+        if action == Action::Module(ModuleId::editor()) {
+            // The editor's key: nvim started again where it ended, else the keys to the editor.
+            if !self.actions.restart_editor() {
+                self.actions.focus(Pane::Editor);
+            }
+            return;
+        }
         if action == Action::Zoom {
             // The zoom is the user's choice and is kept whatever the width; asked to show a panel the window is too
             // narrow for, it says why nothing appears.
             let hidden = !self.panel_hidden.get();
+            if hidden && self.actions.editor_ended() {
+                // Nothing would be left on screen but an ended editor, and the keys typed there would wait for the
+                // next nvim.
+                self.actions.toast(&editor_ended_text(&self.keymap));
+                return;
+            }
             self.panel_hidden.set(hidden);
             self.actions.set_panel_hidden(hidden);
             if !hidden && !self.actions.panel_visible() {
@@ -310,6 +332,11 @@ impl Shared {
                 self.panel.set_editor_link(band);
             }
             EditorEvent::ContextChanged => self.panel.wake(),
+            // A start says what a crash may have left, as the Linux window does; nothing is recovered here.
+            EditorEvent::Recoverable { count, newest } => {
+                crate::log_line!("[mac] {count} file(s) with unsaved changes in swap files");
+                self.actions.toast(&recoverable_text(count, &newest));
+            }
             EditorEvent::CancelDrafts => {
                 let cut = self.panel.editor_detached();
                 if cut > 0 {
@@ -485,10 +512,33 @@ impl Assembly {
         self.shared.handle(event);
     }
 
-    /// A command the prefix completed in `pane`: `Run(Zoom)` hides or shows the panel, every other action
-    /// goes through the companion window's dispatch.
+    /// A command the prefix completed in `pane`: `Run(Zoom)` hides or shows the panel, the editor's module key
+    /// starts an ended nvim again or gives the editor the keys, every other action goes through the companion
+    /// window's dispatch.
     pub fn run_prefix(&self, command: PrefixCommand, pane: Pane) {
         self.shared.run_prefix(command, pane);
+    }
+
+    /// nvim ended and the window stays: the panel takes the keys (shown again if the zoom hid it), and the notice says
+    /// how to start nvim again: `crashed` when it went without saying it was leaving, `None` when no notice is due
+    /// now (a question is about to be put; its Cancel says it).
+    pub fn editor_ended(&self, crashed: Option<bool>) {
+        self.shared.give_panel_keys();
+        match crashed {
+            Some(true) => self.shared.actions.toast(&editor_crashed_text(&self.shared.keymap)),
+            Some(false) => self.shared.actions.toast(&editor_ended_text(&self.shared.keymap)),
+            None => {}
+        }
+    }
+
+    /// What the window says while its editor has ended: how to start nvim again, after a crash as the crash's notice
+    /// says it.
+    pub fn editor_ended_text(&self, crashed: bool) -> String {
+        if crashed {
+            editor_crashed_text(&self.shared.keymap)
+        } else {
+            editor_ended_text(&self.shared.keymap)
+        }
     }
 
     /// Tells the panel where the keys are: `pane` has them, and the window is the key window or not. Call it

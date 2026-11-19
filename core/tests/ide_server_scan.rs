@@ -7,7 +7,8 @@
 
 use eitri_core::ide_server::PORT_VAR;
 use eitri_core::source_scan::{
-    code_only, product_dirs_except, product_sources, read_required, require_anchors, rust_sources, sources, Source,
+    code_only, product_dirs_except, product_sources, production_text, read_required, require_anchors, rust_sources,
+    sources, Source,
 };
 
 /// An answer the terminal client reads as "allow the proposal unchanged": closing a view must never mean that.
@@ -68,8 +69,9 @@ fn the_scan_sees_a_word_in_a_literal_and_in_a_comment() {
     }
 }
 
-/// A file's text before its unit tests. A `#[cfg(test)]` higher up gates one line, not the rest of the file.
-fn before_tests(text: &str) -> &str {
+/// A file's production text: everything before its unit-test module (a `test-support` module is cut there too, which
+/// `production_text` does not treat as test-gated), with the `#[cfg(test)]` items above it blanked.
+fn product_text(text: &str) -> String {
     let end = [
         "#[cfg(test)]\nmod tests",
         "#[cfg(test)]\npub(crate) mod tests",
@@ -79,7 +81,7 @@ fn before_tests(text: &str) -> &str {
     .filter_map(|marker| text.find(marker))
     .min()
     .unwrap_or(text.len());
-    &text[..end]
+    production_text(&text[..end])
 }
 
 /// The port is set on the terminal's shells through its one constant, so product code that spells the variable out is
@@ -93,7 +95,7 @@ fn the_port_variable_is_named_only_in_its_module() {
     );
     let naming: Vec<&str> = read
         .iter()
-        .filter(|source| before_tests(&source.text).contains(PORT_VAR))
+        .filter(|source| product_text(&source.text).contains(PORT_VAR))
         .map(|source| source.path.as_str())
         .collect();
     assert_eq!(naming, vec!["core/src/ide_server/types.rs"]);
@@ -164,13 +166,13 @@ fn the_wiring_is_behind_the_linux_gate() {
         ("shell/src/gtk_host/services.rs", "crate::ide_wiring::IdeWiring"),
     ] {
         let text = read_required(path).text;
-        let product = before_tests(&text);
+        let product = product_text(&text);
         assert!(product.contains(anchor), "{path} no longer has the wiring");
-        assert_eq!(ungated(product), Vec::<String>::new(), "{path}");
+        assert_eq!(ungated(&product), Vec::<String>::new(), "{path}");
     }
     for path in ["shell/src/launch.rs", "shell/src/window_services.rs"] {
         let text = read_required(path).text;
-        assert_eq!(ungated(before_tests(&text)), Vec::<String>::new(), "{path}");
+        assert_eq!(ungated(&product_text(&text)), Vec::<String>::new(), "{path}");
     }
 }
 

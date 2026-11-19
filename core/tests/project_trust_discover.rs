@@ -1771,9 +1771,24 @@ fn a_head_symlink_is_read_as_a_link_only() {
     assert!(!watch.saw_anything(), "discovery opened the file HEAD links to");
 }
 
+fn nofollow_scan_text(source: &str) -> String {
+    eitri_core::source_scan::production_text(source)
+        .chars()
+        .filter(|ch| !ch.is_whitespace())
+        .collect()
+}
+
+#[test]
+fn nofollow_scan_keeps_production_after_a_fixture() {
+    let source = "#[cfg(test)] fn fixture() { std::fs::read_dir(dir); }\nfn live() { std::fs::metadata(path); }";
+    let shipped = nofollow_scan_text(source);
+    assert!(!shipped.contains("read_dir"));
+    assert!(shipped.contains("metadata("));
+}
+
 #[test]
 fn project_trust_touches_the_disk_only_through_nofollow() {
-    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/project_trust");
+    let dir = Path::new("core/src/project_trust");
     let forbidden = [
         "File::open",
         "File::create",
@@ -1802,12 +1817,10 @@ fn project_trust_touches_the_disk_only_through_nofollow() {
         "last_trusted.rs",
         "text_diff.rs",
     ] {
-        let source = std::fs::read_to_string(dir.join(name)).unwrap_or_else(|e| panic!("{name}: {e}"));
+        let source = eitri_core::source_scan::read_required(dir.join(name)).text;
         assert!(source.len() > 200, "{name} is present");
-        let squeezed: String = source.chars().filter(|c| !c.is_whitespace()).collect();
-        // The in-file tests build their fixtures with the standard library; only what ships counts.
-        let shipped = squeezed.split("#[cfg(test)]").next().unwrap_or_default();
-        assert!(shipped.len() > 100, "{name} has code before its tests");
+        let shipped = nofollow_scan_text(&source);
+        assert!(shipped.len() > 100, "{name} has production code");
         for token in forbidden {
             assert!(!shipped.contains(token), "{name} uses `{token}`; go through nofollow");
         }

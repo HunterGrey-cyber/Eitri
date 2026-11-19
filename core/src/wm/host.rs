@@ -1668,8 +1668,8 @@ pub enum EditorEvent {
     Unreachable { win: WinId },
     /// This nvim will say when it leaves: an exit that comes without [`Self::Leaving`] is a crash.
     Watched { win: WinId },
-    /// nvim is quitting on purpose.
-    Leaving { win: WinId },
+    /// nvim is quitting on purpose, from a buffer of `filetype` (empty when it did not say).
+    Leaving { win: WinId, filetype: String },
     /// A start found `count` project files with unsaved changes in swap files, `newest` the latest.
     Recoverable { win: WinId, count: u32, newest: String },
     /// The embedded editor reported its reopen progress.

@@ -619,8 +619,10 @@ impl CloseFlow {
         std::mem::swap(self, &mut w.close);
         match (answer, pending) {
             (PromptKey::Move, Some(_)) => begin_moves(w, cx, win, batch),
-            (PromptKey::Yes, Some(PendingClose::Window { .. })) => {
-                w.close.confirmed = true;
+            (PromptKey::Yes, Some(pending @ PendingClose::Window { .. })) => {
+                // What the start screen's question did not name (a turn that began while it stood) is asked as the
+                // close asks it.
+                w.close.confirmed = !(asks_about_a_start_screen(&Some(pending)) && window_prompt(w, cx, win).is_some());
                 request(w, cx, win, CloseCause::User, batch);
             }
             (PromptKey::Yes, Some(PendingClose::LastModule { module, confirmed })) => {
@@ -732,6 +734,10 @@ pub(super) fn peer_left(w: &mut Window, cx: &Cx, win: WinId, batch: &mut Batch) 
     if w.close.state != CloseState::Asking || !matches!(w.close.pending, Some(PendingClose::Window { .. })) {
         return;
     }
+    // The start screen's question is about nvim's quit and names no window, so no window going answers it.
+    if asks_about_a_start_screen(&w.close.pending) {
+        return;
+    }
     let Some(text) = window_prompt(w, cx, win) else {
         w.say("[window] what the close asked about has gone, so it goes on".into());
         w.close.pending = None;
@@ -748,6 +754,14 @@ pub(super) fn peer_left(w: &mut Window, cx: &Cx, win: WinId, batch: &mut Batch) 
     if w.chrome.prompt.as_ref().is_none_or(|prompt| prompt.text != text) {
         ask_window(w, cx, win, text);
     }
+}
+
+/// Whether the pending question is the one a quit from a start screen asked.
+fn asks_about_a_start_screen(pending: &Option<PendingClose>) -> bool {
+    matches!(
+        pending,
+        Some(PendingClose::Window { confirmed: Some(text) }) if text == super::quit::START_SCREEN_QUIT_PROMPT
+    )
 }
 
 /// Puts the window's close question up.
@@ -1093,7 +1107,15 @@ pub(super) fn editor_event(w: &mut Window, cx: &Cx, win: WinId, event: EditorEve
     }
     let was_ready = w.editor_ready;
     // Taken at every exit, so a restarted nvim starts from nothing said.
-    let crashed = matches!(event, EditorEvent::Exited { .. }) && std::mem::take(&mut w.nvim_said) == NvimSaid::Watched;
+    let said = matches!(event, EditorEvent::Exited { .. }).then(|| std::mem::take(&mut w.nvim_said));
+    let left_from = matches!(event, EditorEvent::Exited { .. }).then(|| std::mem::take(&mut w.nvim_left_from));
+    let end = match said {
+        Some(NvimSaid::Watched) => super::quit::NvimEnd::Crashed,
+        Some(NvimSaid::Leaving) if left_from.as_deref().is_some_and(super::window::is_start_screen) => {
+            super::quit::NvimEnd::QuitFromStartScreen
+        }
+        _ => super::quit::NvimEnd::Quit,
+    };
     // The editor is ready from `Ready` until it ends; a restart in flight clears it too, where it is begun.
     if matches!(
         event,
@@ -1200,8 +1222,13 @@ pub(super) fn editor_event(w: &mut Window, cx: &Cx, win: WinId, event: EditorEve
             w.nvim_said = NvimSaid::Watched;
             return;
         }
-        EditorEvent::Leaving { .. } => {
+        EditorEvent::Leaving { filetype, .. } => {
+            w.say(format!(
+                "[modules] editor: nvim is leaving from a buffer of filetype {}",
+                if filetype.is_empty() { "(none)" } else { filetype }
+            ));
             w.nvim_said = NvimSaid::Leaving;
+            w.nvim_left_from = filetype.clone();
             super::reopen::leaving(w);
             return;
         }
@@ -1227,7 +1254,7 @@ pub(super) fn editor_event(w: &mut Window, cx: &Cx, win: WinId, event: EditorEve
     }
     let never_ready = !was_ready && matches!(event, EditorEvent::Exited { .. } | EditorEvent::Unreachable { .. });
     with_quit(w, cx, win, batch, |quit, world| match event {
-        EditorEvent::Exited { settled, .. } => quit.nvim_exited(world, settled, crashed),
+        EditorEvent::Exited { settled, .. } => quit.nvim_exited(world, settled, end),
         EditorEvent::Unreachable { .. } => quit.nvim_unreachable(world),
         // The window close's `y`, if it had one, was taken back when the close handed the quit to nvim, so a later
         // exit asks again.
@@ -1503,6 +1530,12 @@ impl QuitWorld for WindowQuit<'_, '_> {
     }
     fn window_close_prompt(&self) -> Option<String> {
         window_prompt(self.w, self.cx, self.win)
+    }
+    fn holds_other_modules(&self) -> bool {
+        self.w
+            .layout
+            .try_borrow()
+            .is_ok_and(|layout| layout.modules().iter().any(|id| *id != ModuleId::editor()))
     }
     fn send_quit(&mut self, lua: String, generation: u32) {
         let Some(editor) = owned(self.w.editor_kind()) else {

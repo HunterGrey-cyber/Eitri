@@ -182,6 +182,7 @@ pub(super) fn put_off_start(state: &mut AgentPanelState, tab: TabId, start: Defe
     let view = state.tabs.view_of(tab);
     out.push(Dest::Page(view), tabs_payload_recorded(state, view));
     out.push(Dest::Tab(tab), tab_notice(state, tab, why));
+    queue_back(state, tab, &start, &mut out);
     match start {
         DeferredStart::FirstSend {
             request_id: sent,
@@ -236,6 +237,23 @@ pub(super) fn put_off_restore(state: &mut AgentPanelState, from: TabId, go: Rest
 /// The refused send comes first: the page puts the message back in its box itself, keeping what was
 /// typed there since and putting the message before it. Rust's copy of the draft is that same merge, so
 /// the `draft` that follows (which replaces the box) holds both and loses neither.
+/// A start that will not happen leaves nothing queued for a session that is not coming: what was typed behind it
+/// comes back as the tab's draft (`TabSet::queue_back_to_draft`). A first message's own return then puts the
+/// message ahead of it, and sends the draft itself; for a resume or a restore it is sent here.
+fn queue_back(state: &mut AgentPanelState, tab: TabId, start: &DeferredStart, out: &mut Outbox) {
+    if !state.tabs.queue_back_to_draft(tab) {
+        return;
+    }
+    if !matches!(start, DeferredStart::FirstSend { .. }) {
+        let draft = state.tabs.get(tab).map(|t| t.draft().to_string()).unwrap_or_default();
+        out.push(
+            Dest::Tab(tab),
+            eitri_core::agent_bridge::serialize_draft_for_js(tab, &draft),
+        );
+    }
+    super::routing::send_queue(state, tab, out);
+}
+
 pub(super) fn return_first_message(
     state: &mut AgentPanelState,
     tab: TabId,
@@ -683,6 +701,7 @@ pub(super) fn cancel_trust_question(
     state.trust.hide(tab);
     let tabs_view = state.tabs.view_of(tab);
     out.push(Dest::Page(tabs_view), tabs_payload_recorded(state, tabs_view));
+    queue_back(state, tab, &start, &mut out);
     match start {
         DeferredStart::FirstSend {
             request_id: sent,
@@ -1122,6 +1141,48 @@ mod tests {
                 out.payloads()
             );
         }
+    }
+
+    /// A resume put off at its trust question leaves nothing queued for whatever session the tab starts next: what
+    /// was typed behind it comes back as the draft, and the page is told.
+    #[test]
+    fn a_resume_put_off_returns_what_was_queued_behind_it_as_the_draft() {
+        let (state, _fx) = trust_panel("trust-put-off-queue");
+        let mut s = state.borrow_mut();
+        let tab = s.tabs.active();
+        let resume = DeferredStart::Resume {
+            request_id: "r1".into(),
+            provider_session_id: "s-old".into(),
+            resumed_title: None,
+            resumed_name: None,
+        };
+        gate_start(&mut s, tab, resume).unwrap();
+        s.tabs
+            .queue_message(
+                tab,
+                "for the old session",
+                "for the old session".into(),
+                1,
+                true,
+                agent::PromptOrigin::Typed,
+            )
+            .unwrap();
+        s.tabs.set_draft(tab, "still typing");
+        let start = s.tabs.take_deferred(tab).unwrap();
+        let out = put_off_start(&mut s, tab, start, "not started: no");
+        let t = s.tabs.get(tab).unwrap();
+        assert!(
+            t.session.queue.is_empty(),
+            "nothing left for a fresh session to take up"
+        );
+        assert_eq!(t.draft(), "for the old session\n\nstill typing");
+        let payloads = out.payloads();
+        assert!(
+            payloads
+                .iter()
+                .any(|p| p.contains("\"kind\":\"draft\"") && p.contains("for the old session")),
+            "the page is given the draft: {payloads:?}"
+        );
     }
 
     /// A project whose trust question would be larger than the page is ever sent (here one hook of

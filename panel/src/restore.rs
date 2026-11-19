@@ -101,6 +101,7 @@ pub(super) type SpawnResume<'a> = &'a mut dyn FnMut(
     &str,
     agent::lease::SessionLease,
     ProjectTrust,
+    agent::EarlyHistory,
 ) -> mpsc::Receiver<Result<AgentBackend, BackendError>>;
 
 /// A restore's resumes, as the real workers start them, each with `client_tools`. Only
@@ -108,9 +109,14 @@ pub(super) type SpawnResume<'a> = &'a mut dyn FnMut(
 pub(super) fn resume_spawner(
     state: &AgentPanelState,
     client_tools: Option<agent::ClientToolSet>,
-) -> impl FnMut(&str, agent::lease::SessionLease, ProjectTrust) -> mpsc::Receiver<Result<AgentBackend, BackendError>> {
+) -> impl FnMut(
+    &str,
+    agent::lease::SessionLease,
+    ProjectTrust,
+    agent::EarlyHistory,
+) -> mpsc::Receiver<Result<AgentBackend, BackendError>> {
     let (kind, project_dir) = (state.backend_kind, state.project_dir.clone());
-    move |id, lease, project| {
+    move |id, lease, project, early| {
         spawn_connect_holding(
             kind,
             project_dir.clone(),
@@ -118,6 +124,7 @@ pub(super) fn resume_spawner(
             Some(lease),
             project,
             client_tools.clone(),
+            Some(early),
         )
     }
 }
@@ -232,16 +239,40 @@ pub(super) fn start_restore(
         .collect();
     let (downgraded, asked) = (go.downgraded, go.asked);
     state.restore_cut_note = eitri_core::tab_restore::cut_turns_note(go.cut_turns());
+    // Each resume hands its loaded history to its tab before the session is live; the tabs are known only
+    // once the set has placed them, so the receivers wait here under their session ids.
+    let mut arriving = std::collections::HashMap::new();
     let run = state.tabs.start_restore(from, go, |agent, id| {
         if agent.is_external() {
             return Ok(RestoreConnect::AwaitTrust);
         }
         match leases.remove(id) {
-            Some(Ok(lease)) => Ok(RestoreConnect::Started(spawn(id, lease, project))),
+            Some(Ok(lease)) => {
+                let (early, receiver) = eitri_core::tab_set::early_history_channel();
+                arriving.insert(id.to_string(), receiver);
+                Ok(RestoreConnect::Started(spawn(id, lease, project, early)))
+            }
             Some(Err(reason)) => Err(reason),
             None => Err("it was listed twice".to_string()),
         }
     });
+    let starting: Vec<(TabId, String)> = state
+        .tabs
+        .tabs()
+        .iter()
+        .filter_map(|t| match t.backend() {
+            // Only Claude's: a session id is its agent's own, and another agent's tab may be resuming the same one.
+            TabBackend::Starting(pending) if *t.agent() == AgentId::Claude => {
+                pending.resume.clone().map(|id| (t.id, id))
+            }
+            _ => None,
+        })
+        .collect();
+    for (tab, id) in starting {
+        if let Some(receiver) = arriving.remove(&id) {
+            state.tabs.expect_early_history(tab, receiver);
+        }
+    }
     // Each waiting tab is checked for its own agent now; the tick asks the question once the tab is
     // on screen, or starts it at once when the window already has that agent's answer.
     for &tab in run.awaiting_trust() {
@@ -523,6 +554,13 @@ pub(super) fn account_for_restore(state: &mut AgentPanelState, collected: &Start
             run.note_failed(*tab, &error.message);
             let was_active = tabs.active() == *tab;
             let view = tabs.view_of(*tab);
+            // A tab that closes takes the survivor's place on screen first, so what was typed in it lands in the
+            // composer that is shown, not in whichever tab the close would fall back to.
+            if was_active && back_to.is_none() {
+                if let Some(survivor) = run.first_survivor() {
+                    tabs.select(survivor);
+                }
+            }
             let shown_draft = tabs.get(tabs.active()).map(|t| t.draft().to_string());
             tabs.discard_failed_restore(*tab, back_to);
             let draft_moved = tabs.get(tabs.active()).map(|t| t.draft()) != shown_draft.as_deref();
@@ -1005,6 +1043,107 @@ mod tests {
         assert!(draft.is_some(), "the page hears the draft: {:?}", kinds(&payloads));
         out.deliver(&state, &Pages::default());
         assert_eq!(state.borrow().tabs.get(on_screen).unwrap().draft(), "typed for s-3");
+        for tab in state.borrow_mut().tabs.take_all() {
+            if let Some(retired) = tab.retired {
+                retired.into_backend().shutdown();
+            }
+        }
+    }
+
+    /// A restored tab's history reaches the page as an early snapshot while its resume still waits on the
+    /// provider. At install the session's own snapshot follows without the draft: the page already has the
+    /// conversation's composer up, and what was typed there since the last mirror must stay.
+    #[test]
+    fn a_restored_tabs_history_reaches_the_page_before_its_session_is_live() {
+        let (state, dir) = restore_panel("restore-early", &[("s-1", None, Auto)], &["s-1"]);
+        let mut resumes = FakeResumes::default();
+        started(ask(&state, &mut resumes, RestoreAsk::Dashboard));
+        let screen = Screen::nothing_shown();
+        let mut out = Outbox::default();
+        collect_pending_starts(&mut state.borrow_mut(), &screen, &mut out);
+        assert!(
+            !out.payloads().iter().any(|p| p.contains("\"kind\":\"snapshot\"")),
+            "nothing to draw before the history arrives"
+        );
+
+        let mut history = agent::AgentSessionProjection::default();
+        history.user_prompts.push(agent::UserPromptRecord {
+            seq: 1,
+            text: "the saved question".into(),
+            delivered: false,
+            attachments: Vec::new(),
+        });
+        resumes.earlies.remove(0).deliver(history);
+        let mut out = Outbox::default();
+        collect_pending_starts(&mut state.borrow_mut(), &screen, &mut out);
+        let payloads = out.payloads();
+        let early = payloads
+            .iter()
+            .find(|p| p.contains("\"kind\":\"snapshot\""))
+            .expect("the page is sent the early history");
+        assert!(
+            early.contains("\"early\":true") && early.contains("the saved question"),
+            "{early}"
+        );
+
+        let (_provider, backend) = live_backend(&dir);
+        resumes.senders[0].send(Ok(backend)).unwrap();
+        let mut out = Outbox::default();
+        collect_pending_starts(&mut state.borrow_mut(), &screen, &mut out);
+        let payloads = out.payloads();
+        let snapshot = payloads
+            .iter()
+            .find(|p| p.contains("\"kind\":\"snapshot\""))
+            .expect("the session's own snapshot follows at install");
+        assert!(!snapshot.contains("\"early\""), "{snapshot}");
+        assert!(
+            !payloads.iter().any(|p| p.contains("\"kind\":\"draft\"")),
+            "no draft over the composer: {:?}",
+            kinds(&payloads)
+        );
+        for tab in state.borrow_mut().tabs.take_all() {
+            if let Some(retired) = tab.retired {
+                retired.into_backend().shutdown();
+            }
+        }
+    }
+
+    /// A message typed while a restored tab's resume started goes to that session as soon as it is installed, once,
+    /// with no turn's end needed to send it.
+    #[test]
+    fn a_message_queued_while_a_restored_tab_starts_goes_out_once_it_is_installed() {
+        let (state, dir) = restore_panel("restore-early-queue", &[("s-1", None, Auto)], &["s-1"]);
+        let mut resumes = FakeResumes::default();
+        started(ask(&state, &mut resumes, RestoreAsk::Dashboard));
+        let tab = state.borrow().tabs.active();
+        state
+            .borrow_mut()
+            .tabs
+            .queue_message(
+                tab,
+                "and the tests?",
+                "and the tests?".into(),
+                1,
+                true,
+                agent::PromptOrigin::Typed,
+            )
+            .unwrap();
+        let screen = Screen::nothing_shown();
+        collect_pending_starts(&mut state.borrow_mut(), &screen, &mut Outbox::default());
+        let (provider, backend) = live_backend(&dir);
+        assert!(
+            provider.turns().is_empty(),
+            "nothing is sent before the session is installed"
+        );
+        resumes.senders[0].send(Ok(backend)).unwrap();
+        collect_pending_starts(&mut state.borrow_mut(), &screen, &mut Outbox::default());
+        collect_pending_starts(&mut state.borrow_mut(), &screen, &mut Outbox::default());
+        assert_eq!(
+            provider.turns(),
+            vec!["and the tests?".to_string()],
+            "sent once, to that session"
+        );
+        assert!(state.borrow().tabs.get(tab).unwrap().session.queue.is_empty());
         for tab in state.borrow_mut().tabs.take_all() {
             if let Some(retired) = tab.retired {
                 retired.into_backend().shutdown();

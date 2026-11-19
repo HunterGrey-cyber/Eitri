@@ -12,7 +12,7 @@ use eitri_terminal::{
     paint, paint_ops, CursorCell, ExitInfo, HostEvents, MouseModes, PtySize, SessionCommand, SessionConfig, SpawnSpec,
     TerminalColors, TerminalMetrics, TerminalSession,
 };
-use skia_safe::{surfaces, EncodedImageFormat, ISize, Surface};
+use skia_safe::{surfaces, ColorType, EncodedImageFormat, ISize, Surface};
 use terminal_input::keys::{Key, KeyEvent, ModifiersState, NamedKey};
 use terminal_input::NormalizedInput;
 use terminal_render::{PaintList, PaintOp};
@@ -256,14 +256,15 @@ impl Raster {
     pub fn of_with(list: &PaintList, overlay: &[PaintOp], metrics: &TerminalMetrics) -> Self {
         let mut surface = painted_with(list, overlay, metrics);
         let (width, height) = (surface.width(), surface.height());
-        let info = surface.image_info();
+        // Read back as BGRA whatever the surface's native order (n32 is BGRA on Linux, RGBA on macOS).
+        let info = surface.image_info().with_color_type(ColorType::BGRA8888);
         let row_bytes = info.min_row_bytes();
         let mut pixels = vec![0u8; row_bytes * height as usize];
         assert!(surface.read_pixels(&info, &mut pixels, row_bytes, (0, 0)));
         Raster { pixels, width, height }
     }
 
-    /// `(r, g, b)` at a pixel. n32 premul is BGRA here, and every pixel is opaque.
+    /// `(r, g, b)` at a pixel. Read back as BGRA, and every pixel is opaque.
     pub fn at(&self, x: i32, y: i32) -> (u8, u8, u8) {
         let i = (y as usize * self.width as usize + x as usize) * 4;
         (self.pixels[i + 2], self.pixels[i + 1], self.pixels[i])

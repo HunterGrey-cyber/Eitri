@@ -1958,6 +1958,7 @@ fn held_loop_command(loop_file: &Path) -> String {
 
 /// The live processes, other than this one, whose command line holds `needle`, with their state letter;
 /// a zombie or a process that went while it was read is not live.
+#[cfg(target_os = "linux")]
 fn live_processes_naming(needle: &str) -> Vec<(i32, char)> {
     let me = std::process::id() as i32;
     let mut found = Vec::new();
@@ -1987,6 +1988,38 @@ fn live_processes_naming(needle: &str) -> Vec<(i32, char)> {
         if state != 'Z' && state != 'X' {
             found.push((pid, state));
         }
+    }
+    found
+}
+
+/// The same, read from `ps` where there is no `/proc` (macOS): `-ww` keeps the command line whole, and the
+/// state column's first letter is the process state (`Z` a zombie).
+#[cfg(not(target_os = "linux"))]
+fn live_processes_naming(needle: &str) -> Vec<(i32, char)> {
+    let me = std::process::id() as i32;
+    let out = std::process::Command::new("ps")
+        .args(["-axww", "-o", "pid=", "-o", "stat=", "-o", "command="])
+        .output()
+        .expect("ps runs");
+    assert!(
+        out.status.success(),
+        "ps failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let mut found = Vec::new();
+    for line in String::from_utf8_lossy(&out.stdout).lines() {
+        let mut fields = line.split_whitespace();
+        let (Some(pid), Some(stat)) = (fields.next(), fields.next()) else {
+            continue;
+        };
+        let Ok(pid) = pid.parse::<i32>() else {
+            continue;
+        };
+        let state = stat.chars().next().unwrap_or('?');
+        if pid == me || state == 'Z' || !fields.collect::<Vec<_>>().join(" ").contains(needle) {
+            continue;
+        }
+        found.push((pid, state));
     }
     found
 }
@@ -2092,6 +2125,10 @@ fn interrupt_a_loop(
     }
     let lines_at_end = count_lines(loop_file);
     let left = live_processes_naming(&needle);
+    if !left.is_empty() {
+        // The gate's file lets a command that outlived the turn end, so a failed run leaves no loop behind.
+        let _ = std::fs::write(loop_file.with_extension("release"), b"");
+    }
     assert!(left.is_empty(), "the command outlived the turn's end: {left:?}");
     let lines_later = count_lines(loop_file);
     let _ = provider.close_session(agent::CloseSessionRequest { session_id: thread });
@@ -2220,7 +2257,17 @@ fn an_interrupt_stops_a_subagents_command() {
         run.lines_later, run.lines_at_end,
         "the child's command kept writing after the tab's turn ended"
     );
+    // On Linux Codex leaves the subagent's command running after the interrupt, so the session is stopped. On
+    // macOS (measured with 0.166.0, five runs of five) Codex ends that command itself and the turn ends without a
+    // stop; what must hold on both is above: nothing the child ran writes after the turn's end.
+    #[cfg(target_os = "linux")]
     assert_eq!(session_lost(&run.events).as_deref(), Some(STOPPED));
+    #[cfg(not(target_os = "linux"))]
+    assert!(
+        matches!(session_lost(&run.events).as_deref(), None | Some(STOPPED)),
+        "{:?}",
+        session_lost(&run.events)
+    );
 }
 
 /// An interrupt while a command's card waits answers the card `cancel`: the command never ran, so the turn

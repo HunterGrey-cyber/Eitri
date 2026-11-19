@@ -174,6 +174,11 @@ export type PageModel = {
    *  session -- across a switch away and back too, since Rust sends no snapshot for a failed tab. Dropped once
    *  the tab is no longer failed (`r`) or is closed. */
   keptStates: ReadonlyMap<TabId, AgentUiState>;
+  /** `state` is a resume's history drawn while the active tab is still starting (an `early` snapshot), not a
+   *  session's: the tab draws it as its conversation until the session's own snapshot replaces it. Nothing
+   *  took it up, so a failed start drops it rather than keeping it as a lost session, and so does the tab
+   *  leaving `starting` any way but live or ended. */
+  earlyView: boolean;
   /** A fatal, session-ending failure, shown in the panel so it can be copied and can carry multi-line
    *  startup diagnostics without blocking the WebView as `window.alert` would. */
   fatalError: string | null;
@@ -276,7 +281,7 @@ export function initialPageModel(): PageModel {
     keymapHelp: { prefix: "Ctrl+b", window: [], prefixKeys: [], panel: EMPTY_PANEL_TABLE, newTabChord: "" },
     heldTrust: null, heldRemote: new Map(), confirm: null, renaming: null, queueTaken: null, queueTakenSequence: 0,
     draftImages: NO_DRAFT_IMAGES,
-    state: initialState(), hello: null, tabs: null, keptStates: new Map(), fatalError: null,
+    state: initialState(), hello: null, tabs: null, keptStates: new Map(), earlyView: false, fatalError: null,
     handoff: null, handoffRequests: new Map(), commandNotice: null, rootNote: null, tabRootNotes: new Map(),
     inFlight: new Map(),
     turnClock: null, turnDurations: NO_TURN_DURATIONS, thinkingDisplay: "collapsed", paneFocused: false,
@@ -489,6 +494,12 @@ function reduceEnvelope(model: PageModel, envelope: Envelope): PageModel {
       }
       // A switch to a failed tab brings its kept conversation back, since no snapshot follows for it.
       if (switched) state = keptStates.get(envelope.active) ?? state;
+      // An early history belongs to its tab's start: a switch replaces it with the new tab's state, and a start that
+      // ended other than live (refused and emptied, or failed) takes it off the screen.
+      const startState = envelope.tabs.find((tab) => tab.id === envelope.active)?.state;
+      const earlyKept = model.earlyView && !switched &&
+        (startState === "starting" || startState === "live" || startState === "ended");
+      if (model.earlyView && !earlyKept && !switched) state = initialState();
       // A closed tab's remote question goes with it; one on screen goes down when its tab is no longer shown.
       const heldRemote = new Map([...model.heldRemote].filter(([id]) => envelope.tabs.some((entry) => entry.id === id)));
       const remoteGone = model.confirm?.kind === "remote" && (switched || !heldRemote.has(model.confirm.tab));
@@ -505,7 +516,7 @@ function reduceEnvelope(model: PageModel, envelope: Envelope): PageModel {
           commandNotice: null, sendSync: null, queue: [], queueError: null, queueNote: null, queueSteers: null, shellRunning: false,
           ruleOffers: {}, scratchEditing: false, chooser: null,
         } : {}),
-        state, keptStates, heldRemote,
+        state, keptStates, heldRemote, earlyView: earlyKept,
         ...(remoteGone ? { confirm: null } : {}),
         fatalError: switched || activeState === "starting" || activeState === "live" ? null : model.fatalError,
         tabs: { active: envelope.active, tabs: envelope.tabs, defaultMode: envelope.defaultMode },
@@ -527,10 +538,18 @@ function reduceEnvelope(model: PageModel, envelope: Envelope): PageModel {
       // failed -- and on the legacy backend that is the last reference to a conversation nothing else
       // remembers. A banner left from an earlier session of this tab (a failed start that `r` redid) is stale for
       // the same reason.
+      // An early snapshot is a resume's history with no session running yet: it clears none of that, and a refused
+      // resume must still find the handoff card and the notice where they were.
+      if (envelope.early === true) {
+        return {
+          ...model, state: applySnapshot(model.state, envelope.state, envelope.throughRevision),
+          turnClock, turnDurations: durationsFromSnapshot(envelope.turnTimes), earlyView: true,
+        };
+      }
       return {
         ...model, state: applySnapshot(model.state, envelope.state, envelope.throughRevision),
         turnClock, turnDurations: durationsFromSnapshot(envelope.turnTimes),
-        handoff: null, commandNotice: null, fatalError: null,
+        handoff: null, commandNotice: null, fatalError: null, earlyView: false,
       };
     }
     case "editor_cards":
@@ -622,11 +641,13 @@ function reduceEnvelope(model: PageModel, envelope: Envelope): PageModel {
       // A kept conversation says why in its own lost-session row, so the banner would say it twice. No new
       // `hello` is asked for: Rust re-sends one whenever the set of open provider sessions changes, and this is
       // such a change.
-      const kept = keepAfterFailure(model.state, failureEvidence(envelope.message));
+      // An early history is no session's conversation: the start failed before any session took it up, so it
+      // goes, and the failure is shown as for a start that showed nothing.
+      const kept = model.earlyView ? null : keepAfterFailure(model.state, failureEvidence(envelope.message));
       const keptStates = new Map(model.keptStates);
       if (kept !== null) keptStates.set(envelope.tab, kept);
       return {
-        ...model, keptStates, state: kept ?? initialState(), confirm: withoutStopQuestion(model.confirm),
+        ...model, keptStates, state: kept ?? initialState(), earlyView: false, confirm: withoutStopQuestion(model.confirm),
         handoffRequests: withoutHandoff(model.handoffRequests, envelope.tab), turnClock: null,
         turnDurations: kept === null ? NO_TURN_DURATIONS : model.turnDurations,
         fatalError: kept === null ? envelope.message : null,

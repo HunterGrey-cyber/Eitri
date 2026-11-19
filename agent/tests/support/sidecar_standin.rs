@@ -100,6 +100,8 @@
 //!   refusing evicted cursors with `EVENT_GAP`;
 //! - `EITRI_STANDIN_BIND_AFTER_MS=<ms>`: the process waits this long before it binds;
 //! - `EITRI_STANDIN_REFUSE_CREATE`: every `CreateSession` is refused with `FAILED_PRECONDITION`;
+//! - `EITRI_STANDIN_HANDSHAKE_GATE=<directory>`: every `Handshake` after the first (the helper's readiness check)
+//!   publishes `handshaking` there and answers only once `release` exists (a client's handshake while the link is cut);
 //! - `EITRI_STANDIN_CREATE_GATE=<directory>`: every `CreateSession` publishes `creating` there and answers only once
 //!   `release` exists (a session being created while the link is cut);
 //! - `EITRI_STANDIN_ACCOUNTS=<directory>`: an account named by `VERDANDI_CLAUDE_ACCOUNT` exists when
@@ -1051,6 +1053,17 @@ impl Service<http::Request<Body>> for StandIn {
                     unary(req, move |_: HandshakeRequest| async move {
                         if shared.scripted.stall_handshake {
                             std::future::pending::<()>().await;
+                        }
+                        static HANDSHAKES: AtomicU64 = AtomicU64::new(0);
+                        if let Some(gate) = std::env::var_os("EITRI_STANDIN_HANDSHAKE_GATE") {
+                            // The first handshake is the helper's readiness check; later ones are clients'.
+                            if HANDSHAKES.fetch_add(1, Ordering::SeqCst) > 0 {
+                                let gate = std::path::PathBuf::from(gate);
+                                std::fs::write(gate.join("handshaking"), b"").unwrap();
+                                while !gate.join("release").exists() {
+                                    tokio::time::sleep(Duration::from_millis(10)).await;
+                                }
+                            }
                         }
                         if let Some(words) = &shared.scripted.incompatible {
                             return Err(refusal_saying(

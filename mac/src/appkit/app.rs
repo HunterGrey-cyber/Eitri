@@ -2,10 +2,16 @@
 //! is aimed at it, the question before a quit while an agent is at work, and the shutdown that every way out
 //! runs exactly once.
 //!
-//! **Every way out runs the shutdown.** When nvim exits, Neovide's loop ends and `neovide::embed::run` returns;
-//! `run_main` then shuts down. A quit that ends in AppKit's `terminate:` (the Dock's Quit, a logout, a script's
-//! `quit app`) may end the process without returning from `run`, so the same shutdown also runs synchronously
-//! on `NSApplicationWillTerminateNotification`. Whichever comes first does it; the other finds it done.
+//! **Every way out runs the shutdown.** When nvim exits and the window closes with it, Neovide's loop ends and
+//! `neovide::embed::run` returns; `run_main` then shuts down. A quit that ends in AppKit's `terminate:` (the Dock's
+//! Quit, a logout, a script's `quit app`) may end the process without returning from `run`, so the same shutdown
+//! also runs synchronously on `NSApplicationWillTerminateNotification`. Whichever comes first does it; the other
+//! finds it done.
+//!
+//! **The window may outlive its nvim** (`crate::quit::QuitGate::nvim_ended` says when): Neovide clears the editor's
+//! rectangle and keeps its loop, the panel takes the keys, and the editor's key starts nvim again in the same window
+//! (`Host::restart_editor`); the link is aimed at the new nvim once it listens. A quit while the editor has ended
+//! ends the app here, through `terminate:`: Neovide's own would go to the nvim that is gone.
 
 use std::cell::{Cell, RefCell};
 use std::ffi::OsString;
@@ -32,7 +38,7 @@ use super::page::{repeat, PANEL_DOCUMENT};
 use super::window::{host_for_later, on_next_turn, Host, MacEmbedder};
 use crate::assembly::{assemble, Assembly};
 use crate::editor::{AttachStep, AttachWait, Editor};
-use crate::quit::{AtWork, QuitAfter, QuitDecision, QuitGate, QuitSource};
+use crate::quit::{AtWork, EditorEnded, QuitAfter, QuitDecision, QuitGate, QuitSource};
 use crate::startup::{self, ProjectStart};
 
 /// What starting and leaving have done, for the log and the acceptance build.
@@ -50,6 +56,13 @@ pub struct Lifecycle {
     quit_items_retargeted: Cell<usize>,
     /// The open quit question's Cancel button, for Escape (`Host::cancel_quit_question`).
     quit_cancel: RefCell<Option<Retained<NSButton>>>,
+    /// How many times nvim ended with the window kept, and how many times it was started again.
+    editor_ends: Cell<u32>,
+    restarts: Cell<u32>,
+    /// The app is ending itself (a quit while the editor had ended): asked once.
+    ending: Cell<bool>,
+    /// The editor ended in a crash, and nothing has been said of it since (the subtitle says so till then).
+    crashed: Cell<bool>,
 }
 
 impl Lifecycle {
@@ -100,6 +113,26 @@ impl Lifecycle {
 
     pub fn quit_asking(&self) -> bool {
         self.quit.borrow().is_asking()
+    }
+
+    /// Whether nvim has ended and the window stayed without it.
+    pub fn editor_ended(&self) -> bool {
+        self.quit.borrow().editor_ended()
+    }
+
+    /// Whether the ended editor's nvim crashed, as the window last said.
+    pub fn ended_by_crash(&self) -> bool {
+        self.crashed.get()
+    }
+
+    /// How many times nvim ended with the window kept.
+    pub fn editor_ends(&self) -> u32 {
+        self.editor_ends.get()
+    }
+
+    /// How many times nvim was started again in the window.
+    pub fn restarts(&self) -> u32 {
+        self.restarts.get()
     }
 }
 
@@ -217,6 +250,10 @@ fn start(mtm: MainThreadMarker, command_env: &[String]) -> Result<Option<(Rc<Hos
     }
     let paths = startup::paths(&|key| std::env::var_os(key), &home, &std::env::temp_dir())?;
     let editor = Rc::new(Editor::new(paths.nvim_listen.clone())?);
+    let watch = editor.nvim_watch_args();
+    if watch.is_empty() {
+        crate::log_line!("[mac] no editor watch for nvim: a crash is taken for a quit");
+    }
 
     let host = Host::new(mtm);
     let assembly = assemble(
@@ -232,7 +269,7 @@ fn start(mtm: MainThreadMarker, command_env: &[String]) -> Result<Option<(Rc<Hos
     let config = EmbedConfig {
         data_dir: Some(paths.neovide_data),
         config_file: Some(paths.neovide_config),
-        args: startup::neovide_args(&paths.nvim_listen),
+        args: startup::neovide_args(&paths.nvim_listen, &watch),
     };
     Ok(Some((host, config)))
 }
@@ -271,6 +308,52 @@ fn remove_socket_dir(socket: &std::path::Path) {
 fn is_socket(path: &std::path::Path) -> bool {
     std::fs::symlink_metadata(path).is_ok_and(|meta| meta.file_type().is_socket())
 }
+
+/// Removes the socket file an nvim that did not end cleanly (a `kill -9`) left behind, so the next one can listen
+/// there: only a socket nobody answers on. nvim removes its own on a clean exit. `false`: the path is still taken (an
+/// nvim still listens there, or the file could not go), and a new nvim would neither listen there nor be the one the
+/// link reaches.
+fn remove_stale_socket(path: &std::path::Path) -> bool {
+    if !is_socket(path) {
+        return true;
+    }
+    match std::os::unix::net::UnixStream::connect(path) {
+        Err(e) if e.kind() == std::io::ErrorKind::ConnectionRefused => {
+            let removed = std::fs::remove_file(path);
+            crate::log_line!(
+                "[mac] the socket the ended nvim left at {}: {}",
+                path.display(),
+                match removed {
+                    Ok(()) => "removed".to_owned(),
+                    Err(e) => format!("stays ({e})"),
+                }
+            );
+        }
+        Err(e) => {
+            crate::log_line!("[mac] the editor's socket {} left as it is: {e}", path.display());
+        }
+        Ok(_) => {
+            crate::log_line!("[mac] something still listens on {}; left as it is", path.display());
+            return false;
+        }
+    }
+    !is_socket(path)
+}
+
+/// What the editor's key did for an ended editor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Restart {
+    /// The editor had not ended: nothing was done.
+    NotEnded,
+    /// Its socket's path is still taken: no nvim is started, and the window says so.
+    PathTaken,
+    /// The new nvim is asked for, and the link waits for it.
+    Started,
+}
+
+/// What the window says when the ended nvim's socket path is still taken.
+pub const SOCKET_STILL_TAKEN: &str =
+    "nvim cannot start again: something still listens on the editor's socket (the ended nvim may still be running)";
 
 impl Host {
     pub(super) fn observe_termination(self: &Rc<Self>) {
@@ -321,6 +404,12 @@ impl Host {
                     crate::log_line!("[mac] nvim listens after {after} ms; attaching");
                     *host.life.attach.borrow_mut() = format!("attach requested after {after} ms");
                     assembly.editor.attach();
+                    // A restarted nvim's link replaces the ended one's poll, which is stopped first: a poll let go of
+                    // unstopped would leave its read sources firing.
+                    let old = host.editor_tick.borrow_mut().take();
+                    if let Some(old) = old {
+                        old.stop();
+                    }
                     *host.editor_tick.borrow_mut() = Some(EditorTicker::start(mtm, assembly.clone()));
                     false
                 }
@@ -358,16 +447,15 @@ impl Host {
         if self.life.finished.get() {
             return true;
         }
-        // Background work a finished turn left running counts as the Linux window's close counts it.
-        let work = AtWork {
-            running: assembly.panel.running_count(),
-            queued: assembly.panel.queued_count(),
-            background: assembly.panel.background_count(),
-        };
+        let work = at_work(&assembly);
         let decision = decide(&mut self.life.quit.borrow_mut(), work);
         self.life.log_quit(format!("{source:?}: {decision:?}"));
         match decision {
             QuitDecision::Proceed => true,
+            QuitDecision::EndApp => {
+                self.end_app();
+                false
+            }
             QuitDecision::AlreadyAsking => false,
             QuitDecision::Ask { what } => {
                 if let Some(host) = host_for_later() {
@@ -412,7 +500,16 @@ impl Host {
         self.life
             .log_quit(format!("answered {}", if quit { "Quit" } else { "Cancel" }));
         match after {
+            // A Cancel with the editor ended keeps the window as it is, and says how to start nvim again (the Linux
+            // window's declined close).
+            None if !quit && self.life.editor_ended() => {
+                self.life.crashed.set(false);
+                if let Some(assembly) = self.assembly() {
+                    assembly.editor_ended(Some(false));
+                }
+            }
             None => {}
+            Some(QuitAfter::EndApp) => self.end_app(),
             Some(QuitAfter::SendQuitKey) => {
                 // The key Neovide's own Quit sends; nvim decides from there (its own prompt for an unsaved buffer).
                 let sent = match self.assembly() {
@@ -435,6 +532,87 @@ impl Host {
         if let Some(window) = self.ns_window() {
             window.performClose(None);
         }
+    }
+
+    /// nvim ended with no new nvim in its place (Neovide asks through `Embedder::editor_ended`): `true` keeps the
+    /// window, cleared, with the panel; `false` closes it, and the app quits as before. Decided now, from what nvim
+    /// said of its end and what is at work (`QuitGate::nvim_ended`); what follows a kept window runs on the next turn,
+    /// out of Neovide's handling of the end.
+    pub(super) fn nvim_ended(&self) -> bool {
+        let Some(assembly) = self.assembly() else { return false };
+        if self.life.finished.get() || self.life.ending.get() {
+            return false;
+        }
+        // nvim's last line, that it is leaving, may still wait on its socket: the feeds are read first.
+        assembly.poll_editor(Instant::now());
+        let said = assembly.editor.take_said();
+        let decided = self
+            .life
+            .quit
+            .borrow_mut()
+            .nvim_ended(said, at_work(&assembly), Instant::now());
+        self.life.log_quit(format!("nvim ended ({said:?}): {decided:?}"));
+        if decided == EditorEnded::Close {
+            return false;
+        }
+        self.life.editor_ends.set(self.life.editor_ends.get() + 1);
+        self.life.crashed.set(decided == EditorEnded::Keep { crashed: true });
+        let Some(host) = host_for_later() else { return true };
+        let this_end = self.life.editor_ends.get();
+        on_next_turn(self.mtm(), move || {
+            let Some(assembly) = host.assembly() else { return };
+            // A restart (or another end) may have come first: this end's panel keys and notice are then out of date.
+            if !host.life.editor_ended() || host.life.editor_ends.get() != this_end {
+                crate::log_line!("[mac] the editor's end was overtaken before it was shown; nothing said");
+                return;
+            }
+            match decided {
+                EditorEnded::Close => {}
+                EditorEnded::Ask { what } => {
+                    assembly.editor_ended(None);
+                    host.ask_before_quitting(&what);
+                }
+                EditorEnded::Keep { crashed } => assembly.editor_ended(Some(crashed)),
+            }
+            host.update_subtitle();
+        });
+        true
+    }
+
+    /// Starts nvim again in the window whose editor ended: the socket a killed nvim left is removed, Neovide starts
+    /// the new nvim with the same command line, and the link is aimed at it once it listens. Refused while the path is
+    /// still taken: the link would reach whatever listens there, not the new nvim.
+    pub(super) fn begin_restart(self: &Rc<Self>) -> Restart {
+        if !self.life.editor_ended() || self.life.finished.get() || self.life.ending.get() {
+            return Restart::NotEnded;
+        }
+        let Some(assembly) = self.assembly() else {
+            return Restart::NotEnded;
+        };
+        if !remove_stale_socket(assembly.editor.nvim_listen()) {
+            return Restart::PathTaken;
+        }
+        self.life.quit.borrow_mut().restarted();
+        self.life.restarts.set(self.life.restarts.get() + 1);
+        crate::log_line!("[mac] starting nvim again");
+        self.wait_for_the_editor(assembly);
+        Restart::Started
+    }
+
+    /// Ends the app on the next turn, through AppKit's `terminate:`, whose notification runs the shutdown: the way out
+    /// while the editor has ended, where Neovide's own quit would go to the nvim that is gone.
+    fn end_app(&self) {
+        if self.life.ending.replace(true) {
+            return;
+        }
+        let mtm = self.mtm();
+        on_next_turn(mtm, move || {
+            if let Some(host) = host_for_later() {
+                // nvim is gone: its socket's directory goes with the rest.
+                host.finish("the window was quit while its editor had ended", true);
+            }
+            NSApplication::sharedApplication(mtm).terminate(None);
+        });
     }
 
     /// The shutdown, exactly once: the page is cut off, the timers and the panel's tick stop, the editor's link
@@ -460,6 +638,15 @@ impl Host {
         }
         let took = crate::quit::wait_for_the_close(assembly.panel.shutdown());
         crate::log_line!("[mac] shutdown done in {} ms ({via})", took.as_millis());
+    }
+}
+
+/// What is at work, as the window's close counts it: background work a finished turn left running counts too.
+fn at_work(assembly: &Assembly) -> AtWork {
+    AtWork {
+        running: assembly.panel.running_count(),
+        queued: assembly.panel.queued_count(),
+        background: assembly.panel.background_count(),
     }
 }
 

@@ -963,17 +963,18 @@ impl ClaudeSidecarProvider {
         let mut handshaken = match handshake_with(&runtime, &transport, None, None) {
             Ok(handshaken) => handshaken,
             Err(error) => {
+                let message = format!("the agent's sidecar on {host} did not answer: {error}");
                 let mut transport = transport;
                 if let Err(stop) = transport.stop() {
                     eprintln!(
                         "agent: ClaudeSidecarProvider: the sidecar on {host} that failed its handshake was not \
                          stopped: {stop}"
                     );
+                    // The helper started it and it may still run: the caller keeps its stop.
+                    let sidecar = transport.handoff(String::new(), 0);
+                    return Err(std::io::Error::new(error.kind(), UnstoppedSidecar { message, sidecar }));
                 }
-                return Err(std::io::Error::new(
-                    error.kind(),
-                    format!("the agent's sidecar on {host} did not answer: {error}"),
-                ));
+                return Err(std::io::Error::new(error.kind(), message));
             }
         };
         handshaken.info.host = Some(host);
@@ -1317,6 +1318,15 @@ impl ClaudeSidecarProvider {
             ));
         }
         transport::stop_remote(&self.transport)
+    }
+
+    /// The sidecar a failed [`Self::connect_through_helper`] left running: started by the helper, its handshake
+    /// failed and so did the stop sent after it (the link broke between the two). `None` for any other failure.
+    pub fn unstopped_sidecar(error: &std::io::Error) -> Option<HelperHandoff> {
+        error
+            .get_ref()?
+            .downcast_ref::<UnstoppedSidecar>()
+            .map(|unstopped| unstopped.sidecar.clone())
     }
 
     /// This remote tab's sidecar as a kept stop names it (`HelperHandoff::stop_key`): its host, host key, owning
@@ -4134,6 +4144,22 @@ pub fn replay_frames(
     }
     Ok(out)
 }
+
+/// A failed remote start's error that names the sidecar it left running (see
+/// [`ClaudeSidecarProvider::unstopped_sidecar`]); it reads as its message.
+#[derive(Debug)]
+struct UnstoppedSidecar {
+    message: String,
+    sidecar: HelperHandoff,
+}
+
+impl std::fmt::Display for UnstoppedSidecar {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for UnstoppedSidecar {}
 
 #[cfg(test)]
 mod tests {

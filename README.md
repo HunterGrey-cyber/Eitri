@@ -2,15 +2,17 @@ English | [简体中文](README.zh-CN.md)
 
 <div align="center">
 
-<img src="docs/images/logo.svg" width="128" height="128" alt="The Eitri logo: a window whose editor pane holds an E made of a blue gutter and three green code lines, a blank pane beside it, and a status bar">
+<img src="docs/images/logo.svg" width="112" height="112" alt="The Eitri logo: a window whose editor pane holds an E made of a blue gutter and three green code lines, a blank pane beside it, and a status bar">
 
 <h1>Eitri</h1>
 
-<p><b>Your Neovim, tiled with your agents, terminals and the web pages you build.</b></p>
+<p><b>Sick of reading agent replies and Markdown in a terminal? Run your own Neovim in a GUI that renders them.</b></p>
+<p>Arrange it the way you work: your own init.lua, your tmux keys, panels you build yourself.</p>
 
 <p>
 <a href="https://eitri.cc">Website</a> ·
 <a href="INSTALL.md">Install</a> ·
+<a href="https://eitri.cc/docs/">Docs</a> ·
 <a href="https://github.com/HunterGrey-cyber/eitri/discussions">Discussions</a> ·
 <a href="https://matrix.to/#/#eitri:matrix.org">Matrix</a> ·
 <a href="https://t.me/eitri_cc">Telegram</a>
@@ -22,62 +24,16 @@ English | [简体中文](README.zh-CN.md)
 
 </div>
 
-A Neovim GUI for Linux. Eitri is a desktop window (MIT) around your own Neovim configuration, with the agents you
-supervise (Claude Code, Codex, or any agent that speaks ACP), terminals and web pages of your own tiled beside it.
-Replies come as rendered markdown and diffs with permission cards, all without reaching for the mouse.
+<p align="center">
+<a href="https://eitri.cc/#workspace"><img src="docs/images/workspace-loop.webp" width="880" alt="Eitri with Neovim, a Markdown preview, an agent chat and a terminal tiled in one window; when the agent's turn ends, the review lists the files it changed, one hunk is put back and a note goes to the agent"></a>
+<br><sub>Eitri with a real Claude Code turn, recorded on the release this README ships with (the note is typed at 4x, marked on the picture): Neovim, a Markdown preview, a chat and a terminal in one window; <code>c</code> opens what the turn changed, <code>x</code> puts a hunk back, <code>i</code> leaves a note.</sub>
+</p>
 
-Keyboard-driven tiling: splits, tabs, stacks, floats and workspaces, with tmux's prefix keys: press `Ctrl+b`, then a key; `Ctrl+b ?` lists them all. i3's moves are there as Alt chords after the prefix, and `:EitriTutor` in the editor walks you through the keys. On Hyprland, sway or niri, chats and pages are by default windows your own window manager tiles instead, and these layout keys are off (`window.tiling`).
+Eitri is a Neovim GUI for Linux. For now it runs only on x86_64 under Wayland (X11 is untested).
 
-**[eitri.cc](https://eitri.cc)** has the screenshots, the keys, how it compares, and the requirements and limits.
+If you usually keep Claude Code in one tmux pane and Neovim in another, Eitri puts that setup in one window. The editor is still your own Neovim, with your `init.lua`, plugins, LSP and keymaps. Agent replies and Markdown are laid out beside it so they are easy to read, and terminals, chats and the pages you build tile around the editor with tmux's keys (on Hyprland, sway and niri your window manager does the tiling by default).
 
-> [!NOTE]
-> **Early release.** Eitri works, but expect rough edges, and the `init.lua` API and default keys may still change in
-> 0.x. It is not yet stable enough for everyday use: that waits for real hardware and a week of daily use, not for a
-> version number. Tell us in [Issues](https://github.com/HunterGrey-cyber/eitri/issues) or
-> [Discussions](https://github.com/HunterGrey-cyber/eitri/discussions).
-
-![Eitri: Neovim on the left with a Python file open; on the right, Claude Code's rendered reply with a highlighted code block, and the which-key box open from the leader key](docs/images/hero.webp)
-
-- **Your own Neovim.** A real `nvim --embed` with your `init.lua`, plugins, LSP and keymaps, drawn by a
-  fork of Neovide's GPU renderer.
-- **Replies you can read.** Markdown, code in your colorscheme's colours, foldable tool calls, and each
-  edit as its own diff row.
-- **Agents you supervise.** Claude Code, Codex, or an agent you register over ACP, one per tab, in Manual, Auto
-  or Bypass mode (an ACP agent has no Manual); `Enter` while a turn runs steers it. See [Codex and other agents](docs/guide/agents.md).
-- **An agent that can point.** Any tab's agent can show you a file at a line and read what your editor holds, unsaved
-  changes included, without touching your cursor: [Your editor, from an agent's tab](docs/guide/editor-tools.md).
-- **Pages you build.** A Markdown preview ships with Eitri, and your own HTML page or plugin becomes a module of the
-  window (experimental): [Pages you build](docs/guide/pages.md).
-- **Keyboard end to end.** vim keys in the panel, tmux keys for the window, `Ctrl+h/j/k/l` across panes.
-- **Review each turn.** `c` lists what changed on disk during the agent's turn; revert a hunk, or send comments back.
-- **Configured in Lua.** `$XDG_CONFIG_HOME/eitri/init.lua` (default `~/.config/eitri/init.lua`), the way Neovim reads yours.
-- **Or beside your own nvim.** `:EitriPanel` opens just the agent panel as its own window next to the Neovim in your
-  terminal, and `:EitriPage markdown` opens the Markdown preview the same way.
-
-**Prefer to keep Neovim in your terminal?** Companion mode runs the same agent panel as a window of its own,
-beside the nvim you already use (in tmux or not, in upstream Neovide or another GUI). It attaches over nvim's own
-RPC socket, sends your open file and selection to the agent, reloads buffers after its edits and opens files at a
-line, and takes everything back out when the panel goes away; your configuration is not touched. Your window
-manager arranges the two windows, and sway, Hyprland, niri and (with the bundled extension) GNOME can move focus
-between them with the same `Ctrl+h/j/k/l`. Add the `eitri.nvim` plugin and run `:EitriPanel`, or let
-`eitri split` open upstream Neovide and the panel together: see
-[Use it beside your own nvim](docs/guide/companion.md). The Markdown preview can open there too, with no agent panel:
-`:EitriPage markdown` (or `eitri page markdown` from a shell) starts it as a window of its own that follows the buffer
-you are editing: see [Pages beside your nvim](docs/guide/companion.md#pages-beside-your-nvim).
-
-## Privacy
-
-Eitri sends nothing anywhere on its own: no telemetry, no update check, no crash upload. If it crashes, it writes a
-log under `$XDG_STATE_HOME/eitri/log/` (default `~/.local/state/eitri/log/`) and tells you where; attaching it to an
-issue is up to you.
-
-It uses the network when you ask it to: the installer, `eitri setup` and `eitri sidecar check` or `update` download
-things, and a link you click opens in your browser. The one exception is the Markdown preview, which loads the `https`
-images a document points to, so the server hosting an image sees your address. To load none:
-`eitri.plugin.load("markdown", { remote_images = "off" })` ([Markdown preview](docs/guide/markdown-preview.md#images)).
-
-Claude Code and Codex are programs you installed, and Eitri runs them with your own settings. Whatever they send, and
-whatever update checks they make, is governed by their settings, not by Eitri.
+The agent can be Claude Code, Codex or any agent that speaks ACP. Hand it a task, answer from the keyboard when it asks for approval, and press `c` after the turn to see what it changed.
 
 ## Install
 
@@ -86,22 +42,59 @@ curl --proto '=https' --proto-redir '=https' --tlsv1.2 -sSfL https://github.com/
 eitri ~/path/to/project
 ```
 
-`eitri FILE` opens a single file too, takes the project from it, and hands it to the window already open on that
-project: [Open a file](docs/guide/getting-started.md#open-a-file).
+You need:
 
-Linux x86_64 on Wayland, with Neovim 0.11 or newer and Claude Code installed. On Arch:
-[`eitri-bin`](https://aur.archlinux.org/packages/eitri-bin) or [`eitri-git`](https://aur.archlinux.org/packages/eitri-git)
-from the AUR. `.deb`, `.rpm`, building from source and verifying a download: [INSTALL.md](INSTALL.md).
+- Linux on x86_64 with Wayland (X11 is untested)
+- Neovim 0.11 or newer
+- Claude Code, installed; Codex and ACP agents are optional
 
-Known limits are on [eitri.cc](https://eitri.cc/#requirements); what comes next is on the
-[roadmap](https://eitri.cc/#roadmap).
+The installer builds the agent sidecar on your machine, which takes a few minutes and about 1.4 GiB of free disk while it runs. On Arch you can install [`eitri-bin`](https://aur.archlinux.org/packages/eitri-bin) or [`eitri-git`](https://aur.archlinux.org/packages/eitri-git) instead. `.deb`, `.rpm`, building from source and checking the signature before you run anything: [INSTALL.md](INSTALL.md).
+
+## What it does
+
+- **A workspace around your Neovim.** A real `nvim --embed` with your configuration, drawn by a fork of Neovide's GPU renderer. Around it you tile chats, terminals and pages with tmux's prefix keys (`Ctrl+b`, then a key; `Ctrl+b ?` lists them), and `:EitriTutor` walks you through them. On Hyprland, sway and niri each chat view and page is a window your window manager tiles, by default: [Compositor windows](docs/guide/compositor-windows.md). If you have never used tmux, start with [these 6 keys](docs/guide/tmux-6-keys.md).
+- **Replies and Markdown you can read.** Agent replies are laid out as a document, with code in your colorscheme's colours, each edit as its own diff row, and tool calls you can fold away. The Markdown preview sits beside the file you edit and scrolls with Neovim; one line of `init.lua` turns it on.
+- **Pages you build.** Your own HTML pages, or your dev server, as modules of the window (experimental): [Pages you build](docs/guide/pages.md). Eitri ships four, off until `init.lua` loads them: the Markdown preview and three pages that show your agents ([Many agents at once](docs/guide/many-agents.md)), with their source in `plugins/` to copy from. The guide also has [Write a plugin](docs/guide/write-a-plugin.md); a Recipes page with ready-made setups is on its way.<!-- TODO: link Recipes once docs/2026-11-15-recipe-shots lands -->
+- **Hand it over, answer when it asks.** In a Claude Code or Codex tab, `Enter` while a turn runs puts your message into it. A call that needs your approval waits on a card you answer from the keyboard, and `Shift+Tab` moves a tab between manual, auto and bypass (an ACP tab has no manual): [Permissions](docs/guide/permissions.md).
+- **See what a turn changed.** `c` lists the files that changed on disk during the agent's last turn, hunk by hunk, with a sign on the ones its own edits named. Put a hunk or a whole file back with `x` (`u` undoes it), or leave notes with `i` and send them as your next message with `s`, which shows you the message before it goes. Eitri compares its own snapshots of the project, so you don't need a git repository: [Reviewing a turn](docs/guide/turn-review.md).
+- **The agents you already use.** Claude Code, Codex, or an agent you register over ACP, one per tab. Eitri runs the ones you installed and set up, and never touches your credentials: [Codex and other agents](docs/guide/agents.md).
+- **Or beside your terminal nvim.** `:EitriPanel` opens the agent panel as a window of its own next to the Neovim you already run, in tmux or not: [Use it beside your own nvim](docs/guide/companion.md).
+- **Configured in Lua.** `~/.config/eitri/init.lua`, read the way Neovim reads yours.
+
+<table>
+<tr>
+<td width="50%"><img src="docs/images/markdown.webp" alt="A Markdown file in Neovim on the left and its rendered preview on the right, with a table and a task list"></td>
+<td width="50%"><img src="docs/images/tiled.webp" alt="Eitri tiled: Neovim, two agent chats and a terminal in one window"></td>
+</tr>
+<tr>
+<td><sub>The Markdown preview, beside the file you edit.</sub></td>
+<td><sub>Neovim, two chats and a terminal, tiled with tmux keys.</sub></td>
+</tr>
+</table>
+
+## How it differs
+
+- **From an agent CLI in a tmux pane:** replies and Markdown are laid out as documents in a window you tile around Neovim, and the review sees the files that changed on disk during a turn, including ones a shell command changed.
+- **From Claude Code's `/rewind`:** you can put back one hunk instead of the whole turn, and tell the agent why.
+- **From CodeCompanion.nvim's code review:** Eitri's review is there after each turn without you starting a round, and it needs no git repository.
+- **From Zed:** Eitri runs your Neovim itself, with your configuration; Zed is its own editor with a Vim mode.
+
+The longer answers, with links to each project's own docs, are on [eitri.cc](https://eitri.cc/#differs).
+
+## Status and limits
+
+<!-- At the release cut: "<date>: Eitri <version> is an early release, and the ..." and the caption above gets the version from the recording. -->Eitri is an early release, and the `init.lua` API and default keys may change during 0.x. It is not yet stable enough for everyday use: that waits for real hardware and a week of daily use, not for a version number.
+
+- It runs only on Linux x86_64 under Wayland; macOS is in progress.
+- It uses more memory than native Neovide. The [known issues](docs/known-issues.md) page has the measurements and is worth reading before you file a bug.
+- Eitri sends nothing anywhere on its own: no telemetry, no update check, no crash upload ([what leaves your machine](docs/known-issues.md#what-leaves-your-machine)).
+
+Requirements in full are on [eitri.cc](https://eitri.cc/#requirements), and what comes next is on the [roadmap](https://eitri.cc/#roadmap).
 
 ## Community
 
-- Documentation: https://eitri.cc/docs/
 - [Discussions](https://github.com/HunterGrey-cyber/eitri/discussions): questions, ideas, your setups
 - [Matrix](https://matrix.to/#/#eitri:matrix.org) `#eitri:matrix.org` (English) and [Telegram](https://t.me/eitri_cc) (mostly Chinese)
-- [Known issues](docs/known-issues.md): what is unsupported or rough today, worth a look before you file a bug
 - [Issues](https://github.com/HunterGrey-cyber/eitri/issues) for bugs; [CONTRIBUTING.md](CONTRIBUTING.md) for building and the tests
 - The [Neovide fork](https://github.com/HunterGrey-cyber/neovide) (`neovibe-integration`) and the [agent sidecar](https://github.com/HunterGrey-cyber/verdandi) live in their own repositories
 

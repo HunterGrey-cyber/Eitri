@@ -36,8 +36,8 @@ rc = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(rc)
 
 _SCRATCH_ROOT = os.path.expanduser("~/.cache/eitri-release-sh-tests")
-# The tagline, as the README, the desktop entry, the package description and the release notes give it.
-TAGLINE = "Sick of reading agent replies and Markdown in a terminal? Run your own Neovim in a GUI that renders them."
+# The promo line, as the release notes' first line gives it (the description line has other places: see test_nfpm_profiles).
+PROMO = "Sick of reading agent replies and Markdown in a terminal? Run your own Neovim in a GUI that renders them."
 _VERDANDI_REV = "0123456789abcdef0123456789abcdef01234567"
 _NVIM_PIN = "NVIM_VERSION=0.11.4\nNVIM_SHA256_linux_x86_64=" + "ab" * 32 + "\n"
 _DOCKER_EXIT = 97
@@ -2014,7 +2014,7 @@ class ReleaseNotesEnglishOnly(unittest.TestCase):
     render = ReleaseNotes.render
 
     def assert_english_page(self, notes):
-        self.assertIn("Eitri 1.0.0-rc.1 -- " + TAGLINE, notes)
+        self.assertIn("Eitri 1.0.0-rc.1 -- " + PROMO, notes)
         self.assertNotRegex(notes, "[\u3000-\u9fff\uff00-\uffef]")
         self.assertNotIn("@", notes.replace("release@eitri", ""))
 

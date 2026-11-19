@@ -1,5 +1,5 @@
 [English](getting-started.md) | 简体中文
-<!-- translated-from: getting-started.md sha256=469cf302737e7cc3ff1eba293e75460a58fd257661e150a3e94c1aabe38b8f10 -->
+<!-- translated-from: getting-started.md sha256=07fc356ec739ee07fd9da5ee231c739ad60760d9cf7279b9c9b9ffde3103f5b2 -->
 
 # 快速上手
 
@@ -185,7 +185,7 @@ Eitri 在它的状态目录里存一个小文件，记着开了什么：每 30 �
 
 会话本身没了的话，对话里会说明。红色的 `This session was lost` 表示连接断了，上面显示的内容可能不全；淡色的 `This session has ended (<原因>)` 表示会话已经关闭。两种情况都可以在浏览时按 `r`，在这个标签页里开一个新会话。回合进行中留着的消息，在那个回合结束后仍然会发出去，就算回合是因为上限而结束的也一样。
 
-如果 nvim 自己没了（被杀掉或崩溃），窗口还在，并且会说：`nvim stopped unexpectedly — <prefix> e starts it again and says what can be recovered`。最后一个 buffer 上的 `:q` 照样关窗口，跟普通 Neovim 一样。启动时如果发现这个项目有文件在 swap 里留着未保存的修改，会提示一次：`unsaved changes kept for long.txt — :e the file, then r recovers them or d deletes them`。你不这样做就什么都不会恢复，swap 文件还在的话，每次启动都会再提示。
+如果 nvim 自己没了（被杀掉或崩溃），窗口还在，并且会说：`nvim stopped unexpectedly — <prefix> e starts it again and says what can be recovered`。最后一个 buffer 上的 `:q` 照样关窗口，跟普通 Neovim 一样。例外是在启动页上退出（当前 buffer 是 LazyVim 的 dashboard，或 `alpha`、`dashboard`、`ministarter`、`starter`），而且窗口里除编辑器外还有聊天、终端或页面：这时会先问 `close Eitri? (y/n)`，因为在插件浮窗（比如 Lazy 的更新界面）里连按两次 `q`，第二次会落到后面的启动页上退出。按 `n` 编辑器就地结束，窗口留着，按编辑器的键再启动 nvim；按 `y` 关窗口。真实 buffer 里的 `:qa`、`:wqa`、`ZZ` 照样直接关。启动时如果发现这个项目有文件在 swap 里留着未保存的修改，会提示一次：`unsaved changes kept for long.txt — :e the file, then r recovers them or d deletes them`。你不这样做就什么都不会恢复，swap 文件还在的话，每次启动都会再提示。
 
 如果 Eitri 要存的东西写不进去了，每类问题提示一次，直到恢复正常，说明哪些没存上：`could not save the open tabs`、`could not record this session` 或 `could not store the history`，原因通常是 `the disk is full`。回合照常跑。腾出空间后会自己补上。
 

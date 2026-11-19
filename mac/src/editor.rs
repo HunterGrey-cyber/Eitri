@@ -33,6 +33,8 @@ use eitri_core::scratch::{ScratchDir, ScratchRequest};
 use eitri_core::theme::feed::{ThemeFeed, ThemePayloadReader};
 use eitri_core::theme::payload::NvimThemePayload;
 
+use crate::quit::NvimSaid;
+
 /// How often the host calls [`Editor::poll`]: the finest feed cadence (the pane switch's).
 pub const TICK: Duration = EditorFeeds::TICK;
 
@@ -116,6 +118,9 @@ pub enum EditorEvent {
     CancelDrafts,
     /// The context source answers something new; the panel reads it when its tick runs, so it is woken.
     ContextChanged,
+    /// nvim found `count` of the project's files with unsaved changes left in swap files, `newest` the latest (the
+    /// editor watch's report at each start).
+    Recoverable { count: u32, newest: String },
 }
 
 pub struct Editor {
@@ -144,6 +149,8 @@ pub struct Editor {
     /// pair could not be made; then the host keeps ticking.
     link_wake: Option<UnixStream>,
     polls: Cell<u64>,
+    /// What the running nvim said of its end so far (the editor watch's lines on the pane-switch socket).
+    said: Cell<NvimSaid>,
 }
 
 /// The pair the link's threads wake the host through. Both ends never block: a full buffer already says "poll".
@@ -247,6 +254,7 @@ impl Editor {
             attach_attempts: Cell::new(0),
             link_wake,
             polls: Cell::new(0),
+            said: Cell::new(NvimSaid::Nothing),
         })
     }
 
@@ -304,14 +312,24 @@ impl Editor {
             events.push(EditorEvent::ContextChanged);
         }
         for message in found.pane {
-            if let PaneMessage::Direction(letter) = message {
-                match pane_switch::letter_direction(letter) {
+            match message {
+                PaneMessage::Direction(letter) => match pane_switch::letter_direction(letter) {
                     Some(direction) => events.push(EditorEvent::PaneSwitch(direction)),
                     None => crate::log_line!("[pane_switch] unknown direction {letter:?}, ignoring"),
-                }
+                },
+                PaneMessage::EditorWatched => self.said.set(NvimSaid::Watched),
+                PaneMessage::EditorLeaving { .. } => self.said.set(NvimSaid::Leaving),
+                PaneMessage::Recoverable { count, newest } => events.push(EditorEvent::Recoverable { count, newest }),
+                _ => {}
             }
         }
         events
+    }
+
+    /// What the nvim that just ended said of its end; the next nvim starts from nothing said. Its last line may still
+    /// be waiting on the socket: the caller polls first.
+    pub fn take_said(&self) -> NvimSaid {
+        self.said.replace(NvimSaid::Nothing)
     }
 
     /// Whether a link thread said something since the last call; empties the wake.
@@ -459,9 +477,24 @@ impl Editor {
         self.context_feed.as_ref().map(EditorContextFeed::socket_path)
     }
 
+    /// The pane-switch channel's socket, where nvim's editor watch and navigator write; `None` when it could not be
+    /// made.
+    pub fn pane_switch_socket(&self) -> Option<&Path> {
+        self.pane_switch.as_ref().map(PaneSwitchChannel::socket_path)
+    }
+
     /// The socket nvim listens on.
     pub fn nvim_listen(&self) -> &Path {
         &self.nvim_listen
+    }
+
+    /// What nvim's command line needs to load the editor watch, which says on the pane-switch socket whether nvim
+    /// is leaving on purpose (`startup::editor_watch_args`); nothing without the pane-switch channel.
+    pub fn nvim_watch_args(&self) -> Vec<String> {
+        self.pane_switch
+            .as_ref()
+            .map(|channel| crate::startup::editor_watch_args(&channel.child_env()))
+            .unwrap_or_default()
     }
 }
 
@@ -495,6 +528,47 @@ mod tests {
 
     fn editor() -> Editor {
         Editor::new(std::env::temp_dir().join("eitri-mac-never-bound")).expect("an absolute path")
+    }
+
+    /// The editor watch's lines on the pane-switch socket say what nvim said of its end; taking it starts the next
+    /// nvim from nothing said.
+    #[test]
+    fn what_nvim_says_of_its_end_is_kept_until_taken() {
+        use std::io::Write;
+        let editor = editor();
+        let socket = editor
+            .pane_switch
+            .as_ref()
+            .expect("the pane-switch channel")
+            .socket_path()
+            .to_path_buf();
+        let args = editor.nvim_watch_args();
+        assert_eq!(args.len(), 2, "{args:?}");
+        assert!(args[1].contains(&socket.display().to_string()), "{args:?}");
+        assert_eq!(editor.take_said(), NvimSaid::Nothing);
+        let start = Instant::now();
+        let guard = Instant::now() + Duration::from_secs(60);
+        for (line, said) in [
+            ("nvim-watched\n", NvimSaid::Watched),
+            ("nvim-leaving\n", NvimSaid::Leaving),
+        ] {
+            let mut stream = UnixStream::connect(&socket).expect("connect");
+            stream.write_all(line.as_bytes()).expect("write");
+            drop(stream);
+            let mut now = start;
+            loop {
+                now += TICK;
+                editor.poll(now);
+                if editor.said.get() == said {
+                    break;
+                }
+                assert!(Instant::now() < guard, "{line:?} was never read");
+                std::thread::yield_now();
+            }
+        }
+        assert_eq!(editor.take_said(), NvimSaid::Leaving);
+        assert_eq!(editor.take_said(), NvimSaid::Nothing);
+        editor.shutdown();
     }
 
     #[test]

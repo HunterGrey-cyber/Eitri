@@ -19,7 +19,7 @@ mod fixture;
 
 use eitri_terminal::{paint, TerminalMetrics};
 use fixture::{load_scenarios, Scenario};
-use skia_safe::{surfaces, Color, ISize};
+use skia_safe::{surfaces, Color, ColorType, ISize};
 
 /// Big enough cells that a glyph has room to be unambiguously present or absent, and that sampling
 /// a cell's interior is not at the mercy of one pixel of antialiasing.
@@ -42,7 +42,8 @@ impl Rendered {
             surfaces::raster_n32_premul(ISize::new(width.max(1), height.max(1))).expect("a raster surface");
         paint(surface.canvas(), &scenario.list, &metrics);
 
-        let image_info = surface.image_info();
+        // Read back as BGRA whatever the surface's native order (n32 is BGRA on Linux, RGBA on macOS).
+        let image_info = surface.image_info().with_color_type(ColorType::BGRA8888);
         let row_bytes = image_info.min_row_bytes();
         let mut pixels = vec![0u8; row_bytes * height.max(1) as usize];
         assert!(
@@ -54,7 +55,7 @@ impl Rendered {
 
     fn at(&self, x: i32, y: i32) -> Color {
         let i = (y as usize * self.width as usize + x as usize) * 4;
-        // n32_premul on this platform is BGRA. Alpha is always opaque here (the canvas is cleared to
+        // Read back as BGRA (above). Alpha is always opaque here (the canvas is cleared to
         // a solid colour), so premultiplication does not distort the comparison.
         Color::from_rgb(self.pixels[i + 2], self.pixels[i + 1], self.pixels[i])
     }
@@ -311,9 +312,11 @@ fn a_combining_mark_on_a_wide_base_keeps_the_wide_box() {
 fn fills_use_exactly_the_colour_they_were_given() {
     let s = scenario("colors-indexed-and-truecolor");
     let r = Rendered::of(&s);
-    // The first cell's background is an indexed blue, already resolved to 0000ee upstream.
-    assert_eq!(r.cell_center(0, 0), rgb(0x0000ee));
-    // Its neighbour is the default background. Two adjacent fills must not bleed into each other.
+    // The first cell's background is an indexed blue, already resolved to 0000ee upstream. The cell's dominant
+    // colour, not its centre pixel: with Menlo (macOS) the glyph's ink covers the centre.
+    assert_eq!(r.dominant_color(0, 0), rgb(0x0000ee));
+    // Its neighbour is the default background. Two adjacent fills must not bleed into each other. That cell holds
+    // no glyph, so its centre pixel is the stricter check and stays.
     assert_eq!(r.cell_center(0, 5), rgb(DEFAULT_BG));
 }
 
@@ -343,12 +346,13 @@ fn selection_arrives_as_colours_with_nothing_to_interpret() {
     let r = Rendered::of(&s);
     // Selected cells simply have swapped colours in their ops. There is no selection flag anywhere
     // in the stream and the backend has no notion of one.
+    // Dominant colours, not centre pixels: with Menlo (macOS) the glyph's ink covers a cell's centre.
     assert_eq!(
-        r.cell_center(0, 0),
+        r.dominant_color(0, 0),
         rgb(DEFAULT_BG),
         "unselected cell keeps the default background"
     );
-    let selected = r.cell_center(0, 2);
+    let selected = r.dominant_color(0, 2);
     assert_ne!(selected, rgb(DEFAULT_BG), "a selected cell must be visibly filled");
 }
 

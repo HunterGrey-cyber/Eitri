@@ -1124,8 +1124,8 @@ impl PendingAsker {
 pub struct RemoteStartFailure {
     pub message: String,
     pub info: Option<crate::ProviderInfo>,
-    /// The sidecar started for the tab when its stop did not go through after the session failed (the link
-    /// broke during the create): the caller keeps its stop for when the server can be reached again.
+    /// The sidecar started for the tab when its stop did not go through after its handshake or its session
+    /// failed (the link broke in between): the caller keeps its stop for when the server can be reached again.
     pub unstopped: Option<crate::HelperHandoff>,
 }
 
@@ -1151,7 +1151,7 @@ pub fn open_remote_session(
             RemoteStartFailure {
                 message: error.to_string(),
                 info: None,
-                unstopped: None,
+                unstopped: crate::ClaudeSidecarProvider::unstopped_sidecar(&error),
             }
         })?;
     let provider = Arc::new(provider);

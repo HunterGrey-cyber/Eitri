@@ -259,7 +259,7 @@ fn a_finished_start_installs_into_its_own_tab_with_its_first_turn() {
     let collected = set.collect_starts();
     assert!(matches!(
         collected.as_slice(),
-        [StartCollected::Installed { tab, request_id, first_turn: Some(turn) }]
+        [StartCollected::Installed { tab, request_id, first_turn: Some(turn), .. }]
             if *tab == first && request_id == "req-7" && turn.typed == "hi"
     ));
     assert!(set.get(first).unwrap().live().is_some());
@@ -380,5 +380,250 @@ fn a_rename_is_normalized_and_the_mode_can_still_be_switched_after_the_session_s
     set.select(tab);
     let second_plan = plan(set.cycle_mode(tab, ViewId::BASE));
     assert_eq!(second_plan.scope, BypassScope::Tab(tab));
+    shut_down_all(&mut set);
+}
+
+/// A history with one restored prompt, as a resume's connect worker hands it over.
+fn restored_history(prompt: &str) -> agent::AgentSessionProjection {
+    let mut history = agent::AgentSessionProjection::default();
+    history.user_prompts.push(agent::UserPromptRecord {
+        seq: 1,
+        text: prompt.into(),
+        delivered: false,
+        attachments: Vec::new(),
+    });
+    history
+}
+
+fn snapshot_of(payloads: &[String]) -> Option<serde_json::Value> {
+    payloads
+        .iter()
+        .map(|payload| serde_json::from_str::<serde_json::Value>(payload).unwrap())
+        .find(|envelope| envelope["kind"] == "snapshot")
+}
+
+/// A resume's history arriving before its session is live is drawn once, as an early snapshot under the
+/// starting tab; the backend that installs replaces it with its own, and says the page already drew it.
+#[test]
+fn a_resumes_early_history_is_drawn_while_it_starts_and_replaced_when_it_installs() {
+    let dir = workspace("tabs-early-history");
+    let mut set = set();
+    let tab = set.active();
+    let tx = starting(&mut set, tab, None, None);
+    let (early, arriving) = early_history_channel();
+    set.expect_early_history(tab, arriving);
+    assert!(set.collect_early_histories().is_empty(), "nothing has arrived");
+    assert!(
+        snapshot_of(&set.state_payloads(tab)).is_none(),
+        "a start with no history draws none"
+    );
+
+    early.deliver(restored_history("what changed yesterday?"));
+    assert_eq!(set.collect_early_histories(), vec![tab]);
+    assert!(set.collect_early_histories().is_empty(), "reported once");
+    let snapshot = snapshot_of(&set.state_payloads(tab)).expect("the early history is drawn");
+    assert_eq!(snapshot["early"], true);
+    assert_eq!(snapshot["state"]["userPrompts"][0]["text"], "what changed yesterday?");
+    assert_eq!(
+        set.get(tab).unwrap().wire_state(),
+        TabStateWire::Starting,
+        "the tab is still starting"
+    );
+
+    tx.send(Ok(live(&dir).1)).unwrap();
+    assert!(matches!(
+        set.collect_starts().as_slice(),
+        [StartCollected::Installed { early: true, .. }]
+    ));
+    let snapshot = snapshot_of(&set.state_payloads(tab)).expect("the session's own snapshot");
+    assert!(
+        snapshot.get("early").is_none(),
+        "the backend's projection replaced the early one"
+    );
+    shut_down_all(&mut set);
+}
+
+/// A start that fails drops its early history: no session took it up, and the failed tab draws none.
+#[test]
+fn a_failed_start_drops_its_early_history() {
+    let mut set = set();
+    let tab = set.active();
+    let tx = starting(&mut set, tab, None, None);
+    let (early, arriving) = early_history_channel();
+    set.expect_early_history(tab, arriving);
+    early.deliver(restored_history("an old question"));
+    set.collect_early_histories();
+    tx.send(Err(BackendError {
+        message: "the provider refused the resume".into(),
+        benign: false,
+    }))
+    .unwrap();
+    assert!(matches!(
+        set.collect_starts().as_slice(),
+        [StartCollected::Failed { .. }]
+    ));
+    assert!(snapshot_of(&set.state_payloads(tab)).is_none());
+}
+
+/// A history arriving for a start that is no longer the tab's (a new start began) is not drawn.
+#[test]
+fn a_new_start_draws_no_history_of_the_one_before() {
+    let mut set = set();
+    let tab = set.active();
+    let _tx = starting(&mut set, tab, None, None);
+    let (early, arriving) = early_history_channel();
+    set.expect_early_history(tab, arriving);
+    let (_tx2, result_rx) = mpsc::channel();
+    set.start(
+        tab,
+        PendingStart {
+            request_id: "req-2".into(),
+            result_rx,
+            first_turn: None,
+            resume: Some("another".into()),
+            resumed_title: None,
+            resumed_name: None,
+        },
+    );
+    early.deliver(restored_history("the earlier start's"));
+    assert!(set.collect_early_histories().is_empty());
+    assert!(snapshot_of(&set.state_payloads(tab)).is_none());
+}
+
+fn queue_typed(set: &mut TabSet, tab: TabId, text: &str) {
+    assert!(set
+        .queue_message(tab, text, text.into(), 1, true, agent::PromptOrigin::Typed)
+        .is_ok());
+}
+
+fn refused() -> StartResult {
+    Err(BackendError {
+        message: "the provider refused the resume".into(),
+        benign: false,
+    })
+}
+
+/// A message typed while a resume starts goes to that session once it is live, and to nothing before.
+#[test]
+fn a_message_queued_while_a_resume_starts_goes_to_that_session_once_it_is_live() {
+    let dir = workspace("tabs-early-queue-live");
+    let mut set = set();
+    let tab = set.active();
+    let tx = starting(&mut set, tab, None, None);
+    queue_typed(&mut set, tab, "and the tests?");
+    assert!(set.flush_queue(tab).is_none(), "nothing is live to take it");
+    let (provider, backend) = live(&dir);
+    tx.send(Ok(backend)).unwrap();
+    set.collect_starts();
+    let flush = set.flush_queue(tab).expect("the queue goes to the resumed session");
+    assert!(flush.outcome.is_ok());
+    assert_eq!(provider.turns(), vec!["and the tests?".to_string()]);
+    shut_down_all(&mut set);
+}
+
+/// A resume by hand that is refused keeps what was typed while it started in the failed tab's queue, sent to
+/// nothing; `r` returns it as the draft, and the fresh session started there takes none of it by itself.
+#[test]
+fn a_message_queued_while_a_refused_resume_started_is_never_sent_to_a_fresh_session() {
+    let dir = workspace("tabs-early-queue-refused");
+    let mut set = set();
+    let tab = set.active();
+    let tx = starting(&mut set, tab, None, None);
+    queue_typed(&mut set, tab, "for the old session");
+    tx.send(refused()).unwrap();
+    set.collect_starts();
+    assert_eq!(set.get(tab).unwrap().session.queue.len(), 1, "still shown, not sent");
+    assert!(set.flush_queue(tab).is_none());
+
+    set.reset(tab).unwrap();
+    let t = set.get(tab).unwrap();
+    assert!(t.session.queue.is_empty());
+    assert_eq!(t.draft(), "for the old session");
+    let tx = starting(&mut set, tab, None, None);
+    let (provider, backend) = live(&dir);
+    tx.send(Ok(backend)).unwrap();
+    set.collect_starts();
+    assert!(set.flush_queue(tab).is_none(), "the fresh session is given nothing");
+    assert!(provider.turns().is_empty());
+    shut_down_all(&mut set);
+}
+
+/// A restore whose resume is refused hands its tab back empty: what was typed while it started comes back as
+/// that composer's draft, ahead of what the draft held, and a fresh session started there takes none of it.
+#[test]
+fn a_message_queued_while_a_refused_restore_started_comes_back_as_the_draft() {
+    let dir = workspace("tabs-early-queue-restore");
+    let mut set = set();
+    let tab = set.active();
+    let tx = starting(&mut set, tab, None, None);
+    queue_typed(&mut set, tab, "first");
+    set.set_draft(tab, "still typing");
+    tx.send(refused()).unwrap();
+    set.collect_starts();
+    set.discard_failed_restore(tab, Some((SessionModeChoice::Auto, AgentId::Claude)));
+    let t = set.get(tab).unwrap();
+    assert_eq!(t.wire_state(), TabStateWire::NotStarted);
+    assert!(
+        t.session.queue.is_empty(),
+        "nothing is left queued for a session that never came back"
+    );
+    assert_eq!(t.draft(), "first\n\nstill typing");
+
+    let tx = starting(&mut set, tab, None, None);
+    let (provider, backend) = live(&dir);
+    tx.send(Ok(backend)).unwrap();
+    set.collect_starts();
+    assert!(set.flush_queue(tab).is_none(), "the fresh session is given nothing");
+    assert!(provider.turns().is_empty());
+    shut_down_all(&mut set);
+}
+
+/// A refused restored tab the restore made is closed: what was typed in it goes to the composer on screen, after
+/// what that holds, and is sent nowhere.
+#[test]
+fn a_message_queued_in_a_refused_restored_tab_that_closes_goes_to_the_composer_on_screen() {
+    let dir = workspace("tabs-early-queue-closed");
+    let mut set = set();
+    let shown = set.active();
+    let (provider, backend) = live(&dir);
+    set.get_mut(shown).unwrap().backend = TabBackend::Live(backend);
+    set.set_draft(shown, "mine");
+    let other = set.open(AgentId::Claude);
+    set.select(shown);
+    let tx = starting(&mut set, other, None, None);
+    queue_typed(&mut set, other, "for the refused one");
+    tx.send(refused()).unwrap();
+    set.collect_starts();
+    set.discard_failed_restore(other, None);
+    assert!(set.get(other).is_none());
+    let t = set.get(shown).unwrap();
+    assert_eq!(t.draft(), "mine\n\nfor the refused one");
+    assert!(t.session.queue.is_empty());
+    assert!(set.flush_queue(shown).is_none());
+    assert!(provider.turns().is_empty(), "the session on screen was sent nothing");
+    shut_down_all(&mut set);
+}
+
+/// A start that will not happen hands its queue back as the draft; a fresh session started after is given none of it.
+#[test]
+fn a_queue_handed_back_as_the_draft_is_never_sent_to_a_fresh_session() {
+    let dir = workspace("tabs-queue-back");
+    let mut set = set();
+    let tab = set.active();
+    let _tx = starting(&mut set, tab, None, None);
+    queue_typed(&mut set, tab, "for the old session");
+    set.set_draft(tab, "still typing");
+    set.get_mut(tab).unwrap().backend = TabBackend::NotStarted;
+    assert!(set.queue_back_to_draft(tab));
+    assert!(!set.queue_back_to_draft(tab), "nothing is left to hand back");
+    let t = set.get(tab).unwrap();
+    assert!(t.session.queue.is_empty());
+    assert_eq!(t.draft(), "for the old session\n\nstill typing");
+    let tx = starting(&mut set, tab, None, None);
+    let (provider, backend) = live(&dir);
+    tx.send(Ok(backend)).unwrap();
+    set.collect_starts();
+    assert!(set.flush_queue(tab).is_none());
+    assert!(provider.turns().is_empty());
     shut_down_all(&mut set);
 }

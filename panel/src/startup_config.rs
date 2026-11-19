@@ -711,6 +711,82 @@ mod tests {
         assert_settings_known(&["desk/missing-source-directory"]);
     }
 
+    fn setting_literals(text: &str) -> Vec<&str> {
+        use eitri_core::source_scan::{code_only, word_ends};
+        let code = code_only(text);
+        let literal_after = |tail: &str, tokens: &[&str]| {
+            let tail = tokens
+                .iter()
+                .try_fold(tail, |tail, token| tail.trim_start().strip_prefix(token))?;
+            text[code.len() - tail.len()..]
+                .trim_start()
+                .strip_prefix('"')?
+                .split_once('"')
+                .map(|(key, _)| key)
+        };
+        let mut keys = Vec::new();
+        for end in word_ends(&code, "const") {
+            let tail = code[end..].trim_start();
+            let tail = tail.trim_start_matches(|ch: char| ch.is_alphanumeric() || ch == '_');
+            keys.extend(literal_after(tail, &[":", "&", "str", "="]));
+        }
+        for end in word_ends(&code, "get") {
+            let Some(receiver) = code[..end - 3].trim_end().strip_suffix('.') else {
+                continue;
+            };
+            if let Some(key) = literal_after(&code[end..], &["("]) {
+                if receiver.trim_end().ends_with("config") || key.starts_with("agent.") {
+                    keys.push(key);
+                }
+            }
+        }
+        keys
+    }
+
+    fn assert_config_reads(newline: &str) {
+        let text = r#"const KEY: &str = "window.constant";
+config.get("window.inline");
+config
+    . get(
+        "window.split",
+    );
+other_config.get("window.other");
+store.get("window.unrelated");
+store.borrow().get("agent.borrowed");"#
+            .replace('\n', newline);
+        assert_eq!(
+            setting_literals(&text),
+            [
+                "window.constant",
+                "window.inline",
+                "window.split",
+                "window.other",
+                "agent.borrowed"
+            ]
+        );
+    }
+
+    #[test]
+    fn multi_line_config_get_read_is_found() {
+        assert_config_reads("\n");
+    }
+
+    #[test]
+    fn multi_line_config_get_read_is_found_crlf() {
+        assert_config_reads("\r\n");
+    }
+
+    #[test]
+    fn settings_reads_through_prefixed_config_receivers_are_found() {
+        let source = "window_config.get(\"window.typo\");\nself.lua_config\n    .get(\"editor.typo\");";
+        for newline in ["\n", "\r\n"] {
+            assert_eq!(
+                setting_literals(&source.replace('\n', newline)),
+                ["window.typo", "editor.typo"]
+            );
+        }
+    }
+
     fn assert_settings_known(dirs: &[&str]) {
         let known = known_keys(&[]);
         let families = [
@@ -726,24 +802,17 @@ mod tests {
         ];
         let mut unknown = Vec::new();
         for source in eitri_core::source_scan::rust_sources(dirs) {
-            let production = source.text.split("#[cfg(test)]").next().unwrap_or_default();
-            for line in production.lines() {
-                let declared = line.contains("const ") && line.contains("&str = \"");
-                let read = line.contains("config.get(\"") || line.contains(".get(\"agent.");
-                if !(declared || read) {
-                    continue;
-                }
-                for literal in line.split('"').skip(1).step_by(2) {
-                    let family = literal.split('.').next().unwrap_or_default();
-                    let key_like = literal.contains('.')
-                        && literal.chars().all(|c| c.is_ascii_lowercase() || c == '_' || c == '.');
-                    if key_like
-                        && families.contains(&family)
-                        && !known.contains(&literal)
-                        && !literal.starts_with(eitri_core::editor_tools::switches::TOOL_KEY_PREFIX)
-                    {
-                        unknown.push(format!("{}: {literal}", source.path));
-                    }
+            let production = eitri_core::source_scan::production_text(&source.text);
+            for literal in setting_literals(&production) {
+                let family = literal.split('.').next().unwrap_or_default();
+                let key_like =
+                    literal.contains('.') && literal.chars().all(|c| c.is_ascii_lowercase() || c == '_' || c == '.');
+                if key_like
+                    && families.contains(&family)
+                    && !known.contains(&literal)
+                    && !literal.starts_with(eitri_core::editor_tools::switches::TOOL_KEY_PREFIX)
+                {
+                    unknown.push(format!("{}: {literal}", source.path));
                 }
             }
         }

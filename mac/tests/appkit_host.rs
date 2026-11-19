@@ -22,12 +22,13 @@ mod macos {
     use std::time::{Duration, Instant};
 
     use eitri_mac::appkit::page::PANEL_DOCUMENT;
-    use eitri_mac::appkit::window::Host;
+    use eitri_mac::appkit::window::{Host, MacEmbedder};
     use eitri_mac::assembly::{assemble, HostActions};
     use eitri_mac::editor::{AttachWait, Editor};
     use eitri_mac::quit::QuitSource;
     use eitri_panel::agent_panel::ViewId;
     use eitri_panel::panel_page::PanelHost;
+    use neovide::embed::Embedder;
     use std::cell::{Cell, RefCell};
 
     use eitri_mac::appkit::app::{click_held_button, quit_alert, quit_chosen};
@@ -307,6 +308,104 @@ mod macos {
             "the link's own news wakes it: the editor going is told",
             detached,
             format!("{:?}", assembly.editor_link()),
+        );
+
+        // nvim ended (Neovide asks the embedder): it had said it would say when it leaves and did not, so it crashed;
+        // the window stays. Its last line is still on the socket when Neovide asks: the hook reads it first.
+        let say = |line: &str| {
+            let socket = editor.pane_switch_socket().expect("the pane-switch channel");
+            let mut stream = UnixStream::connect(socket).expect("connect");
+            stream.write_all(line.as_bytes()).expect("write");
+        };
+        let embedder = MacEmbedder::new(host.clone());
+        say("nvim-watched\n");
+        let kept = embedder.editor_ended();
+        check(
+            "a crashed nvim keeps the window",
+            kept && host.life.editor_ended()
+                && host
+                    .life
+                    .quit_log()
+                    .last()
+                    .is_some_and(|l| l == "nvim ended (Watched): Keep { crashed: true }"),
+            format!("kept {kept}, {:?}", host.life.quit_log()),
+        );
+        check(
+            "with the editor ended, the zoom is refused",
+            {
+                assembly.run_prefix(
+                    eitri_core::keymap::prefix::PrefixCommand::Run(eitri_core::keymap::Action::Zoom),
+                    host.pane(),
+                );
+                !host.hidden_by_user()
+            },
+            String::new(),
+        );
+        // The editor's key: the socket the killed nvim left is removed, and the link is aimed at the next nvim on it.
+        let stale = nvim_listen.exists();
+        let restarted = (*host).restart_editor();
+        check(
+            "the editor's key starts nvim again: the stale socket goes and the window waits for the new one",
+            stale
+                && restarted
+                && !nvim_listen.exists()
+                && !host.life.editor_ended()
+                && host.life.restarts() == 1
+                && host.life.attach_phase() == "waiting for nvim's socket",
+            format!(
+                "stale {stale}, restarted {restarted}, socket left {}, {}",
+                nvim_listen.exists(),
+                host.life.attach_phase()
+            ),
+        );
+        check(
+            "a second press while nvim runs starts nothing",
+            !(*host).restart_editor() && host.life.restarts() == 1,
+            String::new(),
+        );
+        let listener = UnixListener::bind(&nvim_listen).expect("a socket where the new nvim would listen");
+        let (go, gone) = mpsc::channel();
+        let nvim = fake_nvim(listener, gone);
+        let linked = spin_until(Duration::from_secs(60), || band() == "attached");
+        check(
+            "the link attaches to the new nvim",
+            linked && host.life.attach_phase().starts_with("attach requested"),
+            format!("{:?}, {}", assembly.editor_link(), host.life.attach_phase()),
+        );
+        go.send(()).unwrap();
+        nvim.join().unwrap();
+        spin_until(Duration::from_secs(60), || band() == "detached");
+        // A crash while something still listens on the socket's path (the old nvim lingering): the editor's key
+        // starts nothing, since the link would reach that listener and not the new nvim.
+        let _ = std::fs::remove_file(&nvim_listen);
+        let squatter = UnixListener::bind(&nvim_listen).expect("a listener on the editor's path");
+        say("nvim-watched\n");
+        let kept = embedder.editor_ended();
+        let handled = (*host).restart_editor();
+        check(
+            "with the socket's path still taken, the editor's key starts nothing",
+            kept && handled && host.life.editor_ended() && host.life.restarts() == 1 && nvim_listen.exists(),
+            format!(
+                "kept {kept}, handled {handled}, ended {}, restarts {}",
+                host.life.editor_ended(),
+                host.life.restarts()
+            ),
+        );
+        drop(squatter);
+        // `:qa` with nothing at work: the window closes with it, as on Linux.
+        say("nvim-watched\n");
+        say("nvim-leaving\n");
+        let kept = embedder.editor_ended();
+        check(
+            "nvim's own quit with nothing at work closes the window",
+            !kept
+                && !host.life.editor_ended()
+                && host
+                    .life
+                    .quit_log()
+                    .last()
+                    .is_some_and(|l| l == "nvim ended (Leaving): Close"),
+            format!("kept {kept}, {:?}", host.life.quit_log()),
         );
 
         // A ticker let go of without `stop` cancels what it armed: libdispatch keeps an uncancelled source alive

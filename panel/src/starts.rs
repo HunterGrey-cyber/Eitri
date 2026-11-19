@@ -24,6 +24,8 @@ pub(super) enum SpawnCall {
         resume: Option<String>,
         project: ProjectTrust,
         client_tools: Option<agent::ClientToolSet>,
+        /// Where a resume hands its loaded history before it is live; `None` for a fresh session.
+        early: Option<agent::EarlyHistory>,
     },
     /// One tab of a restore, with the lease already taken for it.
     Resume {
@@ -31,6 +33,7 @@ pub(super) enum SpawnCall {
         lease: agent::lease::SessionLease,
         project: ProjectTrust,
         client_tools: Option<agent::ClientToolSet>,
+        early: agent::EarlyHistory,
     },
     /// A remote tab's session, started on its server through the window's connection, or the CLI's
     /// session `resume` continued there through a new sidecar.
@@ -171,12 +174,13 @@ pub(super) fn start_deferred(
     match start {
         DeferredStart::FirstSend { request_id, first_turn } => {
             let result_rx = match &state.spawner {
-                Spawner::Real => spawn_connect(kind, project_dir, None, project, client_tools),
+                Spawner::Real => spawn_connect(kind, project_dir, None, project, client_tools, None),
                 #[cfg(test)]
                 Spawner::Fake(fake) => (fake.borrow_mut())(SpawnCall::Connect {
                     resume: None,
                     project,
                     client_tools,
+                    early: None,
                 }),
             };
             let t = state.tabs.get_mut(tab).expect("checked above");
@@ -204,13 +208,15 @@ pub(super) fn start_deferred(
             resumed_name,
         } => {
             let resume = Some(provider_session_id.clone());
+            let (early, arriving) = eitri_core::tab_set::early_history_channel();
             let result_rx = match &state.spawner {
-                Spawner::Real => spawn_connect(kind, project_dir, resume, project, client_tools),
+                Spawner::Real => spawn_connect(kind, project_dir, resume, project, client_tools, Some(early)),
                 #[cfg(test)]
                 Spawner::Fake(fake) => (fake.borrow_mut())(SpawnCall::Connect {
                     resume,
                     project,
                     client_tools,
+                    early: Some(early),
                 }),
             };
             let t = state.tabs.get_mut(tab).expect("checked above");
@@ -226,6 +232,7 @@ pub(super) fn start_deferred(
                     resumed_name,
                 },
             );
+            state.tabs.expect_early_history(tab, arriving);
             // The command_result is owed once the connect finishes.
             shown_payloads(state, tab, &mut out);
         }
@@ -238,12 +245,13 @@ pub(super) fn start_deferred(
                 #[cfg(test)]
                 Spawner::Fake(fake) => {
                     let fake = fake.clone();
-                    let mut spawn = move |id: &str, lease, project| {
+                    let mut spawn = move |id: &str, lease, project, early| {
                         (fake.borrow_mut())(SpawnCall::Resume {
                             id: id.to_string(),
                             lease,
                             project,
                             client_tools: client_tools.clone(),
+                            early,
                         })
                     };
                     start_restore(state, tab, go, &mut spawn, project)
@@ -486,8 +494,9 @@ pub(super) fn spawn_connect(
     resume: Option<String>,
     project: ProjectTrust,
     client_tools: Option<agent::ClientToolSet>,
+    early: Option<agent::EarlyHistory>,
 ) -> mpsc::Receiver<Result<AgentBackend, BackendError>> {
-    spawn_connect_holding(kind, project_dir, resume, None, project, client_tools)
+    spawn_connect_holding(kind, project_dir, resume, None, project, client_tools, early)
 }
 
 /// What the band says while a Codex binary Eitri has not checked yet goes through its self-check.
@@ -638,10 +647,19 @@ pub(super) fn spawn_connect_holding(
     lease: Option<agent::lease::SessionLease>,
     project: ProjectTrust,
     client_tools: Option<agent::ClientToolSet>,
+    early: Option<agent::EarlyHistory>,
 ) -> mpsc::Receiver<Result<AgentBackend, BackendError>> {
     let (result_tx, result_rx) = mpsc::channel();
     std::thread::spawn(move || {
-        let result = AgentBackend::start_holding(kind, &project_dir, resume.as_deref(), lease, project, client_tools);
+        let result = AgentBackend::start_showing_history(
+            kind,
+            &project_dir,
+            resume.as_deref(),
+            lease,
+            project,
+            client_tools,
+            early,
+        );
         // The receiver is gone only if the tab or the panel was torn down mid-connect; dropping
         // the backend here is then the cleanup (`Retiring` normally holds the receiver instead).
         let _ = result_tx.send(result);
@@ -742,6 +760,16 @@ pub(super) fn report_sessions_that_never_opened(state: &mut AgentPanelState, scr
 /// What the page showing a tab is owed goes to that page; a command's answer to the page it was sent
 /// from (`start_answer_dest`), which need not show the tab any more.
 pub(super) fn collect_pending_starts(state: &mut AgentPanelState, screen: &Screen, out: &mut Outbox) {
+    // A resume's history, loaded while its provider has not answered yet: the page showing the tab draws
+    // the conversation now instead of a still screen until the session is live.
+    // Sent without the draft: the page swaps its starting screen's composer for the conversation's and seeds it
+    // from the text it holds, which is newer than the host's mirror of it.
+    for tab in state.tabs.collect_early_histories() {
+        match state.shown_in(tab) {
+            Some(view) if view.is_base() || state.ready(view) => shown_without_draft(state, view, tab, out),
+            _ => {}
+        }
+    }
     let collected = state.tabs.collect_starts();
     for result in collected {
         let part_of_a_restore = account_for_restore(state, &result);
@@ -750,13 +778,24 @@ pub(super) fn collect_pending_starts(state: &mut AgentPanelState, screen: &Scree
                 tab,
                 request_id,
                 first_turn,
+                early,
             } => {
                 // A tab a restore started: nobody asked for this connect by name, so there is no
                 // `command_result` owed -- the restore reports once, when its last resume is back.
                 let restored = part_of_a_restore != RestoreStart::NotPartOfOne;
                 // The page has been showing this tab as starting; give it the real projection at
-                // once rather than making it wait for the first event.
+                // once rather than making it wait for the first event. A page that drew the early
+                // history already has the conversation's composer up, and the person may be typing in
+                // it: it gets the new state without the draft, which would replace what was typed since
+                // the last mirror.
                 match state.shown_in(tab) {
+                    Some(view) if early && (view.is_base() || state.ready(view)) => {
+                        shown_without_draft(state, view, tab, out);
+                        // What the connected agent takes in images, which the starting tab only assumed.
+                        if let Some(images) = state.tabs.draft_attachments_payload(tab) {
+                            out.send(view, images);
+                        }
+                    }
                     Some(view) if view.is_base() || state.ready(view) => view_payloads(state, view, out),
                     _ => {}
                 }
@@ -771,6 +810,12 @@ pub(super) fn collect_pending_starts(state: &mut AgentPanelState, screen: &Scree
                             out,
                         ),
                     }
+                }
+                // What was queued while the session started goes now, as its first turn: no turn has ended yet to
+                // send it, and nothing else would. Behind a first message the turn is already starting, so this
+                // sends nothing and the queue waits for that turn's end.
+                if let Some(flush) = state.tabs.flush_queue(tab) {
+                    apply_flush(state, screen, tab, flush, out);
                 }
             }
             StartCollected::Failed { tab, request_id, error } => {
@@ -817,6 +862,16 @@ pub(super) fn collect_pending_starts(state: &mut AgentPanelState, screen: &Scree
         _ => true,
     });
     finish_restore(state, out);
+}
+
+/// What the page showing `tab` (in `view`) is owed when the tab's state changed under it, without the draft: the
+/// strip, the tab's state and its root note. The box is the page's own between switches, and the host's copy of
+/// it trails what was typed by the mirror's debounce.
+fn shown_without_draft(state: &mut AgentPanelState, view: ViewId, tab: TabId, out: &mut Outbox) {
+    let strip = tabs_payload_recorded(state, view);
+    out.send(view, strip);
+    out.send_all(view, state.tabs.refresh_payloads(tab));
+    out.send_all(view, tab_root_note(state, tab));
 }
 
 /// Owes `payload`, the answer owed under `request_id` when `tab`'s start ended, to the page that asked
@@ -1031,7 +1086,12 @@ mod tests {
                     resume,
                     project,
                     client_tools,
-                } => record.borrow_mut().push((resume, project, client_tools)),
+                    early,
+                } => {
+                    // Dropped unused: these tests hand no history over, and the tab draws none.
+                    drop(early);
+                    record.borrow_mut().push((resume, project, client_tools))
+                }
                 _ => panic!("only a connect is expected here"),
             }
             mpsc::channel().1

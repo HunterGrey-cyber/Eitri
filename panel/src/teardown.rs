@@ -443,6 +443,9 @@ pub(super) fn collect_reports(each: impl IntoIterator<Item = mpsc::Receiver<()>>
 pub(super) struct Retiring {
     /// Connects of tabs that are gone. Whatever one produces is shut down (`poll`).
     pub(super) connects: Vec<(mpsc::Receiver<Result<AgentBackend, BackendError>>, Ending)>,
+    /// A connect of a tab that is gone failed since the last [`Self::take_failed_connect`]: a remote one may have kept
+    /// the stop of the sidecar it left running, which the window's stop sender is to be woken for.
+    pub(super) failed_connect: bool,
     /// What teardowns that were to stop a remote agent report when the stop did not go through.
     pub(super) not_stopped: Vec<mpsc::Receiver<NotStopped>>,
     /// Where the window's remote project is on its server: each remote agent ended here keeps its stop in that
@@ -474,6 +477,11 @@ impl Retiring {
         } = spawn_teardown_keeping(leaving, ending, keep_at);
         self.teardowns.push((tab, dropped));
         self.not_stopped.push(not_stopped);
+    }
+
+    /// Whether a closed tab's connect failed since the last call (see `failed_connect`).
+    pub(super) fn take_failed_connect(&mut self) -> bool {
+        std::mem::take(&mut self.failed_connect)
     }
 
     /// The remote agents teardowns could not stop, reported since the last call. `try_recv` only.
@@ -555,14 +563,20 @@ impl Retiring {
     /// [`TabSet::retire_done`]. `try_recv` only -- this runs on the GTK main loop.
     pub(super) fn poll(&mut self) -> Vec<TabId> {
         let mut finished = Vec::new();
+        let mut failed = false;
         self.connects.retain(|(rx, ending)| match rx.try_recv() {
             Ok(Ok(backend)) => {
                 finished.push((backend, *ending));
                 false
             }
-            Ok(Err(_)) | Err(mpsc::TryRecvError::Disconnected) => false,
+            Ok(Err(_)) => {
+                failed = true;
+                false
+            }
+            Err(mpsc::TryRecvError::Disconnected) => false,
             Err(mpsc::TryRecvError::Empty) => true,
         });
+        self.failed_connect |= failed;
         for (backend, ending) in finished {
             eprintln!("[agent_panel] a closed tab's connect finished; shutting its backend down");
             self.backend_as(backend, ending);
@@ -828,6 +842,27 @@ mod tests {
             "a backend's shutdown is called from one place in the panel"
         );
         assert_eq!(in_teardown, 1, "that place is the teardown worker");
+    }
+
+    /// A closed tab's connect that failed is said once to whoever wakes the stop sender: a remote one may have kept
+    /// the stop of a sidecar it left running.
+    #[test]
+    fn a_closed_tabs_failed_connect_is_said_once() {
+        let mut retiring = Retiring::default();
+        let (failed_tx, failed_rx) = mpsc::channel();
+        retiring.connects.push((failed_rx, Ending::End));
+        assert!(retiring.poll().is_empty());
+        assert!(!retiring.take_failed_connect(), "nothing has failed yet");
+        failed_tx
+            .send(Err(BackendError {
+                message: "failed to create a Claude session".into(),
+                benign: false,
+            }))
+            .unwrap();
+        retiring.poll();
+        assert!(retiring.connects.is_empty());
+        assert!(retiring.take_failed_connect());
+        assert!(!retiring.take_failed_connect(), "said once");
     }
 
     /// A tab closed while the window stays open is kept in panel state

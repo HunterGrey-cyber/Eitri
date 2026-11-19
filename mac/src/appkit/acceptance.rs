@@ -213,6 +213,10 @@ fn on_main(request: Value, reply_to: mpsc::Sender<Value>) {
             }
             let _ = reply_to.send(state(&host));
         }
+        Some("editor_ic") => {
+            let done = host.probe_editor_input_context(request["op"].as_str().unwrap_or_default());
+            let _ = reply_to.send(json!({"done": done}));
+        }
         Some("beep") => {
             // The alert sound AppKit plays at the end of an unhandled key's walk: the driver's check that its
             // recorder hears this process at all, before it counts silence as a pass.
@@ -249,6 +253,11 @@ fn resize_request(request: &Value) -> Option<(f64, f64)> {
     (fits(w) && fits(h)).then_some((w, h))
 }
 
+fn editor_input_context(host: &Host) -> Value {
+    let (source, current) = host.editor_input_context();
+    json!({"source": source, "current": current})
+}
+
 fn state(host: &Host) -> Value {
     let responder = host.responder();
     let pane = host.pane();
@@ -280,6 +289,7 @@ fn state(host: &Host) -> Value {
         "edit_menu": edit_menu_present(host.mtm()),
         "subtitle": host.subtitle(),
         "editor_marked_text": host.editor_marked_text(),
+        "editor_input_context": editor_input_context(host),
         "nvim_listen": host.assembly().map(|a| a.editor.nvim_listen().display().to_string()),
         "links": LINKS.with(|l| l.borrow().clone()),
         "navigations": NAVIGATIONS.with(|n| n.borrow().clone()),
@@ -295,6 +305,9 @@ fn state(host: &Host) -> Value {
         "quit_log": host.life.quit_log(),
         "quit_asking": host.life.quit_asking(),
         "finished_via": host.life.finished_via(),
+        "editor_ended": host.life.editor_ended(),
+        "editor_ends": host.life.editor_ends(),
+        "restarts": host.life.restarts(),
         "running": host.assembly().map(|a| a.panel.running_count()),
         "queued": host.assembly().map(|a| a.panel.queued_count()),
         "responder_is_none": responder == Responder::None,

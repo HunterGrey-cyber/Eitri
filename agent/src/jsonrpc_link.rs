@@ -1348,6 +1348,15 @@ impl JsonRpcLink {
         if let Some(checkpoint) = lock(&self.shared.before_shutdown).take() {
             checkpoint();
         }
+        // macOS: what the child started, recorded before it sees EOF and can exit, after which its children are
+        // launchd's and can no longer be traced to it (`process_probe::descendants`). Only while the pid is our own
+        // unreaped child (`waitid` answers for nothing else), so a reused pid's tree is never recorded.
+        #[cfg(target_os = "macos")]
+        let mut started = if self.owns_child && matches!(child_state(self.pid), ChildState::Running) {
+            crate::process_probe::descendants(self.pid)
+        } else {
+            Vec::new()
+        };
         // Dropping the sender ends the writer thread, which drops stdin: the child sees EOF.
         lock(&self.shared.writer).take();
         // A child handed over for a move is the taker's to end.
@@ -1359,11 +1368,20 @@ impl JsonRpcLink {
         let end = start + grace;
         let exited = loop {
             match child_state(self.pid) {
-                ChildState::Running if Instant::now() < end => thread::sleep(Duration::from_millis(10)),
+                ChildState::Running if Instant::now() < end => {
+                    // macOS: read the tree again on each pass, so a command started during the grace is recorded
+                    // before the child can exit and leave it to launchd.
+                    #[cfg(target_os = "macos")]
+                    crate::process_probe::merge(&mut started, crate::process_probe::descendants(self.pid));
+                    thread::sleep(Duration::from_millis(10))
+                }
                 ChildState::Running => break false,
                 ChildState::Exited => break true,
                 // Not an unreaped child of this process.
                 ChildState::Gone => {
+                    // macOS: what was recorded while the child was ours is still ended (each by its start time).
+                    #[cfg(target_os = "macos")]
+                    crate::process_probe::kill_recorded(&started);
                     match child {
                         // Reaped by someone else (SIGCHLD ignored): the pid may already name another
                         // process, so nothing is signalled.
@@ -1385,7 +1403,16 @@ impl JsonRpcLink {
             *lock(&self.shared.shutdown_grace) = Some(start.elapsed());
             self.shared.exited_during_grace.store(exited, Ordering::SeqCst);
         }
+        // macOS: a child still running may have started more since; read again while it can be traced.
+        #[cfg(target_os = "macos")]
+        if !exited {
+            crate::process_probe::merge(&mut started, crate::process_probe::descendants(self.pid));
+        }
         kill_group(self.pid);
+        // macOS: a command the child started as a session leader of its own is outside the group; end each one still
+        // running (and the group it leads), whether the child exited by itself or was killed.
+        #[cfg(target_os = "macos")]
+        crate::process_probe::kill_recorded(&started);
         match child {
             Some(mut child) => {
                 if !exited {

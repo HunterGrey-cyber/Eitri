@@ -222,6 +222,15 @@ pub enum NvimSaid {
     Leaving,
 }
 
+/// The 'filetype' values of the start screens of the common plugins: a buffer of one of these is what nvim has
+/// open when a person quits from the dashboard instead of from their work.
+pub const START_SCREEN_FILETYPES: [&str; 5] = ["snacks_dashboard", "dashboard", "alpha", "ministarter", "starter"];
+
+/// Whether `filetype` is a start screen's.
+pub fn is_start_screen(filetype: &str) -> bool {
+    START_SCREEN_FILETYPES.contains(&filetype)
+}
+
 /// Whether this window's editor can receive requests or needs its pane released and restarted.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EditorRun {
@@ -263,6 +272,8 @@ pub struct Window {
     pub(super) editor_lost: bool,
     /// What nvim has said about its own end since it started.
     pub(super) nvim_said: NvimSaid,
+    /// The 'filetype' of the buffer nvim said it left from, taken with `nvim_said` at each `Exited`.
+    pub(super) nvim_left_from: String,
     pub(super) editor_run: EditorRun,
     pub(super) restart_wanted: bool,
     pub(super) release_refused_logged: bool,
@@ -384,6 +395,7 @@ impl Window {
             queued_opens: VecDeque::new(),
             editor_lost: false,
             nvim_said: NvimSaid::Nothing,
+            nvim_left_from: String::new(),
             editor_run: EditorRun::Running,
             restart_wanted: false,
             release_refused_logged: false,

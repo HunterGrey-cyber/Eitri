@@ -443,7 +443,7 @@ pub(super) fn event_window(event: &HostEvent) -> Option<WinId> {
             | EditorEvent::Exited { win, .. }
             | EditorEvent::Unreachable { win }
             | EditorEvent::Watched { win }
-            | EditorEvent::Leaving { win }
+            | EditorEvent::Leaving { win, .. }
             | EditorEvent::Recoverable { win, .. }
             | EditorEvent::Reopen { win, .. }
             | EditorEvent::Captured { win, .. }

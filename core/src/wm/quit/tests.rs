@@ -22,6 +22,8 @@ struct Fake {
     confirmed: Cell<bool>,
     prompt: RefCell<Option<String>>,
     editor_last_visible: Cell<bool>,
+    /// The window holds a module besides the editor.
+    others: Cell<bool>,
     log: RefCell<Vec<String>>,
     ticks: RefCell<Vec<u32>>,
     /// How often the last record nvim left was asked to be read; kept out of `log`, which pins what the quit does.
@@ -133,6 +135,9 @@ impl QuitWorld for Rc<Fake> {
     fn close_confirmed(&self) -> bool {
         self.confirmed.get()
     }
+    fn holds_other_modules(&self) -> bool {
+        self.others.get()
+    }
     fn window_close_prompt(&self) -> Option<String> {
         self.prompt.borrow().clone()
     }
@@ -190,13 +195,19 @@ impl Flow {
         let settled = self.world.settled_watch();
         self.flow
             .borrow_mut()
-            .nvim_exited(&mut self.world.clone(), settled, false);
+            .nvim_exited(&mut self.world.clone(), settled, NvimEnd::Quit);
+    }
+    fn nvim_exited_from_a_start_screen(&self) {
+        let settled = self.world.settled_watch();
+        self.flow
+            .borrow_mut()
+            .nvim_exited(&mut self.world.clone(), settled, NvimEnd::QuitFromStartScreen);
     }
     fn nvim_crashed(&self) {
         let settled = self.world.settled_watch();
         self.flow
             .borrow_mut()
-            .nvim_exited(&mut self.world.clone(), settled, true);
+            .nvim_exited(&mut self.world.clone(), settled, NvimEnd::Crashed);
     }
     fn nvim_unreachable(&self) {
         self.flow.borrow_mut().nvim_unreachable(&mut self.world.clone());
@@ -625,6 +636,80 @@ fn a_quit_typed_in_nvim_still_closes_the_window() {
     fake.exited.set(true);
     quitting.nvim_exited();
     assert_eq!(fake.log(), ["close_window".to_string()]);
+}
+
+/// The window's own other modules are what a quit from a start screen would take with it.
+#[test]
+fn a_quit_from_a_start_screen_asks_when_the_window_holds_more() {
+    let fake = Fake::new();
+    let quitting = flow(&fake);
+    fake.running.set(false);
+    fake.exited.set(true);
+    fake.others.set(true);
+    quitting.nvim_exited_from_a_start_screen();
+    assert_eq!(fake.log(), [format!("ask: {START_SCREEN_QUIT_PROMPT}")]);
+    assert_eq!(START_SCREEN_QUIT_PROMPT, "close Eitri? (y/n)");
+    assert_eq!(
+        fake.handoffs.get(),
+        1,
+        "the last record is read as for any unasked exit"
+    );
+}
+
+#[test]
+fn a_declined_start_screen_quit_ends_the_editor_in_place() {
+    let fake = Fake::new();
+    let quitting = flow(&fake);
+    fake.running.set(false);
+    fake.exited.set(true);
+    fake.others.set(true);
+    quitting.nvim_exited_from_a_start_screen();
+    fake.clear();
+    quitting.window_close_declined();
+    assert_eq!(
+        fake.log(),
+        [
+            "end_editor".to_string(),
+            format!(
+                "toast: {}",
+                super::super::feedback::editor_ended_text(&crate::keymap::Keymap::defaults())
+            )
+        ]
+    );
+}
+
+#[test]
+fn a_quit_from_a_start_screen_with_nothing_else_closes_at_once() {
+    let fake = Fake::new();
+    let quitting = flow(&fake);
+    fake.running.set(false);
+    fake.exited.set(true);
+    quitting.nvim_exited_from_a_start_screen();
+    assert_eq!(fake.log(), ["close_window".to_string()]);
+}
+
+/// The close's own question about running work already asks, and `n` to it keeps the window the same way.
+#[test]
+fn a_quit_from_a_start_screen_with_work_running_leaves_the_asking_to_the_close() {
+    let fake = Fake::new();
+    let quitting = flow(&fake);
+    fake.running.set(false);
+    fake.exited.set(true);
+    fake.others.set(true);
+    *fake.prompt.borrow_mut() = Some(RUNNING.into());
+    quitting.nvim_exited_from_a_start_screen();
+    assert_eq!(fake.log(), ["close_window".to_string()]);
+}
+
+#[test]
+fn a_crash_from_a_start_screen_is_still_a_crash() {
+    let fake = Fake::new();
+    let quitting = flow(&fake);
+    fake.running.set(false);
+    fake.exited.set(true);
+    fake.others.set(true);
+    quitting.nvim_crashed();
+    assert!(fake.log().iter().all(|did| !did.starts_with("ask")), "{:?}", fake.log());
 }
 
 #[test]

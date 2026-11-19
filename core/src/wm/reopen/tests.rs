@@ -244,7 +244,10 @@ impl Rig {
 
     /// nvim says it is quitting on purpose (its watch's `VimLeavePre`, which a deadly signal or a hang never runs).
     fn leaving(&self) {
-        self.host.post(HostEvent::Editor(EditorEvent::Leaving { win: WIN }));
+        self.host.post(HostEvent::Editor(EditorEvent::Leaving {
+            win: WIN,
+            filetype: String::new(),
+        }));
     }
 
     /// nvim ends with nobody asking: a crash when `crashed`, else a `:qa`.

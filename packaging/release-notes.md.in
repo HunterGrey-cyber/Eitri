@@ -228,6 +228,12 @@ into an Eitri window, and Eitri reopens your files where you left them. Your Neo
   unless your environment sets `npm_config_fetch_retries`. A download that still fails names the file, the host and what
   was tried, and points at `https_proxy` and `--base-url`. An attempt now gives up after a minute under 1 KiB/s (it was
   five minutes, with no second attempt), and a connection after 30 seconds.
+- Each download can come from a mirror you name: `EITRI_RELEASE_BASE_URL` (or `--base-url`), `EITRI_SIDECAR_BASE_URL`,
+  `EITRI_NVIM_BASE_URL`, `EITRI_NODE_BASE_URL`, `EITRI_GRPC_BASE_URL` and `EITRI_SKIA_BASE_URL`. Whatever the address,
+  every file is still checked against the signed release, so a mirror that serves other bytes stops the install (unless
+  you pass `--insecure-skip-signature`). An address must be `https://` (plain `http://` only to this machine) and may not
+  carry a user name, password, query or fragment. npm already uses your own registry setting. A failed download names
+  the variable that moves it. INSTALL.md lists them under "Download addresses".
 - A cut-off `install.sh` runs nothing and exits non-zero wherever the cut falls after its first line; until now a cut
   inside its opening comment exited 0. A download that breaks before its first byte still exits 0 through the pipe:
   INSTALL.md shows a download-first line for scripts (`On a slow or filtered network`).

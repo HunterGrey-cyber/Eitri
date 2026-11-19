@@ -151,8 +151,13 @@ fn check_host_key(observed: Option<io::Result<String>>, expected: &str) -> io::R
 /// How long a master gets to answer `-O check` before it counts as gone.
 pub const MASTER_CHECK: Duration = Duration::from_secs(2);
 
-/// How long a check waits for another caller's restart of the same master before it reports failure.
-pub const MASTER_LOCK_WAIT: Duration = Duration::from_secs(5);
+/// How long a caller waits for the master's lock before it reports failure: a lifecycle step's attachment deadline
+/// and a margin, so a step holding the host key until its channel attaches in one window does not fail a check or a
+/// step in another. Other holders can keep it longer (a master restart: its own checks and a new master's start; a
+/// helper channel's key guard until its first byte); a waiter that gives up then fails as before, and its caller's
+/// own retry (a tab's reconnect, the stop sender) tries again.
+pub const MASTER_LOCK_WAIT: Duration = Duration::from_secs(super::channel::ATTACHMENT_DEADLINE.as_secs() + 5);
+const _: () = assert!(MASTER_LOCK_WAIT.as_secs() > super::channel::ATTACHMENT_DEADLINE.as_secs());
 /// How long a look at the settled host key waits for a master start to finish; a longer one is not looked at.
 const SETTLED_KEY_WAIT: Duration = Duration::from_millis(200);
 

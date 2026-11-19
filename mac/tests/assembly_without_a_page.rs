@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 
 use eitri_core::keymap::prefix::PrefixCommand;
 use eitri_core::keymap::{Action, TabAction};
-use eitri_core::layout::Direction;
+use eitri_core::layout::{Direction, ModuleId};
 use eitri_mac::assembly::{assemble, HostActions, NOT_IN_THIS_WINDOW, PANEL_NOT_SHOWN, PANEL_TOOK_NO_KEYS};
 use eitri_mac::editor::{Editor, EditorEvent};
 use eitri_mac::keys::Pane;
@@ -34,12 +34,13 @@ enum Done {
     Toast(String),
     ShowEditor,
     Hidden(bool),
+    Restarted,
 }
 
 /// What the host was asked to do. The first flag stands for a window too narrow to show the panel, the second
-/// for AppKit refusing a view the keys.
+/// for AppKit refusing a view the keys, the third for an editor whose nvim ended.
 #[derive(Default)]
-struct Recorder(RefCell<Vec<Done>>, Cell<bool>, Cell<bool>);
+struct Recorder(RefCell<Vec<Done>>, Cell<bool>, Cell<bool>, Cell<bool>);
 impl Recorder {
     fn take(&self) -> Vec<Done> {
         std::mem::take(&mut *self.0.borrow_mut())
@@ -49,6 +50,9 @@ impl Recorder {
     }
     fn set_refusing(&self, refusing: bool) {
         self.2.set(refusing);
+    }
+    fn set_ended(&self, ended: bool) {
+        self.3.set(ended);
     }
 }
 impl HostActions for Recorder {
@@ -68,6 +72,17 @@ impl HostActions for Recorder {
     fn panel_visible(&self) -> bool {
         // Shown unless the window is narrow; the zoom's own state is the assembly's, and is what is tested.
         !self.1.get()
+    }
+    fn editor_ended(&self) -> bool {
+        self.3.get()
+    }
+    fn restart_editor(&self) -> bool {
+        if self.3.replace(false) {
+            self.0.borrow_mut().push(Done::Restarted);
+            true
+        } else {
+            false
+        }
     }
 }
 
@@ -222,6 +237,54 @@ fn the_configuration_and_the_events_reach_the_panel_and_the_host() {
         [Done::Toast(why)] => assert!(why.contains("not connected"), "{why}"),
         other => panic!("expected the one toast, got {other:?}"),
     }
+
+    // The editor's key gives the editor the keys while nvim runs, and starts nvim again once it has ended.
+    assembly.run_prefix(run(Action::Module(ModuleId::editor())), Pane::Panel);
+    assert_eq!(actions.take(), vec![Done::Focus(Pane::Editor)]);
+    let defaults = eitri_core::keymap::Keymap::defaults();
+    let ended = eitri_core::wm::feedback::editor_ended_text(&defaults);
+    assert_eq!(ended, "nvim exited \u{2014} C-b e starts it again");
+    assert_eq!(assembly.editor_ended_text(false), ended);
+    assert_eq!(
+        assembly.editor_ended_text(true),
+        eitri_core::wm::feedback::editor_crashed_text(&defaults)
+    );
+    actions.set_ended(true);
+    // nvim ended: the panel takes the keys (shown again from the zoom) and the notice says how to start it again.
+    assembly.run_prefix(run(Action::Zoom), Pane::Editor);
+    assert_eq!(
+        actions.take(),
+        vec![Done::Toast(ended.clone())],
+        "no zoom while the editor has ended"
+    );
+    assembly.editor_ended(Some(true));
+    assert_eq!(
+        actions.take(),
+        vec![
+            Done::Focus(Pane::Panel),
+            Done::Toast(eitri_core::wm::feedback::editor_crashed_text(&defaults))
+        ]
+    );
+    assembly.editor_ended(Some(false));
+    assert_eq!(actions.take(), vec![Done::Focus(Pane::Panel), Done::Toast(ended)]);
+    assembly.editor_ended(None);
+    assert_eq!(actions.take(), vec![Done::Focus(Pane::Panel)]);
+    assembly.run_prefix(run(Action::Module(ModuleId::editor())), Pane::Panel);
+    assert_eq!(actions.take(), vec![Done::Restarted]);
+    // Running again: the zoom works as before.
+    assembly.run_prefix(run(Action::Zoom), Pane::Editor);
+    assembly.run_prefix(run(Action::Zoom), Pane::Editor);
+    assert_eq!(actions.take(), vec![Done::Hidden(true), Done::Hidden(false)]);
+
+    // A start that found unsaved changes in swap files says so, as the Linux window does.
+    assembly.handle(EditorEvent::Recoverable {
+        count: 2,
+        newest: "src/a.rs".into(),
+    });
+    assert_eq!(
+        actions.take(),
+        vec![Done::Toast(eitri_core::wm::feedback::recoverable_text(2, "src/a.rs"))]
+    );
 
     // The text size steps the panel alone.
     assembly.run_prefix(run(Action::Text(eitri_core::keymap::TextChange::Larger)), Pane::Panel);

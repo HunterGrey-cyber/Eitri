@@ -7,15 +7,12 @@ use eitri_core::source_scan::{self as scan, Source};
 /// Names no host code may hold, lower case.
 const NAMES: &[&str] = &["markdown", "snotra", "agents-strips", "agents-top", "agents-pass"];
 
-/// The `file:line: text` of each line of `text` naming a plugin in any letter case; a Rust file is read only up to
-/// its test module.
+/// The `file:line: text` of each non-test line naming a plugin in any letter case.
 fn hits(path: &str, text: &str) -> Vec<String> {
+    let production;
     let text = if path.ends_with(".rs") {
-        let code = scan::code_only(text);
-        let at = scan::modules(&code, "tests")
-            .first()
-            .map(|body| body.as_ptr() as usize - code.as_ptr() as usize);
-        at.map_or(text, |at| &text[..at])
+        production = scan::production_text(text);
+        &production
     } else {
         text
     };
@@ -35,24 +32,80 @@ fn plugin_source(path: &str) -> bool {
         return false;
     };
     !in_tests(relative)
-        && relative
-            .split('/')
-            .any(|part| part == "plugin" || part == "plugin.rs" || part.starts_with("plugin_"))
+        && relative.split('/').any(|part| {
+            matches!(part, "plugin" | "plugin.rs" | "plugins" | "plugins.rs")
+                || part.starts_with("plugin_")
+                || part.starts_with("plugin-")
+        })
+}
+
+fn rust_host_sources(sources: Vec<Source>) -> Vec<Source> {
+    let test_files = scan::test_only_files(&sources);
+    sources
+        .into_iter()
+        .filter(|source| !test_files.contains(&source.path))
+        .filter(|source| {
+            plugin_source(&source.path)
+                || (!in_tests(&source.path)
+                    && (source.path.starts_with("core/src/wm/") || source.path.starts_with("core/src/layout/")))
+        })
+        .collect()
 }
 
 fn host_sources() -> Vec<Source> {
-    let mut sources = scan::rust_sources(&["core/src/plugin", "core/src/wm", "core/src/layout"])
-        .into_iter()
-        .filter(|source| !in_tests(&source.path))
-        .collect::<Vec<_>>();
-    sources.push(scan::read_required("core/src/lua/plugin.rs"));
-    sources.extend(
-        scan::rust_sources(&scan::product_dirs_except(&["core/src"]))
-            .into_iter()
-            .filter(|source| plugin_source(&source.path)),
-    );
+    let mut sources = rust_host_sources(scan::product_sources());
     sources.extend(scan::sources(&["core/src/plugin"], &["lua", "js"]));
     sources
+}
+
+#[test]
+fn a_test_only_plugins_file_is_not_host_code() {
+    let sources = [
+        ("desk/src/lib.rs", "#[cfg(test)] mod plugins; mod plugin_routes;"),
+        ("desk/src/plugins.rs", "const ID: &str = \"markdown\";"),
+        ("desk/src/plugin_routes.rs", "const ID: &str = \"snotra\";"),
+    ]
+    .map(|(path, text)| Source {
+        path: path.into(),
+        text: text.into(),
+    });
+    let sources = rust_host_sources(sources.into());
+    let found: Vec<_> = sources
+        .iter()
+        .flat_map(|source| hits(&source.path, &source.text))
+        .collect();
+    assert_eq!(found, ["desk/src/plugin_routes.rs:1: const ID: &str = \"snotra\";"]);
+}
+
+#[test]
+fn a_plugin_file_declared_in_production_and_tests_is_scanned() {
+    for newline in ["\n", "\r\n"] {
+        let sources = [
+            ("desk/src/lib.rs", "mod plugins;\n#[cfg(test)] #[path = \"plugins.rs\"] mod test_plugins;\n#[cfg(test,)] mod plugin_fixtures;"),
+            (
+                "desk/src/plugin_fixtures.rs",
+                "#[path = \"plugins.rs\"] mod shared;\nmod private;",
+            ),
+            ("desk/src/plugin_fixtures/private.rs", "const ID: &str = \"markdown\";"),
+            ("desk/src/plugins.rs", "mod routes;\nconst ID: &str = \"markdown\";"),
+            ("desk/src/plugins/routes.rs", "const ID: &str = \"snotra\";"),
+        ]
+        .map(|(path, text)| Source {
+            path: path.into(),
+            text: text.replace('\n', newline),
+        });
+        let found: Vec<_> = rust_host_sources(sources.into())
+            .iter()
+            .flat_map(|source| hits(&source.path, &source.text))
+            .collect();
+        assert_eq!(
+            found,
+            [
+                "desk/src/plugins.rs:2: const ID: &str = \"markdown\";",
+                "desk/src/plugins/routes.rs:1: const ID: &str = \"snotra\";",
+            ]
+        );
+    }
 }
 
 #[test]
@@ -66,12 +119,39 @@ fn a_new_plugin_module_under_desk_is_scanned() {
 }
 
 #[test]
+fn plugins_style_names_count_as_plugin_sources() {
+    for path in [
+        "desk/src/plugins.rs",
+        "desk/src/plugins/routes.rs",
+        "desk/src/plugin-page.rs",
+        "desk/src/plugin-pages/routes.rs",
+    ] {
+        assert!(plugin_source(path), "{path}");
+        for newline in ["\n", "\r\n"] {
+            let source = format!("#[cfg(test)] mod checks {{ const ID: &str = \"markdown\"; }}{newline}fn route() {{ inspect(\"snotra\"); }}");
+            assert_eq!(
+                hits(path, &source),
+                [format!("{path}:2: fn route() {{ inspect(\"snotra\"); }}")]
+            );
+        }
+    }
+    for path in [
+        "desk/src/non_plugin/routes.rs",
+        "desk/src/tests/plugins.rs",
+        "desk/src/plugins/tests.rs",
+    ] {
+        assert!(!plugin_source(path), "{path}");
+    }
+}
+
+#[test]
 fn no_host_code_names_a_plugin() {
     let sources = host_sources();
     scan::require_anchors(&sources, &["pub fn parse_manifest(", "impl PluginHost", "fn serve("]);
     for path in [
         "shell/src/plugin_page.rs",
         "shell/src/plugin_panels.rs",
+        "core/src/lua/plugin.rs",
         "core/src/plugin/bridge.js",
         "core/src/wm/start.rs",
         "core/src/wm/text_size.rs",

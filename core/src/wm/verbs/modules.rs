@@ -2036,6 +2036,7 @@ mod tests;
 mod restart_tests {
     use super::*;
     use crate::keymap::{prefix::Press, KeySpec};
+    use crate::layout::Node;
     use crate::lua::layout::LayoutRequest;
     use crate::wm::fake::{FakeHost, FakeScheduler, Logged};
     use crate::wm::start::StartStep;
@@ -2063,7 +2064,11 @@ mod restart_tests {
         }
         /// As [`Rig::with`], the launch naming `open` for nvim to open.
         fn with_open(setup: Option<ModuleSetup>, keys: bool, open: Vec<String>) -> Self {
-            let mut r = rig(Layout::initial(&[]).unwrap());
+            Self::on(Layout::initial(&[]).unwrap(), setup, keys, open)
+        }
+        /// As [`Rig::with_open`], on `layout`.
+        fn on(layout: Layout, setup: Option<ModuleSetup>, keys: bool, open: Vec<String>) -> Self {
+            let mut r = rig(layout);
             if let Some(setup) = setup {
                 r.controller.set_module_setup(WIN, setup);
             }
@@ -3362,11 +3367,113 @@ mod restart_tests {
         );
     }
 
+    /// What nvim says as it leaves from a buffer of `filetype`.
+    fn leaving_on(r: &Rig, filetype: &str) {
+        r.event(EditorEvent::Watched { win: WIN });
+        r.event(EditorEvent::Leaving {
+            win: WIN,
+            filetype: filetype.into(),
+        });
+    }
+
+    fn close_ops(ops: &[HostOp]) -> usize {
+        ops.iter().filter(|op| matches!(op, HostOp::CloseWindow { .. })).count()
+    }
+
+    fn prompt_text(r: &Rig) -> Option<String> {
+        r.driver.query(|c| c.chrome(WIN).prompt.map(|p| p.text))
+    }
+
+    #[test]
+    fn a_quit_from_a_start_screen_asks_before_it_closes_a_window_that_holds_more() {
+        for filetype in ["snacks_dashboard", "dashboard", "alpha", "ministarter", "starter"] {
+            let r = Rig::new();
+            leaving_on(&r, filetype);
+            let ops = exited_on_its_own(&r);
+            assert_eq!(close_ops(&ops), 0, "{filetype}: {ops:?}");
+            assert_eq!(prompt_text(&r).as_deref(), Some("close Eitri? (y/n)"), "{filetype}");
+        }
+    }
+
+    #[test]
+    fn a_n_to_the_start_screens_question_ends_the_editor_in_place_and_a_key_restarts_it() {
+        let r = Rig::new();
+        leaving_on(&r, "snacks_dashboard");
+        exited_on_its_own(&r);
+        r.answer("n");
+        r.scheduler.advance(Duration::ZERO);
+        assert_eq!(close_ops(&r.ops()), 0, "the window stays");
+        assert_eq!(prompt_text(&r), None);
+        r.release();
+        r.key();
+        assert_eq!(r.restarts(), [r.spawn.clone()], "a key starts nvim again");
+    }
+
+    #[test]
+    fn a_y_to_the_start_screens_question_closes_the_window() {
+        let r = Rig::new();
+        leaving_on(&r, "alpha");
+        exited_on_its_own(&r);
+        r.answer("y");
+        r.scheduler.advance(Duration::ZERO);
+        assert_eq!(close_ops(&r.ops()), 1);
+    }
+
+    #[test]
+    fn a_quit_from_a_real_buffer_closes_at_once() {
+        for filetype in ["rust", "", "text", "lazy"] {
+            let r = Rig::new();
+            leaving_on(&r, filetype);
+            let ops = exited_on_its_own(&r);
+            assert_eq!(close_ops(&ops), 1, "{filetype:?}: {ops:?}");
+            assert_eq!(prompt_text(&r), None, "{filetype:?}");
+        }
+    }
+
+    #[test]
+    fn a_quit_from_a_start_screen_with_nothing_else_in_the_window_closes_at_once() {
+        let alone = Layout::new(Node::Leaf(ModuleId::editor()), ModuleId::editor()).unwrap();
+        let r = Rig::on(alone, None, false, vec![]);
+        leaving_on(&r, "snacks_dashboard");
+        let ops = exited_on_its_own(&r);
+        assert_eq!(close_ops(&ops), 1, "{ops:?}");
+        assert_eq!(prompt_text(&r), None);
+    }
+
+    #[test]
+    fn the_filetype_nvim_left_on_is_logged() {
+        let r = Rig::new();
+        leaving_on(&r, "snacks_dashboard");
+        let said = r.driver.query(|c| c.notes(WIN));
+        assert!(
+            said.iter()
+                .any(|line| line.contains("nvim is leaving") && line.contains("snacks_dashboard")),
+            "{said:?}"
+        );
+    }
+
+    #[test]
+    fn a_start_screen_said_before_a_restart_does_not_ask_of_the_next_quit() {
+        let r = Rig::new();
+        leaving_on(&r, "snacks_dashboard");
+        exited_on_its_own(&r);
+        r.answer("n");
+        r.release();
+        r.key();
+        r.event(EditorEvent::Ready { win: WIN });
+        leaving_on(&r, "rust");
+        let ops = exited_on_its_own(&r);
+        assert_eq!(close_ops(&ops), 1, "{ops:?}");
+    }
+
     #[test]
     fn nvim_that_said_it_was_leaving_closes_the_window_as_a_quit_does() {
         let r = Rig::new();
         r.event(EditorEvent::Watched { win: WIN });
-        r.event(EditorEvent::Leaving { win: WIN });
+        r.event(EditorEvent::Leaving {
+            win: WIN,
+            filetype: String::new(),
+        });
         let ops = exited_on_its_own(&r);
         assert!(ops.iter().any(|op| matches!(op, HostOp::CloseWindow { .. })));
     }
@@ -3387,7 +3494,10 @@ mod restart_tests {
         r.key();
         r.event(EditorEvent::Ready { win: WIN });
         r.event(EditorEvent::Watched { win: WIN });
-        r.event(EditorEvent::Leaving { win: WIN });
+        r.event(EditorEvent::Leaving {
+            win: WIN,
+            filetype: String::new(),
+        });
         let ops = exited_on_its_own(&r);
         assert!(ops.iter().any(|op| matches!(op, HostOp::CloseWindow { .. })));
     }

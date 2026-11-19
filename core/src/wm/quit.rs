@@ -18,6 +18,21 @@ pub enum AskedNvim {
 pub const UNREACHABLE_NVIM: &str = "nvim's launcher exited and nvim still runs where the editor can no \
      longer reach it \u{2014} close the window or kill-pane the editor to end it (its swap file keeps your changes)";
 
+/// What a window with other modules asks when nvim quit from a start screen: the quit may have been the second `q`
+/// of a plugin's float, which closed the float and then the dashboard behind it.
+pub const START_SCREEN_QUIT_PROMPT: &str = "close Eitri? (y/n)";
+
+/// How an nvim that ended with no quit of the window's in flight went.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NvimEnd {
+    /// A quit typed in nvim (`:qa`, `ZZ`, `:q` of the last window): closes the window as plain Neovim's does.
+    Quit,
+    /// A quit from a start screen: the window asks first when it holds something besides the editor.
+    QuitFromStartScreen,
+    /// nvim went without saying it was leaving, after saying it would.
+    Crashed,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Cancel {
     /// The cancelled generation was in flight and is now cleared.
@@ -42,6 +57,8 @@ pub trait QuitWorld {
     fn reveal(&self) -> Reveal;
     fn editor_gone(&self) -> bool;
     fn close_confirmed(&self) -> bool;
+    /// The window holds a module besides the editor (a chat, the terminal, a page), shown or not.
+    fn holds_other_modules(&self) -> bool;
     fn window_close_prompt(&self) -> Option<String>;
     fn send_quit(&mut self, lua: String, generation: u32);
     /// Ends nvim through stdin closure and signals to its own pid, preserving its swap files.
@@ -300,9 +317,11 @@ impl QuitFlow {
 
     /// The host supplies the settled request with the exit, so deciding what closes never waits here.
     /// A hidden editor is restored to its saved arrangement before the window's close persists it.
-    /// `crashed` is nvim going without saying it was leaving, after saying it would: nobody quit it, so
-    /// the window stays and says so, where a `:q` of the last buffer closes it.
-    pub fn nvim_exited(&mut self, world: &mut dyn QuitWorld, settled: Option<NvimAnswer>, crashed: bool) {
+    /// `NvimEnd::Crashed` is nvim going without saying it was leaving, after saying it would: nobody quit it, so
+    /// the window stays and says so, where a `:q` of the last buffer closes it. A quit from a start screen, in a window
+    /// that holds more than the editor, asks first; the close's own question about running work, when there is one,
+    /// already does that, and a `n` to either ends the editor in place.
+    pub fn nvim_exited(&mut self, world: &mut dyn QuitWorld, settled: Option<NvimAnswer>, end: NvimEnd) {
         let watch = settled;
         if self.settle(watch.as_ref()).is_some() {
             println!("[modules] editor: nvim exited, and the quit in flight is not what ended it");
@@ -335,7 +354,7 @@ impl QuitFlow {
             },
             // Nobody asked, so nothing else reads what nvim left of its open files as it ended; a `:qa`'s close then
             // only waits for the read.
-            None if crashed => {
+            None if end == NvimEnd::Crashed => {
                 world.read_handoff();
                 if Self::end_in_place(world, "[modules] editor: nvim stopped with nobody asking") {
                     world.warn(&world.editor_crashed_text());
@@ -343,7 +362,15 @@ impl QuitFlow {
             }
             None => {
                 world.read_handoff();
-                world.close_window();
+                let asks_first = end == NvimEnd::QuitFromStartScreen
+                    && world.holds_other_modules()
+                    && world.window_close_prompt().is_none();
+                if asks_first {
+                    println!("[modules] editor: nvim quit from a start screen; asking before the window closes");
+                    world.ask_to_close_window(START_SCREEN_QUIT_PROMPT);
+                } else {
+                    world.close_window();
+                }
             }
         }
     }

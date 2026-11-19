@@ -1539,6 +1539,48 @@ class WebBundleFingerprintTests(unittest.TestCase):
         self.assertNotEqual(rc.web_bundle_fingerprint(root), self.PINNED_WITH_BUILD_SCRIPT)
 
 
+    def test_the_diagram_renderer_page_joins_the_fingerprint(self):
+        # The Markdown plugin's site has a second page, `diagram-renderer.html`, that the Rust build fingerprints.
+        root = _scratch_dir()
+        self.addCleanup(shutil.rmtree, root, ignore_errors=True)
+        _plant(root, {"src/a.ts": b"x\n", "diagram-renderer.html": b"<p>a</p>\n"})
+        with_page = rc.web_bundle_fingerprint(root)
+        self.assertNotEqual(with_page, self.PINNED_SHA256)
+        _plant(root, {"diagram-renderer.html": b"<p>b</p>\n"})
+        self.assertNotEqual(rc.web_bundle_fingerprint(root), with_page)
+
+    @staticmethod
+    def _rust_input_names():
+        source = os.path.join(os.path.dirname(_PACKAGING), "shell", "build_web.rs")
+        with open(source, encoding="utf-8") as f:
+            text = f.read()
+        start = text.index("fn web_build_inputs(")
+        end = text.find("\nfn ", start + 1)
+        body = re.sub(r"//[^\n]*", "", text[start:end if end != -1 else len(text)])
+        match = re.search(r"for\s+name\s+in\s+\[([^\]]*)\]", body)
+        assert match, "shell/build_web.rs no longer walks its top-level names as `for name in [..]`"
+        return re.findall(r'"([^"]+)"', match.group(1))
+
+    def test_the_name_list_is_the_one_the_rust_build_walks(self):
+        # Order matters: the names are hashed in list order, so the two lists must be equal as lists.
+        rust_names = self._rust_input_names()
+        self.assertTrue(rust_names)
+        self.assertEqual(list(rc.WEB_BUNDLE_INPUT_NAMES), rust_names)
+
+    def test_every_top_level_name_is_hashed_in_the_rust_lists_order(self):
+        # Hashes the fixture by hand in the order read out of the Rust source: a loop that walked the (equal)
+        # list in another order would change the digest.
+        root = _scratch_dir()
+        self.addCleanup(shutil.rmtree, root, ignore_errors=True)
+        names = self._rust_input_names()
+        _plant(root, {"src/a.ts": b"x\n", **{name: f"{name} body\n".encode() for name in names}})
+        h = hashlib.sha256()
+        for rel in ["src/a.ts", *names]:
+            with open(os.path.join(root, rel), "rb") as f:
+                h.update(rel.encode() + b"\0" + f.read() + b"\0")
+        self.assertEqual(rc.web_bundle_fingerprint(root), h.hexdigest())
+
+
 class EitriSourceTreeTests(unittest.TestCase):
     SKIA = "skia-binaries-k.tar.gz"
     SKIA_BYTES = b"skia archive"

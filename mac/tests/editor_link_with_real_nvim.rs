@@ -18,10 +18,17 @@ use eitri_mac::editor::{Editor, EditorEvent, TICK};
 use eitri_mac::startup;
 use rmpv::Value;
 
-/// Under `std::env::temp_dir()`, not the target directory: the socket is capped at 103 bytes and a
-/// worktree's target directory already uses most of that. `case` stays short for the same reason.
+/// A new directory of this user's own under `/tmp`, not the target directory or `std::env::temp_dir()`: the socket
+/// is capped at 103 bytes, a worktree's target directory already uses most of that, and so does macOS's own
+/// `TMPDIR` (`/var/folders/../T/`) once the run directory and the app's socket directory are added below it.
+/// Made with a random name (`/tmp` is shared), kept until the test's own cleanup removes it. `case` stays short
+/// for the same reason.
 fn run_dir(case: &str) -> PathBuf {
-    std::env::temp_dir().join(format!("em-{}-{case}", std::process::id()))
+    tempfile::Builder::new()
+        .prefix(&format!("em-{case}-"))
+        .tempdir_in("/tmp")
+        .expect("a run directory under /tmp")
+        .keep()
 }
 
 /// A headless nvim listening where the Mac host would have Neovide's nvim listen, killed by its own handle
@@ -41,7 +48,6 @@ struct Reserved {
 impl Reserved {
     fn new(case: &str) -> Reserved {
         let run_dir = run_dir(case);
-        let _ = std::fs::remove_dir_all(&run_dir);
         std::fs::create_dir_all(run_dir.join("state")).unwrap();
         let home = run_dir.join("home");
         std::fs::create_dir_all(&home).unwrap();
@@ -207,6 +213,7 @@ fn describe(event: &EditorEvent) -> String {
         EditorEvent::LinkChanged(band) => format!("link {} {}", band.state, band.text),
         EditorEvent::CancelDrafts => "cancel drafts".to_string(),
         EditorEvent::ContextChanged => "context".to_string(),
+        EditorEvent::Recoverable { count, newest } => format!("recoverable {count} {newest}"),
     }
 }
 

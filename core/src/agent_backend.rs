@@ -805,6 +805,21 @@ impl AgentBackend {
         project: ProjectTrust,
         client_tools: Option<agent::ClientToolSet>,
     ) -> Result<Self, BackendError> {
+        Self::start_showing_history(kind, project_dir, resume, lease, project, client_tools, None)
+    }
+
+    /// [`start_holding`](Self::start_holding) that hands a sidecar resume's loaded history to `early`
+    /// (`agent::EarlyHistory`) before the provider is asked to resume. Nothing is handed over by a
+    /// fresh session, by the legacy backend, or by a resume refused before its history was loaded.
+    pub fn start_showing_history(
+        kind: BackendKind,
+        project_dir: &Path,
+        resume: Option<&str>,
+        lease: Option<agent::lease::SessionLease>,
+        project: ProjectTrust,
+        client_tools: Option<agent::ClientToolSet>,
+        early: Option<agent::EarlyHistory>,
+    ) -> Result<Self, BackendError> {
         match kind {
             BackendKind::Legacy => {
                 if resume.is_some() {
@@ -820,20 +835,47 @@ impl AgentBackend {
             }
             BackendKind::Sidecar => {
                 let instance_id = uuid::Uuid::new_v4().to_string();
-                let provider = ClaudeSidecarProvider::connect(&instance_id).map_err(|e| {
-                    // `e` already carries the sidecar's own stderr tail when it failed to start
-                    // (agent::providers::claude_sidecar::spawn), which is the only place the real
-                    // cause -- an incompatible Claude CLI, say -- exists.
-                    BackendError::fatal(format!("failed to connect to the Verdandi sidecar: {e}"))
-                })?;
-                Self::open_claude_session(
-                    std::sync::Arc::new(provider),
-                    project_dir,
-                    resume,
-                    lease,
-                    project,
-                    client_tools,
-                )
+                // `e` already carries the sidecar's own stderr tail when it failed to start
+                // (agent::providers::claude_sidecar::spawn), which is the only place the real
+                // cause -- an incompatible Claude CLI, say -- exists.
+                let connected = |connect: std::io::Result<ClaudeSidecarProvider>| {
+                    connect.map_err(|e| BackendError::fatal(format!("failed to connect to the Verdandi sidecar: {e}")))
+                };
+                let Some(provider_session_id) = resume else {
+                    let provider = connected(ClaudeSidecarProvider::connect(&instance_id))?;
+                    return Self::open_claude_session_showing(
+                        std::sync::Arc::new(provider),
+                        project_dir,
+                        None,
+                        lease,
+                        project,
+                        client_tools,
+                        early,
+                    );
+                };
+                // A resume's provider-free half (the transcript probe, the lease, the history, handed to `early`)
+                // runs while the sidecar starts: neither waits for the other, and the provider is asked to resume
+                // only once both are done.
+                let connecting = std::thread::spawn(move || ClaudeSidecarProvider::connect(&instance_id));
+                let prepared = AgentConversation::prepare_resume(project_dir, provider_session_id, lease, early);
+                let provider = match connecting.join() {
+                    Ok(connect) => connected(connect)?,
+                    Err(panic) => std::panic::resume_unwind(panic),
+                };
+                let provider: std::sync::Arc<dyn agent::AgentProvider + Send + Sync> = std::sync::Arc::new(provider);
+                let info = provider.info();
+                prepared
+                    .and_then(|prepared| AgentConversation::resume_prepared(provider, prepared, project, client_tools))
+                    .map(|conversation| AgentBackend::Conversation {
+                        agent: AgentId::Claude,
+                        conversation: Box::new(conversation),
+                    })
+                    .map_err(|e| {
+                        BackendError::fatal(with_provider_notes(
+                            format!("could not continue the previous session: {e}"),
+                            &info,
+                        ))
+                    })
             }
         }
     }
@@ -849,19 +891,33 @@ impl AgentBackend {
         project: ProjectTrust,
         client_tools: Option<agent::ClientToolSet>,
     ) -> Result<Self, BackendError> {
+        Self::open_claude_session_showing(provider, project_dir, resume, lease, project, client_tools, None)
+    }
+
+    /// [`open_claude_session`](Self::open_claude_session) with a resume's early history sink.
+    fn open_claude_session_showing(
+        provider: std::sync::Arc<dyn agent::AgentProvider + Send + Sync>,
+        project_dir: &Path,
+        resume: Option<&str>,
+        lease: Option<agent::lease::SessionLease>,
+        project: ProjectTrust,
+        client_tools: Option<agent::ClientToolSet>,
+        early: Option<agent::EarlyHistory>,
+    ) -> Result<Self, BackendError> {
         let info = provider.info();
         let backend = |conversation| AgentBackend::Conversation {
             agent: AgentId::Claude,
             conversation: Box::new(conversation),
         };
         match resume {
-            Some(provider_session_id) => AgentConversation::resume_with_tools(
+            Some(provider_session_id) => AgentConversation::resume_showing_history(
                 provider,
                 project_dir,
                 provider_session_id,
                 lease,
                 project,
                 client_tools,
+                early,
             )
             .map(backend)
             .map_err(|e| {
@@ -962,10 +1018,15 @@ impl AgentBackend {
         client_tools: Option<agent::ClientToolSet>,
         keep_stop: impl FnOnce(&agent::HelperHandoff),
     ) -> Result<Self, BackendError> {
-        let provider = std::sync::Arc::new(
-            ClaudeSidecarProvider::connect_through_helper(client, host_key_sha256, start)
-                .map_err(|e| BackendError::fatal(e.to_string()))?,
-        );
+        let provider = match ClaudeSidecarProvider::connect_through_helper(client, host_key_sha256, start) {
+            Ok(provider) => std::sync::Arc::new(provider),
+            Err(error) => {
+                if let Some(sidecar) = ClaudeSidecarProvider::unstopped_sidecar(&error) {
+                    keep_stop(&sidecar);
+                }
+                return Err(BackendError::fatal(error.to_string()));
+            }
+        };
         let info = agent::AgentProvider::info(provider.as_ref());
         AgentConversation::resume_remote_with_tools(
             provider.clone(),

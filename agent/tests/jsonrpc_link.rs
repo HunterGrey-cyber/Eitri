@@ -529,17 +529,14 @@ fn shutdown_kills_the_children_the_agent_started_too() {
         std::thread::sleep(Duration::from_millis(10));
     };
     assert!(alive(grandchild as u32));
+    assert!(!gone_or_zombie(grandchild), "the agent's child runs before the stop");
     link.shutdown(Duration::ZERO);
     let end = Instant::now() + Duration::from_secs(2);
     let mut gone = false;
     while Instant::now() < end {
         // A killed child that nobody waits for stays a zombie until init reaps it, and signal 0
         // still reaches a zombie, so read its state.
-        gone = std::fs::read_to_string(format!("/proc/{grandchild}/stat")).map_or(true, |stat| {
-            stat.rsplit(')')
-                .next()
-                .is_some_and(|rest| rest.trim_start().starts_with('Z'))
-        });
+        gone = gone_or_zombie(grandchild);
         if gone {
             break;
         }
@@ -553,15 +550,144 @@ fn shutdown_kills_the_children_the_agent_started_too() {
     assert!(gone, "the agent's own child outlived the link");
 }
 
+/// Whether `pid` is gone or a zombie. A killed child that nobody waits for stays a zombie until init reaps it, and
+/// signal 0 still reaches a zombie, so its state is read: `/proc` on Linux, `proc_pidinfo` on macOS (which has no
+/// `/proc`; reading it there would call every process gone).
+#[cfg(target_os = "linux")]
+fn gone_or_zombie(pid: i32) -> bool {
+    std::fs::read_to_string(format!("/proc/{pid}/stat")).map_or(true, |stat| {
+        stat.rsplit(')')
+            .next()
+            .is_some_and(|rest| rest.trim_start().starts_with('Z'))
+    })
+}
+
+/// `proc_pidinfo` fails with ESRCH for a process that is gone and for a zombie (measured: `kill(pid, 0)` still
+/// succeeds then), so ESRCH counts as "gone or a zombie"; any other failure stops the test rather than count as gone.
+#[cfg(target_os = "macos")]
+fn gone_or_zombie(pid: i32) -> bool {
+    const SZOMB: u32 = 5;
+    let size = std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int;
+    // SAFETY: all-zero is a valid `proc_bsdinfo`, and the buffer is exactly the size passed.
+    let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
+    let written = unsafe {
+        libc::proc_pidinfo(
+            pid,
+            libc::PROC_PIDTBSDINFO,
+            0,
+            (&mut info as *mut libc::proc_bsdinfo).cast(),
+            size,
+        )
+    };
+    if written == size {
+        return info.pbi_status == SZOMB;
+    }
+    let err = std::io::Error::last_os_error().raw_os_error();
+    assert_eq!(err, Some(libc::ESRCH), "cannot read the state of pid {pid}");
+    true
+}
+
+/// Elsewhere only "gone" can be told, not a zombie.
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn gone_or_zombie(pid: i32) -> bool {
+    // SAFETY: `kill` with signal 0 takes no pointers and sends nothing.
+    unsafe { libc::kill(pid, 0) != 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH) }
+}
+
+/// macOS: an agent that starts a command as the leader of a session of its own (Codex does) and exits on EOF, as Codex
+/// does. Nothing ends a child with its parent there, and the agent's group signal misses that command; the link
+/// records what the agent started before closing its stdin and ends it. (Linux's agents end such commands with the
+/// parent themselves, Codex in its sandbox, and the link does nothing more there.)
+#[cfg(target_os = "macos")]
+#[test]
+fn shutdown_kills_a_command_the_agent_started_in_a_session_of_its_own() {
+    let link = JsonRpcLink::spawn(LinkSpec {
+        program: PathBuf::from("/bin/sh"),
+        args: vec![
+            OsString::from("-c"),
+            OsString::from(r#"perl -MPOSIX -e 'POSIX::setsid(); exec "sleep", "300"' & echo $! >&2; exec cat"#),
+        ],
+        cwd: std::env::temp_dir(),
+        framing: Framing::Bare,
+        env: Vec::new(),
+        env_remove: Vec::new(),
+        over_cap: refuse_all,
+    })
+    .expect("sh starts");
+    let end = soon();
+    let command: i32 = loop {
+        if let Ok(pid) = link.stderr_tail().trim().parse() {
+            break pid;
+        }
+        assert!(Instant::now() < end, "the shell never named its command");
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    // The command has left for a session of its own.
+    let end = soon();
+    // SAFETY: `getsid` takes no pointers.
+    while unsafe { libc::getsid(command) } != command {
+        assert!(Instant::now() < end, "the command never became a session leader");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(!gone_or_zombie(command), "the command runs before the stop");
+    // A grace long enough for the agent to exit on EOF first, leaving the command to launchd.
+    assert!(
+        link.shutdown_for_tests(Duration::from_secs(2)),
+        "the agent exited on EOF within the grace"
+    );
+    assert!(ends_soon(command), "the command the agent started outlived the link");
+}
+
+/// macOS: an agent that starts the command only once it has read EOF, during the grace, and ignores the EOF otherwise
+/// (it is killed when the grace is over): only a reading taken after EOF can record the command.
+#[cfg(target_os = "macos")]
+#[test]
+fn shutdown_kills_a_command_started_during_the_grace_by_an_agent_that_is_killed() {
+    let pid_file = std::env::temp_dir().join(format!(
+        "eitri-link-test-{}-{}.pid",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let script = format!(
+        r#"read _; perl -MPOSIX -e 'POSIX::setsid(); exec "sleep", "300"' & echo $! > '{}'; exec sleep 300"#,
+        pid_file.display()
+    );
+    let link = JsonRpcLink::spawn(LinkSpec {
+        program: PathBuf::from("/bin/sh"),
+        args: vec![OsString::from("-c"), OsString::from(script)],
+        cwd: std::env::temp_dir(),
+        framing: Framing::Bare,
+        env: Vec::new(),
+        env_remove: Vec::new(),
+        over_cap: refuse_all,
+    })
+    .expect("sh starts");
+    std::thread::sleep(Duration::from_millis(200));
+    assert!(!pid_file.exists(), "the command started before EOF");
+    assert!(
+        !link.shutdown_for_tests(Duration::from_millis(500)),
+        "the agent ignored EOF and was killed"
+    );
+    let command: i32 = std::fs::read_to_string(&pid_file)
+        .expect("the agent started its command during the grace")
+        .trim()
+        .parse()
+        .unwrap();
+    let _ = std::fs::remove_file(&pid_file);
+    assert!(
+        ends_soon(command),
+        "the command started during the grace outlived the link"
+    );
+}
+
 /// Waits up to two seconds for `pid` to be gone or a zombie, then kills it if it is not.
 fn ends_soon(pid: i32) -> bool {
     let end = Instant::now() + Duration::from_secs(2);
     while Instant::now() < end {
-        let gone = std::fs::read_to_string(format!("/proc/{pid}/stat")).map_or(true, |stat| {
-            stat.rsplit(')')
-                .next()
-                .is_some_and(|rest| rest.trim_start().starts_with('Z'))
-        });
+        let gone = gone_or_zombie(pid);
         if gone {
             return true;
         }
@@ -595,6 +721,7 @@ fn shutdown_kills_the_children_of_an_agent_that_already_exited() {
         std::thread::sleep(Duration::from_millis(10));
     };
     assert!(alive(grandchild as u32));
+    assert!(!gone_or_zombie(grandchild), "the agent's child runs before the stop");
     // Long enough for the shell to have exited before the link looks.
     link.shutdown(Duration::from_secs(2));
     assert!(

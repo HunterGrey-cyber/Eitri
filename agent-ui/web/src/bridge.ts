@@ -409,7 +409,9 @@ type InboundHandler = (
      *  Rust (`tab_set`'s `turn_clock`) so a switch or a reload shows its real elapsed time; `null`
      *  (or absent, from an older build) when none runs. `turnTimes`: how long every finished turn of the
      *  tab ran, replacing the panel's whole table (absent from an older build). */
-    | { kind: "snapshot"; tab: TabId; throughRevision: number; state: AgentUiSnapshot; turnStartedAtMs?: number | null; turnTimes?: TurnTimeWire[] }
+    /** `early`: a resume's loaded history, drawn while its tab is still starting (Rust's
+     *  `serialize_early_snapshot_for_js`); no session has taken it up yet. */
+    | { kind: "snapshot"; tab: TabId; throughRevision: number; state: AgentUiSnapshot; turnStartedAtMs?: number | null; turnTimes?: TurnTimeWire[]; early?: boolean }
     /** The tab's broker cards, replacing the whole list (Rust's `serialize_editor_cards_for_js`). Sent whenever the
      *  set changes, empty included; the page keeps them only for the tab it shows. */
     | { kind: "editor_cards"; tab: TabId; cards: EditorCardWire[] }

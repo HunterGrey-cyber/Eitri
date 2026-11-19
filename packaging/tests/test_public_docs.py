@@ -609,6 +609,77 @@ def _chinese_link_errors(page, text):
     return errors
 
 
+_RELEASES_DIR = os.path.join(_PUBLISH_FILES, "docs", "releases")
+_RELEASE_NOTES_IN = os.path.join(_REPO_ROOT, "packaging", "release-notes.md.in")
+# The documentation site replaces this comment, alone on its line, with the named section of the file: the heading's
+# line is left out and the section runs to the next "## " heading. GitHub shows nothing for it.
+_FULL_LIST_RE = re.compile(r'^<!-- full-list: (?P<file>\S+) "(?P<heading>[^"]+)" -->$')
+
+
+def _release_pages():
+    return sorted(n for n in os.listdir(_RELEASES_DIR) if n.endswith(".md") and not n.endswith(".zh-CN.md"))
+
+
+def _full_list_markers(text):
+    return [(number, m) for number, line in _outside_fences(text) if (m := _FULL_LIST_RE.match(line))]
+
+
+class ReleasePagesTests(unittest.TestCase):
+    """docs/releases/: one page per minor version and one for the versions before 0.4, read on GitHub and imported by
+    the documentation site. The full list of changes is not copied into a page: a full-list comment names the section
+    of packaging/release-notes.md.in (the GitHub release body) that the site puts there, so the two cannot disagree."""
+
+    def test_each_page_has_its_switch_one_h1_and_resolving_links(self):
+        pages = _release_pages()
+        self.assertIn("before-0.4.md", pages)
+        for name in pages:
+            with open(os.path.join(_RELEASES_DIR, name), encoding="utf-8") as f:
+                text = f.read()
+            self.assertEqual(text.split("\n", 1)[0], f"English | [简体中文]({name[:-3]}.zh-CN.md)", name)
+            h1 = [n for n, line in _outside_fences(text) if line.startswith("# ")]
+            self.assertEqual(len(h1), 1, f"{name}: H1 on lines {h1}")
+            for number, line in _outside_fences(text):
+                if number == 1:
+                    continue
+                for target in _LINK_RE.findall(line):
+                    if re.match(r"^[a-z][a-z0-9+.-]*:|^//|^#", target):
+                        continue
+                    self.assertTrue(_resolves("docs/releases", target), f"{name}:{number}: {target}")
+
+    def test_every_full_list_names_a_section_of_the_release_notes(self):
+        with open(_RELEASE_NOTES_IN, encoding="utf-8") as f:
+            headings = {line[3:].rstrip("\n") for line in f if line.startswith("## ")}
+        seen = 0
+        for name in sorted(os.listdir(_RELEASES_DIR)):
+            if not name.endswith(".md"):
+                continue
+            with open(os.path.join(_RELEASES_DIR, name), encoding="utf-8") as f:
+                text = f.read()
+            stray = [n for n, line in _outside_fences(text) if "full-list:" in line and not _FULL_LIST_RE.match(line)]
+            self.assertEqual(stray, [], f"{name}: a full-list comment must be alone on its line, as the pattern says")
+            for number, m in _full_list_markers(text):
+                seen += 1
+                self.assertEqual(m["file"], "packaging/release-notes.md.in", f"{name}:{number}")
+                self.assertIn(m["heading"], headings, f"{name}:{number}: no '## {m['heading']}' in release-notes.md.in")
+        self.assertGreater(seen, 0, "no release page imports a full list")
+
+    def test_a_twin_imports_the_same_full_list_as_its_english_page(self):
+        for name in _release_pages():
+            zh = os.path.join(_RELEASES_DIR, name[:-3] + ".zh-CN.md")
+            with open(os.path.join(_RELEASES_DIR, name), encoding="utf-8") as f:
+                en_markers = [m.group(0) for _, m in _full_list_markers(f.read())]
+            with open(zh, encoding="utf-8") as f:
+                zh_markers = [m.group(0) for _, m in _full_list_markers(f.read())]
+            self.assertEqual(en_markers, zh_markers, name)
+
+    def test_the_marker_pattern_rejects_what_the_site_would_not_replace(self):
+        self.assertIsNotNone(_FULL_LIST_RE.match('<!-- full-list: packaging/release-notes.md.in "What\'s new since 0.3.0" -->'))
+        for bad in ('<!-- full-list: packaging/release-notes.md.in What\'s new -->',
+                    ' <!-- full-list: packaging/release-notes.md.in "x" -->',
+                    '<!-- full-list: packaging/release-notes.md.in "x" --> trailing'):
+            self.assertIsNone(_FULL_LIST_RE.match(bad), bad)
+
+
 class ChineseDocsLinksTests(unittest.TestCase):
     def test_every_chinese_page_uses_twins_and_existing_anchors(self):
         pages = []

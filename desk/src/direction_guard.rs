@@ -78,9 +78,9 @@ fn direction_offenders(root: &Path, workspace: &str) -> Vec<String> {
                 .map(|line| format!("{}:{line}", relative.display())),
         );
         pending.extend(
-            manifest_path_dependencies(&manifest, workspace, &member)
+            manifest_path_dependencies(&manifest, workspace, &member, &root)
                 .into_iter()
-                .filter_map(|dep| root.join(dep).canonicalize().ok())
+                .filter_map(|dep| dep.canonicalize().ok())
                 .filter(|dep| dep.starts_with(&root)),
         );
     }
@@ -152,6 +152,35 @@ fn direction_scan_reaches_unlisted_path_dependencies() {
     assert_eq!(
         direction_offenders(root, workspace),
         ["support/leaf/Cargo.toml:2: eitri-desk = '1'"]
+    );
+}
+
+#[test]
+fn direction_scan_uses_the_nested_workspace_for_inheritance() {
+    use eitri_core::plugin::test_support::Scratch;
+
+    let scratch = Scratch::new("direction-nested");
+    let root = &scratch.0;
+    let workspace = "[workspace]\nmembers = ['core']\n";
+    for (dir, manifest) in [
+        ("core", "[dependencies.bridge]\npath = '../nested/bridge'"),
+        (
+            "nested",
+            "[workspace]\nmembers = ['bridge', 'leaf']\n[workspace.dependencies]\nserde = '1'\nleaf.path = 'leaf'",
+        ),
+        (
+            "nested/bridge",
+            "[dependencies]\nserde.workspace = true\nleaf.workspace = true",
+        ),
+        ("nested/leaf", "[dependencies]\neitri-desk = '1'"),
+    ] {
+        let dir = root.join(dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("Cargo.toml"), manifest).unwrap();
+    }
+    assert_eq!(
+        direction_offenders(root, workspace),
+        ["nested/leaf/Cargo.toml:2: eitri-desk = '1'"]
     );
 }
 

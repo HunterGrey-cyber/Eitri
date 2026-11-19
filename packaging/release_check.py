@@ -403,11 +403,17 @@ def _sha256_file(path: str) -> str:
     return h.hexdigest()
 
 
+# The top-level files, in hashing order, that both fingerprints cover when present; the list in
+# `shell/build_web.rs`'s `web_build_inputs` is the same, in the same order (a test compares the two).
+WEB_BUNDLE_INPUT_NAMES = ("package.json", "package-lock.json", "index.html", "diagram-renderer.html", "build.mjs")
+
+
 def web_bundle_fingerprint(web_dir: str) -> str:
     """The same fingerprint `shell/build_web.rs`'s `compute_fingerprint` writes to
     `dist/.inputs-sha256`: a sha256 over every file under `src/`
-    (depth-first, each directory's own entries sorted first) followed by `package.json`,
-    `package-lock.json`, `index.html` and `build.mjs` if present, then every top-level `vite.config.*`/
+    (depth-first, each directory's own entries sorted first) followed by the
+    top-level files of `WEB_BUNDLE_INPUT_NAMES` (`package.json`, `package-lock.json`, `index.html`,
+    `diagram-renderer.html`, `build.mjs`) if present, then every top-level `vite.config.*`/
     `tsconfig*.json` sorted -- each entry as its path relative to `web_dir` (forward slashes, as
     Rust's own `Path::join`/`strip_prefix` produce on this platform) plus a NUL, its content plus a
     NUL. Must stay byte-for-byte the same algorithm as the Rust side or this check would only prove
@@ -436,7 +442,7 @@ def web_bundle_fingerprint(web_dir: str) -> str:
 
     for rel, path in walk_sorted(os.path.join(web_dir, "src"), "src"):
         add(rel, path)
-    for name in ("package.json", "package-lock.json", "index.html", "build.mjs"):
+    for name in WEB_BUNDLE_INPUT_NAMES:
         path = os.path.join(web_dir, name)
         if os.path.isfile(path):
             add(name, path)
@@ -1401,9 +1407,9 @@ TWIN_REQUIRED_PAIRS: tuple[tuple[str, str], ...] = (
     ("README.md", "README.zh-CN.md"),
     ("INSTALL.md", "INSTALL.zh-CN.md"),
 )
-# Directories whose every English page is a user-facing guide and so must have its Chinese twin (the
-# documentation site shows both languages side by side); elsewhere a file without a twin is English-only.
-TWIN_REQUIRED_DIRS: tuple[str, ...] = ("docs/guide",)
+# Directories whose every English page is user-facing (the guide, the release pages) and so must have its Chinese
+# twin (the documentation site shows both languages side by side); elsewhere a file without a twin is English-only.
+TWIN_REQUIRED_DIRS: tuple[str, ...] = ("docs/guide", "docs/releases")
 _TWIN_ZH_SUFFIX = ".zh-CN.md"
 _TWIN_MARKER_RE = re.compile(r"^<!-- translated-from: (?P<name>\S+) sha256=(?P<hash>[0-9a-f]{64}) -->$")
 
@@ -1420,7 +1426,7 @@ def check_twins(root: str) -> None:
     (TWIN_REQUIRED_PAIRS) are required pairs at `root`'s own top level; every other
     `<name>.zh-CN.md` file found **at any depth under `root`** is paired with the `<name>.md` in
     the SAME directory -- its adjacent English original -- the same way. Every English page directly in a `TWIN_REQUIRED_DIRS` directory
-    (`docs/guide`) must also have its twin. A file with no twin at all elsewhere (e.g. CONTRIBUTING.md,
+    (`docs/guide`, `docs/releases`) must also have its twin. A file with no twin at all elsewhere (e.g. CONTRIBUTING.md,
     English-only by design) is never checked.
 
     Recurses: `publish/export.sh` mirrors

@@ -90,7 +90,8 @@ pub mod transcript;
 
 pub use account::{AccountError, ClaudeAccount};
 pub use conversation::{
-    conversation_id_for_cwd, AgentConversation, ConversationError, DenyAndStopOutcome, PromptOrigin,
+    conversation_id_for_cwd, AgentConversation, ConversationError, DenyAndStopOutcome, EarlyHistory, PreparedResume,
+    PromptOrigin,
 };
 #[cfg(feature = "legacy-backend")]
 pub use event::{AgentEvent, PermissionSource};

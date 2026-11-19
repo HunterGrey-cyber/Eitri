@@ -195,8 +195,9 @@ pub fn paths(env: &dyn Fn(&str) -> Option<OsString>, home: &Path, run_dir: &Path
 }
 
 /// The command line handed to Neovide: its own name first (the embedder's arguments carry argv[0]), no
-/// fork, and the socket nvim listens on after `--`, so it reaches nvim and not Neovide.
-pub fn neovide_args(nvim_listen: &Path) -> Vec<String> {
+/// fork, and after `--`, so they reach nvim and not Neovide, the socket nvim listens on and `nvim_extra`
+/// ([`editor_watch_args`]). Neovide starts every nvim of the window with them, one started again included.
+pub fn neovide_args(nvim_listen: &Path, nvim_extra: &[String]) -> Vec<String> {
     let socket = nvim_listen
         .to_str()
         .expect("`paths` refuses a socket path that is not UTF-8")
@@ -205,7 +206,44 @@ pub fn neovide_args(nvim_listen: &Path) -> Vec<String> {
         .into_iter()
         .map(String::from)
         .chain([socket])
+        .chain(nvim_extra.iter().cloned())
         .collect()
+}
+
+/// The `--cmd` that loads the editor watch (`eitri_core`'s `editor_watch.lua`, the Linux editor's) into nvim before
+/// the user's config, from the pane-switch channel's `child_env`: it says on the pane-switch socket that nvim will
+/// say when it leaves, and then that it is leaving, which tells a crash from a quit. The socket's address is in
+/// nvim's environment only while the snippet loads (the snippet keeps it): nvim's environment stays Neovide's own.
+/// Nothing when either value is missing (the channel, or its snippet, could not be made).
+pub fn editor_watch_args(child_env: &[(String, String)]) -> Vec<String> {
+    let value = |name: &str| child_env.iter().find(|(key, _)| key == name).map(|(_, value)| value);
+    let (Some(socket), Some(watch)) = (value("EITRI_PANE_SWITCH_SOCKET"), value("EITRI_EDITOR_WATCH_LUA")) else {
+        return Vec::new();
+    };
+    vec![
+        "--cmd".to_owned(),
+        format!(
+            "lua vim.env.EITRI_PANE_SWITCH_SOCKET = {}; pcall(dofile, {}); vim.env.EITRI_PANE_SWITCH_SOCKET = nil",
+            lua_quoted(socket),
+            lua_quoted(watch)
+        ),
+    ]
+}
+
+/// `text` as a Lua string literal: every byte but a few plain ones as a decimal escape, so no quote, backslash,
+/// newline or `|` (which ends a `--cmd`'s Ex command) is ever written as itself.
+pub fn lua_quoted(text: &str) -> String {
+    let mut quoted = String::with_capacity(text.len() + 2);
+    quoted.push('"');
+    for byte in text.bytes() {
+        if byte.is_ascii_alphanumeric() || b"/._-+~".contains(&byte) {
+            quoted.push(char::from(byte));
+        } else {
+            quoted.push_str(&format!("\\{byte:03}"));
+        }
+    }
+    quoted.push('"');
+    quoted
 }
 
 /// Where a descriptor's output goes, as far as a start failure's message is concerned.
@@ -773,9 +811,41 @@ mod tests {
     fn neovide_gets_a_command_line_of_ours() {
         let sock = Path::new("/r/n.sock");
         assert_eq!(
-            neovide_args(sock),
+            neovide_args(sock, &[]),
             ["eitri", "--no-fork", "--", "--listen", sock.to_str().unwrap()]
         );
+        let extra = ["--cmd".to_owned(), "lua x()".to_owned()];
+        assert_eq!(neovide_args(sock, &extra)[5..], extra, "after the socket, for nvim");
+    }
+
+    #[test]
+    fn the_editor_watch_is_loaded_with_its_socket_set_only_while_it_loads() {
+        let env = |pairs: &[(&str, &str)]| -> Vec<(String, String)> {
+            pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect()
+        };
+        let args = editor_watch_args(&env(&[
+            ("EITRI_PANE_SWITCH_SOCKET", "/t/ps"),
+            ("EITRI_NAV_LUA", "/t/nav.lua"),
+            ("EITRI_EDITOR_WATCH_LUA", "/t/watch.lua"),
+        ]));
+        assert_eq!(
+            args,
+            [
+                "--cmd",
+                "lua vim.env.EITRI_PANE_SWITCH_SOCKET = \"/t/ps\"; pcall(dofile, \"/t/watch.lua\"); \
+                 vim.env.EITRI_PANE_SWITCH_SOCKET = nil"
+            ]
+        );
+        assert!(editor_watch_args(&env(&[("EITRI_PANE_SWITCH_SOCKET", "/t/ps")])).is_empty());
+        assert!(editor_watch_args(&env(&[("EITRI_EDITOR_WATCH_LUA", "/t/watch.lua")])).is_empty());
+    }
+
+    #[test]
+    fn a_lua_string_never_writes_a_quote_a_backslash_or_a_bar_as_itself() {
+        assert_eq!(lua_quoted("/a b/\"|c\n"), "\"/a\\032b/\\034\\124c\\010\"");
+        assert_eq!(lua_quoted("é"), "\"\\195\\169\"");
+        assert_eq!(lua_quoted("\\"), "\"\\092\"");
+        assert_eq!(lua_quoted("/T/eitri-1/x_y.lua"), "\"/T/eitri-1/x_y.lua\"");
     }
 
     #[test]
@@ -847,7 +917,7 @@ mod tests {
         assert_eq!(removed, ["NEOVIDE_CONFIG", "NEOVIDE_FORK"]);
         // A `fork = true` in whatever file is read cannot detach the app: Neovide's command line says
         // `--no-fork`, and its embedded start never disowns.
-        assert!(neovide_args(&p.nvim_listen).contains(&"--no-fork".to_string()));
+        assert!(neovide_args(&p.nvim_listen, &[]).contains(&"--no-fork".to_string()));
     }
 
     fn is_dev_null_like(fd: RawFd) -> bool {

@@ -341,9 +341,9 @@ class TheTwoProfilesDifferOnlyInTheAllowedKeys(unittest.TestCase):
         )
         self.assertEqual(public["homepage"], "https://github.com/HunterGrey-cyber/eitri")
 
-    def test_both_descriptions_open_with_the_tagline(self):
+    def test_both_descriptions_open_with_the_description_line(self):
         for path in (PUBLIC_PATH, PRIVATE_PATH):
-            self.assertEqual(_load_yaml(path)["description"].splitlines()[0], TAGLINE, path)
+            self.assertEqual(_load_yaml(path)["description"].splitlines()[0], DESCRIPTION, path)
 
     def test_both_descriptions_end_with_the_source_url_placeholder(self):
         for path in (PUBLIC_PATH, PRIVATE_PATH):
@@ -423,9 +423,19 @@ GNOME_EXT_DST = "/usr/share/gnome-shell/extensions/eitri@huntergrey.cn"
 GNOME_EXT_FILES = ["metadata.json", "extension.js", "direction.js", "policy.js"]
 OLD_DESKTOP_DST = "/usr/share/applications/eitri.desktop"
 ICON_NAME = "cn.huntergrey.eitri"
-# The tagline, as the README, the desktop entry, the package description and the release notes give it.
-TAGLINE = "Your Neovim, tiled with your agents, terminals and the web pages you build."
-TAGLINE_ZH = "你的 Neovim，和 agent、终端、你自己做的网页平铺在一起。"
+# Two lines, each with its own places. PROMO is the hook: the README header and the release notes' first line.
+# DESCRIPTION says what Eitri is: the guide index, the package descriptions, the AUR pkgdesc and the desktop
+# entry's Comment (the last two without the full stop, in English and Chinese).
+PROMO = "Sick of reading agent replies and Markdown in a terminal? Run your own Neovim in a GUI that renders them."
+PROMO_ZH = "受够了在终端里读 agent 回复和 Markdown？在一个能把它们渲染出来的图形窗口里，跑你自己的 Neovim。"
+DESCRIPTION = "A workspace for your own Neovim: coding agents, rendered Markdown and terminals, tiled in one window."
+DESCRIPTION_ZH = "给你自己的 Neovim 一个工作环境：编程 agent、渲染好的 Markdown 和终端，平铺在一个窗口里。"
+DESKTOP_COMMENT = DESCRIPTION[:-1]
+DESKTOP_COMMENT_ZH = DESCRIPTION_ZH[:-1]
+AUR_SUFFIX = {
+    "eitri-bin": " (prebuilt binaries; builds its own sidecar on install)",
+    "eitri-git": " (built from source)",
+}
 # Every file under packaging/icons/hicolor, as the package path it must land at.
 ICON_FILES = {
     "16x16/apps/cn.huntergrey.eitri.png",
@@ -570,9 +580,39 @@ class BothProfilesShipTheDesktopEntryAndTheIcon(unittest.TestCase):
             lines = f.read().splitlines()
         self.assertIn(f"Icon={ICON_NAME}", lines)
         self.assertIn(f"StartupWMClass={ICON_NAME}", lines)
-        self.assertIn("Comment=" + TAGLINE, lines)
-        self.assertIn("Comment[zh_CN]=" + TAGLINE_ZH, lines)
+        self.assertIn("Comment=" + DESKTOP_COMMENT, lines)
+        self.assertIn("Comment[zh_CN]=" + DESKTOP_COMMENT_ZH, lines)
         self.assertFalse(os.path.exists(os.path.join(_HERE, "eitri.desktop")))
+
+
+class LaunchLinesLandInTheirOwnPlaces(unittest.TestCase):
+    """PROMO and DESCRIPTION are different sentences for different places: a line in the wrong place fails here."""
+
+    @staticmethod
+    def _read(*parts):
+        with open(os.path.join(_HERE, "..", *parts), encoding="utf-8") as f:
+            return f.read()
+
+    def test_the_release_notes_open_with_the_promo_line(self):
+        first = self._read("packaging", "release-notes.md.in").splitlines()[0]
+        self.assertEqual(first, "Eitri @VERSION@ -- " + PROMO)
+
+    def test_the_readme_headers_are_the_promo_line(self):
+        for name, line in (("README.md", PROMO), ("README.zh-CN.md", PROMO_ZH)):
+            lines = self._read("publish", "files", name).splitlines()
+            self.assertIn(f"<p><b>{line}</b></p>", lines, name)
+
+    def test_the_guide_index_opens_with_the_description_line(self):
+        for name, line in (("README.md", DESCRIPTION), ("README.zh-CN.md", DESCRIPTION_ZH)):
+            body = self._read("publish", "files", "docs", "guide", name)
+            first_paragraph = body.split("\n\n", 2)
+            self.assertTrue(any(p.startswith(line) for p in first_paragraph), name)
+
+    def test_the_aur_descriptions_are_the_description_line_without_its_stop(self):
+        for pkg, suffix in AUR_SUFFIX.items():
+            wanted = DESCRIPTION[:-1] + suffix
+            self.assertIn(f'pkgdesc="{wanted}"', self._read("packaging", "aur", pkg, "PKGBUILD").splitlines(), pkg)
+            self.assertIn(f"\tpkgdesc = {wanted}", self._read("packaging", "aur", pkg, ".SRCINFO").splitlines(), pkg)
 
 
 def _nfpm_tools_missing():

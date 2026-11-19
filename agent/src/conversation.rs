@@ -228,6 +228,54 @@ pub(crate) const PROVIDER_NAME: &str = "claude";
 /// is the point: no value here is load-bearing any more.
 const RESUME_VERDICT_WAIT: std::time::Duration = std::time::Duration::from_secs(3);
 
+/// Where a resume hands the history it loaded, the moment it has it: after the stability probe and the
+/// lease, before the provider is asked to resume and so before the verdict wait (`RESUME_VERDICT_WAIT`).
+///
+/// A successful Claude resume states no verdict until its first turn, so that wait runs to its end on
+/// every reopen; a window that drew nothing until the conversation came back showed a still screen for
+/// those seconds. What this hands over is the projection the conversation's ingestion then starts
+/// from, so a window drawing it early draws what the resumed session will show. It is a display copy:
+/// nothing in it reaches a permission decision, a turn or the disk, and a resume refused afterwards
+/// leaves the receiver holding history no session took up, which it must drop.
+pub struct EarlyHistory(Box<dyn FnOnce(crate::AgentSessionProjection) + Send>);
+
+impl EarlyHistory {
+    pub fn new(deliver: impl FnOnce(crate::AgentSessionProjection) + Send + 'static) -> Self {
+        Self(Box::new(deliver))
+    }
+
+    /// Hands `history` to the receiver. Public so a test's stand-in for the connect worker can.
+    pub fn deliver(self, history: crate::AgentSessionProjection) {
+        (self.0)(history)
+    }
+}
+
+/// What [`AgentConversation::prepare_resume`] did before any provider was involved: the probe passed, the
+/// session's lease is held, and the seed is loaded (and handed to the early sink, if any). Holds the lease until
+/// [`AgentConversation::resume_prepared`] takes it or it is dropped.
+pub struct PreparedResume {
+    canonical_cwd: PathBuf,
+    cwd_string: String,
+    provider_session_id: String,
+    lease: SessionLease,
+    conversation_id: String,
+    seed: crate::AgentSessionProjection,
+}
+
+impl std::fmt::Debug for PreparedResume {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PreparedResume")
+            .field("provider_session_id", &self.provider_session_id)
+            .finish_non_exhaustive()
+    }
+}
+
+impl std::fmt::Debug for EarlyHistory {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("EarlyHistory")
+    }
+}
+
 /// What a just-issued resume turned out to be.
 #[derive(Debug, PartialEq, Eq)]
 enum ResumeVerdict {
@@ -780,14 +828,42 @@ impl AgentConversation {
         project: ProjectTrust,
         client_tools: Option<ClientToolSet>,
     ) -> Result<Self, ConversationError> {
-        let canonical_cwd = cwd.canonicalize().map_err(ConversationError::Cwd)?;
-        let capabilities = provider.capabilities();
-        if !capabilities.resume {
+        Self::resume_showing_history(provider, cwd, provider_session_id, held, project, client_tools, None)
+    }
+
+    /// [`resume_with_tools`](Self::resume_with_tools) that also hands the loaded history to `early`
+    /// ([`EarlyHistory`]) before the provider is asked for anything. A resume refused before the history
+    /// is loaded (no resume capability, a moving transcript, a lease held elsewhere) hands over nothing.
+    pub fn resume_showing_history(
+        provider: Arc<dyn AgentProvider + Send + Sync>,
+        cwd: &Path,
+        provider_session_id: &str,
+        held: Option<SessionLease>,
+        project: ProjectTrust,
+        client_tools: Option<ClientToolSet>,
+        early: Option<EarlyHistory>,
+    ) -> Result<Self, ConversationError> {
+        // Asked first, so a provider that cannot resume takes no lease and hands no history over.
+        if !provider.capabilities().resume {
             return Err(ConversationError::Provider(ProviderError::UnsupportedCapability(
                 "resume",
             )));
         }
-        let info = provider.info();
+        let prepared = Self::prepare_resume(cwd, provider_session_id, held, early)?;
+        Self::resume_prepared(provider, prepared, project, client_tools)
+    }
+
+    /// The half of a Claude resume that needs no provider: the transcript stability probe, the lease and
+    /// the history seed, handed to `early` as soon as it is loaded. A caller still starting its provider
+    /// runs this meanwhile and finishes with [`resume_prepared`](Self::resume_prepared); dropping what it
+    /// returns lets the lease go.
+    pub fn prepare_resume(
+        cwd: &Path,
+        provider_session_id: &str,
+        held: Option<SessionLease>,
+        early: Option<EarlyHistory>,
+    ) -> Result<PreparedResume, ConversationError> {
+        let canonical_cwd = cwd.canonicalize().map_err(ConversationError::Cwd)?;
         let cwd_string = canonical_cwd.to_string_lossy().to_string();
 
         ensure_transcript_is_not_being_written(&cwd_string, provider_session_id)?;
@@ -835,7 +911,46 @@ impl AgentConversation {
         // `AgentBackend::start` was spawned onto (`panel/src/starts.rs`), never on the GTK
         // main loop, so what it costs is the panel filling in that much later after a resume of
         // that one outsized session. Every other transcript here is a few milliseconds.
-        let mut seed = crate::history::load::seed_for_resume(&cwd_string, &conversation_id, provider_session_id);
+        let seed = crate::history::load::seed_for_resume(&cwd_string, &conversation_id, provider_session_id);
+        // Handed over before the provider call: the copy is the seed exactly as ingestion will start
+        // from it, and nothing live can have folded into it yet.
+        if let Some(early) = early {
+            early.deliver(seed.clone());
+        }
+        Ok(PreparedResume {
+            canonical_cwd,
+            cwd_string,
+            provider_session_id: provider_session_id.to_string(),
+            lease,
+            conversation_id,
+            seed,
+        })
+    }
+
+    /// Finishes a resume [`prepare_resume`](Self::prepare_resume) began, on `provider`: the provider is asked
+    /// to resume only now, so nothing it does can precede the history the seed restored.
+    pub fn resume_prepared(
+        provider: Arc<dyn AgentProvider + Send + Sync>,
+        prepared: PreparedResume,
+        project: ProjectTrust,
+        client_tools: Option<ClientToolSet>,
+    ) -> Result<Self, ConversationError> {
+        let capabilities = provider.capabilities();
+        if !capabilities.resume {
+            return Err(ConversationError::Provider(ProviderError::UnsupportedCapability(
+                "resume",
+            )));
+        }
+        let info = provider.info();
+        let PreparedResume {
+            canonical_cwd,
+            cwd_string,
+            provider_session_id,
+            lease,
+            conversation_id,
+            mut seed,
+        } = prepared;
+        let provider_session_id = provider_session_id.as_str();
 
         let declared_client_tools = declared_tools(&capabilities, client_tools.as_ref());
         let session_id = provider.resume_session(crate::provider::ResumeSessionRequest {
@@ -4082,6 +4197,117 @@ mod tests {
         // A byte releases this child even if another concurrent fork copied the pipe's writer.
         std::io::Write::write_all(child.release.as_mut().unwrap(), &[1]).unwrap();
         assert!(lease_comes_free(&cwd, session), "the child's exit releases its copy");
+    }
+
+    /// The history a resume loads reaches its `EarlyHistory` before the provider is asked to resume,
+    /// and it is the history the resumed conversation then holds.
+    #[test]
+    fn a_resume_hands_its_loaded_history_over_before_asking_the_provider() {
+        let dir = unique_dir();
+        let conversation_id = conversation_id_for_cwd(&dir.canonicalize().expect("the test workspace exists"));
+        let session = format!("sess-{}", uuid::Uuid::new_v4().simple());
+        let parts = crate::history::HistoryParts {
+            user_prompts: vec![crate::UserPromptRecord {
+                seq: 1,
+                text: "what changed yesterday?".into(),
+                delivered: false,
+                attachments: Vec::new(),
+            }],
+            turn_starts: vec![crate::TurnStartRecord {
+                seq: 2,
+                turn_id: "cli-restored".into(),
+                origin: crate::TurnOrigin::Cli,
+                cause: None,
+            }],
+            ..Default::default()
+        };
+        crate::history::store::save(&crate::history::StoredHistory::from_parts(
+            conversation_id,
+            session.clone(),
+            parts,
+        ))
+        .expect("writing the stored history should succeed");
+
+        let provider = AcceptingResume::attaching_to(&session);
+        let witness = Arc::clone(&provider);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let early = EarlyHistory::new(move |history| {
+            let asked = witness.asked.lock().unwrap().len();
+            tx.send((asked, history)).unwrap();
+        });
+        let conversation = AgentConversation::resume_showing_history(
+            provider,
+            &dir,
+            &session,
+            None,
+            ProjectTrust::Untrusted,
+            None,
+            Some(early),
+        )
+        .expect("the fake provider attaches to the session it was asked for");
+        let (asked_before, early) = rx.try_recv().expect("the history was handed over during the resume");
+        assert_eq!(asked_before, 0, "handed over before the provider was asked to resume");
+        assert_eq!(early.user_prompts.len(), 1, "the stored prompt is in it");
+        let shown = conversation.projection();
+        assert_eq!(early.user_prompts, shown.user_prompts);
+        assert_eq!(early.turn_starts, shown.turn_starts);
+        assert_eq!(early.transcript, shown.transcript);
+    }
+
+    /// A resume prepared without a provider holds the session's lease until it is finished on one or
+    /// dropped, and finishing it asks the provider to resume only then.
+    #[test]
+    fn a_prepared_resume_holds_its_lease_until_it_is_finished_or_dropped() {
+        let dir = unique_dir();
+        let cwd = dir.canonicalize().unwrap().to_string_lossy().to_string();
+        let session = "claude-uuid-prepared";
+        let dropped = AgentConversation::prepare_resume(&dir, session, None, None).expect("nothing holds it");
+        assert!(matches!(
+            SessionLease::try_acquire(PROVIDER_NAME, &cwd, session),
+            Err(LeaseError::AlreadyHeld)
+        ));
+        drop(dropped);
+        assert!(lease_comes_free(&cwd, session), "dropped, it lets the session go");
+
+        let prepared = AgentConversation::prepare_resume(&dir, session, None, None).unwrap();
+        let provider = AcceptingResume::attaching_to(session);
+        assert!(
+            provider.asked.lock().unwrap().is_empty(),
+            "no provider is asked while preparing"
+        );
+        let conversation =
+            AgentConversation::resume_prepared(provider.clone(), prepared, ProjectTrust::Untrusted, None)
+                .expect("the fake provider attaches");
+        assert_eq!(*provider.asked.lock().unwrap(), vec![session.to_string()]);
+        assert!(matches!(
+            SessionLease::try_acquire(PROVIDER_NAME, &cwd, session),
+            Err(LeaseError::AlreadyHeld)
+        ));
+        drop(conversation);
+        assert!(lease_comes_free(&cwd, session));
+    }
+
+    /// A resume refused before anything is loaded hands nothing over: here, a session whose lease
+    /// another holder has.
+    #[test]
+    fn a_resume_refused_for_its_lease_hands_no_history_over() {
+        let dir = unique_dir();
+        let cwd = dir.to_string_lossy().to_string();
+        let session = "claude-uuid-held-elsewhere";
+        let _held = SessionLease::try_acquire(PROVIDER_NAME, &cwd, session).unwrap();
+        let (tx, rx) = std::sync::mpsc::channel::<crate::AgentSessionProjection>();
+        let early = EarlyHistory::new(move |history| tx.send(history).unwrap());
+        let result = AgentConversation::resume_showing_history(
+            AcceptingResume::attaching_to(session),
+            &dir,
+            session,
+            None,
+            ProjectTrust::Untrusted,
+            None,
+            Some(early),
+        );
+        assert!(matches!(result, Err(ConversationError::LeaseHeld { .. })));
+        assert!(rx.try_recv().is_err(), "no history was handed over");
     }
 
     /// A resume that fails gives its handed lease back, as one that took its own always did.

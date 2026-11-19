@@ -1716,6 +1716,52 @@ fn window_1s_question_goes_when_only_idle_windows_are_left() {
     assert!(r.ops().contains(&HostOp::Cleanup(CleanupOp::EndGroup)));
 }
 
+/// nvim says it is leaving from a buffer of `filetype`, then exits on its own.
+fn quit_from(r: &Rig, filetype: &str) {
+    r.driver.post(HostEvent::Editor(EditorEvent::Watched { win: WIN }));
+    r.driver.post(HostEvent::Editor(EditorEvent::Leaving {
+        win: WIN,
+        filetype: filetype.into(),
+    }));
+    r.exited(None);
+}
+
+/// The start screen's question is about nvim's quit, not about the other windows: one of them going leaves it up.
+#[test]
+fn the_start_screens_question_stays_when_a_window_goes() {
+    let r = hub_of(&[0, 0]);
+    quit_from(&r, "alpha");
+    let prompt = |r: &Rig| r.driver.query(|c| c.chrome(WIN)).prompt.map(|p| p.text);
+    assert_eq!(prompt(&r).as_deref(), Some("close Eitri? (y/n)"));
+    r.driver.detach_peer(WIN, crate::wm::PeerId(16));
+    r.advance();
+    assert_eq!(prompt(&r).as_deref(), Some("close Eitri? (y/n)"));
+    assert_eq!(r.close_count(), 0);
+}
+
+/// A `y` to the start screen's question closes what was idle when it was asked; work that began since is asked about.
+#[test]
+fn a_y_to_the_start_screens_question_asks_about_work_that_began_meanwhile() {
+    let r = hub_of(&[0, 0]);
+    quit_from(&r, "snacks_dashboard");
+    r.driver.post(HostEvent::Peer(PeerEvent::Summary {
+        peer: crate::wm::PeerId(16),
+        summary: crate::window_link::Summary {
+            running: 1,
+            ..Default::default()
+        },
+    }));
+    r.answer("y");
+    r.advance();
+    let prompt = r
+        .driver
+        .query(|c| c.chrome(WIN))
+        .prompt
+        .expect("the turn is asked about");
+    assert_eq!(prompt.text, "close Eitri and its 2 windows? 1 turn is running (y/n)");
+    assert_eq!(r.close_count(), 0);
+}
+
 /// What it still has to ask about keeps it: the logout waits, as it does for any window that asks.
 #[test]
 fn window_1s_question_stays_while_something_else_is_left_to_ask_about() {

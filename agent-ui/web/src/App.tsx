@@ -171,6 +171,7 @@ import { isExternalTool, agentTitle } from "./externalTools";
 import { acceptsEnvelope, activeTabInfo, agentWord, countedTabTarget, exportView, forgetClosed, importView, isAcpAgent, isExternalAgent, saveView, tabPermissionModes, takeView } from "./tabs";
 import type { TabViewState } from "./tabs";
 import { EmptyTab } from "./components/EmptyTab";
+import { keepTyped } from "./keepTyped";
 import type { NavKeyRequest } from "./components/EmptyTab";
 import { QuestionDock } from "./components/QuestionDock";
 import { PlanDock } from "./components/PlanDock";
@@ -365,13 +366,15 @@ export default function App() {
   /** The conversation for handlers that run between renders; dispatch writes it with the model. */
   const stateRef = useRef(state);
   stateRef.current = state;
-  /** True once the active tab actually holds a session, live or already ended: a `starting` tab, or a `failed`
-   *  one with no kept conversation, renders the empty tab. Derived, not state -- Rust's `tabs` envelope is the
-   *  only source of a tab's `state`. */
+  /** True once the active tab actually holds a session, live or already ended, or is resuming one whose history
+   *  arrived before the session is live (`page.earlyView`): a `starting` tab without it, or a `failed` one with no
+   *  kept conversation, renders the empty tab. Derived, not state -- Rust's `tabs` envelope is the only source of a
+   *  tab's `state`. */
   const sessionStarted =
     activeTab !== null &&
     (activeTab.state === "live" ||
       activeTab.state === "ended" ||
+      (activeTab.state === "starting" && page.earlyView) ||
       (activeTab.state === "failed" && page.keptStates.has(activeTab.id)));
   /** `sessionStarted` for the bridge listener, which is registered once and would otherwise read
    *  its first render's value forever. Assigned during render, so it is current by the time any
@@ -512,6 +515,17 @@ export default function App() {
    *  2026-09-26): the last of `enter_input` (INPUT), `arrive` or a tab switch (BROWSE).
    *  Launch starts INPUT, as it always has. */
   const [emptyLanding, setEmptyLanding] = useState<PanelMode>("input");
+  /** Bumped when a refused restore hands the tab on screen back empty while the person may be typing in it: the empty
+   *  tab leaves INPUT (`EmptyTab`'s `leaveInputRequest`), so an Enter typed for the session that did not come back
+   *  starts no fresh one. */
+  const [emptyLeaveInput, setEmptyLeaveInput] = useState(0);
+  /** Set with it, for `EmptyTab`'s Enter guard (the screen may mount only after the request). */
+  const leftUnderTypingRef = useRef(false);
+  /** The box's text when that happened, kept against the draft the host hands back next (`keepTyped`). */
+  const keptTypingRef = useRef<{ tab: TabId; text: string } | null>(null);
+  /** What the host may have of the box, newest first: the mirrors sent (the newest may still be in flight when the
+   *  host hands the tab back) and the last draft it gave. Two are enough for one debounce in flight. */
+  const hostDraftRef = useRef<{ tab: TabId; texts: string[] } | null>(null);
   /** Bumped by `dropPendingKeys()`, so a cancel route drops the empty tab's own
    *  waiting prefix and leader sequence too (`EmptyTab`'s `dropKeysRequest`), not only this
    *  component's refs. A counter for the reason `arriveRequest` is one. */
@@ -809,7 +823,11 @@ export default function App() {
     draftTimerRef.current = null;
     const pending = pendingDraftRef.current;
     pendingDraftRef.current = null;
-    if (pending !== null) postToRust({ type: "draft", request_id: nextMirrorId(), tab: pending.tab, text: pending.text });
+    if (pending !== null) {
+      const known = hostDraftRef.current?.tab === pending.tab ? hostDraftRef.current.texts : [];
+      hostDraftRef.current = { tab: pending.tab, texts: [pending.text, ...known].slice(0, 2) };
+      postToRust({ type: "draft", request_id: nextMirrorId(), tab: pending.tab, text: pending.text });
+    }
   }
   /** Whether a `draft` for `tab` is the echo of the refusal just recorded: Rust names the refused send in it
    *  (`refused`), which only the trust question's put-off does. Taken once; an echo that never comes expires
@@ -3367,6 +3385,21 @@ export default function App() {
             unreadJumpRef.current = () => { };
             unseenAfterSeqRef.current = null;
           }
+          // A refused restore handed the tab on screen back empty (`starting` -> `not_started`, the same tab): what the
+          // person was typing was for the session that did not come back. The box leaves INPUT, so an Enter already on
+          // its way starts no fresh session; the text stays as the draft, and the failure is what shows.
+          {
+            const was = previousPage.tabs?.tabs.find((tab) => tab.id === payload.active)?.state;
+            const now = payload.tabs.find((tab) => tab.id === payload.active)?.state;
+            if (previousPage.tabs?.active === payload.active && was === "starting" && now === "not_started") {
+              keptTypingRef.current = { tab: payload.active, text: draftRef.current };
+              dropPendingKeys();
+              setEmptyLanding("browse");
+              setMode("browse");
+              setEmptyLeaveInput((n) => n + 1);
+              leftUnderTypingRef.current = true;
+            }
+          }
           activeTabRef.current = payload.active;
           for (const tab of currentHunksRef.current.keys()) {
             if (!payload.tabs.some((entry) => entry.id === tab)) currentHunksRef.current.delete(tab);
@@ -3393,6 +3426,13 @@ export default function App() {
           break;
         }
         case "snapshot": {
+          // A resume's first early history replaces the starting screen's composer with the conversation's. The host
+          // sends no draft with it (its copy trails the box by the mirror's debounce): the new box starts from what
+          // this page holds, and the mirror still pending carries it to the host.
+          if (payload.early === true && !previousPage.earlyView) {
+            restoreSeq.current += 1;
+            setRestoredDraft({ text: draftRef.current, seq: restoreSeq.current });
+          }
           const arrived = arrivedTabsRef.current.delete(payload.tab);
           // The view a switch saved for this tab, if it had one: cursor and expansions now (never the mode: the
           // switch lands BROWSE), the scroll position in the layout effect keyed on `restoreTick`, since it needs
@@ -3654,12 +3694,20 @@ export default function App() {
           // The echo of a refused send this page put back itself: Rust's copy can trail what was typed since, and
           // the box already holds the message and everything typed after it.
           if (takeRefusedEcho(payload.tab, payload.refused)) break;
-          // Otherwise Rust's copy wins; it is sent only on a switch, `ready`, a reset or a scratch return.
+          // Otherwise Rust's copy wins; it is sent only on a switch, `ready`, a reset or a scratch return. After a
+          // refused restore emptied the tab being typed in, the box's own text is kept against it (`keepTyped`) and
+          // mirrored back, since the host's copy may not have it yet.
+          const kept = keptTypingRef.current;
+          keptTypingRef.current = null;
+          const held = hostDraftRef.current?.tab === payload.tab ? hostDraftRef.current.texts : [];
+          const text = kept !== null && kept.tab === payload.tab ? keepTyped(payload.text, held, kept.text) : payload.text;
           restoreSeq.current += 1;
-          draftRef.current = payload.text;
-          givenDraftRef.current = { tab: payload.tab, text: payload.text };
+          draftRef.current = text;
+          givenDraftRef.current = { tab: payload.tab, text };
+          hostDraftRef.current = { tab: payload.tab, texts: [payload.text] };
           pendingDraftRef.current = null;
-          setRestoredDraft({ text: payload.text, seq: restoreSeq.current });
+          setRestoredDraft({ text, seq: restoreSeq.current });
+          if (text !== payload.text) mirrorDraft(text);
           break;
         }
       }
@@ -5514,6 +5562,8 @@ export default function App() {
               dropKeysRequest={emptyDropKeys}
               overlayOpen={overlayOpen}
               landing={emptyLanding}
+              leaveInputRequest={emptyLeaveInput}
+              leftUnderTyping={leftUnderTypingRef}
               onModeChange={setEmptyMode}
               // Only a `navKey` the effect above found no overlay owning the keys
               // for -- this screen decides the rest itself (a starting/failed tab, its own menu vs.
@@ -5697,6 +5747,9 @@ export default function App() {
   // a turn as started when the user pressed Send. The reducer also clears it on a session that ends
   // without one, because no TurnCompleted is ever coming for a session that is gone.
   const turnInProgress = state.activeTurnId !== null;
+  /** The conversation on screen is a resume's history and its session is not live yet: the composer queues behind
+   *  the start, as the starting empty tab's does, and nothing reaches a session until one is live. */
+  const startingEarly = activeTab?.state === "starting";
   /** Enter while the turn runs puts the message into it (the agent reads it at its next step) when the
    *  tab's agent says it can; otherwise the message is held for the turn's end. */
   const enterSteers = (queueSteers ?? state.capabilities.steer) === true;
@@ -7953,12 +8006,17 @@ export default function App() {
         onRunShell={runShell}
         images={composerImages}
         onDraftChange={mirrorDraft}
-        running={turnInProgress || shellRunning}
-        enterSteers={enterSteers && !shellRunning}
+        running={turnInProgress || shellRunning || startingEarly}
+        enterSteers={enterSteers && !shellRunning && !startingEarly}
         onQueue={queueMessage}
         onChord={setComposerChord}
         chordEnd={composerChordEndRef}
         onSendNow={(t) => {
+          // A starting tab has no turn to send into now: the message queues behind the start, as Enter's does.
+          if (startingEarly) {
+            if (t.trim() !== "") queueMessage(t);
+            return;
+          }
           // `Ctrl+Enter` would end the running turn for a question that needs no turn.
           const bare = barePickerCommand(t);
           if (bare !== null && picksDirectly()) {
@@ -7975,7 +8033,8 @@ export default function App() {
         onTakeBackQueue={() => post({ type: "take_back_queue" })}
         queueTaken={queueTaken}
         onHistoryPush={(t) => postToRust({ type: "history_push", request_id: nextRequestId(), text: t })}
-        onInterrupt={interrupt}
+        // Nothing runs to interrupt while the session is still starting.
+        onInterrupt={startingEarly ? undefined : interrupt}
         onEditInNvim={(t) => post({ type: "edit_draft", text: t })}
         editingInNvim={scratchEditing}
         onOpenKeymap={() => {

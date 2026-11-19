@@ -575,12 +575,7 @@ fn payload(bytes: Vec<u8>, gzip: bool) -> Result<Vec<u8>, InstallError> {
     communicate_uncapped(child, &bytes, &|_, _| {}, usize::MAX, None).map(|(out, _)| out)
 }
 
-/// How long a lifecycle step's channel may take to print its attachment marker. A floor sized for a slow link, not a
-/// figure measured on this one: the marker comes back after a channel open and an exec through the master and the
-/// server starting a shell, a few round trips that a link of a few hundred milliseconds stretches past five seconds
-/// when the master's connection is busy with an upload or the server is short of memory. Only a channel that never
-/// answers is made to wait this long.
-pub(crate) const ATTACHMENT_DEADLINE: std::time::Duration = std::time::Duration::from_secs(20);
+pub(crate) use agent::ssh::channel::ATTACHMENT_DEADLINE;
 
 /// Consume only the attachment marker, with the caller's key guard still held. No payload may be sent before it.
 pub(crate) fn attached(child: Child) -> Result<Child, InstallError> {

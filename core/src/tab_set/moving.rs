@@ -498,6 +498,8 @@ fn handoff_of(tab: &Tab, review: Option<ReviewHandoff>) -> TabHandoff {
         plan_start: _,
         // The draft's images are this window's files and memory: they stay, and the landing window says so.
         attachments,
+        // Drawn only while the tab is starting, and a starting tab does not move.
+        early: _,
     } = tab;
     let SessionState {
         title,

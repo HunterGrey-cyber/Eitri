@@ -98,6 +98,20 @@ local function report()
   end
 end
 
+-- The current buffer's 'filetype' as one word of the line, so the window can tell a quit from a start screen
+-- from one made in a file. Characters the line's reader would refuse are dropped and a long name is cut, so the
+-- line stays one the window reads (a line it drops would make the exit look like a crash).
+local FILETYPE_MAX = 40
+local function leaving_filetype()
+  local ok, filetype = pcall(function()
+    return vim.bo.filetype
+  end)
+  if not ok or type(filetype) ~= "string" then
+    return ""
+  end
+  return (filetype:gsub("[^%w_.%-]", ""):sub(1, FILETYPE_MAX))
+end
+
 local group = vim.api.nvim_create_augroup("eitri_editor_watch", { clear = true })
 vim.api.nvim_create_autocmd("VimEnter", {
   group = group,
@@ -108,7 +122,7 @@ vim.api.nvim_create_autocmd("VimEnter", {
       callback = function()
         -- `v:dying` is set on the way out of a deadly signal, which is no quit anyone asked for.
         if vim.v.dying == 0 then
-          send("nvim-leaving")
+          send("nvim-leaving " .. leaving_filetype())
         end
       end,
     })

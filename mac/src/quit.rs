@@ -1,12 +1,17 @@
-//! Whether a quit the window sees first may go on, and what follows the user's answer.
+//! Whether a quit the window sees first may go on, what follows the user's answer, and whether the window
+//! outlives an nvim that ended.
 //!
 //! Three requests reach the window before nvim hears of them: the quit chord (the key monitor sees it before the
 //! menu does), the menu's Quit item (by pointer, or by whatever chord it carries), and the window's close button.
 //! While a turn runs, a message is queued or a tab has background work left running, each is held and a question is
-//! put; the answer `Quit` sends the
-//! request on its way, through the path it would have taken. A quit nvim decides for itself (`:qa`) asks nothing
-//! here, as on Linux; nor does AppKit's own `terminate:` (the Dock's Quit, a logout, a script's `quit app`),
-//! which never passes through the window.
+//! put; the answer `Quit` sends the request on its way, through the path it would have taken. AppKit's own
+//! `terminate:` (the Dock's Quit, a logout, a script's `quit app`) never passes through the window and asks nothing.
+//!
+//! **When nvim ends, the rule is the Linux window's** (`eitri_core::wm::quit`): an nvim that said it was leaving
+//! (`:qa`, or the quit this window sent) is the window's close, which asks the same question while something is at
+//! work and keeps the window, its editor ended, on Cancel; one that went without saying so (a crash, a `kill`) keeps
+//! the window and says how to start it again. While the editor has ended, a quit that may go on ends the app here:
+//! Neovide's own Quit and close would go to the nvim that is gone.
 
 use std::time::{Duration, Instant};
 
@@ -21,6 +26,8 @@ pub enum QuitSource {
     Menu,
     /// The window's close button.
     CloseButton,
+    /// nvim quit by itself (`:qa`) while something was at work.
+    Editor,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -31,6 +38,8 @@ pub enum QuitDecision {
     Ask { what: String },
     /// A question is already open, or this is a repeat of a chord that was held: the request is dropped.
     AlreadyAsking,
+    /// The editor has ended: nothing is asked, and the window ends the app itself.
+    EndApp,
 }
 
 /// What the window does after the user chose to quit.
@@ -40,12 +49,42 @@ pub enum QuitAfter {
     SendQuitKey,
     /// Close the window again; the close requested within [`PASS_FOR`] passes without a question.
     CloseAgain,
+    /// The editor has ended: the window ends the app itself.
+    EndApp,
+}
+
+/// What nvim said of its own end before it went (the editor watch, `editor_watch.lua`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum NvimSaid {
+    /// Nothing: it never reached its watch (a start that failed, a snippet that could not be loaded).
+    #[default]
+    Nothing,
+    /// It will say when it leaves: an end with nothing more said is a crash.
+    Watched,
+    /// It is quitting on purpose.
+    Leaving,
+}
+
+/// What the window does when nvim has ended and no new nvim took its place.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EditorEnded {
+    /// The window closes with it, and the app quits.
+    Close,
+    /// The window stays, its editor ended, and asks before it closes; `what` says what is at work.
+    Ask { what: String },
+    /// The window stays with its editor ended. `crashed`: nvim went without saying it was leaving.
+    Keep { crashed: bool },
 }
 
 /// How long the pass for a close the user already answered stays good. Closing again reaches the close request
 /// at once; a pass still unused after this belongs to a close that never came, and must not let a later close
 /// (another turn, perhaps) through unasked.
 pub const PASS_FOR: Duration = Duration::from_secs(2);
+
+/// How long the user's Quit stays the answer for the end of the nvim it went to. nvim may hold the quit at its own
+/// prompt for an unsaved buffer, or refuse it, and nothing here learns of either; an end later than this is a new
+/// one, and asks again if anything is at work. Long enough for nvim to quit with its plugins shutting down.
+pub const CONFIRMED_FOR: Duration = Duration::from_secs(10);
 
 /// What is at work, as the window's close question counts it: turns running (a waiting question counts as one),
 /// messages queued, and tabs with live background work, which quitting stops.
@@ -74,10 +113,19 @@ pub fn at_work(work: AtWork) -> Option<String> {
 
 #[derive(Debug, Default)]
 pub struct QuitGate {
-    asking: Option<QuitSource>,
+    /// The open question: where the request came from and what it asked about.
+    asking: Option<(QuitSource, String)>,
     pass_close_until: Option<Instant>,
     /// The last press of the quit chord was held (asked about, or dropped): its repeats are dropped too.
     chord_held: bool,
+    /// What the user chose to quit over, and until when (`CONFIRMED_FOR`): the end of the nvim the quit went to asks
+    /// nothing about it again.
+    confirmed: Option<(String, Instant)>,
+    /// The editor has ended and the window stayed.
+    ended: bool,
+    /// nvim was started again: an end of the new one that said nothing (it never reached its watch) is no quit of
+    /// the user's.
+    restarting: bool,
 }
 
 impl QuitGate {
@@ -85,7 +133,7 @@ impl QuitGate {
         if source == QuitSource::CloseButton {
             if let Some(until) = self.pass_close_until.take() {
                 if now < until {
-                    return QuitDecision::Proceed;
+                    return self.go_on();
                 }
             }
         }
@@ -93,11 +141,20 @@ impl QuitGate {
             return QuitDecision::AlreadyAsking;
         }
         match at_work(work) {
-            None => QuitDecision::Proceed,
+            None => self.go_on(),
             Some(what) => {
-                self.asking = Some(source);
+                self.asking = Some((source, what.clone()));
                 QuitDecision::Ask { what }
             }
+        }
+    }
+
+    /// A request that may go on: on its own way, or, with the editor ended, to the end of the app.
+    fn go_on(&self) -> QuitDecision {
+        if self.ended {
+            QuitDecision::EndApp
+        } else {
+            QuitDecision::Proceed
         }
     }
 
@@ -114,14 +171,69 @@ impl QuitGate {
 
     /// The user answered the open question. `None` when there was none, or for Cancel: nothing happens.
     pub fn answer(&mut self, quit: bool, now: Instant) -> Option<QuitAfter> {
-        let source = self.asking.take()?;
+        let (source, what) = self.asking.take()?;
         if !quit {
             return None;
         }
+        if self.ended {
+            return Some(QuitAfter::EndApp);
+        }
+        // The quit goes to nvim, whose end follows; that end must not ask about the same work again.
+        self.confirmed = Some((what, now + CONFIRMED_FOR));
         Some(match source {
             QuitSource::Key | QuitSource::Menu => QuitAfter::SendQuitKey,
             QuitSource::CloseButton => self.close_again(now),
+            // Asked only once the editor has ended, which is handled above.
+            QuitSource::Editor => QuitAfter::EndApp,
         })
+    }
+
+    /// nvim ended with no new nvim in its place; `said` is what it said of that end, `work` what is at work now.
+    ///
+    /// As the Linux window decides it (`eitri_core::wm::quit::QuitFlow::nvim_exited`): an nvim that said it would
+    /// say when it leaves and ended without saying so crashed, and the window stays; so does an nvim started again
+    /// that ended before it was watching. Any other end is the window's close: it closes when nothing is at work, or
+    /// when what is at work is what the user chose to quit over within `CONFIRMED_FOR`, and asks otherwise; a question
+    /// already open
+    /// decides for both. A crash keeps the window even after the user chose to quit (the Linux window closes then):
+    /// nothing here learns that nvim's own prompt for an unsaved buffer was cancelled, so the choice may be old, and
+    /// a quit of the user's always says it is leaving.
+    pub fn nvim_ended(&mut self, said: NvimSaid, work: AtWork, now: Instant) -> EditorEnded {
+        let confirmed = self
+            .confirmed
+            .take()
+            .filter(|(_, until)| now < *until)
+            .map(|(what, _)| what);
+        let restarting = std::mem::take(&mut self.restarting);
+        let decided = if said == NvimSaid::Watched {
+            EditorEnded::Keep { crashed: true }
+        } else if restarting && said == NvimSaid::Nothing {
+            EditorEnded::Keep { crashed: false }
+        } else if self.asking.is_some() {
+            EditorEnded::Keep { crashed: false }
+        } else {
+            match at_work(work) {
+                None => EditorEnded::Close,
+                Some(what) if confirmed.as_deref() == Some(what.as_str()) => EditorEnded::Close,
+                Some(what) => {
+                    self.asking = Some((QuitSource::Editor, what.clone()));
+                    EditorEnded::Ask { what }
+                }
+            }
+        };
+        self.ended = decided != EditorEnded::Close;
+        decided
+    }
+
+    /// A new nvim was asked for in the window whose editor ended.
+    pub fn restarted(&mut self) {
+        self.ended = false;
+        self.restarting = true;
+    }
+
+    /// Whether the editor has ended and the window stayed.
+    pub fn editor_ended(&self) -> bool {
+        self.ended
     }
 
     /// The window closes again and that close must not ask (also when the quit chord could not reach nvim).
@@ -461,6 +573,186 @@ mod tests {
         assert_eq!(
             tabs_window_prompt(work),
             Some("close window? 2 with background tasks (y/n)".to_string())
+        );
+    }
+
+    /// `:qa` with nothing at work closes the window, as on Linux: the chat is on disk and nothing runs.
+    #[test]
+    fn nvims_own_quit_with_nothing_at_work_closes_the_window() {
+        for said in [NvimSaid::Leaving, NvimSaid::Nothing] {
+            let mut gate = QuitGate::default();
+            assert_eq!(
+                gate.nvim_ended(said, w(0, 0), Instant::now()),
+                EditorEnded::Close,
+                "{said:?}"
+            );
+            assert!(!gate.editor_ended());
+        }
+    }
+
+    /// `:qa` while a turn runs asks the window's question; Cancel keeps the window with its editor ended, and from
+    /// then on a quit that may go on ends the app (Neovide's own would go to the nvim that is gone).
+    #[test]
+    fn nvims_own_quit_while_at_work_asks_and_cancel_keeps_the_window() {
+        let now = Instant::now();
+        let mut gate = QuitGate::default();
+        assert_eq!(
+            gate.nvim_ended(NvimSaid::Leaving, w(1, 0), Instant::now()),
+            EditorEnded::Ask {
+                what: "1 running".into()
+            }
+        );
+        assert!(gate.editor_ended() && gate.is_asking());
+        assert_eq!(
+            gate.request(QuitSource::Menu, w(1, 0), now),
+            QuitDecision::AlreadyAsking
+        );
+        assert_eq!(gate.answer(false, now), None);
+        assert!(gate.editor_ended());
+        assert!(matches!(
+            gate.request(QuitSource::CloseButton, w(1, 0), now),
+            QuitDecision::Ask { .. }
+        ));
+        assert_eq!(gate.answer(true, now), Some(QuitAfter::EndApp));
+        assert_eq!(gate.request(QuitSource::Menu, w(0, 0), now), QuitDecision::EndApp);
+        assert_eq!(gate.request_chord(false, w(0, 0), now), QuitDecision::EndApp);
+    }
+
+    #[test]
+    fn quit_to_the_question_nvims_end_put_ends_the_app() {
+        let now = Instant::now();
+        let mut gate = QuitGate::default();
+        let _ = gate.nvim_ended(NvimSaid::Leaving, w(0, 1), Instant::now());
+        assert_eq!(gate.answer(true, now), Some(QuitAfter::EndApp));
+    }
+
+    /// nvim went without saying it was leaving: the window stays and says so, whatever is at work, and even when the
+    /// user had chosen to quit.
+    #[test]
+    fn a_crash_keeps_the_window() {
+        let now = Instant::now();
+        for work in [w(0, 0), w(2, 1)] {
+            let mut gate = QuitGate::default();
+            assert_eq!(
+                gate.nvim_ended(NvimSaid::Watched, work, Instant::now()),
+                EditorEnded::Keep { crashed: true }
+            );
+            assert!(gate.editor_ended() && !gate.is_asking());
+        }
+        let mut gate = QuitGate::default();
+        let _ = gate.request(QuitSource::Menu, w(1, 0), now);
+        assert_eq!(gate.answer(true, now), Some(QuitAfter::SendQuitKey));
+        assert_eq!(
+            gate.nvim_ended(NvimSaid::Watched, w(1, 0), Instant::now()),
+            EditorEnded::Keep { crashed: true }
+        );
+    }
+
+    /// The user chose Quit over what was at work; the nvim that quit for it asks nothing about the same work again,
+    /// and asks about more.
+    #[test]
+    fn a_quit_already_answered_closes_unless_more_is_at_work() {
+        let now = Instant::now();
+        for source in [QuitSource::Key, QuitSource::Menu, QuitSource::CloseButton] {
+            let mut gate = QuitGate::default();
+            let _ = gate.request(source, w(1, 0), now);
+            assert!(gate.answer(true, now).is_some());
+            assert_eq!(
+                gate.nvim_ended(NvimSaid::Leaving, w(1, 0), Instant::now()),
+                EditorEnded::Close,
+                "{source:?}"
+            );
+        }
+        let mut gate = QuitGate::default();
+        let _ = gate.request(QuitSource::Key, w(1, 0), now);
+        let _ = gate.answer(true, now);
+        assert_eq!(
+            gate.nvim_ended(NvimSaid::Leaving, w(1, 1), Instant::now()),
+            EditorEnded::Ask {
+                what: "1 running, 1 queued".into()
+            }
+        );
+        // The answer is used once: the next nvim's end asks again.
+        let mut gate = QuitGate::default();
+        let _ = gate.request(QuitSource::Key, w(1, 0), now);
+        let _ = gate.answer(true, now);
+        let _ = gate.nvim_ended(NvimSaid::Leaving, w(1, 0), Instant::now());
+        gate.restarted();
+        assert!(matches!(
+            gate.nvim_ended(NvimSaid::Leaving, w(1, 0), Instant::now()),
+            EditorEnded::Ask { .. }
+        ));
+    }
+
+    /// A Quit answered long before nvim ends (nvim's own prompt held or refused it, and a later `:qa` ended it) is no
+    /// answer for that end: it asks again.
+    #[test]
+    fn an_old_answer_does_not_close_a_later_end_unasked() {
+        let start = Instant::now();
+        let mut gate = QuitGate::default();
+        let _ = gate.request(QuitSource::Key, w(1, 0), start);
+        assert_eq!(gate.answer(true, start), Some(QuitAfter::SendQuitKey));
+        assert!(matches!(
+            gate.nvim_ended(NvimSaid::Leaving, w(1, 0), start + CONFIRMED_FOR),
+            EditorEnded::Ask { .. }
+        ));
+        let mut gate = QuitGate::default();
+        let _ = gate.request(QuitSource::Key, w(1, 0), start);
+        let _ = gate.answer(true, start);
+        assert_eq!(
+            gate.nvim_ended(
+                NvimSaid::Leaving,
+                w(1, 0),
+                start + CONFIRMED_FOR - Duration::from_millis(1)
+            ),
+            EditorEnded::Close
+        );
+    }
+
+    /// A question open when nvim ends (the quit chord's, say) decides for both: the window stays until it is answered.
+    #[test]
+    fn an_open_question_keeps_the_window_when_nvim_ends() {
+        let now = Instant::now();
+        let mut gate = QuitGate::default();
+        let _ = gate.request(QuitSource::Key, w(1, 0), now);
+        assert_eq!(
+            gate.nvim_ended(NvimSaid::Leaving, w(1, 0), Instant::now()),
+            EditorEnded::Keep { crashed: false }
+        );
+        assert_eq!(gate.answer(true, now), Some(QuitAfter::EndApp));
+    }
+
+    /// nvim started again: a quit goes its own way once more; an end before the new nvim watches is no quit of the
+    /// user's and keeps the window.
+    #[test]
+    fn a_restart_hands_quits_back_to_nvim_and_an_early_end_keeps_the_window() {
+        let now = Instant::now();
+        let mut gate = QuitGate::default();
+        let _ = gate.nvim_ended(NvimSaid::Watched, w(0, 0), Instant::now());
+        gate.restarted();
+        assert!(!gate.editor_ended());
+        assert_eq!(gate.request(QuitSource::Menu, w(0, 0), now), QuitDecision::Proceed);
+        assert_eq!(
+            gate.nvim_ended(NvimSaid::Nothing, w(0, 0), Instant::now()),
+            EditorEnded::Keep { crashed: false }
+        );
+        gate.restarted();
+        assert_eq!(
+            gate.nvim_ended(NvimSaid::Leaving, w(0, 0), Instant::now()),
+            EditorEnded::Close
+        );
+    }
+
+    /// While the editor has ended the close button's pass ends the app too.
+    #[test]
+    fn the_close_buttons_pass_ends_the_app_once_the_editor_ended() {
+        let now = Instant::now();
+        let mut gate = QuitGate::default();
+        let _ = gate.nvim_ended(NvimSaid::Watched, w(0, 0), Instant::now());
+        let _ = gate.close_again(now);
+        assert_eq!(
+            gate.request(QuitSource::CloseButton, w(1, 0), now),
+            QuitDecision::EndApp
         );
     }
 

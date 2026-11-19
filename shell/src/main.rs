@@ -4700,10 +4700,11 @@ fn build_ui(
                     }));
                 }
             }
-            pane_switch::PaneMessage::EditorLeaving => {
+            pane_switch::PaneMessage::EditorLeaving { filetype } => {
                 if let Some(driver) = driver.upgrade() {
                     driver.post(HostEvent::Editor(eitri_core::wm::EditorEvent::Leaving {
                         win: WinId::MAIN,
+                        filetype,
                     }));
                 }
             }

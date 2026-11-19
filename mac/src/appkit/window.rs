@@ -50,11 +50,20 @@ const HOST_TICK: Duration = Duration::from_millis(250);
 /// How long a notice the panel cannot show stays in the window's subtitle.
 const SUBTITLE_NOTICE: Duration = Duration::from_secs(4);
 
-/// The subtitle: what the prefix waits for while it waits, else a notice still live at `now`, else nothing.
-pub fn subtitle_or_notice(strip: String, notice: Option<&(String, Instant)>, now: Instant) -> String {
+/// The subtitle: what the prefix waits for while it waits, else a notice still live at `now`, else what holds while
+/// the editor has ended (`ended`, how to start nvim again), else nothing.
+pub fn subtitle_or_notice(
+    strip: String,
+    notice: Option<&(String, Instant)>,
+    ended: Option<String>,
+    now: Instant,
+) -> String {
+    if !strip.is_empty() {
+        return strip;
+    }
     match notice {
-        Some((text, until)) if strip.is_empty() && now < *until => text.clone(),
-        _ => strip,
+        Some((text, until)) if now < *until => text.clone(),
+        _ => ended.unwrap_or_default(),
     }
 }
 
@@ -158,6 +167,10 @@ pub struct Host {
     reconciles: RefCell<Vec<(String, u32)>>,
     /// Windows Neovide made after the first, left without a panel.
     extra_windows: Cell<u32>,
+    /// The panel's page has loaded at least once, and the web view has since been first responder once
+    /// (`settle_input_method`).
+    page_loaded: Cell<bool>,
+    input_method_settled: Cell<bool>,
 }
 
 impl Host {
@@ -196,15 +209,29 @@ impl Host {
             quit_target: RefCell::new(None),
             reconciles: RefCell::new(Vec::new()),
             extra_windows: Cell::new(0),
+            page_loaded: Cell::new(false),
+            input_method_settled: Cell::new(false),
         });
         host.observe_termination();
         HOST_FOR_LATER.with(|h| *h.borrow_mut() = Rc::downgrade(&host));
         // The page asked for the keys while the editor holds them and was refused: AppKit has already taken
         // them from the editor's view, so they go back.
         let weak = Rc::downgrade(&host);
+        host.panel_view.on_loaded(move || {
+            if let Some(host) = weak.upgrade() {
+                host.page_loaded.set(true);
+                // Out of WebKit's callback: the move of the first responder makes WebKit call back in.
+                let later = host.clone();
+                on_next_turn(host.mtm, move || later.settle_input_method());
+            }
+        });
+        let weak = Rc::downgrade(&host);
         host.panel_view.gate().on_refused(move || {
             if let Some(host) = weak.upgrade() {
                 host.reconcile("the page asked for the keys");
+                // The page's refused focus leaves the editor unable to compose (`settle_input_method`).
+                host.input_method_settled.set(false);
+                host.settle_input_method();
             }
         });
         host
@@ -458,6 +485,7 @@ impl Host {
             on(NSWindowDidBecomeKeyNotification, Some(window), |host| {
                 host.reconcile("the window became key");
                 host.report_pane_focus();
+                host.settle_input_method();
             });
             on(NSWindowDidResignKeyNotification, Some(window), |host| {
                 host.cancel_keys();
@@ -518,7 +546,11 @@ impl Host {
         };
         let waiting = assembly.keys.borrow().waiting();
         let strip = subtitle_text(&strip_pieces(waiting, &assembly.config.keymap));
-        let text = subtitle_or_notice(strip, self.notice.borrow().as_ref(), Instant::now());
+        let ended = self
+            .life
+            .editor_ended()
+            .then(|| assembly.editor_ended_text(self.life.ended_by_crash()));
+        let text = subtitle_or_notice(strip, self.notice.borrow().as_ref(), ended, Instant::now());
         if *self.subtitle.borrow() != text {
             window.setSubtitle(&NSString::from_str(&text));
             *self.subtitle.borrow_mut() = text;
@@ -578,6 +610,42 @@ impl Host {
         }
     }
 
+    /// The editor composes with an input method (Pinyin) only while the page's own focus requests have been met: once
+    /// the page has focused its composer with the editor holding the keys (it does at every load, and the gate
+    /// refuses it), Pinyin hands winit its letters uncomposed, the editor's view first responder and its input context
+    /// current all the while. Measured on macOS 26.7 with the product's page (the acceptance item `pinyin-switch`):
+    /// blurring the composer, reactivating the editor's input context, or resigning and retaking first responder do
+    /// not mend it; one turn of the keys through the web view does, and holds through input source changes. So after
+    /// a load and after each refused focus, once the window is key and the panel on screen, the web view takes the
+    /// keys and gives them straight back to the editor: the pane stays the editor's, and neither nvim nor the panel is
+    /// told of a move. With the keys in the panel, the web view has them and nothing is needed.
+    fn settle_input_method(&self) {
+        if self.input_method_settled.get() || !self.page_loaded.get() {
+            return;
+        }
+        let (Some(window), Some(editor)) = (self.window(), self.editor_view()) else {
+            return;
+        };
+        if self.pane.get() == Pane::Panel && self.responder() == Responder::Panel {
+            self.input_method_settled.set(true);
+            return;
+        }
+        if !window.isKeyWindow() || self.web_view().isHidden() || self.pane.get() != Pane::Editor {
+            return;
+        }
+        let gate = self.panel_view.gate();
+        gate.set_editor_has_keys(false);
+        let took = window.makeFirstResponder(Some(self.web_view()));
+        gate.set_editor_has_keys(true);
+        let back = window.makeFirstResponder(Some(&editor));
+        // Settled only by a whole turn: a view that kept the keys goes back to the pane's, and the turn is tried again.
+        self.input_method_settled.set(took && back);
+        crate::log_line!("[mac] the input method's turn through the web view: taken {took}, given back {back}");
+        if !back {
+            self.reconcile("the input method's turn could not give the editor the keys back");
+        }
+    }
+
     /// Moves the keys to `pane`: the composition in the pane that loses them ends, AppKit's first responder
     /// moves, nvim hears about it (FocusLost/FocusGained, its cursor), and the panel learns whether it has
     /// keyboard focus. `true` when `pane` has the keys afterwards.
@@ -588,11 +656,21 @@ impl Host {
         };
         let gate = self.panel_view.gate();
         match pane {
+            // An ended editor takes no keys while the panel can have them: Neovide would keep them for the next nvim.
+            Pane::Editor if self.life.editor_ended() && !self.web_view().isHidden() => {
+                crate::log_line!(
+                    "[mac] the editor has ended: the keys stay with the {:?}",
+                    self.pane.get()
+                );
+                return self.pane.get() == pane;
+            }
             Pane::Editor => {
                 self.end_page_composition();
                 gate.set_editor_has_keys(true);
                 if !window.makeFirstResponder(Some(&editor)) {
-                    // The pane stays as it was: it must name whoever AppKit gives the keys to.
+                    // The pane stays as it was: it must name whoever AppKit gives the keys to. The page's composition
+                    // was not interrupted after all.
+                    self.panel_view.keep_composition();
                     crate::log_line!("[mac] AppKit refused the editor the keys");
                     gate.set_editor_has_keys(self.pane.get() == Pane::Editor);
                     return false;
@@ -612,6 +690,10 @@ impl Host {
                     return false;
                 }
             }
+        }
+        if pane == Pane::Panel {
+            // The web view has been first responder: what `settle_input_method` does is done.
+            self.input_method_settled.set(true);
         }
         if self.pane.replace(pane) != pane {
             if let Some(proxy) = self.proxy.borrow().as_ref() {
@@ -639,6 +721,64 @@ impl Host {
             .is_some_and(|view| unsafe { msg_send![&*view, hasMarkedText] })
     }
 
+    /// The editor view's input context as AppKit holds it: the keyboard input source it has selected, and whether it
+    /// is the current (active) context. For the acceptance build's state.
+    pub(crate) fn editor_input_context(&self) -> (Option<String>, bool) {
+        let Some(context) = self.editor_view().and_then(|view| view.inputContext()) else {
+            return (None, false);
+        };
+        let source = context.selectedKeyboardInputSource().map(|s| s.to_string());
+        let current = objc2_app_kit::NSTextInputContext::currentInputContext(self.mtm)
+            .is_some_and(|c| std::ptr::eq(&*c, &*context));
+        (source, current)
+    }
+
+    /// The acceptance build's probe of the editor's input context: `discard` (`discardMarkedText`), `reactivate`
+    /// (`deactivate` then `activate`), `resign` (the window's first responder to none and back to the editor).
+    #[cfg(feature = "acceptance")]
+    pub(crate) fn probe_editor_input_context(&self, op: &str) -> bool {
+        let (Some(view), Some(window)) = (self.editor_view(), self.window()) else {
+            return false;
+        };
+        let Some(context) = view.inputContext() else {
+            return false;
+        };
+        match op {
+            "discard" => context.discardMarkedText(),
+            "reactivate" => {
+                context.deactivate();
+                context.activate();
+            }
+            "resign" => {
+                window.makeFirstResponder(None);
+                window.makeFirstResponder(Some(&view));
+            }
+            "pane_focus" => {
+                if let Some(proxy) = self.proxy.borrow().as_ref() {
+                    proxy.send(EmbedEvent::PaneFocus { editor: false });
+                    proxy.send(EmbedEvent::PaneFocus { editor: true });
+                }
+            }
+            "web_cycle_gated" => {
+                let gate = self.panel_view.gate();
+                gate.set_editor_has_keys(false);
+                let took = window.makeFirstResponder(Some(self.web_view()));
+                gate.set_editor_has_keys(true);
+                window.makeFirstResponder(Some(&view));
+                crate::log_line!("[mac] probe: the web view took the keys: {took}");
+            }
+            "web_context" => {
+                if let Some(web) = self.web_view().inputContext() {
+                    web.activate();
+                    web.deactivate();
+                }
+                context.activate();
+            }
+            _ => return false,
+        }
+        true
+    }
+
     /// Cancels a composition open in the editor. Left alone, winit's view keeps its marked text after it
     /// loses the keys, and the next composition starts from it.
     pub(crate) fn end_editor_composition(&self) {
@@ -659,6 +799,8 @@ impl Host {
     /// Asks the input method to drop a composition open in the page. WebKit keeps the composition in the web
     /// process; what it does with the marked text when the view loses the keys is the page's.
     fn end_page_composition(&self) {
+        // The page puts its composer back as it was before the composition; the input method drops its session.
+        self.panel_view.cancel_composition();
         if let Some(context) = self.web_view().inputContext() {
             context.discardMarkedText();
         }
@@ -694,6 +836,12 @@ impl Host {
         }
         web.setHidden(!shown);
         crate::log_line!("[mac] panel {}", if shown { "shown" } else { "hidden" });
+        if shown && !self.input_method_settled.get() {
+            // Neovide is laying the window out: the turn through the web view waits for the next turn of the loop.
+            if let Some(host) = HOST_FOR_LATER.with(|h| h.borrow().upgrade()) {
+                on_next_turn(self.mtm, move || host.settle_input_method());
+            }
+        }
         if shown || self.pane.get() != Pane::Panel {
             return;
         }
@@ -793,6 +941,34 @@ impl HostActions for Host {
     fn panel_visible(&self) -> bool {
         panel_shown(self.content_width_pt(), self.hidden_by_user.get())
     }
+
+    fn editor_ended(&self) -> bool {
+        self.life.editor_ended()
+    }
+
+    fn restart_editor(&self) -> bool {
+        let Some(host) = host_for_later() else { return false };
+        match host.begin_restart() {
+            super::app::Restart::NotEnded => return false,
+            super::app::Restart::PathTaken => {
+                self.toast(super::app::SOCKET_STILL_TAKEN);
+                return true;
+            }
+            super::app::Restart::Started => {}
+        }
+        let sent = self
+            .proxy
+            .borrow()
+            .as_ref()
+            .is_some_and(|proxy| proxy.send(EmbedEvent::RestartEditor));
+        if !sent {
+            crate::log_error!("[mac] the restart did not reach Neovide (no event loop): nvim is not started again");
+        }
+        // The keys go to the editor now: typed before the new nvim reads them, they wait for it.
+        self.focus_pane(Pane::Editor);
+        self.update_subtitle();
+        true
+    }
 }
 
 /// Grows a window too narrow for the panel to the first window's size, centred, unless it is full screen or on its
@@ -865,6 +1041,10 @@ impl Embedder for MacEmbedder {
     fn close_requested(&self) -> bool {
         self.0.quit_requested(crate::quit::QuitSource::CloseButton)
     }
+
+    fn editor_ended(&self) -> bool {
+        self.0.nvim_ended()
+    }
 }
 
 #[cfg(test)]
@@ -903,13 +1083,37 @@ mod tests {
     fn a_notice_shows_in_the_subtitle_until_it_ends_or_the_prefix_waits() {
         let now = Instant::now();
         let notice = ("too narrow".to_owned(), now + Duration::from_secs(4));
-        assert_eq!(subtitle_or_notice(String::new(), Some(&notice), now), "too narrow");
-        assert_eq!(subtitle_or_notice("c new tab".into(), Some(&notice), now), "c new tab");
         assert_eq!(
-            subtitle_or_notice(String::new(), Some(&notice), now + Duration::from_secs(4)),
+            subtitle_or_notice(String::new(), Some(&notice), None, now),
+            "too narrow"
+        );
+        assert_eq!(
+            subtitle_or_notice("c new tab".into(), Some(&notice), None, now),
+            "c new tab"
+        );
+        assert_eq!(
+            subtitle_or_notice(String::new(), Some(&notice), None, now + Duration::from_secs(4)),
             ""
         );
-        assert_eq!(subtitle_or_notice(String::new(), None, now), "");
+        assert_eq!(subtitle_or_notice(String::new(), None, None, now), "");
+    }
+
+    /// While the editor has ended the subtitle says how to start it again, under the prefix's strip and a live notice.
+    #[test]
+    fn the_ended_editor_shows_in_the_subtitle_when_nothing_else_does() {
+        let now = Instant::now();
+        let ended = || Some("nvim exited".to_owned());
+        assert_eq!(subtitle_or_notice(String::new(), None, ended(), now), "nvim exited");
+        let notice = ("too narrow".to_owned(), now + Duration::from_secs(4));
+        assert_eq!(
+            subtitle_or_notice(String::new(), Some(&notice), ended(), now),
+            "too narrow"
+        );
+        assert_eq!(
+            subtitle_or_notice(String::new(), Some(&notice), ended(), now + Duration::from_secs(4)),
+            "nvim exited"
+        );
+        assert_eq!(subtitle_or_notice("c new tab".into(), None, ended(), now), "c new tab");
     }
 
     #[test]

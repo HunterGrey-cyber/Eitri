@@ -4,7 +4,7 @@ version: ${VERSION}
 release: 1
 maintainer: Hunter Grey <71165939+HunterGrey-cyber@users.noreply.github.com>
 description: |
-  Your Neovim, tiled with your agents, terminals and the web pages you build.
+  A workspace for your own Neovim: coding agents, rendered Markdown and terminals, tiled in one window.
   It runs the Claude Code you installed; Eitri never touches your credentials.
   Source, including this package's own build recipe: ${EITRI_SOURCE_URL}
 homepage: https://github.com/HunterGrey-cyber/eitri

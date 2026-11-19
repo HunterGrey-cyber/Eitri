@@ -159,12 +159,15 @@ pub fn manifest_table(manifest: &str) -> toml::Table {
     manifest.parse::<toml::Table>().expect("valid crate manifest TOML")
 }
 
-/// The table and key of each forbidden dependency name or renamed package in a crate manifest.
-pub fn manifest_dependency_offenders(manifest: &str, forbidden: impl Fn(&str) -> bool) -> Vec<String> {
+/// The table and key of each forbidden dependency name or renamed package in a crate manifest. A `workspace = true`
+/// dependency is judged by the entry it inherits from `workspace`'s `[workspace.dependencies]`.
+pub fn manifest_dependency_offenders(manifest: &str, workspace: &str, forbidden: impl Fn(&str) -> bool) -> Vec<String> {
     let manifest = manifest_table(manifest);
+    let workspace = workspace.parse::<toml::Table>().expect("valid workspace manifest TOML");
     let mut offenders = Vec::new();
     for (table, deps) in dependency_tables(&manifest) {
         for (name, spec) in deps {
+            let (spec, _) = dependency_spec(name, spec, &workspace);
             let package = spec.get("package").and_then(toml::Value::as_str);
             if forbidden(name) || package.is_some_and(&forbidden) {
                 let package = package.map_or_else(String::new, |name| format!(" (package {name})"));
@@ -175,20 +178,60 @@ pub fn manifest_dependency_offenders(manifest: &str, forbidden: impl Fn(&str) ->
     offenders
 }
 
-/// The local dependency directories of a workspace member, based at the workspace root.
-pub fn manifest_path_dependencies(manifest: &str, workspace: &str, member: &Path) -> Vec<PathBuf> {
+fn dependency_spec<'a>(name: &str, spec: &'a toml::Value, workspace: &'a toml::Table) -> (&'a toml::Value, bool) {
+    if spec.get("workspace").and_then(toml::Value::as_bool) != Some(true) {
+        return (spec, false);
+    }
+    let inherited = workspace
+        .get("workspace")
+        .and_then(|table| table.get("dependencies"))
+        .and_then(|deps| deps.get(name))
+        .unwrap_or_else(|| panic!("missing workspace dependency {name}"));
+    (inherited, true)
+}
+
+/// The local dependency directories of a crate, resolving inherited paths against its own workspace.
+pub fn manifest_path_dependencies(manifest: &str, workspace: &str, member: &Path, root: &Path) -> Vec<PathBuf> {
     let manifest = manifest_table(manifest);
-    let workspace = workspace.parse::<toml::Table>().expect("valid workspace manifest TOML");
-    let inherited = workspace.get("workspace").and_then(|table| table.get("dependencies"));
+    let (workspace_dir, workspace) = if let Some(path) = manifest.get("package").and_then(|p| p.get("workspace")) {
+        let dir = member.join(path.as_str().expect("workspace path"));
+        let text = read_required(dir.join("Cargo.toml")).text;
+        (dir, text.parse().expect("valid workspace manifest TOML"))
+    } else if manifest.contains_key("workspace") {
+        (member.to_owned(), manifest.clone())
+    } else {
+        member
+            .ancestors()
+            .skip(1)
+            .take_while(|dir| dir.starts_with(root) && *dir != root)
+            .find_map(|dir| {
+                let path = dir.join("Cargo.toml");
+                if !path.is_file() {
+                    return None;
+                }
+                let table = read_required(path)
+                    .text
+                    .parse::<toml::Table>()
+                    .expect("valid ancestor manifest TOML");
+                table.contains_key("workspace").then(|| (dir.to_owned(), table))
+            })
+            .unwrap_or_else(|| {
+                (
+                    root.to_owned(),
+                    workspace.parse().expect("valid workspace manifest TOML"),
+                )
+            })
+    };
     dependency_tables(&manifest)
         .flat_map(|(_, deps)| deps.iter())
         .filter_map(|(name, spec)| {
-            if spec.get("workspace").and_then(toml::Value::as_bool) == Some(true) {
-                let spec = inherited?.get(name)?;
-                Some(PathBuf::from(spec.get("path")?.as_str()?))
+            let (spec, inherited) = dependency_spec(name, spec, &workspace);
+            let path = spec.get("path")?.as_str()?;
+            Some(if inherited {
+                workspace_dir.join(path)
             } else {
-                Some(member.join(spec.get("path")?.as_str()?))
-            }
+                member.join(path)
+            })
         })
         .collect()
 }
@@ -371,13 +414,195 @@ fn read_dirs(sources: &[Source]) -> String {
 pub use crate::rust_mask::code_only;
 pub use crate::rust_mask::without_line_comments;
 
+fn after_test_cfg(attribute: &str) -> Option<&str> {
+    let test = ["[", "cfg", "(", "test"]
+        .into_iter()
+        .try_fold(attribute, |tail, token| tail.trim_start().strip_prefix(token))?
+        .trim_start();
+    test.strip_prefix(',')
+        .unwrap_or(test)
+        .trim_start()
+        .strip_prefix(')')?
+        .trim_start()
+        .strip_prefix(']')
+}
+
+/// Raw Rust source with test-gated items blanked, retaining byte offsets and line numbers.
+pub fn production_text(text: &str) -> String {
+    let code = code_only(text);
+    let mut output = text.as_bytes().to_vec();
+    let mut cursor = 0;
+    while let Some(offset) = code[cursor..].find('#') {
+        let start = cursor + offset;
+        cursor = start + 1;
+        let rest = code[cursor..].trim_start();
+        let inner = rest.starts_with('!');
+        let Some(item) = after_test_cfg(rest.strip_prefix('!').unwrap_or(rest)) else {
+            continue;
+        };
+        cursor = code.len() - item.len() + gated_extent(item, inner, &code[..start]);
+        for byte in &mut output[start..cursor] {
+            if !matches!(*byte, b'\r' | b'\n') {
+                *byte = b' ';
+            }
+        }
+    }
+    String::from_utf8(output).expect("only complete items are blanked")
+}
+
+/// Bare generic arguments are legal in declared field and parameter types. In a value list the
+/// same spelling is a comparison; path arguments there have the explicit `::` separator.
+fn in_declared_fields(prefix: &str) -> bool {
+    let mut depth = 0;
+    let mut containers = 0;
+    let mut opener = 0;
+    for (at, byte) in prefix.bytes().enumerate().rev() {
+        match byte {
+            b'}' if containers > 0 && depth == 0 && !prefix[at + 1..].trim_start().starts_with([',', '>']) => break,
+            b')' | b']' | b'}' => depth += 1,
+            b'(' | b'[' | b'{' if depth > 0 => depth -= 1,
+            _ if depth > 0 => {}
+            b'(' | b'{' => {
+                containers += 1;
+                if containers == 1 {
+                    opener = byte;
+                } else if containers > 2 {
+                    break;
+                }
+            }
+            b'[' => break,
+            _ if containers == 0 => {}
+            b';' => break,
+            b's' if keyword_at(prefix, at, "struct") => return containers == 1,
+            b'u' if keyword_at(prefix, at, "union") => return containers == 1,
+            b'f' if keyword_at(prefix, at, "fn") => return containers == 1 && opener == b'(',
+            b'e' if keyword_at(prefix, at, "enum") => return true,
+            _ => {}
+        }
+    }
+    false
+}
+
+/// The end of a balanced generic argument list. Delimited const expressions can contain operators.
+fn angle_list_end(code: &str) -> Option<usize> {
+    let mut angles = 0;
+    let mut groups = 0;
+    for (at, byte) in code.bytes().enumerate() {
+        match byte {
+            b'(' | b'[' | b'{' => groups += 1,
+            b')' | b']' | b'}' if groups == 0 => return None,
+            b')' | b']' | b'}' => groups -= 1,
+            _ if groups > 0 => {}
+            b';' => return None,
+            b'<' => angles += 1,
+            b'>' if !code[..at].ends_with('-') => {
+                angles -= 1;
+                if angles == 0 {
+                    return Some(at + 1);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+fn gated_extent(code: &str, inner: bool, prefix: &str) -> usize {
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum End {
+        Body,
+        Semicolon,
+        Member,
+    }
+
+    let mut end = None;
+    let mut const_prefix = false;
+    let mut depth = 0;
+    let mut angle_end = 0;
+    let mut where_clause = false;
+    let mut type_context = None;
+    for (at, byte) in code.bytes().enumerate() {
+        match byte {
+            _ if at < angle_end => {}
+            b'(' | b'[' => depth += 1,
+            b'{' if inner || depth > 0 || end == Some(End::Semicolon) => depth += 1,
+            b')' | b']' | b'}' if depth == 0 => return at,
+            b')' | b']' | b'}' => depth -= 1,
+            _ if inner || depth > 0 => {}
+            b';' => return at + 1,
+            _ if end == Some(End::Semicolon) => {}
+            b'=' => type_context = Some(false),
+            b'<' => {
+                let before = code[..at].trim_end();
+                let type_args = end == Some(End::Body)
+                    || *type_context.get_or_insert_with(|| in_declared_fields(prefix))
+                    || before.ends_with("::");
+                let operand = before.is_empty() || before.ends_with([':', '=']) || before.ends_with("=>");
+                if type_args || operand {
+                    if let Some(close) = angle_list_end(&code[at..]) {
+                        let close = at + close;
+                        if type_args || code[close..].trim_start().starts_with("::") {
+                            angle_end = close;
+                        }
+                    }
+                }
+            }
+            b',' if !where_clause => return at + 1,
+            b'{' => {
+                let macro_in_header = end == Some(End::Body)
+                    && code[..at]
+                        .trim_end()
+                        .strip_suffix('!')
+                        .is_some_and(|before| before.trim_end().ends_with(identifier_char));
+                if !macro_in_header {
+                    let close = at + braced(code, at).len();
+                    let tail = code[close..].trim_start();
+                    if tail.starts_with(';') {
+                        return code.len() - tail.len() + 1;
+                    }
+                    if end == Some(End::Body) || !(keyword_at(tail, 0, "else") || tail.starts_with(['.', '?'])) {
+                        return close;
+                    }
+                }
+                depth += 1;
+            }
+            b'w' if keyword_at(code, at, "where") => where_clause = true,
+            b'a'..=b'z' | b'A'..=b'Z' | b'_' if end.is_none() && !code[..at].ends_with(identifier_char) => {
+                let word = code[at..].split(|ch| !identifier_char(ch)).next().unwrap();
+                end = match word {
+                    "const" => {
+                        const_prefix = true;
+                        None
+                    }
+                    "pub" | "unsafe" | "async" | "extern" | "default" | "auto" => None,
+                    "fn" | "impl" | "struct" | "enum" | "trait" | "union" | "mod" => Some(End::Body),
+                    "let" | "use" | "type" | "static" => Some(End::Semicolon),
+                    _ if const_prefix => Some(End::Semicolon),
+                    _ => Some(End::Member),
+                };
+            }
+            _ => {}
+        }
+    }
+    code.len()
+}
+
+fn identifier_char(ch: char) -> bool {
+    ch.is_alphanumeric() || ch == '_'
+}
+
+fn keyword_at(code: &str, at: usize, word: &str) -> bool {
+    !code[..at].ends_with(identifier_char)
+        && code[at..]
+            .strip_prefix(word)
+            .is_some_and(|tail| !tail.starts_with(identifier_char))
+}
+
 /// The byte positions just after every whole-word occurrence of `word`.
 pub fn word_ends(code: &str, word: &str) -> Vec<usize> {
-    let ident = |c: char| c.is_alphanumeric() || c == '_';
     code.match_indices(word)
-        .filter(|(at, _)| !code[..*at].chars().next_back().is_some_and(ident))
+        .filter(|(at, _)| keyword_at(code, *at, word))
         .map(|(at, w)| at + w.len())
-        .filter(|end| !code[*end..].chars().next().is_some_and(ident))
         .collect()
 }
 
@@ -548,7 +773,10 @@ pub fn test_only_files(sources: &[Source]) -> std::collections::BTreeSet<String>
             let head = &code[..after - 3];
             let from = head.rfind([';', '{', '}']).map_or(0, |at| at + 1);
             let squeezed: String = head[from..].chars().filter(|c| !c.is_whitespace()).collect();
-            let gated = squeezed.contains("#[cfg(test)]");
+            let gated = head[from..]
+                .split('#')
+                .skip(1)
+                .any(|attr| after_test_cfg(attr).is_some());
             if depth > 0 {
                 assert!(
                     !gated,
@@ -584,22 +812,27 @@ pub fn test_only_files(sources: &[Source]) -> std::collections::BTreeSet<String>
             .cloned()
     };
     let mut only = std::collections::BTreeSet::new();
-    let mut work = Vec::new();
-    for (candidates, gated) in by_path.values().flatten() {
-        if let Some(path) = resolve(candidates).filter(|_| *gated) {
-            if only.insert(path.clone()) {
-                work.push(path);
+    // A child is test-only once every declaration of it is gated or comes from a test-only parent.
+    let mut ungated_parents = std::collections::BTreeMap::<String, Vec<&str>>::new();
+    for (&parent, declarations) in &by_path {
+        for (candidates, gated) in declarations {
+            if let Some(child) = resolve(candidates) {
+                let parents = ungated_parents.entry(child).or_default();
+                if !gated {
+                    parents.push(parent);
+                }
             }
         }
     }
-    // What a test-only file declares is test-only whatever its own attributes say.
-    while let Some(path) = work.pop() {
-        for (candidates, _) in &by_path[path.as_str()] {
-            if let Some(child) = resolve(candidates) {
-                if only.insert(child.clone()) {
-                    work.push(child);
-                }
+    loop {
+        let previous = only.len();
+        for (child, parents) in &ungated_parents {
+            if parents.iter().all(|parent| only.contains(*parent)) {
+                only.insert(child.clone());
             }
+        }
+        if only.len() == previous {
+            break;
         }
     }
     only
@@ -756,6 +989,124 @@ pub fn stale_never_bound(sources: &[Source], never_bound: &[(&str, &str)]) -> Ve
 #[cfg(test)]
 mod walker_tests {
     use super::*;
+
+    fn assert_production_after_tests(newline: &str) {
+        let source = r##"fn first() {}
+#[cfg(test)] mod checks { fn hidden() { let _ = r#"} é"#; } }
+#[cfg(test)] #[allow(dead_code)] fn hidden_fn(_: [u8; 3]) {}
+#[ cfg ( test ) ] impl Example { fn hidden_method() {} }
+#[cfg(test)] pub(crate) use hidden::{First, Second};
+fn last() { let _ = "#[cfg(test)]"; }
+"##
+        .replace('\n', newline);
+        let product = production_text(&source);
+        assert!(product.starts_with("fn first() {}"));
+        assert!(!product.contains("hidden"));
+        assert!(!product.contains("Second"));
+        assert_eq!(product.len(), source.len());
+        assert_eq!(product.lines().last(), Some("fn last() { let _ = \"#[cfg(test)]\"; }"));
+        assert_eq!(product.find("fn last"), source.find("fn last"));
+    }
+
+    #[test]
+    fn production_code_after_a_cfg_test_module_is_scanned() {
+        assert_production_after_tests("\n");
+    }
+
+    #[test]
+    fn production_code_after_a_cfg_test_module_is_scanned_crlf() {
+        assert_production_after_tests("\r\n");
+    }
+
+    #[test]
+    fn gated_comparison_ends_at_the_arm_comma() {
+        let live = "_ => config.get(\"window.typo\"),";
+        for expression in ["n < 2", "n < pair::<A, B>()"] {
+            let masked = production_text(&format!("match n {{ #[cfg(test)] 0 => {expression}, {live} }}"));
+            assert_eq!(
+                masked.split_whitespace().collect::<Vec<_>>().join(" "),
+                format!("match n {{ {live} }}")
+            );
+        }
+    }
+
+    fn assert_gated_fragment(before: &str, gated: &str, after: &str) {
+        for newline in ["\n", "\r\n"] {
+            let source = format!("{before}{gated}{after}").replace('\n', newline);
+            let blank = gated.replace(|c| c != '\n', " ");
+            let expected = format!("{before}{blank}{after}").replace('\n', newline);
+            assert_eq!(production_text(&source), expected);
+        }
+    }
+
+    #[test]
+    fn gated_field_and_discriminant_operators_preserve_the_next_member() {
+        for expression in [
+            "n < 2",
+            "n << 2",
+            "n < pair::<A, B>()",
+            r#""a" < "b""#,
+            "<Pair<A, B> as Value>::GET",
+        ] {
+            assert_gated_fragment(
+                "S { ",
+                &format!("#[cfg(test)] probe: {expression},"),
+                "\n live: n > 0, id: \"markdown\" }",
+            );
+        }
+        assert_gated_fragment("enum E { ", "#[cfg(test)] A = 1 << 4,", "\n Live = 2 }");
+        for (before, after) in [
+            ("struct S { ", "\n live: C }"),
+            ("enum E { Empty {}, Named { ", "\n live: C } }"),
+        ] {
+            assert_gated_fragment(before, "#[cfg(test)] probe: Pair<A, B>,", after);
+        }
+    }
+
+    #[test]
+    fn gated_impl_includes_the_body_after_a_braced_type_macro() {
+        assert_gated_fragment(
+            "",
+            "#[cfg(test)] impl Marker for fixture_type! {}\n{ const ID: &str = \"markdown\"; }",
+            "\nfn live() {}",
+        );
+        assert_gated_fragment("", "#[cfg(test)] fixture! {}", "\nfn live() {}");
+        assert_gated_fragment("", "#[cfg(test)] fn fixture() -> ! { loop {} }", "\nfn live() {}");
+    }
+
+    #[test]
+    fn gated_let_includes_the_entire_initializer() {
+        for initializer in ["if c { a } else { b }", "S { a }.build()", "match c { _ => a }.next()"] {
+            assert_gated_fragment(
+                "fn f() { ",
+                &format!("#[cfg(test)] let x =\n{initializer};"),
+                "\n live(); }",
+            );
+        }
+    }
+
+    #[test]
+    fn trailing_comma_in_cfg_test_hides_only_the_gated_module() {
+        assert_gated_fragment(
+            "",
+            "#[cfg(test,)]\nmod tests { const ID: &str = \"markdown\"; }",
+            "\n#[cfg(not(test))] mod live;",
+        );
+    }
+
+    #[test]
+    fn gated_return_type_macro_does_not_end_the_function() {
+        let source = "#[cfg(test)] fn fixture() -> ty! { () } { let _ = \"markdown\"; } fn live() {}";
+        assert_eq!(production_text(source).trim(), "fn live() {}");
+    }
+
+    #[test]
+    fn where_suffix_is_not_a_where_clause() {
+        let source = "match p { #[cfg(test)] Place::Elsewhere => 1, Place::Here => 2, }";
+        let masked = production_text(source);
+        assert!(!masked.contains("Elsewhere"));
+        assert!(masked.ends_with("Place::Here => 2, }"));
+    }
 
     #[test]
     fn test_only_files_follow_cfg_test_declarations_down_the_tree() {

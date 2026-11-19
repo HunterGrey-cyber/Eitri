@@ -64,6 +64,14 @@ const BLOB_CACHE_CAP: usize = 4096;
 const DEFAULT_FAMILY: &str = "monospace";
 const DEFAULT_SIZE_PX: f32 = 13.0;
 
+/// What the generic `monospace` stands for, tried in order after it. fontconfig resolves the alias itself.
+/// CoreText knows no family by that name and its last resort is Helvetica, a proportional face, so on macOS
+/// the faces the system ships for it follow: Menlo (Terminal's default), Monaco, Courier.
+#[cfg(target_os = "macos")]
+const MONOSPACE: &[&str] = &[DEFAULT_FAMILY, "Menlo", "Monaco", "Courier"];
+#[cfg(not(target_os = "macos"))]
+const MONOSPACE: &[&str] = &[DEFAULT_FAMILY];
+
 impl TerminalMetrics {
     /// Builds metrics for a pane of `width_px` x `height_px` DEVICE pixels.
     ///
@@ -83,13 +91,13 @@ impl TerminalMetrics {
     /// the same face. Glyph fallback uses the family that matched, including its system aliases.
     pub fn with_families(families: &[String], size_px: f32, width_px: f32, height_px: f32, scale: f32) -> Self {
         let font_mgr = FontMgr::new();
-        // Named families, then the generic monospace alias, then whatever the system will give us.
+        // Named families, then the generic monospace alias (`MONOSPACE`), then whatever the system will give us.
         // The last step matters: a machine with no fontconfig monospace alias would otherwise panic
         // during window construction, which is a very confusing way to learn about a font problem.
         let (family, typeface) = families
             .iter()
             .map(String::as_str)
-            .chain(std::iter::once(DEFAULT_FAMILY))
+            .chain(MONOSPACE.iter().copied())
             .find_map(|family| {
                 font_mgr
                     .match_family_style(family, FontStyle::normal())
@@ -266,7 +274,7 @@ impl TerminalMetrics {
             cache.clear();
         }
         let font = self.font_for_text(text, bold, italic);
-        let blob = TextBlob::new(text, &font);
+        let blob = grapheme_blob(text, &font);
         cache.insert(text.to_owned(), blob.clone());
         blob
     }
@@ -316,6 +324,72 @@ impl TerminalMetrics {
             row as f32 * self.cell_height + self.baseline,
         )
     }
+}
+
+/// The blob for one grapheme, its glyphs placed as `TextBlob::new` places them (each after the last one's advance)
+/// except one kind of combining mark: a face can give its marks a whole cell of advance with the ink inside that
+/// cell (Menlo), and drawn after its base the accent of `é` lands in the next column. Such a mark is drawn at its
+/// base's origin and does not move the pen. Faces whose marks have no advance (their ink reaches back over the base)
+/// or whose ink starts before the mark's own origin (JetBrains Mono's, which expect to follow the base) are placed as
+/// before, and so are graphemes without a mark: `TextBlob::new` itself.
+fn grapheme_blob(text: &str, font: &Font) -> Option<TextBlob> {
+    use unicode_width::UnicodeWidthChar;
+    let chars: Vec<char> = text.chars().collect();
+    let marks = chars.iter().skip(1).any(|ch| ch.width() == Some(0));
+    let glyphs = font.str_to_glyphs_vec(text);
+    if !marks || glyphs.len() != chars.len() {
+        return TextBlob::new(text, font);
+    }
+    let mut widths = vec![0.0; glyphs.len()];
+    font.get_widths(&glyphs, &mut widths);
+    let mut bounds = vec![skia_safe::Rect::default(); glyphs.len()];
+    font.get_bounds(&glyphs, &mut bounds, None);
+    let glyph_list: Vec<PlacedGlyph> = chars
+        .iter()
+        .zip(&glyphs)
+        .zip(widths.iter().zip(&bounds))
+        .map(|((ch, glyph), (advance, ink))| PlacedGlyph {
+            zero_width: ch.width() == Some(0),
+            missing: *glyph == 0,
+            advance: *advance,
+            ink_left: ink.left,
+        })
+        .collect();
+    let xs = glyph_positions(&glyph_list);
+    TextBlob::from_pos_text_h(text, &xs, 0.0, font)
+}
+
+/// What [`glyph_positions`] needs to know of one glyph of a grapheme.
+#[derive(Clone, Copy, Debug)]
+struct PlacedGlyph {
+    /// The character is a combining mark (Unicode width 0).
+    zero_width: bool,
+    /// The face has no glyph for it (glyph 0, the missing-glyph box).
+    missing: bool,
+    advance: f32,
+    /// Where its ink starts, from its own origin.
+    ink_left: f32,
+}
+
+/// The x of each glyph of a grapheme. As `TextBlob::new` would place it (after the previous glyph's advance), except a
+/// mark (not the first glyph) that has a glyph of its own, advances, and has its ink at or after its origin: that one
+/// is placed at the origin of the base before it (the last glyph that is not a mark) and does not move the pen.
+fn glyph_positions(glyphs: &[PlacedGlyph]) -> Vec<f32> {
+    let (mut pen, mut base) = (0.0f32, 0.0f32);
+    let mut xs = Vec::with_capacity(glyphs.len());
+    for (i, g) in glyphs.iter().enumerate() {
+        let mark = i > 0 && g.zero_width;
+        if mark && !g.missing && g.advance > 0.0 && g.ink_left >= 0.0 {
+            xs.push(base);
+            continue;
+        }
+        if !mark {
+            base = pen;
+        }
+        xs.push(pen);
+        pen += g.advance;
+    }
+    xs
 }
 
 /// The family a fallback lookup for `first` is asked in.
@@ -380,7 +454,9 @@ mod tests {
             assert_eq!(metrics.cell_width(), expected.cell_width());
             assert_eq!(metrics.cell_height(), expected.cell_height());
             assert_eq!(metrics.families(), families);
-            assert_eq!(fallback_family('\u{f43a}', &metrics.family), "monospace");
+            // The face the generic alias resolves to on this system (`monospace` itself where fontconfig
+            // knows it, Menlo on macOS).
+            assert_eq!(fallback_family('\u{f43a}', &metrics.family), expected.family);
         }
     }
 
@@ -601,9 +677,100 @@ mod tests {
     fn the_cached_blob_of_a_grapheme_is_shaped_in_the_face_that_has_all_of_it() {
         let metrics = TerminalMetrics::new(800.0, 600.0, 1.0);
         let text = "e\u{301}";
-        let whole = TextBlob::new(text, &metrics.font_for_text(text, false, false)).expect("a blob");
+        let whole = grapheme_blob(text, &metrics.font_for_text(text, false, false)).expect("a blob");
         let cached = metrics.text_blob(text, false, false).expect("a blob");
         assert_eq!(cached.bounds(), whole.bounds());
+    }
+
+    /// A base with a combining mark stays in its own cell whatever advance the face gives the mark: Menlo
+    /// (macOS) gives it a whole cell, and drawn after the base the accent of `é` landed in the next column. The
+    /// oracle is ink on a raster, not the blob's bounds, which are the face's whole box at each glyph.
+    #[test]
+    fn a_combining_mark_is_drawn_over_its_base_not_in_the_next_cell() {
+        use skia_safe::{surfaces, Color, ColorType, ISize, Paint};
+        let metrics = TerminalMetrics::new(800.0, 600.0, 1.0);
+        let (cw, ch) = (metrics.cell_width(), metrics.cell_height());
+        let (w, h) = ((cw * 4.0).ceil() as i32, ch.ceil() as i32);
+        for text in ["e\u{301}", "a\u{308}", "o\u{302}"] {
+            let mut surface = surfaces::raster_n32_premul(ISize::new(w, h)).expect("a raster surface");
+            surface.canvas().clear(Color::WHITE);
+            let blob = metrics.text_blob(text, false, false).expect("a blob");
+            // In the second cell; the third and fourth must stay blank.
+            let mut paint = Paint::default();
+            paint.set_color(Color::BLACK);
+            surface.canvas().draw_text_blob(&blob, (cw, metrics.baseline()), &paint);
+            let info = surface.image_info().with_color_type(ColorType::BGRA8888);
+            let row_bytes = info.min_row_bytes();
+            let mut px = vec![0u8; row_bytes * h as usize];
+            assert!(surface.read_pixels(&info, &mut px, row_bytes, (0, 0)));
+            // One pixel of slack for antialiasing at the cell's edge.
+            let from = (cw * 2.0).ceil() as usize + 1;
+            let past = (0..h as usize)
+                .flat_map(|y| (from..w as usize).map(move |x| (x, y)))
+                .filter(|&(x, y)| px[y * row_bytes + x * 4] < 128)
+                .count();
+            assert_eq!(past, 0, "{text:?}: {past} dark pixels past its cell (cell {cw} px)");
+            // And the mark is drawn: the cell's ink differs from the base's alone.
+            let ink = |px: &[u8]| {
+                (0..h as usize)
+                    .flat_map(|y| (0..w as usize).map(move |x| (x, y)))
+                    .filter(|&(x, y)| px[y * row_bytes + x * 4] < 128)
+                    .count()
+            };
+            let mut bare = surfaces::raster_n32_premul(ISize::new(w, h)).expect("a raster surface");
+            bare.canvas().clear(Color::WHITE);
+            let base = metrics.text_blob(&text[..1], false, false).expect("a blob");
+            bare.canvas().draw_text_blob(&base, (cw, metrics.baseline()), &paint);
+            let mut bare_px = vec![0u8; row_bytes * h as usize];
+            assert!(bare.read_pixels(&info, &mut bare_px, row_bytes, (0, 0)));
+            assert_ne!(ink(&px), ink(&bare_px), "{text:?}: the mark drew nothing");
+        }
+    }
+
+    fn glyph(zero_width: bool, advance: f32, ink_left: f32) -> PlacedGlyph {
+        PlacedGlyph {
+            zero_width,
+            missing: false,
+            advance,
+            ink_left,
+        }
+    }
+
+    /// Menlo's marks advance a cell with their ink inside it: drawn at the base's origin, the pen not moved.
+    #[test]
+    fn a_mark_that_advances_with_its_ink_inside_goes_over_its_base() {
+        let xs = glyph_positions(&[glyph(false, 7.8, 0.6), glyph(true, 7.8, 3.0), glyph(false, 7.8, 0.6)]);
+        assert_eq!(xs, [0.0, 0.0, 7.8]);
+    }
+
+    /// Marks with no advance (DejaVu, Monaco), and marks that advance with their ink before their origin (JetBrains
+    /// Mono: -368..-165 units in a 600-unit cell), are placed as `TextBlob::new` places them.
+    #[test]
+    fn other_marks_keep_the_plain_placement() {
+        assert_eq!(
+            glyph_positions(&[glyph(false, 7.8, 0.6), glyph(true, 0.0, -5.5)]),
+            [0.0, 7.8]
+        );
+        assert_eq!(
+            glyph_positions(&[glyph(false, 6.0, 0.5), glyph(true, 6.0, -3.68)]),
+            [0.0, 6.0]
+        );
+    }
+
+    /// A missing glyph (an unsupported variation selector's box) is never moved over its base.
+    #[test]
+    fn a_missing_glyph_keeps_the_plain_placement() {
+        let mut selector = glyph(true, 7.8, 0.5);
+        selector.missing = true;
+        assert_eq!(glyph_positions(&[glyph(false, 15.6, 0.5), selector]), [0.0, 15.6]);
+    }
+
+    /// A zero-advance mark does not become the base of the next mark: an advancing mark after it still goes to the
+    /// letter's origin.
+    #[test]
+    fn stacked_marks_keep_the_letter_as_their_base() {
+        let xs = glyph_positions(&[glyph(false, 7.8, 0.6), glyph(true, 0.0, -5.0), glyph(true, 7.8, 3.0)]);
+        assert_eq!(xs, [0.0, 7.8, 0.0]);
     }
 
     /// The other half of `fallback_family`: a codepoint outside the private-use areas is looked up

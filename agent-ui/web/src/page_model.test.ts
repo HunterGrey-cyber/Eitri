@@ -95,6 +95,64 @@ describe("pageModel", () => {
     expect(failed.keptStates.get(1)).toBe(failed.state);
   });
 
+  describe("a resume's early history", () => {
+    const starting = (id: number) => ({ ...tab(id), state: "starting" as const });
+    const history = {
+      ...initialState(),
+      userPrompts: [{ seq: 1, text: "the saved question" }],
+    } as ReturnType<typeof initialState>;
+    function drawnEarly(): PageModel {
+      const model = receive(initialPageModel(), { kind: "tabs", active: 1, tabs: [starting(1), tab(2)], defaultMode: "auto" });
+      return receive(model, { kind: "snapshot", tab: 1, throughRevision: 1, state: history, early: true });
+    }
+
+    it("is drawn under the starting tab and replaced by the session's snapshot", () => {
+      const early = drawnEarly();
+      expect(early.earlyView).toBe(true);
+      expect(early.state.userPrompts[0].text).toBe("the saved question");
+      const live = receive(early, { kind: "tabs", active: 1, tabs: [tab(1), tab(2)], defaultMode: "auto" });
+      expect(live.earlyView).toBe(true);
+      expect(live.state).toBe(early.state);
+      const session = receive(live, { kind: "snapshot", tab: 1, throughRevision: 1, state: history });
+      expect(session.earlyView).toBe(false);
+      expect(session.state.userPrompts[0].text).toBe("the saved question");
+    });
+
+    it("goes when the start fails, and the failure shows as for a start that drew nothing", () => {
+      const failed = receive(drawnEarly(), { kind: "error", tab: 1, message: "could not continue the previous session" });
+      expect(failed.earlyView).toBe(false);
+      expect(failed.keptStates.size).toBe(0);
+      expect(failed.state.userPrompts).toEqual([]);
+      expect(failed.fatalError).toBe("could not continue the previous session");
+      const tabs = [{ ...tab(1), state: "failed" as const }, tab(2)];
+      expect(receive(failed, { kind: "tabs", active: 1, tabs, defaultMode: "auto" }).state.userPrompts).toEqual([]);
+    });
+
+    it("goes when the tab is handed back empty", () => {
+      const emptied = receive(drawnEarly(), {
+        kind: "tabs", active: 1, tabs: [{ ...tab(1), state: "not_started" as const }, tab(2)], defaultMode: "auto",
+      });
+      expect(emptied.earlyView).toBe(false);
+      expect(emptied.state.userPrompts).toEqual([]);
+    });
+
+    it("leaves a handoff card and a notice in place: no session is running yet", () => {
+      const handoff = { kind: "handoff" as const, tab: 1, command: "claude --resume old", providerSessionId: "old" };
+      const model = { ...receive(initialPageModel(), { kind: "tabs", active: 1, tabs: [starting(1)], defaultMode: "auto" }),
+        handoff, commandNotice: "kept" } as unknown as PageModel;
+      const early = receive(model, { kind: "snapshot", tab: 1, throughRevision: 1, state: history, early: true });
+      expect(early.handoff).toBe(handoff);
+      expect(early.commandNotice).toBe("kept");
+      expect(receive(early, { kind: "snapshot", tab: 1, throughRevision: 1, state: history }).handoff).toBeNull();
+    });
+
+    it("goes with a switch to another tab", () => {
+      const away = receive(drawnEarly(), { kind: "tabs", active: 2, tabs: [starting(1), tab(2)], defaultMode: "auto" });
+      expect(away.earlyView).toBe(false);
+      expect(away.state.userPrompts).toEqual([]);
+    });
+  });
+
   it("a_handoff_reply_clears_only_its_own_request_without_mutating_bookkeeping", () => {
     const model: PageModel = {
       ...connected(),

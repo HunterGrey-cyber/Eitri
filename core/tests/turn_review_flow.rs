@@ -1287,6 +1287,20 @@ fn crash_mid_write(f: &Fixture, rel: &str) -> String {
     let set = unsafe { libc::setxattr(c.as_ptr(), name.as_ptr(), b"yes".as_ptr().cast(), 3, 0) };
     assert_eq!(set, 0, "these tests need user extended attributes");
     let original = f.read(rel);
+    // The store is made here, before the child: the review's workers make it lazily, and a child that finds it
+    // unmade takes the store's lock exclusively with no deadline (`Shadow::open_with_excludes`). Under load on the
+    // Mac that wait outran the deadline below while this process held the lock file. Made now, the child takes
+    // only the shared lock, whose waits are bounded. This open waits for the same lock (the session's warm-up may
+    // be making the store), so it runs on a thread of its own and is given the same 30 s.
+    let (made, store) = std::sync::mpsc::channel();
+    let (review_dir, project) = (f.review_dir.clone(), f.project.clone());
+    std::thread::spawn(move || {
+        let _ = made.send(Shadow::open_with_excludes(&review_dir, &project, None).map(|_| ()));
+    });
+    match store.recv_timeout(Duration::from_secs(30)) {
+        Ok(opened) => opened.expect("the review store opens"),
+        Err(_) => panic!("the review store was not made in 30 s (something in this process holds its lock)"),
+    }
     let mut child = Command::new(std::env::current_exe().unwrap())
         .args([
             "--exact",

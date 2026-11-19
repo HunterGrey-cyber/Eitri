@@ -157,7 +157,9 @@ fn a_quit_says_it_is_leaving_and_a_signal_does_not() {
     rig.read_until(watched);
     assert_eq!(
         rig.after_exit(&mut child),
-        [PaneMessage::EditorLeaving],
+        [PaneMessage::EditorLeaving {
+            filetype: String::new()
+        }],
         ":qa! is a quit"
     );
 
@@ -165,7 +167,9 @@ fn a_quit_says_it_is_leaving_and_a_signal_does_not() {
     rig.read_until(watched);
     assert_eq!(
         rig.after_exit(&mut child),
-        [PaneMessage::EditorLeaving],
+        [PaneMessage::EditorLeaving {
+            filetype: String::new()
+        }],
         ":cq asks to quit"
     );
 
@@ -178,6 +182,40 @@ fn a_quit_says_it_is_leaving_and_a_signal_does_not() {
     rig.read_until(watched);
     unsafe { libc::kill(child.id() as i32, libc::SIGTERM) };
     assert_eq!(rig.after_exit(&mut child), [], "nobody in the window asked for SIGTERM");
+}
+
+#[test]
+#[ignore = "needs a real nvim on PATH; spends no tokens and needs no display"]
+fn the_leaving_line_names_the_filetype_of_the_buffer_nvim_leaves_from() {
+    let mut rig = Rig::new("leaving-filetype");
+    for filetype in ["snacks_dashboard", "rust"] {
+        let mut child = rig.nvim(
+            "project",
+            &[
+                "-c",
+                &format!("set filetype={filetype}"),
+                "-c",
+                &rig.quit_command("qa!"),
+            ],
+        );
+        rig.read_until(watched);
+        assert_eq!(
+            rig.after_exit(&mut child),
+            [PaneMessage::EditorLeaving {
+                filetype: filetype.to_string()
+            }],
+            "{filetype}"
+        );
+    }
+    // A name with a dot passes as it is: the line has to stay one the window reads, or the exit would look like a crash.
+    let mut child = rig.nvim("project", &["-c", "set filetype=a.b", "-c", &rig.quit_command("qa!")]);
+    rig.read_until(watched);
+    assert_eq!(
+        rig.after_exit(&mut child),
+        [PaneMessage::EditorLeaving {
+            filetype: "a.b".to_string()
+        }]
+    );
 }
 
 #[test]
@@ -232,7 +270,7 @@ fn a_file_another_nvim_is_editing_is_not_reported() {
     let mut second = rig.nvim("project", &["--cmd", &rig.quit_command("qa!")]);
     rig.started();
     std::fs::write(rig.root.join("quit"), b"").unwrap();
-    let seen = rig.read_until(|seen| seen.contains(&PaneMessage::EditorLeaving));
+    let seen = rig.read_until(|seen| seen.iter().any(|m| matches!(m, PaneMessage::EditorLeaving { .. })));
     std::fs::write(rig.root.join("quit"), b"").unwrap();
     second.wait().unwrap();
     editing.kill().unwrap();

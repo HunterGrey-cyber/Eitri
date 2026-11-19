@@ -32,6 +32,10 @@ pub(super) fn tick_collect(state: &mut AgentPanelState, screen: &Screen, out: &m
     for tab in state.retiring.poll() {
         state.tabs.retire_done(tab);
     }
+    // A closed tab's remote start that failed may have kept the stop of the sidecar it left running.
+    if state.retiring.take_failed_connect() {
+        state.remote_stops.send_now();
+    }
     super::hand_over::poll(state, out);
     collect_history(state, out);
     // The project root travels in because the permission policy judges `Read`/`Grep`/`Glob`
@@ -2075,7 +2079,11 @@ mod tests {
         assert_ne!(first.tab, second.tab);
         first.start("t1");
         second.start("t2");
-        tick_handle_until(&handle, "both running", || handle.running_count() == 2);
+        // The busy edge, not the count alone: the count reads the projections, which their workers move between ticks,
+        // and a tick that first sees the turns already ended would never see the window busy.
+        tick_handle_until(&handle, "both running, told busy", || {
+            handle.running_count() == 2 && *busy.borrow() == [true]
+        });
         // One completes, one is interrupted: both are turn ends.
         first.end("t1", agent::TurnOutcome::Completed);
         second.end("t2", agent::TurnOutcome::Interrupted);

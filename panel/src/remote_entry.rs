@@ -1184,6 +1184,16 @@ mod tests {
         shut_down_every_tab(&handle);
     }
 
+    /// The note of the prompt `text`, once both are in the snapshot.
+    fn note_of(snapshot: &serde_json::Value, text: &str) -> Option<serde_json::Value> {
+        let prompt = snapshot["state"]["userPrompts"]
+            .as_array()?
+            .iter()
+            .find(|p| p["text"] == text)?;
+        let note = &snapshot["state"]["sentFrom"][prompt["seq"].as_u64()?.to_string()];
+        (!note.is_null()).then(|| note.clone())
+    }
+
     fn sent_note(snapshot: &serde_json::Value, text: &str) -> serde_json::Value {
         let prompt = snapshot["state"]["userPrompts"]
             .as_array()
@@ -1210,8 +1220,11 @@ mod tests {
             turn_id: "t1".into(),
             text: "steer me".into(),
         });
-        tick_handle_until(&handle, "the delivered message", || {
-            queued_texts(&handle, tab).is_empty()
+        // The queue lets go of the message as soon as the projection shows it read; the note is written from the
+        // event that says so, which a later tick may drain (a delivery leaves folds a snapshot already holds for the
+        // next one). Waited for together, or a loaded machine reads the note in between.
+        tick_handle_until(&handle, "the delivered message and its note", || {
+            queued_texts(&handle, tab).is_empty() && note_of(&provenance_snapshot(&handle, tab), "steer me").is_some()
         });
         assert_eq!(
             sent_note(&provenance_snapshot(&handle, tab), "steer me")["deviceId"],

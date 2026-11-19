@@ -37,6 +37,10 @@ pub struct RemoteConnection {
     /// Where terminal connections get their channels; `None` uses the agents' launcher (a connection a test made).
     terminal_route: Option<Arc<dyn TerminalRoute>>,
     terminal_master: Option<Arc<TerminalMaster>>,
+    /// Stops of sidecars failed starts left running whose stop could not be saved in the project's record (a full
+    /// disk): held here instead, shared by the connection's clones, and sent with the record's
+    /// ([`Self::send_queued_stops`]) for as long as the window lives.
+    held_stops: Arc<std::sync::Mutex<Vec<String>>>,
 }
 
 /// Where a window's terminal connections get their channels.
@@ -218,6 +222,7 @@ impl RemoteConnection {
             terminal_clients: Default::default(),
             terminal_route: None,
             terminal_master: None,
+            held_stops: Arc::default(),
         }
     }
 
@@ -334,7 +339,7 @@ impl RemoteConnection {
             &self.sidecar_start(account),
             project,
             client_tools,
-            |sidecar| kept.set(Some(keep_unstopped(store, &self.project, sidecar))),
+            |sidecar| kept.set(Some(self.keep_or_hold(store, sidecar))),
         );
         started.map_err(|error| with_kept_stop(error, kept.take(), &self.project.host))
     }
@@ -366,7 +371,7 @@ impl RemoteConnection {
             provider_session_id,
             project,
             client_tools,
-            |sidecar| kept.set(Some(keep_unstopped(store, &self.project, sidecar))),
+            |sidecar| kept.set(Some(self.keep_or_hold(store, sidecar))),
         );
         resumed.map_err(|error| with_kept_stop(error, kept.take(), &self.project.host))
     }
@@ -377,14 +382,34 @@ impl RemoteConnection {
         self.client.stop_if_known(sidecar_id)
     }
 
-    /// Sends every stop queued in the project's record while the server was out of reach; each leaves the
-    /// record once it went. A sidecar the helper no longer knows needs no stop. A stop that does not go out
+    /// Keeps the stop of `sidecar`, which a failed start left running, in the project's record; when that write
+    /// fails, holds it in this connection instead ([`Self::send_queued_stops`] sends it either way). The outcome of
+    /// the write, for the start's error.
+    fn keep_or_hold(&self, store: &RemoteProjects, sidecar: &agent::HelperHandoff) -> Result<(), String> {
+        let kept = keep_unstopped(store, &self.project, sidecar);
+        if kept.is_err() {
+            hold(&self.held_stops, sidecar.stop_key());
+        }
+        kept
+    }
+
+    /// Sends every stop queued in the project's record while the server was out of reach, and every stop this
+    /// connection holds because the record could not take it; each leaves the record, or the connection, once it
+    /// went. A sidecar the helper no longer knows needs no stop. A stop that does not go out
     /// stays queued and the rest are still sent; the failures come back together. Returns the ids stopped.
     /// Blocking.
     pub fn send_queued_stops(&self, store: &RemoteProjects) -> Result<Vec<String>, String> {
-        send_queued_for(store, &self.project, |key| {
-            send_queued_stop(key, |daemon, id| self.client.stop_saved(daemon, id))
-        })
+        let stop = |key: &str| send_queued_stop(key, |daemon, id| self.client.stop_saved(daemon, id));
+        let recorded = send_queued_for(store, &self.project, stop);
+        let held = send_held(&self.held_stops, stop);
+        match (recorded, held) {
+            (Ok(mut stopped), Ok(more)) => {
+                stopped.extend(more);
+                Ok(stopped)
+            }
+            (Err(why), Ok(_)) | (Ok(_), Err(why)) => Err(why),
+            (Err(first), Err(second)) => Err(format!("{first}; {second}")),
+        }
     }
 
     fn require_capability(&self, capability: &str) -> Result<(), String> {
@@ -611,6 +636,26 @@ fn keep_unstopped(
     written.map_err(|error| error.to_string())
 }
 
+/// Holds `key` among the stops a connection sends itself, once.
+fn hold(held: &std::sync::Mutex<Vec<String>>, key: String) {
+    let mut held = held.lock().expect("held stops");
+    if !held.contains(&key) {
+        held.push(key);
+    }
+}
+
+/// Sends each stop `held` keeps with `stop`; one that went leaves `held`, one that failed stays for the next try.
+fn send_held(
+    held: &std::sync::Mutex<Vec<String>>,
+    stop: impl FnMut(&str) -> Result<(), String>,
+) -> Result<Vec<String>, String> {
+    let keys = held.lock().expect("held stops").clone();
+    send_each(keys, stop, |key| {
+        held.lock().expect("held stops").retain(|kept| kept != key);
+        Ok(())
+    })
+}
+
 /// A failed start's error, saying what became of the sidecar it left running: `kept` is the outcome of keeping its
 /// stop, `None` when nothing was left running.
 fn with_kept_stop(mut error: BackendError, kept: Option<Result<(), String>>, host: &str) -> BackendError {
@@ -620,7 +665,8 @@ fn with_kept_stop(mut error: BackendError, kept: Option<Result<(), String>>, hos
             .message
             .push_str(&format!("; its agent on {host} is stopped once {host} can be reached")),
         Some(Err(why)) => error.message.push_str(&format!(
-            "; its agent on {host} keeps running there: its stop could not be kept ({why})"
+            "; its agent on {host} keeps running there: its stop could not be saved ({why}), so only this window \
+             stops it, once {host} can be reached"
         )),
     }
     error
@@ -1246,7 +1292,7 @@ mod tests {
         assert!(refused.is_err());
         assert!(with_kept_stop(failed(), Some(refused), &project.host)
             .message
-            .contains("keeps running there"));
+            .contains("only this window stops it"));
         assert_eq!(with_kept_stop(failed(), None, &project.host).message, failed().message);
     }
 
@@ -1385,6 +1431,27 @@ mod tests {
                 assert_eq!(std::fs::read_to_string(dir.join("starts")).unwrap(), "start\nstart\n");
             },
         );
+    }
+
+    #[test]
+    fn a_stop_the_record_could_not_take_is_held_and_sent_until_it_goes() {
+        let held = std::sync::Mutex::new(Vec::new());
+        hold(&held, "0.3.0-a-b/sc-left".into());
+        hold(&held, "0.3.0-a-b/sc-left".into());
+        assert_eq!(*held.lock().unwrap(), vec!["0.3.0-a-b/sc-left".to_string()]);
+        assert!(send_held(&held, |_| Err("the link is down".into())).is_err());
+        assert_eq!(held.lock().unwrap().len(), 1, "a stop that did not go stays held");
+        let mut sent = Vec::new();
+        assert_eq!(
+            send_held(&held, |key| {
+                sent.push(key.to_string());
+                Ok(())
+            })
+            .unwrap(),
+            vec!["0.3.0-a-b/sc-left".to_string()]
+        );
+        assert_eq!(sent, vec!["0.3.0-a-b/sc-left".to_string()]);
+        assert!(held.lock().unwrap().is_empty());
     }
 
     fn project() -> RemoteProject {
