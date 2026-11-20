@@ -511,9 +511,17 @@ pub(crate) fn reconcile_questions(
 /// at any moment, and an expiry of a request this watch never saw asked cannot be told from one.
 #[derive(Debug, Default)]
 pub(crate) struct UnattendedExpiry {
-    /// When each request this watch saw was asked, on the events' own clock (milliseconds).
+    /// When each request this watch saw was asked, on the events' own clock (milliseconds), at most
+    /// [`ASKED_KEPT`] of them: the events come from the server, and a request never resolved stays here.
     asked_at: std::collections::HashMap<String, (i64, Option<String>)>,
+    /// The keys of `asked_at`, oldest first.
+    asked_order: VecDeque<String>,
 }
+
+/// How many asked requests one watch remembers. A session holds few requests waiting at once, so this
+/// reaches far past any that could still be waiting; past it the oldest is forgotten, which costs only
+/// the wait in the line an expiry of that request would have shown.
+const ASKED_KEPT: usize = 256;
 
 /// The shortest wait after which an expiry is the CLI's own: its hook gives a request ten minutes, and the
 /// events' clock is the sidecar's.
@@ -535,12 +543,31 @@ impl UnattendedExpiry {
                 tool_use_id,
                 ..
             } => {
-                self.asked_at
-                    .insert(permission_id.clone(), (occurred_at, tool_use_id.clone()));
+                // Ids are the server's text: a request with one past an id's length is not remembered,
+                // which costs only the wait in its expiry line.
+                let plain = |id: &str| crate::remote_answers::checked_id("a permission id", id).is_ok();
+                if !plain(permission_id) || !tool_use_id.as_deref().is_none_or(plain) {
+                    return None;
+                }
+                if self
+                    .asked_at
+                    .insert(permission_id.clone(), (occurred_at, tool_use_id.clone()))
+                    .is_none()
+                {
+                    self.asked_order.push_back(permission_id.clone());
+                }
+                while self.asked_order.len() > ASKED_KEPT {
+                    if let Some(oldest) = self.asked_order.pop_front() {
+                        self.asked_at.remove(&oldest);
+                    }
+                }
                 None
             }
             AgentDomainEvent::PermissionResolved { permission_id, outcome } => {
                 let asked = self.asked_at.remove(permission_id);
+                if asked.is_some() {
+                    self.asked_order.retain(|id| id != permission_id);
+                }
                 if !unattended || *outcome != crate::PermissionOutcome::Expired {
                     return None;
                 }
@@ -673,6 +700,34 @@ mod tests {
             "a request never seen asked cannot be told from an interrupt"
         );
         assert_eq!(waited(42_400), "42 s");
+    }
+
+    /// Requests the server never resolves do not grow the watch's memory: past `ASKED_KEPT` the oldest is
+    /// forgotten, and a newer one still gets its denial line.
+    #[test]
+    fn asked_requests_never_resolved_are_kept_to_a_bound() {
+        let mut expiry = UnattendedExpiry::default();
+        for n in 0..ASKED_KEPT * 4 {
+            expiry.observe(&requested(&format!("p{n}")), 1_000, true);
+        }
+        assert_eq!(expiry.asked_at.len(), ASKED_KEPT);
+        assert_eq!(expiry.asked_order.len(), ASKED_KEPT);
+        assert_eq!(
+            expiry.observe(&resolved("p0", crate::PermissionOutcome::Expired), 700_000, true),
+            None,
+            "the oldest was forgotten"
+        );
+        let last = format!("p{}", ASKED_KEPT * 4 - 1);
+        assert!(expiry
+            .observe(&resolved(&last, crate::PermissionOutcome::Expired), 700_000, true)
+            .is_some());
+        assert_eq!(expiry.asked_order.len(), ASKED_KEPT - 1);
+        let long = "p".repeat(crate::remote_answers::ID_BYTES + 1);
+        expiry.observe(&requested(&long), 1_000, true);
+        assert!(
+            !expiry.asked_at.contains_key(&long),
+            "an id past its length is not kept"
+        );
     }
 
     fn asked(id: &str) -> AgentDomainEvent {

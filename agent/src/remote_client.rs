@@ -7,6 +7,7 @@
 //! caller's thread, so it belongs on a worker, never on the GTK thread or on that runtime. When the
 //! connection breaks, the next call starts a new channel through the launcher.
 
+use crate::remote_answers::AnswerBound;
 use crate::runtime_thread::RuntimeThread;
 use crate::ssh::{ChannelLauncher, LinkCheck};
 use eitri_server_proto::helper_client::HelperClient as HelperService;
@@ -689,6 +690,12 @@ impl HelperClient {
                 _ => break started,
             }
         };
+        // The id goes into the project's record and into every later call's metadata.
+        let started = started.and_then(|id| {
+            crate::remote_answers::checked_id("the server's sidecar id", &id)
+                .map(|()| id)
+                .map_err(Status::data_loss)
+        });
         let refused = started.as_ref().err().is_some_and(|status| {
             status.code() == tonic::Code::Unavailable && std::error::Error::source(&status).is_none()
         });
@@ -824,6 +831,23 @@ impl HelperClient {
         self.call(HELPER_RPC_TIMEOUT, async move { service.read_file(request).await })
     }
 
+    /// The whole listing for the request's budget, refused past [`AnswerBound::list_tree`]: the bound's own
+    /// line, or the call's failure in words.
+    pub fn collect_list_tree(&self, request: ListTreeRequest) -> Result<Vec<ListTreeEntry>, String> {
+        let bound = AnswerBound::list_tree(request.budget);
+        let stream = self.list_tree(request).map_err(|error| error.to_string())?;
+        self.collect_sync_stream(stream, bound)
+            .map_err(|error| refusal_text(&bound, error))
+    }
+
+    /// The whole read up to the request's limit, refused past [`AnswerBound::read_file`].
+    pub fn collect_read_file(&self, request: ReadFileRequest) -> Result<Vec<ReadFileChunk>, String> {
+        let bound = AnswerBound::read_file(request.limit);
+        let stream = self.read_file(request).map_err(|error| error.to_string())?;
+        self.collect_sync_stream(stream, bound)
+            .map_err(|error| refusal_text(&bound, error))
+    }
+
     pub fn replace_file_if(&self, request: ReplaceFileIfRequest) -> Result<ReplaceFileIfResponse, Status> {
         self.require_pin()?;
         let mut service = self.service();
@@ -911,20 +935,16 @@ impl HelperClient {
         })
     }
 
-    /// Collects a sync response on this connection's runtime with caller-owned memory bounds.
+    /// Collects a sync response on this connection's runtime within the caller's [`AnswerBound`].
     /// A stream is dropped on overflow or timeout, so an unfinished response is never returned as complete.
-    pub fn collect_sync_stream<T: Send + 'static>(
+    pub fn collect_sync_stream<T: prost::Message + Send + 'static>(
         &self,
         stream: tonic::Streaming<T>,
-        entry_limit: usize,
-        byte_limit: usize,
-        item_bytes: fn(&T) -> usize,
+        bound: AnswerBound,
     ) -> Result<Vec<T>, Status> {
         let timeout = eitri_server_proto::SYNC_STREAM_DEADLINE + HELPER_RPC_TIMEOUT;
         self.call(timeout, async move {
-            collect_sync_items(stream, entry_limit, byte_limit, item_bytes)
-                .await
-                .map(tonic::Response::new)
+            collect_sync_items(stream, bound).await.map(tonic::Response::new)
         })
     }
 }
@@ -1023,29 +1043,26 @@ impl Drop for HelperExec {
     }
 }
 
-async fn collect_sync_items<T, S>(
-    mut stream: S,
-    entry_limit: usize,
-    byte_limit: usize,
-    item_bytes: fn(&T) -> usize,
-) -> Result<Vec<T>, Status>
+/// A bound's own refusal as its plain line; any other failure (the server's own status among them) as before.
+fn refusal_text(bound: &AnswerBound, error: Status) -> String {
+    if error.code() == tonic::Code::ResourceExhausted && bound.refused(error.message()) {
+        error.message().to_owned()
+    } else {
+        error.to_string()
+    }
+}
+
+async fn collect_sync_items<T, S>(mut stream: S, bound: AnswerBound) -> Result<Vec<T>, Status>
 where
+    T: prost::Message,
     S: tonic::codegen::tokio_stream::Stream<Item = Result<T, Status>> + Unpin,
 {
     use tonic::codegen::tokio_stream::StreamExt;
     let mut items = Vec::new();
-    let mut bytes = 0usize;
+    let mut tally = bound.tally();
     while let Some(item) = stream.next().await {
         let item = item?;
-        bytes = bytes
-            .checked_add(item_bytes(&item))
-            .filter(|bytes| *bytes <= byte_limit)
-            .ok_or_else(|| Status::resource_exhausted("sync stream exceeds the caller's byte bound"))?;
-        if items.len() >= entry_limit {
-            return Err(Status::resource_exhausted(
-                "sync stream exceeds the caller's entry bound",
-            ));
-        }
+        tally.add(&item).map_err(Status::resource_exhausted)?;
         items.push(item);
     }
     Ok(items)
@@ -1413,9 +1430,15 @@ impl StderrCapture {
     }
 }
 
+/// How much of one line of the helper channel's stderr is kept. The stream comes from the server, so a
+/// line with no end must not grow without one; a longer line keeps its head and says it was cut.
+const STDERR_LINE_BYTES: usize = 4096;
+
 struct StderrReader<R> {
     input: R,
     line: Vec<u8>,
+    /// Bytes of the current line past [`STDERR_LINE_BYTES`], dropped.
+    cut: usize,
     last: Option<String>,
 }
 
@@ -1424,6 +1447,7 @@ impl<R: io::Read> StderrReader<R> {
         Self {
             input,
             line: Vec::new(),
+            cut: 0,
             last: None,
         }
     }
@@ -1441,8 +1465,12 @@ impl<R: io::Read> StderrReader<R> {
                 }
                 Ok(n) => {
                     for part in bytes[..n].split_inclusive(|byte| *byte == b'\n') {
-                        self.line.extend_from_slice(part);
-                        if part.ends_with(b"\n") {
+                        let ended = part.ends_with(b"\n");
+                        let text = &part[..part.len() - usize::from(ended)];
+                        let room = STDERR_LINE_BYTES.saturating_sub(self.line.len()).min(text.len());
+                        self.line.extend_from_slice(&text[..room]);
+                        self.cut = self.cut.saturating_add(text.len() - room);
+                        if ended {
                             self.finish_line();
                         }
                     }
@@ -1456,11 +1484,15 @@ impl<R: io::Read> StderrReader<R> {
     }
 
     fn finish_line(&mut self) {
-        let text = String::from_utf8_lossy(&self.line).trim().to_string();
+        let mut text = String::from_utf8_lossy(&self.line).trim().to_string();
+        if self.cut > 0 {
+            text.push_str(&format!(" [cut: {} more bytes past {STDERR_LINE_BYTES}]", self.cut));
+        }
         if !text.is_empty() {
             self.last = Some(text);
         }
         self.line.clear();
+        self.cut = 0;
     }
 }
 
@@ -1755,28 +1787,80 @@ mod tests {
 
     #[tokio::test]
     async fn remote_client_sync_streams_enforce_bounds_and_preserve_errors() {
+        use eitri_server_proto::ReadFileChunk;
         use tonic::codegen::tokio_stream::iter;
-        let values = || iter([Ok(vec![1u8, 2]), Ok(vec![3u8])]);
+        let chunk = |data: &[u8]| ReadFileChunk {
+            data: data.to_vec(),
+            ..Default::default()
+        };
+        let values = || iter([Ok(chunk(&[1, 2])), Ok(chunk(&[3]))]);
+        let cost = AnswerBound::cost(&chunk(&[1, 2])) + AnswerBound::cost(&chunk(&[3]));
+        let fits = AnswerBound::new("a read", 2, cost);
         assert_eq!(
-            collect_sync_items(values(), 2, 3, Vec::len).await.unwrap(),
-            vec![vec![1, 2], vec![3]]
+            collect_sync_items(values(), fits).await.unwrap(),
+            vec![chunk(&[1, 2]), chunk(&[3])]
         );
-        let error = collect_sync_items(values(), 1, 3, Vec::len).await.unwrap_err();
+        let error = collect_sync_items(values(), AnswerBound::new("a read", 1, cost))
+            .await
+            .unwrap_err();
         assert_eq!(error.code(), tonic::Code::ResourceExhausted);
-        assert!(error.message().contains("entry bound"));
-        let error = collect_sync_items(values(), 2, 2, Vec::len).await.unwrap_err();
+        assert_eq!(error.message(), "a read passed its bound of 1 entries; refused");
+        let error = collect_sync_items(values(), AnswerBound::new("a read", 2, cost - 1))
+            .await
+            .unwrap_err();
         assert_eq!(error.code(), tonic::Code::ResourceExhausted);
-        assert!(error.message().contains("byte bound"));
-        let items = iter([Ok(vec![1u8]), Err(Status::data_loss("incomplete file"))]);
-        let error = collect_sync_items(items, 2, 3, Vec::len).await.unwrap_err();
+        assert_eq!(
+            error.message(),
+            format!("a read passed its bound of {} bytes; refused", cost - 1)
+        );
+        let items = iter([Ok(chunk(&[1])), Err(Status::data_loss("incomplete file"))]);
+        let error = collect_sync_items(items, fits).await.unwrap_err();
         assert_eq!(error.code(), tonic::Code::DataLoss);
         assert_eq!(error.message(), "incomplete file");
-        assert!(
-            collect_sync_items(iter(Vec::<Result<Vec<u8>, Status>>::new()), 0, 0, Vec::len)
-                .await
-                .unwrap()
-                .is_empty()
+        assert!(collect_sync_items(
+            iter(Vec::<Result<ReadFileChunk, Status>>::new()),
+            AnswerBound::new("a read", 0, 0)
+        )
+        .await
+        .unwrap()
+        .is_empty());
+    }
+
+    #[test]
+    fn a_stderr_line_with_no_end_keeps_its_head_and_says_it_was_cut() {
+        use std::io::Read as _;
+        let mut exact = vec![b'x'; STDERR_LINE_BYTES];
+        exact.push(b'\n');
+        let mut reader = StderrReader::new(&exact[..]);
+        while !reader.read_available().unwrap() {}
+        assert_eq!(
+            reader.last.as_deref(),
+            Some(&*"x".repeat(STDERR_LINE_BYTES)),
+            "nothing was cut"
         );
+        let mut long = vec![b'x'; STDERR_LINE_BYTES + 10_000];
+        long.push(b'\n');
+        let mut reader = StderrReader::new(&long[..]);
+        while !reader.read_available().unwrap() {}
+        let cut = format!(" [cut: 10000 more bytes past {STDERR_LINE_BYTES}]");
+        assert!(reader.last.as_deref().unwrap().ends_with(&cut));
+        long.extend_from_slice(b"short\n");
+        let mut reader = StderrReader::new(&long[..]);
+        while !reader.read_available().unwrap() {}
+        assert_eq!(reader.last.as_deref(), Some("short"));
+        let mut endless = StderrReader::new(io::repeat(b'y').take(1 << 20));
+        while !endless.read_available().unwrap() {}
+        let last = endless.last.unwrap();
+        assert!(last.starts_with(&"y".repeat(STDERR_LINE_BYTES)), "{}", &last[..40]);
+        assert!(
+            last.ends_with(&format!(
+                " [cut: {} more bytes past {STDERR_LINE_BYTES}]",
+                (1 << 20) - STDERR_LINE_BYTES
+            )),
+            "{}",
+            &last[last.len() - 60..]
+        );
+        assert!(endless.line.is_empty());
     }
 
     #[test]

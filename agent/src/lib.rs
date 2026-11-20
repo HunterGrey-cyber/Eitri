@@ -75,6 +75,7 @@ pub mod project_boundary;
 pub mod provider_move;
 pub mod providers;
 pub mod read_deny;
+pub mod remote_answers;
 pub mod remote_client;
 pub mod save_health;
 pub mod setting_sources;

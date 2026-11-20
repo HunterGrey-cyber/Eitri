@@ -18,6 +18,7 @@ pub mod quiet;
 pub mod recreate;
 pub mod sessions;
 pub mod shim_dir;
+pub mod shown_once;
 pub mod status_file;
 pub mod status_schema;
 pub mod transport;

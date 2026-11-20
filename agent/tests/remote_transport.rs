@@ -828,8 +828,12 @@ fn replay_of_5000_events_stays_under_the_queue_budget() {
 type HelloAnswer =
     dyn Fn(eitri_server_proto::HelloRequest) -> Result<eitri_server_proto::HelloResponse, tonic::Status> + Send + Sync;
 
-/// A daemon that answers Hello as told and nothing else.
-struct ScriptedHelper(Arc<HelloAnswer>);
+/// A daemon that answers Hello as told, streams the listing and the read it was given, and nothing else.
+struct ScriptedHelper(
+    Arc<HelloAnswer>,
+    Vec<eitri_server_proto::ListTreeEntry>,
+    Vec<eitri_server_proto::ReadFileChunk>,
+);
 
 #[tonic::async_trait]
 impl eitri_server_proto::helper_server::Helper for ScriptedHelper {
@@ -892,7 +896,10 @@ impl eitri_server_proto::helper_server::Helper for ScriptedHelper {
         &self,
         _: tonic::Request<eitri_server_proto::ListTreeRequest>,
     ) -> Result<tonic::Response<Self::ListTreeStream>, tonic::Status> {
-        Err(tonic::Status::unimplemented("ListTree is not built yet"))
+        let items = self.1.clone().into_iter().map(Ok);
+        Ok(tonic::Response::new(Box::pin(tonic::codegen::tokio_stream::iter(
+            items,
+        ))))
     }
 
     type ReadFileStream = std::pin::Pin<
@@ -905,7 +912,10 @@ impl eitri_server_proto::helper_server::Helper for ScriptedHelper {
         &self,
         _: tonic::Request<eitri_server_proto::ReadFileRequest>,
     ) -> Result<tonic::Response<Self::ReadFileStream>, tonic::Status> {
-        Err(tonic::Status::unimplemented("ReadFile is not built yet"))
+        let items = self.2.clone().into_iter().map(Ok);
+        Ok(tonic::Response::new(Box::pin(tonic::codegen::tokio_stream::iter(
+            items,
+        ))))
     }
     async fn replace_file_if(
         &self,
@@ -967,6 +977,19 @@ impl Server {
             + Sync
             + 'static,
     ) -> (tokio::runtime::Runtime, HelperClient) {
+        self.replace_daemon_streaming(hello, Vec::new(), Vec::new())
+    }
+
+    /// [`Self::replace_daemon`], whose ListTree streams `tree` and whose ReadFile streams `chunks`.
+    fn replace_daemon_streaming(
+        &self,
+        hello: impl Fn(eitri_server_proto::HelloRequest) -> Result<eitri_server_proto::HelloResponse, tonic::Status>
+            + Send
+            + Sync
+            + 'static,
+        tree: Vec<eitri_server_proto::ListTreeEntry>,
+        chunks: Vec<eitri_server_proto::ReadFileChunk>,
+    ) -> (tokio::runtime::Runtime, HelperClient) {
         for pid in self.recorded_pids() {
             if let Some(fd) = pidfd(pid) {
                 if exe_of(pid).is_some_and(|exe| exe == helper_binary()) {
@@ -991,7 +1014,7 @@ impl Server {
             let _entered = runtime.enter();
             tokio::net::UnixListener::bind(&socket).unwrap()
         };
-        let helper = ScriptedHelper(Arc::new(hello));
+        let helper = ScriptedHelper(Arc::new(hello), tree, chunks);
         runtime.spawn(async move {
             let _ = tonic::transport::Server::builder()
                 .add_service(eitri_server_proto::helper_server::HelperServer::new(helper))
@@ -1003,6 +1026,67 @@ impl Server {
         let client = self.client(Arc::new(self.launcher()));
         (runtime, client)
     }
+}
+
+fn current_hello(_: eitri_server_proto::HelloRequest) -> Result<eitri_server_proto::HelloResponse, tonic::Status> {
+    Ok(eitri_server_proto::HelloResponse {
+        protocol_major: eitri_server_proto::PROTOCOL_MAJOR,
+        protocol_minor: eitri_server_proto::PROTOCOL_MINOR,
+        helper_version: env!("CARGO_PKG_VERSION").into(),
+        ..Default::default()
+    })
+}
+
+fn listed(rel: String) -> eitri_server_proto::ListTreeEntry {
+    eitri_server_proto::ListTreeEntry {
+        rel,
+        kind: "file".into(),
+        ..Default::default()
+    }
+}
+
+/// A listing within its bound arrives whole; one whose paths are long enough to pass the byte bound is
+/// refused whole with the bound named, never cut short and never read as the server's listing.
+#[test]
+fn a_listing_past_its_byte_bound_from_the_server_is_refused_whole() {
+    let request = |budget| eitri_server_proto::ListTreeRequest {
+        root: "/srv/p".into(),
+        budget,
+        ..Default::default()
+    };
+    let server = Server::new(&[]);
+    let fitting: Vec<_> = (0..10).map(|n| listed(format!("src/{n}.rs"))).collect();
+    let (runtime, client) = server.replace_daemon_streaming(current_hello, fitting.clone(), Vec::new());
+    assert_eq!(client.collect_list_tree(request(10)).unwrap(), fitting);
+    runtime.shutdown_background();
+
+    // Twelve entries are allowed for a budget of 10; three paths of 1 MiB each pass 12 * 384 bytes.
+    let long: Vec<_> = (0..3).map(|n| listed(format!("{n}{}", "x".repeat(1 << 20)))).collect();
+    let (runtime, client) = server.replace_daemon_streaming(current_hello, long, Vec::new());
+    assert_eq!(
+        client.collect_list_tree(request(10)).unwrap_err(),
+        "the server's file listing passed its bound of 4608 bytes; refused"
+    );
+    runtime.shutdown_background();
+}
+
+/// A read whose chunks carry nothing still costs each chunk: a flood of empty chunks for an empty file is
+/// refused with the bound named.
+#[test]
+fn a_read_flooded_with_empty_chunks_from_the_server_is_refused() {
+    use agent::remote_answers::{ITEM_OVERHEAD_BYTES, READ_FILE_FRAMING_BYTES};
+    let server = Server::new(&[]);
+    let flood = vec![eitri_server_proto::ReadFileChunk::default(); READ_FILE_FRAMING_BYTES / ITEM_OVERHEAD_BYTES + 1];
+    let (runtime, client) = server.replace_daemon_streaming(current_hello, Vec::new(), flood);
+    let refused = client
+        .collect_read_file(eitri_server_proto::ReadFileRequest {
+            root: "/srv/p".into(),
+            rel: "empty".into(),
+            limit: 0,
+        })
+        .unwrap_err();
+    assert_eq!(refused, "the server's file read passed its bound of 1 MiB; refused");
+    runtime.shutdown_background();
 }
 
 /// A helper that answers Hello in another protocol major is refused with both sides' versions named.

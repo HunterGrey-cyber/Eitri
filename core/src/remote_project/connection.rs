@@ -489,10 +489,12 @@ impl RemoteConnection {
         self.client.shown_other_host_key()
     }
 
-    /// The mode keepers' lines from a fresh Hello (every Hello repeats them; the caller keeps what it showed).
+    /// The mode keepers' lines from a fresh Hello (every Hello repeats them; the caller keeps what it showed),
+    /// refused whole past [`agent::remote_answers::MODE_WARNINGS`].
     pub fn mode_lines(&self) -> Result<Vec<crate::remote_sync::sessions::ModeLine>, String> {
         self.require_capability(wire::CAP_SYNC_MODES)?;
         let hello = self.client.hello().map_err(|error| error.to_string())?;
+        agent::remote_answers::MODE_WARNINGS.check(&hello.mode_warnings)?;
         Ok(hello
             .mode_warnings
             .into_iter()
@@ -505,31 +507,16 @@ impl RemoteConnection {
             .collect())
     }
 
-    pub fn list_tree(
-        &self,
-        request: wire::ListTreeRequest,
-        entry_limit: usize,
-    ) -> Result<Vec<wire::ListTreeEntry>, String> {
+    /// The server's listing for the request's budget, refused whole past its bound.
+    pub fn list_tree(&self, request: wire::ListTreeRequest) -> Result<Vec<wire::ListTreeEntry>, String> {
         self.require_capability(wire::CAP_SYNC_FILES)?;
-        let stream = self.client.list_tree(request).map_err(|error| error.to_string())?;
-        self.client
-            .collect_sync_stream(stream, entry_limit, usize::MAX, |_| 0)
-            .map_err(|error| error.to_string())
+        self.client.collect_list_tree(request)
     }
 
-    pub fn read_file(
-        &self,
-        request: wire::ReadFileRequest,
-        byte_limit: usize,
-    ) -> Result<Vec<wire::ReadFileChunk>, String> {
+    /// The server's read up to the request's limit, refused whole past its bound.
+    pub fn read_file(&self, request: wire::ReadFileRequest) -> Result<Vec<wire::ReadFileChunk>, String> {
         self.require_capability(wire::CAP_SYNC_FILES)?;
-        let stream = self.client.read_file(request).map_err(|error| error.to_string())?;
-        // Even empty chunks cost an entry; bound them as well as the file's data bytes.
-        self.client
-            .collect_sync_stream(stream, byte_limit.saturating_add(1), byte_limit, |chunk| {
-                chunk.data.len()
-            })
-            .map_err(|error| error.to_string())
+        self.client.collect_read_file(request)
     }
 
     fn check_handoff(&self, handoff: &agent::HelperHandoff) -> Result<(), BackendError> {

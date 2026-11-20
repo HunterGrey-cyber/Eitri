@@ -395,7 +395,7 @@ struct Hold {
     notice: Option<String>,
     written: Option<StatusFile>,
     modes_shown: BTreeMap<String, (u64, u64)>,
-    lines_shown: BTreeSet<String>,
+    lines_shown: super::shown_once::ShownOnce,
     poll_bytes: Option<(u64, u64)>,
     batch_cycles: Option<u64>,
     /// When the first-cycle accounting may try its listings again after one failed.
@@ -717,7 +717,7 @@ impl Runner {
             notice: None,
             written: None,
             modes_shown: BTreeMap::new(),
-            lines_shown: BTreeSet::new(),
+            lines_shown: Default::default(),
             poll_bytes: None,
             batch_cycles: None,
             accounting_after: None,
@@ -888,10 +888,16 @@ impl Runner {
         }
     }
 
+    /// Shows a line the first time its text comes (`shown_once`: bounded, oldest forgotten, long texts cut).
     fn line_once(&mut self, text: String) {
-        if self.hold().lines_shown.insert(text.clone()) {
+        if let Some(text) = self.hold().lines_shown.admit(text) {
             self.line(text);
         }
+    }
+
+    /// Forgets the lines shown once, so a new start shows them again.
+    fn forget_lines(&mut self) {
+        self.hold().lines_shown.clear();
     }
 
     /// Fetches the server's ignores; `None` (with the notice set) when sync cannot start.
@@ -1867,7 +1873,7 @@ impl Runner {
         }
         if seen.paused.is_some() && latest.paused.is_none() {
             // Resumed: the whole start again (resume, ignores, the replica, monitors), as when a holder starts.
-            self.hold().lines_shown.clear();
+            self.forget_lines();
             self.ensure_sessions();
             return;
         }
@@ -1968,7 +1974,7 @@ impl Runner {
             return;
         }
         if !self.hold().started {
-            self.hold().lines_shown.clear();
+            self.forget_lines();
             self.ensure_sessions();
             return;
         }
@@ -2034,9 +2040,12 @@ impl Runner {
     }
 
     /// Mode keeper lines for this root: a counted line when its (epoch, sequence) is new, any other line once.
+    /// An answer past its bound is shown as its refusal, once; any other failure waits for the next Hello.
     fn show_mode_lines(&mut self) {
-        let Ok(lines) = self.deps.helper.mode_lines() else {
-            return;
+        let lines = match self.deps.helper.mode_lines() {
+            Ok(lines) => lines,
+            Err(why) if agent::remote_answers::MODE_WARNINGS.refused(&why) => return self.line_once(why),
+            Err(_) => return,
         };
         let root = self.project.root.to_string_lossy().into_owned();
         for line in lines.into_iter().filter(|line| line.root == root) {

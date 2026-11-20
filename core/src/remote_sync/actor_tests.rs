@@ -289,6 +289,7 @@ struct HelperState {
     sizes: u64,
     activity: wire::ProjectActivityResponse,
     mode_lines: Vec<ModeLine>,
+    mode_lines_error: Option<String>,
     /// WatchModes fails with this while set.
     watch_modes_error: Option<String>,
     /// The host key the connection under the helper shows when it is not the project's.
@@ -323,6 +324,7 @@ impl FakeHelper {
                 sizes: 80 * MIB,
                 activity: wire::ProjectActivityResponse::default(),
                 mode_lines: vec![],
+                mode_lines_error: None,
                 watch_modes_error: None,
                 shown_key: None,
                 watch_modes_settling: 0,
@@ -523,7 +525,11 @@ impl SyncHelper for FakeHelper {
         })
     }
     fn mode_lines(&self) -> Result<Vec<ModeLine>, String> {
-        Ok(self.state.lock().unwrap().mode_lines.clone())
+        let state = self.state.lock().unwrap();
+        match &state.mode_lines_error {
+            Some(error) => Err(error.clone()),
+            None => Ok(state.mode_lines.clone()),
+        }
     }
     fn changed_host_key(&self) -> Result<Option<String>, String> {
         let state = self.state.lock().unwrap();
@@ -1582,6 +1588,45 @@ fn mode_lines_show_once_per_epoch_and_sequence() {
     assert!(wait_line(&events, "sync writes").contains(": 1 sync writes"));
     std::thread::sleep(Duration::from_millis(100));
     assert!(lines(&events).iter().all(|l| !l.contains("/srv/other")));
+}
+
+/// A Hello whose mode lines pass their bound shows the refusal once; any other failure shows nothing.
+#[test]
+fn a_refused_mode_lines_answer_shows_its_refusal_once() {
+    let lab = Lab::new();
+    let refusal = agent::remote_answers::MODE_WARNINGS.past_entries();
+    lab.helper
+        .set(|h| h.mode_lines_error = Some("status: Unavailable, the link is down".into()));
+    let mut config = lab.config(HolderKind::Window);
+    config.recheck_every = Duration::from_millis(20);
+    let (_actor, events) = lab.attach_with(config, lab.engine.clone());
+    std::thread::sleep(Duration::from_millis(200));
+    assert!(lines(&events).iter().all(|l| !l.contains("link is down")));
+    lab.helper.set(|h| h.mode_lines_error = Some(refusal.clone()));
+    assert_eq!(wait_line(&events, "mode lines"), refusal);
+    std::thread::sleep(Duration::from_millis(200));
+    assert!(lines(&events).iter().all(|l| !l.contains("mode lines")), "shown once");
+}
+
+/// A flood of the server's one-time lines is shown and never turns into a refusal that would hide later
+/// lines; what the holder remembers of it is bounded (`shown_once`'s tests).
+#[test]
+fn a_flood_of_server_lines_is_shown_and_hides_nothing() {
+    let lab = Lab::new();
+    let root = lab.root.to_string_lossy().into_owned();
+    let line = |n: usize| ModeLine {
+        root: root.clone(),
+        text: format!("file modes on srv1: note {n}"),
+        sequence: 0,
+        epoch: 0,
+    };
+    lab.helper.set(|h| h.mode_lines = (0..600).map(line).collect());
+    let mut config = lab.config(HolderKind::Window);
+    config.recheck_every = Duration::from_millis(20);
+    let (_actor, events) = lab.attach_with(config, lab.engine.clone());
+    wait_line(&events, "note 599");
+    std::thread::sleep(Duration::from_millis(100));
+    assert!(lines(&events).iter().all(|l| !l.contains("refused")));
 }
 
 #[test]

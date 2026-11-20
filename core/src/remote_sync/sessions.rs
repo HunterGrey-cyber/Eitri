@@ -63,8 +63,7 @@ fn root_text(root: &Path) -> Result<String, String> {
 
 impl SyncHelper for RemoteConnection {
     fn read_file(&self, request: wire::ReadFileRequest) -> Result<Vec<wire::ReadFileChunk>, String> {
-        let limit = request.limit as usize;
-        RemoteConnection::read_file(self, request, limit)
+        RemoteConnection::read_file(self, request)
     }
     fn replace_file_if(&self, request: wire::ReplaceFileIfRequest) -> Result<wire::ReplaceFileIfResponse, String> {
         RemoteConnection::replace_file_if(self, request)
@@ -87,7 +86,7 @@ impl SyncHelper for RemoteConnection {
             patterns: patterns.to_vec(),
             budget,
         };
-        RemoteConnection::list_tree(self, request, budget.saturating_add(2).min(usize::MAX as u64) as usize)
+        RemoteConnection::list_tree(self, request)
     }
 
     fn path_sizes(
