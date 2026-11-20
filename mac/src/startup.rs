@@ -196,7 +196,8 @@ pub fn paths(env: &dyn Fn(&str) -> Option<OsString>, home: &Path, run_dir: &Path
 
 /// The command line handed to Neovide: its own name first (the embedder's arguments carry argv[0]), no
 /// fork, and after `--`, so they reach nvim and not Neovide, the socket nvim listens on and `nvim_extra`
-/// ([`editor_watch_args`]). Neovide starts every nvim of the window with them, one started again included.
+/// ([`nvim_extra`]: the defaults, then the editor watch). Neovide starts every nvim of the window with them, one
+/// started again included.
 pub fn neovide_args(nvim_listen: &Path, nvim_extra: &[String]) -> Vec<String> {
     let socket = nvim_listen
         .to_str()
@@ -208,6 +209,26 @@ pub fn neovide_args(nvim_listen: &Path, nvim_extra: &[String]) -> Vec<String> {
         .chain([socket])
         .chain(nvim_extra.iter().cloned())
         .collect()
+}
+
+/// The `:let` that starts the editor with snacks.nvim's smooth-scroll animation off. Neovide already animates
+/// scrolling, and with snacks' `scroll` on as well (LazyVim turns it on) two animators move the same window.
+/// snacks tests `vim.g.snacks_scroll ~= false` on every scroll, so a `vim.g.snacks_scroll = true` in the user's
+/// `init.lua` (which runs after every `--cmd`) turns it back on. The Linux window's pane sets the same default
+/// (`neovide_editor::SNACKS_SCROLL_OFF_CMD`); this host does not link that crate.
+pub const SNACKS_SCROLL_OFF_CMD: &str = "let g:snacks_scroll = v:false";
+
+/// The `--cmd` arguments every nvim of this window starts with, ahead of the editor watch's.
+pub fn editor_default_args() -> Vec<String> {
+    vec!["--cmd".to_owned(), SNACKS_SCROLL_OFF_CMD.to_owned()]
+}
+
+/// What the host hands [`neovide_args`] for nvim: the defaults first (so a later `--cmd` and the user's config win),
+/// then the editor watch's arguments ([`editor_watch_args`]).
+pub fn nvim_extra(watch: Vec<String>) -> Vec<String> {
+    let mut extra = editor_default_args();
+    extra.extend(watch);
+    extra
 }
 
 /// The `--cmd` that loads the editor watch (`eitri_core`'s `editor_watch.lua`, the Linux editor's) into nvim before
@@ -816,6 +837,21 @@ mod tests {
         );
         let extra = ["--cmd".to_owned(), "lua x()".to_owned()];
         assert_eq!(neovide_args(sock, &extra)[5..], extra, "after the socket, for nvim");
+    }
+
+    #[test]
+    fn nvim_starts_with_snacks_scroll_off_ahead_of_the_watch() {
+        let defaults = editor_default_args();
+        assert_eq!(defaults, ["--cmd", "let g:snacks_scroll = v:false"]);
+        let watch = vec!["--cmd".to_owned(), "lua x()".to_owned()];
+        let sock = Path::new("/r/n.sock");
+        let args = neovide_args(sock, &nvim_extra(watch.clone()));
+        assert_eq!(
+            args[5..7],
+            defaults[..],
+            "the default comes first, so a later --cmd or the user's config wins"
+        );
+        assert_eq!(args[7..], watch);
     }
 
     #[test]

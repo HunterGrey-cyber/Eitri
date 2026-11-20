@@ -1200,7 +1200,7 @@ impl std::fmt::Debug for HangUp {
 /// (measured: 33 pixels at scale 1.5). Drawing none means the only cursor on screen is the one in the
 /// pane that has the keys.
 ///
-/// It is a `--cmd`, so it runs before the user's own config: a user who wants the hollow block
+/// It runs in a `--cmd` (see `pane_default_cmd`), so before the user's own config: a user who wants the hollow block
 /// back sets the variable in their `init.lua` (e.g. `vim.g.neovide_cursor_unfocused_outline_width
 /// = 0.125`) and wins. Neovide reads a `--cmd` value once, in `settings.read_initial_values`, BEFORE
 /// `ui_attach`; `init.lua` runs AT `ui_attach`, so its value, like a runtime `:let`, reaches the
@@ -1210,9 +1210,26 @@ impl std::fmt::Debug for HangUp {
 /// `:let` stands in for it because it takes the same watcher path.
 pub const HIDE_UNFOCUSED_CURSOR_CMD: &str = "let g:neovide_cursor_unfocused_outline_width = 0";
 
+/// The `:let` that starts the editor with snacks.nvim's smooth-scroll animation off.
+///
+/// Neovide already animates scrolling (`neovide_scroll_animation_length`); with snacks' `scroll` on as
+/// well (LazyVim turns it on) two animators move the same window, and with render-markdown the cursor
+/// can loop around on `k`. snacks tests `vim.g.snacks_scroll ~= false` on every scroll
+/// (`lua/snacks/scroll.lua`, the `filter` default), so the variable is read live: this value, set before
+/// the user's config, keeps the animation off, and a `vim.g.snacks_scroll = true` in `init.lua` (or a
+/// later `:let`) turns it back on. Nothing happens when snacks is not installed.
+pub const SNACKS_SCROLL_OFF_CMD: &str = "let g:snacks_scroll = v:false";
+
+/// The single `--cmd` that carries this pane's own defaults: [`HIDE_UNFOCUSED_CURSOR_CMD`] and
+/// [`SNACKS_SCROLL_OFF_CMD`] joined with ` | `. One argument, not one per default, because nvim takes at
+/// most ten `--cmd` and the window's own feeds already take the rest.
+pub fn pane_default_cmd() -> String {
+    format!("{HIDE_UNFOCUSED_CURSOR_CMD} | {SNACKS_SCROLL_OFF_CMD}")
+}
+
 /// The whole argument list this pane hands to `LiveHarnessOptions::extra_nvim_args`: `--clean`
-/// if asked for, then this pane's own default (`HIDE_UNFOCUSED_CURSOR_CMD`), then the host's
-/// extras -- so a host's `--cmd` can override the default too. When there is something to open, the
+/// if asked for, then this pane's own defaults (`pane_default_cmd`), then the host's
+/// extras -- so a host's `--cmd` can override a default too. When there is something to open, the
 /// list ends with `--embed` and then those arguments.
 ///
 /// `--embed` is spelled here, only when `open` is not empty, because nvim loads a positional file
@@ -1226,7 +1243,7 @@ fn nvim_args(clean: bool, extra: &[String], open: &[String]) -> Vec<String> {
         args.push("--clean".to_string());
     }
     args.push("--cmd".to_string());
-    args.push(HIDE_UNFOCUSED_CURSOR_CMD.to_string());
+    args.push(pane_default_cmd());
     args.extend(extra.iter().cloned());
     if !open.is_empty() {
         args.push("--embed".to_string());
@@ -4194,8 +4211,9 @@ mod tests {
     }
 
     #[test]
-    fn clean_comes_first_then_the_cursor_default_then_the_hosts_extras() {
-        let hide = super::HIDE_UNFOCUSED_CURSOR_CMD;
+    fn clean_comes_first_then_the_pane_defaults_then_the_hosts_extras() {
+        let hide = super::pane_default_cmd();
+        let hide = hide.as_str();
         let extra = vec!["--cmd".to_string(), "lua print(1)".to_string()];
         assert_eq!(
             nvim_args(true, &extra, &[]),
@@ -4211,7 +4229,8 @@ mod tests {
 
     #[test]
     fn targets_follow_an_embed_the_pane_spells_and_nothing_else_changes() {
-        let hide = super::HIDE_UNFOCUSED_CURSOR_CMD;
+        let hide = super::pane_default_cmd();
+        let hide = hide.as_str();
         let extra = vec!["--cmd".to_string(), "lua print(1)".to_string()];
         let open = vec!["+42".to_string(), "/a b".to_string()];
         assert_eq!(
@@ -4235,6 +4254,26 @@ mod tests {
             nvim_args(true, &[], &["/f".to_string()]),
             vec!["--clean", "--cmd", hide, "--embed", "/f"]
         );
+    }
+
+    #[test]
+    fn the_pane_defaults_are_one_cmd_that_turns_snacks_scroll_off_and_keeps_the_cursor_default() {
+        // nvim takes at most ten `--cmd`; the pane's defaults share one so the host's feeds keep their slots.
+        let cmd = super::pane_default_cmd();
+        assert_eq!(
+            cmd,
+            "let g:neovide_cursor_unfocused_outline_width = 0 | let g:snacks_scroll = v:false"
+        );
+        assert!(cmd.contains(super::HIDE_UNFOCUSED_CURSOR_CMD));
+        assert!(cmd.contains(super::SNACKS_SCROLL_OFF_CMD));
+        let args = nvim_args(false, &[], &[]);
+        assert_eq!(args.iter().filter(|a| *a == "--cmd").count(), 1);
+        // Ahead of the host's extras, so an extra `--cmd` (and then the user's own config) can turn it back on.
+        let extra = vec!["--cmd".to_string(), "let g:snacks_scroll = v:true".to_string()];
+        let args = nvim_args(true, &extra, &[]);
+        let default_at = args.iter().position(|a| a.contains("snacks_scroll = v:false")).unwrap();
+        let extra_at = args.iter().position(|a| a.contains("snacks_scroll = v:true")).unwrap();
+        assert!(default_at < extra_at);
     }
 
     /// A scale-factor change alone, with no animation, content, resize or keypress, must queue

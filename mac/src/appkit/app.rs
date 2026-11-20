@@ -255,6 +255,8 @@ fn start(mtm: MainThreadMarker, command_env: &[String]) -> Result<Option<(Rc<Hos
         crate::log_line!("[mac] no editor watch for nvim: a crash is taken for a quit");
     }
 
+    let nvim_extra = startup::nvim_extra(watch);
+
     let host = Host::new(mtm);
     let assembly = assemble(
         &root,
@@ -269,7 +271,7 @@ fn start(mtm: MainThreadMarker, command_env: &[String]) -> Result<Option<(Rc<Hos
     let config = EmbedConfig {
         data_dir: Some(paths.neovide_data),
         config_file: Some(paths.neovide_config),
-        args: startup::neovide_args(&paths.nvim_listen, &watch),
+        args: startup::neovide_args(&paths.nvim_listen, &nvim_extra),
     };
     Ok(Some((host, config)))
 }

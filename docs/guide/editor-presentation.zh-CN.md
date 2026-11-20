@@ -1,5 +1,5 @@
 [English](editor-presentation.md) | 简体中文
-<!-- translated-from: editor-presentation.md sha256=3f8f18c33bcc81f4ff94b7bb613c339980232bf653340d71db6181457c612dbb -->
+<!-- translated-from: editor-presentation.md sha256=c8467996a9ddd0c6777aa3b3551799f20cdffba2efece307ab1632f182577932 -->
 
 # 编辑器怎样把画面送上屏幕
 
@@ -34,3 +34,13 @@ eitri.config.set("editor.presentation", "auto")
 ## 试过哪些环境
 
 独立表面在 sway 和 Mutter（GNOME）上、缩放 1 和 1.5、AMD 显卡上测试过；没有在 KWin、Hyprland 和 NVIDIA 上试过，所以 `"auto"` 让 NVIDIA 保持 GTK 方式。如果在你的桌面上看起来不对（编辑器位置错了、旁边有缝、画面停在旧的一帧），请设成 `"gtk"` 并报告。
+
+## 平滑滚动
+
+Neovide 自己就会给滚动加动画。为了不让第二套动画叠在上面，Eitri 启动编辑器的 Neovim 时设置 `vim.g.snacks_scroll = false`，关掉 [snacks.nvim](https://github.com/folke/snacks.nvim) 的滚动动画（LazyVim 会把这个插件的 `scroll` 打开；它和 render-markdown 同时开着时，在 Markdown 缓冲区里按 `k` 之类的移动可能让光标绕圈）。想要 snacks 的滚动动画回来，在你自己的 Neovim 配置里写：
+
+```lua
+vim.g.snacks_scroll = true
+```
+
+你的配置在 Eitri 的默认值之后运行，所以这一行生效。

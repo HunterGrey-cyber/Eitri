@@ -159,10 +159,7 @@ fn width_cmd(width: &str) -> Vec<String> {
 
 /// What Eitri's editor pane passes: its own default, exactly as `NeovideEditorPane` builds it.
 fn pane_default() -> Vec<String> {
-    vec![
-        "--cmd".to_string(),
-        neovide_editor::HIDE_UNFOCUSED_CURSOR_CMD.to_string(),
-    ]
+    vec!["--cmd".to_string(), neovide_editor::pane_default_cmd()]
 }
 
 const CASE_ENV: &str = "EITRI_UNFOCUSED_CURSOR_CASE";

@@ -42,3 +42,15 @@ compositor and driver.
 The editor's own surface is tested on sway and on Mutter (GNOME), at scale 1 and 1.5, with AMD graphics. It has not
 been tried on KWin, Hyprland or NVIDIA. `"auto"` keeps NVIDIA on the GTK way for that reason. If something looks wrong
 on your desktop (the editor misplaced, a gap beside it, a stale frame), set `"gtk"` and report it.
+
+## Smooth scrolling
+
+Neovide animates scrolling by itself. So that a second animation does not run on top of it, Eitri starts the editor's
+Neovim with `vim.g.snacks_scroll = false`, which switches off the scroll animation of
+[snacks.nvim](https://github.com/folke/snacks.nvim) (LazyVim turns that plugin's `scroll` on; together with
+render-markdown, a motion such as `k` could move the cursor around in a Markdown buffer). To have snacks' scroll back,
+put this in your own Neovim configuration, which runs after Eitri's default:
+
+```lua
+vim.g.snacks_scroll = true
+```
