@@ -362,21 +362,24 @@ impl gtk_host::HintPort for ShellHints {
     }
 }
 
-impl gtk_host::EditorReads for NeovideEditorPane {
+/// What the window's router reads of its editor: the editor's pane.
+pub(crate) struct EditorPaneReads(pub(crate) std::rc::Rc<NeovideEditorPane>);
+
+impl gtk_host::EditorReads for EditorPaneReads {
     fn facts(&self) -> eitri_core::wm::EditorFacts {
         kill_pane::editor_facts(
-            self.is_running(),
-            self.nvim_exited(),
-            self.nvim_exit_pending(),
-            self.is_starting(),
-            self.watched_call().as_ref(),
+            self.0.is_running(),
+            self.0.nvim_exited(),
+            self.0.nvim_exit_pending(),
+            self.0.is_starting(),
+            self.0.watched_call().as_ref(),
         )
     }
     fn cell(&self) -> Option<(f64, f64)> {
-        self.cell_size()
+        self.0.cell_size()
     }
     fn running(&self) -> bool {
-        self.is_running()
+        self.0.is_running()
     }
 }
 

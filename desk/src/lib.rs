@@ -7,10 +7,30 @@
 //! is declared for Linux only, in its own file named in `core/tests/linux_only_modules_scan.rs`, never inline.
 //!
 //! It holds the linked windows (`linked`, Linux only for now) with the host traits they are written against
-//! (`host_traits`), and the guards that cover them.
+//! (`host_traits`), the op router that carries the controller's ops out through those traits (`router`), the
+//! module instance pool, the wiring plan of a module's host, the panel's hook registration, the fit of the prefix's
+//! hint panel and the scheduler's book of armed sources, and the guards that cover them.
 
-/// What the linked windows' code asks of the host that carries it.
+/// What the linked windows' code and the op router ask of the host that carries them.
 pub mod host_traits;
+
+/// The op router: every op the window controller emits is carried out through the host's traits.
+pub mod router;
+
+/// Live and idle module instances, kept by the id they were made for.
+pub mod instance_pool;
+
+/// Which controllers each kind of module host gets, as a value.
+pub mod wire_plan;
+
+/// Every hook a window hands its agent panel, registered by one function.
+pub mod panel_wiring;
+
+/// What of the prefix's hint panel fits the window, decided from measures a toolkit gives.
+pub mod prefix_fit;
+
+/// A scheduler's book of armed sources, one per token of the window contract.
+pub mod source_book;
 
 /// The linked windows: the project's second window, the chat and page windows, and the link between them. Linux-only
 /// as a whole, because `core::window_link::{fdpass, link, start}` and `agent::child` are Linux-only on purpose;

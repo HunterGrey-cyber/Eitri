@@ -525,3 +525,55 @@ mod start_dir_tests {
         assert!((face.base_px - px(16.0)).abs() < 1e-3);
     }
 }
+
+/// A killed terminal's late exit and the pane that reused its number, over the window's pool of terminals.
+#[cfg(test)]
+mod pool_tests {
+    use super::exit_is_current;
+    use crate::gtk_host::instance_pool::{InstancePool, Retire, Reused};
+    use eitri_core::layout::{ModuleId, ModuleKind};
+    use std::cell::Cell;
+    use std::rc::Rc;
+
+    /// A pane that counts its starts, as its generation.
+    #[derive(Clone)]
+    struct FakePane {
+        generation: Rc<Cell<u64>>,
+    }
+
+    impl FakePane {
+        fn new() -> Self {
+            Self {
+                generation: Rc::new(Cell::new(0)),
+            }
+        }
+
+        fn start(&self) {
+            self.generation.set(self.generation.get() + 1);
+        }
+    }
+
+    impl Retire for FakePane {
+        fn on_retire(&self) {}
+    }
+
+    fn id(n: u8) -> ModuleId {
+        ModuleId::instance(ModuleKind::Terminal, n).unwrap()
+    }
+
+    #[test]
+    fn a_late_exit_from_a_killed_shell_never_closes_the_instance_that_reused_its_number() {
+        assert!(!exit_is_current(1, 2));
+        assert!(exit_is_current(2, 2));
+        let mut terminals = InstancePool::new();
+        let (pane, _) = terminals.take_or_make(&id(2), FakePane::new);
+        pane.start();
+        let reported = pane.generation.get();
+        assert!(terminals.retire(&id(2)));
+        let (reopened, reused) = terminals.take_or_make(&id(2), || panic!("must reuse"));
+        assert_eq!(reused, Reused::Yes);
+        reopened.start();
+        assert_eq!(reopened.generation.get(), 2);
+        assert!(!exit_is_current(reported, reopened.generation.get()));
+    }
+}

@@ -26,10 +26,10 @@ use std::cell::RefCell;
 use std::path::PathBuf;
 use std::rc::{Rc, Weak};
 
+use crate::chat_views::ChatPage;
 use eitri_core::layout::{ModuleId, ModuleKind};
 use eitri_core::tabs::ViewId;
 use eitri_core::wm::{DropWhy, EditorSpawn, SurfaceKind, WinId};
-use eitri_panel::panel_page::PanelPage;
 use gtk4::glib;
 use gtk4::prelude::*;
 use neovide_editor::{NeovideEditorPane, NeovideEditorPaneOptions};
@@ -46,7 +46,7 @@ use crate::web_host::WebHost;
 use crate::wire::{wire_host, WireDeps, WireKind};
 
 /// Every extra chat view's page, keyed by its module id (`chat_views`'s module doc).
-pub(crate) type ChatPool = Rc<Registry<(webkit6::WebView, Rc<PanelPage>)>>;
+pub(crate) type ChatPool = Rc<Registry<ChatPage>>;
 
 /// Why a new chat view is refused where WebKit cannot start.
 pub(crate) const CHAT_VIEWS_NEED_WEBKIT: &str = "chat views need WebKit, which cannot start here";
@@ -338,9 +338,9 @@ impl Surfaces {
     fn chat_page_host(&self, id: &ModuleId, base: &webkit6::WebView) -> Result<gtk4::Widget, String> {
         let grid = self.grid()?;
         let view = ViewId::of_module(id).ok_or_else(|| format!("{id} is not a chat view"))?;
-        let ((webview, _), _) = self
-            .chat_views
-            .take_or_make(id, || agent_panel::build_chat_page(&self.agent, view, Some(base)));
+        let (ChatPage { view: webview, .. }, _) = self.chat_views.take_or_make(id, || {
+            ChatPage::of(agent_panel::build_chat_page(&self.agent, view, Some(base)))
+        });
         let host = WebHost::new(&webview);
         self.place(&grid, id, &host, &webview, self.web_host);
         Ok(host.upcast())
@@ -424,9 +424,9 @@ impl Surfaces {
             .filter(|view| !view.is_base())
             .ok_or_else(|| format!("{id} is not an extra chat view"))?;
         let was_live = self.chat_views.holds(id);
-        let ((webview, page), reused) = self
-            .chat_views
-            .take_or_make(id, || agent_panel::build_chat_page(&self.agent, view, Some(base)));
+        let (ChatPage { view: webview, page }, reused) = self.chat_views.take_or_make(id, || {
+            ChatPage::of(agent_panel::build_chat_page(&self.agent, view, Some(base)))
+        });
         // Says which of the pool's two answers this was, so a log shows a page reused rather than built.
         println!(
             "[chat] {id}: page {}",
@@ -801,7 +801,7 @@ mod tests {
         let terminal = instance(ModuleKind::Terminal, 2);
         let chat = instance(ModuleKind::Agent, 2);
         terminals.take_or_make(&terminal, || Idle);
-        chat_views.take_or_make(&chat, || ());
+        chat_views.take_or_make(&chat, || crate::chat_views::KeptPage);
         assert!(
             in_use(&terminal, &terminals, &chat_views),
             "a running terminal keeps its pane"

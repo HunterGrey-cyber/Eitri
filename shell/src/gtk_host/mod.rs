@@ -1,6 +1,9 @@
-//! The GTK shell's side of the window contract: `GtkHost` carries out the controller's ops on real
-//! widgets and reports what GTK did through the attached sink; `scheduler::GlibScheduler` arms its
-//! timers, idles and watches on GLib's default context.
+//! The GTK shell's side of the window contract. The op router ([`eitri_desk::router`], the type [`WmHost`]) matches
+//! every op the window controller emits and carries it out through the collaborators the shell gives it; `GtkHost` is
+//! the GTK back end it does that through, its [`Views`] (a module's surface shown, hidden and given the keys, the
+//! chrome drawn, the grid and the editor read) and its [`WindowPort`] (a window opened, shown, closed, put in a mode,
+//! placed), reporting what GTK did through the attached sink. `scheduler::GlibScheduler` arms the controller's timers,
+//! idles and watches on GLib's default context.
 //!
 //! **Re-entrancy.** GTK emits signals while an op is still running: `grab_focus` notifies
 //! `focus-widget` before it returns, `Unmap` of the surface holding the keys clears the window's
@@ -21,27 +24,15 @@
 //! `close()` (GTK ignores a close from inside its close-request emission); it is noted instead,
 //! and the handler lets the close under way proceed whatever the sink answered.
 //!
-//! **The editor's quit.** `Editor(Quit)` sends nvim the quit flow's `:confirm qall` as a watched request; one
-//! that could not be sent is refused and also posted as `EditorEvent::QuitNotSent` with the quit's generation,
-//! since a refusal names no call. `Editor(End)` ends nvim, `Editor(ReleaseExited)` lets an exited nvim's pane go.
-//!
-//! **The editor's restart.** The release is told as its own fact either way, `EditorEvent::Released` or
-//! `ReleaseRefused` (nvim's process still lives), and `Editor(Restart)` starts a fresh nvim on the released pane with
-//! the spawn it carries ([`ServiceSet::restart_editor`]); a pane that refused from the state it was in is refused as
-//! any failed op is and told as `EditorEvent::RestartRefused` naming that state, since a refusal names no call. A
-//! restart carried out is told only once its nvim is ready, by the shell's ready hook (`EditorEvent::Ready`).
-//!
-//! **Surfaces and services.** The host builds and drops module surfaces through a [`SurfaceMaker`]
-//! and carries out the service ops the controller's module lifecycle emits (a terminal's start, a
-//! plugin page's build, reload, visibility and stop, a chat view's chooser) through a
-//! [`ServiceSet`]. Both are traits because what they act on (the grid, the terminal registry, the
-//! plugin pages, the chat panel) belongs to the shell's binary, and this module is also compiled
-//! alone by its conformance test, which hands it stubs. Until one is set, its ops are refused as
-//! not carried out.
+//! **Surfaces and services.** The router builds and drops module surfaces through a [`SurfaceMaker`] and carries out
+//! the service ops through a [`ServiceSet`]. Both are `eitri-desk` traits because every host gives its own (here what
+//! they act on, the grid, the terminal registry, the plugin pages, the chat panel, is the shell binary's), and this
+//! module is also compiled alone by its conformance test, which hands it stubs. A surface the maker builds is
+//! registered here ([`GtkHost::register_surface`]): the widget focus, map and unmap act on.
 //!
 //! **Starting a window.** `OpenWindow` builds the window (created, not shown) for the application
-//! set with [`GtkHost::set_application`] and adopts it; `Present` shows it. `Lua` ops go to the
-//! [`LuaRunner`] the shell sets (`init.lua` and the events it emits are the binary's).
+//! set with [`GtkHost::set_application`] and adopts it; `Present` shows it, through the compositor-aware
+//! [`PairRaise`] when the shell sets one.
 //!
 //! **The window's mode.** `SetMode` toggles the window's mode through the function the shell sets
 //! ([`GtkHost::set_mode_toggle`]), as `prefix F11` does, rather than setting the state it names: the shell owns the
@@ -52,43 +43,18 @@
 //! to be built, the editor's grab that also tells the input method; whether the module is on screen
 //! is the controller's to know before it asks. Without one it is the bare grab. A top-bar item's
 //! `Focus` goes through [`GtkHost::set_top_bar`], which brings a hidden bar out first, and the rename entry's
-//! through [`GtkHost::set_rename_entry`], which does the same and shows the entry so it can take them. The
-//! `select.number` digits and HINT's toggle go to the window's [`HintPort`]; a `Chrome` op reads the
-//! window's model through [`GtkHost::set_chrome_model`] and redraws what changed on the widgets
-//! [`GtkHost::set_chrome_widgets`] gives ([`chrome::reconcile`]), every flash and toast included. The cursor
-//! signals, the literal keys and a chat page's claimed navigation key are service ops
-//! ([`ServiceSet`]), and whether a chat page claims a key is the read [`GtkHost::set_chat_claims`]
-//! gives.
+//! through [`GtkHost::set_rename_entry`], which does the same and shows the entry so it can take them. A
+//! `Chrome` op reads the window's model through [`GtkHost::set_chrome_model`] and redraws what changed on the
+//! widgets [`GtkHost::set_chrome_widgets`] gives ([`chrome::reconcile`]), every flash and toast included.
 //!
 //! **The grid and the editor.** Each window's grid is reached through a [`GridPort`] and its editor
 //! through [`EditorReads`] ([`GtkHost::set_grid`], [`GtkHost::set_editor`]): `Allocate` asks the grid
 //! for a new allocation, `Restack` puts its float band in the op's order, and `Map`/`Unmap` leave
-//! alone a host the grid's probe places by hand. The host also answers the controller's
-//! [`HostReads`] from them, and with [`NoReads`]' values for a window that has given neither yet;
-//! a chat view's attention is the read [`GtkHost::set_view_attention`] gives.
+//! alone a host the grid's probe places by hand. The router answers the controller's reads from them.
 //!
-//! **The pair.** `OpenLinkedWindow` starts or raises the project's second window through the [`LinkedWindows`] the
-//! shell sets ([`GtkHost::set_linked_windows`]), with an activation token from the window's display; `RaisePeer` asks
-//! that token and answers with `PeerEvent::Raised`, on which the controller asks the other window to come forward.
-//! The controller's way onto the link itself is [`peer::LinkPort`], attached by the link's own code, not the host's.
-//! `EndPeer` ends the other window through the same set, when this window started it.
-//! `RestoreLinkedWindow` starts window 2 again at a launch through the same [`LinkedWindows`], with no token, and
-//! `StartEditorWindow` starts the editor window from a window 2 left without one.
-//! A module window of compositor mode adds five: `OpenModuleWindow` starts or raises a chat or page window through
-//! [`LinkedWindows::open_module`] (a window the start opens takes no token and leaves the keys where they are),
-//! `ForwardRaise` answers with the token a module window forwarded, `PeerRun` and `HubAsk` send `run_action` and
-//! `hub_ask` over the link ([`LinkedWindows::send`], [`LinkedWindows::send_to_hub`]), and `CompositorFocus` is the
-//! compositor's focus move past the window's edge, through [`PairRaise::move_focus`].
-//! `PlaceWindow` applies this process's placement role, optionally moving to an output before focusing
-//! ([`monitor_move`]), through the [`MonitorPlacer`] the shell sets, never on the GTK thread.
-//!
-//! **Moves.** An arriving module's `PrepareSurface` and `AdoptMoved` go to the [`SurfaceMaker`]: a terminal's place
-//! is its pane, made off screen at the size the other window had it at, before anything there is frozen, and its
-//! adoption takes the descriptors out of the op and builds the session over them; a numbered chat view's place is its
-//! page, off screen, and a chat's adoption (into that view, or into the base view, which is never prepared) is the
-//! panel's, from the record and the descriptors; a kind whose arrival the maker does not build is refused, so the
-//! controller refuses the offer while its source still holds it whole. The terminal's freeze, forget and resume are
-//! its service's ([`ServiceSet::terminal`]), a chat's the panel's ([`ServiceSet::chat`]).
+//! **Placing and the compositor.** `PlaceWindow` applies this process's placement role, optionally moving to an
+//! output before focusing ([`monitor_move`]), through the [`MonitorPlacer`] the shell sets, never on the GTK thread;
+//! `CompositorFocus` is the compositor's focus move past the window's edge, through [`PairRaise::move_focus`].
 //!
 //! **Lifetime.** The host holds its windows weakly. GTK drops its own reference when a window
 //! closes, and only then does the window dispose and emit `destroy`, which is where the host
@@ -98,32 +64,32 @@
 #![allow(dead_code)]
 
 pub(crate) mod chrome;
-pub(crate) mod instance_pool;
 pub(crate) mod keys;
 pub(crate) mod onboarding;
 pub(crate) mod prefix_panel;
 pub(crate) mod project_chooser;
 pub(crate) mod scheduler;
 
-pub(crate) use eitri_desk::host_traits::{LinkedWindows, NOT_CARRIED_OUT};
+pub(crate) use eitri_desk::host_traits::{
+    respawn_pane, BasePageMaker, BesidePort, EditorReads, GridPort, HintPort, LuaRunner, ProjectHost, RespawnPane,
+    RestartRefused, ServiceSet, SurfaceMaker, NOT_CARRIED_OUT,
+};
 pub(crate) use eitri_desk::linked::peer;
+pub(crate) use eitri_desk::router::{Router, Views, WindowPort};
+pub(crate) use eitri_desk::{instance_pool, prefix_fit, source_book, wire_plan};
+
+/// The window's op router over the GTK host, which is both its views and its window port.
+pub(crate) type WmHost = Router<GtkHost, GtkHost>;
 
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::PathBuf;
 use std::rc::{Rc, Weak};
 
-use eitri_core::attention::Attention;
-use eitri_core::layout::{Direction, ModuleId, Rect, Size};
-use eitri_core::tabs::ViewId;
-use eitri_core::window_link::names::WindowName;
-use eitri_core::window_link::Msg;
+use eitri_core::layout::{Direction, ModuleId, Rect};
 use eitri_core::wm::chrome::ChromeModel;
 use eitri_core::wm::{
-    ActivationToken, Applied, ChatKillCounts, ChatOp, ChooserEnv, CleanupOp, CloseBy, CloseVerdict, DropWhy,
-    EditorCall, EditorEvent, FocusChain, FocusOwner, FocusTo, HintOp, Host, HostEvent, HostOp, HostReads, HostSink,
-    LuaOp, Monitor, MonitorId, NoReads, OnboardingOp, OpTag, PeerEvent, PeerId, PluginOp, ProjectOp, SurfaceKind,
-    TermOp, WinId, WindowSpec,
+    ActivationToken, CloseBy, CloseVerdict, FocusChain, FocusOwner, HostEvent, HostSink, Monitor, MonitorId, WinId,
+    WindowSpec,
 };
 use gtk4::prelude::*;
 use gtk4::{gdk, glib};
@@ -147,47 +113,8 @@ type RenameEntryFn = dyn Fn(WinId) -> bool;
 /// before the `Chrome` op that fills it. Whether it took them.
 type OnboardingFocusFn = dyn Fn(WinId) -> bool;
 
-/// What carries out the first-start screen's own ops (the checks, the detection, the write, the marker, the editor):
-/// the shell's `OnboardingHost`. It answers each as a fact later, through the driver.
-type OnboardingFn = dyn Fn(&OnboardingOp) -> Applied;
-
-/// The native project chooser and its asynchronous work, supplied without coupling the host to the binary.
-pub(crate) trait ProjectHost {
-    fn apply(&self, op: &ProjectOp) -> Applied;
-    /// Carries out [`ProjectOp::Open`], with the activation token the started window comes forward with.
-    fn open(&self, win: WinId, target: &std::path::Path, token: Option<String>) -> Applied;
-    fn focus(&self, win: WinId) -> bool;
-    fn env(&self, win: WinId) -> ChooserEnv;
-}
-
 /// What reads a window's chrome model from the controller; nothing for a window it does not hold.
 type ChromeModelFn = dyn Fn(WinId) -> Option<ChromeModel>;
-
-/// What a chat view holds for the user, as its chip and its strip entry show it: read only, it never calls back.
-type ViewAttentionFn = dyn Fn(ViewId) -> Attention;
-
-/// Whether a chat page keeps a navigation key for itself: read only, it never calls back.
-type ChatClaimsFn = dyn Fn(ViewId, Direction) -> bool;
-
-/// The chat view holding the oldest card waiting for an answer: read only, it never calls back.
-type OldestCardFn = dyn Fn(WinId) -> Option<ViewId>;
-
-/// What a chat view's kill would end, and whether its tabs can close now: read only, it never calls back.
-type KillCountsFn = dyn Fn(ViewId) -> ChatKillCounts;
-
-/// Whether a new chat view can be given its first tab now (a break-out when the flag is set): read only, it never
-/// calls back.
-type FirstTabFn = dyn Fn(ViewId, bool) -> Result<(), String>;
-
-/// The window's `select.number` digits and HINT's session, which stays the shell's.
-pub(crate) trait HintPort {
-    /// Draws each module's digit, the tenth module's as `0`.
-    fn show_digits(&self, win: WinId, digits: &[(ModuleId, u8)]);
-    /// Takes the digits down; nothing if none are up.
-    fn hide_digits(&self, win: WinId);
-    /// Starts or ends a HINT from the prefix; `keycode` is the key still held down that ran it.
-    fn toggle(&self, win: WinId, keycode: u32);
-}
 
 /// The compositor-aware presentation of a window of a pair or one that takes files from outside, supplied by the binary
 /// so the host can also run alone.
@@ -196,14 +123,6 @@ pub(crate) trait PairRaise {
     /// Has the compositor move the keys one window `direction`; `false` with no adapter to do it, which `on_none` has
     /// then said once. Never waits: the adapter's command runs on its worker.
     fn move_focus(&self, direction: Direction, on_none: &dyn Fn(&str)) -> bool;
-}
-
-/// What carries out a [`eitri_core::wm::BesideOp`] in a page window beside the person's own nvim: the shell binary's
-/// page window, by the nvim it follows. A host without it carries none out.
-pub(crate) trait BesidePort {
-    /// Carries `op` out: an `Err` is the reason it was refused now; one a worker finds later is handed to `later`,
-    /// on the main loop. Never waits.
-    fn carry_out(&self, op: &eitri_core::wm::BesideOp, later: Box<dyn FnOnce(String)>) -> Result<(), String>;
 }
 
 /// Why `PlaceWindow` is refused where no window manager adapter can move a window.
@@ -287,295 +206,14 @@ pub(crate) trait MonitorPlacer {
     fn place(&self, how: MonitorMove);
 }
 
-/// What builds a module's surface for `CreateSurface` and releases it for `DropSurface`.
-/// Builds the window's base chat page when the controller says so (`HostOp::BuildBasePage`), which it does once and
-/// never in a hub or a page window.
-pub(crate) trait BasePageMaker {
-    fn build(&self);
-}
-
-pub(crate) trait SurfaceMaker {
-    /// Reveals a prepared page in the same allocation that applies its committed arrangement.
-    fn mapped(&self, _module: &ModuleId, _mapped: bool) {}
-
-    /// Builds `module`'s host for `kind` as the window's startup builds one, places it off screen,
-    /// registers it with the host and wires its controllers. A module whose host already exists keeps
-    /// it as it is: a host never gets a second set of controllers. `Err` says why nothing was built.
-    fn create(&self, win: WinId, module: &ModuleId, kind: &SurfaceKind) -> Result<(), String>;
-    /// Releases what `why` ends: a killed web module's web process, a retired chat view's page. The
-    /// host widget stays in the window for the module's next instance.
-    fn drop_surface(&self, win: WinId, module: &ModuleId, why: &DropWhy) -> Result<(), String>;
-    /// Makes the place of `module`, arriving from the other window, off screen at `size` (logical pixels; zero when
-    /// the other window could not tell), registered with the host, before anything there is frozen. `Err` for a kind
-    /// whose arrival is not built here, or why nothing was made.
-    fn prepare(
-        &self,
-        win: WinId,
-        module: &ModuleId,
-        shape: &eitri_core::window_link::Shape,
-        size: (u32, u32),
-    ) -> Result<(), String> {
-        let _ = (win, module, shape, size);
-        Err(NOT_CARRIED_OUT.into())
-    }
-    /// Builds the prepared `module` from what a committed move carried: `fds` are this call's to keep or close.
-    fn adopt(
-        &self,
-        win: WinId,
-        module: &ModuleId,
-        kind: eitri_core::wm::moves::MoveKind,
-        record: &serde_json::Value,
-        fds: Vec<std::os::fd::OwnedFd>,
-    ) -> Result<(), String> {
-        let _ = (win, module, kind, record, fds);
-        Err(NOT_CARRIED_OUT.into())
-    }
-}
-
-/// The pane operations a restart in place needs, independent of a registry or widget implementation.
-pub(crate) trait RespawnPane {
-    fn shell_start(&self) -> eitri_core::wm::ShellStart;
-    /// Opens a replacement server terminal in `dir`. The pane owns the asynchronous request.
-    fn respawn_server(&self, _dir: PathBuf) -> Result<(), String> {
-        Err("server terminal restart is not available yet".into())
-    }
-    fn close(&self);
-    fn set_start_dir(&self, dir: PathBuf);
-    fn start(&self);
-}
-
-/// Checks the captured shell before touching the pane: the same shell, given no key or mouse report since the read
-/// that found it idle, since a command typed after the read runs in that same shell. No registry borrow outlives the
-/// lookup.
-pub(crate) fn respawn_pane(
-    pane: Option<impl RespawnPane>,
-    expect: eitri_core::wm::ShellStart,
-    dir: PathBuf,
-) -> Result<(), String> {
-    let pane = pane.ok_or_else(|| "the terminal changed".to_string())?;
-    if !expect.untouched(Some(pane.shell_start())) {
-        return Err("the terminal changed".into());
-    }
-    if matches!(expect.identity, Some(eitri_core::wm::ShellIdentity::Server { .. })) {
-        return pane.respawn_server(dir);
-    }
-    pane.close();
-    pane.set_start_dir(dir);
-    pane.start();
-    Ok(())
-}
-
-/// The window's services the controller's effect ops call. `Err` says why an op was not carried out.
-pub(crate) trait ServiceSet {
-    fn view_of_tab(&self, _tab: eitri_core::tabs::TabId) -> Option<ViewId> {
-        None
-    }
-    fn tab_moving(&self, _tab: eitri_core::tabs::TabId) -> bool {
-        true
-    }
-    fn tab_has_work(&self, _tab: eitri_core::tabs::TabId) -> bool {
-        false
-    }
-    fn page_built(&self, _module: &ModuleId) -> bool {
-        false
-    }
-
-    fn plugin_keys_help(&self, _module: &ModuleId) -> Option<eitri_core::plugin::keys::PluginKeysHelp> {
-        None
-    }
-    fn chat_views(&self) -> Vec<ViewId> {
-        Vec::new()
-    }
-    fn can_break_out(&self) -> Result<(), String> {
-        Err(NOT_CARRIED_OUT.into())
-    }
-    /// As [`HostReads::chat_move`] reads it, of this window's panel; with no panel, no chat moves.
-    fn chat_move(&self, view: ViewId, session: Option<&str>) -> Result<eitri_core::wm::ChatMoveFacts, String> {
-        let _ = (view, session);
-        Err(NOT_CARRIED_OUT.into())
-    }
-    fn running_chats(&self) -> Vec<(ModuleId, Option<eitri_core::tabs::TabId>)> {
-        Vec::new()
-    }
-    fn terminal_job_names(&self) -> Vec<String> {
-        Vec::new()
-    }
-    fn terminal_job_modules(&self) -> Vec<ModuleId> {
-        Vec::new()
-    }
-    fn pages_with_tasks(&self) -> Vec<ModuleId> {
-        Vec::new()
-    }
-    fn base_tabs(&self) -> Vec<eitri_core::tabs::TabId> {
-        Vec::new()
-    }
-    fn active_base_tab(&self) -> Option<eitri_core::tabs::TabId> {
-        None
-    }
-    fn arrived_tab(&self, _mv: eitri_core::window_link::moves::MoveId) -> Option<eitri_core::tabs::TabId> {
-        None
-    }
-    fn tab_move(&self, _tab: eitri_core::tabs::TabId) -> Result<eitri_core::wm::ChatMoveFacts, String> {
-        Err(NOT_CARRIED_OUT.into())
-    }
-    fn tab_hand_over(&self, _tab: eitri_core::tabs::TabId) -> Result<eitri_core::wm::TabHandOver, String> {
-        Err(NOT_CARRIED_OUT.into())
-    }
-    fn moved_tab_key(&self, _tab: eitri_core::tabs::TabId) -> Option<eitri_core::window_link::base_tabs::MovedTabKey> {
-        None
-    }
-    fn order_base_tabs(
-        &self,
-        _tabs: &[eitri_core::tabs::TabId],
-        _active: Option<eitri_core::tabs::TabId>,
-    ) -> Result<(), String> {
-        Err(NOT_CARRIED_OUT.into())
-    }
-    /// As [`HostReads::view_of_session`] reads it, of this window's panel; with no panel, no view holds one.
-    fn view_of_session(&self, session: &str) -> Option<ViewId> {
-        let _ = session;
-        None
-    }
-    /// The window's tab set, as [`HostReads::tab_can_step`] reads it: the set is this window's panel's, so the
-    /// read names no window. With no panel, no step switches.
-    fn tab_can_step(&self, delta: i32) -> bool {
-        let _ = delta;
-        false
-    }
-    /// As [`HostReads::tab_has_last`] reads it, of this window's panel; with no panel, there is no last tab.
-    fn tab_has_last(&self) -> bool {
-        false
-    }
-    /// As [`HostReads::tab_place`] reads it, of this window's panel; with no panel, there is no such tab.
-    fn tab_place(&self, n: u16) -> Option<eitri_core::tab_set::TabPlace> {
-        let _ = n;
-        None
-    }
-
-    /// As [`HostReads::terminal_jobs`] reads it: this window's terminals running a job, counted without waiting for
-    /// a child. With no terminals, none.
-    fn terminal_jobs(&self) -> usize {
-        0
-    }
-
-    fn editor(&self, op: &EditorCall) -> Result<(), String>;
-    /// Starts a fresh nvim in the window's released editor pane with `spawn`, as its first start launched one. A set
-    /// with no editor restarts none.
-    fn restart_editor(&self, spawn: &eitri_core::wm::EditorSpawn) -> Result<(), RestartRefused> {
-        let _ = spawn;
-        Err(RestartRefused::Unavailable(NOT_CARRIED_OUT.into()))
-    }
-    fn terminal(&self, op: &TermOp) -> Result<(), String>;
-    fn plugin(&self, op: &PluginOp) -> Result<(), String>;
-    fn chat(&self, op: &ChatOp) -> Result<(), String>;
-    /// Carries out a round key's step ([`HostOp::AgentsScan`]) off this thread, answered later as
-    /// [`HostEvent::Agents`]; `at` is the module with the keys. A set with no agents layer carries none out.
-    fn agents_scan(
-        &self,
-        win: WinId,
-        step: eitri_core::wm::agents_round::RoundKey,
-        at: Option<&ModuleId>,
-    ) -> Result<(), String> {
-        let _ = (win, step, at);
-        Err(NOT_CARRIED_OUT.into())
-    }
-    /// The teardown's steps that end no module (the pair, the scratch directory, the pane-switch channel, the
-    /// feeds). A set that holds none of them carries none out.
-    fn cleanup(&self, op: &CleanupOp) -> Result<(), String> {
-        let _ = op;
-        Err(NOT_CARRIED_OUT.into())
-    }
-    /// What the window decided about the open or raise request `id`, for its client. A set that holds no open socket
-    /// has no request to answer.
-    fn open_answer(&self, id: u64, accepted: bool) -> Result<(), String> {
-        let _ = (id, accepted);
-        Err(NOT_CARRIED_OUT.into())
-    }
-    /// What the pair file and the pages are told once the controller took back what a window held for the other
-    /// window. A set with no pair carries none out.
-    fn pair(&self, op: &eitri_core::wm::PairOp) -> Result<(), String> {
-        let _ = op;
-        Err(NOT_CARRIED_OUT.into())
-    }
-}
-
-/// Why the editor's service did not restart the pane.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum RestartRefused {
-    /// The pane was not released: `state` names the state it was in.
-    Pane { state: String },
-    /// Nothing here restarts an editor: the words say why.
-    Unavailable(String),
-}
-
-/// What the `Lua` ops run on: the window's Lua kernel. `Err` says why an op was not carried out.
-pub(crate) trait LuaRunner {
-    fn run(&self, op: &LuaOp) -> Result<(), String>;
-}
-
-/// A window's grid, as the host reads and drives it. A trait because the grid belongs to the shell's
-/// binary, and this module is also compiled alone by its conformance test, which hands it a stub.
-pub(crate) trait GridPort {
-    /// Attaches native pointer reports to the window's event sink. A stand-in grid has no gestures to wire.
-    fn set_pointer_sink(&self, win: WinId, sink: Weak<dyn HostSink>) {
-        let _ = (win, sink);
-    }
-
-    /// The grid's allocation, or the stand-in content size before its first one.
-    fn size(&self) -> Size;
-    /// The divider thickness, as the grid's dividers measure.
-    fn handle_px(&self) -> i32;
-    /// A container strip's row height, as the grid's strips measure.
-    fn strip_px(&self) -> i32;
-    /// `module`'s minimum size, as its host measures.
-    fn module_min(&self, module: &ModuleId) -> Size;
-    /// Asks for one new measure and allocation of the grid.
-    fn queue_allocation(&self);
-    /// Puts the floats' hosts in `order`, bottom first, above everything tiled; nothing else moves.
-    fn restack_floats(&self, order: &[ModuleId]);
-    /// Whether the grid's probe places `module`'s host by hand, so no map or unmap may touch it.
-    fn probe_places(&self, module: &ModuleId) -> bool;
-    /// `module`'s host as the grid last allocated it; nothing for a host not laid out.
-    fn module_size(&self, module: &ModuleId) -> Option<Size> {
-        let _ = module;
-        None
-    }
-}
-
-/// What the host reads of a window's editor.
-pub(crate) trait EditorReads {
-    /// The editor's cell size in logical pixels, when it can tell.
-    fn cell(&self) -> Option<(f64, f64)>;
-    /// Whether the editor's child is running.
-    fn running(&self) -> bool;
-    /// The pane's facts, copied without waiting for a quit request's worker.
-    fn facts(&self) -> eitri_core::wm::EditorFacts {
-        eitri_core::wm::EditorFacts {
-            running: self.running(),
-            ..Default::default()
-        }
-    }
-}
-
-/// The `Map` and `Unmap` ops of `ops` the grid carries out, as each module and whether it is to be shown:
-/// a host the grid's probe places by hand is left where the probe put it, as the grid's own apply leaves it.
-pub(crate) fn hosts_to_map(ops: &[HostOp], probe_places: impl Fn(&ModuleId) -> bool) -> Vec<(WinId, ModuleId, bool)> {
-    ops.iter()
-        .filter_map(|op| match op {
-            HostOp::Map { win, module } => Some((*win, module.clone(), true)),
-            HostOp::Unmap { win, module } => Some((*win, module.clone(), false)),
-            _ => None,
-        })
-        .filter(|(_, module, _)| !probe_places(module))
-        .collect()
-}
-
 /// A window's chrome as the host draws it: its widgets, and the model last drawn on them.
 struct ChromeDrawn {
     widgets: chrome::ChromeWidgets,
     last: RefCell<Option<ChromeModel>>,
 }
 
+/// The GTK host's state: each window it holds, the surfaces registered in them, and what the shell gives it to show
+/// and focus them with. The router ([`WmHost`]) carries ops out through it as its [`Views`] and [`WindowPort`].
 pub(crate) struct GtkHost {
     me: Weak<GtkHost>,
     sink: RefCell<Option<Weak<dyn HostSink>>>,
@@ -587,31 +225,16 @@ pub(crate) struct GtkHost {
     /// for it arrived meanwhile (then the close under way proceeds).
     asking: RefCell<BTreeMap<WinId, bool>>,
     mode_toggle: RefCell<Option<Rc<ModeToggleFn>>>,
-    surface_maker: RefCell<Option<Rc<dyn SurfaceMaker>>>,
-    base_page_maker: RefCell<Option<Rc<dyn BasePageMaker>>>,
-    services: RefCell<Option<Rc<dyn ServiceSet>>>,
-    lua: RefCell<Option<Rc<dyn LuaRunner>>>,
     /// The application `OpenWindow` builds windows for; held weakly, as GTK holds its windows.
     application: RefCell<Option<glib::WeakRef<gtk4::Application>>>,
     focus_fn: RefCell<Option<Rc<FocusFn>>>,
     top_bar_fn: RefCell<Option<Rc<TopBarFn>>>,
     rename_entry_fn: RefCell<Option<Rc<RenameEntryFn>>>,
     onboarding_focus_fn: RefCell<Option<Rc<OnboardingFocusFn>>>,
-    onboarding_fn: RefCell<Option<Rc<OnboardingFn>>>,
-    project_host: RefCell<Option<Rc<dyn ProjectHost>>>,
     chrome_model: RefCell<Option<Rc<ChromeModelFn>>>,
     /// Each window's chrome widgets, with the model last drawn on them.
     chrome: RefCell<BTreeMap<WinId, Rc<ChromeDrawn>>>,
-    chat_claims_fn: RefCell<Option<Rc<ChatClaimsFn>>>,
-    view_attention_fn: RefCell<Option<Rc<ViewAttentionFn>>>,
-    oldest_card_fn: RefCell<Option<Rc<OldestCardFn>>>,
-    kill_counts_fn: RefCell<Option<Rc<KillCountsFn>>>,
-    summary_fn: RefCell<Option<Rc<dyn Fn(WinId) -> eitri_core::wm::ChatSummary>>>,
-    first_tab_fn: RefCell<Option<Rc<FirstTabFn>>>,
-    hints: RefCell<Option<Rc<dyn HintPort>>>,
-    linked_windows: RefCell<Option<Rc<dyn LinkedWindows>>>,
     pair_raise: RefCell<Option<Rc<dyn PairRaise>>>,
-    beside: RefCell<Option<Rc<dyn BesidePort>>>,
     placer: RefCell<Option<Rc<dyn MonitorPlacer>>>,
     grids: RefCell<BTreeMap<WinId, Rc<dyn GridPort>>>,
     editors: RefCell<BTreeMap<WinId, Rc<dyn EditorReads>>>,
@@ -630,29 +253,14 @@ impl GtkHost {
             closing: RefCell::new(BTreeSet::new()),
             asking: RefCell::new(BTreeMap::new()),
             mode_toggle: RefCell::new(None),
-            surface_maker: RefCell::new(None),
-            base_page_maker: RefCell::new(None),
-            services: RefCell::new(None),
-            lua: RefCell::new(None),
             application: RefCell::new(None),
             focus_fn: RefCell::new(None),
             top_bar_fn: RefCell::new(None),
             rename_entry_fn: RefCell::new(None),
             onboarding_focus_fn: RefCell::new(None),
-            onboarding_fn: RefCell::new(None),
-            project_host: RefCell::new(None),
             chrome_model: RefCell::new(None),
             chrome: RefCell::new(BTreeMap::new()),
-            chat_claims_fn: RefCell::new(None),
-            view_attention_fn: RefCell::new(None),
-            oldest_card_fn: RefCell::new(None),
-            kill_counts_fn: RefCell::new(None),
-            summary_fn: RefCell::new(None),
-            first_tab_fn: RefCell::new(None),
-            hints: RefCell::new(None),
-            linked_windows: RefCell::new(None),
             pair_raise: RefCell::new(None),
-            beside: RefCell::new(None),
             placer: RefCell::new(None),
             grids: RefCell::new(BTreeMap::new()),
             editors: RefCell::new(BTreeMap::new()),
@@ -660,18 +268,15 @@ impl GtkHost {
         })
     }
 
-    /// Where the host reports. Held weakly: the sink (the driver) owns the host.
-    pub(crate) fn attach(&self, sink: Weak<dyn HostSink>) {
-        *self.sink.borrow_mut() = Some(sink.clone());
-        let grids: Vec<_> = self
-            .grids
-            .borrow()
-            .iter()
-            .map(|(win, grid)| (*win, grid.clone()))
-            .collect();
-        for (win, grid) in grids {
-            grid.set_pointer_sink(win, sink.clone());
-        }
+    /// The router over this host, as the window's driver applies ops to it and reads it. Each call makes a new router
+    /// with no collaborators set: a window makes one, at its start.
+    pub(crate) fn router(self: &Rc<GtkHost>) -> Rc<WmHost> {
+        Router::new(self.clone(), self.clone())
+    }
+
+    /// Where the host reports. Held weakly: the sink (the driver) owns the router that owns the host.
+    fn attach_sink(&self, sink: Weak<dyn HostSink>) {
+        *self.sink.borrow_mut() = Some(sink);
     }
 
     fn sink(&self) -> Option<Rc<dyn HostSink>> {
@@ -753,25 +358,6 @@ impl GtkHost {
         *self.mode_toggle.borrow_mut() = Some(toggle);
     }
 
-    /// What `CreateSurface` and `DropSurface` build and release through.
-    pub(crate) fn set_surface_maker(&self, maker: Rc<dyn SurfaceMaker>) {
-        *self.surface_maker.borrow_mut() = Some(maker);
-    }
-
-    /// What the service ops call. Set once, before the first batch that carries one.
-    pub(crate) fn set_services(&self, services: Rc<dyn ServiceSet>) {
-        *self.services.borrow_mut() = Some(services);
-    }
-
-    /// What the `Lua` ops run on. Set before the first batch that carries one.
-    pub(crate) fn set_base_page_maker(&self, maker: Rc<dyn BasePageMaker>) {
-        *self.base_page_maker.borrow_mut() = Some(maker);
-    }
-
-    pub(crate) fn set_lua(&self, lua: Rc<dyn LuaRunner>) {
-        *self.lua.borrow_mut() = Some(lua);
-    }
-
     /// The application whose windows `OpenWindow` builds. Set before the first `OpenWindow`.
     pub(crate) fn set_application(&self, app: &gtk4::Application) {
         *self.application.borrow_mut() = Some(app.downgrade());
@@ -796,15 +382,6 @@ impl GtkHost {
     /// What the first-start screen's `Focus` goes through. Until it is set, such a `Focus` is not carried out.
     pub(crate) fn set_onboarding_focus(&self, focus: Rc<OnboardingFocusFn>) {
         *self.onboarding_focus_fn.borrow_mut() = Some(focus);
-    }
-
-    /// What carries out the first-start screen's ops. Until it is set, they are not carried out.
-    pub(crate) fn set_onboarding(&self, carry: Rc<OnboardingFn>) {
-        *self.onboarding_fn.borrow_mut() = Some(carry);
-    }
-
-    pub(crate) fn set_project_host(&self, host: Rc<dyn ProjectHost>) {
-        *self.project_host.borrow_mut() = Some(host);
     }
 
     /// Where a `Chrome` op reads the window's model. Until it is set, a `Chrome` is not carried out.
@@ -842,61 +419,14 @@ impl GtkHost {
         Ok(())
     }
 
-    /// What a chat view holds for the user, as the controller reads it for the chips and the strips. Until it is
-    /// set, every view holds nothing.
-    pub(crate) fn set_view_attention(&self, attention: Rc<ViewAttentionFn>) {
-        *self.view_attention_fn.borrow_mut() = Some(attention);
-    }
-
-    /// Whether a chat page claims a navigation key, as the controller reads it while it decides that key.
-    /// Until it is set, no page claims one.
-    pub(crate) fn set_chat_claims(&self, claims: Rc<ChatClaimsFn>) {
-        *self.chat_claims_fn.borrow_mut() = Some(claims);
-    }
-
-    /// Which chat view holds the oldest waiting card, as the chat's key reads it. Until it is set, none does.
-    pub(crate) fn set_oldest_card(&self, oldest: Rc<OldestCardFn>) {
-        *self.oldest_card_fn.borrow_mut() = Some(oldest);
-    }
-
-    /// What a chat view's kill would end, as its y/n names it, and whether its tabs can close now. Until it is set,
-    /// nothing runs in any view and every tab can close.
-    pub(crate) fn set_chat_summary(&self, read: Rc<dyn Fn(WinId) -> eitri_core::wm::ChatSummary>) {
-        *self.summary_fn.borrow_mut() = Some(read);
-    }
-
-    pub(crate) fn set_chat_kill_counts(&self, counts: Rc<KillCountsFn>) {
-        *self.kill_counts_fn.borrow_mut() = Some(counts);
-    }
-
-    /// Whether a new chat view can be given its first tab, asked before it is placed. Until it is set, it can.
-    pub(crate) fn set_chat_first_tab(&self, first_tab: Rc<FirstTabFn>) {
-        *self.first_tab_fn.borrow_mut() = Some(first_tab);
-    }
-
-    /// What the `Hint` ops draw and toggle through. Until it is set, they are not carried out.
-    pub(crate) fn set_hints(&self, hints: Rc<dyn HintPort>) {
-        *self.hints.borrow_mut() = Some(hints);
-    }
-
     /// Presents a paired window through its compositor adapter, including its first show.
     pub(crate) fn set_pair_raise(&self, raise: Rc<dyn PairRaise>) {
         *self.pair_raise.borrow_mut() = Some(raise);
     }
 
-    /// What carries out the ops of a page window beside nvim, in that window only.
-    pub(crate) fn set_beside(&self, port: Rc<dyn BesidePort>) {
-        *self.beside.borrow_mut() = Some(port);
-    }
-
     /// What `PlaceWindow` moves this window through. Until it is set, every move is refused.
     pub(crate) fn set_monitor_placer(&self, placer: Rc<dyn MonitorPlacer>) {
         *self.placer.borrow_mut() = Some(placer);
-    }
-
-    /// What `OpenLinkedWindow` starts the second window through. Until it is set, none can be started.
-    pub(crate) fn set_linked_windows(&self, linked: Rc<dyn LinkedWindows>) {
-        *self.linked_windows.borrow_mut() = Some(linked);
     }
 
     /// `win`'s grid: what `Allocate` and `Restack` act on and what the grid reads answer from.
@@ -911,14 +441,6 @@ impl GtkHost {
     /// `win`'s editor: what the editor reads answer from.
     pub(crate) fn set_editor(&self, win: WinId, editor: Rc<dyn EditorReads>) {
         self.editors.borrow_mut().insert(win, editor);
-    }
-
-    fn grid(&self, win: WinId) -> Option<Rc<dyn GridPort>> {
-        self.grids.borrow().get(&win).cloned()
-    }
-
-    fn editor(&self, win: WinId) -> Option<Rc<dyn EditorReads>> {
-        self.editors.borrow().get(&win).cloned()
     }
 
     /// The window the host holds as `win`, while it exists.
@@ -972,61 +494,60 @@ impl GtkHost {
             op_index: None,
         });
     }
+}
 
-    /// The window's mode toggled as `prefix F11` toggles it, not set to the state the op names: the controller asks
-    /// for the state its own toggle leads to, and a bare F11, nvim's `g:neovide_fullscreen` or the compositor may
-    /// have changed the real mode since without the controller hearing, so applying that state could make the press
-    /// do nothing where the toggle still changes the mode.
-    fn set_mode(&self, op: &HostOp, win: WinId) -> Applied {
-        // Cloned out first: the toggle calls into GTK, whose signals post to the sink.
-        let toggle = self.mode_toggle.borrow().clone();
-        let Some(toggle) = toggle else {
-            return self.refuse(op, NOT_CARRIED_OUT);
-        };
-        if self.window(win).is_none() {
-            return self.refuse(op, "no such window");
+/// What one of the shell's grabs of a chrome part answered (`None`: the shell gave no grab), as the views' result.
+fn chrome_grab(took: Option<bool>, refused: &str) -> Result<(), String> {
+    match took {
+        None => Err(NOT_CARRIED_OUT.into()),
+        Some(true) => Ok(()),
+        Some(false) => Err(refused.into()),
+    }
+}
+
+impl Views for GtkHost {
+    fn attach(&self, sink: Weak<dyn HostSink>) {
+        self.attach_sink(sink.clone());
+        let grids: Vec<_> = self
+            .grids
+            .borrow()
+            .iter()
+            .map(|(win, grid)| (*win, grid.clone()))
+            .collect();
+        for (win, grid) in grids {
+            grid.set_pointer_sink(win, sink.clone());
         }
-        toggle(win);
-        Applied::Done
     }
 
-    fn refuse(&self, op: &HostOp, why: &str) -> Applied {
-        self.post(HostEvent::Refused {
-            what: OpTag::of(op),
-            why: why.into(),
-            surface: op.surface(),
-        });
-        Applied::Refused
+    fn has_surface(&self, win: WinId, module: &ModuleId) -> bool {
+        self.surface(win, module).is_some()
     }
 
-    fn focus(&self, op: &HostOp, win: WinId, to: &FocusTo) -> Applied {
-        if self.window(win).is_none() {
-            return self.refuse(op, "no such window");
-        }
-        let module = match to {
-            FocusTo::Module(module) => module,
-            FocusTo::TopBarItem(item) => return self.focus_top_bar(op, win, *item),
-            FocusTo::RenameEntry => return self.focus_rename_entry(op, win),
-            FocusTo::Onboarding => return self.focus_onboarding(op, win),
-            FocusTo::ProjectChooser => return self.focus_project_chooser(op, win),
-            FocusTo::Nothing => return self.refuse(op, NOT_CARRIED_OUT),
-        };
+    fn grid(&self, win: WinId) -> Option<Rc<dyn GridPort>> {
+        self.grids.borrow().get(&win).cloned()
+    }
+
+    fn editor(&self, win: WinId) -> Option<Rc<dyn EditorReads>> {
+        self.editors.borrow().get(&win).cloned()
+    }
+
+    fn focus_module(&self, win: WinId, module: &ModuleId) -> Result<(), String> {
         // Cloned out first: the function grabs, and GTK notifies the focus change from inside it.
         let focus_fn = self.focus_fn.borrow().clone();
         let reports = self.focus_reports.get();
         if let Some(focus_fn) = focus_fn {
             if !focus_fn(module) {
-                return self.refuse(op, "the shell did not give the module the keys");
+                return Err("the shell did not give the module the keys".into());
             }
         } else {
             let Some(widget) = self.surface(win, module) else {
-                return self.refuse(op, "the module has no surface in this window");
+                return Err("the module has no surface in this window".into());
             };
             if !widget.is_mapped() {
-                return self.refuse(op, "the module's surface is not on screen");
+                return Err("the module's surface is not on screen".into());
             }
             if !widget.grab_focus() {
-                return self.refuse(op, "GTK did not move the keys to the module's surface");
+                return Err("GTK did not move the keys to the module's surface".into());
             }
         }
         // A grab on the widget that already holds the keys changes nothing GTK notifies; report
@@ -1034,263 +555,90 @@ impl GtkHost {
         if self.focus_reports.get() == reports {
             self.report_focus(win);
         }
-        Applied::Done
+        Ok(())
     }
 
-    fn focus_top_bar(&self, op: &HostOp, win: WinId, item: u32) -> Applied {
+    fn focus_top_bar(&self, win: WinId, item: u32) -> Result<(), String> {
         // Cloned out first: the grab notifies the focus change from inside it.
         let top_bar = self.top_bar_fn.borrow().clone();
-        let Some(top_bar) = top_bar else {
-            return self.refuse(op, NOT_CARRIED_OUT);
-        };
-        if top_bar(win, item) {
-            Applied::Done
-        } else {
-            self.refuse(op, "no top-bar item took the keys")
-        }
+        chrome_grab(
+            top_bar.map(|top_bar| top_bar(win, item)),
+            "no top-bar item took the keys",
+        )
     }
 
-    fn focus_rename_entry(&self, op: &HostOp, win: WinId) -> Applied {
+    fn focus_rename_entry(&self, win: WinId) -> Result<(), String> {
         // Cloned out first: the grab notifies the focus change from inside it.
         let rename = self.rename_entry_fn.borrow().clone();
-        let Some(rename) = rename else {
-            return self.refuse(op, NOT_CARRIED_OUT);
-        };
-        if rename(win) {
-            Applied::Done
-        } else {
-            self.refuse(op, "the rename entry did not take the keys")
-        }
+        chrome_grab(
+            rename.map(|rename| rename(win)),
+            "the rename entry did not take the keys",
+        )
     }
 
-    fn focus_onboarding(&self, op: &HostOp, win: WinId) -> Applied {
+    fn focus_onboarding(&self, win: WinId) -> Result<(), String> {
         // Cloned out first: the grab notifies the focus change from inside it.
         let focus = self.onboarding_focus_fn.borrow().clone();
-        let Some(focus) = focus else {
-            return self.refuse(op, NOT_CARRIED_OUT);
-        };
-        if focus(win) {
-            Applied::Done
-        } else {
-            self.refuse(op, "the first-start screen did not take the keys")
-        }
+        chrome_grab(
+            focus.map(|focus| focus(win)),
+            "the first-start screen did not take the keys",
+        )
     }
 
-    fn onboarding(&self, op: &HostOp, call: &OnboardingOp) -> Applied {
-        // Cloned out first: the work it starts may post an event at once.
-        let carry = self.onboarding_fn.borrow().clone();
-        match carry {
-            Some(carry) => match carry(call) {
-                Applied::Done => Applied::Done,
-                _ => self.refuse(op, "the first-start screen's work was not started"),
-            },
-            None => self.refuse(op, NOT_CARRIED_OUT),
-        }
-    }
-
-    fn focus_project_chooser(&self, op: &HostOp, win: WinId) -> Applied {
-        let host = self.project_host.borrow().clone();
+    fn grab_reported(&self, win: WinId, grab: &dyn Fn() -> bool) -> bool {
         let reports = self.focus_reports.get();
-        if host.is_some_and(|host| host.focus(win)) {
-            if self.focus_reports.get() == reports {
-                self.report_focus(win);
-            }
-            Applied::Done
-        } else {
-            self.refuse(op, "the project chooser did not take the keys")
+        if !grab() {
+            return false;
         }
+        if self.focus_reports.get() == reports {
+            self.report_focus(win);
+        }
+        true
     }
 
-    fn project(&self, op: &HostOp, call: &ProjectOp) -> Applied {
-        let win = match call {
-            ProjectOp::List { win, .. }
-            | ProjectOp::Read { win, .. }
-            | ProjectOp::FolderDialog { win, .. }
-            | ProjectOp::Open { win, .. } => *win,
-        };
-        if self.window(win).is_none() {
-            return self.refuse(op, "no such window");
-        }
-        let host = self.project_host.borrow().clone();
-        let applied = match (host, call) {
-            // The token names the input that asked, so it is taken here, before the start leaves this thread.
-            (Some(host), ProjectOp::Open { target, .. }) => host.open(win, target, self.activation_token(win)),
-            (Some(host), _) => host.apply(call),
-            (None, _) => Applied::Refused,
-        };
-        if applied == Applied::Done {
-            Applied::Done
-        } else {
-            self.refuse(op, NOT_CARRIED_OUT)
-        }
-    }
-
-    fn chrome(&self, op: &HostOp, win: WinId) -> Applied {
-        match self.draw_chrome(win) {
-            Ok(()) => Applied::Done,
-            Err(why) => self.refuse(op, why),
-        }
-    }
-
-    fn hint(&self, op: &HostOp, call: &HintOp) -> Applied {
-        // Cloned out first: the digits draw into the window, and a HINT adds its controllers.
-        let hints = self.hints.borrow().clone();
-        let Some(hints) = hints else {
-            return self.refuse(op, NOT_CARRIED_OUT);
-        };
-        match call {
-            HintOp::ShowDigits(digits) => hints.show_digits(WinId::MAIN, digits),
-            HintOp::Hide => hints.hide_digits(WinId::MAIN),
-            HintOp::Toggle { keycode } => hints.toggle(WinId::MAIN, *keycode),
-        }
-        Applied::Done
-    }
-
-    /// A `Map` or an `Unmap`: nothing for a host the grid's probe places by hand.
-    fn map_or_unmap(&self, op: &HostOp, win: WinId) -> Applied {
-        // Cloned out first: the probe's answer reads the grid, and nothing it calls should find the host borrowed.
-        let grid = self.grid(win);
-        let probe_places = |module: &ModuleId| grid.as_ref().is_some_and(|grid| grid.probe_places(module));
-        match hosts_to_map(std::slice::from_ref(op), probe_places).pop() {
-            Some((win, module, mapped)) => self.set_mapped(op, win, &module, mapped),
-            None => Applied::Done,
-        }
-    }
-
-    /// Runs `f` on `win`'s grid; refused for a window that has given none.
-    fn on_grid(&self, op: &HostOp, win: WinId, f: impl FnOnce(&dyn GridPort)) -> Applied {
-        // Cloned out first: the grid allocates and restacks, which may call back into the host.
-        let Some(grid) = self.grid(win) else {
-            return self.refuse(op, "the window has no grid");
-        };
-        f(grid.as_ref());
-        Applied::Done
-    }
-
-    fn set_mapped(&self, op: &HostOp, win: WinId, module: &ModuleId, mapped: bool) -> Applied {
-        let Some(widget) = self.surface(win, module) else {
-            return self.refuse(op, "the module has no surface in this window");
-        };
-        if !mapped {
-            self.release_keys_inside(win, &widget);
-        }
-        if let Some(maker) = self.surface_maker.borrow().clone() {
-            maker.mapped(module, mapped);
-        }
-        widget.set_child_visible(mapped);
-        Applied::Done
-    }
-
-    /// Takes the keys from a surface about to be hidden. GTK leaves the window's focus widget on a
-    /// widget made child-invisible, with no notify, so the keys would go on into a surface no one
-    /// can see; clearing the focus first moves them, and the focus report says so while the op
-    /// applies.
-    fn release_keys_inside(&self, win: WinId, widget: &gtk4::Widget) {
-        let Some(window) = self.window(win) else {
+    /// GTK leaves the window's focus widget on a widget made child-invisible, with no notify, so the keys would go
+    /// on into a surface no one can see; clearing the focus first moves them, and the focus report says so while
+    /// the op applies.
+    fn release_keys(&self, win: WinId, module: &ModuleId) {
+        let (Some(window), Some(widget)) = (self.window(win), self.surface(win, module)) else {
             return;
         };
         let holds_keys =
-            GtkWindowExt::focus(&window).is_some_and(|focus| focus == *widget || focus.is_ancestor(widget));
+            GtkWindowExt::focus(&window).is_some_and(|focus| focus == widget || focus.is_ancestor(&widget));
         if holds_keys {
             GtkWindowExt::set_focus(&window, None::<&gtk4::Widget>);
         }
     }
 
-    fn create_surface(&self, op: &HostOp, win: WinId, module: &ModuleId, kind: &SurfaceKind) -> Applied {
-        // Cloned out first: the maker adds widgets, and GTK may call back into the host meanwhile.
-        let maker = self.surface_maker.borrow().clone();
-        let Some(maker) = maker else {
-            return self.refuse(op, NOT_CARRIED_OUT);
-        };
-        if let Err(why) = maker.create(win, module, kind) {
-            return self.refuse(op, &why);
-        }
-        if self.surface(win, module).is_none() {
-            return self.refuse(op, "the surface was built but never registered");
-        }
-        Applied::Done
-    }
-
-    fn drop_surface(&self, op: &HostOp, win: WinId, module: &ModuleId, why: &DropWhy) -> Applied {
-        if self.surface(win, module).is_none() {
-            return self.refuse(op, "the module has no surface in this window");
-        }
-        let maker = self.surface_maker.borrow().clone();
-        let Some(maker) = maker else {
-            return self.refuse(op, NOT_CARRIED_OUT);
-        };
-        match maker.drop_surface(win, module, why) {
-            Ok(()) => Applied::Done,
-            Err(why) => self.refuse(op, &why),
+    fn show(&self, win: WinId, module: &ModuleId, shown: bool) {
+        if let Some(widget) = self.surface(win, module) {
+            widget.set_child_visible(shown);
         }
     }
 
-    fn prepare_surface(
-        &self,
-        op: &HostOp,
-        win: WinId,
-        module: &ModuleId,
-        shape: &eitri_core::window_link::Shape,
-        size: (u32, u32),
-    ) -> Applied {
-        // Cloned out first: the maker adds widgets, and GTK may call back into the host meanwhile.
-        let maker = self.surface_maker.borrow().clone();
-        let Some(maker) = maker else {
-            return self.refuse(op, NOT_CARRIED_OUT);
-        };
-        if let Err(why) = maker.prepare(win, module, shape, size) {
-            return self.refuse(op, &why);
-        }
-        if self.surface(win, module).is_none() {
-            return self.refuse(op, "the arriving module's place was made but never registered");
-        }
-        Applied::Done
+    fn chrome(&self, win: WinId) -> Result<(), String> {
+        self.draw_chrome(win).map_err(str::to_string)
+    }
+}
+
+impl WindowPort for GtkHost {
+    fn attach(&self, sink: Weak<dyn HostSink>) {
+        self.attach_sink(sink);
     }
 
-    /// The descriptors are taken out of the op here, whatever comes of it: refused, they close as they drop.
-    fn adopt_moved(
-        &self,
-        op: &HostOp,
-        win: WinId,
-        module: &ModuleId,
-        kind: eitri_core::wm::moves::MoveKind,
-        record: &serde_json::Value,
-        fds: &eitri_core::wm::Descriptors,
-    ) -> Applied {
-        let fds = fds.take();
-        if self.surface(win, module).is_none() {
-            return self.refuse(op, "the arriving module has no place in this window");
-        }
-        let maker = self.surface_maker.borrow().clone();
-        let Some(maker) = maker else {
-            return self.refuse(op, NOT_CARRIED_OUT);
-        };
-        match maker.adopt(win, module, kind, record, fds) {
-            Ok(()) => Applied::Done,
-            Err(why) => self.refuse(op, &why),
-        }
-    }
-
-    fn end_peer(&self, op: &HostOp, win: WinId, peer: PeerId) -> Applied {
-        let linked = self.linked_windows.borrow().clone();
-        let Some(linked) = linked else {
-            return self.refuse(op, eitri_core::wm::feedback::NO_SECOND_WINDOW_TEXT);
-        };
-        match linked.end_peer(win, peer) {
-            Ok(()) => Applied::Done,
-            Err(why) => self.refuse(op, &why),
-        }
+    fn is_open(&self, win: WinId) -> bool {
+        self.window(win).is_some()
     }
 
     /// Builds `win`'s window, created and not shown, and adopts it. Undecorated: the window's own top
     /// bar is its only titlebar.
-    fn open_window(&self, op: &HostOp, win: WinId, spec: &WindowSpec) -> Applied {
+    fn open(&self, win: WinId, spec: &WindowSpec) -> Result<(), String> {
         if self.window(win).is_some() {
-            return self.refuse(op, "the window is already open");
+            return Err("the window is already open".into());
         }
         let app = self.application.borrow().as_ref().and_then(|app| app.upgrade());
         let Some(app) = app else {
-            return self.refuse(op, NOT_CARRIED_OUT);
+            return Err(NOT_CARRIED_OUT.into());
         };
         let window = gtk4::ApplicationWindow::builder()
             .application(&app)
@@ -1300,14 +648,14 @@ impl GtkHost {
             .decorated(false)
             .build();
         self.adopt_window(win, window.upcast_ref());
-        Applied::Done
+        Ok(())
     }
 
     /// Shows `win`, with the launcher's activation token when the controller has one; without one GTK
     /// uses the token it read from the environment at startup, if any.
-    fn present(&self, op: &HostOp, win: WinId, activation: Option<&ActivationToken>) -> Applied {
+    fn present(&self, win: WinId, activation: Option<&ActivationToken>) -> Result<(), String> {
         let Some(window) = self.window(win) else {
-            return self.refuse(op, "no such window");
+            return Err("no such window".into());
         };
         let raise = self.pair_raise.borrow().clone();
         if let Some(raise) = raise {
@@ -1319,7 +667,46 @@ impl GtkHost {
             window.present();
         }
         crate::launch_env::window_up();
-        Applied::Done
+        Ok(())
+    }
+
+    fn close(&self, win: WinId) -> Result<(), String> {
+        let Some(window) = self.window(win) else {
+            return Err("no such window".into());
+        };
+        if let Some(noted) = self.asking.borrow_mut().get_mut(&win) {
+            // Inside this window's own close request GTK ignores `close()`; the request's handler
+            // lets the close under way proceed once the sink has answered.
+            *noted = true;
+            return Ok(());
+        }
+        if !window.is_realized() {
+            // GTK ignores `close()` on a window that was never realized; nothing can have been
+            // shown in it, so it is destroyed without a close request either way.
+            window.destroy();
+            return Ok(());
+        }
+        self.closing.borrow_mut().insert(win);
+        window.close();
+        self.closing.borrow_mut().remove(&win);
+        Ok(())
+    }
+
+    /// The window's mode toggled as `prefix F11` toggles it, not set to the state the op names: the controller asks
+    /// for the state its own toggle leads to, and a bare F11, nvim's `g:neovide_fullscreen` or the compositor may
+    /// have changed the real mode since without the controller hearing, so applying that state could make the press
+    /// do nothing where the toggle still changes the mode.
+    fn toggle_mode(&self, win: WinId) -> Result<(), String> {
+        // Cloned out first: the toggle calls into GTK, whose signals post to the sink.
+        let toggle = self.mode_toggle.borrow().clone();
+        let Some(toggle) = toggle else {
+            return Err(NOT_CARRIED_OUT.into());
+        };
+        if self.window(win).is_none() {
+            return Err("no such window".into());
+        }
+        toggle(win);
+        Ok(())
     }
 
     /// An activation token from `win`'s display, naming the surface with the keys and the seat's last input, for the
@@ -1333,432 +720,39 @@ impl GtkHost {
             .filter(|token| !token.is_empty())
     }
 
-    fn open_linked_window(&self, op: &HostOp, win: WinId) -> Applied {
-        if self.window(win).is_none() {
-            return self.refuse(op, "no such window");
-        }
-        // Cloned out first: the start wires the new link and may call back into GTK.
-        let linked = self.linked_windows.borrow().clone();
-        let Some(linked) = linked else {
-            return self.refuse(op, eitri_core::wm::feedback::NO_SECOND_WINDOW_TEXT);
-        };
-        match linked.open(win, &WindowName::Second, self.activation_token(win)) {
-            Ok(()) => Applied::Done,
-            Err(why) => self.refuse(op, &why),
-        }
-    }
-
-    fn restore_linked_window(&self, op: &HostOp, win: WinId) -> Applied {
-        if self.window(win).is_none() {
-            return self.refuse(op, "no such window");
-        }
-        // Cloned out first: the start wires the new link and may call back into GTK.
-        let linked = self.linked_windows.borrow().clone();
-        let Some(linked) = linked else {
-            return self.refuse(op, eitri_core::wm::feedback::NO_SECOND_WINDOW_TEXT);
-        };
-        match linked.restore(win, &WindowName::Second) {
-            Ok(()) => Applied::Done,
-            Err(why) => self.refuse(op, &why),
-        }
-    }
-
-    /// Starts the module window `name`, or raises it when it runs. The window that comes forward takes the activation
-    /// token of the key that asked, or of this window's surface when none came; a window the start opens takes none, and
-    /// leaves the keys where they are.
-    fn open_module_window(
-        &self,
-        op: &HostOp,
-        win: WinId,
-        name: &WindowName,
-        token: Option<&str>,
-        keep_keys: bool,
-    ) -> Applied {
-        // Cloned out first: the start wires the new link and may call back into GTK.
-        let linked = self.linked_windows.borrow().clone();
-        let Some(linked) = linked else {
-            return self.refuse(op, eitri_core::wm::feedback::NO_SECOND_WINDOW_TEXT);
-        };
-        let token = if keep_keys {
-            None
-        } else {
-            match token {
-                Some(token) => Some(token.to_string()),
-                None if self.window(win).is_some() => self.activation_token(win),
-                None => None,
-            }
-        };
-        match linked.open_module(win, name, token, keep_keys) {
-            Ok(()) => Applied::Done,
-            Err(why) => self.refuse(op, &why),
-        }
-    }
-
-    /// A raise a module window asked for: the token that came with it is the one the window that comes forward gets,
-    /// so it is answered as it would be had this window made one.
-    fn forward_raise(&self, peer: PeerId, token: Option<&str>) -> Applied {
-        self.post(HostEvent::Peer(PeerEvent::Raised {
-            peer,
-            token: token.map(str::to_string),
-        }));
-        Applied::Done
-    }
-
-    /// The key action `name` goes to the module window `peer`, which parses and runs it itself.
-    fn peer_run(
-        &self,
-        op: &HostOp,
-        win: WinId,
-        peer: PeerId,
-        name: &str,
-        opts: &[(String, serde_json::Value)],
-    ) -> Applied {
-        let linked = self.linked_windows.borrow().clone();
-        let Some(linked) = linked else {
-            return self.refuse(op, eitri_core::wm::feedback::NO_SECOND_WINDOW_TEXT);
-        };
-        let msg = Msg::RunAction {
-            name: name.to_string(),
-            opts: opts.to_vec(),
-        };
-        match linked.send(win, peer, msg) {
-            Ok(()) => Applied::Done,
-            Err(why) => self.refuse(op, &why),
-        }
-    }
-
-    /// A module window asks window 1 for another window, with an activation token from its own surface for the window
-    /// that comes forward.
-    fn hub_ask(&self, op: &HostOp, win: WinId, ask: &eitri_core::window_link::HubAsk) -> Applied {
-        let linked = self.linked_windows.borrow().clone();
-        let Some(linked) = linked else {
-            return self.refuse(op, eitri_core::wm::feedback::NO_SECOND_WINDOW_TEXT);
-        };
-        let msg = Msg::HubAsk {
-            ask: ask.clone(),
-            token: self.activation_token(win),
-        };
-        match linked.send_to_hub(win, msg) {
-            Ok(()) => Applied::Done,
-            Err(why) => self.refuse(op, &why),
-        }
-    }
-
-    /// Window 1 hands a tab between module windows; the links carry the rest.
-    fn hand_over_tab(
-        &self,
-        op: &HostOp,
-        win: WinId,
-        from: PeerId,
-        (agent, session): (&eitri_core::agent_backend::AgentId, &str),
-        to: &WindowName,
-        token: Option<&str>,
-    ) -> Applied {
-        let linked = self.linked_windows.borrow().clone();
-        let Some(linked) = linked else {
-            return self.refuse(op, eitri_core::wm::feedback::NO_SECOND_WINDOW_TEXT);
-        };
-        match linked.hand_over(win, from, agent, session, to, token.map(str::to_string)) {
-            Ok(()) => Applied::Done,
-            Err(why) => self.refuse(op, &why),
-        }
-    }
-
-    /// Window 1 tells a module window that the tab it offered stays there.
-    fn keep_tab(&self, op: &HostOp, win: WinId, peer: PeerId, session: &str, why: &str) -> Applied {
-        let linked = self.linked_windows.borrow().clone();
-        let Some(linked) = linked else {
-            return self.refuse(op, eitri_core::wm::feedback::NO_SECOND_WINDOW_TEXT);
-        };
-        let msg = Msg::TabKept {
-            session: session.to_string(),
-            why: why.to_string(),
-        };
-        match linked.send(win, peer, msg) {
-            Ok(()) => Applied::Done,
-            Err(why) => self.refuse(op, &why),
-        }
-    }
-
-    /// A focus move past this window's edge: the compositor's own tool moves it, on its worker. With none, the notice
-    /// that says so is the refusal, shown once.
-    fn compositor_focus(&self, op: &HostOp, direction: Direction) -> Applied {
-        let raise = self.pair_raise.borrow().clone();
-        let Some(raise) = raise else {
-            return self.refuse(op, NOT_CARRIED_OUT);
-        };
-        let notice = RefCell::new(None::<String>);
-        if raise.move_focus(direction, &|text| *notice.borrow_mut() = Some(text.to_string())) {
-            return Applied::Done;
-        }
-        match notice.into_inner() {
-            Some(text) => self.refuse(op, &text),
-            None => Applied::Refused,
-        }
-    }
-
-    /// A beside op, through the page window's carrier: refused now, or later by a worker, as [`OpTag::Beside`].
-    fn beside(&self, op: &HostOp, beside: &eitri_core::wm::BesideOp) -> Applied {
-        let port = self.beside.borrow().clone();
-        let Some(port) = port else {
-            eprintln!("[page] {beside:?}: no window beside nvim here to carry it out");
-            return self.refuse(op, NOT_CARRIED_OUT);
-        };
-        let me = self.me.clone();
-        let later = Box::new(move |why: String| {
-            if let Some(host) = me.upgrade() {
-                host.post(HostEvent::Refused {
-                    what: OpTag::Beside,
-                    why,
-                    surface: None,
-                });
-            }
-        });
-        match port.carry_out(beside, later) {
-            Ok(()) => Applied::Done,
-            Err(why) => self.refuse(op, &why),
-        }
-    }
-
-    fn start_editor_window(&self, op: &HostOp, win: WinId) -> Applied {
-        if self.window(win).is_none() {
-            return self.refuse(op, "no such window");
-        }
-        let linked = self.linked_windows.borrow().clone();
-        let Some(linked) = linked else {
-            return self.refuse(op, eitri_core::wm::feedback::EDITOR_WINDOW_CLOSED_TEXT);
-        };
-        match linked.start_editor(win) {
-            Ok(()) => Applied::Done,
-            Err(why) => self.refuse(op, &why),
-        }
-    }
-
     /// Only this process's own window can be moved: the window manager is told its pid (or GNOME's extension finds
     /// the caller's windows), so `win` must be one of this host's.
-    fn move_to_monitor(
-        &self,
-        op: &HostOp,
-        win: WinId,
-        connector: Option<&str>,
-        role: eitri_core::wm::PlacementRole,
-    ) -> Applied {
+    fn place(&self, win: WinId, connector: Option<&str>, role: eitri_core::wm::PlacementRole) -> Result<(), String> {
         if self.window(win).is_none() {
-            return self.refuse(op, "no such window");
+            return Err("no such window".into());
         }
         let placer = self.placer.borrow().clone();
         let Some(placer) = placer else {
-            return self.refuse(op, NOT_CARRIED_OUT);
+            return Err(NOT_CARRIED_OUT.into());
         };
-        match monitor_move(placer.wm(), std::process::id(), connector, role) {
-            Ok(how) => {
-                placer.place(how);
-                Applied::Done
-            }
-            Err(why) => self.refuse(op, &why),
-        }
+        let how = monitor_move(placer.wm(), std::process::id(), connector, role)?;
+        placer.place(how);
+        Ok(())
     }
 
-    /// The other window comes forward by its own raise once it hears `focus{window}` with this token: under GNOME
-    /// the token lets it take the keys from this window, and under sway, Hyprland and niri, which turn a token into
-    /// an urgency hint, it also has the compositor focus it by its pid. The controller sends that message on the
-    /// answer posted here.
-    fn raise_peer(&self, op: &HostOp, win: WinId, peer: PeerId) -> Applied {
-        if self.window(win).is_none() {
-            return self.refuse(op, "no such window");
+    /// The compositor's own tool moves the keys, on its worker. With none, the notice that says so is the refusal,
+    /// shown once.
+    fn compositor_focus(&self, direction: Direction) -> Result<(), Option<String>> {
+        let raise = self.pair_raise.borrow().clone();
+        let Some(raise) = raise else {
+            return Err(Some(NOT_CARRIED_OUT.into()));
+        };
+        let notice = RefCell::new(None::<String>);
+        if raise.move_focus(direction, &|text| *notice.borrow_mut() = Some(text.to_string())) {
+            return Ok(());
         }
-        let token = self.activation_token(win);
-        self.post(HostEvent::Peer(PeerEvent::Raised { peer, token }));
-        Applied::Done
+        Err(notice.into_inner())
     }
 
-    fn lua(&self, op: &HostOp, call: &LuaOp) -> Applied {
-        // Cloned out first: the kernel runs Lua, which may post to the sink or call into GTK.
-        let lua = self.lua.borrow().clone();
-        let Some(lua) = lua else {
-            return self.refuse(op, NOT_CARRIED_OUT);
-        };
-        match lua.run(call) {
-            Ok(()) => Applied::Done,
-            Err(why) => self.refuse(op, &why),
-        }
-    }
-
-    fn service(&self, op: &HostOp, call: impl FnOnce(&dyn ServiceSet) -> Result<(), String>) -> Applied {
-        // Cloned out first: a service may post to the sink or call into GTK.
-        let services = self.services.borrow().clone();
-        let Some(services) = services else {
-            return self.refuse(op, NOT_CARRIED_OUT);
-        };
-        match call(services.as_ref()) {
-            Ok(()) => Applied::Done,
-            Err(why) => self.refuse(op, &why),
-        }
-    }
-
-    /// The restart's refusal, as any failed op's and as its own fact naming the pane's state, so the editor can be
-    /// shown and tried again; a window with nothing to restart says `unavailable`.
-    fn restart_editor(&self, op: &HostOp, win: WinId, spawn: &eitri_core::wm::EditorSpawn) -> Applied {
-        // Cloned out first: the pane's restart may queue a render, and a service may post to the sink.
-        let services = self.services.borrow().clone();
-        let refused = match services {
-            Some(services) => match services.restart_editor(spawn) {
-                Ok(()) => return Applied::Done,
-                Err(refused) => refused,
-            },
-            None => RestartRefused::Unavailable(NOT_CARRIED_OUT.into()),
-        };
-        let (why, state) = match refused {
-            RestartRefused::Pane { state } => (
-                format!("the editor pane is {state}; only a released pane restarts"),
-                state,
-            ),
-            RestartRefused::Unavailable(why) => (why, "unavailable".to_string()),
-        };
-        let applied = self.refuse(op, &why);
-        self.post(HostEvent::Editor(EditorEvent::RestartRefused { win, state }));
-        applied
-    }
-
-    fn close_window(&self, op: &HostOp, win: WinId) -> Applied {
-        let Some(window) = self.window(win) else {
-            return self.refuse(op, "no such window");
-        };
-        if let Some(noted) = self.asking.borrow_mut().get_mut(&win) {
-            // Inside this window's own close request GTK ignores `close()`; the request's handler
-            // lets the close under way proceed once the sink has answered.
-            *noted = true;
-            return Applied::Done;
-        }
-        if !window.is_realized() {
-            // GTK ignores `close()` on a window that was never realized; nothing can have been
-            // shown in it, so it is destroyed without a close request either way.
-            window.destroy();
-            return Applied::Done;
-        }
-        self.closing.borrow_mut().insert(win);
-        window.close();
-        self.closing.borrow_mut().remove(&win);
-        Applied::Done
-    }
-}
-
-impl Host for GtkHost {
-    fn apply(&self, op: &HostOp) -> Applied {
-        // Every variant is named, so a new op is a compile error here until this shell decides.
-        match op {
-            HostOp::Focus { win, to, on_grab: _ } => self.focus(op, *win, to),
-            HostOp::Map { win, .. } | HostOp::Unmap { win, .. } => self.map_or_unmap(op, *win),
-            HostOp::Allocate { win } => self.on_grid(op, *win, |grid| grid.queue_allocation()),
-            // The floats only, bottom first: each move places its float after the one below it.
-            HostOp::Restack { win, moves } => {
-                let order: Vec<ModuleId> = moves.iter().map(|step| step.module.clone()).collect();
-                self.on_grid(op, *win, |grid| grid.restack_floats(&order))
-            }
-            HostOp::CloseWindow { win } => self.close_window(op, *win),
-            HostOp::CreateSurface { win, module, kind } => self.create_surface(op, *win, module, kind),
-            HostOp::DropSurface { win, module, why } => self.drop_surface(op, *win, module, why),
-            HostOp::Chrome { win, .. } => self.chrome(op, *win),
-            HostOp::Hint(call) => self.hint(op, call),
-            HostOp::Onboarding(call) => self.onboarding(op, call),
-            HostOp::Project(call) => self.project(op, call),
-            HostOp::Editor(call @ EditorCall::Quit { win, generation, .. }) => {
-                let applied = self.service(op, |s| s.editor(call));
-                // A refusal names no call, so the quit that sent nothing is told as its own fact, with its
-                // generation, for the quit flow to clear it.
-                if applied == Applied::Refused {
-                    self.post(HostEvent::Editor(EditorEvent::QuitNotSent {
-                        win: *win,
-                        generation: *generation,
-                    }));
-                }
-                applied
-            }
-            // Told as a fact either way: the restart a show asked for waits for the release.
-            HostOp::Editor(call @ EditorCall::ReleaseExited { win }) => {
-                let applied = self.service(op, |s| s.editor(call));
-                self.post(HostEvent::Editor(match applied {
-                    Applied::Done => EditorEvent::Released { win: *win },
-                    _ => EditorEvent::ReleaseRefused { win: *win },
-                }));
-                applied
-            }
-            HostOp::Editor(EditorCall::Restart { win, spawn, .. }) => self.restart_editor(op, *win, spawn),
-            HostOp::Editor(call) => self.service(op, |s| s.editor(call)),
-            HostOp::Terminal(call) => self.service(op, |s| s.terminal(call)),
-            HostOp::Plugin(call) => self.service(op, |s| s.plugin(call)),
-            HostOp::Chat(call) => self.service(op, |s| s.chat(call)),
-            HostOp::AgentsScan { win, step, at } => self.service(op, |s| s.agents_scan(*win, *step, at.as_ref())),
-            HostOp::OpenWindow { win, spec } => self.open_window(op, *win, spec),
-            HostOp::Present { win, activation } => self.present(op, *win, activation.as_ref()),
-            HostOp::OpenAnswer { id, accepted } => self.service(op, |s| s.open_answer(*id, *accepted)),
-            HostOp::Lua(call) => self.lua(op, call),
-            HostOp::OpenLinkedWindow { win } => self.open_linked_window(op, *win),
-            HostOp::RestoreLinkedWindow { win } => self.restore_linked_window(op, *win),
-            HostOp::StartEditorWindow { win } => self.start_editor_window(op, *win),
-            HostOp::PlaceWindow { win, monitor, role } => {
-                self.move_to_monitor(op, *win, monitor.as_ref().map(|m| m.0.as_str()), *role)
-            }
-            HostOp::RaisePeer { win, peer } => self.raise_peer(op, *win, *peer),
-            // An arriving module is built by its kind's own code: a refused prepare makes this window refuse the offer
-            // before the other window has frozen anything.
-            HostOp::PrepareSurface {
-                win,
-                module,
-                shape,
-                size,
-            } => self.prepare_surface(op, *win, module, shape, *size),
-            HostOp::AdoptMoved {
-                win,
-                module,
-                kind,
-                record,
-                fds,
-            } => self.adopt_moved(op, *win, module, *kind, record, fds),
-            HostOp::OrderBaseTabs { tabs, active, .. } => self.service(op, |s| s.order_base_tabs(tabs, *active)),
-            HostOp::EndPeer { win, peer } => self.end_peer(op, *win, *peer),
-            HostOp::Cleanup(call) => self.service(op, |s| s.cleanup(call)),
-            HostOp::Pair(call) => self.service(op, |s| s.pair(call)),
-            HostOp::SetMode { win, .. } => self.set_mode(op, *win),
-            HostOp::OpenModuleWindow {
-                win,
-                name,
-                token,
-                keep_keys,
-            } => self.open_module_window(op, *win, name, token.as_deref(), *keep_keys),
-            HostOp::ForwardRaise { peer, token, .. } => self.forward_raise(*peer, token.as_deref()),
-            HostOp::PeerRun { win, peer, name, opts } => self.peer_run(op, *win, *peer, name, opts),
-            HostOp::CompositorFocus { direction, .. } => self.compositor_focus(op, *direction),
-            HostOp::HubAsk { win, ask } => self.hub_ask(op, *win, ask),
-            // Only a window beside nvim carries these out, by the nvim it follows.
-            HostOp::Beside(beside) => self.beside(op, beside),
-            HostOp::BuildBasePage { .. } => {
-                // Cloned out first: the page's build reaches the panel, and through it the host again.
-                let maker = self.base_page_maker.borrow().clone();
-                match maker {
-                    Some(maker) => {
-                        maker.build();
-                        Applied::Done
-                    }
-                    None => self.refuse(op, NOT_CARRIED_OUT),
-                }
-            }
-            HostOp::HandOverTab {
-                win,
-                from,
-                agent,
-                session,
-                to,
-                token,
-            } => self.hand_over_tab(op, *win, *from, (agent, session), to, token.as_deref()),
-            HostOp::KeepTab {
-                win,
-                peer,
-                session,
-                why,
-            } => self.keep_tab(op, *win, *peer, session, why),
-            HostOp::Quit => self.refuse(op, NOT_CARRIED_OUT),
-        }
+    /// The name of the window manager this window's moves go through, which `companion.wm` picks.
+    fn compositor_name(&self) -> &'static str {
+        let wm = self.placer.borrow().as_ref().map(|placer| placer.wm());
+        eitri_core::compositor::mode::compositor_name(wm.unwrap_or(eitri_core::compositor::Wm::None))
     }
 
     fn monitors(&self) -> Vec<Monitor> {
@@ -1790,217 +784,6 @@ impl Host for GtkHost {
                 }
             })
             .collect()
-    }
-}
-
-/// Every read answers at once from the window's grid and editor, and calls nothing that could reach the
-/// controller; a window that has given neither answers as [`NoReads`] does.
-impl HostReads for GtkHost {
-    fn view_of_tab(&self, tab: eitri_core::tabs::TabId) -> Option<ViewId> {
-        let services = self.services.borrow().clone();
-        services.and_then(|services| services.view_of_tab(tab))
-    }
-    fn tab_moving(&self, tab: eitri_core::tabs::TabId) -> bool {
-        let services = self.services.borrow().clone();
-        services.is_none_or(|services| services.tab_moving(tab))
-    }
-    fn tab_has_work(&self, tab: eitri_core::tabs::TabId) -> bool {
-        let services = self.services.borrow().clone();
-        services.is_some_and(|services| services.tab_has_work(tab))
-    }
-    fn project_chooser_env(&self, win: WinId) -> ChooserEnv {
-        let host = self.project_host.borrow().clone();
-        host.map_or_else(|| NoReads.project_chooser_env(win), |host| host.env(win))
-    }
-
-    /// The name of the window manager this window's moves go through, which `companion.wm` picks.
-    fn compositor_name(&self) -> &'static str {
-        let wm = self.placer.borrow().as_ref().map(|placer| placer.wm());
-        eitri_core::compositor::mode::compositor_name(wm.unwrap_or(eitri_core::compositor::Wm::None))
-    }
-    fn module_window_open(&self, name: &WindowName) -> bool {
-        let linked = self.linked_windows.borrow().clone();
-        linked.is_some_and(|linked| linked.module_window_open(name))
-    }
-    fn page_built(&self, _win: WinId, module: &ModuleId) -> bool {
-        self.services
-            .borrow()
-            .as_ref()
-            .is_some_and(|services| services.page_built(module))
-    }
-
-    fn plugin_keys_help(&self, _win: WinId, module: &ModuleId) -> Option<eitri_core::plugin::keys::PluginKeysHelp> {
-        let services = self.services.borrow().clone();
-        services.and_then(|services| services.plugin_keys_help(module))
-    }
-    fn chat_views(&self) -> Vec<ViewId> {
-        let services = self.services.borrow().clone();
-        services.map_or_else(Vec::new, |services| services.chat_views())
-    }
-    fn can_break_out(&self, _win: WinId) -> Result<(), String> {
-        let services = self.services.borrow().clone();
-        services.map_or_else(|| Err(NOT_CARRIED_OUT.into()), |services| services.can_break_out())
-    }
-    fn chat_move(
-        &self,
-        _win: WinId,
-        view: ViewId,
-        session: Option<&str>,
-    ) -> Result<eitri_core::wm::ChatMoveFacts, String> {
-        let services = self.services.borrow().clone();
-        services.map_or_else(
-            || Err(NOT_CARRIED_OUT.into()),
-            |services| services.chat_move(view, session),
-        )
-    }
-    fn running_chats(&self, _win: WinId) -> Vec<(ModuleId, Option<eitri_core::tabs::TabId>)> {
-        let services = self.services.borrow().clone();
-        services.map_or_else(|| Vec::new(), |s| s.running_chats())
-    }
-    fn terminal_job_names(&self, _win: WinId) -> Vec<String> {
-        let services = self.services.borrow().clone();
-        services.map_or_else(Vec::new, |services| services.terminal_job_names())
-    }
-    fn terminal_job_modules(&self, _win: WinId) -> Vec<ModuleId> {
-        let services = self.services.borrow().clone();
-        services.map_or_else(|| Vec::new(), |s| s.terminal_job_modules())
-    }
-    fn pages_with_tasks(&self, _win: WinId) -> Vec<ModuleId> {
-        let services = self.services.borrow().clone();
-        services.map_or_else(|| Vec::new(), |s| s.pages_with_tasks())
-    }
-    fn base_tabs(&self, _win: WinId) -> Vec<eitri_core::tabs::TabId> {
-        let services = self.services.borrow().clone();
-        services.map_or_else(|| Vec::new(), |s| s.base_tabs())
-    }
-    fn active_base_tab(&self, _win: WinId) -> Option<eitri_core::tabs::TabId> {
-        let services = self.services.borrow().clone();
-        services.map_or_else(|| None, |s| s.active_base_tab())
-    }
-    fn arrived_tab(&self, _win: WinId, mv: eitri_core::window_link::moves::MoveId) -> Option<eitri_core::tabs::TabId> {
-        let services = self.services.borrow().clone();
-        services.map_or_else(|| None, |s| s.arrived_tab(mv))
-    }
-    fn tab_move(&self, _win: WinId, tab: eitri_core::tabs::TabId) -> Result<eitri_core::wm::ChatMoveFacts, String> {
-        let services = self.services.borrow().clone();
-        services.map_or_else(|| Err(NOT_CARRIED_OUT.into()), |s| s.tab_move(tab))
-    }
-    fn tab_hand_over(&self, _win: WinId, tab: eitri_core::tabs::TabId) -> Result<eitri_core::wm::TabHandOver, String> {
-        let services = self.services.borrow().clone();
-        services.map_or_else(|| Err(NOT_CARRIED_OUT.into()), |s| s.tab_hand_over(tab))
-    }
-    fn moved_tab_key(
-        &self,
-        _win: WinId,
-        tab: eitri_core::tabs::TabId,
-    ) -> Option<eitri_core::window_link::base_tabs::MovedTabKey> {
-        let services = self.services.borrow().clone();
-        services.map_or_else(|| None, |s| s.moved_tab_key(tab))
-    }
-    fn view_of_session(&self, _win: WinId, session: &str) -> Option<ViewId> {
-        let services = self.services.borrow().clone();
-        services.and_then(|services| services.view_of_session(session))
-    }
-    fn tab_can_step(&self, _win: WinId, delta: i32) -> bool {
-        let services = self.services.borrow().clone();
-        services.is_some_and(|services| services.tab_can_step(delta))
-    }
-    fn tab_has_last(&self, _win: WinId) -> bool {
-        let services = self.services.borrow().clone();
-        services.is_some_and(|services| services.tab_has_last())
-    }
-    fn tab_place(&self, _win: WinId, n: u16) -> Option<eitri_core::tab_set::TabPlace> {
-        let services = self.services.borrow().clone();
-        services.and_then(|services| services.tab_place(n))
-    }
-
-    fn grid_size(&self, win: WinId) -> Size {
-        match self.grid(win) {
-            Some(grid) => grid.size(),
-            None => NoReads.grid_size(win),
-        }
-    }
-    fn handle_px(&self, win: WinId) -> i32 {
-        match self.grid(win) {
-            Some(grid) => grid.handle_px(),
-            None => NoReads.handle_px(win),
-        }
-    }
-    fn strip_px(&self, win: WinId) -> i32 {
-        match self.grid(win) {
-            Some(grid) => grid.strip_px(),
-            None => NoReads.strip_px(win),
-        }
-    }
-    fn module_min(&self, win: WinId, module: &ModuleId) -> Size {
-        match self.grid(win) {
-            Some(grid) => grid.module_min(module),
-            None => NoReads.module_min(win, module),
-        }
-    }
-    fn editor_cell(&self, win: WinId) -> Option<(f64, f64)> {
-        self.editor(win).and_then(|editor| editor.cell())
-    }
-    /// The module's host as the grid last allocated it; nothing before its first allocation.
-    fn module_size(&self, win: WinId, module: &ModuleId) -> Option<Size> {
-        self.grid(win)?.module_size(module)
-    }
-    fn editor_facts(&self, win: WinId) -> eitri_core::wm::EditorFacts {
-        self.editor(win).map_or_else(Default::default, |editor| editor.facts())
-    }
-    fn terminal_jobs(&self, _win: WinId) -> usize {
-        let services = self.services.borrow().clone();
-        services.map_or(0, |services| services.terminal_jobs())
-    }
-    fn editor_running(&self, win: WinId) -> bool {
-        self.editor(win).is_some_and(|editor| editor.running())
-    }
-    /// The chat page's own answer, read from what the page last reported; none is claimed before the shell
-    /// gives the read.
-    fn chat_claims(&self, view: ViewId, direction: Direction) -> bool {
-        let claims = self.chat_claims_fn.borrow().clone();
-        match claims {
-            Some(claims) => claims(view, direction),
-            None => NoReads.chat_claims(view, direction),
-        }
-    }
-    /// The panel's own count for the view; nothing held before the shell gives the read.
-    fn view_attention(&self, view: ViewId) -> Attention {
-        let attention = self.view_attention_fn.borrow().clone();
-        match attention {
-            Some(attention) => attention(view),
-            None => NoReads.view_attention(view),
-        }
-    }
-    /// The panel's own answer; none before the shell gives the read.
-    fn oldest_card_view(&self, win: WinId) -> Option<ViewId> {
-        let oldest = self.oldest_card_fn.borrow().clone();
-        match oldest {
-            Some(oldest) => oldest(win),
-            None => NoReads.oldest_card_view(win),
-        }
-    }
-    /// The panel's own counts for the view; nothing running before the shell gives the read.
-    fn chat_summary(&self, win: WinId) -> eitri_core::wm::ChatSummary {
-        self.summary_fn
-            .borrow()
-            .as_ref()
-            .map_or_else(Default::default, |read| read(win))
-    }
-    fn chat_kill_counts(&self, view: ViewId) -> ChatKillCounts {
-        let counts = self.kill_counts_fn.borrow().clone();
-        match counts {
-            Some(counts) => counts(view),
-            None => NoReads.chat_kill_counts(view),
-        }
-    }
-    /// The panel's own answer; a view can be given its tab before the shell gives the read.
-    fn chat_first_tab(&self, view: ViewId, breaks: bool) -> Result<(), String> {
-        let first_tab = self.first_tab_fn.borrow().clone();
-        match first_tab {
-            Some(first_tab) => first_tab(view, breaks),
-            None => NoReads.chat_first_tab(view, breaks),
-        }
     }
 }
 
@@ -2135,465 +918,11 @@ mod monitor_move_tests {
 }
 
 #[cfg(test)]
-mod editor_reads_tests {
-    use super::*;
-    use eitri_core::wm::{close::NvimAnswer, EditorFacts};
-    use std::time::Instant;
-
-    struct EditorSnapshot(RefCell<EditorFacts>);
-
-    impl EditorReads for EditorSnapshot {
-        fn cell(&self) -> Option<(f64, f64)> {
-            None
-        }
-        fn running(&self) -> bool {
-            self.0.borrow().running
-        }
-        fn facts(&self) -> EditorFacts {
-            self.0.borrow().clone()
-        }
-    }
-
-    #[test]
-    fn editor_facts_copy_the_registered_panes_snapshot() {
-        let host = GtkHost::new();
-        let win = WinId::MAIN;
-        assert_eq!(host.editor_facts(win), EditorFacts::default());
-        let editor = Rc::new(EditorSnapshot(RefCell::new(EditorFacts {
-            running: false,
-            exited: false,
-            exit_pending: true,
-            starting: false,
-            watch: Some(NvimAnswer {
-                sent_at: Instant::now(),
-                done: false,
-                returned: false,
-                last: None,
-            }),
-        })));
-        host.set_editor(win, editor.clone());
-        assert_eq!(host.editor_facts(win), *editor.0.borrow());
-        assert_eq!(host.editor_facts(WinId(2)), EditorFacts::default());
-        *editor.0.borrow_mut() = EditorFacts {
-            exited: true,
-            ..Default::default()
-        };
-        assert_eq!(host.editor_facts(win), *editor.0.borrow());
-    }
-
-    /// The editor's calls reach the window's editor service, the release of an exited nvim among them, which is told
-    /// as its own fact. A quit the service could not send is refused as any failed op is, and told again as the
-    /// quit's own fact with its generation, since the refusal names no call.
-    #[test]
-    fn a_quit_that_could_not_be_sent_is_told_with_its_generation() {
-        use eitri_core::wm::conformance::RecordingSink;
-        struct Services(RefCell<Vec<String>>);
-        impl ServiceSet for Services {
-            fn editor(&self, op: &EditorCall) -> Result<(), String> {
-                self.0.borrow_mut().push(format!("{op:?}"));
-                match op {
-                    EditorCall::Quit { .. } => Err("nvim is not running; the quit was not sent".into()),
-                    _ => Ok(()),
-                }
-            }
-            fn terminal(&self, _: &TermOp) -> Result<(), String> {
-                unreachable!()
-            }
-            fn plugin(&self, _: &PluginOp) -> Result<(), String> {
-                unreachable!()
-            }
-            fn chat(&self, _: &ChatOp) -> Result<(), String> {
-                unreachable!()
-            }
-        }
-        let host = GtkHost::new();
-        let sink = Rc::new(RecordingSink::default());
-        let erased: Rc<dyn HostSink> = sink.clone();
-        host.attach(Rc::downgrade(&erased));
-        let services = Rc::new(Services(RefCell::default()));
-        host.set_services(services.clone());
-
-        let release = HostOp::Editor(EditorCall::ReleaseExited { win: WinId::MAIN });
-        assert_eq!(
-            host.apply(&release),
-            Applied::Done,
-            "the release reaches the editor service"
-        );
-        let events: Vec<HostEvent> = sink.events().into_iter().map(|(_, event)| event).collect();
-        assert_eq!(events, [HostEvent::Editor(EditorEvent::Released { win: WinId::MAIN })]);
-
-        let quit = HostOp::Editor(EditorCall::Quit {
-            win: WinId::MAIN,
-            lua: "quit".into(),
-            generation: 7,
-            editor: eitri_core::wm::owned_editor_for_tests(),
-        });
-        assert_eq!(host.apply(&quit), Applied::Refused);
-        let events: Vec<HostEvent> = sink.events().into_iter().skip(1).map(|(_, event)| event).collect();
-        assert!(matches!(
-            events.as_slice(),
-            [
-                HostEvent::Refused {
-                    what: OpTag::Editor,
-                    ..
-                },
-                HostEvent::Editor(EditorEvent::QuitNotSent {
-                    win: WinId::MAIN,
-                    generation: 7
-                })
-            ]
-        ));
-        assert_eq!(services.0.borrow().len(), 2, "both calls reached the service");
-    }
-
-    /// An open's answer goes to the service that holds the socket; with none, it is refused as any op is.
-    #[test]
-    fn an_open_answer_reaches_the_service() {
-        use eitri_core::wm::conformance::RecordingSink;
-        #[derive(Default)]
-        struct Services(RefCell<Vec<(u64, bool)>>);
-        impl ServiceSet for Services {
-            fn editor(&self, _: &EditorCall) -> Result<(), String> {
-                unreachable!()
-            }
-            fn terminal(&self, _: &TermOp) -> Result<(), String> {
-                unreachable!()
-            }
-            fn plugin(&self, _: &PluginOp) -> Result<(), String> {
-                unreachable!()
-            }
-            fn chat(&self, _: &ChatOp) -> Result<(), String> {
-                unreachable!()
-            }
-            fn open_answer(&self, id: u64, accepted: bool) -> Result<(), String> {
-                self.0.borrow_mut().push((id, accepted));
-                Ok(())
-            }
-        }
-        let host = GtkHost::new();
-        let sink = Rc::new(RecordingSink::default());
-        let erased: Rc<dyn HostSink> = sink.clone();
-        host.attach(Rc::downgrade(&erased));
-        let answer = HostOp::OpenAnswer { id: 7, accepted: true };
-        assert_eq!(host.apply(&answer), Applied::Refused, "no services yet");
-        let services = Rc::new(Services::default());
-        host.set_services(services.clone());
-        assert_eq!(host.apply(&answer), Applied::Done);
-        assert_eq!(*services.0.borrow(), [(7, true)]);
-    }
-
-    /// A release nvim's living process refused, and a restart the pane refused from the state it was in, are each
-    /// refused as any failed op is and told as their own facts, the restart's with the state, since a refusal names
-    /// no call. A restart carried out is told nothing until its nvim is ready.
-    #[test]
-    fn a_refused_release_and_a_refused_restart_are_told_as_their_own_facts() {
-        use eitri_core::wm::conformance::RecordingSink;
-        use eitri_core::wm::EditorSpawn;
-        struct Pane {
-            exited: Cell<bool>,
-            refused_from: RefCell<Option<String>>,
-            restarts: RefCell<Vec<EditorSpawn>>,
-        }
-        impl ServiceSet for Pane {
-            fn editor(&self, op: &EditorCall) -> Result<(), String> {
-                match op {
-                    EditorCall::ReleaseExited { .. } if self.exited.get() => Ok(()),
-                    EditorCall::ReleaseExited { .. } => Err("nvim has not exited; the pane was not released".into()),
-                    _ => unreachable!("{op:?}"),
-                }
-            }
-            fn restart_editor(&self, spawn: &EditorSpawn) -> Result<(), RestartRefused> {
-                self.restarts.borrow_mut().push(spawn.clone());
-                let refused_from = self.refused_from.borrow().clone();
-                match refused_from {
-                    Some(state) => Err(RestartRefused::Pane { state }),
-                    None => Ok(()),
-                }
-            }
-            fn terminal(&self, _: &TermOp) -> Result<(), String> {
-                unreachable!()
-            }
-            fn plugin(&self, _: &PluginOp) -> Result<(), String> {
-                unreachable!()
-            }
-            fn chat(&self, _: &ChatOp) -> Result<(), String> {
-                unreachable!()
-            }
-        }
-        let host = GtkHost::new();
-        let sink = Rc::new(RecordingSink::default());
-        let erased: Rc<dyn HostSink> = sink.clone();
-        host.attach(Rc::downgrade(&erased));
-        let pane = Rc::new(Pane {
-            exited: Cell::new(false),
-            refused_from: RefCell::new(Some("Ready".into())),
-            restarts: RefCell::default(),
-        });
-        host.set_services(pane.clone());
-        let events = || -> Vec<HostEvent> { sink.events().into_iter().map(|(_, event)| event).collect() };
-
-        let release = HostOp::Editor(EditorCall::ReleaseExited { win: WinId::MAIN });
-        assert_eq!(host.apply(&release), Applied::Refused);
-        assert!(matches!(
-            events().as_slice(),
-            [
-                HostEvent::Refused {
-                    what: OpTag::Editor,
-                    ..
-                },
-                HostEvent::Editor(EditorEvent::ReleaseRefused { win: WinId::MAIN })
-            ]
-        ));
-
-        let spawn = EditorSpawn {
-            env: vec![("TMUX".into(), "x".into())],
-            args: vec!["--cmd".into(), "let g:x = 1".into()],
-            cwd: None,
-            clean: false,
-            background: None,
-            open: vec![],
-        };
-        let restart = HostOp::Editor(EditorCall::Restart {
-            win: WinId::MAIN,
-            spawn: spawn.clone(),
-            editor: eitri_core::wm::owned_editor_for_tests(),
-        });
-        assert_eq!(host.apply(&restart), Applied::Refused);
-        let told = events();
-        let [_, _, HostEvent::Refused {
-            what: OpTag::Editor,
-            why,
-            ..
-        }, HostEvent::Editor(EditorEvent::RestartRefused {
-            win: WinId::MAIN,
-            state,
-        })] = told.as_slice()
-        else {
-            panic!("the restart's refusal and its fact: {told:?}");
-        };
-        assert!(why.contains("Ready"), "the refusal says the state: {why}");
-        assert_eq!(state, "Ready");
-
-        *pane.refused_from.borrow_mut() = None;
-        assert_eq!(host.apply(&restart), Applied::Done);
-        assert_eq!(events().len(), 4, "a restart carried out is told nothing yet");
-        assert_eq!(
-            *pane.restarts.borrow(),
-            [spawn.clone(), spawn],
-            "each restart reached the pane with its spawn"
-        );
-    }
-}
-
-// Only the probe places hosts by hand, so only a build with it has a host to leave alone.
-#[cfg(all(test, feature = "probe"))]
-mod tests {
-    use super::*;
-
-    /// The probe's hosts stay where it put them: a map or an unmap of one reaches nothing, every other host's
-    /// op is carried out as it came, and no other op is a map.
-    #[test]
-    fn map_and_unmap_skip_a_host_the_probe_places() {
-        let placed = ModuleId::terminal();
-        let laid_out = ModuleId::agent();
-        let win = WinId::MAIN;
-        let ops = vec![
-            HostOp::Map {
-                win,
-                module: placed.clone(),
-            },
-            HostOp::Map {
-                win,
-                module: laid_out.clone(),
-            },
-            HostOp::Allocate { win },
-            HostOp::Unmap {
-                win,
-                module: placed.clone(),
-            },
-            HostOp::Unmap {
-                win,
-                module: laid_out.clone(),
-            },
-        ];
-        assert_eq!(
-            hosts_to_map(&ops, |module| *module == placed),
-            vec![(win, laid_out.clone(), true), (win, laid_out.clone(), false)]
-        );
-        assert_eq!(
-            hosts_to_map(&ops, |_| false),
-            vec![
-                (win, placed.clone(), true),
-                (win, laid_out.clone(), true),
-                (win, placed, false),
-                (win, laid_out, false),
-            ],
-            "without the probe every map and unmap is carried out"
-        );
-    }
-}
-
-#[cfg(test)]
-mod terminal_at_tests {
+mod window_port_tests {
     use super::*;
     use eitri_core::wm::conformance::RecordingSink;
-    use eitri_core::wm::ShellStart;
-
-    #[derive(Clone)]
-    struct Pane {
-        shell: ShellStart,
-        calls: Rc<RefCell<Vec<String>>>,
-    }
-
-    impl RespawnPane for Pane {
-        fn shell_start(&self) -> ShellStart {
-            self.shell
-        }
-        fn close(&self) {
-            self.calls.borrow_mut().push("close".into());
-        }
-        fn set_start_dir(&self, dir: PathBuf) {
-            self.calls.borrow_mut().push(format!("dir {}", dir.display()));
-        }
-        fn start(&self) {
-            self.calls.borrow_mut().push("start".into());
-        }
-    }
-
-    #[test]
-    fn a_server_restart_without_a_server_op_is_refused_and_touches_nothing() {
-        let shell = ShellStart::identified(
-            1,
-            Some(eitri_core::wm::ShellIdentity::Server {
-                generation: 7,
-                terminal_id: 1,
-            }),
-        );
-        let calls = Rc::new(RefCell::new(Vec::new()));
-        let pane = Pane {
-            shell,
-            calls: calls.clone(),
-        };
-        assert_eq!(
-            respawn_pane(Some(pane), shell, "/srv/project".into()),
-            Err("server terminal restart is not available yet".into())
-        );
-        assert!(calls.borrow().is_empty());
-    }
-
-    struct Services(Option<Pane>);
-    impl ServiceSet for Services {
-        fn editor(&self, _: &EditorCall) -> Result<(), String> {
-            unreachable!()
-        }
-        fn plugin(&self, _: &PluginOp) -> Result<(), String> {
-            unreachable!()
-        }
-        fn chat(&self, _: &ChatOp) -> Result<(), String> {
-            unreachable!()
-        }
-        fn terminal(&self, op: &TermOp) -> Result<(), String> {
-            match op {
-                TermOp::Respawn { expect, dir, .. } => respawn_pane(self.0.clone(), *expect, dir.clone()),
-                _ => unreachable!(),
-            }
-        }
-    }
-
-    #[test]
-    fn a_respawn_for_a_pane_no_longer_running_expect_or_typed_into_since_is_refused_and_touches_nothing() {
-        let expect = ShellStart::of(3, Some(42));
-        let calls = Rc::new(RefCell::new(Vec::new()));
-        let host = GtkHost::new();
-        let sink = Rc::new(RecordingSink::default());
-        let erased: Rc<dyn HostSink> = sink.clone();
-        host.attach(Rc::downgrade(&erased));
-        let op = HostOp::Terminal(TermOp::Respawn {
-            win: WinId::MAIN,
-            module: ModuleId::terminal(),
-            dir: PathBuf::from("/new"),
-            expect,
-        });
-        for shell in [
-            None,
-            Some(ShellStart::of(4, Some(42))),
-            Some(ShellStart::of(3, Some(43))),
-            Some(ShellStart::of(3, None)),
-            Some(ShellStart::of(3, Some(42)).typed(1)),
-        ] {
-            host.set_services(Rc::new(Services(shell.map(|shell| Pane {
-                shell,
-                calls: calls.clone(),
-            }))));
-            assert_eq!(host.apply(&op), Applied::Refused);
-            assert!(calls.borrow().is_empty());
-            assert!(
-                matches!(sink.events().last(), Some((_, HostEvent::Refused { what: OpTag::Respawn, surface: Some((WinId::MAIN, module)), .. })) if module == &ModuleId::terminal())
-            );
-        }
-        host.set_services(Rc::new(Services(Some(Pane {
-            shell: expect,
-            calls: calls.clone(),
-        }))));
-        assert_eq!(host.apply(&op), Applied::Done);
-        assert_eq!(*calls.borrow(), ["close", "dir /new", "start"]);
-    }
-}
-
-#[cfg(test)]
-mod module_window_ops_tests {
-    use super::*;
-    use eitri_core::window_link::HubAsk;
-    use eitri_core::wm::conformance::RecordingSink;
-
-    #[derive(Default)]
-    struct Linked {
-        opened: RefCell<Vec<(WindowName, Option<String>, bool)>>,
-        sent: RefCell<Vec<(PeerId, Msg)>>,
-        to_hub: RefCell<Vec<Msg>>,
-        handed: RefCell<Vec<(PeerId, String, WindowName, Option<String>)>>,
-        open_windows: RefCell<Vec<WindowName>>,
-    }
-
-    impl LinkedWindows for Linked {
-        fn open(&self, _: WinId, _: &WindowName, _: Option<String>) -> Result<(), String> {
-            unreachable!()
-        }
-        fn restore(&self, _: WinId, _: &WindowName) -> Result<(), String> {
-            unreachable!()
-        }
-        fn start_editor(&self, _: WinId) -> Result<(), String> {
-            unreachable!()
-        }
-        fn module_window_open(&self, name: &WindowName) -> bool {
-            self.open_windows.borrow().contains(name)
-        }
-        fn open_module(&self, _: WinId, name: &WindowName, token: Option<String>, keep: bool) -> Result<(), String> {
-            self.opened.borrow_mut().push((name.clone(), token, keep));
-            Ok(())
-        }
-        fn send(&self, _: WinId, peer: PeerId, msg: Msg) -> Result<(), String> {
-            self.sent.borrow_mut().push((peer, msg));
-            Ok(())
-        }
-        fn send_to_hub(&self, _: WinId, msg: Msg) -> Result<(), String> {
-            self.to_hub.borrow_mut().push(msg);
-            Ok(())
-        }
-        fn hand_over(
-            &self,
-            _: WinId,
-            from: PeerId,
-            _: &eitri_core::agent_backend::AgentId,
-            session: &str,
-            to: &WindowName,
-            token: Option<String>,
-        ) -> Result<(), String> {
-            let handed = (from, session.to_string(), to.clone(), token);
-            self.handed.borrow_mut().push(handed);
-            Ok(())
-        }
-    }
+    use eitri_core::wm::Applied;
+    use eitri_core::wm::{Host, HostOp, HostReads, OpTag};
 
     struct Compositor(Option<&'static str>);
     impl PairRaise for Compositor {
@@ -2611,221 +940,14 @@ mod module_window_ops_tests {
         }
     }
 
-    fn host() -> (Rc<GtkHost>, Rc<RecordingSink>, Rc<Linked>) {
+    /// The GTK host with no window, the router over it, and where the router posts.
+    fn router() -> (Rc<GtkHost>, Rc<WmHost>, Rc<RecordingSink>) {
         let host = GtkHost::new();
+        let router = host.router();
         let sink = Rc::new(RecordingSink::default());
         let erased: Rc<dyn HostSink> = sink.clone();
-        host.attach(Rc::downgrade(&erased));
-        let linked = Rc::new(Linked::default());
-        host.set_linked_windows(linked.clone());
-        (host, sink, linked)
-    }
-
-    fn chat(n: u8) -> WindowName {
-        WindowName::Chat(n)
-    }
-
-    #[test]
-    fn opening_a_module_window_passes_the_key_s_token_and_a_start_s_window_takes_none() {
-        let (host, _sink, linked) = host();
-        for (token, keep_keys) in [(Some("key"), false), (Some("dropped"), true), (None, false)] {
-            let op = HostOp::OpenModuleWindow {
-                win: WinId::MAIN,
-                name: chat(2),
-                token: token.map(str::to_string),
-                keep_keys,
-            };
-            assert_eq!(host.apply(&op), Applied::Done);
-        }
-        assert_eq!(
-            *linked.opened.borrow(),
-            vec![
-                (chat(2), Some("key".to_string()), false),
-                (chat(2), None, true),
-                // No window of this host to make a token from: it goes without one.
-                (chat(2), None, false),
-            ]
-        );
-    }
-
-    #[derive(Default)]
-    struct Pages(Cell<u32>);
-
-    impl BasePageMaker for Pages {
-        fn build(&self) {
-            self.0.set(self.0.get() + 1);
-        }
-    }
-
-    #[test]
-    fn the_base_page_is_built_by_the_maker_and_refused_without_one() {
-        let (host, sink, _) = host();
-        let op = HostOp::BuildBasePage { win: WinId::MAIN };
-        assert_eq!(host.apply(&op), Applied::Refused);
-        assert!(sink.events().iter().any(|(_, event)| matches!(
-            event,
-            HostEvent::Refused {
-                what: OpTag::BuildBasePage,
-                ..
-            }
-        )));
-        let pages = Rc::new(Pages::default());
-        host.set_base_page_maker(pages.clone());
-        assert_eq!(host.apply(&op), Applied::Done);
-        assert_eq!(pages.0.get(), 1);
-    }
-
-    #[test]
-    fn a_host_with_no_pair_refuses_the_ops_that_reach_another_window() {
-        let host = GtkHost::new();
-        let sink = Rc::new(RecordingSink::default());
-        let erased: Rc<dyn HostSink> = sink.clone();
-        host.attach(Rc::downgrade(&erased));
-        let ops = [
-            HostOp::OpenModuleWindow {
-                win: WinId::MAIN,
-                name: chat(1),
-                token: None,
-                keep_keys: false,
-            },
-            HostOp::PeerRun {
-                win: WinId::MAIN,
-                peer: PeerId(16),
-                name: "zoom".into(),
-                opts: vec![],
-            },
-            HostOp::HubAsk {
-                win: WinId::MAIN,
-                ask: HubAsk::InstanceNew,
-            },
-            HostOp::CompositorFocus {
-                win: WinId::MAIN,
-                direction: Direction::Left,
-            },
-            HostOp::HandOverTab {
-                win: WinId::MAIN,
-                from: PeerId(16),
-                agent: eitri_core::agent_backend::AgentId::Claude,
-                session: "s".into(),
-                to: chat(2),
-                token: None,
-            },
-            HostOp::KeepTab {
-                win: WinId::MAIN,
-                peer: PeerId(16),
-                session: "s".into(),
-                why: "no".into(),
-            },
-        ];
-        for op in &ops {
-            assert_eq!(host.apply(op), Applied::Refused, "{op:?}");
-        }
-        let refused: Vec<OpTag> = sink
-            .events()
-            .into_iter()
-            .filter_map(|(_, event)| match event {
-                HostEvent::Refused { what, .. } => Some(what),
-                _ => None,
-            })
-            .collect();
-        assert_eq!(
-            refused,
-            vec![
-                OpTag::OpenModuleWindow,
-                OpTag::PeerRun,
-                OpTag::HubAsk,
-                OpTag::CompositorFocus,
-                OpTag::HandOverTab,
-                OpTag::KeepTab
-            ]
-        );
-    }
-
-    #[test]
-    fn a_hand_over_goes_to_the_pair_and_a_kept_tab_over_the_askers_link() {
-        let (host, _sink, linked) = host();
-        let hand_over = HostOp::HandOverTab {
-            win: WinId::MAIN,
-            from: PeerId(16),
-            agent: eitri_core::agent_backend::AgentId::Claude,
-            session: "s".into(),
-            to: chat(3),
-            token: Some("theirs".into()),
-        };
-        assert_eq!(host.apply(&hand_over), Applied::Done);
-        assert_eq!(
-            *linked.handed.borrow(),
-            vec![(PeerId(16), "s".to_string(), chat(3), Some("theirs".to_string()))]
-        );
-        let keep = HostOp::KeepTab {
-            win: WinId::MAIN,
-            peer: PeerId(16),
-            session: "s".into(),
-            why: "all nine chat windows are open".into(),
-        };
-        assert_eq!(host.apply(&keep), Applied::Done);
-        assert_eq!(
-            *linked.sent.borrow(),
-            vec![(
-                PeerId(16),
-                Msg::TabKept {
-                    session: "s".into(),
-                    why: "all nine chat windows are open".into()
-                }
-            )]
-        );
-    }
-
-    #[test]
-    fn a_forwarded_raise_is_answered_with_the_token_it_carries() {
-        let (host, sink, _linked) = host();
-        let op = HostOp::ForwardRaise {
-            win: WinId::MAIN,
-            peer: PeerId(17),
-            token: Some("theirs".into()),
-        };
-        assert_eq!(host.apply(&op), Applied::Done);
-        assert_eq!(
-            sink.events().into_iter().map(|(_, event)| event).collect::<Vec<_>>(),
-            vec![HostEvent::Peer(PeerEvent::Raised {
-                peer: PeerId(17),
-                token: Some("theirs".into())
-            })]
-        );
-    }
-
-    #[test]
-    fn a_run_and_an_ask_go_over_the_link_as_the_messages_the_other_window_reads() {
-        let (host, _sink, linked) = host();
-        let run = HostOp::PeerRun {
-            win: WinId::MAIN,
-            peer: PeerId(17),
-            name: "tab.select".into(),
-            opts: vec![("n".into(), 3.into())],
-        };
-        assert_eq!(host.apply(&run), Applied::Done);
-        let ask = HostOp::HubAsk {
-            win: WinId::MAIN,
-            ask: HubAsk::InstanceNew,
-        };
-        assert_eq!(host.apply(&ask), Applied::Done);
-        assert_eq!(
-            *linked.sent.borrow(),
-            vec![(
-                PeerId(17),
-                Msg::RunAction {
-                    name: "tab.select".into(),
-                    opts: vec![("n".into(), 3.into())]
-                }
-            )]
-        );
-        assert_eq!(
-            *linked.to_hub.borrow(),
-            vec![Msg::HubAsk {
-                ask: HubAsk::InstanceNew,
-                token: None
-            }]
-        );
+        router.attach(Rc::downgrade(&erased));
+        (host, router, sink)
     }
 
     #[test]
@@ -2839,35 +961,26 @@ mod module_window_ops_tests {
                 unreachable!()
             }
         }
-        let (host, _sink, _linked) = host();
-        assert_eq!(host.compositor_name(), "the compositor");
+        let (host, router, _sink) = router();
+        assert_eq!(router.compositor_name(), "the compositor");
         use eitri_core::compositor::Wm;
         for (wm, name) in [(Wm::Hyprland, "Hyprland"), (Wm::Sway, "sway"), (Wm::Niri, "niri")] {
             host.set_monitor_placer(Rc::new(Placer(wm)));
-            assert_eq!(host.compositor_name(), name);
+            assert_eq!(router.compositor_name(), name);
         }
     }
 
     #[test]
-    fn a_window_a_hand_over_starts_reads_as_open_to_the_controller() {
-        let (host, _sink, linked) = host();
-        assert!(!host.module_window_open(&chat(2)));
-        linked.open_windows.borrow_mut().push(chat(2));
-        assert!(host.module_window_open(&chat(2)));
-        assert!(!host.module_window_open(&chat(3)));
-    }
-
-    #[test]
     fn a_focus_move_past_the_edge_is_the_compositors_and_says_once_when_it_has_none() {
-        let (host, sink, _linked) = host();
+        let (host, router, sink) = router();
         let op = HostOp::CompositorFocus {
             win: WinId::MAIN,
             direction: Direction::Right,
         };
         host.set_pair_raise(Rc::new(Compositor(None)));
-        assert_eq!(host.apply(&op), Applied::Done);
+        assert_eq!(router.apply(&op), Applied::Done);
         host.set_pair_raise(Rc::new(Compositor(Some("no compositor tool"))));
-        assert_eq!(host.apply(&op), Applied::Refused);
+        assert_eq!(router.apply(&op), Applied::Refused);
         assert!(sink.events().into_iter().any(|(_, event)| matches!(
             event,
             HostEvent::Refused { what: OpTag::CompositorFocus, why, .. } if why == "no compositor tool"

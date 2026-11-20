@@ -1,0 +1,950 @@
+== bare create_surface_of_each_kind_answers_done_and_registers_it
+op 0 CreateSurface
+  maker.create WinId(1) terminal#2 Terminal { cwd: "." }
+  = Done
+op 1 CreateSurface
+  maker.create WinId(1) agent#2 Chat { view: ViewId(2) }
+  = Done
+op 2 CreateSurface
+  maker.create WinId(1) lua:panel LuaPanel { url: "about:blank", title: "panel" }
+  = Done
+op 3 CreateSurface
+  maker.create WinId(1) lua:plugin PluginPage { plugin: "plugin" }
+  = Done
+op 4 CreateSurface
+  maker.create WinId(1) editor Editor { spawn: EditorSpawn { env: [], args: [], cwd: None, clean: true, background: None, open: [] } }
+  = Done
+op 5 Map
+  grid.probe_places terminal#2
+  maker.mapped terminal#2 true
+  = Done
+op 6 Focus
+  = Done
+op 7 Map
+  grid.probe_places agent#2
+  maker.mapped agent#2 true
+  = Done
+op 8 Focus
+  = Done
+op 9 Map
+  grid.probe_places lua:panel
+  maker.mapped lua:panel true
+  = Done
+op 10 Focus
+  = Done
+op 11 Map
+  grid.probe_places lua:plugin
+  maker.mapped lua:plugin true
+  = Done
+op 12 Focus
+  = Done
+op 13 Map
+  grid.probe_places editor
+  maker.mapped editor true
+  = Done
+op 14 Focus
+  = Done
+== bare drop_surface_of_a_killed_web_module_keeps_its_widget
+op 0 CreateSurface
+  maker.create WinId(1) lua:panel LuaPanel { url: "about:blank", title: "panel" }
+  = Done
+op 1 Map
+  grid.probe_places lua:panel
+  maker.mapped lua:panel true
+  = Done
+op 2 Unmap
+  grid.probe_places lua:panel
+  maker.mapped lua:panel false
+  = Done
+op 3 DropSurface
+  maker.drop WinId(1) lua:panel Killed
+  = Done
+op 4 Map
+  grid.probe_places lua:panel
+  maker.mapped lua:panel true
+  = Done
+op 5 Focus
+  = Done
+== bare create_surface_of_a_runtime_instance_is_built_and_wired_once
+op 0 CreateSurface
+  maker.create WinId(1) terminal#3 Terminal { cwd: "." }
+  = Done
+op 1 Map
+  grid.probe_places terminal#3
+  maker.mapped terminal#3 true
+  = Done
+op 2 Focus
+  = Done
+op 3 Unmap
+  grid.probe_places terminal#3
+  maker.mapped terminal#3 false
+  = Done
+op 4 CreateSurface
+  maker.create WinId(1) terminal#3 Terminal { cwd: ".." }
+  = Done
+op 5 Map
+  grid.probe_places terminal#3
+  maker.mapped terminal#3 true
+  = Done
+op 6 Focus
+  = Done
+== bare focus_posts_native_focus_while_it_applies
+op 0 Focus
+  = Done
+== bare present_then_focus_gives_the_first_module_the_keys
+op 0 Present
+  = Done
+op 1 Focus
+  = Done
+== bare focus_on_a_hidden_module_is_refused
+op 0 Focus
+  event Refused { what: Focus, why: "the module's surface is not on screen", surface: Some((WinId(1), ModuleId("editor"))) }
+  = Refused
+== bare unmapping_the_focus_owner_reports_focus_moving
+op 0 Focus
+  = Done
+op 1 Unmap
+  grid.probe_places agent
+  maker.mapped agent false
+  = Done
+== bare map_then_focus_then_unmap_moves_the_keys_to_the_mapped_module
+op 0 Focus
+  = Done
+op 1 Map
+  grid.probe_places editor
+  maker.mapped editor true
+  = Done
+op 2 Focus
+  = Done
+op 3 Unmap
+  grid.probe_places agent
+  maker.mapped agent false
+  = Done
+== bare a_focus_on_a_tab_not_drawn_after_its_map_is_answered_done
+op 0 Focus
+  = Done
+op 1 Map
+  grid.probe_places editor
+  maker.mapped editor true
+  = Done
+op 2 Focus
+  = Done
+op 3 Unmap
+  grid.probe_places agent
+  maker.mapped agent false
+  = Done
+== bare allocate_queues_one_allocation
+op 0 Allocate
+  grid.queue_allocation
+  = Done
+== bare restack_orders_the_float_band_only
+op 0 Restack
+  grid.restack_floats ["terminal", "agent"]
+  = Done
+== bare chrome_reads_the_model_and_answers_done
+op 0 Chrome
+  = Done
+== bare focus_onboarding_before_the_chrome_op_grabs_and_reports_no_owner
+op 0 Focus
+  = Done
+op 1 Chrome
+  = Done
+== bare close_window_never_asks
+op 0 CloseWindow
+  = Done
+== bare a_terminal_prepare_is_carried_out_and_answered_prepared
+op 0 PrepareSurface
+  maker.prepare WinId(1) terminal#3 Tiled (640, 480)
+  = Done
+== bare a_chat_view_prepare_is_carried_out_and_answered_prepared
+op 0 PrepareSurface
+  maker.prepare WinId(1) agent#3 Tiled (640, 480)
+  = Done
+== bare close_window_closes_without_asking_and_proceeds
+op 0 CloseWindow
+  = Done
+== bare project_read_answers
+op 0 Project
+  projects.apply Read { win: WinId(1), serial: 7, dir: "/walked", filter: Some("a"), debounce: true, near: Some("abc") }
+  event Project(Listing { win: WinId(1), serial: 7, dir: "/walked", listing: Stuck })
+  = Done
+== bare project_list_answers_the_request
+op 0 Project
+  projects.apply List { win: WinId(1), serial: 5 }
+  event Project(Rows { win: WinId(1), serial: 5, rows: [] })
+  = Done
+== bare project_folder_dialog_answers_its_window
+op 0 Project
+  projects.apply FolderDialog { win: WinId(1), at: None }
+  event Project(Folder { win: WinId(1), path: None })
+  = Done
+== bare project_open_is_carried_out
+op 0 Project
+  projects.open WinId(1) /work/other no token
+  = Done
+== bare project_focus_and_close_report_the_keys
+op 0 Map
+  grid.probe_places editor
+  maker.mapped editor true
+  = Done
+op 1 Focus
+  projects.focus WinId(1)
+  = Done
+op 2 Focus
+  = Done
+== bare a_refused_open_linked_window_is_posted_refused
+op 0 OpenLinkedWindow
+  event Refused { what: OpenLinkedWindow, why: "this window has no second window yet", surface: None }
+  = Refused
+== bare a_refused_open_module_window_is_posted_refused
+op 0 OpenModuleWindow
+  event Refused { what: OpenModuleWindow, why: "this window has no second window yet", surface: None }
+  = Refused
+== bare a_refused_peer_run_is_posted_refused
+op 0 PeerRun
+  event Refused { what: PeerRun, why: "this window has no second window yet", surface: None }
+  = Refused
+== bare a_refused_hub_ask_is_posted_refused
+op 0 HubAsk
+  event Refused { what: HubAsk, why: "this window has no second window yet", surface: None }
+  = Refused
+== bare a_refused_beside_op_is_posted_refused
+op 0 Beside
+  event Refused { what: Beside, why: "not carried out by this shell yet", surface: None }
+  = Refused
+== bare a_refused_compositor_focus_is_posted_refused
+op 0 CompositorFocus
+  event Refused { what: CompositorFocus, why: "not carried out by this shell yet", surface: None }
+  = Refused
+== bare focus_on_the_current_owner_still_reports_native_focus
+op 0 Focus
+  = Done
+op 1 Focus
+  = Done
+== bare a_join_back_that_fails_is_posted_refused_with_its_text
+op 0 Chat
+  services.chat JoinBack { win: WinId(1), view: ViewId(2) }
+  event Refused { what: Chat, why: "the tab could not join the base view", surface: Some((WinId(1), ModuleId("agent#2"))) }
+  = Refused
+== bare a_round_scan_with_no_agents_layer_is_posted_refused
+op 0 AgentsScan
+  services.agents_scan WinId(1) Next Some(ModuleId("agent"))
+  event Refused { what: AgentsScan, why: "not carried out by this shell yet", surface: None }
+  = Refused
+== bare the_teardown_ops_are_answered_done_in_order
+op 0 Cleanup
+  services.cleanup PairOnClose { layout_written: true }
+  = Done
+op 1 Editor
+  services.editor Shutdown { win: WinId(1) }
+  = Done
+op 2 Terminal
+  services.terminal ShutdownAll { win: WinId(1) }
+  = Done
+op 3 Cleanup
+  services.cleanup PaneSwitchDir
+  = Done
+op 4 Cleanup
+  services.cleanup Feeds
+  = Done
+op 5 Plugin
+  services.plugin ShutdownAll { win: WinId(1) }
+  = Done
+op 6 Chat
+  services.chat ShutdownAll { win: WinId(1), hold: true }
+  = Done
+op 7 Cleanup
+  services.cleanup ScratchDir
+  = Done
+op 8 CloseWindow
+  = Done
+== bare the_teardown_ops_are_answered_done_in_order
+op 0 Cleanup
+  services.cleanup PairOnClose { layout_written: true }
+  = Done
+op 1 Editor
+  services.editor Shutdown { win: WinId(1) }
+  = Done
+op 2 Cleanup
+  services.cleanup EditorRecord { token: Some("0123456789abcdef"), seq: 1 }
+  = Done
+op 3 Terminal
+  services.terminal ShutdownAll { win: WinId(1) }
+  = Done
+op 4 Cleanup
+  services.cleanup PaneSwitchDir
+  = Done
+op 5 Cleanup
+  services.cleanup Feeds
+  = Done
+op 6 Plugin
+  services.plugin ShutdownAll { win: WinId(1) }
+  = Done
+op 7 Chat
+  services.chat ShutdownAll { win: WinId(1), hold: true }
+  = Done
+op 8 Cleanup
+  services.cleanup ScratchDir
+  = Done
+op 9 CloseWindow
+  = Done
+== bare every_op_once
+op 0 Focus
+  event Refused { what: Focus, why: "not carried out by this shell yet", surface: None }
+  = Refused
+op 1 Focus
+  event Refused { what: Focus, why: "not carried out by this shell yet", surface: None }
+  = Refused
+op 2 Focus
+  = Done
+op 3 Focus
+  projects.focus WinId(1)
+  = Done
+op 4 Focus
+  event Refused { what: Focus, why: "not carried out by this shell yet", surface: None }
+  = Refused
+op 5 Focus
+  event Refused { what: Focus, why: "no such window", surface: Some((WinId(9), ModuleId("agent"))) }
+  = Refused
+op 6 Focus
+  event Refused { what: Focus, why: "the module has no surface in this window", surface: Some((WinId(1), ModuleId("terminal#2"))) }
+  = Refused
+op 7 Map
+  grid.probe_places terminal#2
+  event Refused { what: Map, why: "the module has no surface in this window", surface: Some((WinId(1), ModuleId("terminal#2"))) }
+  = Refused
+op 8 Unmap
+  grid.probe_places terminal
+  maker.mapped terminal false
+  = Done
+op 9 Map
+  grid.probe_places terminal
+  maker.mapped terminal true
+  = Done
+op 10 Allocate
+  event Refused { what: Allocate, why: "the window has no grid", surface: None }
+  = Refused
+op 11 Restack
+  event Refused { what: Restack, why: "the window has no grid", surface: None }
+  = Refused
+op 12 DropSurface
+  event Refused { what: DropSurface, why: "the module has no surface in this window", surface: Some((WinId(1), ModuleId("terminal#2"))) }
+  = Refused
+op 13 DropSurface
+  maker.drop WinId(1) terminal Retired
+  = Done
+op 14 Chrome
+  event Refused { what: Chrome, why: "not carried out by this shell yet", surface: None }
+  = Refused
+op 15 Chrome
+  = Done
+op 16 Hint
+  event Refused { what: Hint, why: "not carried out by this shell yet", surface: None }
+  = Refused
+op 17 Hint
+  event Refused { what: Hint, why: "not carried out by this shell yet", surface: None }
+  = Refused
+op 18 Hint
+  event Refused { what: Hint, why: "not carried out by this shell yet", surface: None }
+  = Refused
+op 19 Onboarding
+  event Refused { what: Onboarding, why: "not carried out by this shell yet", surface: None }
+  = Refused
+op 20 Project
+  event Refused { what: Project, why: "no such window", surface: None }
+  = Refused
+op 21 Project
+  projects.open WinId(1) /work/other no token
+  = Done
+op 22 Editor
+  services.editor SetFocused { win: WinId(1), focused: true }
+  = Done
+op 23 Editor
+  services.editor Quit { win: WinId(1), lua: "quit", generation: 3, editor: OwnedEditor(()) }
+  = Done
+op 24 Editor
+  services.editor ReleaseExited { win: WinId(1) }
+  event Editor(Released { win: WinId(1) })
+  = Done
+op 25 Editor
+  services.restart_editor EditorSpawn { env: [], args: [], cwd: None, clean: true, background: None, open: [] }
+  event Refused { what: Editor, why: "not carried out by this shell yet", surface: None }
+  event Editor(RestartRefused { win: WinId(1), state: "unavailable" })
+  = Refused
+op 26 OpenWindow
+  event Refused { what: OpenWindow, why: "the window is already open", surface: None }
+  = Refused
+op 27 OpenWindow
+  event Refused { what: OpenWindow, why: "not carried out by this shell yet", surface: None }
+  = Refused
+op 28 Present
+  event Refused { what: Present, why: "no such window", surface: None }
+  = Refused
+op 29 OpenAnswer
+  services.open_answer 3 false
+  event Refused { what: OpenAnswer, why: "not carried out by this shell yet", surface: None }
+  = Refused
+op 30 SetMode
+  event Refused { what: SetMode, why: "not carried out by this shell yet", surface: None }
+  = Refused
+op 31 PlaceWindow
+  event Refused { what: PlaceWindow, why: "not carried out by this shell yet", surface: None }
+  = Refused
+op 32 Lua
+  event Refused { what: Lua, why: "not carried out by this shell yet", surface: None }
+  = Refused
+op 33 OpenLinkedWindow
+  event Refused { what: OpenLinkedWindow, why: "this window has no second window yet", surface: None }
+  = Refused
+op 34 OpenLinkedWindow
+  event Refused { what: OpenLinkedWindow, why: "no such window", surface: None }
+  = Refused
+op 35 RestoreLinkedWindow
+  event Refused { what: RestoreLinkedWindow, why: "this window has no second window yet", surface: None }
+  = Refused
+op 36 StartEditorWindow
+  event Refused { what: StartEditorWindow, why: "the editor window is closed", surface: None }
+  = Refused
+op 37 RaisePeer
+  event Peer(Raised { peer: PeerId(2), token: None })
+  = Done
+op 38 RaisePeer
+  event Refused { what: RaisePeer, why: "no such window", surface: None }
+  = Refused
+op 39 ForwardRaise
+  event Peer(Raised { peer: PeerId(3), token: Some("theirs") })
+  = Done
+op 40 OpenModuleWindow
+  event Refused { what: OpenModuleWindow, why: "this window has no second window yet", surface: None }
+  = Refused
+op 41 OpenModuleWindow
+  event Refused { what: OpenModuleWindow, why: "this window has no second window yet", surface: None }
+  = Refused
+op 42 PeerRun
+  event Refused { what: PeerRun, why: "this window has no second window yet", surface: None }
+  = Refused
+op 43 HubAsk
+  event Refused { what: HubAsk, why: "this window has no second window yet", surface: None }
+  = Refused
+op 44 CompositorFocus
+  event Refused { what: CompositorFocus, why: "not carried out by this shell yet", surface: None }
+  = Refused
+op 45 HandOverTab
+  event Refused { what: HandOverTab, why: "this window has no second window yet", surface: None }
+  = Refused
+op 46 KeepTab
+  event Refused { what: KeepTab, why: "this window has no second window yet", surface: None }
+  = Refused
+op 47 EndPeer
+  event Refused { what: EndPeer, why: "this window has no second window yet", surface: None }
+  = Refused
+op 48 Beside
+  event Refused { what: Beside, why: "not carried out by this shell yet", surface: None }
+  = Refused
+op 49 BuildBasePage
+  event Refused { what: BuildBasePage, why: "not carried out by this shell yet", surface: None }
+  = Refused
+op 50 PrepareSurface
+  maker.prepare WinId(1) terminal#2 Tiled (640, 480)
+  = Done
+op 51 AdoptMoved
+  maker.adopt WinId(1) terminal#2 Terminal {"cwd":"/"} fds=0
+  event Refused { what: AdoptMoved, why: "not carried out by this shell yet", surface: Some((WinId(1), ModuleId("terminal#2"))) }
+  = Refused
+op 52 AdoptMoved
+  event Refused { what: AdoptMoved, why: "the arriving module has no place in this window", surface: Some((WinId(1), ModuleId("lua:nowhere"))) }
+  = Refused
+op 53 OrderBaseTabs
+  services.order_base_tabs [TabId(1), TabId(2)] Some(TabId(2))
+  event Refused { what: OrderBaseTabs, why: "not carried out by this shell yet", surface: None }
+  = Refused
+op 54 Pair
+  services.pair Unrestored { win: WinId(1) }
+  event Refused { what: Pair, why: "not carried out by this shell yet", surface: None }
+  = Refused
+op 55 Chat
+  services.chat PageShown { win: WinId(1), view: ViewId(1) }
+  = Done
+op 56 Quit
+  event Refused { what: Quit, why: "not carried out by this shell yet", surface: None }
+  = Refused
+op 57 CloseWindow
+  event Refused { what: CloseWindow, why: "no such window", surface: None }
+  = Refused
+op 58 CloseWindow
+  = Done
+== full create_surface_of_each_kind_answers_done_and_registers_it
+op 0 CreateSurface
+  maker.create WinId(1) terminal#2 Terminal { cwd: "." }
+  = Done
+op 1 CreateSurface
+  maker.create WinId(1) agent#2 Chat { view: ViewId(2) }
+  = Done
+op 2 CreateSurface
+  maker.create WinId(1) lua:panel LuaPanel { url: "about:blank", title: "panel" }
+  = Done
+op 3 CreateSurface
+  maker.create WinId(1) lua:plugin PluginPage { plugin: "plugin" }
+  = Done
+op 4 CreateSurface
+  maker.create WinId(1) editor Editor { spawn: EditorSpawn { env: [], args: [], cwd: None, clean: true, background: None, open: [] } }
+  = Done
+op 5 Map
+  grid.probe_places terminal#2
+  maker.mapped terminal#2 true
+  = Done
+op 6 Focus
+  = Done
+op 7 Map
+  grid.probe_places agent#2
+  maker.mapped agent#2 true
+  = Done
+op 8 Focus
+  = Done
+op 9 Map
+  grid.probe_places lua:panel
+  maker.mapped lua:panel true
+  = Done
+op 10 Focus
+  = Done
+op 11 Map
+  grid.probe_places lua:plugin
+  maker.mapped lua:plugin true
+  = Done
+op 12 Focus
+  = Done
+op 13 Map
+  grid.probe_places editor
+  maker.mapped editor true
+  = Done
+op 14 Focus
+  = Done
+== full drop_surface_of_a_killed_web_module_keeps_its_widget
+op 0 CreateSurface
+  maker.create WinId(1) lua:panel LuaPanel { url: "about:blank", title: "panel" }
+  = Done
+op 1 Map
+  grid.probe_places lua:panel
+  maker.mapped lua:panel true
+  = Done
+op 2 Unmap
+  grid.probe_places lua:panel
+  maker.mapped lua:panel false
+  = Done
+op 3 DropSurface
+  maker.drop WinId(1) lua:panel Killed
+  = Done
+op 4 Map
+  grid.probe_places lua:panel
+  maker.mapped lua:panel true
+  = Done
+op 5 Focus
+  = Done
+== full create_surface_of_a_runtime_instance_is_built_and_wired_once
+op 0 CreateSurface
+  maker.create WinId(1) terminal#3 Terminal { cwd: "." }
+  = Done
+op 1 Map
+  grid.probe_places terminal#3
+  maker.mapped terminal#3 true
+  = Done
+op 2 Focus
+  = Done
+op 3 Unmap
+  grid.probe_places terminal#3
+  maker.mapped terminal#3 false
+  = Done
+op 4 CreateSurface
+  maker.create WinId(1) terminal#3 Terminal { cwd: ".." }
+  = Done
+op 5 Map
+  grid.probe_places terminal#3
+  maker.mapped terminal#3 true
+  = Done
+op 6 Focus
+  = Done
+== full focus_posts_native_focus_while_it_applies
+op 0 Focus
+  = Done
+== full present_then_focus_gives_the_first_module_the_keys
+op 0 Present
+  = Done
+op 1 Focus
+  = Done
+== full focus_on_a_hidden_module_is_refused
+op 0 Focus
+  event Refused { what: Focus, why: "the module's surface is not on screen", surface: Some((WinId(1), ModuleId("editor"))) }
+  = Refused
+== full unmapping_the_focus_owner_reports_focus_moving
+op 0 Focus
+  = Done
+op 1 Unmap
+  grid.probe_places agent
+  maker.mapped agent false
+  = Done
+== full map_then_focus_then_unmap_moves_the_keys_to_the_mapped_module
+op 0 Focus
+  = Done
+op 1 Map
+  grid.probe_places editor
+  maker.mapped editor true
+  = Done
+op 2 Focus
+  = Done
+op 3 Unmap
+  grid.probe_places agent
+  maker.mapped agent false
+  = Done
+== full a_focus_on_a_tab_not_drawn_after_its_map_is_answered_done
+op 0 Focus
+  = Done
+op 1 Map
+  grid.probe_places editor
+  maker.mapped editor true
+  = Done
+op 2 Focus
+  = Done
+op 3 Unmap
+  grid.probe_places agent
+  maker.mapped agent false
+  = Done
+== full allocate_queues_one_allocation
+op 0 Allocate
+  grid.queue_allocation
+  = Done
+== full restack_orders_the_float_band_only
+op 0 Restack
+  grid.restack_floats ["terminal", "agent"]
+  = Done
+== full chrome_reads_the_model_and_answers_done
+op 0 Chrome
+  = Done
+== full focus_onboarding_before_the_chrome_op_grabs_and_reports_no_owner
+op 0 Focus
+  = Done
+op 1 Chrome
+  = Done
+== full close_window_never_asks
+op 0 CloseWindow
+  = Done
+== full a_terminal_prepare_is_carried_out_and_answered_prepared
+op 0 PrepareSurface
+  maker.prepare WinId(1) terminal#3 Tiled (640, 480)
+  = Done
+== full a_chat_view_prepare_is_carried_out_and_answered_prepared
+op 0 PrepareSurface
+  maker.prepare WinId(1) agent#3 Tiled (640, 480)
+  = Done
+== full close_window_closes_without_asking_and_proceeds
+op 0 CloseWindow
+  = Done
+== full project_read_answers
+op 0 Project
+  projects.apply Read { win: WinId(1), serial: 7, dir: "/walked", filter: Some("a"), debounce: true, near: Some("abc") }
+  event Project(Listing { win: WinId(1), serial: 7, dir: "/walked", listing: Stuck })
+  = Done
+== full project_list_answers_the_request
+op 0 Project
+  projects.apply List { win: WinId(1), serial: 5 }
+  event Project(Rows { win: WinId(1), serial: 5, rows: [] })
+  = Done
+== full project_folder_dialog_answers_its_window
+op 0 Project
+  projects.apply FolderDialog { win: WinId(1), at: None }
+  event Project(Folder { win: WinId(1), path: None })
+  = Done
+== full project_open_is_carried_out
+op 0 Project
+  projects.open WinId(1) /work/other no token
+  = Done
+== full project_focus_and_close_report_the_keys
+op 0 Map
+  grid.probe_places editor
+  maker.mapped editor true
+  = Done
+op 1 Focus
+  projects.focus WinId(1)
+  = Done
+op 2 Focus
+  = Done
+== full a_refused_open_linked_window_is_posted_refused
+op 0 OpenLinkedWindow
+  linked.open WinId(1) Second no token
+  = Done
+== full a_refused_open_module_window_is_posted_refused
+op 0 OpenModuleWindow
+  linked.open_module WinId(1) Chat(2) no token keep_keys=false
+  = Done
+== full a_refused_peer_run_is_posted_refused
+op 0 PeerRun
+  linked.send WinId(1) PeerId(16) RunAction { name: "zoom", opts: [] }
+  = Done
+== full a_refused_hub_ask_is_posted_refused
+op 0 HubAsk
+  linked.send_to_hub WinId(1) HubAsk InstanceNew no token
+  = Done
+== full a_refused_beside_op_is_posted_refused
+op 0 Beside
+  beside.carry_out RaiseEditor
+  = Done
+== full a_refused_compositor_focus_is_posted_refused
+op 0 CompositorFocus
+  event Refused { what: CompositorFocus, why: "not carried out by this shell yet", surface: None }
+  = Refused
+== full focus_on_the_current_owner_still_reports_native_focus
+op 0 Focus
+  = Done
+op 1 Focus
+  = Done
+== full a_join_back_that_fails_is_posted_refused_with_its_text
+op 0 Chat
+  services.chat JoinBack { win: WinId(1), view: ViewId(2) }
+  event Refused { what: Chat, why: "the tab could not join the base view", surface: Some((WinId(1), ModuleId("agent#2"))) }
+  = Refused
+== full a_round_scan_with_no_agents_layer_is_posted_refused
+op 0 AgentsScan
+  services.agents_scan WinId(1) Next Some(ModuleId("agent"))
+  event Refused { what: AgentsScan, why: "not carried out by this shell yet", surface: None }
+  = Refused
+== full the_teardown_ops_are_answered_done_in_order
+op 0 Cleanup
+  services.cleanup PairOnClose { layout_written: true }
+  = Done
+op 1 Editor
+  services.editor Shutdown { win: WinId(1) }
+  = Done
+op 2 Terminal
+  services.terminal ShutdownAll { win: WinId(1) }
+  = Done
+op 3 Cleanup
+  services.cleanup PaneSwitchDir
+  = Done
+op 4 Cleanup
+  services.cleanup Feeds
+  = Done
+op 5 Plugin
+  services.plugin ShutdownAll { win: WinId(1) }
+  = Done
+op 6 Chat
+  services.chat ShutdownAll { win: WinId(1), hold: true }
+  = Done
+op 7 Cleanup
+  services.cleanup ScratchDir
+  = Done
+op 8 CloseWindow
+  = Done
+== full the_teardown_ops_are_answered_done_in_order
+op 0 Cleanup
+  services.cleanup PairOnClose { layout_written: true }
+  = Done
+op 1 Editor
+  services.editor Shutdown { win: WinId(1) }
+  = Done
+op 2 Cleanup
+  services.cleanup EditorRecord { token: Some("0123456789abcdef"), seq: 1 }
+  = Done
+op 3 Terminal
+  services.terminal ShutdownAll { win: WinId(1) }
+  = Done
+op 4 Cleanup
+  services.cleanup PaneSwitchDir
+  = Done
+op 5 Cleanup
+  services.cleanup Feeds
+  = Done
+op 6 Plugin
+  services.plugin ShutdownAll { win: WinId(1) }
+  = Done
+op 7 Chat
+  services.chat ShutdownAll { win: WinId(1), hold: true }
+  = Done
+op 8 Cleanup
+  services.cleanup ScratchDir
+  = Done
+op 9 CloseWindow
+  = Done
+== full every_op_once
+op 0 Focus
+  event Refused { what: Focus, why: "not carried out by this shell yet", surface: None }
+  = Refused
+op 1 Focus
+  event Refused { what: Focus, why: "not carried out by this shell yet", surface: None }
+  = Refused
+op 2 Focus
+  = Done
+op 3 Focus
+  projects.focus WinId(1)
+  = Done
+op 4 Focus
+  event Refused { what: Focus, why: "not carried out by this shell yet", surface: None }
+  = Refused
+op 5 Focus
+  event Refused { what: Focus, why: "no such window", surface: Some((WinId(9), ModuleId("agent"))) }
+  = Refused
+op 6 Focus
+  event Refused { what: Focus, why: "the module has no surface in this window", surface: Some((WinId(1), ModuleId("terminal#2"))) }
+  = Refused
+op 7 Map
+  grid.probe_places terminal#2
+  event Refused { what: Map, why: "the module has no surface in this window", surface: Some((WinId(1), ModuleId("terminal#2"))) }
+  = Refused
+op 8 Unmap
+  grid.probe_places terminal
+  maker.mapped terminal false
+  = Done
+op 9 Map
+  grid.probe_places terminal
+  maker.mapped terminal true
+  = Done
+op 10 Allocate
+  event Refused { what: Allocate, why: "the window has no grid", surface: None }
+  = Refused
+op 11 Restack
+  event Refused { what: Restack, why: "the window has no grid", surface: None }
+  = Refused
+op 12 DropSurface
+  event Refused { what: DropSurface, why: "the module has no surface in this window", surface: Some((WinId(1), ModuleId("terminal#2"))) }
+  = Refused
+op 13 DropSurface
+  maker.drop WinId(1) terminal Retired
+  = Done
+op 14 Chrome
+  event Refused { what: Chrome, why: "not carried out by this shell yet", surface: None }
+  = Refused
+op 15 Chrome
+  = Done
+op 16 Hint
+  hints.show_digits WinId(1) [(ModuleId("agent"), 1), (ModuleId("terminal"), 2)]
+  = Done
+op 17 Hint
+  hints.hide_digits WinId(1)
+  = Done
+op 18 Hint
+  hints.toggle WinId(1) 42
+  = Done
+op 19 Onboarding
+  onboarding Detect { win: WinId(1), generation: 1 }
+  = Done
+op 20 Project
+  event Refused { what: Project, why: "no such window", surface: None }
+  = Refused
+op 21 Project
+  projects.open WinId(1) /work/other no token
+  = Done
+op 22 Editor
+  services.editor SetFocused { win: WinId(1), focused: true }
+  = Done
+op 23 Editor
+  services.editor Quit { win: WinId(1), lua: "quit", generation: 3, editor: OwnedEditor(()) }
+  = Done
+op 24 Editor
+  services.editor ReleaseExited { win: WinId(1) }
+  event Editor(Released { win: WinId(1) })
+  = Done
+op 25 Editor
+  services.restart_editor EditorSpawn { env: [], args: [], cwd: None, clean: true, background: None, open: [] }
+  event Refused { what: Editor, why: "not carried out by this shell yet", surface: None }
+  event Editor(RestartRefused { win: WinId(1), state: "unavailable" })
+  = Refused
+op 26 OpenWindow
+  event Refused { what: OpenWindow, why: "the window is already open", surface: None }
+  = Refused
+op 27 OpenWindow
+  event Refused { what: OpenWindow, why: "not carried out by this shell yet", surface: None }
+  = Refused
+op 28 Present
+  event Refused { what: Present, why: "no such window", surface: None }
+  = Refused
+op 29 OpenAnswer
+  services.open_answer 3 false
+  event Refused { what: OpenAnswer, why: "not carried out by this shell yet", surface: None }
+  = Refused
+op 30 SetMode
+  event Refused { what: SetMode, why: "not carried out by this shell yet", surface: None }
+  = Refused
+op 31 PlaceWindow
+  event Refused { what: PlaceWindow, why: "not carried out by this shell yet", surface: None }
+  = Refused
+op 32 Lua
+  lua.run Emit { event: "x" }
+  = Done
+op 33 OpenLinkedWindow
+  linked.open WinId(1) Second no token
+  = Done
+op 34 OpenLinkedWindow
+  event Refused { what: OpenLinkedWindow, why: "no such window", surface: None }
+  = Refused
+op 35 RestoreLinkedWindow
+  linked.restore WinId(1) Second
+  = Done
+op 36 StartEditorWindow
+  linked.start_editor WinId(1)
+  = Done
+op 37 RaisePeer
+  event Peer(Raised { peer: PeerId(2), token: None })
+  = Done
+op 38 RaisePeer
+  event Refused { what: RaisePeer, why: "no such window", surface: None }
+  = Refused
+op 39 ForwardRaise
+  event Peer(Raised { peer: PeerId(3), token: Some("theirs") })
+  = Done
+op 40 OpenModuleWindow
+  linked.open_module WinId(1) Chat(2) no token keep_keys=false
+  = Done
+op 41 OpenModuleWindow
+  linked.open_module WinId(1) Chat(3) no token keep_keys=true
+  = Done
+op 42 PeerRun
+  linked.send WinId(1) PeerId(16) RunAction { name: "tab.select", opts: [("n", Number(3))] }
+  = Done
+op 43 HubAsk
+  linked.send_to_hub WinId(1) HubAsk InstanceNew no token
+  = Done
+op 44 CompositorFocus
+  event Refused { what: CompositorFocus, why: "not carried out by this shell yet", surface: None }
+  = Refused
+op 45 HandOverTab
+  linked.hand_over WinId(1) PeerId(16) Claude s Chat(4) token
+  = Done
+op 46 KeepTab
+  linked.send WinId(1) PeerId(16) TabKept { session: "s", why: "no room" }
+  = Done
+op 47 EndPeer
+  linked.end_peer WinId(1) PeerId(2)
+  = Done
+op 48 Beside
+  beside.carry_out RaiseSelf
+  = Done
+op 49 BuildBasePage
+  base_page.build
+  = Done
+op 50 PrepareSurface
+  maker.prepare WinId(1) terminal#2 Tiled (640, 480)
+  = Done
+op 51 AdoptMoved
+  maker.adopt WinId(1) terminal#2 Terminal {"cwd":"/"} fds=0
+  event Refused { what: AdoptMoved, why: "not carried out by this shell yet", surface: Some((WinId(1), ModuleId("terminal#2"))) }
+  = Refused
+op 52 AdoptMoved
+  event Refused { what: AdoptMoved, why: "the arriving module has no place in this window", surface: Some((WinId(1), ModuleId("lua:nowhere"))) }
+  = Refused
+op 53 OrderBaseTabs
+  services.order_base_tabs [TabId(1), TabId(2)] Some(TabId(2))
+  event Refused { what: OrderBaseTabs, why: "not carried out by this shell yet", surface: None }
+  = Refused
+op 54 Pair
+  services.pair Unrestored { win: WinId(1) }
+  event Refused { what: Pair, why: "not carried out by this shell yet", surface: None }
+  = Refused
+op 55 Chat
+  services.chat PageShown { win: WinId(1), view: ViewId(1) }
+  = Done
+op 56 Quit
+  event Refused { what: Quit, why: "not carried out by this shell yet", surface: None }
+  = Refused
+op 57 CloseWindow
+  event Refused { what: CloseWindow, why: "no such window", surface: None }
+  = Refused
+op 58 CloseWindow
+  = Done

@@ -2,12 +2,11 @@
 //! default main context, each of which fires by posting an event to the attached sink rather than by
 //! running a caller's callback, and the waker worker threads use to reach the UI thread.
 //!
-//! A fired timer or idle is forgotten before its event is posted, so a sink that re-arms the same
-//! token from inside its handler arms a fresh source, and a later `cancel` never removes a source
-//! GLib has already destroyed (which GLib reports as a critical warning).
+//! Which source each token holds is a `SourceBook` (`source_book.rs`): a fired timer or idle is forgotten before its
+//! event is posted, so a sink that re-arms the same token from inside its handler arms a fresh source, and a later
+//! `cancel` never removes a source GLib has already destroyed (which GLib reports as a critical warning).
 
 use std::cell::RefCell;
-use std::collections::HashMap;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::rc::{Rc, Weak};
 use std::sync::Arc;
@@ -15,6 +14,8 @@ use std::time::{Duration, Instant};
 
 use eitri_core::wm::{HostEvent, HostSink, Interest, Priority, Scheduler, TimerToken, Waker, WatchToken};
 use gtk4::glib::{self, translate::IntoGlib};
+
+use super::source_book::SourceBook;
 
 /// The GLib priority a contract priority runs at. Input and ordinary service work share GDK's own
 /// event priority, `PRIORITY_DEFAULT`: under GTK input arrives as events on the same context, so
@@ -32,8 +33,8 @@ pub(crate) fn glib_priority(priority: Priority) -> glib::Priority {
 pub(crate) struct GlibScheduler {
     me: Weak<GlibScheduler>,
     sink: RefCell<Option<Weak<dyn HostSink>>>,
-    timers: RefCell<HashMap<TimerToken, glib::SourceId>>,
-    watches: RefCell<HashMap<WatchToken, glib::SourceId>>,
+    timers: RefCell<SourceBook<TimerToken, glib::SourceId>>,
+    watches: RefCell<SourceBook<WatchToken, glib::SourceId>>,
     wake: RefCell<Option<WakeWatch>>,
 }
 
@@ -48,8 +49,8 @@ impl GlibScheduler {
         Rc::new_cyclic(|me| GlibScheduler {
             me: me.clone(),
             sink: RefCell::new(None),
-            timers: RefCell::new(HashMap::new()),
-            watches: RefCell::new(HashMap::new()),
+            timers: RefCell::new(SourceBook::new()),
+            watches: RefCell::new(SourceBook::new()),
             wake: RefCell::new(None),
         })
     }
@@ -75,12 +76,12 @@ impl GlibScheduler {
         let source = arm(Box::new(move || {
             if let Some(me) = me.upgrade() {
                 // Forget the source before posting: GLib destroys it when this returns `Break`.
-                me.timers.borrow_mut().remove(&token);
+                me.timers.borrow_mut().take(token);
                 me.post(HostEvent::Timer(token));
             }
             glib::ControlFlow::Break
         }));
-        self.timers.borrow_mut().insert(token, source);
+        self.timers.borrow_mut().arm(token, source);
     }
 
     /// The UI thread's watch on the waker's eventfd, added on first use. A failed add (another thread
@@ -131,7 +132,7 @@ impl Scheduler for GlibScheduler {
     }
 
     fn cancel(&self, token: TimerToken) {
-        let source = self.timers.borrow_mut().remove(&token);
+        let source = self.timers.borrow_mut().take(token);
         if let Some(source) = source {
             source.remove();
         }
@@ -153,7 +154,7 @@ impl Scheduler for GlibScheduler {
                 // The descriptor was closed under the watch: GLib would report it ready on every
                 // iteration and spin the UI thread. Drop the watch and post once so its owner looks.
                 eprintln!("[wm] watch {token:?}: its descriptor was closed while watched; the watch is dropped");
-                me.watches.borrow_mut().remove(&token);
+                me.watches.borrow_mut().take(token);
                 me.post(HostEvent::Fd(token));
                 return glib::ControlFlow::Break;
             }
@@ -163,7 +164,7 @@ impl Scheduler for GlibScheduler {
         let added = add_on_default_context(fd, condition, glib_priority(priority).into_glib(), ready);
         match added {
             Ok(source) => {
-                self.watches.borrow_mut().insert(token, source);
+                self.watches.borrow_mut().arm(token, source);
             }
             Err(neovide_editor::fd_watch::NotOwner) => {
                 eprintln!("[wm] watch {token:?} was not added: another thread owns the main context")
@@ -172,7 +173,7 @@ impl Scheduler for GlibScheduler {
     }
 
     fn unwatch(&self, token: WatchToken) {
-        let source = self.watches.borrow_mut().remove(&token);
+        let source = self.watches.borrow_mut().take(token);
         if let Some(source) = source {
             source.remove();
         }
@@ -191,10 +192,10 @@ impl Drop for GlibScheduler {
     /// Removes every source still armed: their closures would only find a dead scheduler, and the
     /// waker's watch must go before the last owner of its eventfd can close it.
     fn drop(&mut self) {
-        for (_, source) in self.timers.get_mut().drain() {
+        for source in self.timers.get_mut().drain() {
             source.remove();
         }
-        for (_, source) in self.watches.get_mut().drain() {
+        for source in self.watches.get_mut().drain() {
             source.remove();
         }
         if let Some(source) = self.wake.get_mut().as_mut().and_then(|w| w.source.take()) {

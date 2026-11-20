@@ -824,7 +824,7 @@ fn the_windows_service_set_forwards_every_service() {
         let open = at + code[at..].find('{').expect("a body after it");
         scan::braced(&code, open).to_string()
     };
-    let declared = names(&block("shell/src/gtk_host/mod.rs", "trait ServiceSet"));
+    let declared = names(&block("desk/src/host_traits.rs", "trait ServiceSet"));
     let written = names(&block("shell/src/window_services.rs", "ServiceSet for PanelServices"));
     assert!(
         declared.iter().any(|name| name == "restart_editor") && declared.len() > 5,

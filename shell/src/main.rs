@@ -80,12 +80,13 @@ mod window_services;
 // `gtk_host` on its own, and the wiring calls the window's own controllers, which only this binary has.
 #[path = "gtk_host/wire.rs"]
 mod wire;
-// Beside `gtk_host` for the same reason: the hooks it registers are the agent panel's, which the
-// conformance test's build of `gtk_host` does not have, and its tests read the companion window's.
-#[path = "gtk_host/panel_wiring.rs"]
-mod panel_wiring;
-// Beside `gtk_host` for the same reason: the services and the surface constructors act on the window's own
-// registry, pages and grid.
+// `eitri-desk` holds it; the tests below read the windows that fill its hooks, which only this binary has.
+use eitri_desk::panel_wiring;
+#[cfg(test)]
+#[path = "gtk_host/panel_wiring_tests.rs"]
+mod panel_wiring_tests;
+// Beside `gtk_host`, as `wire` is: the services and the surface constructors act on the window's own registry,
+// pages and grid.
 #[path = "gtk_host/services.rs"]
 mod gtk_host_services;
 #[path = "gtk_host/surfaces.rs"]
@@ -920,6 +921,7 @@ fn build_ui(
     // it, written out in sequence because each phase's work builds what later phases' closures capture.
     let wm_scheduler = gtk_host::scheduler::GlibScheduler::new();
     let wm_host = gtk_host::GtkHost::new();
+    let wm_router = wm_host.router();
     let driver = {
         let mut controller = eitri_core::wm::Controller::new(wm_scheduler.clone());
         // Before the first batch: nothing of this window may quit, end or restart a person's own nvim.
@@ -928,10 +930,10 @@ fn build_ui(
         }
         // What the controller reads at once: the grid's size and measures and the editor's cell, from the host,
         // which answers as no window allocated yet until it is given the grid and the editor below.
-        controller.set_reads(wm_host.clone());
-        let driver = eitri_core::wm::Driver::new(controller, wm_host.clone(), wm_scheduler.clone());
+        controller.set_reads(wm_router.clone());
+        let driver = eitri_core::wm::Driver::new(controller, wm_router.clone(), wm_scheduler.clone());
         let sink: Rc<dyn eitri_core::wm::HostSink> = driver.clone();
-        wm_host.attach(Rc::downgrade(&sink));
+        wm_router.attach(Rc::downgrade(&sink));
         wm_scheduler.attach(Rc::downgrade(&sink));
         driver
     };
@@ -953,7 +955,7 @@ fn build_ui(
     // focus changes and activation reach the controller from here on.
     wm_host.set_application(app);
     // `window.new` starts the second window through the pair; the link it makes reaches the controller once linked.
-    wm_host.set_linked_windows(pair.clone());
+    wm_router.set_linked_windows(pair.clone());
     let (wm_role, editor_presence) = pair.wm_spec_role();
     // Bound here because the terminals made below are told its name; nothing is taken from it until the watch at the
     // end of this function, once the window can act on a request.
@@ -1020,7 +1022,7 @@ fn build_ui(
             takeover::chunk_check(held.link_chan()),
         );
     }
-    wm_host.set_surface_maker(editor_maker.clone());
+    wm_router.set_surface_maker(editor_maker.clone());
     driver.start(WinId::MAIN, StartStep::Editor);
     // `None` in window 2, whose editor phase makes nothing.
     let made_editor = editor_maker.take();
@@ -1034,7 +1036,7 @@ fn build_ui(
         None => (None, None, None),
     };
     if let Some(pane) = &pane {
-        wm_host.set_editor(WinId::MAIN, pane.clone());
+        wm_host.set_editor(WinId::MAIN, Rc::new(window_services::EditorPaneReads(pane.clone())));
         *followed_nvim.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(pane.learned_nvim());
     }
 
@@ -1065,7 +1067,7 @@ fn build_ui(
         eprintln!("[lua] eitri.window could not be set: {err}");
     }
     // What the kernel phase's `init.lua` and the requests phase's `shell:ready` run on.
-    wm_host.set_lua(Rc::new(gtk_host_services::LuaKernel {
+    wm_router.set_lua(Rc::new(gtk_host_services::LuaKernel {
         engine: lua_engine.clone(),
         init_file: config_dir.join("init.lua"),
     }));
@@ -1124,7 +1126,7 @@ fn build_ui(
     // Before any tab can start: a remote project's tabs start on its server, and its copy's start nowhere.
     let remote_prepared = remote_window::prepare(&agent_panel_handle, origin);
     let base_page = gtk_host_surfaces::BasePage::new(agent_panel_handle.clone(), panel_notice);
-    wm_host.set_base_page_maker(base_page.clone());
+    wm_router.set_base_page_maker(base_page.clone());
     // Filled once `init.lua` has said whether the terminal's `claude` may attach, which is after this hook is set.
     #[cfg(target_os = "linux")]
     let ide_wiring: Rc<std::cell::OnceCell<Rc<ide_wiring::IdeWiring>>> = Rc::default();
@@ -2425,7 +2427,7 @@ fn build_ui(
         let allocator: Rc<dyn eitri_core::wm::Allocator> = driver.clone();
         grid.set_allocator(WinId::MAIN, Rc::downgrade(&allocator));
     }
-    wm_host.set_grid(WinId::MAIN, Rc::new(grid.downgrade()));
+    wm_host.set_grid(WinId::MAIN, Rc::new(module_grid::GridHandle(grid.downgrade())));
     // With no `WebView` in this process (`webkit_sandbox`), the chat's and each Lua panel's place is
     // a plain GTK notice: allocated directly, as the editor is, rather than held at a settled size
     // like a `WebView` being resized.
@@ -2578,7 +2580,7 @@ fn build_ui(
     // A window with no editor declares the editor's surface like any other and the controller makes none for it,
     // so only what is made is checked below.
     let startup_modules: Vec<ModuleId> = linked_window::hosted_at_start(&startup_surfaces, &pair.wm_spec_role().1);
-    wm_host.set_surface_maker(surfaces.clone());
+    wm_router.set_surface_maker(surfaces.clone());
     driver.start(
         WinId::MAIN,
         StartStep::Surfaces {
@@ -2691,7 +2693,7 @@ fn build_ui(
             follow_slot.clone(),
         )
     });
-    wm_host.set_services(Rc::new(PanelServices {
+    wm_router.set_services(Rc::new(PanelServices {
         cm_session: cm_session.clone().map(|session| (session, app.clone())),
         inner: gtk_host_services::Services {
             editor: pane.clone(),
@@ -3219,7 +3221,7 @@ fn build_ui(
             control,
         );
         let sink: Rc<dyn eitri_core::wm::HostSink> = driver.clone();
-        wm_host.set_project_host(project_host::WindowProjects::new(
+        wm_router.set_project_host(project_host::WindowProjects::new(
             eitri_core::wm::WinId::MAIN,
             window.upcast_ref(),
             project_chooser.clone(),
@@ -3407,7 +3409,7 @@ fn build_ui(
         agent: agent_panel_handle.clone(),
     });
     // `select.number`'s digits, drawn over every module's host, and HINT's toggle from the prefix.
-    wm_host.set_hints(Rc::new(ShellHints {
+    wm_router.set_hints(Rc::new(ShellHints {
         coordinator: hint_coordinator.clone(),
         grid: grid.downgrade(),
     }));
@@ -3504,7 +3506,7 @@ fn build_ui(
         }
         {
             let host = host.clone();
-            wm_host.set_onboarding(Rc::new(move |op| host.apply(op)));
+            wm_router.set_onboarding(Rc::new(move |op| host.apply(op)));
         }
         {
             let host = Rc::downgrade(&host);
@@ -3529,7 +3531,7 @@ fn build_ui(
                 .map(|driver| driver.query(move |c| c.chrome(win)))
         }));
         let attention_of = agent_panel_handle.clone();
-        wm_host.set_view_attention(Rc::new(move |view: ViewId| attention_of.attention_of(view)));
+        wm_router.set_view_attention(Rc::new(move |view: ViewId| attention_of.attention_of(view)));
         let strip_grid = grid.downgrade();
         let bar_grid = grid.downgrade();
         let shown_toast = toast.clone();
@@ -4009,7 +4011,7 @@ fn build_ui(
             app: app.clone(),
             window: window.clone(),
             driver: driver.clone(),
-            wm_host: wm_host.clone(),
+            wm_router: wm_router.clone(),
             plugin_panels: plugin_panels.clone(),
             link,
             start,
@@ -4540,7 +4542,7 @@ fn build_ui(
     // the page's mode as it last reported it, read and nothing else.
     {
         let agent = agent_panel_handle.clone();
-        wm_host.set_chat_claims(Rc::new(move |view: ViewId, direction: Direction| {
+        wm_router.set_chat_claims(Rc::new(move |view: ViewId, direction: Direction| {
             agent.nav_claims(view, direction)
         }));
     }
@@ -4549,11 +4551,11 @@ fn build_ui(
     // named on its y/n -- and whether its tabs can close now.
     {
         let agent = agent_panel_handle.clone();
-        wm_host.set_chat_summary(Rc::new(move |_| agent.chat_summary()));
+        wm_router.set_chat_summary(Rc::new(move |_| agent.chat_summary()));
         let agent = agent_panel_handle.clone();
-        wm_host.set_oldest_card(Rc::new(move |_: WinId| agent.oldest_card_view()));
+        wm_router.set_oldest_card(Rc::new(move |_: WinId| agent.oldest_card_view()));
         let agent = agent_panel_handle.clone();
-        wm_host.set_chat_kill_counts(Rc::new(move |view: ViewId| {
+        wm_router.set_chat_kill_counts(Rc::new(move |view: ViewId| {
             let ((running, queued), tab) = if view.is_base() {
                 ((agent.running_count(), agent.queued_count()), None)
             } else {
@@ -4569,7 +4571,7 @@ fn build_ui(
             }
         }));
         let agent = agent_panel_handle.clone();
-        wm_host.set_chat_first_tab(Rc::new(move |view: ViewId, breaks: bool| {
+        wm_router.set_chat_first_tab(Rc::new(move |view: ViewId, breaks: bool| {
             if breaks {
                 agent.can_break_out()
             } else {
@@ -4579,7 +4581,7 @@ fn build_ui(
     }
     // The controller's `CreateSurface` and `DropSurface`: the same constructors, a host made there wired
     // there, and what a kill or a retirement ends.
-    wm_host.set_surface_maker(Rc::new(gtk_host_surfaces::SurfaceOps {
+    wm_router.set_surface_maker(Rc::new(gtk_host_surfaces::SurfaceOps {
         surfaces: surfaces.clone(),
         wire_deps: wire_deps.clone(),
         wire_terminal: wire_terminal.clone(),

@@ -782,7 +782,7 @@ impl Probe {
 
     /// The window's pooled page of `id`, if it has a live one.
     fn pooled(&self, id: &ModuleId) -> Option<WebView> {
-        self.ctx.chat_views.get(id).map(|(view, _)| view)
+        self.ctx.chat_views.get(id).map(|page| page.view)
     }
 
     /// Exercises the window's own chat view lifecycle. Kill a startup view as `prefix x y`

@@ -3,47 +3,58 @@
 use eitri_core::layout::ModuleId;
 use std::collections::BTreeMap;
 
-pub(crate) trait Retire {
+pub trait Retire {
     fn on_retire(&self);
 }
 
+/// An entry whose retirement closes it: a terminal's pane, whose shell a kill hangs up.
+pub trait Closes {
+    fn close(&self);
+}
+
+impl<P: Closes> Retire for P {
+    fn on_retire(&self) {
+        self.close();
+    }
+}
+
 #[derive(Debug, PartialEq, Eq)]
-pub(crate) enum Reused {
+pub enum Reused {
     Yes,
     No,
 }
 
 /// Entries never change ids, because a page's message handler keeps the view it was built for.
 /// Reads need no retirement hook; inserting or retiring an entry requires its kind's hook.
-pub(crate) struct InstancePool<P> {
+pub struct InstancePool<P> {
     live: BTreeMap<ModuleId, P>,
     idle: BTreeMap<ModuleId, P>,
 }
 
 impl<P> InstancePool<P> {
-    pub(crate) fn new() -> Self {
+    pub fn new() -> Self {
         Self {
             live: BTreeMap::new(),
             idle: BTreeMap::new(),
         }
     }
 
-    pub(crate) fn get(&self, id: &ModuleId) -> Option<&P> {
+    pub fn get(&self, id: &ModuleId) -> Option<&P> {
         self.live.get(id)
     }
 
-    pub(crate) fn live(&self) -> impl Iterator<Item = (&ModuleId, &P)> {
+    pub fn live(&self) -> impl Iterator<Item = (&ModuleId, &P)> {
         self.live.iter()
     }
 
-    pub(crate) fn each(&self) -> impl Iterator<Item = &P> {
+    pub fn each(&self) -> impl Iterator<Item = &P> {
         self.live.values().chain(self.idle.values())
     }
 }
 
 impl<P: Retire + Clone> InstancePool<P> {
     /// Reuse a live or idle entry only under its original id.
-    pub(crate) fn take_or_make(&mut self, id: &ModuleId, make: impl FnOnce() -> P) -> (P, Reused) {
+    pub fn take_or_make(&mut self, id: &ModuleId, make: impl FnOnce() -> P) -> (P, Reused) {
         if let Some(entry) = self.live.get(id) {
             return (entry.clone(), Reused::Yes);
         }
@@ -57,7 +68,7 @@ impl<P: Retire + Clone> InstancePool<P> {
 
     /// The entry under `id` made live again: the live one as it is, else the idle one taken back. `None` when the
     /// pool never held one: only an entry made for `id` may come back under it.
-    pub(crate) fn revive(&mut self, id: &ModuleId) -> Option<P> {
+    pub fn revive(&mut self, id: &ModuleId) -> Option<P> {
         if let Some(entry) = self.live.get(id) {
             return Some(entry.clone());
         }
@@ -67,7 +78,7 @@ impl<P: Retire + Clone> InstancePool<P> {
     }
 
     /// Run the kind's retirement hook once as the live entry moves to its idle slot.
-    pub(crate) fn retire(&mut self, id: &ModuleId) -> bool {
+    pub fn retire(&mut self, id: &ModuleId) -> bool {
         let Some(entry) = self.set_idle(id) else {
             return false;
         };
@@ -77,7 +88,7 @@ impl<P: Retire + Clone> InstancePool<P> {
 
     /// The live entry under `id` moved to its idle slot without its retirement hook, which the caller runs on the
     /// entry answered once nothing holds the pool. `None` when no live entry has that id.
-    pub(crate) fn set_idle(&mut self, id: &ModuleId) -> Option<P> {
+    pub fn set_idle(&mut self, id: &ModuleId) -> Option<P> {
         let entry = self.live.remove(id)?;
         self.idle.insert(id.clone(), entry.clone());
         Some(entry)
@@ -85,7 +96,7 @@ impl<P: Retire + Clone> InstancePool<P> {
 
     /// A new entry made for `id`, live from now on. Only for an id the pool holds no entry for, live or idle: an entry
     /// never changes ids.
-    pub(crate) fn insert(&mut self, id: &ModuleId, entry: P) {
+    pub fn insert(&mut self, id: &ModuleId, entry: P) {
         debug_assert!(
             !self.live.contains_key(id) && !self.idle.contains_key(id),
             "{id} already has an entry"
@@ -192,7 +203,6 @@ mod terminal_tests {
     struct FakePane {
         serial: u8,
         closes: Rc<Cell<u32>>,
-        generation: Rc<Cell<u64>>,
     }
 
     impl FakePane {
@@ -200,12 +210,7 @@ mod terminal_tests {
             Self {
                 serial,
                 closes: Rc::new(Cell::new(0)),
-                generation: Rc::new(Cell::new(0)),
             }
-        }
-
-        fn start(&self) {
-            self.generation.set(self.generation.get() + 1);
         }
     }
 
@@ -258,23 +263,6 @@ mod terminal_tests {
         assert_eq!(panes.iter().map(|p| p.closes.get()).collect::<Vec<_>>(), [0, 1, 0]);
         assert_eq!(terminals.get(&id(1)).unwrap().serial, 1);
         assert_eq!(terminals.get(&id(3)).unwrap().serial, 3);
-    }
-
-    #[test]
-    fn a_late_exit_from_a_killed_shell_never_closes_the_instance_that_reused_its_number() {
-        use crate::terminal::exit_is_current;
-        assert!(!exit_is_current(1, 2));
-        assert!(exit_is_current(2, 2));
-        let mut terminals = Terminals::new();
-        let (pane, _) = terminals.take_or_make(&id(2), || FakePane::new(2));
-        pane.start();
-        let reported = pane.generation.get();
-        assert!(terminals.retire(&id(2)));
-        let (reopened, reused) = terminals.take_or_make(&id(2), || panic!("must reuse"));
-        assert_eq!(reused, Reused::Yes);
-        reopened.start();
-        assert_eq!(reopened.generation.get(), 2);
-        assert!(!exit_is_current(reported, reopened.generation.get()));
     }
 }
 

@@ -28,6 +28,13 @@
 //! rule (`eitri_core::wm::grid::restack_moves`) over a child list shaped as the grid's: hosts below a
 //! strip and a divider.
 //!
+//! The router's record (`support/router_record.rs`): every script, and one op of every kind, run again with each
+//! collaborator the host is given written down around the stage's own (the surface maker, the services, the grid, the
+//! project chooser, and in a second pass Lua, the pair, HINT, the page beside nvim, the base page and the first-start
+//! screen's work), must give `router_conformance.trace` line for line: which collaborator each op reaches, with what,
+//! what the host posts and how it answers. Written by this host before its op router was shared, so any host that
+//! routes ops the same way writes it again. `EITRI_WRITE_ROUTER_TRACE=1` writes the file instead of comparing.
+//!
 //! Needs a display, and never the real desktop: **it starts its own** (`support/own_x_server.rs`) --
 //! an `Xvfb` with a 1024x768 screen, pointed to before GTK initialises, with any inherited
 //! `WAYLAND_DISPLAY`/`DISPLAY` dropped --
@@ -75,6 +82,17 @@ mod web_host;
 #[allow(dead_code)]
 #[path = "support/frame_turns.rs"]
 mod frame_turns;
+
+/// Where the router record's collaborator traits live for this host.
+mod traits {
+    pub(crate) use super::gtk_host::{
+        BasePageMaker, BesidePort, GridPort, HintPort, LuaRunner, ProjectHost, RestartRefused, ServiceSet, SurfaceMaker,
+    };
+    pub(crate) use eitri_desk::host_traits::LinkedWindows;
+}
+
+#[path = "../../desk/tests/support/router_record.rs"]
+mod router_record;
 
 fn pump() {
     frame_turns::settle();
@@ -288,7 +306,11 @@ impl GridObserve for StubGrid {
 /// changes focus and GTK notifies it.
 struct Stage {
     host: Rc<gtk_host::GtkHost>,
+    /// The op router over `host`, which every script applies its ops to.
+    router: Rc<gtk_host::WmHost>,
     sink: Rc<RecordingSink>,
+    /// The sink the host posts to, held as long as the host is: `sink`, or a record run's trace.
+    _posts_to: Rc<dyn HostSink>,
     grid: Rc<StubGrid>,
     window: gtk4::Window,
     /// The fixture's widgets in order: `a`, `b`, `hidden`.
@@ -412,10 +434,27 @@ fn recording_widgets(
 }
 
 fn stage(f: &Fixture) -> Result<Stage, String> {
+    stage_recorded(f, None)
+}
+
+/// What a record run of the stage writes down, and whether the host is also given every collaborator the stage
+/// leaves out (Lua, the pair, HINT, the page beside nvim, the base page, the first-start screen's work).
+struct Recorded {
+    trace: router_record::Trace,
+    full: bool,
+}
+
+/// The stage, with its collaborators written down around the stage's own when `recorded` says so; its events then
+/// go to the trace, not to `sink`.
+fn stage_recorded(f: &Fixture, recorded: Option<&Recorded>) -> Result<Stage, String> {
     let host = gtk_host::GtkHost::new();
+    let router = host.router();
     let sink = Rc::new(RecordingSink::default());
-    let erased: Rc<dyn HostSink> = sink.clone();
-    host.attach(Rc::downgrade(&erased));
+    let erased: Rc<dyn HostSink> = match recorded {
+        Some(recorded) => router_record::TraceSink::new(&recorded.trace),
+        None => sink.clone(),
+    };
+    router.attach(Rc::downgrade(&erased));
 
     let window = gtk4::Window::new();
     window.set_default_size(600, 300);
@@ -431,13 +470,44 @@ fn stage(f: &Fixture) -> Result<Stage, String> {
     buttons[2].set_child_visible(false);
     let grid = StubGrid::new(f);
     *grid.window.borrow_mut() = Some(window.downgrade());
-    host.set_surface_maker(Rc::new(StubMaker {
+    let maker = StubMaker {
         host: Rc::downgrade(&host),
         column: column.downgrade(),
         grid: Rc::downgrade(&grid),
-    }));
-    host.set_services(Rc::new(StubServices));
-    host.set_grid(f.win, grid.clone());
+    };
+    match recorded {
+        Some(Recorded { trace, full }) => {
+            use router_record::*;
+            router.set_surface_maker(Rc::new(RecMaker {
+                inner: maker,
+                trace: trace.clone(),
+            }));
+            router.set_services(Rc::new(RecServices {
+                inner: StubServices,
+                trace: trace.clone(),
+            }));
+            host.set_grid(
+                f.win,
+                Rc::new(RecGrid {
+                    inner: grid.clone(),
+                    trace: trace.clone(),
+                }),
+            );
+            if *full {
+                router.set_lua(Rc::new(RecLua(trace.clone())));
+                router.set_linked_windows(Rc::new(RecLinked(trace.clone())));
+                router.set_hints(Rc::new(RecHints(trace.clone())));
+                router.set_beside(Rc::new(RecBeside(trace.clone())));
+                router.set_base_page_maker(Rc::new(RecBasePage(trace.clone())));
+                router.set_onboarding(rec_onboarding(trace));
+            }
+        }
+        None => {
+            router.set_surface_maker(Rc::new(maker));
+            router.set_services(Rc::new(StubServices));
+            host.set_grid(f.win, grid.clone());
+        }
+    }
     let chrome: Rc<RefCell<Vec<String>>> = Rc::default();
     host.set_chrome_model(Rc::new(|_| Some(stage_model())));
     let screen = gtk_host::onboarding::OnboardingScreen::new();
@@ -449,10 +519,17 @@ fn stage(f: &Fixture) -> Result<Stage, String> {
     let project_entry = gtk4::Entry::new();
     project_entry.set_visible(false);
     column.append(&project_entry);
-    host.set_project_host(Rc::new(StubProjects {
+    let projects = StubProjects {
         sink: Rc::downgrade(&erased),
         entry: project_entry,
-    }));
+    };
+    match recorded {
+        Some(Recorded { trace, .. }) => router.set_project_host(Rc::new(router_record::RecProjects {
+            inner: projects,
+            trace: trace.clone(),
+        })),
+        None => router.set_project_host(Rc::new(projects)),
+    }
     host.set_chrome_widgets(f.win, recording_widgets(&chrome, &screen));
     window.set_child(Some(&column));
     host.adopt_window(f.win, &window);
@@ -472,7 +549,9 @@ fn stage(f: &Fixture) -> Result<Stage, String> {
     let widgets = buttons.into_iter().map(|b| b.upcast()).collect();
     Ok(Stage {
         host,
+        router,
         sink,
+        _posts_to: erased,
         grid,
         window,
         widgets,
@@ -488,16 +567,10 @@ fn finish(stage: Stage) {
     pump();
 }
 
-/// Scripts this host adds to the shared ones: behaviour GTK's signals alone would not give.
-fn own_scripts(f: &Fixture) -> Vec<Script> {
-    let focus = |module: &ModuleId| HostOp::Focus {
-        win: f.win,
-        to: FocusTo::Module(module.clone()),
-        on_grab: vec![],
-    };
-    vec![Script {
-        name: "focus_on_the_current_owner_still_reports_native_focus",
-        ops: vec![focus(&f.a), focus(&f.a)],
+/// The stage's own script with what this host must report of it: GTK's signals alone would not give the second
+/// focus report, since the keys do not move.
+fn own_script(f: &Fixture) -> Script {
+    Script {
         expect: vec![
             Expect::Answer {
                 op: 1,
@@ -508,7 +581,8 @@ fn own_scripts(f: &Fixture) -> Vec<Script> {
                 event: EventMatch::NativeFocusOn(Some(f.a.clone())),
             },
         ],
-    }]
+        ..router_record::focus_twice(f)
+    }
 }
 
 fn outside_close(f: &Fixture) -> Result<(), String> {
@@ -525,7 +599,7 @@ fn outside_close(f: &Fixture) -> Result<(), String> {
     finish(s);
 
     let s = stage(f)?;
-    let answer = s.host.apply(&HostOp::CloseWindow { win: f.win });
+    let answer = s.router.apply(&HostOp::CloseWindow { win: f.win });
     pump();
     if answer != Applied::Done {
         return Err(format!("CloseWindow answered {answer:?}"));
@@ -561,13 +635,13 @@ fn stopped_close(f: &Fixture) -> Result<(), String> {
     let s = stage(f)?;
     let stopper = Rc::new(StopSink(RecordingSink::default()));
     let erased: Rc<dyn HostSink> = stopper.clone();
-    s.host.attach(Rc::downgrade(&erased));
+    s.router.attach(Rc::downgrade(&erased));
     s.window.close();
     pump();
     if stopper.0.close_requests() != 1 || !s.window.is_visible() {
         return Err("a close the sink stopped did not keep the window open".into());
     }
-    if s.host.apply(&HostOp::CloseWindow { win: f.win }) != Applied::Done || s.window.is_visible() {
+    if s.router.apply(&HostOp::CloseWindow { win: f.win }) != Applied::Done || s.window.is_visible() {
         return Err("CloseWindow after a stopped close did not close the window".into());
     }
     if stopper.0.close_requests() != 1 {
@@ -581,7 +655,7 @@ fn stopped_close(f: &Fixture) -> Result<(), String> {
 /// by asking to keep it open: the host's own close wins over the verdict it was asked for.
 struct CloseInsideSink {
     inner: RecordingSink,
-    host: Weak<gtk_host::GtkHost>,
+    host: Weak<gtk_host::WmHost>,
     win: WinId,
     answer: Cell<Option<Applied>>,
 }
@@ -608,12 +682,12 @@ fn close_window_inside_the_request(f: &Fixture) -> Result<(), String> {
     let s = stage(f)?;
     let sink = Rc::new(CloseInsideSink {
         inner: RecordingSink::default(),
-        host: Rc::downgrade(&s.host),
+        host: Rc::downgrade(&s.router),
         win: f.win,
         answer: Cell::new(None),
     });
     let erased: Rc<dyn HostSink> = sink.clone();
-    s.host.attach(Rc::downgrade(&erased));
+    s.router.attach(Rc::downgrade(&erased));
     s.window.close();
     pump();
     if sink.inner.close_requests() != 1 {
@@ -642,7 +716,9 @@ fn closed_windows_are_forgotten(f: &Fixture) -> Result<(), String> {
     for by_op in [true, false] {
         let Stage {
             host,
+            router,
             sink,
+            _posts_to: _,
             grid: _,
             window,
             widgets,
@@ -652,7 +728,7 @@ fn closed_windows_are_forgotten(f: &Fixture) -> Result<(), String> {
         drop(widgets);
         drop(screen);
         if by_op {
-            if host.apply(&HostOp::CloseWindow { win: f.win }) != Applied::Done {
+            if router.apply(&HostOp::CloseWindow { win: f.win }) != Applied::Done {
                 return Err("CloseWindow on a shown window was refused".into());
             }
         } else {
@@ -682,7 +758,7 @@ fn unmapped_owner_keeps_no_keys(f: &Fixture) -> Result<(), String> {
         win: f.win,
         module: f.a.clone(),
     };
-    if s.host.apply(&focus) != Applied::Done || s.host.apply(&unmap) != Applied::Done {
+    if s.router.apply(&focus) != Applied::Done || s.router.apply(&unmap) != Applied::Done {
         return Err("focus then unmap of a visible module was refused".into());
     }
     pump();
@@ -704,9 +780,10 @@ fn open_window_then_present(f: &Fixture) -> Result<(), String> {
     app.register(None::<&gtk4::gio::Cancellable>)
         .map_err(|e| e.to_string())?;
     let host = gtk_host::GtkHost::new();
+    let router = host.router();
     let sink = Rc::new(RecordingSink::default());
     let erased: Rc<dyn HostSink> = sink.clone();
-    host.attach(Rc::downgrade(&erased));
+    router.attach(Rc::downgrade(&erased));
     let open = HostOp::OpenWindow {
         win: f.win,
         spec: WindowSpec {
@@ -715,11 +792,11 @@ fn open_window_then_present(f: &Fixture) -> Result<(), String> {
             title: "conformance".into(),
         },
     };
-    if host.apply(&open) != Applied::Refused {
+    if router.apply(&open) != Applied::Refused {
         return Err("OpenWindow with no application set was carried out".into());
     }
     host.set_application(&app);
-    if host.apply(&open) != Applied::Done {
+    if router.apply(&open) != Applied::Done {
         return Err("OpenWindow was refused".into());
     }
     let window = host.window(f.win).ok_or("the opened window is not the host's")?;
@@ -729,14 +806,14 @@ fn open_window_then_present(f: &Fixture) -> Result<(), String> {
     if window.is_visible() {
         return Err("OpenWindow showed the window".into());
     }
-    if host.apply(&open) != Applied::Refused {
+    if router.apply(&open) != Applied::Refused {
         return Err("a second OpenWindow for an open window was carried out".into());
     }
     let present = HostOp::Present {
         win: f.win,
         activation: None,
     };
-    if host.apply(&present) != Applied::Done {
+    if router.apply(&present) != Applied::Done {
         return Err("Present was refused".into());
     }
     pump();
@@ -773,11 +850,11 @@ fn focus_goes_through_the_shells_function(f: &Fixture) -> Result<(), String> {
         to: FocusTo::Module(f.a.clone()),
         on_grab: vec![],
     };
-    if s.host.apply(&focus) != Applied::Done {
+    if s.router.apply(&focus) != Applied::Done {
         return Err("a Focus the shell's function granted was refused".into());
     }
     grants.set(false);
-    if s.host.apply(&focus) != Applied::Refused {
+    if s.router.apply(&focus) != Applied::Refused {
         return Err("a Focus the shell's function refused was carried out".into());
     }
     if *asked.borrow() != vec![f.a.clone(), f.a.clone()] {
@@ -803,7 +880,7 @@ fn gtk_host_sets_the_mode_it_is_asked_for(f: &Fixture) -> Result<(), String> {
             top_bar_revealed: false,
         },
     };
-    if s.host.apply(&op) != Applied::Refused {
+    if s.router.apply(&op) != Applied::Refused {
         return Err("a SetMode with no mode toggle set was carried out".into());
     }
     let toggled: Rc<RefCell<Vec<WinId>>> = Rc::default();
@@ -812,14 +889,14 @@ fn gtk_host_sets_the_mode_it_is_asked_for(f: &Fixture) -> Result<(), String> {
         s.host
             .set_mode_toggle(Rc::new(move |win: WinId| toggled.borrow_mut().push(win)));
     }
-    if s.host.apply(&op) != Applied::Done {
+    if s.router.apply(&op) != Applied::Done {
         return Err("a SetMode with the mode toggle set was refused".into());
     }
     if *toggled.borrow() != vec![f.win] {
         return Err(format!("the mode was toggled {:?}", toggled.borrow()));
     }
     // The same state asked again toggles again: what is carried out is the toggle, not the state.
-    if s.host.apply(&op) != Applied::Done || toggled.borrow().len() != 2 {
+    if s.router.apply(&op) != Applied::Done || toggled.borrow().len() != 2 {
         return Err(format!("a second SetMode toggled {:?}", toggled.borrow()));
     }
     finish(s);
@@ -860,7 +937,7 @@ fn top_bar_chrome_and_hints_go_through_the_shells_functions(f: &Fixture) -> Resu
         HostOp::Hint(eitri_core::wm::HintOp::Hide),
     ];
     for op in &ops {
-        if s.host.apply(op) != Applied::Refused {
+        if s.router.apply(op) != Applied::Refused {
             return Err(format!("{op:?} was carried out with no function to carry it"));
         }
     }
@@ -872,12 +949,12 @@ fn top_bar_chrome_and_hints_go_through_the_shells_functions(f: &Fixture) -> Resu
             .set_top_bar(Rc::new(move |_, index| grants.get() && index == 0 && item.grab_focus()));
     }
     let hints = Rc::new(Hints(RefCell::new(Vec::new())));
-    s.host.set_hints(hints.clone());
-    if s.host.apply(&top_bar) != Applied::Done {
+    s.router.set_hints(hints.clone());
+    if s.router.apply(&top_bar) != Applied::Done {
         return Err("a top-bar Focus the shell's function granted was refused".into());
     }
     grants.set(false);
-    if s.host.apply(&top_bar) != Applied::Refused {
+    if s.router.apply(&top_bar) != Applied::Refused {
         return Err("a top-bar Focus the shell's function refused was carried out".into());
     }
     let entry_grants = Rc::new(Cell::new(true));
@@ -887,15 +964,15 @@ fn top_bar_chrome_and_hints_go_through_the_shells_functions(f: &Fixture) -> Resu
         s.host
             .set_rename_entry(Rc::new(move |_| grants.get() && entry.grab_focus()));
     }
-    if s.host.apply(&rename) != Applied::Done {
+    if s.router.apply(&rename) != Applied::Done {
         return Err("a rename entry Focus the shell's function granted was refused".into());
     }
     entry_grants.set(false);
-    if s.host.apply(&rename) != Applied::Refused {
+    if s.router.apply(&rename) != Applied::Refused {
         return Err("a rename entry Focus the shell's function refused was carried out".into());
     }
     let chrome = HostOp::Chrome { win: f.win, rev: 3 };
-    if s.host.apply(&chrome) != Applied::Done {
+    if s.router.apply(&chrome) != Applied::Done {
         return Err("a Chrome op for a window with its widgets was refused".into());
     }
     let first = std::mem::take(&mut *s.chrome.borrow_mut());
@@ -913,7 +990,7 @@ fn top_bar_chrome_and_hints_go_through_the_shells_functions(f: &Fixture) -> Resu
     if first != expected {
         return Err(format!("the first Chrome drew {first:?}"));
     }
-    if s.host.apply(&chrome) != Applied::Done || !s.chrome.borrow().is_empty() {
+    if s.router.apply(&chrome) != Applied::Done || !s.chrome.borrow().is_empty() {
         return Err(format!("the same model drawn again touched {:?}", s.chrome.borrow()));
     }
     for op in [
@@ -924,7 +1001,7 @@ fn top_bar_chrome_and_hints_go_through_the_shells_functions(f: &Fixture) -> Resu
         HostOp::Hint(eitri_core::wm::HintOp::Hide),
         HostOp::Hint(eitri_core::wm::HintOp::Toggle { keycode: 41 }),
     ] {
-        if s.host.apply(&op) != Applied::Done {
+        if s.router.apply(&op) != Applied::Done {
             return Err(format!("{op:?} was refused"));
         }
     }
@@ -947,7 +1024,7 @@ fn the_pair_starts_and_raises_through_the_shell(f: &Fixture) -> Result<(), Strin
         started: RefCell<Vec<WinId>>,
         answer: RefCell<Result<(), String>>,
     }
-    impl gtk_host::LinkedWindows for Pair {
+    impl eitri_desk::host_traits::LinkedWindows for Pair {
         fn open(&self, win: WinId, _name: &WindowName, _token: Option<String>) -> Result<(), String> {
             self.opened.borrow_mut().push(win);
             self.answer.borrow().clone()
@@ -972,13 +1049,13 @@ fn the_pair_starts_and_raises_through_the_shell(f: &Fixture) -> Result<(), Strin
         started: RefCell::default(),
         answer: RefCell::new(Ok(())),
     });
-    s.host.set_linked_windows(pair.clone());
+    s.router.set_linked_windows(pair.clone());
     let open = HostOp::OpenLinkedWindow { win: f.win };
-    if s.host.apply(&open) != Applied::Done {
+    if s.router.apply(&open) != Applied::Done {
         return Err("an OpenLinkedWindow the pair carried out was refused".into());
     }
     *pair.answer.borrow_mut() = Err("this window cannot start a second window".into());
-    if s.host.apply(&open) != Applied::Refused {
+    if s.router.apply(&open) != Applied::Refused {
         return Err("an OpenLinkedWindow the pair refused was answered done".into());
     }
     if *pair.opened.borrow() != [f.win, f.win] {
@@ -986,20 +1063,20 @@ fn the_pair_starts_and_raises_through_the_shell(f: &Fixture) -> Result<(), Strin
     }
     // A launch's restore of window 2 goes through the same pair, its refusal the pair's.
     let restore = HostOp::RestoreLinkedWindow { win: f.win };
-    if s.host.apply(&restore) != Applied::Refused {
+    if s.router.apply(&restore) != Applied::Refused {
         return Err("a RestoreLinkedWindow the pair refused was answered done".into());
     }
     *pair.answer.borrow_mut() = Ok(());
-    if s.host.apply(&restore) != Applied::Done || *pair.restored.borrow() != [f.win, f.win] {
+    if s.router.apply(&restore) != Applied::Done || *pair.restored.borrow() != [f.win, f.win] {
         return Err(format!("the pair was asked to restore {:?}", pair.restored.borrow()));
     }
     // A window 2's start of the editor window goes through the same pair, its refusal the pair's.
     let start = HostOp::StartEditorWindow { win: f.win };
-    if s.host.apply(&start) != Applied::Done {
+    if s.router.apply(&start) != Applied::Done {
         return Err("a StartEditorWindow the pair carried out was refused".into());
     }
     *pair.answer.borrow_mut() = Err("the editor window runs already".into());
-    if s.host.apply(&start) != Applied::Refused || *pair.started.borrow() != [f.win, f.win] {
+    if s.router.apply(&start) != Applied::Refused || *pair.started.borrow() != [f.win, f.win] {
         return Err(format!(
             "the pair was asked to start the editor {:?}",
             pair.started.borrow()
@@ -1024,7 +1101,7 @@ fn the_pair_starts_and_raises_through_the_shell(f: &Fixture) -> Result<(), Strin
         peer: PeerId(2),
     };
     s.sink.applying(Some(0));
-    let answer = s.host.apply(&raise);
+    let answer = s.router.apply(&raise);
     s.sink.applying(None);
     if answer != Applied::Done {
         return Err(format!("RaisePeer answered {answer:?}"));
@@ -1044,11 +1121,11 @@ fn the_pair_starts_and_raises_through_the_shell(f: &Fixture) -> Result<(), Strin
         win: f.win,
         peer: PeerId(2),
     };
-    if s.host.apply(&end) != Applied::Refused {
+    if s.router.apply(&end) != Applied::Refused {
         return Err("an EndPeer the pair refused was answered done".into());
     }
     *pair.answer.borrow_mut() = Ok(());
-    if s.host.apply(&end) != Applied::Done {
+    if s.router.apply(&end) != Applied::Done {
         return Err("an EndPeer the pair carried out was refused".into());
     }
     if pair.opened.borrow().len() != 4 {
@@ -1233,7 +1310,7 @@ fn a_plugin_page_prepare_is_carried_out_and_answered_prepared(f: &Fixture) -> Re
         shape: eitri_core::window_link::Shape::Tiled,
         size: (640, 480),
     };
-    if s.host.apply(&op) != Applied::Done {
+    if s.router.apply(&op) != Applied::Done {
         return Err("plugin page prepare refused".into());
     }
     // Carried out is what the driver answers as `HostEvent::Prepared`: the page's place exists, registered in the
@@ -1272,7 +1349,7 @@ fn an_arrival_is_prepared_and_its_adoption_owns_the_descriptors(f: &Fixture) -> 
         shape: eitri_core::window_link::Shape::Tiled,
         size: (640, 480),
     };
-    if s.host.apply(&prepare) != Applied::Done {
+    if s.router.apply(&prepare) != Applied::Done {
         return Err("the stub maker's place was refused".into());
     }
     let adopt = |module: &ModuleId| {
@@ -1285,7 +1362,7 @@ fn an_arrival_is_prepared_and_its_adoption_owns_the_descriptors(f: &Fixture) -> 
             record: serde_json::Value::Null,
             fds: fds.clone(),
         };
-        (s.host.apply(&op), fds.len())
+        (s.router.apply(&op), fds.len())
     };
     for module in [arriving.clone(), ModuleId::parse("terminal#5").unwrap()] {
         let (answer, left) = adopt(&module);
@@ -1707,7 +1784,7 @@ fn the_focus_op_before_the_chrome_op_still_grabs(f: &Fixture) -> Result<(), Stri
         to: FocusTo::Onboarding,
         on_grab: vec![],
     };
-    if s.host.apply(&focus) != Applied::Done {
+    if s.router.apply(&focus) != Applied::Done {
         return Err("a Focus on a hidden screen was refused".into());
     }
     let held = GtkWindowExt::focus(&s.window).ok_or("no widget holds the keys after the Focus")?;
@@ -1720,7 +1797,7 @@ fn the_focus_op_before_the_chrome_op_still_grabs(f: &Fixture) -> Result<(), Stri
     if !s.screen.has_keys() {
         return Err("the screen does not report holding the keys".into());
     }
-    if s.host.apply(&HostOp::Chrome { win: f.win, rev: 2 }) != Applied::Done {
+    if s.router.apply(&HostOp::Chrome { win: f.win, rev: 2 }) != Applied::Done {
         return Err("the Chrome op that fills the screen was refused".into());
     }
     pump();
@@ -1761,6 +1838,26 @@ fn the_screen_takes_the_keys_with_no_input_context() -> Result<(), String> {
     result
 }
 
+/// The router's record: every script, and one of every op, on a fresh stage each, once with the stage's own
+/// collaborators and once with every collaborator a host can be given; the trace must be the one in
+/// `router_conformance.trace`, line for line.
+fn router_record(f: &Fixture) -> Result<(), String> {
+    let trace: router_record::Trace = Rc::default();
+    for (full, script) in router_record::record_runs(f) {
+        let recorded = Recorded {
+            trace: trace.clone(),
+            full,
+        };
+        let s = stage_recorded(f, Some(&recorded))?;
+        router_record::record(s.router.as_ref(), &trace, router_record::config(full), &script);
+        finish(s);
+    }
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../desk/tests")
+        .join(router_record::TRACE_FILE);
+    router_record::check_trace(&trace, &path, true)
+}
+
 fn run_all() -> Result<Vec<String>, String> {
     let f = Fixture {
         win: WinId::MAIN,
@@ -1771,30 +1868,16 @@ fn run_all() -> Result<Vec<String>, String> {
     let mut passed = Vec::new();
     // This host is given no pair here, so the pair's ops are refused; an arriving terminal's place is made by the stub
     // maker, as the shell's maker makes its pane.
-    let scripts = conformance::scripts(&f)
-        .into_iter()
-        .chain(conformance::pair_refusal_scripts(&f))
-        .chain(own_scripts(&f))
-        .chain([
-            conformance::join_back_refusal_script(f.win, "the tab could not join the base view"),
-            conformance::agents_scan_refusal_script(f.win),
-            conformance::teardown_script(f.win),
-            conformance::teardown_script_for(
-                f.win,
-                Some(CleanupOp::EditorRecord {
-                    token: Some("0123456789abcdef".into()),
-                    seq: 1,
-                }),
-            ),
-        ]);
-    for script in scripts {
+    for script in router_record::scripts(&f, own_script(&f)) {
         let s = stage(&f)?;
-        let result = conformance::run_observed(s.host.as_ref(), &s.sink, &script, Some(s.grid.as_ref()));
+        let result = conformance::run_observed(s.router.as_ref(), &s.sink, &script, Some(s.grid.as_ref()));
         let events = s.sink.events();
         finish(s);
         result.map_err(|e| format!("{e}; events posted: {events:?}"))?;
         passed.push(script.name.to_string());
     }
+    router_record(&f)?;
+    passed.push("the_router_record_is_the_kept_trace".into());
     unmapped_owner_keeps_no_keys(&f)?;
     passed.push("an_unmapped_owner_keeps_no_keys".into());
     outside_close(&f)?;

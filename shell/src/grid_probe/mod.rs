@@ -93,7 +93,7 @@ pub(crate) fn start_if_requested(ctx: Context) {
         .chat_views
         .live()
         .into_iter()
-        .map(|(id, (view, _))| (id, page_pointer(&view)))
+        .map(|(id, page)| (id, page_pointer(&page.view)))
         .collect();
     for (id, _) in &startup {
         if let Some(view) = crate::agent_panel::ViewId::of_module(id) {

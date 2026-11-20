@@ -333,7 +333,7 @@ fn the_shell_verb_path_is_gone() {
     for gone in ["letrun_verb", "set_shell_verb_arm(", "ShellCall"] {
         assert!(!code.contains(gone), "build_ui still has `{gone}`");
     }
-    let host = file_code("shell/src/gtk_host/mod.rs");
+    let host = file_code("shell/src/gtk_host/mod.rs") + &file_code("desk/src/router.rs");
     for gone in ["run_shell_verb", "shell_verb_arm", "ShellCall"] {
         assert!(!host.contains(gone), "the GTK host still has `{gone}`");
     }
@@ -342,8 +342,8 @@ fn the_shell_verb_path_is_gone() {
         assert!(!contract.contains(gone), "the contract still has `{gone}`");
     }
     assert!(
-        host.contains("HostOp::SetMode{win,..}=>self.set_mode(op,*win),"),
-        "the host carries out the window's mode"
+        host.contains("HostOp::SetMode{win,..}=>self.answer(op,self.windows.toggle_mode(*win)),"),
+        "the router carries out the window's mode through the window port"
     );
     let toggle = call_texts(&code, "wm_host.set_mode_toggle(");
     assert_eq!(toggle.len(), 1, "one mode toggle");
@@ -1110,7 +1110,7 @@ fn no_window_verb_is_left_in_build_ui() {
     ] {
         assert!(!code.contains(verb), "build_ui still names `{verb}`");
     }
-    assert!(code.contains("wm_host.set_linked_windows(pair.clone());"));
+    assert!(code.contains("wm_router.set_linked_windows(pair.clone());"));
     assert!(code.contains("link.attach_controller(WinId::MAIN,peer,name.clone(),&wm);"));
 }
 
@@ -1222,8 +1222,8 @@ fn no_chrome_hook_is_left_in_build_ui() {
     assert!(!grid.contains("fnconnect_chrome_changed(") && !grid.contains("fnnotify_chrome_changed("));
     // What draws it instead: the model, read by the host's `Chrome` arm onto the window's widgets.
     assert!(code.contains("wm_host.set_chrome_model(") && code.contains("wm_host.set_chrome_widgets("));
-    let host = file_code("shell/src/gtk_host/mod.rs");
-    assert!(arm(&host, "HostOp::Chrome{", "HostOp::").contains("self.chrome(op,*win)"));
+    let router = file_code("desk/src/router.rs");
+    assert!(arm(&router, "HostOp::Chrome{", "HostOp::").contains("self.views.chrome(*win)"));
 }
 
 /// The window's start is the controller's start plan, walked in its order from `build_ui`: each phase one
@@ -1267,7 +1267,7 @@ fn build_ui_walks_the_start_plan() {
         .find("agent_panel::make_panel_handle(")
         .expect("the panel's handle");
     let maker = code
-        .find("wm_host.set_base_page_maker(")
+        .find("wm_router.set_base_page_maker(")
         .expect("the host can build the page");
     let told = code.find("driver.set_early_facts(").expect("the start's facts");
     let kernel = code.find("StartStep::Kernel").unwrap();
@@ -1360,11 +1360,11 @@ fn the_base_page_has_one_call_site() {
         scan::braced(&surfaces, maker).contains("build_base_page("),
         "only the maker's `build` builds it"
     );
-    let host = file_code("shell/src/gtk_host/mod.rs");
+    let host = file_code("desk/src/router.rs");
     assert_eq!(
         host.matches("maker.build()").count(),
         1,
-        "the host runs the maker in one place"
+        "the router runs the maker in one place"
     );
     let arm = host.find("HostOp::BuildBasePage{..}=>{").expect("the op's arm");
     let built = host.find("maker.build()").unwrap();

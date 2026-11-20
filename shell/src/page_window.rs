@@ -483,7 +483,7 @@ pub(crate) struct Wiring {
     pub(crate) app: gtk4::Application,
     pub(crate) window: gtk4::ApplicationWindow,
     pub(crate) driver: Rc<eitri_core::wm::Driver<eitri_core::wm::Controller>>,
-    pub(crate) wm_host: Rc<crate::gtk_host::GtkHost>,
+    pub(crate) wm_router: Rc<crate::gtk_host::WmHost>,
     pub(crate) plugin_panels: Rc<crate::plugin_panels::PluginPanels>,
     pub(crate) link: Rc<CompanionLink>,
     pub(crate) start: BesideStart,
@@ -501,7 +501,7 @@ pub(crate) fn wire(wiring: Wiring) {
         app,
         window,
         driver,
-        wm_host,
+        wm_router,
         plugin_panels,
         link,
         start,
@@ -530,7 +530,7 @@ pub(crate) fn wire(wiring: Wiring) {
     {
         let link = Rc::downgrade(&link);
         let runner = runner.clone();
-        wm_host.set_beside(Rc::new(Carrier {
+        wm_router.set_beside(Rc::new(Carrier {
             ctx: Rc::new(move || {
                 let link = link.upgrade();
                 BesideCtx {

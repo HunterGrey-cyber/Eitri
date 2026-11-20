@@ -1386,42 +1386,45 @@ fn page_outside_hole<'a, P, C: Copy>(
 
 /// The window controller's way into the grid, held weakly as the GTK host holds its windows: a grid gone
 /// with its window answers as one never allocated and does nothing.
-impl GridPort for glib::WeakRef<ModuleGrid> {
+pub(crate) struct GridHandle(pub(crate) glib::WeakRef<ModuleGrid>);
+
+impl GridPort for GridHandle {
     fn set_pointer_sink(&self, win: WinId, sink: Weak<dyn HostSink>) {
-        if let Some(grid) = self.upgrade() {
+        if let Some(grid) = self.0.upgrade() {
             grid.set_pointer_sink(win, sink);
         }
     }
 
     fn size(&self) -> Size {
-        self.upgrade()
+        self.0
+            .upgrade()
             .map_or(eitri_core::wm::grid::UNALLOCATED, |grid| grid.size())
     }
     fn handle_px(&self) -> i32 {
-        self.upgrade().map_or(1, |grid| grid.handle_px())
+        self.0.upgrade().map_or(1, |grid| grid.handle_px())
     }
     fn strip_px(&self) -> i32 {
-        self.upgrade().map_or(DEFAULT_STRIP_PX, |grid| grid.strip_px())
+        self.0.upgrade().map_or(DEFAULT_STRIP_PX, |grid| grid.strip_px())
     }
     fn module_min(&self, module: &ModuleId) -> Size {
-        self.upgrade().map(|grid| grid.min_size(module)).unwrap_or_default()
+        self.0.upgrade().map(|grid| grid.min_size(module)).unwrap_or_default()
     }
     fn queue_allocation(&self) {
-        if let Some(grid) = self.upgrade() {
+        if let Some(grid) = self.0.upgrade() {
             grid.queue_resize();
             grid.notify_changed_by_controller();
         }
     }
     fn restack_floats(&self, order: &[ModuleId]) {
-        if let Some(grid) = self.upgrade() {
+        if let Some(grid) = self.0.upgrade() {
             grid.restack_floats(order);
         }
     }
     fn probe_places(&self, module: &ModuleId) -> bool {
-        self.upgrade().is_some_and(|grid| grid.probe_places_host(module))
+        self.0.upgrade().is_some_and(|grid| grid.probe_places_host(module))
     }
     fn module_size(&self, module: &ModuleId) -> Option<Size> {
-        let grid = self.upgrade()?;
+        let grid = self.0.upgrade()?;
         let (_, host) = grid.hosts().into_iter().find(|(id, _)| id == module)?;
         let size = Size {
             w: host.width(),

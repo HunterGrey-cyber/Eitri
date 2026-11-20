@@ -340,7 +340,7 @@ fn text_size_driver(
         }
     }
     let scheduler = crate::gtk_host::scheduler::GlibScheduler::new();
-    let host = GtkHost::new();
+    let host = GtkHost::new().router();
     host.set_services(Rc::new(TextServices {
         agent: agent.clone(),
         panel_px,

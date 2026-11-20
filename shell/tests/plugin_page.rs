@@ -1215,9 +1215,10 @@ fn terminal_at_restarts_the_base_terminal_in_place() -> Result<Vec<String>, Stri
         window.set_default_size(900, 600);
         window.set_child(Some(&grid));
         let host = gtk_host::GtkHost::new();
+        let router = host.router();
         host.adopt_window(WinId::MAIN, &window);
         host.register_surface(WinId::MAIN, terminal_id, pane.widget().upcast_ref());
-        host.set_services(Rc::new(Pane(pane.clone())));
+        router.set_services(Rc::new(Pane(pane.clone())));
         grid.apply();
         window.present();
         pane.start();
@@ -1240,7 +1241,7 @@ fn terminal_at_restarts_the_base_terminal_in_place() -> Result<Vec<String>, Stri
             dir: target.clone(),
             expect: shell,
         });
-        if host.apply(&op) != Applied::Done {
+        if router.apply(&op) != Applied::Done {
             return Err("the live pane refused its restart".into());
         }
         wait_for(|| pane.shell_pid().is_some_and(|pid| Some(pid) != shell.pid))?;
