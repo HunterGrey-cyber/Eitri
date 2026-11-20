@@ -154,7 +154,7 @@ When Neovim runs inside tmux, nothing in Neovim's environment changes, its navig
 your tmux setup keeps moving between tmux panes as it does today. The edge of tmux's panes is tmux's. With
 vim-tmux-navigator there is then no crossing to the panel window (use a binding on the tmux side, or your
 window manager's keys); with smart-splits.nvim, the `at_edge` hook above hands a move at tmux's own edge to the
-panel. Neither has been tried on real hardware yet (see [known issues](../known-issues.md#companion-mode)). The
+panel. Neither has been tried yet (see [known issues](../known-issues.md#companion-mode)). The
 editor's window is not raised when you open a file from the panel, because from inside tmux the process tree
 leads to the tmux server, not to the terminal. Neovim inside tmux also hears of focus changes only with
 `set -g focus-events on` in your `tmux.conf`; without it the reload on focus, described next, does not happen.

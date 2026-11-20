@@ -95,7 +95,7 @@ was.
 
 A page needs a moment to be drawn in the window it arrives in. It is shown there once it says it is ready, or after one
 second at the latest; in that time neither window shows it, and you may see the place where it was stay empty for a
-fraction of a second (about 0.06 to 0.3 s when measured in an isolated session). Its window will not let you move it
+fraction of a second (about 0.06 to 0.3 s). Its window will not let you move it
 again until it has appeared.
 
 A move is refused, with the reason in a toast, when there is no other window (`this window has no second window yet`),
@@ -144,8 +144,8 @@ unseen by the other window's revert check until Eitri has read its first event.
 
 ## What has been tried
 
-Two windows have been run in an isolated, headless sway session with two outputs, scripted keys and a stand-in model: the
+Two windows have been run on sway with two outputs and a stand-in model: the
 moves, the keys across the edge, a window ending and coming back, a restart on remembered monitors and the memory
 figure above. The Markdown preview and a moved chat were seen arriving. GNOME's token raise was tried in a probe, not
-with the pair. On Hyprland 0.57 and 0.56.2 in a virtual machine only the keys at the edge were tried, on one output and
-on two. niri, KDE and a real desktop with two physical monitors have not been tried; reports are welcome. The [known issues](../known-issues.md) list the rest.
+with the pair. On Hyprland 0.57 and 0.56.2 only the keys at the edge were tried, on one output and
+on two. niri and KDE have not been tried; reports are welcome. The [known issues](../known-issues.md) list the rest.

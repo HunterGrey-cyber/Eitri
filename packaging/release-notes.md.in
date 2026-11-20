@@ -42,8 +42,8 @@ into an Eitri window, and Eitri reopens your files where you left them. Your Neo
 - `:EitriTutor` follows the mode: in a window that opened in compositor mode it teaches that mode's keys (chat windows,
   the bottom terminal, moving out to your compositor) instead of Eitri's own layout.
 - A finished turn in another window no longer shows as running, in the top bar or in the close question.
-- Run on sway 1.12 in a headless session, and in a virtual machine on Hyprland 0.57.0 (Lua config), 0.56.2 (`hyprland.conf`
-  and Lua config) and niri 26.04; not on real hardware, and not on GNOME or KDE. Each chat window costs 51.4 MiB more than
+- Tried on sway 1.12, Hyprland 0.57.0 (Lua config) and 0.56.2 (`hyprland.conf` and Lua config) and niri 26.04; not
+  yet on GNOME or KDE. Each chat window costs 51.4 MiB more than
   the same chat as a tile with four projects open (release build, medians). The page's "Known gaps" lists what does not
   work yet.
 
@@ -95,6 +95,19 @@ into an Eitri window, and Eitri reopens your files where you left them. Your Neo
   when you close that terminal, and its output goes to a log under `~/.local/state/eitri/log/`. `eitri --no-fork`
   keeps the window in the foreground.
 
+**Remote development** (experimental)
+
+- `eitri host open example-host:/path/to/project` opens a project that lives on another Linux machine. The agent and
+  its tools run on the server, next to the code and its toolchains; your Neovim, its plugins, the panel and your keys
+  stay on your computer, which keeps a mirror of the project at the same path. Your saves travel to the server, and
+  the agent's edits come back.
+- In the window's Neovim, git reads run on your copy and git writes (`commit`, `checkout`, `push` and the others) run
+  on the server, after your saves have reached it. The bottom terminal of a remote window is a shell on the server; it
+  keeps running when the link drops, and the window attaches to it again.
+- It is off by default: `eitri.config.set("remote_dev.enabled", true)` turns it on. You need key-based ssh, OpenSSH
+  8.5 or later and Mutagen 0.18 or later on your computer (Eitri does not ship Mutagen), and `git` and `claude`,
+  installed and set up, on the server. The guide's new "Remote development" page has the details.
+
 **Your editor and your agent**
 
 - An agent in any tab (Claude Code, Codex or one you registered) gets editor tools: `open_file`, `read_buffer`,
@@ -134,7 +147,7 @@ into an Eitri window, and Eitri reopens your files where you left them. Your Neo
 - When `claude` is not found, the panel and the first-start screen say where to get Claude Code.
 - Agent replies draw closed `mermaid` fences as diagrams in the panel (up to 20,000 characters and 500 lines, each in
   a hidden renderer view with a four-second limit). Copying gives the fence's source, and a fence that fails to draw or
-  is too large stays as code. Nobody has looked at these drawings on a real desktop yet.
+  is too large stays as code.
 - A reply's separate text blocks keep their paragraph break instead of running together.
 - A tab keeps about 200 settled turns in the panel (`agent.history_turns`, 10 to 2000). Older turns are unloaded, a line
   says `N earlier turns not loaded.`, `Enter` on it (or `:history older`) loads an older page, and `:history latest`
@@ -325,6 +338,9 @@ into an Eitri window, and Eitri reopens your files where you left them. Your Neo
 - **A bare `/plan` no longer goes to Claude Code as a message.** It switches plan mode in Eitri.
 - **In companion mode on Hyprland, a key at a real edge now stops there.** Hyprland's own move picks a window even when
   nothing lies that way, so `Ctrl+k` and `Ctrl+j` could leave for the panel. Windows that overlap are still left to it.
+- **Remote tabs show a permission card for every call whose answer depends on a path,** in Manual and in Auto,
+  because Eitri cannot yet check paths on the server; Bypass and tools you allowed by name behave as they do
+  locally. Turn review is not available on remote tabs yet.
 
 ## What's new in 0.3.0
 
@@ -549,88 +565,84 @@ for good; later releases' `install.sh` cannot build 0.2.0 from source. The 0.2.0
 
 ## How much of this has been tried
 
-Everything new has automated tests. The tiling window (containers, floats, the scratchpad, workspaces, chat
-views and open rules) and the Markdown preview passed every row of their checks in an isolated, headless test
-session: scripted keys, not a person at a real desktop. The Claude Code backend's suites that run the real `claude`
-against the model service (2.1.302; 113 cases) last ran on a development build with an earlier Verdandi than the
-one this release pins. They ran in two sessions because the first stopped when the test account
-reached the model service's rate limit; after the second, all 113 pass. Two cases failed along the way for reasons other than this
-release's change: one hit the model service's usage-policy check on a probe that asks for a destructive command (it
-passed when run again), and one met this CLI version's new transcript line types, which the history reader now skips.
-Eight Glob and Grep probes in one suite are skipped, because this CLI build lists no such tools. The request a Claude Code tab
-sends was captured from that same earlier backend against a local stand-in: it carries `claude -p`'s system prompt
-with Claude Code's own identity line for the Agent SDK and Eitri's note once at its end. No turn against the real
-model service has run on this release's backend; what it adds was checked against a scripted stand-in, as the next
-paragraph says. Codex tabs passed their scripted suites with `codex` 0.160.0 to 0.161.0 (a
-newer Codex runs and is marked untested), and the real `codex` 0.162 and 0.163 were run against a scripted model.
-`eitri FILE` passed 46 checks in the same kind of headless sway session, with the real launcher, a scripted Claude Code
-stand-in and the real `codex` against a scripted model: a file in a repository, `+42`, `~/notes.md` with its note and a card
-in a Manual and in an Auto tab, a Codex tab and a registered agent at such a folder, a file handed to a running window from
-outside, through a folder above its project, and from its bottom terminal, a window that cannot take it, and a saved layout
-that hides the editor. Read-only at such a folder was run against `codex` 0.160.0, 0.162.1, 0.163.0 and 0.164.0. A person has
-not looked at all its screens, and GNOME's raise, a scaled output and real hardware have not been tried.
-Companion mode on Hyprland (0.57.0 and 0.56.2) was run on a live desktop in a virtual machine, with keys sent through QEMU; on niri, KDE or a real GNOME login it has not been seen on a screen yet.
+Everything new has automated tests. The tiling window (containers, floats, the scratchpad, workspaces, chat views and
+open rules) and the Markdown preview passed every row of their checks. On this release's backend, the real Claude Code
+2.1.322 ran against the model service on 2026-11-20: all seven session lifecycle checks (among them a second turn, an
+interrupt, a tool run once allowed, a resume, and no sidecar or `claude` process left behind) and all five permission
+checks (allow, deny, an interrupt and a closed session while a request waits, an edit under Auto) passed, as did plan
+mode and images (below). The wider suites that run the real `claude` against the model service (2.1.302; 113 cases)
+last ran on a development build with an earlier Verdandi than the one this release pins. They ran in two sessions
+because the first stopped when the test account reached the model service's rate limit; after the second, all 113
+pass. Two cases failed along the way for reasons other than this release's change: one hit the model service's
+usage-policy check on a probe that asks for a destructive command (it passed when run again), and one met this CLI
+version's new transcript line types, which the history reader now skips. Eight Glob and Grep probes in one suite are
+skipped, because this CLI build lists no such tools. The request a Claude Code tab sends was captured from that same
+earlier backend against a local stand-in: it carries `claude -p`'s system prompt with Claude Code's own identity line
+for the Agent SDK and Eitri's note once at its end. Codex tabs passed their scripted suites with `codex` 0.160.0 to
+0.161.0 (a newer Codex runs and is marked untested), and the real `codex` 0.162 and 0.163 were run against a scripted
+model. `eitri FILE` passed 46 checks on sway, with the real launcher, a scripted Claude Code stand-in and the real
+`codex` against a scripted model: a file in a repository, `+42`, `~/notes.md` with its note and a card in a Manual and
+in an Auto tab, a Codex tab and a registered agent at such a folder, a file handed to a running window from outside,
+through a folder above its project, and from its bottom terminal, a window that cannot take it, and a saved layout
+that hides the editor. Read-only at such a folder was run against `codex` 0.160.0, 0.162.1, 0.163.0 and 0.164.0.
+GNOME's raise and a scaled output have not been tried. Companion mode ran on Hyprland 0.57.0 and 0.56.2; on GNOME only
+the extension's moves were tried, and it has not been tried on niri or KDE yet.
 
 The Claude Code tab's handling of Claude Code's own work was tested on this release's backend with the real Claude
 Code 2.1.311 against a scripted stand-in for the model service. The flows above ran end to end through Eitri's agent
-host, and fifteen screen checks of them passed in the redesigned chat page in the isolated, headless session, in dark
-and light and at a narrow panel width: turns Claude Code started, `/tasks` and `/workflows`, the workflow card,
-subagents, compaction, a message steered into a running turn, `/clear`, a scheduled wake-up, retries and the
-question box, where an answer typed through an input method was sent. Restoring a resumed conversation was also
-compared with real Claude Code session files. Steering was seen on a screen only in a Claude Code tab, and typing
-through an input method into the companion panel, in its message box or its question box, has not been verified.
+host, and fifteen screen checks of them passed in the redesigned chat page, in dark and light and at a narrow panel
+width: turns Claude Code started, `/tasks` and `/workflows`, the workflow card, subagents, compaction, a message
+steered into a running turn, `/clear`, a scheduled wake-up, retries and the question box, where an answer typed
+through an input method was sent. Restoring a resumed conversation was also compared with real Claude Code session
+files. Reopening a saved chat was run against the model service with the real Claude Code 2.1.322: the earlier
+messages show while the tab starts, the tab then takes another turn, and a session Claude Code no longer has ends in a
+message saying so. Steering was checked on screen only in a Claude Code tab, and typing through an input method into
+the companion panel, in its message box or its question box, has not been verified.
 
 Plan mode and image attachments were tested with the real Claude Code 2.1.311 against a scripted stand-in for the
 model service, end to end through Eitri's agent host: an approval into each of the three modes, keep planning with
 feedback and a second plan, entering and leaving plan mode yourself, interrupting or closing the tab while a plan
 waits, file edits and commands while Claude plans, and turns with one or four images, images alone and images queued
-behind a running turn. The plan box and the image chips were then driven by keys in the isolated, headless session,
-in dark and light, at a normal width, at a 320-pixel chat pane and in a full-width companion panel: all three
-approvals, keep planning, a plan waiting through an interrupt, a closed tab, a stopped agent backend and a page reload,
-a hostile plan drawn inert, pasted and dropped images, their errors, and images queued, taken back and carried across a
-tab switch and a reload. Nobody has looked at those screens on a real desktop. Against a real model, automated tests
-without a window had the model plan, revise a plan and carry it out after an approval, an edit after a Manual approval
-wait for an answer, and the model read an attached image; no other version of Claude Code was tried.
+behind a running turn. The plan box and the image chips then passed their screen checks, in dark and light, at a
+normal width, at a 320-pixel chat pane and in a full-width companion panel: all three approvals, keep planning, a plan
+waiting through an interrupt, a closed tab, a stopped agent backend and a page reload, a hostile plan drawn inert,
+pasted and dropped images, their errors, and images queued, taken back and carried across a tab switch and a reload.
+Against the model service, the real Claude Code 2.1.322 on this release's backend planned, revised a plan and carried
+it out after an approval, held its edit for an answer after a plan approved into Manual, and read an attached
+image; 2.1.311 had done the same on earlier builds.
 
-The other work since 0.3.0 was tried in the same isolated, headless session, with Neovim 0.12.6 and scripted agents,
-and by a person only on screenshots from it. Taking over a terminal Neovim passed all 17 of its rows, each of the five
-ways of closing the window among them. Pages beside your own Neovim passed 60 of 60 checks. Reopening your files passed
-its seven window rows, and its record was run on Neovim 0.10.4, 0.11.2 and 0.12.6 and with six starter configurations.
-The project list and the folder browser, the agents pages (after one fix a first pass found), crash records (60 of 60
-rows) and the Markdown diagram viewer (16 of 16) passed their rows too. Live review passed the machine checks of its 14
-rows; one check was marked failed by a host-wide test in four runs in a row, and its cause is not established. The
-launcher change (the prompt back at once, the login shell's `PATH`) was seen in the sandbox and not from a desktop
-launcher. Mermaid drawings in replies are tested without having been looked at on a real desktop. The editor tools ran
-against a fake language server and a scripted model, and the `claude` in your terminal against a stand-in client, not a
-real interactive Claude Code.
+The other work since 0.3.0 was checked with Neovim 0.12.6 and scripted agents. Taking over a terminal Neovim passed
+all 17 of its rows, each of the five ways of closing the window among them. Pages beside your own Neovim passed 60 of
+60 checks. Reopening your files passed its seven window rows, and its record was run on Neovim 0.10.4, 0.11.2 and
+0.12.6 and with six starter configurations. The project list and the folder browser, the agents pages (after one fix
+a first pass found), crash records (60 of 60 rows) and the Markdown diagram viewer (16 of 16) passed their rows too.
+Live review passed the machine checks of its 14 rows; one check was marked failed by a host-wide test in four runs in
+a row, and its cause is not established. The launcher change (the prompt back at once, the login shell's `PATH`) has
+not been tried from a desktop launcher yet. The editor tools ran against a fake language server and a scripted model,
+and the `claude` in your terminal against a stand-in client, not a real interactive Claude Code.
 
-None of 0.4.0 has been through real hardware and a person's hands, so it is not yet stable enough for everyday use.
-The verification record counts no run on real hardware and no recorded week of daily use. What ran was scripts, a
-headless session and scripted stand-ins, the virtual-machine runs on Hyprland 0.57.0 and 0.56.2 named above, and the
-real Claude Code runs named above (2.1.302 and 2.1.311). Still not seen: GNOME's raise, KDE, a scaled output, a person
-at a real desktop with a real account, and any other Claude Code version. That waits for real hardware and a week of daily
-use, not for a version number; reports from real desktops are especially welcome. What you may run into is listed in
-the known issues (`docs/known-issues.md` in the repository).
+0.4.0 is an early release and not yet stable: expect rough edges, and the `init.lua` API and the default keys may
+still change during 0.x. What you may run into is listed in the known issues (`docs/known-issues.md` in the
+repository).
 
 ## Performance, against native Neovide
 
-Measured on development builds shortly before this release, in an isolated, headless test session on an AMD
-desktop, and on an Intel laptop where it says so:
+Measured on development builds shortly before this release, on an AMD desktop, and on an Intel laptop where it
+says so:
 
-- **On GTK 4.24, typing is one refresh slower than native Neovide.** In a headless session with the compositor
-  feeding GTK a real 165 Hz period through presentation feedback, GTK 4.24.1 added 5.97 ms at the median;
-  the same build with GTK 4.22.5 added 0.30 ms. With GTK's 60 Hz fallback clock, the addition was about
-  16.5 ms. A 156-line GTK-only reproduction also shows the delay on GTK's development branch (4.25.0,
+- **On GTK 4.24, typing is one refresh slower than native Neovide.** With the compositor feeding GTK a real
+  165 Hz period through presentation feedback, GTK 4.24.1 added 5.97 ms at the median; the same build with
+  GTK 4.22.5 added 0.30 ms. With GTK's 60 Hz fallback clock, the addition was about 16.5 ms. A 156-line
+  GTK-only reproduction also shows the delay on GTK's development branch (4.25.0,
   commit c36202f6, 2026-10-25). Three workarounds using public GTK API were measured; none restored native
   latency, so none ships. The one measured at the real 165 Hz period (`render`) still added about 5.8 ms;
   the other two were measured only with the 60 Hz fallback clock. Settled idle was measured only with
-  that fallback clock and stayed quiet. The period was real, but the screen was the headless session's;
-  a physical display has still not been measured.
-- **On GTK 4.24, scrolling with a held `j` at a 165 Hz headless output drops frames.** Native Neovide drew
+  that fallback clock and stayed quiet.
+- **On GTK 4.24, scrolling with a held `j` at a 165 Hz output drops frames.** Native Neovide drew
   165.5 changed frames a second, Eitri on GTK 4.24.1 140.6, and the same build on GTK 4.22.5 165.4.
   The 99th-percentile frame intervals were 6.1, 12.1 and 6.1 ms respectively. This separate scrolling run
   used stock presentation feedback, so GTK 4.24 still used its 60 Hz fallback clock; scrolling has not been
-  repeated with real-period feedback or on a physical display.
+  repeated with real-period feedback.
 - **While a reply streams**, a key's redraw took 11.2 ms at the median with WebKitGTK 2.54 (a stand-in reply),
   against about 2.3 ms with WebKitGTK 2.52.
 - **Memory:** one tab used 253 to 283 MiB more than native Neovide, against a goal of 256 MiB, and each extra

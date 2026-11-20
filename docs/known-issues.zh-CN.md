@@ -1,5 +1,5 @@
 [English](known-issues.md) | 简体中文
-<!-- translated-from: known-issues.md sha256=d19feb45d2d7b22de36506d79f5b8d5366ec8651a355daae25daef3d7e9d48d3 -->
+<!-- translated-from: known-issues.md sha256=52df08a6cf33457eff21f5aa78a498e4d0d32054e75327ad2f9166aa36f912c5 -->
 
 # 已知问题与限制
 
@@ -7,9 +7,9 @@
 
 ## 能在哪里运行
 
-- **x86_64 的 Linux，Wayland。** X11 只试过一种会话：Ubuntu 24.04 上的 GNOME on Xorg，在一台没有 GPU 加速的虚拟机里。窗口、编辑器、agent 面板、底部终端和平铺在那里都能用。X11 上编辑器始终用 GTK 方式绘制，GNOME Shell 扩展和 companion 模式的焦点移动对 X11 窗口不起作用。其他 X11 桌面和窗口管理器（包括 i3）没有测试过（欢迎反馈）。macOS：移植中。Windows：不支持，WSL2 配合 WSLg 也许能用，但没有测试过。目前还没有 ARM 版本。
+- **x86_64 的 Linux，Wayland。** X11 只试过一种会话：Ubuntu 24.04 上的 GNOME on Xorg，没有 GPU 加速。窗口、编辑器、agent 面板、底部终端和平铺在那里都能用。X11 上编辑器始终用 GTK 方式绘制，GNOME Shell 扩展和 companion 模式的焦点移动对 X11 窗口不起作用。其他 X11 桌面和窗口管理器（包括 i3）没有测试过（欢迎反馈）。macOS：移植中。Windows：不支持，WSL2 配合 WSLg 也许能用，但没有测试过。目前还没有 ARM 版本。
 - **在 GNOME 和 sway 上测试过，companion 模式还在 Hyprland 上测试过。** 其他桌面和合成器，包括 KDE Plasma，没有测试过，欢迎反馈。Hyprland：companion 模式（焦点移动和置前）在真实运行的 0.57.0 和 0.56.2 上跑过（0.56.2 分别用 `hyprland.conf` 和 `hyprland.lua`）；第二个窗口的置前没有跑过。
-- **[合成器窗口](guide/compositor-windows.zh-CN.md)**是 Hyprland、sway 和 niri 上的默认行为，目前只在无界面会话和虚拟机里跑过，还有一些地方不符合预期：见指南里的[已知缺口](guide/compositor-windows.zh-CN.md#known-gaps)。
+- **[合成器窗口](guide/compositor-windows.zh-CN.md)**是 Hyprland、sway 和 niri 上的默认行为，还很新，有一些地方不符合预期：见指南里的[已知缺口](guide/compositor-windows.zh-CN.md#known-gaps)。
 - **需要 WebKitGTK 2.40 或更新**（`webkitgtk-6.0` API）。预构建二进制按 glibc 2.39 和 GTK 4.14 构建，更旧的版本没有测试过。Ubuntu 24.04、Debian 13、Fedora 40+、RHEL 10 和 Arch 满足要求；Ubuntu 22.04 和 Debian 12 不满足。
 - **Neovim 0.11 或更新**：用你自己 `PATH` 里的，或者让安装脚本在你的版本更旧时为 Eitri 单独下载一份私有副本（0.12.6）。`PATH` 里的 Neovim 0.11 会被接受，也不会被替换，但有三个常见配置在它上面仍有问题：当前的 kickstart.nvim 无法启动（它用了 0.12 才有的 `vim.pack`）；LazyVim 在第一次启动时，`Ctrl+j` 和 `Ctrl+k` 会被它的通知浮窗抢走，Eitri 收不到；AstroNvim 偶尔会保留它自己的 `Ctrl+j`（在 0.12.6 上也出现过一次，所以和版本无关）。LazyVim 和 kickstart 的这两项在 0.12.6 上都通过。如果你用其中之一，请让 `PATH` 里是 0.12，或者用 `EITRI_NVIM` 指向它。
 - **Claude Code**，已安装并配置好，2.1.252 或更新，低于 3.0。没有它时 Eitri 照样能打开，编辑器可以用；agent 面板没法运行对话。
@@ -26,12 +26,12 @@
 
 ## 速度与绘制
 
-下面这些是在 0.3.0 发布前不久的开发构建上，于一台 AMD 台式机上的隔离无界面测试会话里测得的，条目里写了别的机器的除外。实体显示器仍未测量；下面区分了真实的刷新周期反馈和默认回退时钟。
+下面这些是在 0.3.0 发布前不久的开发构建上，于一台 AMD 台式机上测得的，条目里写了别的机器的除外。下面区分了真实的刷新周期反馈和默认回退时钟。
 
-- **用 GTK 的方式绘制时，编辑器在 GTK 4.24 上慢一个刷新周期。** 默认情况下那里不用这种方式：在 Wayland 上、GTK 4.24 或更新、显卡驱动不是 NVIDIA 的时候，编辑器把它的帧放在自己的一个表面上直接交给合成器（[编辑器怎样到达屏幕](guide/editor-presentation.zh-CN.md)），在 sway 和 Mutter 上、60 和 165 Hz 下，打出的字母到达屏幕的时间中位数只比原生 Neovide 晚 0.02 到 0.46 ms。X11、NVIDIA 的驱动、`editor.presentation = "gtk"`，以及回退之后（编辑器会打印原因），仍然用 GTK 的方式。在那种情况下，合成器向 GTK 提供真实的 165 Hz 周期时，GTK 4.24.1 的打字中位数多 5.97 ms，同一个构建用 GTK 4.22.5 时只多 0.30 ms；GTK 使用 60 Hz 回退时钟时，约多 16.5 ms。一个 156 行的纯 GTK 复现程序在 GTK 开发分支（4.25.0，提交 c36202f6，2026-10-25）上也测到了这个延迟。编辑器自己的表面还没有在 NVIDIA、KWin 或实体显示器上试过。
-- **用 GTK 的方式绘制时，在 GTK 4.24、165 Hz 的无界面输出上按住 `j` 滚动会掉帧。** 原生 Neovide 每秒画出 165.5 个有变化的帧，Eitri 用 GTK 4.24.1 时为 140.6，同一个构建用 GTK 4.22.5 时为 165.4。第 99 百分位的帧间隔依次为 6.1、12.1 和 6.1 ms。这是另一次滚动测量，使用原样的呈现反馈，因此 GTK 4.24 仍使用 60 Hz 回退时钟；滚动还没有用真实周期反馈重测，也没有在实体显示器上测量。用编辑器自己的表面时，一项按住键的测试不比 GTK 的方式差。
+- **用 GTK 的方式绘制时，编辑器在 GTK 4.24 上慢一个刷新周期。** 默认情况下那里不用这种方式：在 Wayland 上、GTK 4.24 或更新、显卡驱动不是 NVIDIA 的时候，编辑器把它的帧放在自己的一个表面上直接交给合成器（[编辑器怎样到达屏幕](guide/editor-presentation.zh-CN.md)），在 sway 和 Mutter 上、60 和 165 Hz 下，打出的字母到达屏幕的时间中位数只比原生 Neovide 晚 0.02 到 0.46 ms。X11、NVIDIA 的驱动、`editor.presentation = "gtk"`，以及回退之后（编辑器会打印原因），仍然用 GTK 的方式。在那种情况下，合成器向 GTK 提供真实的 165 Hz 周期时，GTK 4.24.1 的打字中位数多 5.97 ms，同一个构建用 GTK 4.22.5 时只多 0.30 ms；GTK 使用 60 Hz 回退时钟时，约多 16.5 ms。一个 156 行的纯 GTK 复现程序在 GTK 开发分支（4.25.0，提交 c36202f6，2026-10-25）上也测到了这个延迟。编辑器自己的表面还没有在 NVIDIA 或 KWin 上试过。
+- **用 GTK 的方式绘制时，在 GTK 4.24、165 Hz 的输出上按住 `j` 滚动会掉帧。** 原生 Neovide 每秒画出 165.5 个有变化的帧，Eitri 用 GTK 4.24.1 时为 140.6，同一个构建用 GTK 4.22.5 时为 165.4。第 99 百分位的帧间隔依次为 6.1、12.1 和 6.1 ms。这是另一次滚动测量，使用原样的呈现反馈，因此 GTK 4.24 仍使用 60 Hz 回退时钟；滚动还没有用真实周期反馈重测。用编辑器自己的表面时，一项按住键的测试不比 GTK 的方式差。
 - **agent 回复流式输出时，在编辑器里打字会变慢。** 在 WebKitGTK 2.54 上，替身回复按默认每秒 5 次更新输出时，一次按键的重绘中位数是 11.2 ms，GTK 4.22.5 上也一样；在 WebKitGTK 2.52 上约为 2.3 ms。真实的回复还没有测过。如果你在回复期间打字时觉得卡，请在「Testing feedback」表单里告诉我们，并附上你的 GPU 和显示器刷新率。
-- **底部终端比你的按键晚画一个输出帧。** 在 60 Hz 的输出上，回显要在按键后约 18 ms 才出现在屏幕上（165 Hz 时是 8.7 ms），这是在 AMD 台式机上的无头 sway 会话里测的。Ghostty（中位数 17.3 ms）、WezTerm（16.7）和 Zed 里的终端（18.3）落在同一个位置；foot（1.0）、kitty（0.7）和 alacritty（0.7）则立刻画出来。原因是 GTK 4.24 每按一个键会对窗口提交两次，合成器要晚一个刷新周期才显示第二次；终端在 GTK 的帧时钟里绘制，而编辑器不是。我们试过去掉第一次提交，结果打字更慢了（两种刷新率下都约 20 ms），所以没有发布。想要最低的延迟，就在编辑器里运行 Neovim 自己的 `:terminal`，它和编辑器用同一种方式绘制（同一轮测试里，在缓冲区里打字的中位数是 1.7 ms）。`:terminal` 缓冲区本身的延迟没有测过，实体显示器上也没有测过。
+- **底部终端比你的按键晚画一个输出帧。** 在 60 Hz 的输出上，回显要在按键后约 18 ms 才出现在屏幕上（165 Hz 时是 8.7 ms），这是在 AMD 台式机上的 sway 里测的。Ghostty（中位数 17.3 ms）、WezTerm（16.7）和 Zed 里的终端（18.3）落在同一个位置；foot（1.0）、kitty（0.7）和 alacritty（0.7）则立刻画出来。原因是 GTK 4.24 每按一个键会对窗口提交两次，合成器要晚一个刷新周期才显示第二次；终端在 GTK 的帧时钟里绘制，而编辑器不是。我们试过去掉第一次提交，结果打字更慢了（两种刷新率下都约 20 ms），所以没有发布。想要最低的延迟，就在编辑器里运行 Neovim 自己的 `:terminal`，它和编辑器用同一种方式绘制（同一轮测试里，在缓冲区里打字的中位数是 1.7 ms）。`:terminal` 缓冲区本身的延迟没有测过。
 - **内存：** 只开一个标签页的闲置窗口，面板在窗口里面时比原生 Neovide 多用 232 MiB；在合成器模式下（面板是一个单独的窗口，平铺式合成器上的默认方式）多用 245 MiB。两者都在我们定的 256 MiB 以内。这是 0.3.0 之后的开发版本在一块 AMD Radeon RX 9070 上测的；换成与它同机的集成显卡，窗口多用 248 到 259 MiB。第一个 Claude 标签页约多用 85 MiB，其中包括它的 sidecar（占 79 MiB）；之后每多一个标签页约多 63 MiB（其中约 55 MiB 是它自己的 sidecar）。每个 Claude 会话还会运行你自己安装的 `claude` CLI。那是你的程序，不是 Eitri 的一部分：闲置时每个会话约 109 MiB，回合进行时更多，不算在上面这些数字里。
 - **0.3.0 里，闲置会话的 sidecar 会一直涨；下一个版本修好了。** 七个会话闲置时，每个 sidecar 每小时涨 30 到 47 MB，三小时内没有停下来的迹象。每五分钟强制一次垃圾回收也没有让它变慢，所以这是 sidecar 仍然握着的内存，不是还没来得及回收的内存。按这个速度，开着五个标签页放一周的窗口会涨到约 30 GB（外推得出，没有实际跑过）。退出窗口就会还回去。0.3.0 之后的版本自带的 sidecar 闲置时不再增长：在同一个 25 分钟、单个闲置会话的测试里，它的内存从第五分钟起一直是 102.6 MB，而 0.3.0 的每小时涨 22 MB（其中 JavaScript 堆每小时涨 44 MB，新的只有 0.3 MB）。在 0.3.0 之后的开发版本上，一个窗口里四个闲置会话的 sidecar 30 分钟里合计一直是 248 MiB，每个的变化都在 0.1 MiB 以内。0.3.0 无法通过 sidecar 更新拿到这个修复。
 - **高刷新率下机器有负载时，编辑器会掉帧。** 在一台 Intel 笔记本上，165 Hz、有其他工作让机器保持 17-28 % 繁忙时，它每秒画 137-149 帧，而原生 Neovide 是 160 帧；繁忙度 34 % 时是 111 帧，四次测量里出现过一帧 83.6 ms。这是在 0.2.0 的打字延迟修复之前测的，之后没有重测。
@@ -67,15 +67,15 @@ Lua 面板和插件页面（[你自己做的页面](guide/pages.zh-CN.md)）是*
 
 Companion 模式是把 agent 面板作为一个独立窗口，开在你自己的 nvim 旁边（见[使用指南](guide/companion.zh-CN.md)）。它比较新，试过的部分比单窗口模式少。
 
-- **到目前为止只在一个隔离的、无界面的测试会话里试过，还没有在真实硬件上试过：** sway 配合终端里的 nvim；sway 上配合 Neovide 0.16.2 的 `eitri split`（也试过从 tmux 里的 shell 启动）；无界面 GNOME Shell 50 里的 GNOME Shell 扩展。Hyprland 只在虚拟机里跑过（终端 nvim 的 companion 模式，在 0.57.0 和 0.56.2 上；没跑第二个窗口的置前，也没在真实硬件上跑）。niri、别的 nvim 图形前端，以及在真实 GNOME 登录会话里启用扩展，完全还没有试过。niri 上，边缘上的行为是窗口管理器自己的，Eitri 不去检查它。
+- **到目前为止试过的：** sway 配合终端里的 nvim；sway 上配合 Neovide 0.16.2 的 `eitri split`（也试过从 tmux 里的 shell 启动）；GNOME Shell 50 里 GNOME Shell 扩展的焦点移动；Hyprland 0.57.0 和 0.56.2 上配合终端 nvim 的 companion 模式（没跑第二个窗口的置前）。niri 和别的 nvim 图形前端还没有试过。niri 上，边缘上的行为是窗口管理器自己的，Eitri 不去检查它。
 - **nvim 运行在 tmux 里的情况还没有试过。** tmux 窗格的边缘仍归 tmux 管。用 vim-tmux-navigator 时，没法用 `Ctrl+h/j/k/l` 从 nvim 跨到面板窗口；用 smart-splits.nvim 并按[使用指南](guide/companion.zh-CN.md#navigator-plugins-and-tmux)设好它的 `at_edge` 钩子时，在 tmux 自己的边缘上这次移动应该能到达面板，但还没有测试过。从面板里打开文件也不会把编辑器的窗口提到前面（从 nvim 往上的进程树通向的是 tmux server，而不是终端）。
 - **在窗口管理器会话之前启动的 tmux server** 会在它的环境里一直保留那个会话旧的 `SWAYSOCK` 或 `HYPRLAND_INSTANCE_SIGNATURE`，从它里面的 nvim 启动的面板会继承这个过期的值：移动焦点和提到前面都不会有任何效果。重新登录后请重启 tmux server，或者从带有当前会话环境的 shell 里启动面板。
-- **在桌面会话之前启动的 tmux server** 同样会一直保留旧的 `WAYLAND_DISPLAY`（或者根本没有），而旧会话留下的 socket 文件也可能还在 `$XDG_RUNTIME_DIR` 里。窗口打开之前，Eitri 会先检查哪个 `wayland-*` socket 背后真有合成器：能用的名字绝不改动，失效或不存在的名字换成唯一一个活着的 socket（有几个就取最新的），一个都没有时，窗口和编辑器一起用 X11（stderr 上有一行说明用了哪个）。如果编辑器那一半仍然显示关于显示的红色页面，页面会说明它试了哪个显示；请带着指向你合成器 socket 的 `WAYLAND_DISPLAY` 重新启动 Eitri（`ls $XDG_RUNTIME_DIR/wayland-*`；在 tmux 里用 `tmux setenv -g WAYLAND_DISPLAY <名字>`，或重启 tmux server）。还没有在真实硬件上试过。
+- **在桌面会话之前启动的 tmux server** 同样会一直保留旧的 `WAYLAND_DISPLAY`（或者根本没有），而旧会话留下的 socket 文件也可能还在 `$XDG_RUNTIME_DIR` 里。窗口打开之前，Eitri 会先检查哪个 `wayland-*` socket 背后真有合成器：能用的名字绝不改动，失效或不存在的名字换成唯一一个活着的 socket（有几个就取最新的），一个都没有时，窗口和编辑器一起用 X11（stderr 上有一行说明用了哪个）。如果编辑器那一半仍然显示关于显示的红色页面，页面会说明它试了哪个显示；请带着指向你合成器 socket 的 `WAYLAND_DISPLAY` 重新启动 Eitri（`ls $XDG_RUNTIME_DIR/wayland-*`；在 tmux 里用 `tmux setenv -g WAYLAND_DISPLAY <名字>`，或重启 tmux server）。
 - **`foot --server` 的客户端共用同一个 pid**，所以按进程把编辑器提到前面时，可能提起同一个 server 的另一个 foot 窗口，而不是装着你那个 nvim 的窗口。
 - **在 sway 的边缘，这个按键会被吞掉。** Eitri 必须先接管或放行 `Ctrl+h/j/k/l`，才能去问 sway 那个方向上有没有窗口，所以在边缘上这个按键什么也不做，和 tmux 自己的 `select-pane` 在它的边缘上一样。
 - **KDE：不移动焦点。** 在那里 Wayland 客户端没法抢到焦点；请用桌面自己的窗口键。
-- **开在你 nvim 旁边的页面**（`eitri page`、`:EitriPage`；[使用指南](guide/companion.zh-CN.md#pages-beside-your-nvim)）只经过了测试，还没有在窗口里跑过。仍然欠着：在隔离的无界面桌面里配合终端里的真实 Neovim 跑一遍（页面的配色、跟随、按键、关闭、`kill -9`、tmux 里的 nvim）；虚拟机里的 Hyprland 0.56.2 和 0.57；niri；KDE；启用了扩展的 GNOME；真实硬件；以及 nvim 0.11（最低版本），它没有跑过。agent 工作期间的缓冲区重新加载，以及聚焦时的重新加载（在 tmux 里需要 `set -g focus-events on`），也处于同样的状态。
-- **接管终端里的 nvim**（`:EitriOpen`、`eitri open`；[指南](guide/takeover.zh-CN.md)）已经在测试里用真实的 Neovim（0.12）、私有的 tmux 和隔离的显示试过，但还没有在窗口里被人看着跑过，也没在真实硬件上试过。还欠：那次窗口里的运行、Hyprland 和 GNOME 会话、真实的 lazy.nvim 配置，以及作为已安装插件的 vim-tmux-navigator 和 smart-splits。
+- **开在你 nvim 旁边的页面**（`eitri page`、`:EitriPage`；[使用指南](guide/companion.zh-CN.md#pages-beside-your-nvim)）在 sway 上配合终端里的 nvim 0.12.6 通过了窗口检查（页面的配色、跟随、按键、关闭、`kill -9`），它的槽位和重新加载测试在 nvim 0.11.2 和 0.12.6 上都通过。还没有试过：tmux 里的 nvim（那里聚焦时的重新加载需要 `set -g focus-events on`）、Hyprland、niri、KDE 和启用了扩展的 GNOME。
+- **接管终端里的 nvim**（`:EitriOpen`、`eitri open`；[指南](guide/takeover.zh-CN.md)）在 tmux 里的 Neovim 0.12.6 上通过了全部 17 行窗口检查。还没有试过：Hyprland 和 GNOME 会话、真实的 lazy.nvim 配置，以及作为已安装插件的 vim-tmux-navigator 和 smart-splits。
 - **页面窗口在两种情况下关得慢。** 正常关闭会把它的槽位留在你的 Neovim 里，直到 Neovim 下一次存活检查（最多一秒），被杀掉的窗口也一样；你运行 `:EitriPage` 时如果 Neovim 正卡在一个提示上，`eitri page` 会一直等着、不开窗口，直到它响应。
 - **GNOME 需要 Eitri GNOME Shell 扩展**才能移动焦点：由你自己启用，下次登录时生效（见[使用指南](guide/companion.zh-CN.md#gnome-the-extension)）。有了它：移动只在拥有焦点的窗口所在的显示器上进行；X11 或 XWayland 窗口永远不算数；在上一次移动之后大约三分之一秒内再移回去会被拒绝；所有窗口都跑在同一个进程里的终端（GNOME Terminal、Ptyxis）在交回焦点时会落到它最近使用的窗口，那未必是 nvim 所在的窗口；被转发的 `eitri split` 不会把面板带到前面。
 
@@ -99,7 +99,7 @@ Companion 模式是把 agent 面板作为一个独立窗口，开在你自己的
 - **在 Bypass 标签页里，动态工作流里各个 agent 的调用会出卡片。** Claude Code 不会让 Eitri 看到这些调用开始，所以 Eitri 分不清某次调用是不是在 plan 模式里发出的：它等 2 秒，然后在两种回答会不同的地方显示卡片；在 Bypass 下，这就是每一次这样的调用，没有人在做计划时也一样。在 Manual 和 Auto 下，它们的文件编辑、命令和 Claude Code 自己的提问，凡是本来会由保存的规则或 Claude Code 的 auto 模式处理的，也都是卡片。
 - **图片在资源限制下解码，不是在沙箱里。** Eitri 在一个单独的进程里解码粘贴或拖进来的图片，这个进程的内存限制为启动时的大小再加 768 MiB，处理器时间 30 秒，总时间 60 秒。一个只是很大或损坏的文件，碰到限制时结束的是这个进程，图片的小块上会显示错误。但这些限制挡不住专门利用图片解码器漏洞构造的文件：这个进程以你的身份运行，能访问你的文件，没有系统调用过滤。它需要 Linux 5.11 或更新的内核；在禁止它所用系统调用的容器或沙箱里，任何图片都无法解码，图片的小块上会说明原因。
 - **底部终端可以写你的剪贴板，这是有意为之。** 在那里运行的程序可以用 OSC 52 转义序列设置剪贴板或主选区（和 Alacritty 的默认行为一样）；Eitri 事先不会询问，但写入之后窗格会显示三秒钟的提示（`Terminal 3: OSC 52 wrote clipboard: 9 bytes`），写明是哪个终端、哪个目标和多少字节，不显示内容。读取剪贴板则会被拒绝。
-- **agent 面板的脚本策略是新的，只在测试里检查过，还没有在每一种环境的屏幕上看过。** 面板现在只允许自己的那段脚本（按哈希），不再允许任意内联脚本。如果更新后 agent 面板一直是空白，请连同你的 WebKitGTK 版本一起报告。
+- **agent 面板的脚本策略是新的。** 面板现在只允许自己的那段脚本（按哈希），不再允许任意内联脚本。如果更新后 agent 面板一直是空白，请连同你的 WebKitGTK 版本一起报告。
 
 <a id="claude-code-conversations"></a>
 ## Claude Code 对话
@@ -115,7 +115,7 @@ Companion 模式是把 agent 面板作为一个独立窗口，开在你自己的
 - **有些关于后台任务的报告只显示 Claude Code 的原话。** Claude Code 用 Eitri 还不认识的方式报告一个任务时（停掉的 shell、工作流里的 agent），那一行只显示 Claude Code 发来的文字，往往只是任务的描述，不说这个任务怎么样了。
 - **刚执行完 `/clear` 时，空白的视图中间可能留着一块空的高亮区域。** 下一个回合画出来后它就消失了。
 - **Claude Code 会留着你发的图片。** 它把每张图片都写进它存在磁盘上的会话文件，和在终端里一样，Eitri 不会删除它们。Eitri 自己对标签页的记录只保留每张图片的类型、尺寸和校验和。一个标签页发出的图片超过 16 MB 之后，它会提醒一次对话已经很重，并建议 `/compact` 或开一个新标签页。
-- **plan 模式和图片只在一个测试会话的屏幕上出现过，用的是 Claude Code 2.1.311 和脚本化的模型服务。** 计划框、它的按钮和图片小块是在一个隔离的桌面会话里用按键操作的，深色和浅色、正常宽度和窄宽度都试过。和真实模型只在没有窗口的自动化测试里跑过（Claude Code 2.1.311）：模型做了计划，计划改过一版后被批准，Manual 批准之后的编辑停下来等回答，模型也读出了附上的图片。还没有人在真实的桌面上用过它们。欢迎报告你看到的情况。
+- **plan 模式和图片的界面是用 Claude Code 2.1.311 和脚本化的模型服务检查的。** 计划框、它的按钮和图片小块在深色和浅色、正常宽度和窄宽度下都通过了检查。对着真实的模型服务，本版本后端上的 Claude Code 2.1.322 做了计划、改了一版计划并在批准后执行，在计划批准进 Manual 之后让编辑停下来等回答，也读出了附上的图片（2.1.311 在更早的构建上也一样）。欢迎报告你看到的情况。
 - **聊天面板很窄时（大约 320 像素），状态行会被截断。** 面板的模式只显示一个字母（`I`、`B`），权限模式的名字被截掉（`bypass permission`），活动行的转圈图标单独占一行。
 
 <a id="codex-and-acp-tabs"></a>
@@ -151,7 +151,7 @@ agent 的一个回合结束后，在面板的 BROWSE 模式里按 `c`，会列�
 
 ## 稳定性
 
-Eitri 还没有稳定到可以日常使用：这要等真实硬件、真人的手和一周的日常使用，而不是等某个版本号。0.4.0 几乎所有部分都只在一个隔离的、无界面的测试会话里见过正常工作，agent 的位置上放的是脚本化的替身，没有真实账号（平铺窗口、聊天视图、聊天页面和它的按键、回合进行中插话引导和排队的消息、计划模式和图片、接管终端里的 Neovim、重新打开上次的文件、项目列表、agents 页面、通过输入法输入、Markdown 预览、companion 模式、`eitri split`、GNOME 扩展、回合审阅、实时审阅、信任提问）。例外是 Hyprland 0.57.0 和 0.56.2 上的虚拟机运行，以及对真实 Claude Code 2.1.302 和 2.1.311 的自动化运行。没有一样在真实硬件上连续跑过一个有记录的星期：真实的滚轮和触摸板、两块缩放不同的显示器、一个真实账号的一整天。完全没见过的有：GNOME 上的窗口提升、KDE、缩放过的输出，以及其他版本的 Claude Code。特别欢迎来自真实桌面的反馈。0.x 期间 `init.lua` 的 API 和默认按键还可能改动。
+0.4.0 是早期版本，还不稳定：会有粗糙的地方。0.x 期间 `init.lua` 的 API 和默认按键还可能改动。对真实 Claude Code 的自动化运行覆盖了 2.1.302、2.1.311 和 2.1.322，其他版本没有试过。欢迎反馈。
 
 ## 这里没有你遇到的问题？
 

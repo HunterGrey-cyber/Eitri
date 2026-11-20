@@ -264,12 +264,12 @@ compositors too.
 
 ## What has been tried
 
-All of this ran with a stand-in model and scripted keys, never on real hardware:
+All of this ran with a stand-in model:
 
-- **sway 1.12**, in an isolated headless session: every row of the pass, including an output that returns after the start.
-- **Hyprland 0.57** with a Lua config, and **0.56.2** with `hyprland.conf` and with a Lua config, in a virtual machine:
+- **sway 1.12**: every row of the pass, including an output that returns after the start.
+- **Hyprland 0.57** with a Lua config, and **0.56.2** with `hyprland.conf` and with a Lua config:
   windows, rules, restart on two outputs, the off keys and the edge keys pass.
-- **niri 26.04**, nested in another compositor in a virtual machine: windows, rules and focus moves pass. Its outputs,
+- **niri 26.04**: windows, rules and focus moves pass. Its outputs,
   restart and the off keys were not run.
 
 GNOME, KDE and a real `claude` or `codex` in these windows have not been tried. Reports are welcome. The

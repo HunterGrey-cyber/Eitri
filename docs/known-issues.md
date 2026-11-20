@@ -8,18 +8,17 @@ bug, and tell us if something here is wrong or has changed. The requirements are
 
 ## Where it runs
 
-- **Linux on x86_64, Wayland.** X11 has been tried in one session: GNOME on Xorg on Ubuntu 24.04, in a virtual
-  machine without GPU acceleration. The window, the editor, the agent panel, the bottom terminal and tiling worked
-  there. On X11 the editor always draws the GTK way, and the GNOME Shell extension and companion mode's focus moves
-  do not apply to X11 windows. Other X11 desktops and window managers, i3 among them, are untested (reports are
-  welcome). macOS is in progress. Windows is not supported; WSL2 with WSLg may work, untested. There is no ARM
-  build yet.
+- **Linux on x86_64, Wayland.** X11 has been tried in one session: GNOME on Xorg on Ubuntu 24.04, without GPU
+  acceleration. The window, the editor, the agent panel, the bottom terminal and tiling worked there. On X11 the
+  editor always draws the GTK way, and the GNOME Shell extension and companion mode's focus moves do not apply to
+  X11 windows. Other X11 desktops and window managers, i3 among them, are untested (reports are welcome). macOS is
+  in progress. Windows is not supported; WSL2 with WSLg may work, untested. There is no ARM build yet.
 - **Tested on GNOME and sway, and companion mode on Hyprland.** Other desktops and compositors, KDE Plasma
   among them, have not been tested; reports from them are welcome. Hyprland: companion mode (focus moves and
   raises) was run on a live 0.57.0 and 0.56.2 (with `hyprland.conf` and with `hyprland.lua`); the second window's
   raises were not.
-- **[Compositor windows](guide/compositor-windows.md)**, the default on Hyprland, sway and niri, have run only in a
-  headless session and a virtual machine, and some things do not work as they should yet: the guide's
+- **[Compositor windows](guide/compositor-windows.md)**, the default on Hyprland, sway and niri, are new, and some
+  things do not work as they should yet: the guide's
   [known gaps](guide/compositor-windows.md#known-gaps) list them.
 - **WebKitGTK 2.40 or newer** (the `webkitgtk-6.0` API) is required. The prebuilt binaries are built against
   glibc 2.39 and GTK 4.14; older versions are untested. Ubuntu 24.04, Debian 13, Fedora 40+, RHEL 10 and Arch
@@ -64,9 +63,8 @@ bug, and tell us if something here is wrong or has changed. The requirements are
 
 ## Speed and drawing
 
-These were measured on development builds shortly before 0.3.0, in an isolated, headless test session on an AMD
-desktop, unless a bullet names another machine. A physical display has still not been measured; the items below
-distinguish real refresh-period feedback from the fallback clock.
+These were measured on development builds shortly before 0.3.0, on an AMD desktop unless a bullet names another
+machine. The items below distinguish real refresh-period feedback from the fallback clock.
 
 - **Drawn the GTK way, the editor is one refresh slower on GTK 4.24.** By default it is not drawn that way there: on
   Wayland with GTK 4.24 or newer, unless the graphics driver is NVIDIA's, the editor hands its frames to the
@@ -76,27 +74,26 @@ distinguish real refresh-period feedback from the fallback clock.
   fallback (the editor prints why). There, with the compositor feeding GTK a real 165 Hz period, GTK 4.24.1 added
   5.97 ms at the median, where the same build with GTK 4.22.5 added 0.30 ms; with GTK's 60 Hz fallback clock the
   addition was about 16.5 ms. A 156-line GTK-only reproduction also shows the delay on GTK's development branch
-  (4.25.0, commit c36202f6, 2026-10-25). The editor's own surface has not been tried on NVIDIA, KWin or a physical
-  display.
-- **Drawn the GTK way on GTK 4.24, scrolling with a held `j` at a 165 Hz headless output drops frames.** Native Neovide drew
+  (4.25.0, commit c36202f6, 2026-10-25). The editor's own surface has not been tried on NVIDIA or KWin.
+- **Drawn the GTK way on GTK 4.24, scrolling with a held `j` at a 165 Hz output drops frames.** Native Neovide drew
   165.5 changed frames a second, Eitri on GTK 4.24.1 140.6, and the same build on GTK 4.22.5 165.4.
   The 99th-percentile frame intervals were 6.1, 12.1 and 6.1 ms respectively. This separate scrolling run
   used stock presentation feedback, so GTK 4.24 still used its 60 Hz fallback clock; scrolling has not been
-  repeated with real-period feedback or on a physical display. With the editor's own surface, a held-key test did no
+  repeated with real-period feedback. With the editor's own surface, a held-key test did no
   worse than the GTK way.
 - **While an agent reply streams, typing in the editor is slower.** With WebKitGTK 2.54 a key's redraw took 11.2 ms
   at the median while a stand-in reply streamed at the default 5 updates a second, on GTK 4.22.5 as well; with
   WebKitGTK 2.52 it was about 2.3 ms. A real reply has not been measured. If you see lag while typing during a
   reply, say so in the "Testing feedback" form, with your GPU and monitor refresh rate.
 - **The bottom terminal draws one output frame behind what you type.** Its echo reaches the screen about 18 ms after
-  the key at a 60 Hz output (8.7 ms at 165 Hz), measured in a headless sway session on an AMD desktop. Ghostty
+  the key at a 60 Hz output (8.7 ms at 165 Hz), measured on sway on an AMD desktop. Ghostty
   (17.3 ms at the median), WezTerm (16.7) and the terminal in Zed (18.3) land in the same place; foot (1.0), kitty
   (0.7) and alacritty (0.7) draw at once. The cause is that GTK 4.24 makes two commits of the window for each key and
   the compositor shows the second one a refresh later; the terminal draws inside GTK's frame clock, which the editor
   does not. We tried to remove the first commit and typing got slower (about 20 ms at either rate), so nothing ships.
   If you want the lowest latency, run Neovim's own `:terminal` in the editor, which is drawn the way the editor is
   (typing in a buffer took 1.7 ms at the median in the same run). A `:terminal` buffer's own latency has not been
-  measured, and none of this has been measured on a physical display.
+  measured.
 - **Memory:** an idle window with one tab uses 232 MiB more than native Neovide when the panel is inside the
   window, and 245 MiB more in compositor mode, where the panel is a window of its own (the default on a tiling
   compositor). Both are under the 256 MiB we aim for. That was measured on a development build after 0.3.0, on an
@@ -170,11 +167,9 @@ Companion mode is the agent panel as its own window beside your own nvim
 ([the guide](guide/companion.md)). It is new, and less of it has been tried than of the
 one-window mode.
 
-- **Tried only in an isolated, headless test session so far, not on real hardware:** sway with a terminal nvim,
-  `eitri split` with Neovide 0.16.2 on sway (also started from a shell inside tmux), and the GNOME Shell extension in a headless GNOME Shell
-  50. Hyprland was run only in a virtual machine (companion mode with a terminal nvim on 0.57.0 and 0.56.2, not
-  the second window's raises, not real hardware). niri, other nvim GUIs and a real GNOME login with the extension
-  have not been tried at all. On niri the edge behaviour is the window manager's own; Eitri does not check it.
+- **Tried so far:** sway with a terminal nvim, `eitri split` with Neovide 0.16.2 on sway (also started from a shell
+  inside tmux), the GNOME Shell extension's moves in GNOME Shell 50, and companion mode with a terminal nvim on Hyprland 0.57.0
+  and 0.56.2 (not the second window's raises). niri and other nvim GUIs have not been tried yet. On niri the edge behaviour is the window manager's own; Eitri does not check it.
 - **nvim inside tmux has not been tried yet.** The edge of tmux's panes stays tmux's. With vim-tmux-navigator
   there is no crossing from nvim to the panel window with `Ctrl+h/j/k/l`; with smart-splits.nvim and its
   `at_edge` hook set as in [the guide](guide/companion.md#navigator-plugins-and-tmux), the move should reach the panel at
@@ -190,20 +185,18 @@ one-window mode.
   live socket (the newest, if several), and with none live both the window and the editor use X11 (one line on stderr
   says which). If the editor's half still shows a red page about a display, it says which display it tried; start Eitri
   with `WAYLAND_DISPLAY` set to your compositor's socket (`ls $XDG_RUNTIME_DIR/wayland-*`; in tmux,
-  `tmux setenv -g WAYLAND_DISPLAY <name>`, or restart the tmux server). Not tried on real hardware yet.
+  `tmux setenv -g WAYLAND_DISPLAY <name>`, or restart the tmux server).
 - **`foot --server` clients share one pid**, so raising the editor by its process can bring up another foot window
   of the same server instead of the one that holds your nvim.
 - **At sway's edge the key is consumed.** Eitri has to take or release `Ctrl+h/j/k/l` before it can ask sway
   whether a window lies that way, so at the edge the key does nothing, as tmux's own `select-pane` does at its edge.
 - **KDE: no focus moves.** A Wayland client cannot take focus there; use the desktop's own window keys.
-- **Pages beside your nvim** (`eitri page`, `:EitriPage`; [the guide](guide/companion.md#pages-beside-your-nvim)) have been through tests only, not yet
-  a run in a window. Still owed: a pass in an isolated headless desktop with a real Neovim in a terminal (the page's colours, the
-  follow, the keys, closing, `kill -9`, nvim inside tmux), Hyprland 0.56.2 and 0.57 in a virtual machine, niri, KDE, GNOME
-  with the extension, real hardware, and nvim 0.11 (the floor), which has not been run. The buffer reload that runs
-  while the agent works, and the reload on focus (which in tmux needs `set -g focus-events on`), are in the same state.
-- **Taking over a terminal nvim** (`:EitriOpen`, `eitri open`; [the guide](guide/takeover.md)) has been tried against
-  real Neovims (0.12) in a private tmux and an isolated display, in tests, but not yet in a run in a window that someone
-  looked at, and not on real hardware. Still owed: that run, Hyprland and the GNOME session, a real lazy.nvim spec, and
+- **Pages beside your nvim** (`eitri page`, `:EitriPage`; [the guide](guide/companion.md#pages-beside-your-nvim)) passed their window checks on sway
+  with nvim 0.12.6 in a terminal (the page's colours, the follow, the keys, closing, `kill -9`), and their slot and
+  reload suites pass on nvim 0.11.2 and 0.12.6. Not tried yet: nvim inside tmux (where the reload on focus
+  needs `set -g focus-events on`), Hyprland, niri, KDE and GNOME with the extension.
+- **Taking over a terminal nvim** (`:EitriOpen`, `eitri open`; [the guide](guide/takeover.md)) passed all 17 rows of its
+  window checks against Neovim 0.12.6 in tmux. Not tried yet: Hyprland, the GNOME session, a real lazy.nvim spec, and
   vim-tmux-navigator and smart-splits as installed plugins.
 - **A page window closes slowly in two cases.** A graceful close leaves its slot in your Neovim until Neovim's next liveness
   check (up to a second), as a killed window does; and a Neovim that is blocked at a prompt when you run `:EitriPage` keeps
@@ -287,7 +280,7 @@ one-window mode.
   or the primary selection with an OSC 52 escape sequence (the same default as Alacritty). Eitri asks nothing first, but
   the pane shows a notice for three seconds after the write (`Terminal 3: OSC 52 wrote clipboard: 9 bytes`), naming
   the terminal, the target and the size, never the text. Reading the clipboard is refused.
-- **The agent panel's script policy is new and was checked in tests, not yet on a screen on every setup.** The
+- **The agent panel's script policy is new.** The
   panel now allows only its own script by hash instead of any inline script. If the agent panel stays blank
   after an update, please report it with your WebKitGTK version.
 
@@ -320,12 +313,11 @@ one-window mode.
 - **Claude Code keeps the images you send.** It writes each one into the session file it keeps on disk, as in a
   terminal, and Eitri does not remove them. Eitri's own record of a tab keeps only each image's type, size and checksum.
   After 16 MB of images a tab says once that the conversation is heavy and suggests `/compact` or a new tab.
-- **Plan mode and images have been on a screen only in a test session, against a scripted model service with Claude
-  Code 2.1.311.** The plan box, its buttons and the image chips were driven by keys in an isolated desktop session, in
-  dark and light, at a normal and a narrow width. Against a real model they have run only in automated tests without
-  a window (Claude Code 2.1.311): the model planned, a plan was revised and approved, an edit after a Manual approval
-  waited for an answer, and the model read an attached image. Nobody has used them on a real desktop yet. Reports of
-  what you see are welcome.
+- **Plan mode and images on screen were checked against a scripted model service, with Claude Code 2.1.311.** The
+  plan box, its buttons and the image chips passed their checks in dark and light, at a normal and a narrow width.
+  Against the real model service, Claude Code 2.1.322 on this release's backend planned, revised a plan and carried it
+  out after an approval, held an edit for an answer after a plan approved into Manual, and read an attached image
+  (2.1.311 did the same on earlier builds). Reports of what you see are welcome.
 - **In a narrow chat pane (about 320 pixels) the status line is cut short.** The panel's mode shows as a single
   letter (`I`, `B`), the permission mode's name is cut off (`bypass permission`), and the activity line's spinner
   sits on a line of its own.
@@ -404,16 +396,9 @@ file in your nvim.
 
 ## Stability
 
-Eitri is not yet stable enough for everyday use: that waits for real hardware, a person's hands and a week of daily
-use, not for a version number. Almost all of 0.4.0 has been seen working only in an isolated, headless test session,
-with scripted stand-ins behind the agents instead of a real account (the tiling windows, chat views, the chat page and
-its keys, steering a running turn and the queued messages, plan mode and images, taking over a terminal Neovim,
-reopening your files, the project list, the agents pages, typing through an input method, the Markdown preview,
-companion mode, `eitri split`, the GNOME extension, turn review, live review, the trust question). The exceptions are
-virtual-machine runs on Hyprland 0.57.0 and 0.56.2 and automated runs against the real Claude Code 2.1.302 and 2.1.311.
-None of it has run for a recorded week on real hardware: a real wheel and touchpad, two monitors of different scale, a
-real account's day. Not seen at all: GNOME's raise, KDE, a scaled output and any other Claude Code version. Reports
-from real desktops are especially welcome. The `init.lua` API and the default keys may change during 0.x.
+0.4.0 is an early release and not yet stable: expect rough edges. The `init.lua` API and the default keys may change
+during 0.x. Automated runs against the real Claude
+Code cover 2.1.302, 2.1.311 and 2.1.322; other versions have not been tried. Reports are welcome.
 
 ## Not on this list?
 

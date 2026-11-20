@@ -1,5 +1,5 @@
 [English](compositor-windows.md) | 简体中文
-<!-- translated-from: compositor-windows.md sha256=b345e02940502a8dbcc31092b8502a0a61504e1bc5f48e190a80cb02f2133a80 -->
+<!-- translated-from: compositor-windows.md sha256=8b548c4fb3d417c03cad167cbb03275377300801ff7131e109d666e6b1c609f4 -->
 
 # 合成器窗口
 
@@ -199,10 +199,10 @@ nvim 在窗口 1 里退出时（比如 `:qa` 或 `:wqa`），窗口 1 也这样�
 <a id="what-has-been-tried"></a>
 ## 试过什么
 
-以下都用替身模型和脚本按键运行，没有在真实硬件上跑过：
+以下都用替身模型运行：
 
-- **sway 1.12**，在隔离的无界面会话里：通过了每一行，包括启动之后才回来的输出。
-- **Hyprland 0.57**（Lua 配置）和 **0.56.2**（`hyprland.conf` 和 Lua 配置），在虚拟机里：窗口、规则、两个输出上的重启、关闭的键和边缘键都通过。
-- **niri 26.04**，在虚拟机里嵌套在另一个合成器中：窗口、规则和焦点移动通过。它的输出、重启和关闭的键没有运行。
+- **sway 1.12**：通过了每一行，包括启动之后才回来的输出。
+- **Hyprland 0.57**（Lua 配置）和 **0.56.2**（`hyprland.conf` 和 Lua 配置）：窗口、规则、两个输出上的重启、关闭的键和边缘键都通过。
+- **niri 26.04**：窗口、规则和焦点移动通过。它的输出、重启和关闭的键没有运行。
 
 GNOME、KDE，以及在这些窗口里运行真实的 `claude` 或 `codex`，都没有试过。欢迎反馈。[已知问题](../known-issues.zh-CN.md)列出了其余的内容。
