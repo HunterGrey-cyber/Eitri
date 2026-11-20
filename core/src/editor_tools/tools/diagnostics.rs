@@ -263,18 +263,10 @@ impl DiagnosticsRun {
     /// An outside path that may be read: where it leads, with every link followed. After a card, `shown` is the
     /// place the card named: a path that leads elsewhere by now was not approved.
     fn outside_approved(&mut self, cx: &ToolCx<'_>, raw: &str, shown: Option<&Path>) -> Step {
-        let path = match paths::outside_target(cx.root, raw) {
+        let path = match paths::approved_outside(cx.root, raw, shown, "nothing was read") {
             Ok(path) => path,
             Err(refused) => return self.done(failure(refused.0)),
         };
-        if let Some(shown) = shown {
-            if path != shown {
-                return self.done(failure(format!(
-                    "{raw} now leads somewhere other than {}; nothing was read",
-                    shown.display()
-                )));
-            }
-        }
         self.approved = Some(path.clone());
         self.call(cx, Some(path))
     }

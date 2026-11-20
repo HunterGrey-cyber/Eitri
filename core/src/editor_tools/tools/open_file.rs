@@ -199,19 +199,10 @@ impl OpenRun {
     /// An outside path that may be shown: where it leads, checked, and loaded if it is not open. After a card,
     /// `approved` is the place the card named: a path that leads elsewhere by now was not approved.
     fn outside_approved(&mut self, cx: &ToolCx<'_>, approved: Option<&Path>) -> Step {
-        let path = match paths::outside_target(cx.root, &self.raw) {
+        let path = match paths::approved_outside(cx.root, &self.raw, approved, "nothing was shown") {
             Ok(path) => path,
             Err(refused) => return failure(refused.0),
         };
-        if let Some(approved) = approved {
-            if path != approved {
-                return failure(format!(
-                    "{} now leads somewhere other than {}; nothing was shown",
-                    self.raw,
-                    approved.display()
-                ));
-            }
-        }
         match paths::file_check(&path) {
             Ok(()) => self.call(path, true, false),
             Err(refused) => failure(refused.0),

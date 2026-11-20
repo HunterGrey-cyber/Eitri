@@ -143,8 +143,8 @@ pub fn name_inside(root: &Path, home: Option<&Path>, name: &Path) -> Option<Path
     }
 }
 
-/// Where an approved outside path leads, every link followed, as [`judge_for`]'s `shown` names it.
-pub fn outside_target(root: &Path, raw: &str) -> Result<PathBuf, ToolError> {
+/// Where an outside path leads, every link followed, as [`judge_for`]'s `shown` names it.
+fn outside_target(root: &Path, raw: &str) -> Result<PathBuf, ToolError> {
     if path_holds_control(raw) {
         return Err(control_refused(raw));
     }
@@ -152,6 +152,20 @@ pub fn outside_target(root: &Path, raw: &str) -> Result<PathBuf, ToolError> {
         ErrorKind::NotFound => ToolError(format!("no such file: {raw}")),
         _ => ToolError(format!("{raw} could not be resolved: {error}")),
     })
+}
+
+/// Where an outside path that may be used leads now, every link followed. A card may wait minutes, so after one
+/// `approved` is the place it named, and a path that leads elsewhere by now was not approved: compared as a path,
+/// never as its text. `nothing` ends that refusal with what the tool did not do.
+pub fn approved_outside(root: &Path, raw: &str, approved: Option<&Path>, nothing: &str) -> Result<PathBuf, ToolError> {
+    let path = outside_target(root, raw)?;
+    match approved {
+        Some(approved) if path != approved => Err(ToolError(format!(
+            "{raw} now leads somewhere other than {}; {nothing}",
+            approved.display()
+        ))),
+        _ => Ok(path),
+    }
 }
 
 /// Whether a file may be loaded: a regular file of at most 16 MiB. By `symlink_metadata`, so nothing is opened: a

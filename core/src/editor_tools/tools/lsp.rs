@@ -866,18 +866,10 @@ impl AskCollect {
     /// `approved` is the place the card named: a path that leads elsewhere by now was not approved.
     fn outside_approved(&mut self, approved: Option<&Path>, cx: &ToolCx<'_>) -> Progress {
         let raw = self.raw_path.clone().unwrap_or_default();
-        let path = match paths::outside_target(cx.root, &raw) {
+        let path = match paths::approved_outside(cx.root, &raw, approved, "nothing was read") {
             Ok(path) => path,
             Err(refused) => return failed(refused.0),
         };
-        if let Some(approved) = approved {
-            if path != approved {
-                return failed(format!(
-                    "{raw} now leads somewhere other than {}; nothing was read",
-                    approved.display()
-                ));
-            }
-        }
         match paths::file_check(&path) {
             Ok(()) => {
                 self.allowed = Some(path.clone());

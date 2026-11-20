@@ -132,20 +132,10 @@ impl ReadRun {
     /// An outside path that may be read: where it leads, with every link followed. After a card, `approved` is the
     /// place the card named: a path that leads elsewhere by now was not approved.
     fn outside_approved(&mut self, cx: &ToolCx<'_>, approved: Option<&Path>) -> Step {
-        let path = match paths::outside_target(cx.root, &self.raw) {
-            Ok(path) => path,
-            Err(refused) => return self.done(failure(refused.0)),
-        };
-        if let Some(approved) = approved {
-            if path != approved {
-                return self.done(failure(format!(
-                    "{} now leads somewhere other than {}; nothing was read",
-                    self.raw,
-                    approved.display()
-                )));
-            }
+        match paths::approved_outside(cx.root, &self.raw, approved, "nothing was read") {
+            Ok(path) => self.call(path, true),
+            Err(refused) => self.done(failure(refused.0)),
         }
-        self.call(path, true)
     }
 
     fn card_answered(&mut self, allowed: bool, cx: &ToolCx<'_>) -> Step {
