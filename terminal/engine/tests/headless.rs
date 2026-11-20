@@ -168,7 +168,29 @@ fn inherited_spawn_is_unchanged() {
             )
         })
         .collect();
-    let expected: BTreeMap<_, _> = child_environment(std::env::vars_os()).into_iter().collect();
+    #[allow(unused_mut)]
+    let mut expected: BTreeMap<_, _> = child_environment(std::env::vars_os()).into_iter().collect();
+    // On macOS `/usr/bin/env` is a system-protected binary, and the system drops every `DYLD_*` variable from the
+    // environment of such a program; cargo sets `DYLD_FALLBACK_LIBRARY_PATH` for the test run. The spawn passes it on
+    // like any other variable, so the comparison leaves out what the program cannot show.
+    #[cfg(target_os = "macos")]
+    expected.retain(|name, _| !name.as_encoded_bytes().starts_with(b"DYLD_"));
+    // The PTY's line discipline writes every `\n` of the child's output as `\r\n`, so a value with a line break in it
+    // (CI runners set some, such as the commit message) arrives with `\r\n`; the expectation gets the same change.
+    let expected: BTreeMap<_, _> = expected
+        .into_iter()
+        .map(|(name, value)| {
+            let bytes = value.into_vec();
+            let mut seen = Vec::with_capacity(bytes.len());
+            for b in bytes {
+                if b == b'\n' {
+                    seen.push(b'\r');
+                }
+                seen.push(b);
+            }
+            (name, OsString::from_vec(seen))
+        })
+        .collect();
     assert_eq!(got, expected);
 }
 
@@ -288,8 +310,10 @@ fn queries_are_answered_with_no_client() {
     wait_for(|| !term.status().alive);
     let a = term.attach("one".into()).unwrap();
     let s = snapshot(&a);
+    // `od` pads its columns differently on Linux and macOS, so the bytes are compared with the spacing normalised.
     let text = String::from_utf8_lossy(&s.replay.bytes);
-    assert!(text.contains("1b 5b 3f 36 63"), "{text}");
+    let spaced = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    assert!(spaced.contains("1b 5b 3f 36 63"), "{text}");
     finish(term);
 }
 
@@ -443,6 +467,9 @@ fn input_written_counts_partial_writes() {
     finish(term);
 }
 
+// Linux only: `HeadlessTerminal::status` reads the foreground job's name and working directory from `/proc`, which
+// macOS lacks, so there both stay `None`. Server terminals run on Linux servers.
+#[cfg(target_os = "linux")]
 #[test]
 fn job_and_cwd_follow_the_foreground() {
     let mut c = config("");
@@ -659,18 +686,24 @@ fn signal_and_left_terminal_exits_are_distinct() {
         }
     }
     finish(term);
-    let term = HeadlessTerminal::spawn(config("exec 0<&- 1>&- 2>&-; exec sleep 30")).unwrap();
-    let a = term.attach("one".into()).unwrap();
-    loop {
-        if let StreamItem::Exited(exit) = next(&a) {
-            assert!(exit.detached);
-            assert_eq!(exit.code, None);
-            assert_eq!(exit.signal, None);
-            break;
+    // Linux only: macOS gives the PTY master no end-of-file while the session leader still has the terminal as its
+    // controlling terminal, even with descriptors 0-2 closed, so a child that leaves the terminal cannot be told
+    // from one that is quiet. Server terminals run on Linux servers.
+    #[cfg(target_os = "linux")]
+    {
+        let term = HeadlessTerminal::spawn(config("exec 0<&- 1>&- 2>&-; exec sleep 30")).unwrap();
+        let a = term.attach("one".into()).unwrap();
+        loop {
+            if let StreamItem::Exited(exit) = next(&a) {
+                assert!(exit.detached);
+                assert_eq!(exit.code, None);
+                assert_eq!(exit.signal, None);
+                break;
+            }
         }
+        assert!(term.status().alive);
+        finish(term);
     }
-    assert!(term.status().alive);
-    finish(term);
 }
 
 #[test]
@@ -716,6 +749,9 @@ fn an_exit_completes_an_owed_snapshot_or_reports_why_it_cannot() {
     }
 }
 
+// Linux only: macOS gives the PTY master no end-of-file for a child that closed descriptors 0-2 but is still running
+// (see `signal_and_left_terminal_exits_are_distinct`), so nothing reports that the child left the terminal.
+#[cfg(target_os = "linux")]
 #[test]
 fn eof_with_an_open_sequence_reports_waiting_then_left_terminal() {
     use eitri_terminal::WaitWhy;
