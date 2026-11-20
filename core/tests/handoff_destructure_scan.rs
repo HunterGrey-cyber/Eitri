@@ -138,6 +138,45 @@ fn the_panels_tab_record_names_every_field_of_the_panels_state() {
     );
 }
 
+/// The Codex and ACP providers move a chat through the one sequence in `agent::provider_move`: a provider that
+/// stopped its link, waited for a start or took a link up by itself again could refuse what the other allows, or
+/// lose what the other keeps.
+#[test]
+fn the_codex_and_acp_providers_move_through_provider_move() {
+    for path in [
+        "agent/src/providers/codex/provider.rs",
+        "agent/src/providers/acp/provider.rs",
+    ] {
+        let code = code_only(&read_required(path).text);
+        for (function, call) in [
+            ("freeze_with_clock", "provider_move::freeze("),
+            ("adopt", "provider_move::take_up("),
+            ("commit", "provider_move::commit("),
+            ("resume_after_move", "provider_move::take_up("),
+            ("resume_after_move", "provider_move::resume("),
+        ] {
+            let bodies = functions(&code, function);
+            assert_eq!(bodies.len(), 1, "{path} no longer has one `{function}`");
+            assert!(
+                bodies[0].contains(call),
+                "{path}'s `{function}` no longer calls `{call}`"
+            );
+        }
+        for own in [
+            ".stop_for_move(",
+            "START_WAIT",
+            "JsonRpcLink::adopt(",
+            "JsonRpcLink::resume_after_move(",
+            "start_after_commit(",
+        ] {
+            assert!(
+                !code.contains(own),
+                "{path} has `{own}` of its own: the move's sequence is `agent::provider_move`'s"
+            );
+        }
+    }
+}
+
 #[test]
 fn a_destructure_with_a_rest_pattern_is_caught() {
     let code = "fn f(s: &S) { let S { a, b: _, .. } = s; let Sx { c } = t; let S {\n d,\n e } = s; }";

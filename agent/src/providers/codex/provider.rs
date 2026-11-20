@@ -42,7 +42,7 @@ use crate::provider::{
     ProviderCapabilities, ProviderError, ProviderErrorCode, ProviderInfo, ResolvePermissionRequest,
     ResumeSessionRequest, SendTurnRequest, SteerTurnRequest,
 };
-use crate::provider_move::{at_offset, forget_unclaimed, handed_ids, offset_ms, MovedAnswer, START_WAIT};
+use crate::provider_move::{self, at_offset, forget_unclaimed, offset_ms, MovedAnswer, TakeUp, TakenLink};
 use crate::steer_gate::{SteerEntry, SteerOrder};
 use crate::{AgentDomainEvent, MoveRefusedWhy, UNARY_RPC_TIMEOUT};
 use serde::{Deserialize, Serialize};
@@ -3206,37 +3206,22 @@ impl CodexProvider {
         now: impl Fn() -> Instant,
         pause: impl Fn(Duration),
     ) -> Result<(CodexProviderHandoff, LinkHandoff, [OwnedFd; 3]), MoveRefusedWhy> {
-        let deadline = now() + START_WAIT;
-        let mut st = loop {
-            let st = lock(&self.state);
-            match self.move_blocker(&st) {
-                None => break st,
-                // The start's caller waits outside this lock and takes it again once its answer comes.
-                Some(MoveRefusedWhy::Starting) if now() < deadline => {
-                    drop(st);
-                    pause(Duration::from_millis(10));
-                }
-                Some(why) => return Err(why),
-            }
-        };
-        let Some(link) = lock(&self.link).take() else {
-            return Err(MoveRefusedWhy::Ended);
-        };
-        let (link_handoff, fds) = match link.stop_for_move() {
-            Ok(stopped) => stopped,
-            Err(refused) => {
-                let why = refused.reason;
-                *lock(&self.link) = Some(*refused.link);
-                return Err(MoveRefusedWhy::Link(why));
-            }
-        };
-        let gone = State {
+        let gone = || State {
             closed: true,
             dead: true,
             ..State::default()
         };
-        let state = std::mem::replace(&mut *st, gone);
-        Ok((self.handoff_of(state, self.now()), link_handoff, fds))
+        let (handoff, (link, fds)) = provider_move::freeze(
+            &self.state,
+            &self.link,
+            |st| self.move_blocker(st),
+            gone,
+            // A deadline crosses as time from this moment: the provider's own clock, read with the state frozen.
+            |state| self.handoff_of(state, self.now()),
+            now,
+            pause,
+        )?;
+        Ok((handoff, link, fds))
     }
 
     fn handoff_of(&self, state: State, now: Instant) -> CodexProviderHandoff {
@@ -3358,10 +3343,8 @@ impl CodexProvider {
     /// written to Codex until [`commit`](Self::commit); dropping the provider before then only closes this
     /// process's copies of the descriptors.
     pub fn adopt(handoff: CodexProviderHandoff, link: LinkHandoff, fds: [OwnedFd; 3]) -> io::Result<CodexProvider> {
-        let pid = link.pid;
-        let handed = handed_ids(&link);
-        let link = JsonRpcLink::adopt(link, fds, approvals::over_cap_reply)?;
-        Self::rebuilt(handoff, link, pid, &handed)
+        let taken = provider_move::take_up(TakeUp::Adopt, link, fds, approvals::over_cap_reply)?;
+        Self::rebuilt(handoff, taken)
     }
 
     /// Starts the adopted link once the move is committed: what was carried is read first, then Codex's
@@ -3371,17 +3354,11 @@ impl CodexProvider {
     /// carried as time remaining start running here: they are moved on by the time the chat waited for its
     /// commit, while nothing of Codex's could be read.
     pub fn commit(&self) -> io::Result<()> {
-        let mut st = lock(&self.state);
-        let started = match lock(&self.link).as_mut() {
-            Some(link) => link.start_after_commit(),
-            None => Ok(()),
-        };
-        // Pumping resumes even when the link's threads could not start: the tab then learns that the
-        // session ended, instead of waiting for good.
-        if let Some(adopted_at) = st.adopted_at.take() {
-            later_deadlines(&mut st, self.now().duration_since(adopted_at));
-        }
-        started
+        provider_move::commit(&self.state, &self.link, |st| {
+            if let Some(adopted_at) = st.adopted_at.take() {
+                later_deadlines(st, self.now().duration_since(adopted_at));
+            }
+        })
     }
 
     /// The source's way back when a move is given up before its commit: this provider takes its own
@@ -3392,9 +3369,7 @@ impl CodexProvider {
         link: LinkHandoff,
         fds: [OwnedFd; 3],
     ) -> io::Result<()> {
-        let pid = link.pid;
-        let handed = handed_ids(&link);
-        let link = JsonRpcLink::resume_after_move(link, fds, approvals::over_cap_reply)?;
+        let taken = provider_move::take_up(TakeUp::Resume, link, fds, approvals::over_cap_reply)?;
         let CodexProvider {
             #[cfg(feature = "test-support")]
                 clock: _,
@@ -3414,23 +3389,15 @@ impl CodexProvider {
             steer_unsupported,
             editor_server_lever: _,
             editor_note_due: _,
-        } = Self::rebuilt(handoff, link, pid, &handed)?;
+        } = Self::rebuilt(handoff, taken)?;
         self.steer_unsupported
             .store(steer_unsupported.load(Ordering::Acquire), Ordering::Release);
-        let mut st = lock(&self.state);
-        *st = state.into_inner().unwrap_or_else(|poisoned| poisoned.into_inner());
-        // The source's link reads on at once, so there is no commit to wait for.
-        st.adopted_at = None;
-        *lock(&self.link) = link.into_inner().unwrap_or_else(|poisoned| poisoned.into_inner());
+        provider_move::resume(&self.state, &self.link, (state, link), |st| st.adopted_at = None);
         Ok(())
     }
 
-    fn rebuilt(
-        handoff: CodexProviderHandoff,
-        link: JsonRpcLink,
-        pid: u32,
-        handed: &[u64],
-    ) -> io::Result<CodexProvider> {
+    fn rebuilt(handoff: CodexProviderHandoff, taken: TakenLink) -> io::Result<CodexProvider> {
+        let TakenLink { link, pid, handed } = taken;
         let now = Instant::now();
         let CodexProviderHandoff {
             version,
@@ -3496,7 +3463,7 @@ impl CodexProvider {
             .into_iter()
             .map(|moved| SentSteer::from_moved(moved, &link))
             .collect::<io::Result<SteerOrder<_>>>()?;
-        forget_unclaimed(&link, handed);
+        forget_unclaimed(&link, &handed);
         let state = State {
             thread_id,
             family,
