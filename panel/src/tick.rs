@@ -42,6 +42,7 @@ pub(super) fn tick_collect(state: &mut AgentPanelState, screen: &Screen, out: &m
     // paths against it -- see `AgentBackend::answer_what_needs_no_human`. A view counts as
     // mapped only while its page is live and on screen.
     poll_permission_sends(state, out);
+    super::remote_sessions::note_server_roots(state);
     let project_dir = state.project_dir.clone();
     let pumped = state.tabs.pump_views(&project_dir, &|view| screen.shows(view));
     super::remote_tabs::tick(state, out);
@@ -463,6 +464,7 @@ pub(super) fn needs_polling(state: &AgentPanelState) -> bool {
         || state.trust.is_busy()
         || state.history_writer.is_busy()
         || state.remote_prompts.needs_polling()
+        || state.remote_sessions.needs_polling()
         || state.remote_stops.needs_polling()
 }
 

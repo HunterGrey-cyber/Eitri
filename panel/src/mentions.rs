@@ -7,7 +7,7 @@
 //! behind it, so the order the person sent them in holds.
 use super::routing::remember_prompts;
 use super::*;
-use eitri_core::mentions::gather::{Gather, Gathered};
+use eitri_core::mentions::gather::{Gather, Gathered, RulesSource};
 use eitri_core::mentions::{requested, Kind};
 use std::time::Instant;
 
@@ -24,6 +24,100 @@ struct Waiting {
 pub(super) struct Desk {
     waiting: Vec<Waiting>,
     sequencer: Option<eitri_core::editor_tools::stamp::Sequencer>,
+    /// The last rules fetched from the window's server, reused for [`FETCHED_RULES_REUSE`].
+    fetched: std::sync::Arc<std::sync::Mutex<Option<FetchedRules>>>,
+}
+
+/// How long rules fetched from the server serve later messages before they are fetched again.
+const FETCHED_RULES_REUSE: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Rules the server's settings gave, for one root and config directory, and when.
+#[derive(Clone)]
+struct FetchedRules {
+    at: Instant,
+    key: (String, Option<String>),
+    rules: agent::read_deny::ReadRules,
+    server_root: std::path::PathBuf,
+}
+
+/// Where a remote tab's sources are judged from: the server's `Read` deny rules, fetched on the gathering worker when
+/// the sections are built (a fetch younger than [`FETCHED_RULES_REUSE`] for the same scope is reused). A tab whose
+/// folder the trust scan has not named, a window with no connection or a fetch that fails or is refused leaves every
+/// source out with the reason.
+fn remote_rules(state: &AgentPanelState, tab: TabId) -> RulesSource {
+    let unavailable = |why: String| RulesSource::Fetched {
+        rules: agent::read_deny::ReadRules::unavailable_because(&why),
+        server_root: state.project_dir.clone(),
+    };
+    let Some(connection) = state.server.clone() else {
+        return unavailable("the server's settings could not be read: this window has no connection".to_owned());
+    };
+    let canonical = super::remote_sessions::canonical_root_of(state, tab);
+    let config_dir = super::remote_sessions::reported_config_dir_of(state, tab);
+    let account = agent::account::configured().map(|account| account.name().to_string());
+    let cache = state.mentions.fetched.clone();
+    let fallback_root = state.project_dir.clone();
+    RulesSource::Fetch(Box::new(move || {
+        let scope = RulesScope {
+            canonical_root: canonical,
+            account,
+            config_dir,
+        };
+        server_rules(&connection, &scope, &cache, fallback_root)
+    }))
+}
+
+/// What a remote tab's rules are fetched for.
+struct RulesScope {
+    canonical_root: String,
+    account: Option<String>,
+    config_dir: Option<String>,
+}
+
+/// The server's rules for `scope`, and the server root they are anchored at: the last fetch, if it was for the same
+/// root and config directory and is younger than [`FETCHED_RULES_REUSE`], else asked now (blocking: the gathering
+/// worker's call) and kept for the next. A failure is not kept: it leaves every source out with its reason, anchored
+/// at `fallback_root`.
+fn server_rules(
+    connection: &eitri_core::remote_project::RemoteConnection,
+    scope: &RulesScope,
+    cache: &std::sync::Mutex<Option<FetchedRules>>,
+    fallback_root: std::path::PathBuf,
+) -> (agent::read_deny::ReadRules, std::path::PathBuf) {
+    let key = (scope.canonical_root.clone(), scope.config_dir.clone());
+    let reusable = cache
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone()
+        .filter(|fetched| fetched.key == key && fetched.at.elapsed() < FETCHED_RULES_REUSE);
+    if let Some(fetched) = reusable {
+        return (fetched.rules, fetched.server_root);
+    }
+    let settings = connection
+        .tab_scope(
+            &scope.canonical_root,
+            scope.account.as_deref(),
+            scope.config_dir.as_deref(),
+        )
+        .and_then(|tab| connection.read_deny_settings(&tab));
+    match settings {
+        Ok(settings) => {
+            let fetched = FetchedRules {
+                at: Instant::now(),
+                key,
+                rules: settings.read_rules(),
+                server_root: settings.used.root.clone().into(),
+            };
+            *cache.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(fetched.clone());
+            (fetched.rules, fetched.server_root)
+        }
+        Err(why) => (
+            agent::read_deny::ReadRules::unavailable_because(&format!(
+                "the server's settings could not be read: {why}"
+            )),
+            fallback_root,
+        ),
+    }
 }
 
 impl Desk {
@@ -145,10 +239,10 @@ pub(super) fn hold(state: &mut AgentPanelState, message: InboundMessage, view: V
     let Some(tab) = admitted.target.filter(|_| keeps_order(&message)) else {
         return Held::Goes(message, admitted);
     };
-    let claude = state
-        .tabs
-        .get(tab)
-        .is_some_and(|t| *t.agent() == AgentId::Claude && !t.is_remote());
+    let remote = state.tabs.get(tab).is_some_and(|t| t.is_remote());
+    // A remote tab's sources are judged by the server's rules, which a helper without transcripts cannot give.
+    let claude = state.tabs.get(tab).is_some_and(|t| *t.agent() == AgentId::Claude)
+        && (!remote || super::remote_sessions::offers_transcripts(state));
     let behind = state.mentions.waiting.iter().any(|waiting| waiting.tab == tab);
     let kinds: Vec<Kind> = match words_of(&message) {
         Some(text) if claude => requested(text),
@@ -164,6 +258,15 @@ pub(super) fn hold(state: &mut AgentPanelState, message: InboundMessage, view: V
     ) {
         state.tabs.note_sent(tab);
     }
+    let rules = if remote {
+        remote_rules(state, tab)
+    } else {
+        RulesSource::Local {
+            config_dir: agent::transcript::claude_projects_dir()
+                .ok()
+                .and_then(|projects| projects.parent().map(Path::to_path_buf)),
+        }
+    };
     let gather = Gather::start(
         state.editor_rpc.as_deref().filter(|_| !kinds.is_empty()),
         state.mentions.sequencer.get_or_insert_with(|| {
@@ -176,9 +279,7 @@ pub(super) fn hold(state: &mut AgentPanelState, message: InboundMessage, view: V
         &kinds,
         &state.project_dir,
         state.home.as_deref(),
-        agent::transcript::claude_projects_dir()
-            .ok()
-            .and_then(|projects| projects.parent().map(Path::to_path_buf)),
+        rules,
         Instant::now(),
     );
     state.mentions.waiting.push(Waiting {
@@ -850,5 +951,159 @@ mod tests {
         tick_handle_until(&r.handle, "the second", || r.provider.turns().len() == 2);
         assert!(r.provider.turns()[0].starts_with("one @diagnostics\n\n[@diagnostics: "));
         assert_eq!(r.provider.turns()[1], "two");
+    }
+
+    mod server_rules_tests {
+        use super::super::*;
+        use agent::remote_client::terminal_transport::tonic::{self, Request, Response, Status};
+        use agent::remote_client::terminal_transport::wire::transcripts_server::Transcripts;
+        use agent::remote_client::{
+            read_deny_settings_event, ListTranscriptsResponse, ReadDenySettingsEvent, ReadTranscriptRequest,
+            SettingsRead, SettingsScope, TranscriptChunk, TranscriptScope, TranscriptStableResponse,
+        };
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::{Arc, Mutex};
+
+        type Items<T> = std::pin::Pin<
+            Box<dyn agent::remote_client::terminal_transport::tokio_stream::Stream<Item = Result<T, Status>> + Send>,
+        >;
+
+        /// A helper whose settings deny `secret.txt`, counting how often it is asked; refusing when told to.
+        #[derive(Clone, Default)]
+        struct Settings {
+            asked: Arc<AtomicUsize>,
+            refuse: Arc<std::sync::atomic::AtomicBool>,
+        }
+
+        #[tonic::async_trait]
+        impl Transcripts for Settings {
+            async fn list_transcripts(
+                &self,
+                _: Request<TranscriptScope>,
+            ) -> Result<Response<ListTranscriptsResponse>, Status> {
+                Err(Status::unimplemented("not here"))
+            }
+            type ReadTranscriptTailStream = Items<TranscriptChunk>;
+            async fn read_transcript_tail(
+                &self,
+                _: Request<ReadTranscriptRequest>,
+            ) -> Result<Response<Self::ReadTranscriptTailStream>, Status> {
+                Err(Status::unimplemented("not here"))
+            }
+            async fn transcript_stable(
+                &self,
+                _: Request<ReadTranscriptRequest>,
+            ) -> Result<Response<TranscriptStableResponse>, Status> {
+                Err(Status::unimplemented("not here"))
+            }
+            type ReadDenySettingsStream = Items<ReadDenySettingsEvent>;
+            async fn read_deny_settings(
+                &self,
+                request: Request<TranscriptScope>,
+            ) -> Result<Response<Self::ReadDenySettingsStream>, Status> {
+                self.asked.fetch_add(1, Ordering::SeqCst);
+                if self.refuse.load(Ordering::SeqCst) {
+                    return Err(Status::unavailable("the link is down"));
+                }
+                let root = request.into_inner().root;
+                let events = vec![
+                    ReadDenySettingsEvent {
+                        event: Some(read_deny_settings_event::Event::Scope(SettingsScope {
+                            home: "/home/example".into(),
+                            config_dir: "/home/example/.claude".into(),
+                            files: 1,
+                            root: root.clone(),
+                            root_gone: false,
+                        })),
+                    },
+                    ReadDenySettingsEvent {
+                        event: Some(read_deny_settings_event::Event::File(SettingsRead {
+                            path: format!("{root}/.claude/settings.local.json"),
+                            bytes: br#"{"permissions":{"deny":["Read(secret.txt)"]}}"#.to_vec(),
+                            ..Default::default()
+                        })),
+                    },
+                ];
+                let items: Vec<Result<ReadDenySettingsEvent, Status>> = events.into_iter().map(Ok).collect();
+                Ok(Response::new(Box::pin(
+                    agent::remote_client::terminal_transport::tokio_stream::iter(items),
+                )))
+            }
+        }
+
+        fn connection(settings: Settings) -> eitri_core::remote_project::RemoteConnection {
+            let client = agent::remote_client::HelperClient::serving_transcripts_for_test(
+                "example-host",
+                "SHA256:example",
+                &[agent::remote_client::CAP_TRANSCRIPTS],
+                settings,
+            );
+            let project = eitri_core::remote_project::RemoteProject {
+                version: 1,
+                host: "example-host".into(),
+                host_key_sha256: "SHA256:example".into(),
+                root: "/srv/project".into(),
+                helper_version: "0.4.0".into(),
+                sync: None,
+                created_at: 1,
+                queued_stops: Vec::new(),
+            };
+            eitri_core::remote_project::RemoteConnection::with_client(client, project, String::new(), String::new())
+        }
+
+        fn scope(root: &str, config_dir: Option<&str>) -> RulesScope {
+            RulesScope {
+                canonical_root: root.into(),
+                account: None,
+                config_dir: config_dir.map(str::to_owned),
+            }
+        }
+
+        /// The server's rules are fetched once for a root and config directory and reused for a while; another root
+        /// or config directory is fetched again; a failure is not kept, and leaves the sources out with its reason.
+        #[test]
+        fn the_servers_rules_are_reused_only_for_their_own_scope() {
+            let settings = Settings::default();
+            let connection = connection(settings.clone());
+            let cache = Mutex::new(None);
+            let fallback = std::path::PathBuf::from("/srv/project");
+            let here = scope("/srv/project", Some("/home/example/.claude"));
+            let (rules, root) = server_rules(&connection, &here, &cache, fallback.clone());
+            assert_eq!(root, std::path::Path::new("/srv/project"));
+            assert_eq!(rules.closed(), None);
+            assert!(rules.denies(&root, &root.join("secret.txt")));
+            assert!(!rules.denies(&root, &root.join("a.rs")));
+            server_rules(&connection, &here, &cache, fallback.clone());
+            assert_eq!(
+                settings.asked.load(Ordering::SeqCst),
+                1,
+                "a second send reuses the fetch"
+            );
+            server_rules(
+                &connection,
+                &scope("/srv/other", Some("/home/example/.claude")),
+                &cache,
+                fallback.clone(),
+            );
+            assert_eq!(settings.asked.load(Ordering::SeqCst), 2, "another root is fetched");
+            server_rules(&connection, &scope("/srv/other", None), &cache, fallback.clone());
+            assert_eq!(
+                settings.asked.load(Ordering::SeqCst),
+                3,
+                "another config directory is fetched"
+            );
+
+            settings.refuse.store(true, Ordering::SeqCst);
+            let failing = scope("/srv/failing", None);
+            let (rules, _) = server_rules(&connection, &failing, &cache, fallback.clone());
+            let why = rules.closed().expect("a failed fetch closes the reader");
+            assert!(why.starts_with("the server's settings could not be read: "), "{why}");
+            server_rules(&connection, &failing, &cache, fallback.clone());
+            assert_eq!(settings.asked.load(Ordering::SeqCst), 5, "a failure is not kept");
+            // A tab whose folder the scan has not named asks nothing.
+            let (rules, _) = server_rules(&connection, &scope("", None), &cache, fallback);
+            assert!(rules.closed().is_some());
+            assert_eq!(settings.asked.load(Ordering::SeqCst), 5);
+        }
     }
 }

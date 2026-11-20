@@ -3560,6 +3560,16 @@ pub struct ChooserRecord {
 /// `limit` is the number of sessions a project keeps, given once the project holds that many: the list then
 /// says that the oldest sessions are dropped, and the key is left out otherwise.
 pub fn serialize_chooser_for_js(open: &[ChooserTab], records: &[ChooserRecord], limit: Option<usize>) -> String {
+    chooser_envelope("chooser", open, records, limit)
+}
+
+/// The chooser's rows again for a list that arrived after the chooser was sent (a remote tab's sessions): the page
+/// replaces the rows of a chooser still open and, with none open, drops it; it never opens one or takes the keys.
+pub fn serialize_chooser_update_for_js(open: &[ChooserTab], records: &[ChooserRecord], limit: Option<usize>) -> String {
+    chooser_envelope("chooser_update", open, records, limit)
+}
+
+fn chooser_envelope(kind: &str, open: &[ChooserTab], records: &[ChooserRecord], limit: Option<usize>) -> String {
     let open: Vec<Value> = open
         .iter()
         .map(|t| {
@@ -3579,7 +3589,7 @@ pub fn serialize_chooser_for_js(open: &[ChooserTab], records: &[ChooserRecord], 
             })
         })
         .collect();
-    let mut envelope = json!({ "kind": "chooser", "open": open, "records": records });
+    let mut envelope = json!({ "kind": kind, "open": open, "records": records });
     if let Some(limit) = limit {
         envelope["limit"] = json!(limit);
     }

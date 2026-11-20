@@ -1001,6 +1001,18 @@ impl AgentPanelHandle {
                 }
             }),
         );
+        // So is a remote tab's request held for the server's fact or for a fresh check: a fact or an answer that
+        // arrives wakes the tab, and its time limit is judged by a drain that runs by then.
+        next = earliest(
+            next,
+            state.tabs.next_gate_fact_release().map(|left| {
+                if left.is_zero() {
+                    now + Self::TICK
+                } else {
+                    after_now(now + left)
+                }
+            }),
+        );
         // Every live page's typing cadence, each against its own document.
         for (view, page) in self.pages.live_views() {
             let paced = page
@@ -2655,13 +2667,17 @@ impl AgentPanelHandle {
         // prompt in this page -- it was about the tab the user is leaving to see this list. A fresh
         // one raised from inside the chooser (its own Shift+Tab) makes its own plan afterwards.
         self.drop_bypass_prompt_in(view);
-        if super::detail::remote_page(&self.state.borrow(), view) {
+        let remote = super::detail::remote_page(&self.state.borrow(), view);
+        if remote && !super::remote_sessions::offers_transcripts(&self.state.borrow()) {
             self.dispatch(
                 view,
                 eitri_core::agent_bridge::serialize_notice_for_js(super::detail::REMOTE_RESUME_UNAVAILABLE),
             );
             return;
         }
+        // A remote tab's list comes from its server on a worker: the chooser opens with what is known, and is sent
+        // again to this page when the list arrives (`remote_sessions::tick`).
+        let line = remote.then(|| super::remote_sessions::on_open(&mut self.state.borrow_mut(), view));
         let (payload, listed) = chooser_payload(&self.state.borrow(), view);
         {
             let mut state = self.state.borrow_mut();
@@ -2670,7 +2686,7 @@ impl AgentPanelHandle {
         }
         self.partner.borrow_mut().sessions.clear();
         #[cfg(target_os = "linux")]
-        let partner = self.partner.borrow().partner;
+        let partner = self.partner.borrow().partner.filter(|_| !remote);
         #[cfg(target_os = "linux")]
         if let Some(partner) = partner {
             let generation = self.partner.borrow().generation + 1;
@@ -2709,6 +2725,9 @@ impl AgentPanelHandle {
             return;
         }
         self.dispatch(view, payload);
+        if let Some(Some(line)) = line {
+            self.dispatch(view, eitri_core::agent_bridge::serialize_notice_for_js(&line));
+        }
     }
 
     /// `prefix i`: the detail popover of the tab `view`'s page shows.

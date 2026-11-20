@@ -17,14 +17,15 @@
 
 pub mod archive;
 pub mod composed_block;
-/// Turning either stored record into the projection a resumed conversation starts from.
-/// Crate-internal: the only caller is `AgentConversation::resume`, and a seed is not something a
-/// consumer of this crate builds for itself.
+/// Turning either stored record into the projection a resumed conversation starts from. Crate-internal except
+/// [`seed_from_tail`] and [`seed_from_stored`]: a conversation resumed on another machine is seeded by a consumer that
+/// holds the transcript's bytes (or none) and no local file.
 pub(crate) mod load;
 pub mod store;
 pub mod transcript_jsonl;
 
 pub use composed_block::strip_composed_block;
+pub use load::{seed_from_stored, seed_from_tail};
 pub use store::{HistoryLoadError, HistoryParts, StoredHistory, HISTORY_FORMAT_VERSION};
 pub use transcript_jsonl::{
     read_transcript_history, HistoryCounts, TranscriptHistory, HISTORY_MAX_CHARS, HISTORY_MAX_ITEMS,

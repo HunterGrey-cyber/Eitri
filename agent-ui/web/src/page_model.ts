@@ -455,7 +455,15 @@ function reduceEnvelope(model: PageModel, envelope: Envelope): PageModel {
     case "link_state":
       return { ...model, state: { ...model.state, linkState: envelope.linkState } };
     case "root_note": {
-      if (typeof envelope.text !== "string" || envelope.text === "") return model;
+      if (typeof envelope.text !== "string") return model;
+      // A tab's note told empty is taken down: the server said that tab's root is a boundary after all.
+      if (typeof envelope.tab === "number" && envelope.text === "") {
+        if (!model.tabRootNotes.has(envelope.tab)) return model;
+        const tabRootNotes = new Map(model.tabRootNotes);
+        tabRootNotes.delete(envelope.tab);
+        return { ...model, tabRootNotes };
+      }
+      if (envelope.text === "") return model;
       if (typeof envelope.tab !== "number") return { ...model, rootNote: envelope.text };
       // The window says whether this text was dismissed in some page: a tab moved here keeps its dismissal.
       const dismissed = envelope.dismissed === true;
@@ -678,6 +686,19 @@ function reduceEnvelope(model: PageModel, envelope: Envelope): PageModel {
         },
         renaming: null,
       };
+    case "chooser_update":
+      // Rows that arrived after the chooser was sent: a chooser the user closed meanwhile is not opened again, and
+      // an open one keeps the keys it has (no overlay is closed for it, unlike a `chooser`).
+      return model.chooser === null
+        ? model
+        : {
+            ...model,
+            chooser: {
+              open: envelope.open,
+              records: envelope.records,
+              ...(envelope.limit === undefined ? {} : { limit: envelope.limit }),
+            },
+          };
     case "chooser_titles":
       // Only the titles of the rows already drawn change: same rows, same order, so the cursor stays on its row,
       // and a chooser the user closed is not opened again.

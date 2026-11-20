@@ -123,6 +123,8 @@ pub(super) async fn run(paths: Paths, socket: PathBuf, pid: u32, session: Shared
                 let mut state = shared.lock().expect("session");
                 state.error = Some(status);
                 state.changed.send_modify(|_| {});
+                // Nothing about the session is followed any more: its fact streams end.
+                shared.facts.close();
                 Ok(())
             })
             .await;
@@ -212,10 +214,10 @@ async fn watch(
         }
         *delivered = true;
         let shared = session.clone();
-        let (closed, journal_failure, pending_write) = blocking(move || {
+        let (closed, journal_failure, pending_write, fact_job) = blocking(move || {
             let mut state = shared.lock().expect("session");
             if event.sequence <= state.journal.head() {
-                return Ok((state.closed, None, None));
+                return Ok((state.closed, None, None, None));
             }
             // Events skipped before this one may have started or ended a turn.
             let gap = event.sequence > state.journal.head() + 1;
@@ -226,19 +228,24 @@ async fn watch(
             let mut journal_failure = state.journal.append(event.sequence, &bytes).err();
             // Pending already holds the effect of every event up to its watermark; an older one is not applied again.
             // `None` here means no Pending write was tried, which neither starts nor ends a run of failures.
-            let pending_write = if event.sequence > state.pending.applied() {
-                match settle(&mut state.pending, &event, &bytes) {
+            // The path facts follow what Pending took, under the same lock; a new gate request's fact is computed by a
+            // task spawned below, never here, so no later event waits for it.
+            let (pending_write, fact_job) = if event.sequence > state.pending.applied() {
+                let written = match settle(&mut state.pending, &event, &bytes) {
                     Ok(written) => written.then_some(None),
                     Err(error) => Some(Some(error.to_string())),
-                }
+                };
+                (written, shared.facts.follow(&event, &state.pending))
             } else {
-                None
+                (None, None)
             };
             if matches!(event.event, Some(Event::TurnCompleted(_) | Event::SessionClosed(_))) {
                 journal_failure = journal_failure.or(state.journal.turn_ended().err());
             }
             if matches!(event.event, Some(Event::SessionClosed(_))) {
                 state.closed = true;
+                // Whatever Pending had already applied, a closed session holds no fact and its fact streams end.
+                shared.facts.close();
             }
             let head = state.journal.head();
             state.changed.send_replace(head);
@@ -246,9 +253,13 @@ async fn watch(
                 state.closed,
                 journal_failure.map(|error| error.to_string()),
                 pending_write,
+                fact_job,
             ))
         })
         .await?;
+        if let Some(job) = fact_job {
+            tokio::spawn(session.facts.clone().run(job));
+        }
         audit_failure(paths, &id, "journal-write", journal_failure, &mut failing.journal).await;
         if let Some(failure) = pending_write {
             audit_failure(paths, &id, "pending-write", failure, &mut failing.pending).await;

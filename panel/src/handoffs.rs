@@ -258,6 +258,7 @@ pub(super) fn panel_tab_handoff(state: &AgentPanelState, tab: TabId) -> Result<P
         // the tab is not carried, and the taking window asks again what it needs to.
         server: _,
         remote_prompts: _,
+        remote_sessions: _,
         // The stops this window keeps are its server's, sent by its own sender.
         remote_stops: _,
         // The sync with the window's server is the window's.

@@ -34,6 +34,10 @@ pub struct RecordingProvider {
     interrupt_capable: bool,
     /// Every `close_session` that reached the provider: what a backend's shutdown does.
     closes: AtomicUsize,
+    /// What `info` answers; the default until [`Self::set_info`].
+    info: std::sync::Mutex<ProviderInfo>,
+    /// While set, the next stop of its agent on a server waits for the sender of [`Self::hold_remote_stop`].
+    remote_stop_gate: std::sync::Mutex<Option<std::sync::mpsc::Receiver<()>>>,
     /// Advertises `cli_auto_mode`: its sessions run the CLI's own auto mode, and it accepts a
     /// deferral -- which, like the real provider, it refuses without this.
     cli_auto: bool,
@@ -101,11 +105,104 @@ pub struct RecordingProvider {
     /// While set, every send carrying images is recorded and refused with these words, as the sidecar
     /// refuses content (`TurnContentRefused`).
     refusing_content: std::sync::Mutex<Option<String>>,
+    /// The server's path facts it stands for, once [`Self::serve_facts`] was called: a remote tab's provider whose
+    /// helper serves facts this window uses.
+    facts: std::sync::Mutex<Option<FactsDouble>>,
+}
+
+/// What [`RecordingProvider`] says of the server's path facts, and what it was asked.
+#[derive(Default)]
+struct FactsDouble {
+    root: std::path::PathBuf,
+    states: std::collections::HashMap<String, agent::gate_facts::GateFactState>,
+    root_fact: Option<agent::gate_facts::RootFact>,
+    /// The digest each id's pending request has now, where a test set one; otherwise the digest its fact names.
+    digests: std::collections::HashMap<String, Option<[u8; 32]>>,
+    /// Every fresh check is answered at once with the request's own fact as both facts: a disk that did not change.
+    /// Otherwise every check is held until [`RecordingProvider::answer_fresh_checks`].
+    fresh_from_facts: bool,
+    checks: Vec<(String, [u8; 32])>,
+    held: Vec<Box<dyn FnOnce(agent::gate_facts::FreshFact) + Send>>,
 }
 
 type ClientReadReply = std::sync::mpsc::Sender<Result<agent::ClientToolCallState, agent::ProviderError>>;
 
 impl RecordingProvider {
+    /// Serves the server's path facts from now on, about the sidecar root `root`: every request's fact waits until
+    /// [`Self::set_fact`] says otherwise, and every fresh check is held until answered.
+    pub fn serve_facts(&self, root: &std::path::Path) {
+        *self.facts.lock().unwrap() = Some(FactsDouble {
+            root: root.to_path_buf(),
+            ..FactsDouble::default()
+        });
+    }
+
+    /// What the fact of the pending request `permission_id` is from now on.
+    pub fn set_fact(&self, permission_id: &str, state: agent::gate_facts::GateFactState) {
+        if let Some(facts) = self.facts.lock().unwrap().as_mut() {
+            facts.states.insert(permission_id.to_string(), state);
+        }
+    }
+
+    /// What the server says of the root from now on.
+    pub fn set_root_fact(&self, root_fact: Option<agent::gate_facts::RootFact>) {
+        if let Some(facts) = self.facts.lock().unwrap().as_mut() {
+            facts.root_fact = root_fact;
+        }
+    }
+
+    /// What digest the pending request `permission_id` has from now on (`None`: no request waits under the id), in
+    /// place of the one its fact names: the id now names another request, or none.
+    pub fn set_fact_digest(&self, permission_id: &str, digest: Option<[u8; 32]>) {
+        if let Some(facts) = self.facts.lock().unwrap().as_mut() {
+            facts.digests.insert(permission_id.to_string(), digest);
+        }
+    }
+
+    /// Answers every later fresh check at once with the request's fact as both the first and the fresh one (none
+    /// held: `Unavailable`).
+    pub fn answer_fresh_from_facts(&self) {
+        if let Some(facts) = self.facts.lock().unwrap().as_mut() {
+            facts.fresh_from_facts = true;
+        }
+    }
+
+    /// Answers every held fresh check with `answer`; how many there were.
+    pub fn answer_fresh_checks(&self, answer: agent::gate_facts::FreshFact) -> usize {
+        let held = self
+            .facts
+            .lock()
+            .unwrap()
+            .as_mut()
+            .map(|facts| std::mem::take(&mut facts.held))
+            .unwrap_or_default();
+        let count = held.len();
+        for done in held {
+            done(answer.clone());
+        }
+        count
+    }
+
+    /// The permission ids every fresh check named, in order.
+    pub fn fresh_checks(&self) -> Vec<String> {
+        self.facts
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|facts| facts.checks.iter().map(|(id, _)| id.clone()).collect())
+            .unwrap_or_default()
+    }
+
+    /// The digest every fresh check named, in order.
+    pub fn fresh_check_digests(&self) -> Vec<[u8; 32]> {
+        self.facts
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|facts| facts.checks.iter().map(|(_, digest)| *digest).collect())
+            .unwrap_or_default()
+    }
+
     /// What `link_state` reports from now on: a remote tab's link as it stands, or `None`.
     pub fn set_link(&self, link: Option<agent::RemoteLinkState>) {
         *self.link.lock().unwrap() = link;
@@ -114,6 +211,18 @@ impl RecordingProvider {
     /// What a remote tab's provider says from now on of how its session ended, and where its agent is.
     pub fn set_remote(&self, ending: Option<agent::RemoteEnding>, handoff: Option<agent::HelperHandoff>) {
         *self.remote.lock().unwrap() = (ending, handoff);
+    }
+
+    /// What `info` answers from now on: a conversation made after this reads it at its start.
+    pub fn set_info(&self, info: ProviderInfo) {
+        *self.info.lock().unwrap() = info;
+    }
+
+    /// Holds the next stop of its agent on a server until the returned sender sends or is dropped.
+    pub fn hold_remote_stop(&self) -> std::sync::mpsc::Sender<()> {
+        let (release, gate) = std::sync::mpsc::channel();
+        *self.remote_stop_gate.lock().unwrap() = Some(gate);
+        release
     }
 
     /// How many times its agent on a server was stopped.
@@ -440,6 +549,66 @@ impl agent::AgentProvider for RecordingProvider {
         self.link.lock().unwrap().clone()
     }
 
+    fn gate_fact(&self, permission_id: &str) -> agent::gate_facts::GateFactState {
+        match self.facts.lock().unwrap().as_ref() {
+            Some(facts) => facts
+                .states
+                .get(permission_id)
+                .cloned()
+                .unwrap_or(agent::gate_facts::GateFactState::Waiting),
+            None if self.link.lock().unwrap().is_some() => agent::gate_facts::GateFactState::NoCapability,
+            None => agent::gate_facts::GateFactState::NotRemote,
+        }
+    }
+
+    fn check_fact(
+        &self,
+        permission_id: &str,
+        digest: [u8; 32],
+        done: Box<dyn FnOnce(agent::gate_facts::FreshFact) + Send>,
+    ) {
+        // Answered after the lock is let go, as the provider answers: the callback may do anything but call back.
+        let answer = match self.facts.lock().unwrap().as_mut() {
+            None => None,
+            Some(facts) => {
+                facts.checks.push((permission_id.to_string(), digest));
+                let same = match facts.states.get(permission_id) {
+                    Some(agent::gate_facts::GateFactState::Have(have)) => agent::gate_facts::FreshFact::Both {
+                        first: have.fact.clone(),
+                        fresh: have.fact.clone(),
+                    },
+                    _ => agent::gate_facts::FreshFact::Unavailable,
+                };
+                if !facts.fresh_from_facts {
+                    facts.held.push(done);
+                    return;
+                }
+                Some(same)
+            }
+        };
+        done(answer.unwrap_or(agent::gate_facts::FreshFact::Unavailable));
+    }
+
+    fn gate_fact_digest(&self, permission_id: &str) -> Option<[u8; 32]> {
+        let facts = self.facts.lock().unwrap();
+        let facts = facts.as_ref()?;
+        match facts.digests.get(permission_id) {
+            Some(set) => *set,
+            None => match facts.states.get(permission_id)? {
+                agent::gate_facts::GateFactState::Have(have) => Some(have.request_digest),
+                _ => None,
+            },
+        }
+    }
+
+    fn gate_root_fact(&self) -> Option<agent::gate_facts::RootFact> {
+        self.facts.lock().unwrap().as_ref()?.root_fact
+    }
+
+    fn gate_facts_root(&self) -> Option<std::path::PathBuf> {
+        Some(self.facts.lock().unwrap().as_ref()?.root.clone())
+    }
+
     fn remote_ending(&self) -> Option<agent::RemoteEnding> {
         self.remote.lock().unwrap().0.clone()
     }
@@ -450,6 +619,10 @@ impl agent::AgentProvider for RecordingProvider {
 
     fn stop_remote_agent(&self) -> Option<std::io::Result<()>> {
         self.link.lock().unwrap().as_ref()?;
+        let gate = self.remote_stop_gate.lock().unwrap().take();
+        if let Some(gate) = gate {
+            let _ = gate.recv();
+        }
         if self.failing_remote_stops.load(Ordering::SeqCst) {
             return Some(Err(std::io::Error::other("the server cannot be reached")));
         }
@@ -571,7 +744,7 @@ impl agent::AgentProvider for RecordingProvider {
         self.steer_turn(request)
     }
     fn info(&self) -> ProviderInfo {
-        ProviderInfo::default()
+        self.info.lock().unwrap().clone()
     }
     fn create_session(&self, _request: agent::CreateSessionRequest) -> Result<String, agent::ProviderError> {
         Ok("fake-session".into())

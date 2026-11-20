@@ -10,10 +10,13 @@
 use crate::remote_answers::AnswerBound;
 use crate::runtime_thread::RuntimeThread;
 use crate::ssh::{ChannelLauncher, LinkCheck};
+use eitri_server_proto::gate_client::GateClient as GateService;
 use eitri_server_proto::helper_client::HelperClient as HelperService;
+use eitri_server_proto::transcripts_client::TranscriptsClient as TranscriptsService;
 use eitri_server_proto::{
-    HelloRequest, HelloResponse, ListSidecarsRequest, PendingPermission, PendingRequest, SidecarInfo,
-    StartSidecarRequest, StopSidecarRequest, TrustScanRequest, TrustScanResponse, PROTOCOL_MAJOR, PROTOCOL_MINOR,
+    CheckFactRequest, CheckFactResponse, GateFactEvent, HelloRequest, HelloResponse, ListSidecarsRequest,
+    PendingPermission, PendingRequest, SidecarInfo, StartSidecarRequest, StopSidecarRequest, TrustScanRequest,
+    TrustScanResponse, WatchFactsRequest, PROTOCOL_MAJOR, PROTOCOL_MINOR,
 };
 use std::ffi::OsString;
 use std::io;
@@ -111,6 +114,32 @@ pub use eitri_server_proto::{
     WaitFileHashRequest, WaitFileHashResponse, WatchModesRequest, WatchModesResponse, CAP_EXEC, CAP_GIT_CONFIG,
     CAP_INSTALLATION_ARGS, CAP_SYNC_FILES, CAP_SYNC_IGNORES, CAP_SYNC_MODES,
 };
+pub use eitri_server_proto::{
+    read_deny_settings_event, ListTranscriptsResponse, ReadDenySettingsEvent, ReadTranscriptRequest, SettingsRead,
+    SettingsScope, TranscriptChunk, TranscriptEntry, TranscriptScope, TranscriptStableResponse, CAP_TRANSCRIPTS,
+    SETTINGS_FILES_MAX, SETTINGS_FILE_MAX, SETTINGS_TOTAL_MAX, TRANSCRIPTS_LIST_MAX, TRANSCRIPT_CHUNK,
+    TRANSCRIPT_PATH_MAX, TRANSCRIPT_REFUSAL_MAX, TRANSCRIPT_TAIL_MAX, TRANSCRIPT_TITLE_MAX,
+};
+
+/// The largest transcript list this laptop decodes: every entry at its bound (a 36-byte id, a title of
+/// `TRANSCRIPT_TITLE_MAX` bytes and two numbers, with their tags) and the answer's paths and refusal, with room to
+/// spare. A list is one message, so the decoder, not the entry count checked after it, is what bounds what a server
+/// can make the laptop allocate for one.
+pub const TRANSCRIPT_LIST_MESSAGE_MAX: usize = eitri_server_proto::TRANSCRIPTS_LIST_MAX
+    * (eitri_server_proto::TRANSCRIPT_TITLE_MAX + 96)
+    + 3 * eitri_server_proto::TRANSCRIPT_PATH_MAX
+    + eitri_server_proto::TRANSCRIPT_REFUSAL_MAX
+    + 16 * 1024;
+
+/// The largest stability answer this laptop decodes: two paths, a refusal and two flags, with room to spare.
+pub const TRANSCRIPT_STABLE_MESSAGE_MAX: usize =
+    3 * eitri_server_proto::TRANSCRIPT_PATH_MAX + eitri_server_proto::TRANSCRIPT_REFUSAL_MAX + 4 * 1024;
+
+/// The `Transcripts` service, decoding no message past `limit`: a stream's chunk or file may be large, a unary answer
+/// gets the limit its own bounds need.
+fn transcripts_service(channel: Channel, limit: usize) -> TranscriptsService<Channel> {
+    TranscriptsService::new(channel).max_decoding_message_size(limit)
+}
 
 /// A checked START proved that an older installation was collected with no surviving agents.
 pub const MISSING_INSTALLATION: &str = "the owning helper installation is gone";
@@ -133,6 +162,14 @@ struct Inner {
     hello: Mutex<Option<HelloResponse>>,
     host: String,
     daemon: String,
+    /// The installation this window started on the host (the daemon its first connection named), shared by every
+    /// route to another installation: only a helper of this installation's own build serves facts this window
+    /// uses.
+    own_installation: Arc<Mutex<String>>,
+    /// Whether this route is the window's own connection (the daemon its first connection named), not a route to
+    /// another installation: only the window's own installation serves facts this window uses, and another
+    /// installation of the same build (another helper or manifest hash) is not it.
+    own_route: bool,
     routes: Routes,
     installations: Arc<Mutex<Option<Vec<String>>>>,
     state: Arc<RouteState>,
@@ -235,6 +272,8 @@ impl HelperClient {
                 hello: Mutex::new(None),
                 host: host.to_string(),
                 daemon: daemon.to_string(),
+                own_installation: Arc::new(Mutex::new(daemon.to_string())),
+                own_route: true,
                 routes: Default::default(),
                 installations: Default::default(),
                 state,
@@ -309,6 +348,8 @@ impl HelperClient {
                 hello: Mutex::new(None),
                 host: self.inner.host.clone(),
                 daemon: daemon.into(),
+                own_installation: Arc::clone(&self.inner.own_installation),
+                own_route: false,
                 routes: self.inner.routes.clone(),
                 installations: self.inner.installations.clone(),
                 state,
@@ -548,8 +589,35 @@ impl HelperClient {
         }
     }
 
+    /// Names the installation this window's own helper is, for a test whose helper runs from a build tree (keyed
+    /// by its version alone, with no build in its name).
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn with_own_installation(self, installation: &str) -> Self {
+        *self.inner.own_installation.lock().expect("own installation") = installation.to_owned();
+        self
+    }
+
+    /// The path facts of `sidecar_id`'s sessions, asked from tasks on the connection's runtime.
+    pub(crate) fn fact_asker(&self, sidecar_id: &str) -> FactAsker {
+        FactAsker {
+            channel: self.channel(),
+            sidecar_id: sidecar_id.to_string(),
+        }
+    }
+
+    /// Whether this window may use the path facts of the helper that answered `hello`: it serves them
+    /// (`gate-facts`), and it is this window's own installation, so its classifier is this build's. A helper of
+    /// another installation (one an older or newer window started) keeps a tab on the gate without facts.
+    pub fn serves_usable_facts(&self, hello: &HelloResponse) -> bool {
+        self.inner.own_route && facts_usable(&self.inner.own_installation.lock().expect("own installation"), hello)
+    }
+
     fn service(&self) -> HelperService<Channel> {
         HelperService::new(self.channel())
+    }
+
+    fn transcripts(&self, limit: usize) -> TranscriptsService<Channel> {
+        transcripts_service(self.channel(), limit)
     }
 
     fn call<T, F>(&self, limit: Duration, future: F) -> Result<T, Status>
@@ -797,6 +865,13 @@ impl HelperClient {
         };
         self.call(TRUST_SCAN_TIMEOUT, async move { service.trust_scan(request).await })
     }
+    /// The capabilities from the last checked Hello, or `None` before there was one. Never calls the server, so a
+    /// window's own thread may ask it.
+    pub fn cached_capabilities(&self) -> Option<Vec<String>> {
+        let cached = self.inner.hello.lock().expect("helper hello").clone();
+        cached.map(|hello| hello.capabilities)
+    }
+
     /// The capabilities from the last checked Hello, obtaining it once if the caller has not asked yet.
     pub fn hello_capabilities(&self) -> Result<Vec<String>, Status> {
         let cached = self.inner.hello.lock().expect("helper hello").clone();
@@ -896,6 +971,68 @@ impl HelperClient {
         self.call(HELPER_RPC_TIMEOUT, async move { service.watch_modes(request).await })
     }
 
+    /// The server's session transcripts for a root and account. What comes back is the server's word: the caller
+    /// bounds every field before use.
+    pub fn list_transcripts(&self, scope: TranscriptScope) -> Result<ListTranscriptsResponse, Status> {
+        self.require_pin()?;
+        let mut service = self.transcripts(TRANSCRIPT_LIST_MESSAGE_MAX);
+        self.call(HELPER_RPC_TIMEOUT, async move { service.list_transcripts(scope).await })
+    }
+
+    /// The last bytes of one transcript as a stream of chunks, which the caller collects within bounds.
+    pub fn read_transcript_tail(
+        &self,
+        request: ReadTranscriptRequest,
+    ) -> Result<tonic::Streaming<TranscriptChunk>, Status> {
+        self.require_pin()?;
+        let mut service = self.transcripts(eitri_server_proto::TRANSCRIPT_MESSAGE_MAX);
+        self.call(HELPER_RPC_TIMEOUT, async move {
+            service.read_transcript_tail(request).await
+        })
+    }
+
+    /// The server's stability probe of one transcript (a quarter of a second on the server).
+    pub fn transcript_stable(&self, request: ReadTranscriptRequest) -> Result<TranscriptStableResponse, Status> {
+        self.require_pin()?;
+        let mut service = self.transcripts(TRANSCRIPT_STABLE_MESSAGE_MAX);
+        self.call(
+            HELPER_RPC_TIMEOUT,
+            async move { service.transcript_stable(request).await },
+        )
+    }
+
+    /// The server's CLI settings files for a root, as a stream the caller collects within bounds and checks for
+    /// completeness: a scope that says how many files follow, then those files, or a refusal.
+    pub fn read_deny_settings(
+        &self,
+        scope: TranscriptScope,
+    ) -> Result<tonic::Streaming<ReadDenySettingsEvent>, Status> {
+        self.require_pin()?;
+        let mut service = self.transcripts(eitri_server_proto::TRANSCRIPT_MESSAGE_MAX);
+        self.call(
+            HELPER_RPC_TIMEOUT,
+            async move { service.read_deny_settings(scope).await },
+        )
+    }
+
+    /// The whole tail of one transcript, refused past [`AnswerBound::transcript_tail`]: the bound's own line, or the
+    /// call's failure in words. Whether the chunks are complete and whole is the caller's check.
+    pub fn collect_transcript_tail(&self, request: ReadTranscriptRequest) -> Result<Vec<TranscriptChunk>, String> {
+        let bound = AnswerBound::transcript_tail();
+        let stream = self.read_transcript_tail(request).map_err(|error| error.to_string())?;
+        self.collect_sync_stream(stream, bound)
+            .map_err(|error| refusal_text(&bound, error))
+    }
+
+    /// Every event of the settings stream, refused past [`AnswerBound::settings_stream`]. Whether the files are all
+    /// there and each within its bound is the caller's check.
+    pub fn collect_read_deny_settings(&self, scope: TranscriptScope) -> Result<Vec<ReadDenySettingsEvent>, String> {
+        let bound = AnswerBound::settings_stream();
+        let stream = self.read_deny_settings(scope).map_err(|error| error.to_string())?;
+        self.collect_sync_stream(stream, bound)
+            .map_err(|error| refusal_text(&bound, error))
+    }
+
     pub fn exec(
         &self,
         input: impl tonic::codegen::tokio_stream::Stream<Item = ExecInput> + Send + 'static,
@@ -946,6 +1083,75 @@ impl HelperClient {
         self.call(timeout, async move {
             collect_sync_items(stream, bound).await.map(tonic::Response::new)
         })
+    }
+}
+
+#[cfg(any(test, feature = "test-support"))]
+impl HelperClient {
+    /// A connection pinned to `pinned_host_key` whose helper is `service` alone, in this process, over a socket pair:
+    /// no child and no ssh. Its Hello says `capabilities` and nothing else; it opens no second channel.
+    pub fn serving_transcripts_for_test<S>(
+        host: &str,
+        pinned_host_key: &str,
+        capabilities: &[&str],
+        service: S,
+    ) -> HelperClient
+    where
+        S: eitri_server_proto::transcripts_server::Transcripts,
+    {
+        struct NoChild;
+        impl ChannelLauncher for NoChild {
+            fn spawn(&self, _: &[OsString]) -> io::Result<Child> {
+                Err(io::Error::other("a test connection opens no channel"))
+            }
+        }
+        let runtime = Arc::new(RuntimeThread::spawn());
+        let channel = runtime
+            .block_on(
+                async move {
+                    let (near, far) = tokio::net::UnixStream::pair()?;
+                    tokio::spawn(
+                        tonic::transport::Server::builder()
+                            .add_service(eitri_server_proto::transcripts_server::TranscriptsServer::new(service))
+                            .serve_with_incoming(tonic::codegen::tokio_stream::iter([Ok::<_, io::Error>(far)])),
+                    );
+                    let near = Mutex::new(Some(near));
+                    Endpoint::from_static("http://localhost")
+                        .connect_with_connector(tower::service_fn(move |_: Uri| {
+                            let near = near.lock().expect("test stream").take();
+                            async move {
+                                near.map(hyper_util::rt::TokioIo::new)
+                                    .ok_or_else(|| io::Error::other("only one channel is allowed"))
+                            }
+                        }))
+                        .await
+                        .map_err(io::Error::other)
+                },
+                HELPER_RPC_TIMEOUT,
+            )
+            .expect("the test channel opens in time")
+            .expect("the test channel opens");
+        HelperClient {
+            inner: Arc::new(Inner {
+                hello: Mutex::new(Some(HelloResponse {
+                    capabilities: capabilities.iter().map(|name| name.to_string()).collect(),
+                    ..Default::default()
+                })),
+                host: host.to_string(),
+                daemon: String::new(),
+                own_installation: Arc::new(Mutex::new(String::new())),
+                own_route: true,
+                routes: Default::default(),
+                installations: Default::default(),
+                state: Default::default(),
+                runtime,
+                channel,
+                launcher: Arc::new(NoChild),
+                stderr: Default::default(),
+                refused: Default::default(),
+                pinned: Some(pinned_host_key.to_string()),
+            }),
+        }
     }
 }
 
@@ -1132,6 +1338,85 @@ impl PendingAsker {
             Ok(answer) => answer.map(|response| response.into_inner().requests),
             Err(_) => Err(Status::deadline_exceeded(
                 "the helper did not say what is waiting in time",
+            )),
+        }
+    }
+}
+
+/// Whether the helper that answered `hello` serves facts a window whose own installation is `own` uses: it lists
+/// `gate-facts` and is that installation's build (`<version>-<first seven of its build>`, which the installation's
+/// name begins with: [`installation_build`]).
+fn facts_usable(own: &str, hello: &HelloResponse) -> bool {
+    let rev7: String = hello.helper_build.chars().take(7).collect();
+    hello
+        .capabilities
+        .iter()
+        .any(|cap| cap == eitri_server_proto::CAP_GATE_FACTS)
+        && !own.is_empty()
+        && rev7.len() == 7
+        && installation_build(own) == format!("{}-{rev7}", hello.helper_version)
+}
+
+/// The `<version>-<rev7>` an installation's name begins with. The installer names an installation
+/// `<version>-<rev7>-<16 hex of the helper>-<16 hex of the manifest>`, and Hello names only the version and build, so
+/// those two hashes are left off; any other name (the bare `<version>-<rev7>` a helper run from no installation is
+/// keyed by) is the whole name.
+fn installation_build(own: &str) -> &str {
+    let is_hash = |part: &str| part.len() == 16 && part.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'));
+    let mut parts = own.rsplitn(3, '-');
+    match (parts.next(), parts.next(), parts.next()) {
+        (Some(manifest), Some(helper), Some(build)) if is_hash(manifest) && is_hash(helper) => build,
+        _ => own,
+    }
+}
+
+/// The `Gate` service on a helper connection, decoding no message past [`crate::gate_facts::GATE_MESSAGE_MAX`].
+fn gate_service(channel: Channel) -> GateService<Channel> {
+    GateService::new(channel).max_decoding_message_size(crate::gate_facts::GATE_MESSAGE_MAX)
+}
+
+/// Asks a helper for the path facts of one sidecar's sessions, from tasks on the connection's runtime.
+#[derive(Clone)]
+pub(crate) struct FactAsker {
+    channel: Channel,
+    sidecar_id: String,
+}
+
+impl FactAsker {
+    /// Opens `session_id`'s fact stream; bounded like the quick calls until it opens.
+    pub(crate) async fn watch(&self, session_id: &str) -> Result<tonic::Streaming<GateFactEvent>, Status> {
+        let request = WatchFactsRequest {
+            sidecar_id: self.sidecar_id.clone(),
+            session_id: session_id.to_string(),
+        };
+        let mut service = gate_service(self.channel.clone());
+        match tokio::time::timeout(HELPER_RPC_TIMEOUT, service.watch_facts(request)).await {
+            Ok(opened) => opened.map(tonic::Response::into_inner),
+            Err(_) => Err(Status::deadline_exceeded(
+                "the helper did not open the fact stream in time",
+            )),
+        }
+    }
+
+    /// The fresh check of the request `permission_id` names by `digest`, within `wait`.
+    pub(crate) async fn check(
+        &self,
+        session_id: &str,
+        permission_id: &str,
+        digest: [u8; 32],
+        wait: Duration,
+    ) -> Result<CheckFactResponse, Status> {
+        let request = CheckFactRequest {
+            sidecar_id: self.sidecar_id.clone(),
+            session_id: session_id.to_string(),
+            permission_id: permission_id.to_string(),
+            request_digest: digest.to_vec(),
+        };
+        let mut service = gate_service(self.channel.clone());
+        match tokio::time::timeout(wait, service.check_fact(request)).await {
+            Ok(answer) => answer.map(tonic::Response::into_inner),
+            Err(_) => Err(Status::deadline_exceeded(
+                "the helper did not answer the fresh check in time",
             )),
         }
     }
@@ -1785,6 +2070,64 @@ impl Drop for ChildPipe {
 mod tests {
     use super::*;
 
+    #[test]
+    fn facts_are_used_only_from_this_windows_own_installation() {
+        let hello = |capabilities: &[&str], version: &str, build: &str| HelloResponse {
+            capabilities: capabilities.iter().map(|cap| cap.to_string()).collect(),
+            helper_version: version.into(),
+            helper_build: build.into(),
+            ..Default::default()
+        };
+        let facts = eitri_server_proto::CAP_GATE_FACTS;
+        assert!(facts_usable(
+            "0.4.0-abcdef1",
+            &hello(&[facts], "0.4.0", "abcdef1234567890")
+        ));
+        assert!(!facts_usable("0.4.0-abcdef1", &hello(&[], "0.4.0", "abcdef1234567890")));
+        assert!(!facts_usable(
+            "0.4.0-abcdef1",
+            &hello(&[facts], "0.3.9", "abcdef1234567890")
+        ));
+        assert!(!facts_usable(
+            "0.4.0-abcdef1",
+            &hello(&[facts], "0.4.0", "1234567abcdef")
+        ));
+        assert!(!facts_usable("0.4.0-abc", &hello(&[facts], "0.4.0", "abc")));
+        assert!(!facts_usable("", &hello(&[facts], "", "")));
+    }
+
+    #[test]
+    fn an_installed_helper_is_judged_by_the_version_and_build_its_name_begins_with() {
+        let hello = |version: &str, build: &str| HelloResponse {
+            capabilities: vec![eitri_server_proto::CAP_GATE_FACTS.to_string()],
+            helper_version: version.into(),
+            helper_build: build.into(),
+            ..Default::default()
+        };
+        // The installer's name: `<version>-<rev7>-<16 hex of the helper>-<16 hex of the manifest>`.
+        let installed = "0.4.0-abcdef1-653bb4b2567cfb4b-f7537a30eacfc29e";
+        assert!(facts_usable(installed, &hello("0.4.0", "abcdef1234567890")));
+        assert!(!facts_usable(installed, &hello("0.4.0", "1234567abcdef")));
+        assert!(!facts_usable(installed, &hello("0.3.9", "abcdef1234567890")));
+        assert!(facts_usable(
+            "0.4.0-rc1-abcdef1-653bb4b2567cfb4b-f7537a30eacfc29e",
+            &hello("0.4.0-rc1", "abcdef1")
+        ));
+        // Anything else is compared whole: one hash, a hash that is not 16 lowercase hex digits.
+        assert!(!facts_usable(
+            "0.4.0-abcdef1-653bb4b2567cfb4b",
+            &hello("0.4.0", "abcdef1")
+        ));
+        assert!(!facts_usable(
+            "0.4.0-abcdef1-653BB4B2567CFB4B-f7537a30eacfc29e",
+            &hello("0.4.0", "abcdef1")
+        ));
+        assert!(!facts_usable(
+            "0.4.0-abcdef1-653bb4b2567cfb4-f7537a30eacfc29e",
+            &hello("0.4.0", "abcdef1")
+        ));
+    }
+
     #[tokio::test]
     async fn remote_client_sync_streams_enforce_bounds_and_preserve_errors() {
         use eitri_server_proto::ReadFileChunk;
@@ -1861,6 +2204,110 @@ mod tests {
             &last[last.len() - 60..]
         );
         assert!(endless.line.is_empty());
+    }
+
+    /// A `Transcripts` service that answers `ReadDenySettings` with one settings file of `bytes` bytes.
+    struct OneSettingsFile {
+        bytes: usize,
+    }
+
+    type Items<T> = std::pin::Pin<Box<dyn tonic::codegen::tokio_stream::Stream<Item = Result<T, Status>> + Send>>;
+
+    #[tonic::async_trait]
+    impl eitri_server_proto::transcripts_server::Transcripts for OneSettingsFile {
+        async fn list_transcripts(
+            &self,
+            _: tonic::Request<TranscriptScope>,
+        ) -> Result<tonic::Response<ListTranscriptsResponse>, Status> {
+            Err(Status::unimplemented("not under test"))
+        }
+
+        type ReadTranscriptTailStream = Items<TranscriptChunk>;
+        async fn read_transcript_tail(
+            &self,
+            _: tonic::Request<ReadTranscriptRequest>,
+        ) -> Result<tonic::Response<Self::ReadTranscriptTailStream>, Status> {
+            Err(Status::unimplemented("not under test"))
+        }
+
+        async fn transcript_stable(
+            &self,
+            _: tonic::Request<ReadTranscriptRequest>,
+        ) -> Result<tonic::Response<TranscriptStableResponse>, Status> {
+            Err(Status::unimplemented("not under test"))
+        }
+
+        type ReadDenySettingsStream = Items<ReadDenySettingsEvent>;
+        async fn read_deny_settings(
+            &self,
+            _: tonic::Request<TranscriptScope>,
+        ) -> Result<tonic::Response<Self::ReadDenySettingsStream>, Status> {
+            let file = SettingsRead {
+                path: "/srv/project/.claude/settings.json".into(),
+                strict: true,
+                bytes: vec![b' '; self.bytes],
+                ..Default::default()
+            };
+            let event = ReadDenySettingsEvent {
+                event: Some(read_deny_settings_event::Event::File(file)),
+            };
+            Ok(tonic::Response::new(Box::pin(tonic::codegen::tokio_stream::iter([
+                Ok(event),
+            ]))))
+        }
+    }
+
+    /// A settings file at its bound is a valid answer, and its message is over the 4 MiB a tonic client decodes by
+    /// default: the helper's client takes it, a client left at the default does not.
+    #[tokio::test]
+    async fn remote_client_transcripts_decode_a_settings_file_at_its_bound() {
+        use eitri_server_proto::SETTINGS_FILE_MAX;
+        let (wire, peer) = tokio::io::duplex(64 * 1024);
+        tokio::spawn(async move {
+            tonic::transport::Server::builder()
+                .add_service(eitri_server_proto::transcripts_server::TranscriptsServer::new(
+                    OneSettingsFile {
+                        bytes: SETTINGS_FILE_MAX as usize,
+                    },
+                ))
+                .serve_with_incoming(tonic::codegen::tokio_stream::iter([Ok::<_, io::Error>(peer)]))
+                .await
+                .unwrap();
+        });
+        let wire = Arc::new(Mutex::new(Some(wire)));
+        let channel = Endpoint::from_static("http://localhost")
+            .connect_with_connector(tower::service_fn(move |_| {
+                let wire = wire.lock().unwrap().take();
+                async move {
+                    wire.map(hyper_util::rt::TokioIo::new)
+                        .ok_or_else(|| io::Error::other("only one channel is allowed"))
+                }
+            }))
+            .await
+            .unwrap();
+
+        let mut default = TranscriptsService::new(channel.clone());
+        let mut stream = default
+            .read_deny_settings(TranscriptScope::default())
+            .await
+            .unwrap()
+            .into_inner();
+        let refused = stream.message().await.unwrap_err();
+        assert_eq!(refused.code(), tonic::Code::OutOfRange, "{refused:?}");
+
+        let mut stream = transcripts_service(channel, eitri_server_proto::TRANSCRIPT_MESSAGE_MAX)
+            .read_deny_settings(TranscriptScope::default())
+            .await
+            .unwrap()
+            .into_inner();
+        let Some(ReadDenySettingsEvent {
+            event: Some(read_deny_settings_event::Event::File(file)),
+        }) = stream.message().await.unwrap()
+        else {
+            panic!("a file event");
+        };
+        assert_eq!(file.bytes.len() as u64, SETTINGS_FILE_MAX);
+        assert!(stream.message().await.unwrap().is_none());
     }
 
     #[test]
@@ -1963,6 +2410,37 @@ mod tests {
         assert!(failed.contains("Permission denied (publickey)."), "{failed}");
     }
 
+    /// A route to another installation serves no facts this window uses, even one of the window's own version and
+    /// build (another helper or manifest hash: a build of the same revision with other changes in it); the window's
+    /// own connection, and a route back to its own daemon, do.
+    #[test]
+    fn only_the_windows_own_route_serves_usable_facts() {
+        struct Never;
+        impl ChannelLauncher for Never {
+            fn spawn(&self, _: &[OsString]) -> io::Result<Child> {
+                Err(io::Error::other("no channel in this test"))
+            }
+        }
+        let own = "0.4.0-abcdef1-653bb4b2567cfb4b-f7537a30eacfc29e";
+        let client = lazy_test_client(Arc::new(Never)).with_own_installation(own);
+        let hello = HelloResponse {
+            capabilities: vec![eitri_server_proto::CAP_GATE_FACTS.to_string()],
+            helper_version: "0.4.0".into(),
+            helper_build: "abcdef1234567890".into(),
+            ..Default::default()
+        };
+        assert!(client.serves_usable_facts(&hello));
+        assert!(client.for_daemon("").unwrap().serves_usable_facts(&hello));
+        assert!(client
+            .for_daemon("current-installation")
+            .unwrap()
+            .serves_usable_facts(&hello));
+        let same_build = client
+            .for_daemon("0.4.0-abcdef1-0000000000000000-1111111111111111")
+            .unwrap();
+        assert!(!same_build.serves_usable_facts(&hello));
+    }
+
     fn lazy_test_client(launcher: Arc<dyn ChannelLauncher>) -> HelperClient {
         let runtime = Arc::new(RuntimeThread::spawn());
         let channel = {
@@ -1974,6 +2452,8 @@ mod tests {
                 hello: Mutex::new(None),
                 host: "example-host".into(),
                 daemon: "current-installation".into(),
+                own_installation: Arc::new(Mutex::new("current-installation".into())),
+                own_route: true,
                 routes: Default::default(),
                 installations: Default::default(),
                 state: Default::default(),

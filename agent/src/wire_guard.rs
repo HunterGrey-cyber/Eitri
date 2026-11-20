@@ -1301,6 +1301,21 @@ pub(super) fn production_code(root: &Path) -> BTreeMap<String, String> {
 /// when there is no such function or more than one, so an exemption cannot outlive its function
 /// or cover a second one.
 pub(super) fn without_fn_body(code: &str, name: &str) -> Result<String, String> {
+    let (c, open, close) = fn_body_span(code, name)?;
+    let before: String = c[..open].iter().collect();
+    let after: String = c[close + 1..].iter().collect();
+    Ok(format!("{before}{{}}{after}"))
+}
+
+/// The body of the one `fn <name>` in `code` (as [`production_code`] gives it), its braces included. An error when
+/// there is no such function or more than one, so a scan of one function cannot read another.
+pub(super) fn fn_body(code: &str, name: &str) -> Result<String, String> {
+    let (c, open, close) = fn_body_span(code, name)?;
+    Ok(c[open..=close].iter().collect())
+}
+
+/// `code` as chars, and the char offsets of the opening and closing brace of the one `fn <name>`'s body.
+fn fn_body_span(code: &str, name: &str) -> Result<(Vec<char>, usize, usize), String> {
     let needle = format!("fn {name}(");
     let starts: Vec<usize> = code.match_indices(&needle).map(|(at, _)| at).collect();
     let [start] = starts[..] else {
@@ -1314,9 +1329,7 @@ pub(super) fn without_fn_body(code: &str, name: &str) -> Result<String, String> 
     // `matching_close` counts in chars; the byte offsets above are turned into char offsets first.
     let open_char = code[..open].chars().count();
     let close_char = matching_close(&c, open_char).ok_or_else(|| format!("`{needle}`'s body is not closed"))?;
-    let before: String = c[..open_char].iter().collect();
-    let after: String = c[close_char + 1..].iter().collect();
-    Ok(format!("{before}{{}}{after}"))
+    Ok((c, open_char, close_char))
 }
 
 /// Scans a tree of sources keyed by their path relative to `src/` (`/`-separated).
@@ -1402,7 +1415,7 @@ const READ_ONLY_OTHER_FIELD_METHODS: &[&str] = &[
 
 /// `code` with every string, raw string and char literal turned into spaces, byte for byte: a position in one
 /// is the same position in the other, and no literal's text can look like a keyword.
-fn blank_literals(code: &str) -> String {
+pub(super) fn blank_literals(code: &str) -> String {
     let c: Vec<char> = code.chars().collect();
     let mut out = String::with_capacity(code.len());
     let mut i = 0;
@@ -1430,7 +1443,7 @@ fn ends_with_word(text: &str, word: &str) -> bool {
 /// The keyword must start an item -- at the start, or after `;`, `{`, `}`, an attribute's `]`, `pub` or
 /// `pub(..)` -- and be followed by nothing but a path tree. So a `use` in an expression, a raw identifier
 /// `r#use` or a literal's text is no import.
-fn use_item_spans(blank: &str) -> Vec<std::ops::Range<usize>> {
+pub(super) fn use_item_spans(blank: &str) -> Vec<std::ops::Range<usize>> {
     whole_word_positions(blank, "use")
         .into_iter()
         .filter_map(|at| {
@@ -2228,6 +2241,51 @@ fn wire_guard_covers_the_helper_and_the_transport() {
         BTreeSet::from(["server/src/journal/regressions.rs", "server/src/serve/fake_sidecar.rs"]),
         "the forwarding scan's test-only files changed"
     );
+}
+
+/// The helper's gate path facts compute what the disk says and decide nothing: both scans read their files as
+/// production code, with no exception, and find nothing in them.
+#[test]
+fn the_server_gate_files_build_no_decision() {
+    const GATE_FILES: [&str; 3] = ["gate/mod.rs", "gate/surroundings.rs", "serve/gate.rs"];
+    let helper = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap()
+        .join("server/src");
+    let tree = read_tree(&helper);
+    let report = scan_tree(&tree);
+    for file in GATE_FILES {
+        assert!(report.scanned.contains(file), "server/src/{file} was not scanned");
+        assert!(!report.skipped.contains(file), "server/src/{file} was skipped");
+        assert!(
+            !report.offenders.iter().any(|offender| offender.contains(file)),
+            "{}",
+            report.offenders.join("\n")
+        );
+    }
+    // The forwarding scan with every tree it reads names from, as the whole-tree test runs it.
+    let workspace = helper.parent().unwrap().parent().unwrap();
+    let mut files = BTreeMap::new();
+    for dir in FORWARDING_ALIAS_TREES {
+        for (rel, source) in read_tree(&workspace.join(dir)) {
+            files.insert(format!("{dir}/{rel}"), source);
+        }
+    }
+    let (offenders, skipped) = scan_remote_decisions_and_skips(&files);
+    for file in GATE_FILES {
+        let rel = format!("server/src/{file}");
+        assert!(files.contains_key(&rel), "{rel} is missing");
+        assert!(!skipped.contains(&rel), "{rel} was skipped by the forwarding scan");
+        assert!(
+            !offenders.iter().any(|offender| offender.contains(&rel)),
+            "{}",
+            offenders.join("\n")
+        );
+        assert!(
+            !REMOTE_DECISION_SITES.iter().any(|(site, _)| *site == rel),
+            "{rel} has a decision-site exception"
+        );
+    }
 }
 
 #[test]

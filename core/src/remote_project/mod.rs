@@ -2,9 +2,11 @@
 
 mod connection;
 mod origin;
+pub mod resume;
 pub mod terminal_facts;
 pub mod terminal_link;
 pub mod terminals;
+pub mod transcripts;
 
 pub use connection::{verified_host_key, RemoteConnection, TerminalMaster, TerminalRoute};
 pub use origin::{

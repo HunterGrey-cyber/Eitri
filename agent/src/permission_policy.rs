@@ -174,14 +174,47 @@ use std::path::{Path, PathBuf};
 
 mod eitri_places;
 pub use eitri_places::{
-    eitri_places_card, EitriPlaceInputs, EitriPlaces, REASON_EITRI_OWN_PLACES, REASON_EITRI_PLACE_UNKNOWN,
+    eitri_places_card, EitriPlaceInputs, EitriPlaces, PLACE_VARIABLES, REASON_EITRI_OWN_PLACES,
+    REASON_EITRI_PLACE_UNKNOWN,
+};
+mod server_fact;
+pub use server_fact::{
+    classify_with_fact, gate_fact, known_reason, request_digest, rule_that_allows_with_fact, FactSurroundings,
+    GateFact, REASON_SERVER_FACT_CHANGED, REASON_SERVER_FACT_IMPOSSIBLE, REASON_SERVER_FACT_MISSING,
+    REASON_SERVER_FACT_UNKNOWN,
 };
 
-/// The filesystem facts available to the gate. A remote root supplies no laptop facts.
+/// A permission request's input as the gate judges it: the event's `input_json` read as JSON or, when it is not JSON,
+/// the raw text as a JSON string, a value that is not an object and so is never allowed. A request is never dropped
+/// for a malformed input, so the turn cannot hang on a call nobody was asked about. `unreadable` is told why the text
+/// was not JSON. The laptop's translator and the server's path facts both read requests through this, so the two
+/// judge the same value.
+pub fn request_input(input_json: &str, unreadable: impl FnOnce(&serde_json::Error)) -> Value {
+    serde_json::from_str(input_json).unwrap_or_else(|error| {
+        unreadable(&error);
+        Value::String(input_json.to_owned())
+    })
+}
+
+/// Whether a permission request with this `origin` is one the gate raised and judges: HOOK, or UNSPECIFIED (what a
+/// sidecar older than the field sends, read as HOOK). Any other value, the CLI's own prompt or one this build does
+/// not know, is the CLI's prompt, which the gate never judges by path. The laptop's translator and the server's path
+/// facts both ask this, so they agree on which requests have a fact.
+pub fn is_gate_request(origin: i32) -> bool {
+    use claude_runtime_protocol::v1::PermissionOrigin;
+    matches!(
+        PermissionOrigin::try_from(origin),
+        Ok(PermissionOrigin::Unspecified | PermissionOrigin::Hook)
+    )
+}
+
+/// The filesystem facts available to the gate. A remote root supplies no laptop facts: its tab either has none
+/// at all, or reads the server's fact for each request (`crate::gate_facts`), looked up per request by the caller.
 #[derive(Debug, Clone, Copy)]
 pub enum GateRoot<'a> {
     Local(&'a Path),
     RemoteWithoutFacts,
+    RemoteWithFacts,
 }
 
 /// What to do with one tool call that reached the gate.
@@ -222,6 +255,109 @@ fn ask(reason: &'static str) -> Classification {
         reason,
     }
 }
+
+/// Every reason this policy gives, each a named constant: the classifier's own, the places' check's, the project
+/// boundary's, and the two the policy adds on top (a saved rule's allow, Manual's edit card). A reason received as
+/// text from a classifier that ran elsewhere is mapped back onto one of these ([`known_reason`]), so
+/// [`Classification::reason`] stays one of this build's fixed labels. No reason is written as a literal at its
+/// `ask`/`allow`, so a new one cannot be missed here.
+pub const ALL_REASONS: &[&str] = &[
+    // The decisions by name, and `Glob`'s pattern.
+    REASON_INPUT_NOT_AN_OBJECT,
+    REASON_TOOL_CHANGES_NOTHING,
+    REASON_CLI_ALWAYS_ASKS,
+    REASON_TOOL_NOT_IN_THE_TABLE,
+    REASON_GLOB_PATTERN_REACHES_OUT,
+    REASON_GLOB_HAS_NO_PATTERN,
+    // The project boundary.
+    crate::project_boundary::REASON_ROOT_UNRESOLVABLE,
+    crate::project_boundary::REASON_ROOT_IS_THE_FILESYSTEM_ROOT,
+    crate::project_boundary::REASON_ROOT_IN_A_KERNEL_TREE,
+    crate::project_boundary::REASON_ROOT_NO_LONGER_ITSELF,
+    crate::project_boundary::REASON_ROOT_IS_HOME_OR_ABOVE,
+    crate::project_boundary::REASON_ROOT_NOT_YOURS,
+    crate::project_boundary::REASON_ROOT_OTHERS_CAN_WRITE,
+    // The path checks.
+    REASON_NO_PATH_READS_THE_ROOT,
+    REASON_PATH_FIELD_MISSING,
+    REASON_PATH_FIELD_NOT_A_STRING,
+    REASON_PATH_FIELD_EMPTY,
+    REASON_PATH_NOT_RESOLVED,
+    REASON_LINKS_PAST_LIMITS,
+    REASON_PATH_RESOLVES_INSIDE,
+    REASON_PATH_RESOLVES_OUTSIDE,
+    REASON_SEARCH_PATH_RESPELLED,
+    REASON_THROUGH_A_KERNEL_TREE,
+    REASON_LINK_LEAVES_THE_ROOT,
+    // The edit tools.
+    REASON_EDIT_PATH_RAW_SHAPE,
+    REASON_EDIT_PATH_WRITTEN_OUTSIDE,
+    REASON_EDIT_REQUESTED_PATH_PROTECTED,
+    REASON_EDIT_TARGET_HARD_LINKED,
+    REASON_EDIT_TARGET_PROTECTED,
+    REASON_EDIT_TARGET_UNEXAMINABLE,
+    REASON_ACCEPT_EDITS_WRITES_HERE,
+    // `Bash`.
+    REASON_BASH_INPUT_BEYOND_THE_COMMAND,
+    REASON_BASH_HAS_NO_COMMAND,
+    REASON_COMMAND_TOO_LONG,
+    REASON_COMMAND_SHELL_SYNTAX,
+    REASON_COMMAND_ODD_BLANK,
+    REASON_COMMAND_EMPTY,
+    REASON_ARGUMENT_REACHES_OUT_BY_PATH,
+    REASON_ARGUMENT_GLUES_A_VALUE,
+    REASON_ARGUMENT_GLUES_A_PATH,
+    REASON_ARGUMENT_RESOLVES_OUTSIDE,
+    REASON_COMMAND_FOLLOWS_LINKS,
+    REASON_FIND_ACTION_WRITES_OR_RUNS,
+    REASON_OPTION_NOT_KNOWN_TO_ONLY_READ,
+    REASON_DIFF_OF_A_DIRECTORY,
+    REASON_CD_MOVES_THE_CWD,
+    REASON_READ_ONLY_COMMAND,
+    REASON_NOT_ON_READ_ONLY_LIST,
+    // `git`: its arguments, then the repository it would use.
+    REASON_GIT_OPTION_WRITES,
+    REASON_READ_ONLY_GIT_SUBCOMMAND,
+    REASON_GIT_GLOBAL_OPTION,
+    REASON_GIT_SUBCOMMAND_NOT_READ_ONLY,
+    REASON_GIT_LOCATION_FROM_ENVIRONMENT,
+    REASON_GIT_REPOSITORY_ABOVE_ROOT,
+    REASON_ROOT_IS_A_GIT_DIRECTORY,
+    REASON_DOT_GIT_NOT_A_REPOSITORY,
+    REASON_GIT_CONFIG_RUNS_A_PROGRAM,
+    REASON_GIT_CONFIG_UNKNOWN_KEY,
+    REASON_GIT_URL_RUNS_A_PROGRAM,
+    REASON_GIT_CONFIG_UNREADABLE,
+    REASON_GIT_HOOK,
+    REASON_GIT_HOOKSPATH,
+    REASON_GIT_ALTERNATES,
+    REASON_GIT_DIR_ESCAPES,
+    REASON_GIT_DIR_UNREADABLE,
+    REASON_GIT_DIR_TOO_BIG,
+    REASON_GIT_TOO_MUCH_TO_CHECK,
+    REASON_GIT_DIR_TOO_MANY_LINKS,
+    REASON_GIT_DIR_NOT_THIS_PROJECTS,
+    // The work budget.
+    REASON_TOO_MUCH_WORK,
+    // Eitri's own places.
+    REASON_EITRI_OWN_PLACES,
+    REASON_EITRI_PLACE_UNKNOWN,
+    // What the policy adds on top of the classifier: never from the classifier itself.
+    REASON_ALLOWED_BY_A_PROJECT_RULE,
+    REASON_MANUAL_ASKS_BEFORE_EVERY_EDIT,
+];
+
+/// The reasons of [`ALL_REASONS`] that come with an allow; every other one comes with a card. Each reason belongs to
+/// one verdict, so a verdict received beside a reason can be checked against it.
+const ALLOW_REASONS: &[&str] = &[
+    REASON_TOOL_CHANGES_NOTHING,
+    REASON_NO_PATH_READS_THE_ROOT,
+    REASON_PATH_RESOLVES_INSIDE,
+    REASON_ACCEPT_EDITS_WRITES_HERE,
+    REASON_READ_ONLY_COMMAND,
+    REASON_READ_ONLY_GIT_SUBCOMMAND,
+    REASON_ALLOWED_BY_A_PROJECT_RULE,
+];
 
 /// Tools the CLI asks about every time, decidable from the name alone -- what is left once `Write`,
 /// `Edit` and `NotebookEdit` moved to their own conditional check (the acceptEdits fast path, see
@@ -451,8 +587,9 @@ const REASON_OPTION_NOT_KNOWN_TO_ONLY_READ: &str =
 
 /// Environment variables that tell git where its repository, work tree, objects or index are, so
 /// that the project root no longer decides it. The Bash tool's shell inherits this process's
-/// environment, so if any is set here git is no boundary (see [`git_repository_stays_inside`]).
-const GIT_LOCATION_VARIABLES: &[&str] = &[
+/// environment, so if any is set here git is no boundary (see [`git_repository_stays_inside`]). Public for a
+/// classifier run on another machine, which reads them from the environment the agent there was started with.
+pub const GIT_LOCATION_VARIABLES: &[&str] = &[
     "GIT_DIR",
     "GIT_WORK_TREE",
     "GIT_COMMON_DIR",
@@ -463,7 +600,8 @@ const GIT_LOCATION_VARIABLES: &[&str] = &[
 
 /// What, beyond the call and the project root, decides whether a path in the call can reach out.
 /// Read from the process environment by [`classify_permission_request`], passed in by tests so
-/// nothing has to mutate the environment of the whole test process.
+/// nothing has to mutate the environment of the whole test process, and built from a
+/// [`FactSurroundings`] where the classifier runs for another machine ([`gate_fact`]).
 #[derive(Debug, Clone, Copy)]
 struct Surroundings<'a> {
     home: Option<&'a Path>,
@@ -491,30 +629,60 @@ pub fn classify_permission_request(tool_name: &str, input: &Value, project_root:
 
 /// [`classify_permission_request`] with the places passed in.
 fn classify_with_places(tool_name: &str, input: &Value, project_root: &Path, places: &EitriPlaces) -> Classification {
+    in_this_process(|around| classify_with_places_around(tool_name, input, project_root, places, around))
+}
+
+/// [`classify_with_places`] in the surroundings given.
+fn classify_with_places_around(
+    tool_name: &str,
+    input: &Value,
+    project_root: &Path,
+    places: &EitriPlaces,
+    surroundings: &Surroundings,
+) -> Classification {
     let place_card = eitri_places_card(tool_name, input, project_root, places);
+    classify_with_place_card(tool_name, input, project_root, place_card, surroundings)
+}
+
+/// `classify` in this process's surroundings: its `$HOME`, its identity, the `GIT_*` variables of its environment
+/// (which the Bash tool's shell inherits), and the whole work budget.
+fn in_this_process<T>(classify: impl FnOnce(&Surroundings) -> T) -> T {
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    classify(&Surroundings {
+        home: home.as_deref(),
+        who: &Identity::current(),
+        git_location_from_environment: GIT_LOCATION_VARIABLES.iter().any(|v| std::env::var_os(v).is_some()),
+        work_budget: MAX_WORK_PER_CLASSIFICATION,
+    })
+}
+
+/// The classification once the places' check has answered `place_card` for the same call: its card first when the
+/// call writes into a place, then the policy in `surroundings`. No rules and no mode. What the disk gives, wherever it
+/// runs: this process's classifier and the one a server runs for a remote tab ([`gate_fact`]) both come here.
+fn classify_with_place_card(
+    tool_name: &str,
+    input: &Value,
+    project_root: &Path,
+    place_card: Option<Classification>,
+    surroundings: &Surroundings,
+) -> Classification {
+    place_card_first(place_card, || classify_in(tool_name, input, project_root, surroundings))
+}
+
+/// The places' card `place_card` joined with the classification `classify` gives, as every classifier joins them,
+/// wherever its classification comes from: a card for a write into Eitri's own places before anything else is asked.
+fn place_card_first(place_card: Option<Classification>, classify: impl FnOnce() -> Classification) -> Classification {
     if let Some(card) = place_card.filter(|card| card.reason == REASON_EITRI_OWN_PLACES) {
         return card;
     }
     // A place card that only says where the call writes is unknown gives way to a card of the policy's own, whose
     // reason is the more exact one, unless a saved rule could answer that card; it still cards where the policy
     // would allow.
-    let classification = classify_without_places(tool_name, input, project_root);
+    let classification = classify();
     match place_card {
         Some(card) if !classification.needs_a_human() || REPLACEABLE_BY_A_RULE.contains(&classification.reason) => card,
         _ => classification,
     }
-}
-
-/// [`classify_permission_request`] without the places' check.
-fn classify_without_places(tool_name: &str, input: &Value, project_root: &Path) -> Classification {
-    let home = std::env::var_os("HOME").map(PathBuf::from);
-    let surroundings = Surroundings {
-        home: home.as_deref(),
-        who: &Identity::current(),
-        git_location_from_environment: GIT_LOCATION_VARIABLES.iter().any(|v| std::env::var_os(v).is_some()),
-        work_budget: MAX_WORK_PER_CLASSIFICATION,
-    };
-    classify_in(tool_name, input, project_root, &surroundings)
 }
 
 /// [`classify_permission_request`], then the project's prefix rules -- in that order, always. A rule
@@ -537,10 +705,22 @@ fn classify_with_rules_and_places(
     rules: &crate::permission_rules::PrefixRules,
     places: &EitriPlaces,
 ) -> Classification {
-    if rule_that_allows_with_places(tool_name, input, project_root, rules, places).is_some() {
+    in_this_process(|around| classify_with_rules_around(tool_name, input, project_root, rules, places, around))
+}
+
+/// [`classify_with_rules_and_places`] in the surroundings given.
+fn classify_with_rules_around(
+    tool_name: &str,
+    input: &Value,
+    project_root: &Path,
+    rules: &crate::permission_rules::PrefixRules,
+    places: &EitriPlaces,
+    surroundings: &Surroundings,
+) -> Classification {
+    if rule_that_allows_around(tool_name, input, project_root, rules, places, surroundings).is_some() {
         return allow(REASON_ALLOWED_BY_A_PROJECT_RULE);
     }
-    classify_with_places(tool_name, input, project_root, places)
+    classify_with_places_around(tool_name, input, project_root, places, surroundings)
 }
 
 /// Why a file write or edit is a card in a Manual tab, wherever it points.
@@ -572,10 +752,22 @@ fn classify_in_manual_with_places(
     rules: &crate::permission_rules::PrefixRules,
     places: &EitriPlaces,
 ) -> Classification {
+    in_this_process(|around| classify_in_manual_around(tool_name, input, project_root, rules, places, around))
+}
+
+/// [`classify_in_manual_with_places`] in the surroundings given.
+fn classify_in_manual_around(
+    tool_name: &str,
+    input: &Value,
+    project_root: &Path,
+    rules: &crate::permission_rules::PrefixRules,
+    places: &EitriPlaces,
+    surroundings: &Surroundings,
+) -> Classification {
     if EDIT_TOOLS.contains(&tool_name) {
         return ask(REASON_MANUAL_ASKS_BEFORE_EVERY_EDIT);
     }
-    classify_with_rules_and_places(tool_name, input, project_root, rules, places)
+    classify_with_rules_around(tool_name, input, project_root, rules, places, surroundings)
 }
 
 /// The policy at a root with no boundary, without reading any filesystem or identity facts.
@@ -618,8 +810,20 @@ fn rule_that_allows_with_places(
     rules: &crate::permission_rules::PrefixRules,
     places: &EitriPlaces,
 ) -> Option<String> {
+    in_this_process(|around| rule_that_allows_around(tool_name, input, project_root, rules, places, around))
+}
+
+/// [`rule_that_allows_with_places`] in the surroundings given.
+fn rule_that_allows_around(
+    tool_name: &str,
+    input: &Value,
+    project_root: &Path,
+    rules: &crate::permission_rules::PrefixRules,
+    places: &EitriPlaces,
+    surroundings: &Surroundings,
+) -> Option<String> {
     let rule = rules.matching_rule(tool_name, input)?;
-    let classification = classify_with_places(tool_name, input, project_root, places);
+    let classification = classify_with_places_around(tool_name, input, project_root, places, surroundings);
     (classification.needs_a_human() && REPLACEABLE_BY_A_RULE.contains(&classification.reason))
         .then(|| rule.to_rule_string())
 }
@@ -782,10 +986,10 @@ fn classify_within_budget(
             Some(Value::String(pattern))
                 if pattern.starts_with('/') || pattern.starts_with('~') || pattern.contains("..") =>
             {
-                ask("the glob pattern itself reaches outside the project")
+                ask(REASON_GLOB_PATTERN_REACHES_OUT)
             }
             Some(Value::String(_)) => classify_search_path(input, &root),
-            _ => ask("this Glob call has no string `pattern`"),
+            _ => ask(REASON_GLOB_HAS_NO_PATTERN),
         },
         // The acceptEdits fast path (module doc). `file_path` is `Write`/`Edit`'s own schema field;
         // `NotebookEdit` names its target `notebook_path` instead.
@@ -795,25 +999,33 @@ fn classify_within_budget(
     }
 }
 
+// The reasons of the decisions by name, and of `Glob`'s pattern.
+const REASON_INPUT_NOT_AN_OBJECT: &str = "the tool input is not a JSON object";
+const REASON_TOOL_CHANGES_NOTHING: &str = "this tool changes no file, runs no command and reaches no network";
+const REASON_CLI_ALWAYS_ASKS: &str = "the CLI asks about this tool every time in its default mode";
+const REASON_TOOL_NOT_IN_THE_TABLE: &str = "this tool is not in the policy's table";
+const REASON_GLOB_PATTERN_REACHES_OUT: &str = "the glob pattern itself reaches outside the project";
+const REASON_GLOB_HAS_NO_PATTERN: &str = "this Glob call has no string `pattern`";
+
 // Name-only decisions are shared so remote calls cannot drift from a local no-boundary root.
-fn classify_by_name(tool_name: &str, input: &Value) -> Option<Classification> {
+/// The decision made by the tool's name alone, or for an input that is not an object: `None` for a call judged by
+/// its paths. Reads nothing; a remote tab with the server's facts decides these without waiting for one.
+pub fn classify_by_name(tool_name: &str, input: &Value) -> Option<Classification> {
     // Before anything else: a call whose input is not even an object is not a call this module can
     // read. Both backends deliver `input` as whatever JSON arrived, so this is reachable.
     if !input.is_object() {
-        return Some(ask("the tool input is not a JSON object"));
+        return Some(ask(REASON_INPUT_NOT_AN_OBJECT));
     }
 
     if NEVER_ASK_TOOLS.contains(&tool_name) {
-        return Some(allow(
-            "this tool changes no file, runs no command and reaches no network",
-        ));
+        return Some(allow(REASON_TOOL_CHANGES_NOTHING));
     }
     if ALWAYS_ASK_TOOLS.contains(&tool_name) {
-        return Some(ask("the CLI asks about this tool every time in its default mode"));
+        return Some(ask(REASON_CLI_ALWAYS_ASKS));
     }
 
     if !matches!(tool_name, "Read" | "Grep" | "Glob" | "Bash") && !EDIT_TOOLS.contains(&tool_name) {
-        return Some(ask("this tool is not in the policy's table"));
+        return Some(ask(REASON_TOOL_NOT_IN_THE_TABLE));
     }
     None
 }
@@ -823,6 +1035,16 @@ fn classify_by_name(tool_name: &str, input: &Value) -> Option<Classification> {
 fn boundary(project_root: &Path, home: Option<&Path>, who: &Identity) -> Result<PathBuf, Classification> {
     checked_root(project_root, home, who).map_err(|refused| ask(refused.reason()))
 }
+
+// The reasons of the path checks (`Read`, `Grep`, `Glob`; the edit tools share the field and limit ones).
+const REASON_NO_PATH_READS_THE_ROOT: &str = "no path given, so this reads the project root";
+const REASON_PATH_FIELD_MISSING: &str = "this tool's required path field is missing";
+const REASON_PATH_FIELD_NOT_A_STRING: &str = "this tool's path field is not a string";
+const REASON_PATH_FIELD_EMPTY: &str = "this tool's path field is empty";
+const REASON_PATH_NOT_RESOLVED: &str = "the path could not be resolved on disk";
+const REASON_LINKS_PAST_LIMITS: &str = "the path's links could not be resolved within this policy's limits";
+const REASON_PATH_RESOLVES_INSIDE: &str = "the path resolves inside the project root";
+const REASON_PATH_RESOLVES_OUTSIDE: &str = "the path resolves outside the project root";
 
 enum PathField {
     Required,
@@ -858,14 +1080,14 @@ fn classify_path(input: &Value, field: &str, requirement: PathField, root: &Path
     let raw = match input.get(field) {
         None | Some(Value::Null) => match requirement {
             // No path means the working directory, which is the root.
-            PathField::Optional => return allow("no path given, so this reads the project root"),
-            PathField::Required => return ask("this tool's required path field is missing"),
+            PathField::Optional => return allow(REASON_NO_PATH_READS_THE_ROOT),
+            PathField::Required => return ask(REASON_PATH_FIELD_MISSING),
         },
         Some(Value::String(s)) => s,
-        Some(_) => return ask("this tool's path field is not a string"),
+        Some(_) => return ask(REASON_PATH_FIELD_NOT_A_STRING),
     };
     if raw.is_empty() {
-        return ask("this tool's path field is empty");
+        return ask(REASON_PATH_FIELD_EMPTY);
     }
 
     // Resolved within bounds, not `canonicalize`d: a path through a padded
@@ -875,15 +1097,15 @@ fn classify_path(input: &Value, field: &str, requirement: PathField, root: &Path
     // that leaves the root on the way, cards however the path ends ([`resolve_in_root`]).
     let resolved = match resolve_in_root(root, Path::new(raw)) {
         Resolution::At(resolved) => resolved,
-        Resolution::Missing | Resolution::Unexaminable => return ask("the path could not be resolved on disk"),
-        Resolution::Refused => return ask("the path's links could not be resolved within this policy's limits"),
+        Resolution::Missing | Resolution::Unexaminable => return ask(REASON_PATH_NOT_RESOLVED),
+        Resolution::Refused => return ask(REASON_LINKS_PAST_LIMITS),
         Resolution::ThroughAKernelTree => return ask(REASON_THROUGH_A_KERNEL_TREE),
         Resolution::LinkLeavesTheRoot => return ask(REASON_LINK_LEAVES_THE_ROOT),
     };
     if resolved.starts_with(root) {
-        allow("the path resolves inside the project root")
+        allow(REASON_PATH_RESOLVES_INSIDE)
     } else {
-        ask("the path resolves outside the project root")
+        ask(REASON_PATH_RESOLVES_OUTSIDE)
     }
 }
 
@@ -1029,6 +1251,19 @@ const PROTECTED_EDIT_FILE_BASENAMES: &[&str] = &[
     "pyrightconfig.json",
 ];
 
+// The reasons of the edit tools' check.
+const REASON_EDIT_PATH_RAW_SHAPE: &str = "the path contains `..` or starts with `~` -- the real CLI's own hook never \
+     hands this policy a path shaped like that for this tool, so this policy does not try to resolve one itself";
+const REASON_EDIT_PATH_WRITTEN_OUTSIDE: &str =
+    "the path as written is outside the project root, wherever it leads today";
+const REASON_EDIT_REQUESTED_PATH_PROTECTED: &str =
+    "the requested path names one of Claude Code's protected paths or files";
+const REASON_EDIT_TARGET_HARD_LINKED: &str =
+    "the target is a hard-linked file (more than one path names the same data)";
+const REASON_EDIT_TARGET_PROTECTED: &str = "the target is one of Claude Code's protected paths or files";
+const REASON_ACCEPT_EDITS_WRITES_HERE: &str =
+    "Claude Code's acceptEdits mode writes here without asking (in-project, not a protected path)";
+
 /// `Write`, `Edit` and `NotebookEdit`, once `field` names the tool's own path input. The
 /// acceptEdits fast path (module doc): a target that [`resolve`]s inside `root`, is not a
 /// hard-linked file, and does not match [`DANGEROUS_DIRECTORIES`] / [`DANGEROUS_RELATIVE_PATH`] /
@@ -1088,17 +1323,13 @@ const PROTECTED_EDIT_FILE_BASENAMES: &[&str] = &[
 fn classify_edit_target(input: &Value, field: &str, root: &Path) -> Classification {
     let raw = match input.get(field) {
         Some(Value::String(s)) if !s.is_empty() => s,
-        Some(Value::String(_)) => return ask("this tool's path field is empty"),
-        None | Some(Value::Null) => return ask("this tool's required path field is missing"),
-        Some(_) => return ask("this tool's path field is not a string"),
+        Some(Value::String(_)) => return ask(REASON_PATH_FIELD_EMPTY),
+        None | Some(Value::Null) => return ask(REASON_PATH_FIELD_MISSING),
+        Some(_) => return ask(REASON_PATH_FIELD_NOT_A_STRING),
     };
 
     if edit_target_raw_path_is_suspect(raw) {
-        return ask(
-            "the path contains `..` or starts with `~` -- the real CLI's own hook never hands this \
-             policy a path shaped like that for this tool, so this policy does not try to resolve \
-             one itself",
-        );
+        return ask(REASON_EDIT_PATH_RAW_SHAPE);
     }
 
     let requested = if Path::new(raw).is_absolute() {
@@ -1109,10 +1340,10 @@ fn classify_edit_target(input: &Value, field: &str, root: &Path) -> Classificati
     // Both spellings must be inside, as in the CLI's own `zy`: contained as written
     // here -- lexically, which is exact since `..` was carded above -- and as resolved below.
     if !requested.starts_with(root) {
-        return ask("the path as written is outside the project root, wherever it leads today");
+        return ask(REASON_EDIT_PATH_WRITTEN_OUTSIDE);
     }
     if path_is_protected(&requested) {
-        return ask("the requested path names one of Claude Code's protected paths or files");
+        return ask(REASON_EDIT_REQUESTED_PATH_PROTECTED);
     }
 
     let target = match resolve_edit_target(root, Path::new(raw)) {
@@ -1121,15 +1352,15 @@ fn classify_edit_target(input: &Value, field: &str, root: &Path) -> Classificati
     };
 
     if !target.logical.starts_with(root) {
-        return ask("the path resolves outside the project root");
+        return ask(REASON_PATH_RESOLVES_OUTSIDE);
     }
     if target.is_hard_link {
-        return ask("the target is a hard-linked file (more than one path names the same data)");
+        return ask(REASON_EDIT_TARGET_HARD_LINKED);
     }
     if path_is_protected(&target.logical) {
-        return ask("the target is one of Claude Code's protected paths or files");
+        return ask(REASON_EDIT_TARGET_PROTECTED);
     }
-    allow("Claude Code's acceptEdits mode writes here without asking (in-project, not a protected path)")
+    allow(REASON_ACCEPT_EDITS_WRITES_HERE)
 }
 
 /// Whether `raw` -- an edit tool's own path field, exactly as given, before any resolution -- is a
@@ -1157,7 +1388,6 @@ struct EditTarget {
 }
 
 /// Why an edit target did not resolve: past this policy's limits, or behind a lookup that failed.
-const REASON_EDIT_TARGET_PAST_LIMITS: &str = "the path's links could not be resolved within this policy's limits";
 const REASON_EDIT_TARGET_UNEXAMINABLE: &str =
     "a directory or name on the way could not be examined, so where the path leads is unknown";
 
@@ -1175,7 +1405,7 @@ fn resolve_edit_target(root: &Path, raw: &Path) -> Result<EditTarget, &'static s
                 is_hard_link,
             })
         }
-        Resolution::Refused => Err(REASON_EDIT_TARGET_PAST_LIMITS),
+        Resolution::Refused => Err(REASON_LINKS_PAST_LIMITS),
         // Not "nothing there yet" -- a link behind it was never examined.
         Resolution::Unexaminable => Err(REASON_EDIT_TARGET_UNEXAMINABLE),
         // Where it leads is not the same in the CLI's process.
@@ -1211,7 +1441,7 @@ fn resolve_edit_target(root: &Path, raw: &Path) -> Result<EditTarget, &'static s
 fn resolve_missing_edit_target(root: &Path, raw: &Path) -> Result<EditTarget, &'static str> {
     let components: Vec<std::path::Component> = raw.components().collect();
     if components.len() > MAX_RESOLUTION_STEPS {
-        return Err(REASON_EDIT_TARGET_PAST_LIMITS);
+        return Err(REASON_LINKS_PAST_LIMITS);
     }
     for prefix_len in (0..components.len()).rev() {
         let prefix: PathBuf = components[..prefix_len].iter().collect();
@@ -1238,7 +1468,7 @@ fn resolve_missing_edit_target(root: &Path, raw: &Path) -> Result<EditTarget, &'
                     is_hard_link: false,
                 });
             }
-            Resolution::Refused => return Err(REASON_EDIT_TARGET_PAST_LIMITS),
+            Resolution::Refused => return Err(REASON_LINKS_PAST_LIMITS),
             // Defensive: the full path came back `Missing`, so every lookup on the way to what was
             // missing succeeded, and a prefix repeats those lookups -- only a directory changing
             // between the two can land here (a mutation to `continue` survives the tests for that
@@ -1253,7 +1483,7 @@ fn resolve_missing_edit_target(root: &Path, raw: &Path) -> Result<EditTarget, &'
     }
     // Unreachable in practice -- `prefix_len == 0` above always resolves to `root` -- but a card
     // rather than a panic if it somehow is not.
-    Err(REASON_EDIT_TARGET_PAST_LIMITS)
+    Err(REASON_LINKS_PAST_LIMITS)
 }
 
 /// Whether `path` (either the requested spelling, or already resolved/logical -- see
@@ -1332,6 +1562,27 @@ fn fold_confusables(segment: &str) -> String {
         .collect()
 }
 
+// The reasons of the `Bash` check.
+const REASON_BASH_HAS_NO_COMMAND: &str = "this Bash call has no string `command`";
+const REASON_COMMAND_TOO_LONG: &str = "the command is longer than the CLI's own re-prompt threshold";
+const REASON_COMMAND_SHELL_SYNTAX: &str = "the command contains shell syntax this policy refuses to parse";
+const REASON_COMMAND_ODD_BLANK: &str =
+    "the command contains a blank or control character the shell does not split words at";
+const REASON_COMMAND_EMPTY: &str = "the command is empty";
+const REASON_ARGUMENT_REACHES_OUT_BY_PATH: &str = "an argument reaches outside the project by path";
+const REASON_ARGUMENT_GLUES_A_VALUE: &str =
+    "an argument glues a value to an option, which this policy refuses to parse";
+const REASON_ARGUMENT_GLUES_A_PATH: &str =
+    "an argument glues a path to a short option, which this policy refuses to parse";
+const REASON_ARGUMENT_RESOLVES_OUTSIDE: &str =
+    "an argument resolves outside the project root, or not within this policy's limits";
+const REASON_COMMAND_FOLLOWS_LINKS: &str = "this command follows symbolic links while it walks the tree";
+const REASON_FIND_ACTION_WRITES_OR_RUNS: &str = "this find call carries an action that writes or executes";
+const REASON_DIFF_OF_A_DIRECTORY: &str =
+    "diff of a directory opens what its entries link to, inside the project or not";
+const REASON_CD_MOVES_THE_CWD: &str = "cd moves the Bash cwd, and every other judgement here assumes it is the root";
+const REASON_READ_ONLY_COMMAND: &str = "a read-only command from the CLI's own list, with no shell syntax";
+
 /// `Bash` is allowed only for a command this module can read in full -- which means a plain
 /// sequence of whitespace-separated words, whose first word is on the CLI's own read-only list, and
 /// which touches nothing outside the project by path.
@@ -1395,48 +1646,48 @@ fn classify_bash(input: &Value, root: &Path, surroundings: &Surroundings) -> Cla
         return ask(REASON_BASH_INPUT_BEYOND_THE_COMMAND);
     }
     let Some(Value::String(command)) = input.get("command") else {
-        return ask("this Bash call has no string `command`");
+        return ask(REASON_BASH_HAS_NO_COMMAND);
     };
     if command.len() > MAX_BASH_COMMAND_LEN {
-        return ask("the command is longer than the CLI's own re-prompt threshold");
+        return ask(REASON_COMMAND_TOO_LONG);
     }
     if command.contains(BASH_CHARS_THAT_FORCE_A_CARD) {
-        return ask("the command contains shell syntax this policy refuses to parse");
+        return ask(REASON_COMMAND_SHELL_SYNTAX);
     }
     if command
         .chars()
         .any(|c| !SHELL_BLANKS.contains(&c) && (c.is_whitespace() || c.is_control()))
     {
-        return ask("the command contains a blank or control character the shell does not split words at");
+        return ask(REASON_COMMAND_ODD_BLANK);
     }
 
     let mut words = command.split(SHELL_BLANKS).filter(|w| !w.is_empty());
     let Some(program) = words.next() else {
-        return ask("the command is empty");
+        return ask(REASON_COMMAND_EMPTY);
     };
     let arguments: Vec<&str> = words.collect();
 
     if arguments.iter().any(|a| a.starts_with('/') || a.contains("..")) {
-        return ask("an argument reaches outside the project by path");
+        return ask(REASON_ARGUMENT_REACHES_OUT_BY_PATH);
     }
     if arguments.iter().any(|a| a.contains('=')) {
-        return ask("an argument glues a value to an option, which this policy refuses to parse");
+        return ask(REASON_ARGUMENT_GLUES_A_VALUE);
     }
     if arguments.iter().any(|a| is_short_option_cluster(a) && a.contains('/')) {
-        return ask("an argument glues a path to a short option, which this policy refuses to parse");
+        return ask(REASON_ARGUMENT_GLUES_A_PATH);
     }
     if !arguments_stay_inside(&arguments, root) {
-        return ask("an argument resolves outside the project root, or not within this policy's limits");
+        return ask(REASON_ARGUMENT_RESOLVES_OUTSIDE);
     }
     if follows_links_while_walking(program, &arguments) {
-        return ask("this command follows symbolic links while it walks the tree");
+        return ask(REASON_COMMAND_FOLLOWS_LINKS);
     }
     if program == "find"
         && arguments
             .iter()
             .any(|a| FIND_ACTIONS_THAT_ARE_NOT_READS.iter().any(|p| a.starts_with(p)))
     {
-        return ask("this find call carries an action that writes or executes");
+        return ask(REASON_FIND_ACTION_WRITES_OR_RUNS);
     }
     if !options_read_only_what_they_name(program, &arguments) {
         return ask(REASON_OPTION_NOT_KNOWN_TO_ONLY_READ);
@@ -1449,18 +1700,20 @@ fn classify_bash(input: &Value, root: &Path, surroundings: &Surroundings) -> Cla
             .iter()
             .any(|a| resolve_existing(root, Path::new(a)).is_some_and(|resolved| resolved.is_dir()))
     {
-        return ask("diff of a directory opens what its entries link to, inside the project or not");
+        return ask(REASON_DIFF_OF_A_DIRECTORY);
     }
 
     match program {
         "git" => classify_git(&arguments, root, surroundings),
-        "cd" => ask("cd moves the Bash cwd, and every other judgement here assumes it is the root"),
-        other if READ_ONLY_BASH_COMMANDS.contains(&other) => {
-            allow("a read-only command from the CLI's own list, with no shell syntax")
-        }
+        "cd" => ask(REASON_CD_MOVES_THE_CWD),
+        other if READ_ONLY_BASH_COMMANDS.contains(&other) => allow(REASON_READ_ONLY_COMMAND),
         _ => ask(REASON_NOT_ON_READ_ONLY_LIST),
     }
 }
+
+// The reasons of the `git` check's own arguments.
+const REASON_GIT_OPTION_WRITES: &str = "this git call carries an option that writes a file";
+const REASON_READ_ONLY_GIT_SUBCOMMAND: &str = "a read-only git subcommand";
 
 /// `git`, once the command has passed every check `classify_bash` makes of any command.
 ///
@@ -1475,7 +1728,7 @@ fn classify_git(arguments: &[&str], root: &Path, surroundings: &Surroundings) ->
         .iter()
         .any(|a| GIT_ARGUMENT_PREFIXES_THAT_WRITE.iter().any(|p| a.starts_with(p)))
     {
-        return ask("this git call carries an option that writes a file");
+        return ask(REASON_GIT_OPTION_WRITES);
     }
     // Until 2026-09-28 `git --no-pager log` carded, because the first word after `git` was
     // taken as the subcommand. `--no-pager` and `-P`, its short spelling, only stop git starting a
@@ -1489,7 +1742,7 @@ fn classify_git(arguments: &[&str], root: &Path, surroundings: &Surroundings) ->
     match arguments[skipped..].split_first() {
         Some((sub, rest)) if READ_ONLY_GIT_SUBCOMMANDS.contains(sub) => {
             if git_options_read_only_what_they_name(sub, rest) {
-                allow("a read-only git subcommand")
+                allow(REASON_READ_ONLY_GIT_SUBCOMMAND)
             } else {
                 ask(REASON_OPTION_NOT_KNOWN_TO_ONLY_READ)
             }

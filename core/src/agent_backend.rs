@@ -16,6 +16,7 @@
 //!
 //! Selected by `EITRI_AGENT_BACKEND=legacy|sidecar`, defaulting to `sidecar`.
 
+use agent::gate_facts::{FreshFact, GateFactState};
 use agent::setting_sources::ProjectTrust;
 use agent::GateRoot;
 use agent::{
@@ -28,6 +29,10 @@ use std::path::{Path, PathBuf};
 
 use crate::agent_bridge::SessionModeChoice;
 use crate::editor_tools::SERVER_NAME;
+
+mod fact_gate;
+mod fact_waits;
+use fact_waits::{FactRead, FactWaits, FreshPlan, FreshState};
 
 /// `reason` first, then the remedies of the sidecar `info` describes, each once. The panel recognises a
 /// failure by substrings of its text, so the text itself stays as it was.
@@ -1008,7 +1013,10 @@ impl AgentBackend {
     /// Continues the CLI's own session `provider_session_id` on the server through a new sidecar started
     /// for `start`, with the resume request a local tab sends: a remote tab whose agent the server no longer
     /// runs. The new sidecar is stopped again when the resume fails, or given to `keep_stop` when that stop does
-    /// not go through. **Blocking.**
+    /// not go through. `seed` is the history the caller built from the server's transcript
+    /// ([`crate::remote_project::RemoteConnection::resume_seed`]), which the conversation starts from; this makes
+    /// no call for it. **Blocking.**
+    #[allow(clippy::too_many_arguments)]
     pub fn resume_remote(
         client: agent::remote_client::HelperClient,
         host_key_sha256: &str,
@@ -1016,6 +1024,7 @@ impl AgentBackend {
         provider_session_id: &str,
         project: ProjectTrust,
         client_tools: Option<agent::ClientToolSet>,
+        seed: Option<agent::AgentSessionProjection>,
         keep_stop: impl FnOnce(&agent::HelperHandoff),
     ) -> Result<Self, BackendError> {
         let provider = match ClaudeSidecarProvider::connect_through_helper(client, host_key_sha256, start) {
@@ -1034,6 +1043,7 @@ impl AgentBackend {
             provider_session_id,
             project,
             client_tools,
+            seed,
         )
         .map(|conversation| AgentBackend::Conversation {
             agent: AgentId::Claude,
@@ -1328,6 +1338,49 @@ impl AgentBackend {
         match self {
             AgentBackend::Legacy(_) => None,
             AgentBackend::Conversation { conversation, .. } => conversation.link_state(),
+        }
+    }
+
+    /// The server's path fact for the pending request `permission_id` (`agent::gate_facts`): `NotRemote` on this
+    /// machine.
+    pub fn gate_fact(&self, permission_id: &str) -> GateFactState {
+        match self {
+            AgentBackend::Legacy(_) => GateFactState::NotRemote,
+            AgentBackend::Conversation { conversation, .. } => conversation.gate_fact(permission_id),
+        }
+    }
+
+    /// The digest the pending request `permission_id` has now, as the provider computed it from the request's own
+    /// bytes; `None` on this machine and for an id no request waits under.
+    fn gate_fact_digest(&self, permission_id: &str) -> Option<[u8; 32]> {
+        match self {
+            AgentBackend::Legacy(_) => None,
+            AgentBackend::Conversation { conversation, .. } => conversation.gate_fact_digest(permission_id),
+        }
+    }
+
+    /// Asks the server for a fresh fact about `permission_id` without waiting; `done` only stores the answer (it may
+    /// run on this thread), and the tab is woken after it.
+    fn check_fact(&self, permission_id: &str, digest: [u8; 32], done: Box<dyn FnOnce(FreshFact) + Send>) {
+        match self {
+            AgentBackend::Legacy(_) => done(FreshFact::Unavailable),
+            AgentBackend::Conversation { conversation, .. } => conversation.check_fact(permission_id, digest, done),
+        }
+    }
+
+    /// The server's word on whether the tab's root is a boundary, once its fact stream said it.
+    pub fn gate_root_fact(&self) -> Option<agent::gate_facts::RootFact> {
+        match self {
+            AgentBackend::Legacy(_) => None,
+            AgentBackend::Conversation { conversation, .. } => conversation.gate_root_fact(),
+        }
+    }
+
+    /// The root the server's facts are about, when this tab's provider serves facts this window uses.
+    pub fn gate_facts_root(&self) -> Option<PathBuf> {
+        match self {
+            AgentBackend::Legacy(_) => None,
+            AgentBackend::Conversation { conversation, .. } => conversation.gate_facts_root(),
         }
     }
 
@@ -2573,6 +2626,7 @@ impl AgentBackend {
                 ));
             }
         }
+        self.retry_fact_waits(approvals, user_answered, mode, &mut retry);
         let retried: BTreeSet<String> = retry
             .iter()
             .filter_map(|(_, event)| match event {
@@ -2636,6 +2690,68 @@ impl AgentBackend {
             RevisedDelivery::Nothing
         } else {
             RevisedDelivery::Events(kept)
+        }
+    }
+
+    /// A remote tab's requests waiting for the server's fact or for a fresh check (`HumanApprovals::facts`) are judged
+    /// again once the fact has come, the check is over, the wait has run out, or the tab entered bypass (`mode`): each
+    /// goes into `retry`, and one that is a card then is drawn by a snapshot, since its event was kept from the page.
+    /// The others stay hidden. A wait whose request is no longer pending, or that the person answered, ends here.
+    fn retry_fact_waits(
+        &self,
+        approvals: &mut HumanApprovals,
+        user_answered: &BTreeSet<String>,
+        mode: PermissionMode,
+        retry: &mut Vec<(u64, AgentDomainEvent)>,
+    ) {
+        if approvals.facts.is_empty() {
+            return;
+        }
+        let now = std::time::Instant::now();
+        // Read before the projection's guard is taken; only these requests' records are copied.
+        let ready: BTreeSet<String> = approvals
+            .facts
+            .ids()
+            .filter(|id| {
+                approvals.facts.fresh_ready(id, now, mode)
+                    || approvals.facts.fact_due(id, now, mode)
+                    || (approvals.facts.holds_for_fact(id) && self.gate_fact(id) != GateFactState::Waiting)
+            })
+            .filter(|id| {
+                !retry.iter().any(|(_, event)| {
+                    matches!(event, AgentDomainEvent::PermissionRequested { permission_id, .. } if permission_id == *id)
+                })
+            })
+            .cloned()
+            .collect();
+        // Its own statement: no answer is sent while the guard is held.
+        let (revision, still, records) = {
+            let projection = self.projection();
+            let still: BTreeSet<String> = approvals
+                .facts
+                .ids()
+                .filter(|id| !user_answered.contains(*id) && projection.pending_permissions.contains_key(*id))
+                .cloned()
+                .collect();
+            let records: Vec<(String, agent::PermissionRequestRecord)> = ready
+                .into_iter()
+                .filter(|id| still.contains(id))
+                .filter_map(|id| Some((id.clone(), projection.pending_permissions.get(&id)?.clone())))
+                .collect();
+            (projection.last_revision, still, records)
+        };
+        approvals.facts.retain(|id| still.contains(id));
+        for (id, p) in records {
+            retry.push((
+                revision,
+                AgentDomainEvent::PermissionRequested {
+                    permission_id: id,
+                    tool_use_id: p.tool_use_id,
+                    tool_name: p.tool_name,
+                    input: p.input,
+                    provider_prompt: p.provider_prompt,
+                },
+            ));
         }
     }
 
@@ -2867,13 +2983,15 @@ impl AgentBackend {
             };
             // Only an Auto tab leaves anything to the CLI's classifier: Manual is Eitri's policy
             // alone, whatever the CLI runs under it. Nor does an Auto tab at a root that is no
-            // boundary: Eitri's policy answers there, and every path-judged call is a card.
-            let defers_to_the_cli = mode == PermissionMode::Auto
-                && self.capabilities().cli_auto_mode
-                && cli_reports_auto
-                && gate_root_is_a_boundary(project_root);
+            // boundary: Eitri's policy answers there, and every path-judged call is a card. A remote
+            // tab with the server's facts reads the boundary from the request's fact (`decide`).
+            let may_defer = mode == PermissionMode::Auto && self.capabilities().cli_auto_mode && cli_reports_auto;
+            let defers_to_the_cli = may_defer && gate_root_is_a_boundary(project_root);
+            // A request drawn or dropped in one of the next four steps is judged no further: a wait for the server's
+            // fact or a fresh check ends with it, or it would stay hidden with its wait over.
             if tripped {
                 eprintln!("[permission] not answering {tool_name}: the agent reported a policy it was not asked for");
+                approvals.facts.forget(permission_id);
                 kept.push((revision, event));
                 continue;
             }
@@ -2881,11 +2999,13 @@ impl AgentBackend {
             // answered (a duplicate delivery, e.g. after a resync) is dropped without a second answer,
             // and so is one whose answer is still on its way.
             if host_answered.contains(permission_id) || approvals.host_sends.contains(permission_id) {
+                approvals.facts.forget(permission_id);
                 continue;
             }
             // A host answer that failed to reach a remote agent is shown as the card it fell back to.
             if cards_only.contains(permission_id) {
                 plan.unsequenced.remove(permission_id);
+                approvals.facts.forget(permission_id);
                 kept.push((revision, event));
                 continue;
             }
@@ -2894,9 +3014,20 @@ impl AgentBackend {
             if plan.cards.contains(permission_id) {
                 eprintln!("[permission] asking the user: {tool_name} (asked in plan mode)");
                 plan.unsequenced.remove(permission_id);
+                approvals.facts.forget(permission_id);
                 kept.push((revision, event));
                 continue;
             }
+            // A remote tab's request whose automatic answer waits for the server's fresh check is judged again only
+            // once that check is over; until then it is drawn as no card, and a second delivery starts nothing.
+            let fresh = match approvals
+                .facts
+                .fresh_state(permission_id, std::time::Instant::now(), tab_mode)
+            {
+                FreshState::Waiting => continue,
+                FreshState::NotWaiting => None,
+                FreshState::Ready(wait, answer) => Some((wait, answer)),
+            };
             let declared = self.declared_client_tools();
             let own_tools = (one_own_server && !declared.is_empty()).then_some(declared);
             let external = self.agent().is_external();
@@ -2905,11 +3036,12 @@ impl AgentBackend {
             // not know whether the CLI made the call in plan mode. It waits hidden, answered by nobody, and every
             // drain looks at it again (`take_revised_ui_delivery_after_answers`) until its call is seen or
             // `PLAN_SEQUENCE_WAIT_MS` has passed (a call the sidecar never shows, a request that names none). One whose
-            // wait ran out is judged in either mode (`Sequence::phase`): nothing else says where the CLI stood.
+            // wait ran out is judged in either mode (`Sequence::phase`): nothing else says where the CLI stood. A
+            // request back from a fresh check was placed before the check began.
             let ordered = sequence.offered
                 && !external
                 && waits_for_its_call(tool_name, provider_prompt.is_some(), mode, own_tools);
-            if ordered && sequence.waits() {
+            if fresh.is_none() && ordered && sequence.waits() {
                 if plan.waited_ms(permission_id, wall_clock_ms()) < PLAN_SEQUENCE_WAIT_MS {
                     continue;
                 }
@@ -2923,17 +3055,6 @@ impl AgentBackend {
                 input,
                 provider_prompt: provider_prompt.as_ref(),
             };
-            let judge = |planning: Option<PlanGate>| Judge {
-                mode,
-                external,
-                defers_to_the_cli,
-                own_tools,
-                rules,
-                project_root,
-                approvals: &*approvals,
-                planning,
-                places: &places,
-            };
             // The tab's mode is the mode plan mode was entered from: while the CLI runs plan mode, its table
             // decides (`plan_verdict`).
             let in_plan = PlanGate {
@@ -2942,29 +3063,47 @@ impl AgentBackend {
                 main_thread,
             };
             let phase = sequence.phase(ordered);
-            let planned = match phase {
-                RequestPhase::Executing => decide(request, judge(None)),
-                RequestPhase::Planning => decide(request, judge(Some(in_plan))),
-                // Either mode may be the one the CLI asked in: an answer only where both give the same one, and
-                // otherwise a card. A deferral is no safe middle: outside plan mode a Manual tab's deferral would
-                // reach an auto CLI's classifier.
-                RequestPhase::Uncertain => {
-                    let executing = decide(request, judge(None));
-                    let planning = decide(request, judge(Some(in_plan)));
-                    match (executing, planning) {
-                        (Some(executing), Some(planning)) if executing.decision == planning.decision => Some(planning),
-                        (None, _) | (_, None) => None,
-                        (Some(_), Some(_)) => {
-                            eprintln!("[permission] asking the user: {tool_name} (plan mode may or may not apply)");
-                            None
-                        }
-                    }
+            // A remote tab with the server's facts judges with the fact for this very request (the provider keeps one
+            // only under the digest it computed from the request's own bytes), or, once a fresh check is over, with the
+            // fresh fact, and again with the one the server held since it first saw the request.
+            let in_hand = match fact_gate::InHand::gather(self, project_root, permission_id, fresh, tab_mode) {
+                Ok(in_hand) => in_hand,
+                Err(why) => {
+                    eprintln!("[permission] asking the user: {tool_name} ({why})");
+                    plan.card_in(phase, permission_id);
+                    kept.push((revision, event));
+                    continue;
                 }
             };
-            let Some(planned) = planned else {
-                if phase != RequestPhase::Executing {
-                    plan.make_card(permission_id);
+            let read = FactRead::new(in_hand.judged());
+            let base = Judge {
+                mode,
+                external,
+                defers_to_the_cli,
+                may_defer,
+                own_tools,
+                rules,
+                project_root,
+                approvals: &*approvals,
+                planning: None,
+                places: &places,
+                facts: &read,
+            };
+            let planned = decide_in_phase(request, phase, in_plan, |planning| Judge { planning, ..base });
+            let again = in_hand
+                .first()
+                .and_then(|first| decide_again(request, phase, in_plan, base, first));
+            match fact_gate::when_missing(approvals, permission_id, tool_name, &in_hand, &read) {
+                Some(fact_gate::Missing::Hold) => continue,
+                Some(fact_gate::Missing::Card) => {
+                    plan.card_in(phase, permission_id);
+                    kept.push((revision, event));
+                    continue;
                 }
+                None => {}
+            }
+            let Some(planned) = planned else {
+                plan.card_in(phase, permission_id);
                 kept.push((revision, event));
                 continue;
             };
@@ -2976,12 +3115,27 @@ impl AgentBackend {
                 plan.held.insert(permission_id.clone());
                 continue;
             }
+            let read_a_fact = read.read();
+            let rests_on = match self.fresh_step(approvals, in_hand, read_a_fact, &planned, again, tab_mode) {
+                fact_gate::FreshStep::Answer(rests_on) => rests_on,
+                fact_gate::FreshStep::Started => continue,
+                fact_gate::FreshStep::Card => {
+                    plan.card_in(phase, permission_id);
+                    kept.push((revision, event));
+                    continue;
+                }
+            };
             let deferred_call = (phase != RequestPhase::Executing && planned.decision.defers())
                 .then(|| planned.call.clone())
                 .flatten();
             // As `approve_pending` decides it: a backend that reports a link answers over the network, whatever
             // root its tab named.
-            let remote = matches!(project_root, GateRoot::RemoteWithoutFacts) || self.link_state().is_some();
+            let remote = matches!(project_root, GateRoot::RemoteWithoutFacts | GateRoot::RemoteWithFacts)
+                || self.link_state().is_some();
+            let planned = PlannedAnswer {
+                fact: rests_on,
+                ..planned
+            };
             if self.answer_and_record(
                 planned,
                 host_answered,
@@ -3024,11 +3178,14 @@ impl AgentBackend {
                     if let Some(id) = &planned.consumes_approval {
                         approvals.consume(id);
                     }
+                    // A lost answer to the same request still kept makes this its second send: lost again, it is
+                    // not sent a third time, and this send carries the request's tracking from here on.
+                    let resent = approvals.lost.take(&planned.permission_id);
                     approvals.host_sends.0.push(HostSend {
                         planned,
                         send,
                         mode,
-                        resent: false,
+                        resent,
                     });
                     true
                 }
@@ -3184,7 +3341,8 @@ impl AgentBackend {
     /// the mode it was planned under. Nor does it go while anything would keep the gate from answering automatically
     /// now: the session reported a policy it was not asked for, plans or changes mode (`plan_holds`, `plan_followed`
     /// as the drain's), the request is a plan card, its call began outside executing, or it cannot be placed. One
-    /// that no longer stands stays the person's card.
+    /// that no longer stands stays the person's card. One that rests on the server's fact is not sent as it was: the
+    /// server checks the request fresh first, and the gate judges it again with what that check brings.
     fn resend_lost_when_back(
         &mut self,
         approvals: &mut HumanApprovals,
@@ -3241,6 +3399,34 @@ impl AgentBackend {
                     planned,
                     mode: planned_under,
                     retry,
+                    person,
+                });
+                continue;
+            }
+            // An answer that rests on the server's fact goes again only after another fresh check: the disk may have
+            // changed while it was lost. The request is judged again in full once that check is over, and drawn as
+            // no card meanwhile, as an answer on its way is. The lost answer stays, not to be sent as it was, for a
+            // resolution that shows the agent took it after all, until the answer the check allows goes out
+            // (`answer_and_record`) or the request leaves.
+            if let Some((first, digest)) = planned.fact.clone() {
+                let plan = FreshPlan {
+                    first,
+                    digest,
+                    mode: planned_under,
+                    decision: planned.decision.clone(),
+                };
+                let done = approvals
+                    .facts
+                    .start_fresh(&planned.permission_id, plan, std::time::Instant::now());
+                eprintln!(
+                    "[permission] checking {} on the server again before answering",
+                    planned.tool_name
+                );
+                self.check_fact(&planned.permission_id, digest, done);
+                approvals.lost.0.push(LostAnswer {
+                    planned,
+                    mode: planned_under,
+                    retry: false,
                     person,
                 });
                 continue;
@@ -3419,6 +3605,7 @@ impl AgentBackend {
                         fast_path: None,
                         by_rule: None,
                         creates_file: None,
+                        fact: None,
                         sent: format!("allowed {why}: {}", p.tool_name),
                         could_not: format!("allow {} {why}", p.tool_name),
                     })
@@ -3432,12 +3619,18 @@ impl AgentBackend {
                 break;
             }
             match self.respond_permission_async(&planned.permission_id, PermissionDecision::Allow) {
-                Ok(send) => approvals.host_sends.0.push(HostSend {
-                    planned,
-                    send,
-                    mode: PermissionMode::Bypass,
-                    resent: false,
-                }),
+                Ok(send) => {
+                    // Answered now: a wait for the server's fact or a fresh check of it ends here, and a lost answer
+                    // still kept makes this its second send, as in `answer_and_record`.
+                    approvals.facts.forget(&planned.permission_id);
+                    let resent = approvals.lost.take(&planned.permission_id);
+                    approvals.host_sends.0.push(HostSend {
+                        planned,
+                        send,
+                        mode: PermissionMode::Bypass,
+                        resent,
+                    })
+                }
                 Err(error) => eprintln!("[permission] could not {}: {}", planned.could_not, error.message),
             }
         }
@@ -3563,6 +3756,7 @@ fn record_host_answer(
         fast_path,
         by_rule,
         creates_file,
+        fact: _,
         sent,
         could_not: _,
     } = planned;
@@ -3742,6 +3936,13 @@ impl PlanBook {
             .min()
     }
 
+    /// [`Self::make_card`] for a request judged in `phase`: one judged as made outside plan mode is no plan card.
+    fn card_in(&mut self, phase: RequestPhase, permission_id: &str) {
+        if phase != RequestPhase::Executing {
+            self.make_card(permission_id);
+        }
+    }
+
     /// Makes the pending request `permission_id` a plan card, which only a person's answer settles. A card waits for
     /// nothing: it leaves the requests waiting for their call, which are drawn as no card, so a request is never
     /// both. It has been looked at.
@@ -3783,15 +3984,18 @@ pub fn root_is_a_boundary(project_root: &Path) -> bool {
     .is_none()
 }
 
-/// Remote roots have no local boundary facts; only the local arm may inspect this machine.
+/// Remote roots have no local boundary facts; only the local arm may inspect this machine. A remote tab with the
+/// server's facts reads its boundary from each request's fact, never from here.
 pub fn gate_root_is_a_boundary(root: GateRoot<'_>) -> bool {
     match root {
         GateRoot::Local(path) => root_is_a_boundary(path),
         GateRoot::RemoteWithoutFacts => false,
+        GateRoot::RemoteWithFacts => false,
     }
 }
 
 /// What `decide` judges a request by besides the request itself.
+#[derive(Clone, Copy)]
 struct Judge<'a> {
     mode: PermissionMode,
     /// The session is an external agent's, whose requests no policy here judges.
@@ -3799,6 +4003,9 @@ struct Judge<'a> {
     /// An Auto tab on a session whose CLI runs its own auto mode, at a root that is a boundary
     /// (`answer_what_needs_no_human`).
     defers_to_the_cli: bool,
+    /// An Auto tab on a session whose CLI runs its own auto mode, whatever the root: a remote tab with the server's
+    /// facts defers at a root the request's fact calls a boundary.
+    may_defer: bool,
     /// The tools this session declared, while the CLI's latest report lists exactly one server of the
     /// tool server's name and that one is in process; otherwise nothing here is the session's own.
     own_tools: Option<&'a BTreeSet<String>>,
@@ -3812,6 +4019,9 @@ struct Judge<'a> {
     /// Where Eitri reads its own configuration and code at start: a call that may write there is a card in every
     /// mode but Bypass, ahead of the plan table and the deferral to the CLI.
     places: &'a agent::EitriPlaces,
+    /// The server's fact for this request, on a remote tab that has them (`GateRoot::RemoteWithFacts`); what the
+    /// decision read of it is noted there.
+    facts: &'a FactRead<'a>,
 }
 
 /// The CLI runs plan mode, entered from the tab's mode `origin`. `cli_runs_auto` is whether the session runs
@@ -4008,6 +4218,9 @@ struct PlannedAnswer {
     fast_path: Option<FastPathAnsweredForYou>,
     by_rule: Option<RuleAnsweredForYou>,
     creates_file: Option<String>,
+    /// The server's fact this answer rests on (the one it first held) and the request's digest: an answer that is
+    /// lost on its way is checked fresh again before it goes a second time.
+    fact: Option<(agent::GateFact, [u8; 32])>,
     /// The log line once the answer was sent.
     sent: String,
     /// What could not be done, for the log line of an answer that failed to send.
@@ -4034,6 +4247,7 @@ impl PlannedAnswer {
             fast_path: None,
             by_rule: None,
             creates_file: None,
+            fact: None,
             sent,
             could_not,
         }
@@ -4063,12 +4277,14 @@ fn decide(request: GateRequest<'_>, judge: Judge<'_>) -> Option<PlannedAnswer> {
         mode,
         external,
         defers_to_the_cli,
+        may_defer,
         own_tools,
         rules,
         project_root,
         approvals,
         planning,
         places,
+        facts,
     } = judge;
     let GateRequest {
         tool_use_id,
@@ -4081,7 +4297,7 @@ fn decide(request: GateRequest<'_>, judge: Judge<'_>) -> Option<PlannedAnswer> {
     // GateRoot enters the decision here too: even bypass row notes must not inspect a laptop copy.
     let creates_file = || match project_root {
         GateRoot::Local(path) => call.clone().filter(|_| write_over_no_file(tool_name, input, path)),
-        GateRoot::RemoteWithoutFacts => None,
+        GateRoot::RemoteWithoutFacts | GateRoot::RemoteWithFacts => None,
     };
     if external {
         // An external agent's requests are judged by nobody here. In Auto its own reviewer has
@@ -4176,14 +4392,20 @@ fn decide(request: GateRequest<'_>, judge: Judge<'_>) -> Option<PlannedAnswer> {
             return None;
         }
     }
-    let mode = match planning.map(|gate| plan_verdict(tool_name, false, gate, gate_root_is_a_boundary(project_root))) {
+    // A remote tab with the server's facts takes the places check from the request's fact.
+    let by_name = fact_gate::decided_by_name(project_root, tool_name, input);
+    if fact_gate::places_card_from_fact(tool_name, by_name, judge)? {
+        return None;
+    }
+    let mode = match planning.map(|gate| fact_gate::plan_verdict_at(tool_name, gate, project_root, facts)) {
         None => mode,
-        Some(PlanVerdict::AsMode(mode)) => mode,
-        Some(PlanVerdict::Card) => {
+        Some(None) => return None,
+        Some(Some(PlanVerdict::AsMode(mode))) => mode,
+        Some(Some(PlanVerdict::Card)) => {
             eprintln!("[permission] asking the user: {tool_name} (plan mode)");
             return None;
         }
-        Some(PlanVerdict::Defer) => {
+        Some(Some(PlanVerdict::Defer)) => {
             return Some(PlannedAnswer::plain(
                 &request,
                 PermissionDecision::Defer,
@@ -4205,11 +4427,11 @@ fn decide(request: GateRequest<'_>, judge: Judge<'_>) -> Option<PlannedAnswer> {
             )
         });
     }
-    if let (true, GateRoot::Local(path)) = (defers_to_the_cli, project_root) {
-        // A saved rule still answers what it answers today, and says so on the row; it is the only
-        // allow this host gives an Auto call on such a session. Asked here rather than through
-        // `classify_with_rules`, whose classifier half is exactly what is not consulted.
-        let planned = match agent::rule_that_allows(tool_name, input, path, rules) {
+    // A saved rule still answers what it answers today, and says so on the row; it is the only
+    // allow this host gives an Auto call on such a session. Asked here rather than through
+    // `classify_with_rules`, whose classifier half is exactly what is not consulted.
+    let deferral = |rule: Option<String>| -> PlannedAnswer {
+        match rule {
             Some(rule) => PlannedAnswer {
                 by_rule: call.clone().map(|id| RuleAnsweredForYou {
                     tool_use_id: id,
@@ -4235,17 +4457,29 @@ fn decide(request: GateRequest<'_>, judge: Judge<'_>) -> Option<PlannedAnswer> {
                 format!("left to the CLI's auto mode: {tool_name}"),
                 format!("leave to the CLI's auto mode {tool_name}"),
             ),
-        };
+        }
+    };
+    if let (true, GateRoot::Local(path)) = (defers_to_the_cli, project_root) {
+        let planned = deferral(agent::rule_that_allows(tool_name, input, path, rules));
         // A display fact about the call, not a grant.
         return Some(PlannedAnswer {
             creates_file: creates_file(),
             ..planned
         });
     }
+    if let Some(fact) = fact_gate::remote_deferral(may_defer, project_root, facts)? {
+        return Some(deferral(agent::rule_that_allows_with_fact(
+            tool_name, input, fact, rules,
+        )));
+    }
     let classification = match project_root {
         GateRoot::RemoteWithoutFacts => {
             agent::classify_without_a_boundary(tool_name, input, rules, mode == PermissionMode::Manual)
         }
+        GateRoot::RemoteWithFacts => match by_name {
+            Some(by_name) => by_name,
+            None => agent::classify_with_fact(tool_name, input, facts.get()?, rules, mode == PermissionMode::Manual),
+        },
         GateRoot::Local(path) if mode == PermissionMode::Manual => {
             agent::classify_in_manual(tool_name, input, path, rules)
         }
@@ -4277,6 +4511,9 @@ fn decide(request: GateRequest<'_>, judge: Judge<'_>) -> Option<PlannedAnswer> {
         .then(|| match project_root {
             GateRoot::Local(path) => agent::rule_that_allows(tool_name, input, path, rules),
             GateRoot::RemoteWithoutFacts => None,
+            GateRoot::RemoteWithFacts => facts
+                .get()
+                .and_then(|fact| agent::rule_that_allows_with_fact(tool_name, input, fact, rules)),
         })
         .flatten();
     let by_rule = call.clone().zip(rule).map(|(id, rule)| RuleAnsweredForYou {
@@ -4297,6 +4534,54 @@ fn decide(request: GateRequest<'_>, judge: Judge<'_>) -> Option<PlannedAnswer> {
             format!("auto-answer {tool_name}"),
         )
     })
+}
+
+/// The decision `decide_in_phase` makes for `request` with the server's first fact `first` in place of the fact the
+/// judge holds: once a fresh check is over, an answer goes out only where this gives the decision planned too.
+fn decide_again(
+    request: GateRequest<'_>,
+    phase: RequestPhase,
+    in_plan: PlanGate,
+    base: Judge<'_>,
+    first: &agent::GateFact,
+) -> Option<PermissionDecision> {
+    let read = FactRead::new(Some(first));
+    decide_in_phase(request, phase, in_plan, |planning| Judge {
+        planning,
+        facts: &read,
+        ..base
+    })
+    .map(|again| again.decision)
+}
+
+/// `decide` for a request judged as `phase` says: as the CLI made it outside plan mode, in it (`in_plan`), or in
+/// either, where only an answer both give is given and anything else is a card. A deferral is no safe middle:
+/// outside plan mode a Manual tab's deferral would reach an auto CLI's classifier.
+fn decide_in_phase<'a>(
+    request: GateRequest<'_>,
+    phase: RequestPhase,
+    in_plan: PlanGate,
+    judge: impl Fn(Option<PlanGate>) -> Judge<'a>,
+) -> Option<PlannedAnswer> {
+    match phase {
+        RequestPhase::Executing => decide(request, judge(None)),
+        RequestPhase::Planning => decide(request, judge(Some(in_plan))),
+        RequestPhase::Uncertain => {
+            let executing = decide(request, judge(None));
+            let planning = decide(request, judge(Some(in_plan)));
+            match (executing, planning) {
+                (Some(executing), Some(planning)) if executing.decision == planning.decision => Some(planning),
+                (None, _) | (_, None) => None,
+                (Some(_), Some(_)) => {
+                    eprintln!(
+                        "[permission] asking the user: {} (plan mode may or may not apply)",
+                        request.tool_name
+                    );
+                    None
+                }
+            }
+        }
+    }
 }
 
 /// The calls the user approved on a card in one tab, each kept with the tool and the exact input the
@@ -4337,6 +4622,10 @@ pub struct HumanApprovals {
     /// a resolution can be folded before its answer's reply is read. Pruned to the answers still tracked.
     #[serde(skip)]
     resolved_out: ResolvedWhileOut,
+    /// A remote tab's requests waiting for the server's fact, or for the fresh check before an automatic answer. A
+    /// copy carries none, so a move does not take them: the window the tab lands in judges them again.
+    #[serde(skip)]
+    facts: FactWaits,
 }
 
 /// The agent's resolutions of requests whose host answer is still tracked. A copy carries none, as with
@@ -4378,6 +4667,13 @@ struct LostAnswer {
 impl HostSendsLost {
     fn ids(&self) -> impl Iterator<Item = &String> {
         self.0.iter().map(|lost| &lost.planned.permission_id)
+    }
+
+    /// Takes out the lost answers to `permission_id`; whether there were any.
+    fn take(&mut self, permission_id: &str) -> bool {
+        let before = self.0.len();
+        self.0.retain(|lost| lost.planned.permission_id != permission_id);
+        self.0.len() != before
     }
 }
 
@@ -4424,6 +4720,22 @@ impl HumanApprovals {
     /// answered, so no page draws them, the bypass sweep skips them and no card answer is taken.
     pub(crate) fn host_send_ids(&self) -> impl Iterator<Item = &String> {
         self.host_sends.0.iter().map(|sent| &sent.planned.permission_id)
+    }
+
+    /// The requests a remote tab holds for the server's fact or for a fresh check: drawn as no card.
+    pub(crate) fn fact_wait_ids(&self) -> impl Iterator<Item = &String> {
+        self.facts.ids()
+    }
+
+    /// How long until a remote tab's wait for a fact or a fresh check runs out, `None` when none waits.
+    pub(crate) fn next_fact_release(&self) -> Option<std::time::Duration> {
+        self.facts.next_release(std::time::Instant::now())
+    }
+
+    /// Moves the start of `permission_id`'s wait for its fact back to `since`. For tests of the time limit.
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn held_for_fact_since(&mut self, permission_id: &str, since: std::time::Instant) {
+        self.facts.held_for_fact_since(permission_id, since);
     }
 
     /// Whether a host answer is still on its way; the panel's tick then keeps reading until its reply
@@ -4943,17 +5255,28 @@ impl BackendGreeting {
         Self::with_resumable(kind, project_dir, resumable)
     }
 
-    /// A remote tab never offers this machine's session records and reads none of them.
+    /// A remote tab never offers this machine's session records and reads none of them: what it offers is
+    /// `server_sessions`, the sessions its server's transcripts hold, listed by a worker beforehand
+    /// ([`crate::remote_project::resume::ServerSessions`]; empty while it is not listed yet and when the helper
+    /// has no `transcripts`). A local root ignores `server_sessions`.
     pub fn for_agent_at_root(
         kind: BackendKind,
         agent: &AgentId,
         project_dir: PathBuf,
         titles: Titles<'_>,
         root: GateRoot<'_>,
+        server_sessions: Vec<ResumableSession>,
     ) -> Self {
         match root {
             GateRoot::Local(_) => Self::for_agent_titled(kind, agent, project_dir, titles),
-            GateRoot::RemoteWithoutFacts => Self::with_resumable(kind, project_dir, Vec::new()),
+            GateRoot::RemoteWithoutFacts | GateRoot::RemoteWithFacts => {
+                let offered = if agent.is_external() {
+                    Vec::new()
+                } else {
+                    server_sessions
+                };
+                Self::with_resumable(kind, project_dir, offered)
+            }
         }
     }
 
@@ -9379,6 +9702,8 @@ mod plan_tests {
 }
 
 #[cfg(test)]
+mod fact_tests;
+#[cfg(test)]
 mod image_tests;
 
 #[cfg(test)]
@@ -9947,11 +10272,33 @@ mod eitri_gate_tests {
         };
         for (name, remote_arm) in [
             ("gate_root_is_a_boundary", "GateRoot::RemoteWithoutFacts=>false,"),
+            ("gate_root_is_a_boundary", "GateRoot::RemoteWithFacts=>false,"),
+            ("decide", "GateRoot::RemoteWithoutFacts|GateRoot::RemoteWithFacts=>None,"),
             ("decide", "GateRoot::RemoteWithoutFacts=>None,"),
             ("decide", "GateRoot::RemoteWithoutFacts=>agent::classify_without_a_boundary(tool_name,input,rules,mode==PermissionMode::Manual),"),
+            ("decide", "GateRoot::RemoteWithFacts=>matchby_name{Some(by_name)=>by_nameNone=>agent::classify_with_fact(tool_name,input,facts.get()?,rules,mode==PermissionMode::Manual)"),
+            ("decide", "GateRoot::RemoteWithFacts=>facts.get().and_then(|fact|agent::rule_that_allows_with_fact(tool_name,input,fact,rules))"),
         ] {
             let (_, body) = function_in(&backend, name);
             assert!(compact(&body).contains(&compact(remote_arm)), "{name}: remote branch must remain free of local facts");
+        }
+        // The fact steps `decide` and the drain call (`fact_gate.rs`) name the remote arm the same way.
+        let gate = vec![source_scan::read_required("core/src/agent_backend/fact_gate.rs")];
+        for (name, remote_arm) in [
+            (
+                "decided_by_name",
+                "GateRoot::RemoteWithFacts=>agent::permission_policy::classify_by_name(tool_name,input)",
+            ),
+            (
+                "plan_verdict_at",
+                "GateRoot::RemoteWithFactsifat(true)!=at(false)=>facts.get().map(|fact|at(fact.root_is_boundary))",
+            ),
+        ] {
+            let (_, body) = function_in(&gate, name);
+            assert!(
+                compact(&body).contains(&compact(remote_arm)),
+                "{name}: remote branch must remain free of local facts"
+            );
         }
         // Blank local match arms, then inspect everything a remote request can reach in the common body.
         fn without_local_arms(body: &str) -> (String, usize) {
@@ -10028,19 +10375,61 @@ mod eitri_gate_tests {
         assert_eq!(source_scan::calls(&events, "collect"), 1);
         let (_, offers) = function_in(&tabs, "refresh_offers");
         let guard = offers
-            .find("if tab.is_remote()")
-            .expect("remote tabs must skip rule offers");
+            .find("if tab.is_remote() && !server_facts")
+            .expect("remote tabs without the server's facts must skip rule offers");
         let open = guard + offers[guard..].find('{').unwrap();
         let guarded = source_scan::braced(&offers, open);
         assert!(guarded.contains("return had;"));
         assert!(guard + guarded.len() < offers.find("permission_rules::offer").unwrap());
+        // With them, a card's offer is judged from its fact alone: the laptop's root is not named on that side.
+        let facts_side = &offers[offers.find("true => facts.get(id)").expect("the facts' offer")..];
+        let facts_side = &facts_side[..facts_side.find("false =>").unwrap()];
+        assert!(facts_side.contains("permission_rules::offer_after("));
+        assert!(!facts_side.contains("project_root"));
+        for name in ["answer_what_needs_no_human", "retry_fact_waits"] {
+            let (_, answer) = function_in(&backend, name);
+            for forbidden in ["std::fs", "Identity::current", "resolve_in_root", "write_over_no_file"] {
+                assert!(
+                    !answer.contains(forbidden),
+                    "{name} reads local facts through {forbidden}"
+                );
+            }
+        }
         let (_, answer) = function_in(&backend, "answer_what_needs_no_human");
         assert!(answer.contains("gate_root_is_a_boundary(project_root)"));
-        for forbidden in ["std::fs", "Identity::current", "resolve_in_root", "write_over_no_file"] {
-            assert!(
-                !answer.contains(forbidden),
-                "answer path reads local facts through {forbidden}"
-            );
+        // The policy half a remote tab with the server's facts calls, and what keeps its waits, read nothing here
+        // either: no file, no boundary, no identity, no file's existence.
+        let halves = vec![source_scan::read_required("agent/src/permission_policy/server_fact.rs")];
+        let waits = source_scan::read_required("core/src/agent_backend/fact_waits.rs");
+        let steps = source_scan::read_required("core/src/agent_backend/fact_gate.rs");
+        let mut bodies: Vec<(String, String)> = ["classify_with_fact", "rule_that_allows_with_fact", "disk_answer"]
+            .into_iter()
+            .map(|name| (name.to_string(), function_in(&halves, name).1))
+            .collect();
+        bodies.push(("fact_waits.rs".to_string(), source_scan::production_text(&waits.text)));
+        bodies.push(("fact_gate.rs".to_string(), source_scan::production_text(&steps.text)));
+        for (name, body) in bodies {
+            for forbidden in [
+                "std::fs",
+                "Identity::current",
+                "symlink_metadata",
+                "canonicalize",
+                "try_exists",
+            ] {
+                assert!(
+                    !body.contains(forbidden),
+                    "{name} reads local facts through {forbidden}"
+                );
+            }
+            for forbidden in [
+                "boundary",
+                "checked_root",
+                "resolve_in_root",
+                "write_over_no_file",
+                "root_is_a_boundary",
+            ] {
+                assert_eq!(source_scan::calls(&body, forbidden), 0, "{name} calls {forbidden}");
+            }
         }
     }
 
@@ -10098,6 +10487,8 @@ mod eitri_gate_tests {
                 approvals: &HumanApprovals::default(),
                 planning: None,
                 places: &agent::EitriPlaces::default(),
+                may_defer: false,
+                facts: &FactRead::new(None),
             },
         )
     }
@@ -10391,6 +10782,8 @@ mod eitri_gate_tests {
                 approvals: &HumanApprovals::default(),
                 planning,
                 places,
+                may_defer: false,
+                facts: &FactRead::new(None),
             },
         )
     }
@@ -10486,6 +10879,8 @@ mod eitri_gate_tests {
                 approvals: &HumanApprovals::default(),
                 planning: None,
                 places: &agent::EitriPlaces::default(),
+                may_defer: false,
+                facts: &FactRead::new(None),
             },
         )
         .map(|planned| planned.sent)

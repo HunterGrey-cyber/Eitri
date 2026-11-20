@@ -635,13 +635,18 @@ impl AgentConversation {
 
     /// Continues the CLI's own session `provider_session_id` on a server through a new sidecar
     /// (`provider`), with the same resume request a local tab sends, in `root` as recorded. The
-    /// transcript lives on the server, so nothing here reads or leases one on this machine.
+    /// transcript lives on the server, so nothing here reads or leases one on this machine, and nothing
+    /// here asks the server for it: `seed` is the history the caller built from the transcript it fetched
+    /// (`history::seed_from_tail`), which the conversation starts from; `None` starts it empty. The seed's
+    /// conversation id is `conversation_id_for_cwd` of `root`, the id Eitri's own copy of the history is
+    /// kept under.
     pub fn resume_remote_with_tools(
         provider: Arc<dyn AgentProvider + Send + Sync>,
         root: &Path,
         provider_session_id: &str,
         project: ProjectTrust,
         client_tools: Option<ClientToolSet>,
+        seed: Option<crate::AgentSessionProjection>,
     ) -> Result<Self, ConversationError> {
         let cwd = Self::check_remote_root(root)?;
         let capabilities = provider.capabilities();
@@ -659,7 +664,7 @@ impl AgentConversation {
             project,
             client_tools,
         })?;
-        let mut conversation = Self::assembled(
+        let mut conversation = Self::assembled_from(
             provider,
             None,
             PROVIDER_NAME,
@@ -667,6 +672,7 @@ impl AgentConversation {
             capabilities,
             info,
             session_id,
+            seed.unwrap_or_default(),
         );
         conversation.declared_client_tools = declared_client_tools;
         Ok(conversation)
@@ -736,12 +742,36 @@ impl AgentConversation {
         info: ProviderInfo,
         session_id: String,
     ) -> Self {
+        Self::assembled_from(
+            provider,
+            external,
+            provider_name,
+            canonical_cwd,
+            capabilities,
+            info,
+            session_id,
+            crate::AgentSessionProjection::default(),
+        )
+    }
+
+    /// [`assembled`](Self::assembled) over a `seed` the caller built (the history a session continued on another
+    /// machine starts from; a fresh session's is empty). What the CLI's reports are judged against is declared on
+    /// it here, before the first event folds.
+    #[allow(clippy::too_many_arguments)]
+    fn assembled_from(
+        provider: Arc<dyn AgentProvider + Send + Sync>,
+        external: Option<Arc<dyn ExternalProvider + Send + Sync>>,
+        provider_name: &'static str,
+        canonical_cwd: PathBuf,
+        capabilities: ProviderCapabilities,
+        info: ProviderInfo,
+        session_id: String,
+        mut seed: crate::AgentSessionProjection,
+    ) -> Self {
         let conversation_id = conversation_id_for_cwd(&canonical_cwd);
         let resumable = external.as_ref().map_or(capabilities.resume, |e| e.resumes());
         // A fresh session has nothing to restore. `create` never reads either history record -- not even
-        // to check -- because a conversation that has not happened yet cannot have one. What its CLI's
-        // reports are judged against is declared before the first event folds.
-        let mut seed = crate::AgentSessionProjection::default();
+        // to check -- because a conversation that has not happened yet cannot have one.
         seed.offer_plan_mode(provider.cli_expectation());
         let ingest = ConversationIngest::start(
             Arc::clone(&provider),
@@ -1394,6 +1424,36 @@ impl AgentConversation {
     /// when nothing is wrong), `None` for a local one.
     pub fn link_state(&self) -> Option<crate::provider::RemoteLinkState> {
         self.provider.link_state()
+    }
+
+    /// The server's path fact for the pending gate request `permission_id` ([`AgentProvider::gate_fact`]).
+    pub fn gate_fact(&self, permission_id: &str) -> crate::gate_facts::GateFactState {
+        self.provider.gate_fact(permission_id)
+    }
+
+    /// The digest the pending gate request `permission_id` has now ([`AgentProvider::gate_fact_digest`]).
+    pub fn gate_fact_digest(&self, permission_id: &str) -> Option<[u8; 32]> {
+        self.provider.gate_fact_digest(permission_id)
+    }
+
+    /// The fresh check before an automatic answer ([`AgentProvider::check_fact`]); never waits.
+    pub fn check_fact(
+        &self,
+        permission_id: &str,
+        digest: [u8; 32],
+        done: Box<dyn FnOnce(crate::gate_facts::FreshFact) + Send>,
+    ) {
+        self.provider.check_fact(permission_id, digest, done);
+    }
+
+    /// The server's word on the tab's root ([`AgentProvider::gate_root_fact`]).
+    pub fn gate_root_fact(&self) -> Option<crate::gate_facts::RootFact> {
+        self.provider.gate_root_fact()
+    }
+
+    /// The root the server's facts are about, when the provider serves any ([`AgentProvider::gate_facts_root`]).
+    pub fn gate_facts_root(&self) -> Option<std::path::PathBuf> {
+        self.provider.gate_facts_root()
     }
 
     /// Marks this conversation, just taken up again from its server, as reading back history that the window
@@ -2092,6 +2152,7 @@ impl AgentConversation {
 
     /// Has `wake` called whenever something was folded for the UI to take (`ConversationIngest::set_ui_wake`).
     pub fn set_ui_wake(&self, wake: crate::ingestion::UiWake) {
+        self.provider.set_gate_fact_wake(wake.clone());
         self.ingest.set_ui_wake(wake);
     }
 

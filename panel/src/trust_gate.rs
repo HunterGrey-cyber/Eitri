@@ -1023,9 +1023,15 @@ impl TrustGate {
         self.remote.in_flight
     }
 
+    /// How many of `subject`'s server checks are queued or running.
+    #[cfg(test)]
+    pub(crate) fn server_checks_of(&self, subject: impl Into<Subject>) -> usize {
+        self.server_checks.get(&subject.into().key()).copied().unwrap_or(0)
+    }
+
     /// A check of `subject` that nothing waits on (a page that loaded refreshes `prefix i`'s row and
-    /// its question). A remote subject's is a scan of the server's tree, so none is queued while one of
-    /// its checks is queued or running: that one answers the row too.
+    /// its question; a remote tab taken up from the saved tabs has its project named). A remote subject's is a scan
+    /// of the server's tree, so none is queued while one of its checks is queued or running: that one answers too.
     pub(crate) fn refresh(&mut self, subject: impl Into<Subject>) {
         let subject = subject.into();
         if subject.is_remote() && self.server_checks.get(&subject.key()).is_some_and(|n| *n > 0) {
@@ -2900,6 +2906,10 @@ fn scan_on_server(remote: &RemotePlace, profile: &Profile) -> Result<Discovery, 
     };
     let (json, refusal) = match server {
         Server::Helper(client) => {
+            // The connection's Hello, held from now on, is what the window reads its helper's services from without
+            // calling the server (a tab taken up from the saved tabs may need it before anything else asked for it);
+            // a failure here leaves the scan to say what is wrong.
+            let _ = client.hello_capabilities();
             let answer = client
                 .trust_scan(&remote.root.root, &profile.key())
                 .map_err(|status| cannot(status.message().to_string()))?;

@@ -127,6 +127,7 @@ mod tests {
             ready: true,
             failure: None,
             exited_unix_ms: None,
+            started: None,
         };
         let file = run.join("sc-0123456789abcdef.pid");
         private_fs::write_private(&file, &serde_json::to_vec(&record).unwrap()).unwrap();

@@ -130,10 +130,69 @@ pub fn transcript_path(cwd: &str, provider_session_id: &str) -> std::io::Result<
     Ok(transcript_path_in(&claude_projects_dir()?, cwd, provider_session_id))
 }
 
-fn transcript_path_in(projects: &Path, cwd: &str, provider_session_id: &str) -> PathBuf {
+/// The transcript of `provider_session_id` for the project at `cwd` under `projects`, the folder `list_session_files`
+/// lists.
+pub fn transcript_path_in(projects: &Path, cwd: &str, provider_session_id: &str) -> PathBuf {
     projects
         .join(sanitize_cwd_for_claude_projects(cwd))
         .join(format!("{provider_session_id}.jsonl"))
+}
+
+/// One session transcript in a project's folder, as a listing shows it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionFile {
+    pub provider_session_id: String,
+    pub len: u64,
+    /// Modification time, milliseconds since the Unix epoch (0 when the system gives none).
+    pub modified_ms: u64,
+}
+
+/// The session transcripts of the project at `cwd` under `projects_dir`, newest first (equal times in id order), at
+/// most `max`. Only regular files named `<uuid>.jsonl` count, the uuid in its lowercase hyphenated form (so the name
+/// cannot be a path, another spelling of an id, or a sub-agent's `agent-*.jsonl` log); a link, a directory or anything
+/// else is skipped. A project with no folder has no sessions. An entry the directory listing or the file's metadata
+/// fails on is skipped too: the answer is what could be read, not an error. A caller that wants to know whether the
+/// folder holds more than `max` asks for one more than it will show and compares the length.
+pub fn list_session_files(projects_dir: &Path, cwd: &str, max: usize) -> std::io::Result<Vec<SessionFile>> {
+    let dir = projects_dir.join(sanitize_cwd_for_claude_projects(cwd));
+    let entries = match std::fs::read_dir(&dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error),
+    };
+    let mut found = Vec::new();
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(id) = name.to_str().and_then(|name| name.strip_suffix(".jsonl")) else {
+            continue;
+        };
+        if !is_canonical_session_uuid(id) {
+            continue;
+        }
+        if !entry.file_type().is_ok_and(|kind| kind.is_file()) {
+            continue;
+        }
+        let Ok(meta) = entry.metadata() else { continue };
+        let modified_ms = meta
+            .modified()
+            .ok()
+            .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+            .map_or(0, |since| u64::try_from(since.as_millis()).unwrap_or(u64::MAX));
+        found.push(SessionFile {
+            provider_session_id: id.to_owned(),
+            len: meta.len(),
+            modified_ms,
+        });
+    }
+    found.sort_by(|a, b| {
+        b.modified_ms
+            .cmp(&a.modified_ms)
+            .then_with(|| a.provider_session_id.cmp(&b.provider_session_id))
+    });
+    if found.len() > max {
+        found.drain(max..);
+    }
+    Ok(found)
 }
 
 /// A short stability probe before a resume, which is refused while the transcript is still being
@@ -201,8 +260,6 @@ pub const AI_TITLE_TAIL_BYTES: u64 = 64 * 1024;
 /// JSON, a non-string or blank `aiTitle` -- is `None`, never an `Err`. The caller has three levels
 /// of ladder and nothing it could do with an error.
 pub fn newest_ai_title(path: &Path) -> Option<String> {
-    use std::io::{Read, Seek, SeekFrom};
-
     // **Asked before the open, because `open(2)` on a FIFO blocks until a writer appears** and this
     // function runs on the GTK main loop. A `stat` does not block; a blocking open here would
     // freeze the window while the picker is being built, with no diagnostic and nothing to cancel.
@@ -216,7 +273,15 @@ pub fn newest_ai_title(path: &Path) -> Option<String> {
     // to exactly the case this exists for. See `tests::OPEN_ATTEMPTS`.
     #[cfg(test)]
     tests::note_open_attempt(path);
-    let mut file = std::fs::File::open(path).ok()?;
+    ai_title_in(std::fs::File::open(path).ok()?)
+}
+
+/// [`newest_ai_title`] over a transcript the caller has already opened, for a caller that opens it its own way (the
+/// helper opens without following a link and without blocking, and has checked the file is a regular one). Reads the
+/// same last [`AI_TITLE_TAIL_BYTES`] and answers `None` in the same cases.
+pub fn ai_title_in(mut file: std::fs::File) -> Option<String> {
+    use std::io::{Read, Seek, SeekFrom};
+
     let len = file.metadata().ok()?.len();
     // A file shorter than the window is read whole, and then its first line is REAL and must be
     // kept. Dropping it unconditionally would cost the title of every short session.
@@ -263,6 +328,12 @@ pub fn newest_ai_title(path: &Path) -> Option<String> {
     // Reused rather than reimplemented, so a title from the CLI can never render differently from
     // one this project recorded itself.
     crate::persistence::title_from_prompt(&newest?)
+}
+
+/// Whether `id` is a session id in the one form the CLI names its transcripts by: a UUID, lowercase and hyphenated.
+/// Every other spelling of the same UUID is refused, so one session never has two names.
+pub fn is_canonical_session_uuid(id: &str) -> bool {
+    uuid::Uuid::parse_str(id).is_ok_and(|parsed| parsed.hyphenated().to_string() == id)
 }
 
 #[cfg(test)]
@@ -428,6 +499,88 @@ mod tests {
         .unwrap();
         assert!(!stable);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ---- list_session_files ------------------------------------------------------------------
+
+    #[test]
+    fn list_session_files_skips_agent_logs_and_bad_names() {
+        let projects = std::env::temp_dir().join(format!("agent-list-sessions-{}", uuid::Uuid::new_v4()));
+        let dir = projects.join(sanitize_cwd_for_claude_projects("/srv/project"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let old = "11111111-1111-4111-8111-111111111111";
+        let new = "22222222-2222-4222-8222-222222222222";
+        std::fs::write(dir.join(format!("{old}.jsonl")), "a\n").unwrap();
+        std::fs::write(dir.join(format!("{new}.jsonl")), "bcd\n").unwrap();
+        for (id, secs) in [(old, 100), (new, 200)] {
+            std::fs::File::options()
+                .write(true)
+                .open(dir.join(format!("{id}.jsonl")))
+                .unwrap()
+                .set_modified(std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(secs))
+                .unwrap();
+        }
+        for bad in [
+            "agent-a1b2c3d.jsonl",
+            "not-a-uuid.jsonl",
+            "22222222-2222-4222-8222-222222222222.json",
+            "22222222-2222-4222-8222-22222222222.jsonl",
+            "22222222222242228222222222222222.jsonl",
+            "AAAAAAAA-AAAA-4AAA-8AAA-AAAAAAAAAAAA.jsonl",
+            "..jsonl",
+        ] {
+            std::fs::write(dir.join(bad), "x\n").unwrap();
+        }
+        std::fs::create_dir(dir.join("33333333-3333-4333-8333-333333333333.jsonl")).unwrap();
+        std::os::unix::fs::symlink(
+            dir.join(format!("{new}.jsonl")),
+            dir.join("44444444-4444-4444-8444-444444444444.jsonl"),
+        )
+        .unwrap();
+
+        let listed = list_session_files(&projects, "/srv/project", 10).unwrap();
+        assert_eq!(
+            listed,
+            vec![
+                SessionFile {
+                    provider_session_id: new.to_owned(),
+                    len: 4,
+                    modified_ms: 200_000
+                },
+                SessionFile {
+                    provider_session_id: old.to_owned(),
+                    len: 2,
+                    modified_ms: 100_000
+                },
+            ]
+        );
+        assert_eq!(list_session_files(&projects, "/srv/project", 1).unwrap().len(), 1);
+        assert!(list_session_files(&projects, "/srv/other", 10).unwrap().is_empty());
+        let _ = std::fs::remove_dir_all(&projects);
+    }
+
+    #[test]
+    fn list_session_files_orders_equal_times_by_id_and_cuts_after_ordering() {
+        let projects = std::env::temp_dir().join(format!("agent-list-ties-{}", uuid::Uuid::new_v4()));
+        let dir = projects.join(sanitize_cwd_for_claude_projects("/srv/project"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let ids = [
+            "cccccccc-cccc-4ccc-8ccc-cccccccccccc",
+            "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+            "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+        ];
+        for id in ids {
+            let file = std::fs::File::create(dir.join(format!("{id}.jsonl"))).unwrap();
+            file.set_modified(std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(50))
+                .unwrap();
+        }
+        let listed = list_session_files(&projects, "/srv/project", 10).unwrap();
+        let order: Vec<&str> = listed.iter().map(|file| file.provider_session_id.as_str()).collect();
+        assert_eq!(order, vec![ids[1], ids[2], ids[0]]);
+        let cut = list_session_files(&projects, "/srv/project", 2).unwrap();
+        let order: Vec<&str> = cut.iter().map(|file| file.provider_session_id.as_str()).collect();
+        assert_eq!(order, vec![ids[1], ids[2]]);
+        let _ = std::fs::remove_dir_all(&projects);
     }
 
     // ---- newest_ai_title ---------------------------------------------------------------------

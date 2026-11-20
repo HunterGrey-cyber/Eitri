@@ -82,7 +82,7 @@ pub struct ReadRules {
 
 /// The most a settings file may be: a project's own files are read before anyone has been asked about it, so what they
 /// may cost has a bound that does not depend on what they are.
-const FILE_MAX: u64 = 4 * 1024 * 1024;
+pub const FILE_MAX: u64 = 4 * 1024 * 1024;
 /// The most bytes of `Read` patterns, all files together, and of one pattern.
 const PATTERN_BYTES_MAX: usize = 256 * 1024;
 const PATTERN_MAX: usize = 4096;
@@ -171,61 +171,120 @@ fn main_checkout_of(dir: &Path) -> Option<PathBuf> {
     (common.file_name()? == ".git").then(|| common.parent().map(Path::to_path_buf))?
 }
 
+/// A settings file the CLI reads: where, and whether a file that cannot be read closes the reader (one of the
+/// project's own or the account's always does, one found in a folder above only when the reason is not that we may not
+/// look).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SettingsFile {
+    pub path: PathBuf,
+    pub strict: bool,
+}
+
+/// What reading one settings file gave.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FileRead {
+    Bytes(Vec<u8>),
+    /// Nothing is there, or the file is one that may not be looked at and does not close the reader.
+    Missing,
+    /// It is there and could not be read: the words for a person.
+    Failed(String),
+}
+
+/// Every settings file that bears on a project at `root`, in the order they are read: the user tier (`config_dir`,
+/// the account's: `settings.json`, `settings.local.json`, the server-managed `remote-settings.json`), the project's
+/// `.claude/settings.json` and `settings.local.json` in the project's folder, in every folder above it (the CLI keeps
+/// the local file at the repository's root, and a session opened in a subfolder is under it) and in the checkout a
+/// linked worktree belongs to, and the managed policy files of Linux and macOS. The folders are looked at on the
+/// machine this runs on.
+pub fn files_to_read(root: &Path, config_dir: Option<&Path>) -> Vec<SettingsFile> {
+    let mut files: Vec<SettingsFile> = Vec::new();
+    let mut push = |path: PathBuf, strict: bool| files.push(SettingsFile { path, strict });
+    if let Some(dir) = config_dir {
+        for name in ["settings.json", "settings.local.json", "remote-settings.json"] {
+            push(dir.join(name), true);
+        }
+    }
+    let mut dirs: Vec<PathBuf> = root.ancestors().take(ANCESTORS_MAX).map(Path::to_path_buf).collect();
+    for dir in dirs.clone() {
+        if let Some(main) = main_checkout_of(&dir) {
+            dirs.extend(main.ancestors().take(ANCESTORS_MAX).map(Path::to_path_buf));
+        }
+    }
+    let mut seen: Vec<PathBuf> = Vec::new();
+    for dir in dirs {
+        if seen.contains(&dir) {
+            continue;
+        }
+        let own = dir == root;
+        for name in ["settings.json", "settings.local.json"] {
+            // The project's own files must be readable; a folder above it that denies us is one the CLI cannot read.
+            push(dir.join(".claude").join(name), own);
+        }
+        seen.push(dir);
+    }
+    for managed in MANAGED_DIRS {
+        push(Path::new(managed).join("managed-settings.json"), true);
+        if let Ok(entries) = std::fs::read_dir(Path::new(managed).join("managed-settings.d")) {
+            let mut found: Vec<PathBuf> = entries
+                .flatten()
+                .map(|entry| entry.path())
+                .filter(|path| path.extension().is_some_and(|ext| ext == "json"))
+                .collect();
+            found.sort();
+            for path in found {
+                push(path, true);
+            }
+        }
+    }
+    files
+}
+
+/// One settings file read on this machine, bounded by [`FILE_MAX`]. A failure that would not close the reader (a
+/// folder above the project that denies us) is [`FileRead::Missing`], so [`ReadRules::from_reads`] needs no tier.
+pub fn read_settings(file: &SettingsFile) -> FileRead {
+    match read_settings_file(&file.path) {
+        Ok(Some(bytes)) => FileRead::Bytes(bytes),
+        Ok(None) => FileRead::Missing,
+        Err(error) if closes(file.strict, &error) => FileRead::Failed(error.why),
+        Err(_) => FileRead::Missing,
+    }
+}
+
 impl ReadRules {
-    /// The rules of every tier for a project at `root`, read from the files, each read wherever the CLI may: the
-    /// user tier (`config_dir`, the account's: `settings.json`, `settings.local.json`, the server-managed
-    /// `remote-settings.json`), the project's `.claude/settings.json` and `settings.local.json` in the project's
-    /// folder, in every folder above it (the CLI keeps the local file at the repository's root, and a session opened in
-    /// a subfolder is under it) and in the checkout a linked worktree belongs to, and the managed policy files of Linux
-    /// and macOS. With no `config_dir` there is no user tier to read and the reader is closed.
+    /// The rules of every tier for a project at `root`, read from the files on this machine: [`files_to_read`] names
+    /// them and [`read_settings`] reads each, and [`ReadRules::from_reads`] builds the rules. With no `config_dir`
+    /// there is no user tier to read and the reader is closed.
     pub fn load(root: &Path, config_dir: Option<&Path>, home: Option<&Path>) -> ReadRules {
+        let reads = files_to_read(root, config_dir).into_iter().map(|file| {
+            let read = read_settings(&file);
+            (file, read)
+        });
+        ReadRules::from_reads(root, home, config_dir.is_some(), reads.collect())
+    }
+
+    /// The rules from settings files already read, wherever they were read: `reads` pairs each file of
+    /// [`files_to_read`], in that order, with what reading it gave. `config_dir_known` is false when the account's
+    /// directory is not known, which closes the reader. A [`FileRead::Failed`] closes it whatever the file's tier:
+    /// the reader of the files drops the failures that do not close (see [`read_settings`]). Bytes longer than
+    /// [`FILE_MAX`] close it too, so the bound holds wherever the bytes were read.
+    pub fn from_reads(
+        root: &Path,
+        home: Option<&Path>,
+        config_dir_known: bool,
+        reads: Vec<(SettingsFile, FileRead)>,
+    ) -> ReadRules {
         let mut rules = ReadRules::default();
-        // (file, whether a file that cannot be read closes the reader)
-        let mut files: Vec<(PathBuf, bool)> = Vec::new();
-        match config_dir {
-            Some(dir) => {
-                for name in ["settings.json", "settings.local.json", "remote-settings.json"] {
-                    files.push((dir.join(name), true));
+        if !config_dir_known {
+            rules.close(Path::new("the account's settings directory"), "it is not known");
+        }
+        for (file, read) in reads {
+            match read {
+                FileRead::Bytes(bytes) if bytes.len() as u64 > FILE_MAX => {
+                    rules.close(&file.path, &format!("it is larger than {} MiB", FILE_MAX / 1024 / 1024))
                 }
-            }
-            None => rules.close(Path::new("the account's settings directory"), "it is not known"),
-        }
-        let mut dirs: Vec<PathBuf> = root.ancestors().take(ANCESTORS_MAX).map(Path::to_path_buf).collect();
-        for dir in dirs.clone() {
-            if let Some(main) = main_checkout_of(&dir) {
-                dirs.extend(main.ancestors().take(ANCESTORS_MAX).map(Path::to_path_buf));
-            }
-        }
-        let mut seen: Vec<PathBuf> = Vec::new();
-        for dir in dirs {
-            if seen.contains(&dir) {
-                continue;
-            }
-            let own = dir == root;
-            for name in ["settings.json", "settings.local.json"] {
-                // The project's own files must be readable; a folder above it that denies us is one the CLI cannot read.
-                files.push((dir.join(".claude").join(name), own));
-            }
-            seen.push(dir);
-        }
-        for managed in MANAGED_DIRS {
-            files.push((Path::new(managed).join("managed-settings.json"), true));
-            if let Ok(entries) = std::fs::read_dir(Path::new(managed).join("managed-settings.d")) {
-                let mut found: Vec<PathBuf> = entries
-                    .flatten()
-                    .map(|entry| entry.path())
-                    .filter(|path| path.extension().is_some_and(|ext| ext == "json"))
-                    .collect();
-                found.sort();
-                files.extend(found.into_iter().map(|path| (path, true)));
-            }
-        }
-        for (file, strict) in files {
-            match read_settings_file(&file) {
-                Ok(Some(bytes)) => rules.add_settings(&bytes, root, home, &file),
-                Ok(None) => {}
-                Err(error) if closes(strict, &error) => rules.close(&file, &error.why),
-                Err(_) => {}
+                FileRead::Bytes(bytes) => rules.add_settings(&bytes, root, home, &file.path),
+                FileRead::Missing => {}
+                FileRead::Failed(why) => rules.close(&file.path, &why),
             }
         }
         rules
@@ -313,8 +372,13 @@ impl ReadRules {
 
     /// The reader of a caller that could not read the settings at all: nothing is told while it holds.
     pub fn unavailable() -> ReadRules {
+        ReadRules::unavailable_because("the settings were not read in time")
+    }
+
+    /// A reader that tells nothing, for `why`: the settings could not be had at all (a server that did not answer).
+    pub fn unavailable_because(why: &str) -> ReadRules {
         ReadRules {
-            unreadable: Some("the settings were not read in time".to_owned()),
+            unreadable: Some(why.to_owned()),
             ..ReadRules::default()
         }
     }
@@ -739,6 +803,85 @@ mod tests {
             format!(r#"{{"permissions":{{"deny":["{deny}"]}}}}"#),
         )
         .unwrap();
+    }
+
+    #[test]
+    fn load_equals_from_reads_over_the_same_files() {
+        let dir = crate::state_dirs::test_workspace_dir("read-deny-from-reads");
+        let root = dir.join("project");
+        let config = dir.join("config");
+        std::fs::create_dir_all(root.join(".claude")).unwrap();
+        std::fs::create_dir_all(&config).unwrap();
+        settings_file(&root, "settings.local.json", "Read(./a.env)");
+        std::fs::write(
+            config.join("settings.json"),
+            r#"{"permissions":{"deny":["Read(./b.env)"]}}"#,
+        )
+        .unwrap();
+        for config_dir in [Some(config.as_path()), None] {
+            let loaded = ReadRules::load(&root, config_dir, None);
+            let reads: Vec<(SettingsFile, FileRead)> = files_to_read(&root, config_dir)
+                .into_iter()
+                .map(|file| {
+                    let read = read_settings(&file);
+                    (file, read)
+                })
+                .collect();
+            assert!(reads.iter().any(|(_, read)| matches!(read, FileRead::Bytes(_))));
+            assert_eq!(loaded, ReadRules::from_reads(&root, None, config_dir.is_some(), reads));
+            // What both built is checked on its own terms, so two equal wrong answers do not pass.
+            assert!(loaded.denies(&root, &root.join("a.env")));
+            assert_eq!(
+                loaded.closed(),
+                config_dir
+                    .is_none()
+                    .then_some("the account's settings directory could not be read (it is not known)")
+            );
+            if config_dir.is_some() {
+                assert!(loaded.denies(&root, &root.join("b.env")));
+                assert!(!loaded.denies(&root, &root.join("open.txt")));
+            }
+        }
+        // Bytes sent from another machine act as bytes read here, and a failed read closes the reader.
+        let file = SettingsFile {
+            path: root.join(".claude/settings.json"),
+            strict: true,
+        };
+        let sent = FileRead::Bytes(br#"{"permissions":{"deny":["Read(./secret)"]}}"#.to_vec());
+        let rules = ReadRules::from_reads(&root, None, true, vec![(file.clone(), sent)]);
+        assert!(rules.denies(&root, &root.join("secret")));
+        let failed_text = format!("{} could not be read (no)", file.path.display());
+        let failed = ReadRules::from_reads(&root, None, true, vec![(file.clone(), FileRead::Failed("no".into()))]);
+        assert_eq!(failed.closed(), Some(failed_text.as_str()));
+        // A file nothing was found at adds no rule and no close, and a failure closes whatever the file's tier.
+        assert_eq!(
+            ReadRules::from_reads(&root, None, true, vec![(file.clone(), FileRead::Missing)]).closed(),
+            None
+        );
+        let lax = SettingsFile {
+            strict: false,
+            ..file.clone()
+        };
+        let failed = ReadRules::from_reads(&root, None, true, vec![(lax, FileRead::Failed("no".into()))]);
+        assert_eq!(failed.closed(), Some(failed_text.as_str()));
+        // Bytes past the bound close the reader whatever sent them.
+        let file = SettingsFile {
+            path: root.join(".claude/settings.json"),
+            strict: false,
+        };
+        let long = FileRead::Bytes(vec![b' '; FILE_MAX as usize + 1]);
+        let rules = ReadRules::from_reads(&root, None, true, vec![(file.clone(), long)]);
+        assert_eq!(
+            rules.closed(),
+            Some(format!("{} could not be read (it is larger than 4 MiB)", file.path.display()).as_str())
+        );
+        let mut exact = br#"{"permissions":{"deny":[]}}"#.to_vec();
+        exact.resize(FILE_MAX as usize, b' ');
+        assert!(
+            ReadRules::from_reads(&root, None, true, vec![(file, FileRead::Bytes(exact))])
+                .closed()
+                .is_none()
+        );
     }
 
     #[test]

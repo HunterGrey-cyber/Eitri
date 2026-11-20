@@ -13,7 +13,9 @@ use std::path::Path;
 
 use serde_json::Value;
 
-use crate::permission_policy::{bash_input_is_only_a_command, classify_permission_request, REPLACEABLE_BY_A_RULE};
+use crate::permission_policy::{
+    bash_input_is_only_a_command, classify_permission_request, Classification, REPLACEABLE_BY_A_RULE,
+};
 
 /// One `Bash(<words> *)` rule. `words` is never empty.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -238,7 +240,19 @@ pub fn offer(tool_name: &str, input: &Value, project_root: &Path) -> Option<Pref
     if tool_name != "Bash" {
         return None;
     }
-    let classification = classify_permission_request(tool_name, input, project_root);
+    offer_after(
+        tool_name,
+        input,
+        classify_permission_request(tool_name, input, project_root),
+    )
+}
+
+/// [`offer`] for a call the classifier already judged somewhere else (a remote tab's server judged it: the
+/// classification its fact gives with no rules and no mode). Reads nothing.
+pub fn offer_after(tool_name: &str, input: &Value, classification: Classification) -> Option<PrefixRule> {
+    if tool_name != "Bash" {
+        return None;
+    }
     if !classification.needs_a_human() || !REPLACEABLE_BY_A_RULE.contains(&classification.reason) {
         return None;
     }

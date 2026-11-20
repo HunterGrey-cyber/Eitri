@@ -31,6 +31,7 @@ pub(super) fn greeting_for_view(state: &AgentPanelState, view: ViewId) -> Backen
         state.project_dir.clone(),
         eitri_core::agent_backend::Titles::Cached(&state.titles),
         root,
+        state.remote_sessions.sessions_of(state.tab_of_page(view)),
     )
 }
 
@@ -106,21 +107,36 @@ pub(super) fn with_running_agents_sessions(
 /// to an extra view naming it, then every record open in no tab, each marked if another window holds
 /// its lease. Also each record listed with the title shown.
 pub(super) fn chooser_payload(state: &AgentPanelState, view: ViewId) -> (String, Vec<(String, Option<String>)>) {
-    if remote_page(state, view) {
+    chooser_payload_as(state, view, false)
+}
+
+/// [`chooser_payload`] as the rows of a chooser the page may have closed since: a list that arrived later is sent
+/// as an update, which the page lays over a chooser still open and drops otherwise.
+pub(super) fn chooser_update_payload(state: &AgentPanelState, view: ViewId) -> (String, Vec<(String, Option<String>)>) {
+    chooser_payload_as(state, view, true)
+}
+
+fn chooser_payload_as(state: &AgentPanelState, view: ViewId, update: bool) -> (String, Vec<(String, Option<String>)>) {
+    let remote = remote_page(state, view);
+    if remote && !super::remote_sessions::offers_transcripts(state) {
         return (
             eitri_core::agent_bridge::serialize_notice_for_js(REMOTE_RESUME_UNAVAILABLE),
             Vec::new(),
         );
     }
     // The records offered are the agent's of the tab the opening page shows, as the resume that
-    // follows starts in it.
+    // follows starts in it. A remote tab's are its server's sessions, as the last list found them.
     let agent = hello_agent(state, view);
-    let greeting = BackendGreeting::for_agent_titled(
-        state.backend_kind,
-        &agent,
-        state.project_dir.clone(),
-        eitri_core::agent_backend::Titles::Cached(&state.titles),
-    );
+    let greeting = if remote {
+        greeting_for_view(state, view)
+    } else {
+        BackendGreeting::for_agent_titled(
+            state.backend_kind,
+            &agent,
+            state.project_dir.clone(),
+            eitri_core::agent_backend::Titles::Cached(&state.titles),
+        )
+    };
     let lease_name = agent.record_name();
     let mut greeting = greeting;
     greeting.resumable = with_running_agents_sessions(
@@ -146,20 +162,24 @@ pub(super) fn chooser_payload(state: &AgentPanelState, view: ViewId) -> (String,
         })
         .collect();
     let canonical = state.canonical_project_dir.as_str();
+    // A session on a server holds no lease on this machine.
     let records = chooser_records(&greeting.resumable, &state.tabs.open_sessions(), |id| {
-        agent::lease::SessionLease::is_held(&lease_name, canonical, id).unwrap_or(false)
+        !remote && agent::lease::SessionLease::is_held(&lease_name, canonical, id).unwrap_or(false)
     });
     let listed = records
         .iter()
         .map(|r| (r.provider_session_id.clone(), r.title.clone()))
         .collect();
     // At the cap the next new session drops the oldest record; the list says so beside its count.
-    let limit = agent::conversation_is_full(&agent::conversation_id_for_cwd(std::path::Path::new(canonical)))
-        .then_some(agent::MAX_RECORDS_PER_CONVERSATION);
-    (
-        eitri_core::agent_bridge::serialize_chooser_for_js(&open, &records, limit),
-        listed,
-    )
+    let limit = (!remote
+        && agent::conversation_is_full(&agent::conversation_id_for_cwd(std::path::Path::new(canonical))))
+    .then_some(agent::MAX_RECORDS_PER_CONVERSATION);
+    let envelope = if update {
+        eitri_core::agent_bridge::serialize_chooser_update_for_js(&open, &records, limit)
+    } else {
+        eitri_core::agent_bridge::serialize_chooser_for_js(&open, &records, limit)
+    };
+    (envelope, listed)
 }
 
 /// The detail popover's envelope for `tab` (`prefix i`, `open_detail{tab}`).

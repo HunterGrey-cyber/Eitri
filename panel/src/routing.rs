@@ -223,17 +223,12 @@ pub(super) fn command_prompt_is_in(state: &AgentPanelState, view: ViewId) -> boo
     command.page.is_none() || typed_in == view || state.tabs.get(tab).is_none_or(|t| t.view_id() != typed_in)
 }
 
-/// The `root_note` envelope of `tab`'s own note, naming the tab, when it has one (a remote tab). A local tab has
-/// none: its page draws the window's note, told after every `hello`, so showing a local tab sends nothing and a
-/// dismissed window note stays dismissed. The page keeps a tab's note, and its Dismiss, per tab.
-pub(super) fn tab_root_note(state: &AgentPanelState, tab: TabId) -> Option<String> {
-    let t = state.tabs.get(tab)?;
-    let note = t.root_note()?;
-    Some(eitri_core::agent_bridge::serialize_tab_root_note_for_js(
-        tab,
-        &note,
-        t.root_note_dismissed(),
-    ))
+/// The `root_note` envelope of `tab`'s own note, naming the tab, for a remote tab (an empty text when it has none,
+/// which takes down one the page kept), recorded as told (`TabSet::shown_root_note`). A local tab has none: its page
+/// draws the window's note, told after every `hello`, so showing a local tab sends nothing and a dismissed window
+/// note stays dismissed. The page keeps a tab's note, and its Dismiss, per tab.
+pub(super) fn tab_root_note(state: &mut AgentPanelState, tab: TabId) -> Option<String> {
+    state.tabs.shown_root_note(tab)
 }
 
 /// The base page's `tabs`, then the active tab's own state (always, not only when stale), and the

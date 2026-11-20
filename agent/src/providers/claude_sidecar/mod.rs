@@ -12,6 +12,7 @@ mod effort_reply;
 #[cfg(target_os = "linux")]
 mod moving;
 mod plan_rpc;
+mod remote_facts;
 mod spawn;
 mod steer;
 mod system_prompt;
@@ -482,6 +483,8 @@ struct RemoteSide {
     asker: crate::remote_client::PendingAsker,
     /// How the session ended, once the helper said: written before its loss is queued.
     ending: Arc<Mutex<Option<crate::provider::RemoteEnding>>>,
+    /// The helper's path facts for the session's gate requests, when it serves facts this window may use.
+    facts: Option<Arc<remote_facts::RemoteFacts>>,
 }
 
 /// One session's watch task. It ends with the provider (`Drop`), whoever else keeps the runtime alive.
@@ -978,12 +981,14 @@ impl ClaudeSidecarProvider {
             }
         };
         handshaken.info.host = Some(host);
+        let facts = facts_for(&client, &hello, &sidecar_id, None, &clock);
         let remote = RemoteSide {
             checker,
             link: Arc::default(),
             clock,
             asker: client.pending_asker(&sidecar_id),
             ending: Arc::default(),
+            facts,
         };
         Ok(Self::holding(Box::new(transport), runtime, handshaken, Some(remote)))
     }
@@ -1056,12 +1061,14 @@ impl ClaudeSidecarProvider {
             Err(status) => return Err(refused(status)),
         };
         let gone = client.installation_gone();
-        let running = !gone
-            && client
-                .list()
-                .map_err(refused)?
-                .iter()
-                .any(|sidecar| sidecar.sidecar_id == helper.sidecar_id && sidecar.alive);
+        let listed = if gone {
+            Vec::new()
+        } else {
+            client.list().map_err(refused)?
+        };
+        let running = listed
+            .iter()
+            .any(|sidecar| sidecar.sidecar_id == helper.sidecar_id && sidecar.alive);
         let transport = transport::helper::ThroughHelper::new(
             client.clone(),
             helper.sidecar_id.clone(),
@@ -1087,12 +1094,16 @@ impl ClaudeSidecarProvider {
             journal_only(&runtime, &transport)?
         };
         handshaken.info.host = Some(host);
+        let facts = running
+            .then(|| facts_for(&client, &hello, &helper.sidecar_id, Some(listed.as_slice()), &clock))
+            .flatten();
         let remote = RemoteSide {
             checker,
             link: Arc::default(),
             clock,
             asker: client.pending_asker(&helper.sidecar_id),
             ending: Arc::new(Mutex::new(gone.then_some(crate::provider::RemoteEnding::AgentGone))),
+            facts,
         };
         Ok((Box::new(transport), runtime, handshaken, remote))
     }
@@ -1459,6 +1470,7 @@ impl ClaudeSidecarProvider {
         // A remote tab's watch differs in three things only: what ends it (`remote_watch_verdict`),
         // the link state it keeps, and that it stops reading while the queue is full.
         let remote = self.remote.clone();
+        let facts = self.remote.as_ref().and_then(|remote| remote.facts.clone());
         let watched = session_id.clone();
         let watch = async move {
             // The single exit for every abnormal path. Nothing here may return quietly except the
@@ -1475,6 +1487,11 @@ impl ClaudeSidecarProvider {
                 return;
             }
 
+            // Whatever way the watch ends, the session's facts stop being followed.
+            let _watching_facts = facts.clone().map(|facts| remote_facts::WatchingFacts {
+                facts,
+                session_id: session_id.clone(),
+            });
             // The first open reads from the session's start; every later one is a re-watch.
             let mut reopening = false;
             let mut outage = Outage::default();
@@ -1505,6 +1522,10 @@ impl ClaudeSidecarProvider {
                                 .link
                                 .set(catch_up.map_or(crate::provider::RemoteLinkState::Live, |c| c.start()));
                             outage.opened(remote.clock.now_unix_ms());
+                        }
+                        // The facts follow the open stream: none from before it is used.
+                        if let Some(facts) = &facts {
+                            facts.follow(&session_id);
                         }
                         let snapshot = (std::mem::replace(&mut reopening, true) && asks_questions)
                             .then(|| read_interaction_state(&client, &session_id, plans_offered));
@@ -1555,6 +1576,10 @@ impl ClaudeSidecarProvider {
                             match state.tracker.observe(sequence) {
                                 watch::SequenceVerdict::Deliver => {
                                     delivered_since_open = true;
+                                    // Named by its own bytes before translation drops them.
+                                    if let Some(facts) = &facts {
+                                        facts.observe(&event);
+                                    }
                                     let mut translated = Vec::new();
                                     state.split.separate_block(&mut event);
                                     if let Some(boundary) = state.split.before(&event) {
@@ -1624,6 +1649,9 @@ impl ClaudeSidecarProvider {
                     }
                 };
 
+                if let Some(facts) = &facts {
+                    facts.disconnected(&session_id);
+                }
                 if closed_by_session {
                     return;
                 }
@@ -1671,6 +1699,45 @@ impl ClaudeSidecarProvider {
             task,
         });
     }
+}
+
+/// The path facts of the sidecar `sidecar_id`, when the helper that answered `hello` serves facts this window may
+/// use and names the sidecar's root (from `listed`, or a listing asked now). Blocking: a worker's call.
+fn facts_for(
+    client: &crate::remote_client::HelperClient,
+    hello: &eitri_server_proto::HelloResponse,
+    sidecar_id: &str,
+    listed: Option<&[eitri_server_proto::SidecarInfo]>,
+    clock: &Arc<dyn crate::remote_client::ReconnectClock>,
+) -> Option<Arc<remote_facts::RemoteFacts>> {
+    if !client.serves_usable_facts(hello) {
+        return None;
+    }
+    let asked;
+    let listed = match listed {
+        Some(listed) => listed,
+        None => match client.list() {
+            Ok(list) => {
+                asked = list;
+                &asked
+            }
+            Err(status) => {
+                eprintln!(
+                    "agent: ClaudeSidecarProvider: no path facts for this tab, the helper did not list its sidecar: {}",
+                    status.message()
+                );
+                return None;
+            }
+        },
+    };
+    let root = &listed.iter().find(|sidecar| sidecar.sidecar_id == sidecar_id)?.root;
+    remote_facts::RemoteFacts::new(
+        client.fact_asker(sidecar_id),
+        root,
+        clock.clone(),
+        client.runtime().handle().clone(),
+    )
+    .map(Arc::new)
 }
 
 impl Drop for ClaudeSidecarProvider {
@@ -2565,6 +2632,44 @@ impl AgentProvider for ClaudeSidecarProvider {
     /// sidecar on this machine.
     fn link_state(&self) -> Option<crate::provider::RemoteLinkState> {
         self.remote.as_ref().map(|remote| remote.link.get())
+    }
+
+    fn gate_fact(&self, permission_id: &str) -> crate::gate_facts::GateFactState {
+        match self.remote.as_ref().map(|remote| remote.facts.as_ref()) {
+            None => crate::gate_facts::GateFactState::NotRemote,
+            Some(None) => crate::gate_facts::GateFactState::NoCapability,
+            Some(Some(facts)) => facts.state(permission_id),
+        }
+    }
+
+    fn gate_fact_digest(&self, permission_id: &str) -> Option<[u8; 32]> {
+        self.remote.as_ref()?.facts.as_ref()?.expected_digest(permission_id)
+    }
+
+    fn check_fact(
+        &self,
+        permission_id: &str,
+        digest: [u8; 32],
+        done: Box<dyn FnOnce(crate::gate_facts::FreshFact) + Send>,
+    ) {
+        match self.remote.as_ref().and_then(|remote| remote.facts.as_ref()) {
+            Some(facts) => facts.check(permission_id, digest, done),
+            None => done(crate::gate_facts::FreshFact::Unavailable),
+        }
+    }
+
+    fn gate_root_fact(&self) -> Option<crate::gate_facts::RootFact> {
+        self.remote.as_ref()?.facts.as_ref()?.root_fact()
+    }
+
+    fn gate_facts_root(&self) -> Option<std::path::PathBuf> {
+        Some(self.remote.as_ref()?.facts.as_ref()?.root().to_path_buf())
+    }
+
+    fn set_gate_fact_wake(&self, wake: crate::ingestion::UiWake) {
+        if let Some(facts) = self.remote.as_ref().and_then(|remote| remote.facts.as_ref()) {
+            facts.set_wake(wake);
+        }
     }
 
     fn remote_ending(&self) -> Option<crate::provider::RemoteEnding> {

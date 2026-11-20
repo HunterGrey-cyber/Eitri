@@ -31,6 +31,9 @@ const KILL_BUDGET: Duration = Duration::from_secs(2);
 pub(crate) const LOG_CAP: u64 = 8 * 1024 * 1024;
 const LOG_TAIL: u64 = 1024 * 1024;
 const RETENTION_MS: u64 = 7 * 24 * 3600 * 1000;
+/// The most bytes of a sidecar or terminal host record read back; a longer one is not read, and its process is never
+/// adopted.
+pub(crate) const RECORD_READ_MAX: u64 = 64 * 1024;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Record {
@@ -53,6 +56,14 @@ pub struct Record {
     pub failure: Option<String>,
     #[serde(default)]
     pub exited_unix_ms: Option<u64>,
+    /// What the gate's path facts need of the environment the sidecar was started with; absent in a record written
+    /// before the helper kept it, whose requests then get a refusal fact.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "super::gate::surroundings::started_or_none"
+    )]
+    pub started: Option<super::gate::StartedEnv>,
 }
 
 struct Entry {
@@ -126,6 +137,7 @@ impl Sidecars {
             ready: true,
             failure: None,
             exited_unix_ms: None,
+            started: None,
         };
         self.entries.lock().unwrap().insert(
             id.into(),
@@ -134,6 +146,22 @@ impl Sidecars {
                 pidfd: Some(Arc::new(pin(pid).unwrap())),
                 child: None,
                 handshake,
+            })),
+        );
+    }
+
+    /// Registers `record` as a running, ready sidecar of this daemon. Its pid must be a live process (a test's own).
+    #[cfg(test)]
+    #[allow(dead_code)] // for the gate facts tests, which build the daemon's modules in
+    pub fn test_running(&self, record: Record) {
+        let pidfd = pin(record.pid).unwrap();
+        self.entries.lock().unwrap().insert(
+            record.sidecar_id.clone(),
+            Arc::new(Mutex::new(Entry {
+                record,
+                pidfd: Some(Arc::new(pidfd)),
+                child: None,
+                handshake: true,
             })),
         );
     }
@@ -307,6 +335,8 @@ impl Sidecars {
         let mut command = std::process::Command::new(format!("/proc/self/fd/{}", executable.as_raw_fd()));
         command.arg0("verdandi-claude-sidecar").env_clear().envs(&captured.env);
         agent::apply_sidecar_env(&mut command, &policy);
+        // The agent's shell inherits this environment: the gate's path facts judge its requests against it.
+        let started = super::gate::StartedEnv::of(&command);
         command
             .env("VERDANDI_CLAUDE_SIDECAR_SOCKET", &socket)
             .env("VERDANDI_CLAUDE_SIDECAR_PARENT_WATCH", "none")
@@ -348,6 +378,7 @@ impl Sidecars {
                 ready: false,
                 failure: None,
                 exited_unix_ms: None,
+                started,
             };
             self.persist(&record).map_err(internal)?;
             crate::audit::record(&self.paths.state, "sidecar-start", &format!("id={id} pid={pid}"))
@@ -728,17 +759,23 @@ pub(crate) fn in_normal_form(root: &[u8]) -> bool {
 }
 
 pub(crate) fn open_root(root: &str) -> Result<File, Status> {
-    let dir = open_directory(root, "root")?;
+    open_owned_directory(root, "root")
+}
+
+/// [`open_directory`] of a directory the daemon's uid owns; `what` names the field in a refusal.
+pub(crate) fn open_owned_directory(path: &str, what: &str) -> Result<File, Status> {
+    let dir = open_directory(path, what)?;
     if dir.metadata().map_err(internal)?.uid() != private_fs::euid() {
-        return Err(Status::invalid_argument("root must be owned by the daemon's uid"));
+        return Err(Status::invalid_argument(format!(
+            "{what} must be owned by the daemon's uid"
+        )));
     }
     Ok(dir)
 }
 
-/// An absolute, normal-form directory of at most 4096 bytes, each component opened `O_DIRECTORY` from the one before
-/// (following links), so the descriptor names the directory the path named when it was opened. `what` names the
-/// field in a refusal.
-pub(crate) fn open_directory(path: &str, what: &str) -> Result<File, Status> {
+/// The form every path the helper takes for a directory has: at most 4096 bytes, absolute, normal form. `what` names
+/// the field in a refusal.
+pub(crate) fn check_path_form(path: &str, what: &str) -> Result<(), Status> {
     if path.len() > 4096 {
         return Err(Status::invalid_argument(format!("{what} exceeds byte cap")));
     }
@@ -748,8 +785,30 @@ pub(crate) fn open_directory(path: &str, what: &str) -> Result<File, Status> {
     if !in_normal_form(path.as_bytes()) {
         return Err(Status::invalid_argument(format!("{what} must be in normal form")));
     }
+    Ok(())
+}
+
+/// A refusal's text, as the in-band answers of the `Transcripts` service and the trust scan carry it.
+pub(crate) fn refusal_text(status: &Status) -> String {
+    status.message().to_owned()
+}
+
+/// How far a path could be opened as a directory.
+pub(crate) struct Prefix {
+    /// The deepest directory that opened: the whole path's, or the one holding the first component that did not.
+    pub(crate) dir: File,
+    /// Where the part that did not open starts in the path (`path.len()` when all of it opened).
+    pub(crate) rest: usize,
+}
+
+/// Opens as much of a well-formed (see [`check_path_form`]) `path` as exists, each component `O_DIRECTORY` from the one
+/// before (following links), so the descriptor names the directory the path named when it was opened. A component
+/// that is missing, not a directory or not enterable ends the walk there.
+pub(crate) fn open_prefix(path: &str, what: &str) -> Result<Prefix, Status> {
+    check_path_form(path, what)?;
     let mut dir = private_fs::open_dir(Path::new("/")).map_err(internal)?;
-    for part in path.split('/').skip(1).filter(|s| !s.is_empty()) {
+    let mut start = 1;
+    for part in path[1..].split('/').filter(|s| !s.is_empty()) {
         let name = CString::new(part).map_err(|_| Status::invalid_argument(format!("invalid {what}")))?;
         let fd = unsafe {
             libc::openat(
@@ -759,13 +818,37 @@ pub(crate) fn open_directory(path: &str, what: &str) -> Result<File, Status> {
             )
         };
         if fd < 0 {
-            return Err(Status::invalid_argument(format!(
-                "{what} must be an existing directory"
-            )));
+            return Ok(Prefix { dir, rest: start });
         }
         dir = unsafe { File::from_raw_fd(fd) };
+        start += part.len() + 1;
     }
-    Ok(dir)
+    Ok(Prefix { dir, rest: path.len() })
+}
+
+/// An absolute, normal-form directory of at most 4096 bytes, each component opened `O_DIRECTORY` from the one before
+/// (following links), so the descriptor names the directory the path named when it was opened. `what` names the
+/// field in a refusal.
+pub(crate) fn open_directory(path: &str, what: &str) -> Result<File, Status> {
+    let prefix = open_prefix(path, what)?;
+    if prefix.rest < path.len() {
+        return Err(Status::invalid_argument(format!(
+            "{what} must be an existing directory"
+        )));
+    }
+    Ok(prefix.dir)
+}
+
+/// Whether `path` still leads to the directory `held` is open on.
+pub(crate) fn leads_to(held: &File, path: &str) -> bool {
+    let identity = |file: &File| file.metadata().map(|metadata| (metadata.dev(), metadata.ino())).ok();
+    match (
+        identity(held),
+        open_directory(path, "path").ok().as_ref().and_then(identity),
+    ) {
+        (Some(held), Some(now)) => held == now,
+        _ => false,
+    }
 }
 
 /// The path the kernel gives the directory `root` holds, resolved through every link: what a sidecar started in
@@ -1211,7 +1294,7 @@ pub(crate) fn live_roots_in(run: &Path) -> io::Result<Vec<Option<String>>> {
             continue;
         }
         let judged = (|| {
-            let bytes = private_fs::read_private_nofollow_bytes_capped(&entry.path(), 64 * 1024)?;
+            let bytes = private_fs::read_private_nofollow_bytes_capped(&entry.path(), RECORD_READ_MAX)?;
             let record: Record = serde_json::from_slice(&bytes)?;
             let identity = ProcessIdentity {
                 pid: record.pid,
@@ -1253,7 +1336,7 @@ fn refusing_records_with(run: &Path, stat: impl Fn(u32) -> io::Result<u64>) -> i
         };
         let mut pid = None;
         let alive = (|| {
-            let bytes = private_fs::read_private_nofollow_bytes_capped(&entry.path(), 64 * 1024)?;
+            let bytes = private_fs::read_private_nofollow_bytes_capped(&entry.path(), RECORD_READ_MAX)?;
             let record: ProcessIdentity = serde_json::from_slice(&bytes)?;
             pid = Some(record.pid);
             // A record without a boot id can still describe a live terminal, so check its process.
@@ -1333,7 +1416,7 @@ fn read_records(paths: &Paths) -> Vec<Record> {
             if id.len() != 16 || !id.bytes().all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase()) {
                 return None;
             }
-            let bytes = private_fs::read_private_nofollow_bytes_capped(&file.path(), 64 * 1024).ok()?;
+            let bytes = private_fs::read_private_nofollow_bytes_capped(&file.path(), RECORD_READ_MAX).ok()?;
             let mut record: Record = serde_json::from_slice(&bytes).ok()?;
             let name = format!("sc-{id}.sock");
             if ![&paths.run, &metadata_run]
@@ -1592,6 +1675,7 @@ mod tests {
                 ready: true,
                 failure: None,
                 exited_unix_ms: None,
+                started: None,
             },
             pidfd: Some(Arc::new(pin(pid).unwrap())),
             child: Some(child),
@@ -1684,6 +1768,7 @@ mod tests {
             ready: true,
             failure: None,
             exited_unix_ms: None,
+            started: None,
         }
     }
 
@@ -2118,6 +2203,50 @@ mod tests {
         let mut request = valid;
         request.root = "/".repeat(4097);
         assert!(validate_request(&request).is_err());
+
+        // What the record keeps of the start environment is bounded too: a value too long to keep leaves nothing
+        // kept (the sidecar's requests get a refusal fact), and the longest kept one, beside the longest root, with
+        // every character as long as JSON writes it, still fits the cap the record is read back with.
+        use super::super::gate::surroundings::STARTED_RECORD_MAX;
+        use super::super::gate::StartedEnv;
+        let started = |value: &str| {
+            let mut command = std::process::Command::new("/bin/true");
+            command.env_clear().env("XDG_DATA_DIRS", value).env("HOME", value);
+            StartedEnv::of(&command)
+        };
+        assert_eq!(started(&"/".repeat(STARTED_RECORD_MAX)), None);
+        assert!(started("/srv/home").is_some());
+        let escaped = |count: usize| "\u{1}".repeat(count);
+        let (mut kept, mut over) = (0, STARTED_RECORD_MAX);
+        while over - kept > 1 {
+            let count = (kept + over) / 2;
+            if started(&escaped(count)).is_some() {
+                kept = count;
+            } else {
+                over = count;
+            }
+        }
+        let longest = started(&escaped(kept)).expect("an empty start environment is kept");
+        assert!(started(&escaped(kept + 1)).is_none());
+        assert!(serde_json::to_vec(&longest).unwrap().len() <= STARTED_RECORD_MAX);
+        let record = Record {
+            pid: u32::MAX,
+            start_time: u64::MAX,
+            socket: PathBuf::from(format!("/{}", "s".repeat(107))),
+            sidecar_id: "f".repeat(16),
+            root: escaped(4096),
+            account: "a".repeat(128),
+            command_id: "c".repeat(128),
+            started_unix_ms: u64::MAX,
+            ready: true,
+            failure: Some(escaped(1024)),
+            exited_unix_ms: Some(u64::MAX),
+            started: Some(longest),
+        };
+        let bytes = serde_json::to_vec(&record).unwrap();
+        assert!(bytes.len() as u64 <= RECORD_READ_MAX, "{} bytes", bytes.len());
+        let back: Record = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(back.started, record.started);
     }
 
     #[test]

@@ -478,6 +478,8 @@ fn handoff_of(tab: &Tab, review: Option<ReviewHandoff>) -> TabHandoff {
         send_sync,
         // A dismissal is this window's pages': the other window's draw the note again.
         root_note_dismissed: _,
+        // The other window's trust scan names the root again; until it does, the tab has no server facts there.
+        server_root: _,
         // Refused by the freeze while set: a terminal handoff in flight does not move.
         pending_handoff: _,
         last_handoff,

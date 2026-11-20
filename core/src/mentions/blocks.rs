@@ -51,6 +51,9 @@ pub struct Scope<'a> {
     canonical: PathBuf,
     home: Option<&'a Path>,
     rules: &'a ReadRules,
+    /// The project's root on the server whose rules these are, when they are not this machine's: each name is judged
+    /// as named and rewritten onto it, since a rule there may name the server's own absolute paths.
+    server_root: Option<&'a Path>,
     judged: RefCell<HashMap<(PathBuf, Option<PathBuf>), Result<String, Kept>>>,
 }
 
@@ -69,8 +72,32 @@ impl<'a> Scope<'a> {
             canonical: std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf()),
             home,
             rules,
+            server_root: None,
             judged: RefCell::default(),
         }
+    }
+
+    /// The scope for rules read on a server where the project is at `server_root`; `None` keeps this machine's.
+    pub fn with_server_root(mut self, server_root: Option<&'a Path>) -> Scope<'a> {
+        self.server_root = server_root;
+        self
+    }
+
+    /// Whether a rule covers the file named `named` (resolved to `resolved`), both under the root with its links
+    /// followed: as named here, and, for a server's rules, rewritten onto the server's root.
+    fn rules_deny(&self, named: &Path, resolved: &Path) -> bool {
+        if self.rules.denies_either(&self.canonical, named, resolved) {
+            return true;
+        }
+        let Some(server_root) = self.server_root else {
+            return false;
+        };
+        let onto = |path: &Path| match path.strip_prefix(&self.canonical) {
+            Ok(rest) => server_root.join(rest),
+            // Not under the project here: no server path names it, and the rules deny it.
+            Err(_) => path.to_path_buf(),
+        };
+        self.rules.denies_either(server_root, &onto(named), &onto(resolved))
     }
 
     /// `name`'s path under the root as a sentence may name it, or why it may not be told. `read_from` is the record of
@@ -115,13 +142,13 @@ impl<'a> Scope<'a> {
         if !paths::record_passes(&self.canonical, self.home, &name, read_from.as_deref(), None) {
             return Err(Kept::Outside);
         }
-        if self.rules.denies_either(&self.canonical, &name, &resolved) || self.denies_as_given(&original) {
+        if self.rules_deny(&name, &resolved) || self.denies_as_given(&original) {
             return Err(Kept::Denied);
         }
         // The text was read from the record's file, whatever the buffer is called now: a rule on that file covers it.
         if let Some(record) = &read_from {
             let from = paths::name_inside(&self.canonical, self.home, record).unwrap_or_else(|| record.clone());
-            if self.rules.denies_either(&self.canonical, record, &from) {
+            if self.rules_deny(record, &from) {
                 return Err(Kept::Denied);
             }
         }

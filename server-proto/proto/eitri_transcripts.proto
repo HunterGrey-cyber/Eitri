@@ -1,0 +1,31 @@
+syntax = "proto3";
+package eitri.server.v1;
+
+// The account's transcripts and the CLI's settings files on the server, read-only. Parsing stays on the laptop.
+service Transcripts {
+  rpc ListTranscripts(TranscriptScope) returns (ListTranscriptsResponse);
+  rpc ReadTranscriptTail(ReadTranscriptRequest) returns (stream TranscriptChunk);
+  rpc TranscriptStable(ReadTranscriptRequest) returns (TranscriptStableResponse);
+  rpc ReadDenySettings(TranscriptScope) returns (stream ReadDenySettingsEvent);
+}
+// config_dir: the handshake's effective_claude_config_dir when the laptop has one; else account (may be empty).
+message TranscriptScope { string root = 1; string account = 2; string config_dir = 3; }
+message TranscriptEntry { string provider_session_id = 1; uint64 len = 2; uint64 modified_unix_ms = 3; string ai_title = 4; }
+// config_dir: the directory the helper used (normal form). root: the project's folder as the helper resolved it, the
+// canonical path (the path the kernel gives the folder, through every link, as a sidecar started there records it), so
+// it is not the tab's spelling; the laptop compares it with the tab's canonical root from its trust scan. root_gone:
+// the folder does not exist, so root is its longest existing prefix, canonical, then the missing names as the request
+// spelled them; the laptop compares it with the text it sent or the tab's canonical root.
+message ListTranscriptsResponse { repeated TranscriptEntry entries = 1; bool truncated = 2; string config_dir = 3; string refusal = 4; string root = 5; bool root_gone = 6; }
+message ReadTranscriptRequest { TranscriptScope scope = 1; string provider_session_id = 2; }
+// A transcript's last bytes in order; `started_mid_file` is the same on every chunk and `last` is true on the final one.
+// A refusal ends the stream in place of a final chunk. `config_dir` (the directory the helper used) is set on the
+// first chunk, with `root` and `root_gone` as ListTranscriptsResponse has them.
+message TranscriptChunk { bytes data = 1; bool started_mid_file = 2; bool last = 3; string refusal = 4; string config_dir = 5; string root = 6; bool root_gone = 7; }
+message TranscriptStableResponse { bool stable = 1; bool missing = 2; string refusal = 3; string config_dir = 4; string root = 5; bool root_gone = 6; }
+message SettingsRead { string path = 1; bool strict = 2; bytes bytes = 3; bool missing = 4; string failed = 5; }
+// Streamed: first a SettingsScope, then exactly `files` SettingsRead messages, one per file `files_to_read` names on
+// the server, in its order. A stream that ends with fewer is incomplete. The server's `$HOME` is what `~` in a rule
+// means; the laptop's would be wrong. A refusal replaces the whole answer: the list is never cut short.
+message ReadDenySettingsEvent { oneof event { SettingsScope scope = 1; SettingsRead file = 2; string refusal = 3; } }
+message SettingsScope { string home = 1; string config_dir = 2; uint32 files = 3; string root = 4; bool root_gone = 5; }

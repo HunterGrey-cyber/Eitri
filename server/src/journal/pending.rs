@@ -93,6 +93,12 @@ impl Pending {
     pub fn is_empty(&self) -> bool {
         self.requests.is_empty()
     }
+    /// The sequence and event bytes of the request pending under `permission_id`, if one is.
+    pub fn held(&self, permission_id: &str) -> Option<(u64, &[u8])> {
+        self.requests
+            .get(permission_id)
+            .map(|(sequence, event)| (*sequence, event.as_slice()))
+    }
     fn rewrite(&mut self, next: Requests, sequence: u64) -> io::Result<()> {
         let applied = self.applied.max(sequence);
         let bytes = encode_requests(applied, &next)?;

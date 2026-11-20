@@ -30,6 +30,14 @@ pub const READ_FILE_FRAMING_SHARE: usize = 16;
 /// The mode keepers' lines in one Hello: one or two per root the server keeps.
 pub const MODE_WARNINGS: AnswerBound = AnswerBound::new("the server's mode lines", 256, 256 << 10);
 
+/// The settings stream's per-message allowance beyond a file's own bytes: its framing and the longest paths and
+/// text one message carries (the scope names a home, a config directory and a root).
+pub const SETTINGS_MESSAGE_FRAMING_BYTES: usize =
+    ITEM_OVERHEAD_BYTES + 3 * eitri_server_proto::TRANSCRIPT_PATH_MAX + eitri_server_proto::TRANSCRIPT_REFUSAL_MAX;
+
+/// What one entry of a transcript list may spend beyond its title: the id, the numbers and the framing.
+pub const TRANSCRIPT_ENTRY_FRAMING_BYTES: usize = ITEM_OVERHEAD_BYTES + 128;
+
 /// The longest identifier a server's answer may name (a sidecar's, say); the helper's are 16 hex digits.
 pub const ID_BYTES: usize = 128;
 
@@ -44,6 +52,25 @@ pub fn checked_id(what: &str, id: &str) -> Result<(), String> {
     fits.then_some(()).ok_or_else(|| {
         format!("{what} is not an identifier of at most {ID_BYTES} letters, digits, '-', '_' or '.'; refused")
     })
+}
+
+/// A text or blob in a server's answer of `len` bytes against its longest allowed, `max`: the refusal naming `what`.
+pub fn checked_len(what: &str, len: usize, max: usize) -> Result<(), String> {
+    (len <= max).then_some(()).ok_or_else(|| {
+        format!(
+            "{what} is {} long, past its bound of {}; refused",
+            size_text(len),
+            size_text(max)
+        )
+    })
+}
+
+/// A session id from a server's answer, which the laptop shows and sends back: a lowercase hyphenated UUID, the form
+/// the CLI names its transcripts in; the refusal naming `what` if not.
+pub fn checked_session_uuid(what: &str, id: &str) -> Result<(), String> {
+    crate::transcript::is_canonical_session_uuid(id)
+        .then_some(())
+        .ok_or_else(|| format!("{what} is not a lowercase hyphenated UUID; refused"))
 }
 
 /// A count and a byte budget for one answer, and the words that name it.
@@ -73,9 +100,42 @@ impl AnswerBound {
     /// A ReadFile answer for a request with this data `limit`. The byte budget, which charges each
     /// chunk [`ITEM_OVERHEAD_BYTES`], is what bounds the number of chunks.
     pub fn read_file(limit: u64) -> Self {
+        Self::data_read("the server's file read", limit)
+    }
+
+    /// A transcript tail: at most [`eitri_server_proto::TRANSCRIPT_TAIL_MAX`] bytes of data, in chunks, with the
+    /// framing a file read is allowed.
+    pub fn transcript_tail() -> Self {
+        Self::data_read("the server's transcript tail", eitri_server_proto::TRANSCRIPT_TAIL_MAX)
+    }
+
+    /// A transcript list: at most [`eitri_server_proto::TRANSCRIPTS_LIST_MAX`] entries, each with a title of at most
+    /// [`eitri_server_proto::TRANSCRIPT_TITLE_MAX`] bytes. A title past its own bound is the caller's check.
+    pub fn transcript_list() -> Self {
+        let entries = eitri_server_proto::TRANSCRIPTS_LIST_MAX;
+        Self::new(
+            "the server's transcript list",
+            entries,
+            entries * (eitri_server_proto::TRANSCRIPT_TITLE_MAX + TRANSCRIPT_ENTRY_FRAMING_BYTES),
+        )
+    }
+
+    /// A settings stream: a scope, at most [`eitri_server_proto::SETTINGS_FILES_MAX`] files and, in place of the
+    /// rest, a refusal; the files' data together at most [`eitri_server_proto::SETTINGS_TOTAL_MAX`].
+    pub fn settings_stream() -> Self {
+        let entries = eitri_server_proto::SETTINGS_FILES_MAX + 2;
+        Self::new(
+            "the server's settings",
+            entries,
+            (eitri_server_proto::SETTINGS_TOTAL_MAX as usize)
+                .saturating_add(entries.saturating_mul(SETTINGS_MESSAGE_FRAMING_BYTES)),
+        )
+    }
+
+    fn data_read(what: &'static str, limit: u64) -> Self {
         let limit = usize::try_from(limit).unwrap_or(usize::MAX);
         Self::new(
-            "the server's file read",
+            what,
             usize::MAX,
             limit
                 .saturating_add(READ_FILE_FRAMING_BYTES)
@@ -303,6 +363,44 @@ mod tests {
                 "{bad:?}"
             );
         }
+    }
+
+    #[test]
+    fn a_field_past_its_bound_and_a_session_id_not_in_canonical_form_are_refused() {
+        assert_eq!(checked_len("a title", 1024, 1024), Ok(()));
+        assert_eq!(
+            checked_len("a title", 1025, 1024),
+            Err("a title is 1025 bytes long, past its bound of 1 KiB; refused".into())
+        );
+        let id = "0b7a7d3e-5f0c-4c52-9a0e-3a1f0c6d2b11";
+        assert_eq!(checked_session_uuid("the id", id), Ok(()));
+        for bad in [
+            id.to_uppercase(),
+            id.replace('-', ""),
+            format!("{{{id}}}"),
+            format!("{id}.jsonl"),
+        ] {
+            assert_eq!(
+                checked_session_uuid("the id", &bad),
+                Err("the id is not a lowercase hyphenated UUID; refused".into()),
+                "{bad}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_transcripts_bounds_follow_the_wire_bounds() {
+        let list = AnswerBound::transcript_list();
+        assert_eq!(list.entries(), eitri_server_proto::TRANSCRIPTS_LIST_MAX);
+        assert!(list.bytes() > list.entries() * eitri_server_proto::TRANSCRIPT_TITLE_MAX);
+        let tail = AnswerBound::transcript_tail();
+        assert_eq!(tail.bytes(), (35 << 20));
+        let settings = AnswerBound::settings_stream();
+        assert_eq!(settings.entries(), eitri_server_proto::SETTINGS_FILES_MAX + 2);
+        assert!(settings.bytes() > eitri_server_proto::SETTINGS_TOTAL_MAX as usize);
+        assert!(tail
+            .past_bytes()
+            .starts_with("the server's transcript tail passed its bound of 35 MiB"));
     }
 
     #[test]

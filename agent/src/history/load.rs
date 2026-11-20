@@ -36,7 +36,7 @@ use crate::projection::{
 };
 
 use super::store::{self, HistoryLoadError, StoredHistory};
-use super::transcript_jsonl::{read_transcript_history, TranscriptHistory};
+use super::transcript_jsonl::{read_history_from_tail, read_transcript_history, TranscriptHistory};
 
 /// The projection a resumed conversation starts from.
 ///
@@ -68,8 +68,52 @@ pub(crate) fn seed_from(
     conversation_id: &str,
     provider_session_id: &str,
 ) -> AgentSessionProjection {
+    seed_with(read_b(transcript_path), conversation_id, provider_session_id)
+}
+
+/// The projection a conversation resumed on another machine starts from, built from the transcript's bytes: the last
+/// bytes of the file (the whole file when `started_mid_file` is false). The same fold, the same notes and the same
+/// fall to Eitri's own copy as [`seed_from`]; a tail that starts mid file drops its first line, which is partial.
+/// `source_label` names the transcript in the notice (`source_path`, and `attempted_transcript_path` when the fall
+/// happens) as there is no local path: the caller says where the bytes came from, host included.
+pub fn seed_from_tail(
+    tail: &[u8],
+    started_mid_file: bool,
+    conversation_id: &str,
+    provider_session_id: &str,
+    source_label: &str,
+) -> AgentSessionProjection {
+    let path = PathBuf::from(source_label);
+    let attempt = if tail.is_empty() {
+        BOutcome::Loaded {
+            path,
+            history: empty_transcript_history(),
+        }
+    } else {
+        judge(path, read_history_from_tail(tail, started_mid_file))
+    };
+    seed_with(attempt, conversation_id, provider_session_id)
+}
+
+/// The projection a conversation resumed on another machine starts from when that machine's transcript could not be
+/// had (it is missing, was refused or did not arrive): Eitri's own copy, with `reason` and `source_label` in the
+/// notice as the fall in [`seed_from`] says them. The same fall as a transcript that holds nothing usable.
+pub fn seed_from_stored(
+    conversation_id: &str,
+    provider_session_id: &str,
+    source_label: &str,
+    reason: &str,
+) -> AgentSessionProjection {
+    let attempt = BOutcome::Failed {
+        path: Some(PathBuf::from(source_label)),
+        reason: reason.to_string(),
+    };
+    seed_with(attempt, conversation_id, provider_session_id)
+}
+
+/// What [`seed_from`] and [`seed_from_tail`] share once B has been read or has failed.
+fn seed_with(attempt: BOutcome, conversation_id: &str, provider_session_id: &str) -> AgentSessionProjection {
     let mut projection = AgentSessionProjection::default();
-    let attempt = read_b(transcript_path);
     match attempt {
         BOutcome::Loaded { path, history } => {
             load_transcript(&mut projection, &path, history);
@@ -184,7 +228,12 @@ fn read_b(transcript_path: std::io::Result<PathBuf>) -> BOutcome {
             history: empty_transcript_history(),
         };
     }
-    match read_transcript_history(&path) {
+    judge(path.clone(), read_transcript_history(&path))
+}
+
+/// Whether what was read of the transcript at `path` is usable: see [`read_b`] for the cases.
+fn judge(path: PathBuf, read: std::io::Result<TranscriptHistory>) -> BOutcome {
+    match read {
         Ok(history) if history.parsed_items == 0 => {
             // **Says what was observed, not what it might mean.** This arm is the "the format
             // may have changed" signal, but it is reachable with no format change at all: a
@@ -1951,6 +2000,153 @@ mod tests {
         );
         assert!(restored.waiting_plan().is_none());
         assert!(restored.pending_permissions.is_empty());
+    }
+
+    /// The projection as JSON with the notice's source path blanked: a tail has no local path to name.
+    fn comparable(mut projection: AgentSessionProjection) -> serde_json::Value {
+        if let Some(history) = projection.history.as_mut() {
+            history.source_path.clear();
+        }
+        serde_json::to_value(&projection).expect("a projection serializes")
+    }
+
+    #[test]
+    fn seed_from_tail_equals_seed_from_the_same_file() {
+        let conversation_id = setup();
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/history_b");
+        let mut files: Vec<PathBuf> = std::fs::read_dir(&dir)
+            .expect("the history corpus is there")
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| path.extension().is_some_and(|ext| ext == "jsonl"))
+            .collect();
+        files.sort();
+        assert!(files.len() > 20, "the corpus must not be empty");
+        for file in files {
+            let bytes = std::fs::read(&file).unwrap();
+            let from_file = seed_from(
+                Ok(write_transcript(&String::from_utf8(bytes.clone()).unwrap())),
+                &conversation_id,
+                "sess-eq",
+            );
+            let from_tail = seed_from_tail(&bytes, false, &conversation_id, "sess-eq", "sess-eq.jsonl");
+            assert_eq!(comparable(from_file), comparable(from_tail), "{}", file.display());
+        }
+    }
+
+    #[test]
+    fn a_tail_that_starts_mid_file_drops_its_first_line() {
+        let conversation_id = setup();
+        let whole = format!("{}\n{}\n", typed_prompt("first"), assistant_text("reply"));
+        // The tail begins inside the first line: that partial line is dropped, the reply after it is kept.
+        let cut = whole.find("\"type\":\"user\"").unwrap() + 10;
+        let mid = seed_from_tail(
+            &whole.as_bytes()[cut..],
+            true,
+            &conversation_id,
+            "sess-mid",
+            "sess-mid.jsonl",
+        );
+        assert!(mid.user_prompts.is_empty(), "the partial first line is not a prompt");
+        assert_eq!(mid.transcript.len(), 1);
+        let history = mid.history.as_ref().expect("the tail has a notice");
+        assert_eq!(history.restored_items, 1);
+        // The reader cannot tell a tail that starts on a line boundary from one that starts inside a line, so the
+        // flag alone decides: set, the boundary tail loses its real first line; clear, it keeps it.
+        let boundary = whole.find('\n').unwrap() + 1;
+        let tail = &whole.as_bytes()[boundary..];
+        let dropped = seed_from_tail(tail, true, &conversation_id, "sess-mid", "sess-mid.jsonl");
+        assert!(
+            dropped.transcript.is_empty(),
+            "the first line of a tail is always dropped"
+        );
+        let kept = seed_from_tail(tail, false, &conversation_id, "sess-mid", "sess-mid.jsonl");
+        assert_eq!(
+            kept.transcript.len(),
+            1,
+            "a tail that is a whole file keeps its first line"
+        );
+    }
+
+    #[test]
+    fn a_tail_names_its_source_by_the_label_the_caller_gives() {
+        let conversation_id = setup();
+        let label = "example-host:/home/user/.claude/projects/-srv-project/sess-label.jsonl";
+        let read = seed_from_tail(
+            format!("{}\n", typed_prompt("kept")).as_bytes(),
+            false,
+            &conversation_id,
+            "sess-label",
+            label,
+        );
+        let notice = read.history.as_ref().expect("the tail has a notice");
+        assert_eq!(notice.source, HistorySource::ClaudeTranscript);
+        assert_eq!(notice.source_path, label);
+        assert_eq!(notice.attempted_transcript_path, None);
+
+        // A tail with nothing to restore falls to Eitri's own copy and names the label as what was tried.
+        store_copy(
+            &conversation_id,
+            "sess-label",
+            vec![prompt(1, "what eitri kept")],
+            vec![],
+            vec![],
+        );
+        let nothing = format!("{}\n{}\n", attachment(), attachment());
+        let fell = seed_from_tail(nothing.as_bytes(), false, &conversation_id, "sess-label", label);
+        let notice = fell.history.as_ref().expect("the stored copy was restored");
+        assert_eq!(notice.source, HistorySource::EitriCopy);
+        assert_eq!(notice.attempted_transcript_path.as_deref(), Some(label));
+        assert_eq!(
+            notice.fallback_reason.as_deref(),
+            Some("nothing in it could be restored (written by claude 2.1.272)")
+        );
+    }
+
+    /// The tail a source hands over, read in memory, gives what the file reader gives for a file larger than the scan
+    /// bound: its last bytes, read as a tail that starts mid file.
+    #[test]
+    fn a_tail_in_memory_reads_as_the_file_reader_reads_a_file_past_the_scan_bound() {
+        let bound = super::super::transcript_jsonl::HISTORY_SCAN_MAX_BYTES as usize;
+        let mut big = Vec::with_capacity(bound + 8192);
+        let mut n = 0u64;
+        while big.len() < bound + 4099 {
+            big.extend_from_slice(assistant_text(&format!("line {n} {}", "x".repeat(37))).as_bytes());
+            big.push(b'\n');
+            n += 1;
+        }
+        let path = crate::state_dirs::test_workspace_dir("transcript-big").join("session.jsonl");
+        std::fs::write(&path, &big).unwrap();
+        let summary = |history: TranscriptHistory| {
+            (
+                format!("{:?}", history.events),
+                history.parsed_items,
+                history.omitted_items,
+                format!("{:?}", history.counts),
+            )
+        };
+        let from_file = summary(read_transcript_history(&path).unwrap());
+        let _ = std::fs::remove_file(&path);
+        let from_last_bytes = summary(read_history_from_tail(&big[big.len() - bound..], true).unwrap());
+        let from_everything = summary(read_history_from_tail(&big, false).unwrap());
+        assert!(from_file.1 > 0, "the file holds something to compare");
+        assert_eq!(from_file, from_last_bytes);
+        assert_eq!(from_file, from_everything);
+    }
+
+    #[test]
+    fn a_tail_past_the_scan_bound_is_cut_to_its_last_32_mib_and_read_as_mid_file() {
+        let conversation_id = setup();
+        let bound = super::super::transcript_jsonl::HISTORY_SCAN_MAX_BYTES as usize;
+        let line = format!("{}\n", assistant_text("filler"));
+        let mut whole = Vec::with_capacity(bound + 8192);
+        while whole.len() < bound + 4096 {
+            whole.extend_from_slice(line.as_bytes());
+        }
+        let excess = whole.len() - bound;
+        // Whatever the caller says about where the bytes start, more than the bound is a tail that starts mid file.
+        let long = seed_from_tail(&whole, false, &conversation_id, "sess-long", "sess-long.jsonl");
+        let cut = seed_from_tail(&whole[excess..], true, &conversation_id, "sess-long", "sess-long.jsonl");
+        assert_eq!(comparable(long), comparable(cut));
     }
 
     #[test]

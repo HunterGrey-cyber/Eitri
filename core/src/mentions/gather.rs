@@ -23,6 +23,41 @@ use crate::nvim_rpc::{Pending, RpcError};
 /// The most diagnostics the editor is asked for: the host tells fewer, and the ones past the bound are counted.
 pub const DIAGNOSTICS_ASKED_MAX: u32 = 2000;
 
+/// How long the worker may take when it fetches the rules from a server first: a settings answer over the link, then
+/// the sections. Past it the sources are left out as not read in time.
+pub const FETCHED_RULES_BUDGET: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Where the `Read` deny rules a message's sources are judged by come from.
+pub enum RulesSource {
+    /// This machine's settings for the project, read on the worker with the account's directory, if known.
+    Local { config_dir: Option<PathBuf> },
+    /// Rules read elsewhere: a remote tab's server's settings, anchored at the project's root there (`server_root`).
+    /// The editor names the laptop's copy of each file, so each name is judged both as named and rewritten onto
+    /// `server_root`.
+    Fetched { rules: ReadRules, server_root: PathBuf },
+    /// Rules fetched on the worker when the sections are built (a call to a server, which blocks): the rules and the
+    /// server root they are anchored at, as [`RulesSource::Fetched`] holds them.
+    Fetch(Box<dyn FnOnce() -> (ReadRules, PathBuf) + Send>),
+}
+
+impl RulesSource {
+    fn takes_long(&self) -> bool {
+        matches!(self, RulesSource::Fetch(_))
+    }
+
+    /// The rules and the server root they are anchored at, if not this machine's. Reads the disk or the server.
+    fn read(self, root: &Path, home: Option<&Path>) -> (ReadRules, Option<PathBuf>) {
+        match self {
+            RulesSource::Local { config_dir } => (ReadRules::load(root, config_dir.as_deref(), home), None),
+            RulesSource::Fetched { rules, server_root } => (rules, Some(server_root)),
+            RulesSource::Fetch(fetch) => {
+                let (rules, server_root) = fetch();
+                (rules, Some(server_root))
+            }
+        }
+    }
+}
+
 /// What one source's read has come to.
 enum Read {
     Buffers(Pending, Option<Result<BuffersAnswer, String>>),
@@ -137,9 +172,9 @@ impl Gathered {
 
 /// The sections for `answers`. Looks at the disk: the settings, and every name a buffer or an entry gives. A worker's
 /// work.
-fn build(answers: Vec<(Kind, Answer)>, root: &Path, home: Option<&Path>, config_dir: Option<&Path>) -> Gathered {
-    let rules = ReadRules::load(root, config_dir, home);
-    let scope = Scope::new(root, home, &rules);
+fn build(answers: Vec<(Kind, Answer)>, root: &Path, home: Option<&Path>, source: RulesSource) -> Gathered {
+    let (rules, server_root) = source.read(root, home);
+    let scope = Scope::new(root, home, &rules).with_server_root(server_root.as_deref());
     let sections = answers
         .into_iter()
         .map(|(kind, answer)| {
@@ -164,7 +199,7 @@ pub struct Gather {
     reads: Vec<Read>,
     root: PathBuf,
     home: Option<PathBuf>,
-    config_dir: Option<PathBuf>,
+    rules: Option<RulesSource>,
     give_up_at: Instant,
     /// The worker that is writing the sections, once every answer is in, and when it is given up on.
     building: Option<(Receiver<Gathered>, Instant)>,
@@ -179,7 +214,7 @@ impl Gather {
         kinds: &[Kind],
         root: &Path,
         home: Option<&Path>,
-        config_dir: Option<PathBuf>,
+        rules: RulesSource,
         now: Instant,
     ) -> Gather {
         let reads = kinds
@@ -214,7 +249,7 @@ impl Gather {
             reads,
             root: root.to_path_buf(),
             home: home.map(Path::to_path_buf),
-            config_dir,
+            rules: Some(rules),
             give_up_at: now + EDITOR_BUDGET,
             building: None,
         }
@@ -249,17 +284,23 @@ impl Gather {
             .into_iter()
             .map(Read::into_answer)
             .collect();
-        let (root, home, config_dir) = (self.root.clone(), self.home.clone(), self.config_dir.clone());
+        let (root, home) = (self.root.clone(), self.home.clone());
+        let source = self.rules.take().unwrap_or(RulesSource::Local { config_dir: None });
+        let budget = if source.takes_long() {
+            FETCHED_RULES_BUDGET
+        } else {
+            EDITOR_BUDGET
+        };
         let (tx, rx) = mpsc::channel();
         let spawned = std::thread::Builder::new()
             .name("mention-sections".into())
             .spawn(move || {
-                let _ = tx.send(build(answers, &root, home.as_deref(), config_dir.as_deref()));
+                let _ = tx.send(build(answers, &root, home.as_deref(), source));
             });
         if spawned.is_err() {
             return Some(Gathered::unavailable(&self.kinds, "a worker could not be started"));
         }
-        self.building = Some((rx, now + EDITOR_BUDGET));
+        self.building = Some((rx, now + budget));
         None
     }
 }

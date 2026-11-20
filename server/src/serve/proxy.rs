@@ -252,6 +252,7 @@ mod tests {
             ready: true,
             failure: None,
             exited_unix_ms: None,
+            started: None,
         };
         agent::private_fs::write_private(
             &ordinary.join(format!("sc-{id}.pid")),

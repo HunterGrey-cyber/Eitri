@@ -831,6 +831,42 @@ pub trait AgentProvider {
     fn remote_ending(&self) -> Option<RemoteEnding> {
         None
     }
+    /// The server's path fact for the pending gate request `permission_id` (`crate::gate_facts`): `NotRemote` for
+    /// a provider on this machine, `NoCapability` for a remote one whose helper serves no facts this window uses.
+    fn gate_fact(&self, _permission_id: &str) -> crate::gate_facts::GateFactState {
+        crate::gate_facts::GateFactState::NotRemote
+    }
+    /// The digest the pending gate request `permission_id` has now, computed on this machine from its own event's
+    /// bytes (`crate::gate_facts::FactCache`); `None` for a provider on this machine, one serving no facts, and an id
+    /// no request waits under. An automatic answer resting on a fact goes out only while this still names the
+    /// request the fact was about.
+    fn gate_fact_digest(&self, _permission_id: &str) -> Option<[u8; 32]> {
+        None
+    }
+    /// Asks the server for a fresh fact about the pending request `permission_id`, named by `digest`, without
+    /// waiting: `done` is called exactly once, within [`GATE_FRESH_WAIT`](crate::gate_facts::GATE_FRESH_WAIT), then
+    /// the tab is woken. It may run on the caller's thread (without facts it gets `Unavailable` at once), so it must
+    /// not block or call back into the provider.
+    fn check_fact(
+        &self,
+        _permission_id: &str,
+        _digest: [u8; 32],
+        done: Box<dyn FnOnce(crate::gate_facts::FreshFact) + Send>,
+    ) {
+        done(crate::gate_facts::FreshFact::Unavailable);
+    }
+    /// The server's word on whether the tab's root is a boundary, once its fact stream sent it.
+    fn gate_root_fact(&self) -> Option<crate::gate_facts::RootFact> {
+        None
+    }
+    /// The root the server's facts are about (the sidecar's recorded root, which every request's digest names),
+    /// `Some` exactly when the provider serves facts this window uses: the caller compares it with the root it
+    /// expects before reading any.
+    fn gate_facts_root(&self) -> Option<std::path::PathBuf> {
+        None
+    }
+    /// What a fact arriving or a fresh check's answer calls to wake the tab.
+    fn set_gate_fact_wake(&self, _wake: crate::ingestion::UiWake) {}
     /// Stops a remote tab's agent on its server (`StopSidecar`): the explicit act that ends it, since
     /// dropping the provider ends nothing there. `None` for a provider on this machine. Blocking.
     fn stop_remote_agent(&self) -> Option<std::io::Result<()>> {

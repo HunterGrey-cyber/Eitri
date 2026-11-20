@@ -1,9 +1,11 @@
 //! Runtime forwarding and durable session observation share the helper connection.
 #[cfg(test)]
-mod fake_sidecar;
+pub mod fake_sidecar;
+mod gate;
 mod proxy;
 mod replay;
 mod terminal;
+pub mod transcripts;
 mod watcher;
 
 use std::collections::HashMap;
@@ -18,12 +20,15 @@ use eitri_server_proto::{PendingPermission, SessionInfo};
 use sha2::{Digest, Sha256};
 use tonic::Status;
 
+use super::gate::{Engine, HeldFacts};
 use super::sidecars::{Record as SidecarRecord, Sidecars};
 use super::sync::activity::{Facts, SessionFacts, Tasks, Turn};
 use crate::run_dir::Paths;
 
+pub use gate::GateFacts;
 pub use proxy::Proxy;
 pub use terminal::TerminalRoutes;
+pub use transcripts::server as transcripts_server;
 
 pub(super) struct Session {
     identity: (String, String),
@@ -173,6 +178,8 @@ pub(super) struct SessionLock {
     /// Whether the session's watch is connected and has delivered everything the sidecar had sent: only then does its
     /// recorded state say what the session is doing now.
     current: AtomicBool,
+    /// The path facts of its pending gate requests, kept beside Pending under a lock of their own.
+    facts: Arc<HeldFacts>,
 }
 
 impl SessionLock {
@@ -183,10 +190,12 @@ impl SessionLock {
             closed: state.closed,
             pending: state.pending.len() as u64,
         };
+        let facts = Arc::new(HeldFacts::new(&state.identity.1, state.closed));
         Self {
             state: Mutex::new(state),
             info: Mutex::new(info),
             current: AtomicBool::new(false),
+            facts,
         }
     }
 
@@ -264,6 +273,8 @@ pub struct Serving {
     /// Sidecars that created a session whose id the daemon could not read from the answer: it is not followed, so
     /// what those sidecars do is never judged known.
     unlearned: Mutex<std::collections::HashSet<String>>,
+    /// How the path facts of gate requests are computed.
+    gate: Arc<Engine>,
 }
 
 impl Drop for Serving {
@@ -321,6 +332,18 @@ fn expired_identity(paths: &Paths, name: &str) -> io::Result<Option<(String, Str
 
 impl Serving {
     pub fn new(paths: Paths, sidecars: Arc<Sidecars>) -> Arc<Self> {
+        Self::serving(paths, sidecars, Engine::standard())
+    }
+
+    /// Serving whose gate facts `gate` computes: a slow, counting or failing classifier in a test.
+    #[cfg(test)]
+    #[allow(dead_code)] // for the gate facts tests, which build the daemon's modules in
+    pub fn with_gate(paths: Paths, sidecars: Arc<Sidecars>, gate: Arc<Engine>) -> Arc<Self> {
+        Self::serving(paths, sidecars, gate)
+    }
+
+    fn serving(paths: Paths, sidecars: Arc<Sidecars>, gate: Arc<Engine>) -> Arc<Self> {
+        gate.audit_into(&paths.state);
         Arc::new(Self {
             paths,
             adopted: AtomicBool::new(false),
@@ -335,6 +358,7 @@ impl Serving {
             retrying: Default::default(),
             warning: Default::default(),
             unlearned: Default::default(),
+            gate,
         })
     }
 
@@ -472,6 +496,11 @@ impl Serving {
                 return Err(self.failed.lock().expect("failed sessions")[&name].clone());
             }
         };
+        // The facts are computable before anyone can find the session, so a first `WatchFacts` never reads its root
+        // before the sidecar's surroundings are known.
+        if let Some(info) = info.as_ref().filter(|_| !closed) {
+            self.start_facts(info, &session).await;
+        }
         self.failed.lock().expect("failed sessions").remove(&name);
         self.retrying.lock().expect("retry identities").remove(&name);
         self.sessions.lock().await.insert(identity, session.clone());
@@ -494,6 +523,55 @@ impl Serving {
             tasks.push(task);
         }
         Ok(())
+    }
+
+    /// Makes the session's gate facts computable against its sidecar's root and start environment, and computes them
+    /// for every gate request already pending: a daemon keeps facts in memory only, so adopting a session after a
+    /// restart computes them all again. Runs before the session is listed and its watch starts, so the requests listed
+    /// here are exactly those the watch has not applied. It never stops the session being followed: a scene that
+    /// cannot be built gives every request a refusal fact, and a failure to list the pending requests is audited.
+    async fn start_facts(&self, info: &SidecarRecord, session: &SharedSession) {
+        let (paths, root, started) = (self.paths.clone(), info.root.clone(), info.started.clone());
+        let scene = match started {
+            None => Err(super::gate::REFUSAL_UNKNOWN_START),
+            // Building the scene reads the account files and resolves the installation, so it runs off the runtime.
+            Some(started) => {
+                let built = blocking(move || {
+                    Ok(Arc::new(super::gate::surroundings::scene(
+                        std::path::Path::new(&root),
+                        &started,
+                        &paths,
+                    )))
+                })
+                .await;
+                match built {
+                    Ok(scene) => Ok(scene),
+                    Err(error) => {
+                        let fields = format!("sidecar={} error={}", info.sidecar_id, error.message());
+                        self.audit("gate-facts-scene", fields).await;
+                        Err(super::gate::REFUSAL_FAILED)
+                    }
+                }
+            }
+        };
+        session.facts.start(self.gate.clone(), scene);
+        let shared = session.clone();
+        let jobs = blocking(move || {
+            let state = shared.lock().expect("session");
+            Ok(shared.facts.adopt(&state.pending))
+        })
+        .await;
+        match jobs {
+            Ok(jobs) => {
+                for job in jobs {
+                    tokio::spawn(session.facts.clone().run(job));
+                }
+            }
+            Err(error) => {
+                let fields = format!("sidecar={} error={}", info.sidecar_id, error.message());
+                self.audit("gate-facts-adopt", fields).await;
+            }
+        }
     }
 
     /// Whether the sidecar a watch was started on is still that same running process.
@@ -700,9 +778,11 @@ impl Serving {
             .collect();
         let mut sessions = self.sessions.lock().await;
         let mut failed = self.failed.lock().expect("failed sessions");
-        sessions.retain(|identity, _| {
+        sessions.retain(|identity, session| {
             let name = journal_name(identity);
             if evicted.contains(&name) {
+                // Its fact streams end: nothing about it is followed any more.
+                session.facts.close();
                 failed.insert(name, replay::session_gone("the retained history has expired"));
                 false
             } else {
@@ -2099,6 +2179,7 @@ mod tests {
             .unwrap();
         assert!(!paths.state.join("journal").join(name).exists());
         assert!(serving.sessions.lock().await.is_empty());
+        assert!(session.facts.is_closed(), "an evicted session's fact streams end");
     }
 
     #[test]

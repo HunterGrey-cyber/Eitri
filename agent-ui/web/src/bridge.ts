@@ -486,6 +486,9 @@ type InboundHandler = (
     | ({ kind: "tabs" } & TabsEnvelope)
     | { kind: "tab_detail"; tab: TabId; rows: DetailRow[] }
     | ({ kind: "chooser" } & ChooserEnvelope)
+    /** The rows of a chooser's list that arrived after it was sent (a remote tab's sessions): laid over a chooser
+     *  still open, in place of its rows; with none open, nothing happens (it never opens one or takes the keys). */
+    | ({ kind: "chooser_update" } & ChooserEnvelope)
     /** Newer titles for records the last chooser listed, read after it was sent: laid over an open chooser's
      *  rows in place; with no chooser open, nothing happens (it never opens one). */
     | { kind: "chooser_titles"; titles: { providerSessionId: string; title: string }[] }
@@ -995,6 +998,7 @@ export function installDispatch(handler: InboundHandler): void {
         obj.kind === "tabs" ||
         obj.kind === "tab_detail" ||
         obj.kind === "chooser" ||
+        obj.kind === "chooser_update" ||
         obj.kind === "chooser_titles" ||
         obj.kind === "confirm_close" ||
         obj.kind === "confirm_close_others" ||

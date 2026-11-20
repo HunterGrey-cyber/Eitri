@@ -825,16 +825,15 @@ pub(super) fn handle_inbound_message(
                 // Why the folder is no boundary: a fact about the window, said again to every document,
                 // right after the greeting it belongs with; then the shown tab's own note, if it has one, which
                 // the page draws over the window's while that tab is shown.
+                let shown_note = state
+                    .tab_of_page(view)
+                    .and_then(|tab| super::routing::tab_root_note(state, tab));
                 let notes: Vec<String> = state
                     .root_note
                     .as_deref()
                     .map(eitri_core::agent_bridge::serialize_root_note_for_js)
                     .into_iter()
-                    .chain(
-                        state
-                            .tab_of_page(view)
-                            .and_then(|tab| super::routing::tab_root_note(state, tab)),
-                    )
+                    .chain(shown_note)
                     .collect();
                 payloads.splice(1..1, notes);
                 // The status-band hints the replaced document was showing, of this view's tabs.
@@ -1039,16 +1038,28 @@ pub(super) fn handle_inbound_message(
                 refuse(&mut out, "the previous session is still being handed off to a terminal");
                 return out;
             }
-            if state.tabs.get(tab).is_some_and(|tab| tab.is_remote()) {
+            // A remote tab resumes only from its server's transcripts (`resume_in` takes it there), and holds no
+            // lease on this machine: the session's transcript and its CLI are on the server.
+            let remote = state.tabs.get(tab).is_some_and(|tab| tab.is_remote());
+            if remote && !super::remote_sessions::offers_transcripts(state) {
                 refuse(&mut out, super::detail::REMOTE_RESUME_UNAVAILABLE);
                 return out;
+            }
+            // Checked before routing, so a malformed id never opens a tab of its own first.
+            if remote {
+                if let Err(why) =
+                    agent::remote_answers::checked_session_uuid("the session to resume", &provider_session_id)
+                {
+                    refuse(&mut out, &why);
+                    return out;
+                }
             }
             let canonical = state.canonical_project_dir.clone();
             // The session is the tab's agent's: its lease is under that agent's name.
             let agent = state.tabs.get(tab).map_or(AgentId::Claude, |t| t.agent().clone());
             let lease_name = agent.record_name();
-            let held =
-                agent::lease::SessionLease::is_held(&lease_name, &canonical, &provider_session_id).unwrap_or(false);
+            let held = !remote
+                && agent::lease::SessionLease::is_held(&lease_name, &canonical, &provider_session_id).unwrap_or(false);
             let route = state.tabs.route_resume(tab, &agent, &provider_session_id, held);
             match route {
                 // Already open: a bound tab is never selected, its view is shown instead; a base-view

@@ -17,6 +17,8 @@
 //! - `~/.local/lib/eitri`, where the installer puts the program, its launcher `~/.local/bin/eitri`, and the directory
 //!   of the running binary (the shipped plugins and the sidecar sit beside it), unless that lies inside the project
 //!   root: there it is a build tree the project's own build rewrites.
+//! - any further directories the caller names (`EitriPlaceInputs::extra`): on a server, the remote helper's own data
+//!   and state directories.
 //!
 //! Each place counts as named, as resolved, and by where every link inside it leads, so a file a dotfiles manager
 //! linked into the configuration directory is a place wherever it lives (to the depth [`Kind::link_depth`] gives).
@@ -43,7 +45,7 @@ use super::{
     MAX_RESOLUTION_STEPS, MAX_WORK_PER_CLASSIFICATION, NEVER_ASK_TOOLS, WORK_PER_ENTRY, WORK_PER_LOOKUP,
 };
 use serde_json::Value;
-use std::ffi::OsStr;
+use std::ffi::{OsStr, OsString};
 use std::path::{Component, Path, PathBuf};
 
 /// Why a call that writes, or may write, into one of Eitri's own places cards. Not in
@@ -57,7 +59,7 @@ pub const REASON_EITRI_PLACE_UNKNOWN: &str =
     "where this call writes, or where one of Eitri's own configuration places is, could not be established";
 
 /// Variables whose value decides where an Eitri place is; a command naming one may be building that path.
-const PLACE_VARIABLES: [&str; 4] = ["eitri_config_dir", "xdg_config_home", "xdg_data_home", "xdg_state_home"];
+const PLACE_VARIABLE_WORDS: [&str; 4] = ["eitri_config_dir", "xdg_config_home", "xdg_data_home", "xdg_state_home"];
 
 /// The edit tools and the field that names their target.
 const EDIT_TARGET_FIELDS: [(&str, &str); 4] = [
@@ -88,6 +90,10 @@ pub struct EitriPlaceInputs<'a> {
     pub xdg_data_dirs: Option<&'a OsStr>,
     /// The canonical directory of the running binary.
     pub exe_dir: Option<&'a Path>,
+    /// Further directories that are Eitri's own, beyond those the variables above decide: the remote helper's data
+    /// and state directories, whose journal and pending requests decide what Eitri is told. Absolute ones only; links
+    /// inside them are followed to a data directory's depth.
+    pub extra: &'a [PathBuf],
 }
 
 /// What a place holds, which decides how deep the links inside it are followed back ([`Kind::link_depth`]).
@@ -142,19 +148,31 @@ fn exe_dir_of_this_process() -> Option<PathBuf> {
         .clone()
 }
 
+/// The environment variables that decide where Eitri's places are, in the order [`EitriPlaces::from_variables`] reads
+/// them. A process that judges calls for an agent started elsewhere keeps these of that agent's environment.
+pub const PLACE_VARIABLES: [&str; 6] = [
+    "HOME",
+    "EITRI_CONFIG_DIR",
+    "XDG_CONFIG_HOME",
+    "XDG_DATA_HOME",
+    "XDG_STATE_HOME",
+    "XDG_DATA_DIRS",
+];
+
 impl EitriPlaces {
     /// This process's places. The only reader of the real environment here.
     pub fn from_process() -> EitriPlaces {
-        let var = std::env::var_os;
-        let (home, config, xdg_config, xdg_data, xdg_state, xdg_data_dirs) = (
-            var("HOME"),
-            var("EITRI_CONFIG_DIR"),
-            var("XDG_CONFIG_HOME"),
-            var("XDG_DATA_HOME"),
-            var("XDG_STATE_HOME"),
-            var("XDG_DATA_DIRS"),
-        );
-        let exe_dir = exe_dir_of_this_process();
+        EitriPlaces::from_variables(|name| std::env::var_os(name), exe_dir_of_this_process().as_deref(), &[])
+    }
+
+    /// The places for the value `var` gives each of [`PLACE_VARIABLES`], the running binary's directory `exe_dir`
+    /// and the further directories `extra` ([`EitriPlaceInputs`]).
+    pub fn from_variables(
+        var: impl Fn(&str) -> Option<OsString>,
+        exe_dir: Option<&Path>,
+        extra: &[PathBuf],
+    ) -> EitriPlaces {
+        let [home, config, xdg_config, xdg_data, xdg_state, xdg_data_dirs] = PLACE_VARIABLES.map(var);
         EitriPlaces::from_values(&EitriPlaceInputs {
             home: home.as_deref(),
             eitri_config_dir: config.as_deref(),
@@ -162,7 +180,8 @@ impl EitriPlaces {
             xdg_data_home: xdg_data.as_deref(),
             xdg_state_home: xdg_state.as_deref(),
             xdg_data_dirs: xdg_data_dirs.as_deref(),
-            exe_dir: exe_dir.as_deref(),
+            exe_dir,
+            extra,
         })
     }
 
@@ -205,6 +224,13 @@ impl EitriPlaces {
             _ => vec![PathBuf::from("/usr/local/share"), PathBuf::from("/usr/share")],
         };
         dirs.extend(system.into_iter().map(|dir| (dir.join("eitri"), Kind::Data)));
+        dirs.extend(
+            inputs
+                .extra
+                .iter()
+                .filter(|dir| dir.is_absolute())
+                .map(|dir| (dir.clone(), Kind::Data)),
+        );
         let mut unique: Vec<(PathBuf, Kind)> = Vec::new();
         for dir in dirs {
             if !unique.iter().any(|(seen, _)| *seen == dir.0) {
@@ -255,7 +281,7 @@ pub fn eitri_places_card(
     if ran_out {
         Some(ask(REASON_EITRI_PLACE_UNKNOWN))
     } else {
-        card.map(ask)
+        card.map(|reason| ask(reason))
     }
 }
 
@@ -559,7 +585,7 @@ fn needles(spellings: &[Vec<String>], root: &Path, home: Option<&Path>) -> Vec<S
             .collect()
         })
         .unwrap_or_default();
-    let mut out: Vec<String> = PLACE_VARIABLES.iter().map(|v| v.to_string()).collect();
+    let mut out: Vec<String> = PLACE_VARIABLE_WORDS.iter().map(|v| v.to_string()).collect();
     let mut add = |text: String| {
         if !out.contains(&text) {
             out.push(text);
@@ -750,6 +776,7 @@ mod tests {
                 xdg_state_home: os("/xs"),
                 xdg_data_dirs: os("/flat/share:rel:/usr/share"),
                 exe_dir: Some(Path::new("/opt/eitri/0.4.0")),
+                extra: &[],
             }),
             expected,
             "the variables' places first, the home defaults always, the system data directories, the binary's \

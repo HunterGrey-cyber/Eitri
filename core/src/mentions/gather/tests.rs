@@ -99,7 +99,9 @@ fn each_name_is_read_once_and_the_sections_come_in_the_order_written() {
         &[Kind::Diagnostics, Kind::Buffers, Kind::Quickfix],
         &project.root,
         None,
-        Some(config(&project)),
+        RulesSource::Local {
+            config_dir: Some(config(&project)),
+        },
         now,
     );
     assert_eq!(editor.asked().len(), 3, "one chunk for each name");
@@ -139,7 +141,9 @@ fn with_no_editor_each_name_says_it_was_not_attached() {
         &[Kind::Buffers],
         &project.root,
         None,
-        Some(config(&project)),
+        RulesSource::Local {
+            config_dir: Some(config(&project)),
+        },
         now,
     );
     let done = finished(&mut gather, now);
@@ -160,7 +164,9 @@ fn an_editor_that_does_not_answer_in_time_is_given_up_on() {
         &[Kind::Quickfix],
         &project.root,
         None,
-        Some(config(&project)),
+        RulesSource::Local {
+            config_dir: Some(config(&project)),
+        },
         now,
     );
     assert!(gather.poll(now + Duration::from_secs(4)).is_none());
@@ -183,7 +189,9 @@ fn an_answer_that_is_not_the_chunks_is_a_section_that_says_so() {
         &[Kind::Buffers],
         &project.root,
         None,
-        Some(config(&project)),
+        RulesSource::Local {
+            config_dir: Some(config(&project)),
+        },
         now,
     );
     editor.answer_oldest(&json!({"buffers": "no"}));
@@ -206,7 +214,9 @@ fn a_settings_file_that_is_not_json_keeps_every_file_out() {
         &[Kind::Buffers],
         &project.root,
         None,
-        Some(config(&project)),
+        RulesSource::Local {
+            config_dir: Some(config(&project)),
+        },
         now,
     );
     editor.answer_oldest(&buffer_reply(&a, &["TEXT"]));
@@ -216,4 +226,97 @@ fn a_settings_file_that_is_not_json_keeps_every_file_out() {
         "{done}"
     );
     assert!(!done.contains("TEXT"), "{done}");
+}
+
+/// The rules a server's settings give, read on the gathering worker as a remote tab's are.
+fn server_rules(server_root: &Path, deny: &[&str]) -> RulesSource {
+    let list: Vec<String> = deny.iter().map(|rule| format!("{rule:?}")).collect();
+    let settings = format!(r#"{{"permissions":{{"deny":[{}]}}}}"#, list.join(","));
+    let reads = vec![(
+        agent::read_deny::SettingsFile {
+            path: server_root.join(".claude/settings.local.json"),
+            strict: false,
+        },
+        agent::read_deny::FileRead::Bytes(settings.into_bytes()),
+    )];
+    let rules = ReadRules::from_reads(server_root, Some(Path::new("/home/example")), true, reads);
+    let server_root = server_root.to_path_buf();
+    RulesSource::Fetch(Box::new(move || (rules, server_root)))
+}
+
+fn buffers_with(project: &Project, rules: RulesSource, file: &Path) -> String {
+    let editor = FakeEditor::default();
+    let now = Instant::now();
+    let mut gather = Gather::start(
+        Some(&editor),
+        &mut sequencer(),
+        &[Kind::Buffers],
+        &project.root,
+        None,
+        rules,
+        now,
+    );
+    editor.answer_oldest(&buffer_reply(file, &["SECRET-LINE"]));
+    finished(&mut gather, now).appended_to("why?")
+}
+
+/// A rule only the server's settings hold (its `settings.local.json`, which git does not carry to the laptop) keeps
+/// the file out of `@buffers`, whether it names the file from the project's folder or by the server's own absolute
+/// path, which may differ from the laptop's.
+#[test]
+fn a_server_only_local_settings_rule_keeps_a_file_out_of_buffers() {
+    let remote = project("server-rule", &[]);
+    let secret = remote.root.join("secret.txt");
+    let told = buffers_with(&remote, server_rules(&remote.root, &[]), &secret);
+    assert!(told.contains("SECRET-LINE"), "no rule, the buffer is told: {told}");
+    for (server_root, rule) in [
+        (remote.root.clone(), "Read(secret.txt)".to_owned()),
+        (
+            PathBuf::from("/srv/project"),
+            "Read(//srv/project/secret.txt)".to_owned(),
+        ),
+        (PathBuf::from("/srv/project"), "Read(/secret.txt)".to_owned()),
+    ] {
+        let kept = buffers_with(&remote, server_rules(&server_root, &[rule.as_str()]), &secret);
+        assert!(
+            !kept.contains("SECRET-LINE"),
+            "{rule} at {}: {kept}",
+            server_root.display()
+        );
+        assert!(kept.contains("covered by a Read deny rule"), "{kept}");
+    }
+    // The laptop's own settings play no part for a remote tab: a rule only there does not keep the file out.
+    let local = project("server-rule-local", &["Read(secret.txt)"]);
+    let told = buffers_with(&local, server_rules(&local.root, &[]), &local.root.join("secret.txt"));
+    assert!(told.contains("SECRET-LINE"), "{told}");
+}
+
+/// A fetch that fails leaves every source out with its reason.
+#[test]
+fn a_failed_fetch_leaves_the_sources_out_with_the_line() {
+    let project = project("server-failed", &[]);
+    let failed = RulesSource::Fetch(Box::new(|| {
+        (
+            ReadRules::unavailable_because("the server's settings could not be read: no answer"),
+            PathBuf::from("/srv/project"),
+        )
+    }));
+    let text = buffers_with(&project, failed, &project.root.join("a.rs"));
+    assert!(!text.contains("SECRET-LINE"), "{text}");
+    assert!(
+        text.contains("the server's settings could not be read: no answer"),
+        "{text}"
+    );
+}
+
+/// A local tab reads this machine's settings, as before.
+#[test]
+fn local_tabs_read_their_own_settings_as_before() {
+    let project = project("local-rule", &["Read(secret.txt)"]);
+    let local = RulesSource::Local {
+        config_dir: Some(config(&project)),
+    };
+    let text = buffers_with(&project, local, &project.root.join("secret.txt"));
+    assert!(!text.contains("SECRET-LINE"), "{text}");
+    assert!(text.contains("covered by a Read deny rule"), "{text}");
 }

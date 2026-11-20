@@ -214,6 +214,24 @@ pub fn read_transcript_history(path: &Path) -> std::io::Result<TranscriptHistory
     read_history_from(&mut reader, started_mid_file)
 }
 
+/// The history held in transcript bytes already in memory: a whole file, or its last bytes when `started_mid_file`,
+/// in which case the first line is dropped as [`read_transcript_history`] drops the partial line a seek lands in.
+///
+/// Bytes past [`HISTORY_SCAN_MAX_BYTES`] are cut to their last that many and then read as a tail that starts mid file,
+/// whatever the caller said, so a source that hands over more than the file reader would read gives the same history.
+pub(crate) fn read_history_from_tail(tail: &[u8], started_mid_file: bool) -> std::io::Result<TranscriptHistory> {
+    let (tail, started_mid_file) = match tail.len().checked_sub(HISTORY_SCAN_MAX_BYTES as usize) {
+        Some(excess) if excess > 0 => (&tail[excess..], true),
+        _ => (tail, started_mid_file),
+    };
+    // A byte slice is already a buffered reader.
+    let mut reader = tail;
+    if started_mid_file {
+        let _ = read_bounded_line(&mut reader)?;
+    }
+    read_history_from(&mut reader, started_mid_file)
+}
+
 /// The whole fold, over any reader. Split out so tests can drive it from a `&[u8]` without a
 /// temporary file, and so [`read_transcript_history`] holds nothing but the seek decision.
 pub(crate) fn read_history_from(

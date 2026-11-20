@@ -20,22 +20,28 @@ use super::{proxy, replay};
 use crate::run_dir::Paths;
 
 /// How one watch call is answered.
-pub(super) enum Reply {
+pub enum Reply {
     /// These events, then the stream ends as `End` says.
     Events(Vec<SessionEvent>, End),
     /// What a sidecar holding only these events sends for the request's cursor: the events after it, or an
     /// EVENT_GAP refusal when the event after the cursor is no longer held. The stream then stays open.
     Ring(Vec<SessionEvent>),
     Refuse(Status),
+    /// Nothing until the notify is signalled, then these events; the stream then stays open.
+    #[allow(dead_code)] // for the gate facts tests, which build the daemon's modules in
+    Later(Arc<tokio::sync::Notify>, Vec<SessionEvent>),
+    /// Nothing until the notify is signalled, then these events, then the stream ends as `End` says.
+    #[allow(dead_code)] // for the gate facts tests, which build the daemon's modules in
+    LaterThen(Arc<tokio::sync::Notify>, Vec<SessionEvent>, End),
 }
 
-pub(super) enum End {
+pub enum End {
     Clean,
     Fail(Status),
     Hold,
 }
 
-pub(super) struct FakeSidecar {
+pub struct FakeSidecar {
     root: PathBuf,
     pub paths: Paths,
     pub info: eitri_server_proto::SidecarInfo,
@@ -140,6 +146,27 @@ impl Service<http::Request<Body>> for Script {
                             .boxed(),
                         Some(Reply::Events(events, End::Hold)) => {
                             encode(events).chain(futures_util::stream::pending()).boxed()
+                        }
+                        Some(Reply::Later(signal, events)) => futures_util::stream::once(async move {
+                            signal.notified().await;
+                            encode(events)
+                        })
+                        .flatten()
+                        .chain(futures_util::stream::pending())
+                        .boxed(),
+                        Some(Reply::LaterThen(signal, events, end)) => {
+                            let end: BoxStream<'static, Result<Bytes, Status>> = match end {
+                                End::Clean => futures_util::stream::empty().boxed(),
+                                End::Fail(status) => futures_util::stream::once(async move { Err(status) }).boxed(),
+                                End::Hold => futures_util::stream::pending().boxed(),
+                            };
+                            futures_util::stream::once(async move {
+                                signal.notified().await;
+                                encode(events)
+                            })
+                            .flatten()
+                            .chain(end)
+                            .boxed()
                         }
                         Some(Reply::Ring(events)) => {
                             let after = request.after_sequence.unwrap_or(0);

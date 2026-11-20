@@ -304,6 +304,13 @@ fn the_chooser_lists_open_tabs_then_records_and_marks_those_held_elsewhere() {
     );
     let full: serde_json::Value = serde_json::from_str(&serialize_chooser_for_js(&open, &records, Some(200))).unwrap();
     assert_eq!(full["limit"], 200);
+    // The rows of a list that arrived later carry the same rows under their own kind, so a page that closed its
+    // chooser meanwhile does not take them for a request to open one.
+    let update: serde_json::Value =
+        serde_json::from_str(&serialize_chooser_update_for_js(&open, &records, None)).unwrap();
+    assert_eq!(update["kind"], "chooser_update");
+    assert_eq!(update["open"], value["open"]);
+    assert_eq!(update["records"], value["records"]);
     assert_eq!(value["open"][0]["tab"], 1);
     assert_eq!(value["open"][0]["marker"], serde_json::Value::Null);
     assert_eq!(value["records"][0]["providerSessionId"], "c-9");

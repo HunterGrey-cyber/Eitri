@@ -84,6 +84,8 @@ mod remote_entry;
 #[cfg(any(test, feature = "test-support"))]
 #[path = "remote_host_test.rs"]
 mod remote_host_test;
+#[path = "remote_sessions.rs"]
+mod remote_sessions;
 #[path = "remote_socket/mod.rs"]
 mod remote_socket;
 #[path = "remote_tabs.rs"]
@@ -501,6 +503,8 @@ struct AgentPanelState {
     server: Option<eitri_core::remote_project::RemoteConnection>,
     /// A remote tab's questions open in its page, and the work the person's choices started.
     remote_prompts: remote_tabs::RemotePrompts,
+    /// The server's sessions each remote tab's chooser lists, asked for on a worker.
+    remote_sessions: remote_sessions::RemoteSessions,
     /// Stops of agents on this window's server kept for when it can be reached, and what sends them.
     remote_stops: remote_tabs::RemoteStops,
     /// The window's sync with its server as the sync actor last reported it (a remote window only).
@@ -612,6 +616,7 @@ impl AgentPanelState {
             spawner: Spawner::Real,
             server: None,
             remote_prompts: remote_tabs::RemotePrompts::default(),
+            remote_sessions: remote_sessions::RemoteSessions::default(),
             remote_stops: remote_tabs::RemoteStops::default(),
             sync_chip: None,
             unclaimed_remote: Vec::new(),

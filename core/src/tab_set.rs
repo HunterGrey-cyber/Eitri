@@ -522,6 +522,10 @@ pub struct Tab {
     /// The text of the tab's own note the person dismissed, in whichever page: it stays dismissed in every page
     /// the tab is shown in while the note says the same.
     root_note_dismissed: Option<String>,
+    /// A remote tab's root on its server as the window's trust scan of the project named it (canonical, the folder a
+    /// link leads to), set by the panel; `None` before a scan named it. The server's path facts are used only when
+    /// the root they are about is this one.
+    server_root: Option<PathBuf>,
     pub pending_handoff: Option<PendingHandoff>,
     /// Held here, not only in the WebView, so a panel reload cannot lose it (see the doc this field
     /// had on `AgentPanelState` before session tabs; it moved per tab with them).
@@ -821,6 +825,7 @@ impl SessionState {
             .chain(held)
             .chain(self.plan.held.iter().cloned())
             .chain(self.plan.unsequenced.keys().cloned())
+            .chain(self.human_allowed.fact_wait_ids().cloned())
             .collect()
     }
 
@@ -907,19 +912,52 @@ impl Tab {
         matches!(self.origin, TabOrigin::Remote { .. })
     }
 
+    /// What the gate judges this tab's paths with: the laptop's disk for a local tab; for a remote one the server's
+    /// fact for each request when its provider serves facts this window uses and they are about the root the
+    /// window's trust scan named on the server, and no facts at all otherwise (a root not named yet, or another
+    /// one, included).
     pub fn gate_root<'a>(&self, local_root: &'a Path) -> agent::GateRoot<'a> {
         match self.origin {
             TabOrigin::Local => agent::GateRoot::Local(local_root),
+            TabOrigin::Remote { .. } if self.uses_server_facts() => agent::GateRoot::RemoteWithFacts,
             TabOrigin::Remote { .. } => agent::GateRoot::RemoteWithoutFacts,
         }
     }
 
+    fn uses_server_facts(&self) -> bool {
+        let Some(served) = self.live().and_then(AgentBackend::gate_facts_root) else {
+            return false;
+        };
+        self.server_root.as_deref() == Some(served.as_path())
+    }
+
+    /// The tab's root on its server as the trust scan named it ([`Tab::gate_root`]).
+    pub fn set_server_root(&mut self, root: Option<PathBuf>) {
+        self.server_root = root;
+    }
+
+    /// A remote tab's own note about its root: none where the server says the root is a boundary; the local note's
+    /// words naming the server where it says it is not, for a reason this build knows; and otherwise (no facts, no
+    /// word on the root yet, a reason this build does not know) that path checks on the server are not available.
     pub fn root_note(&self) -> Option<String> {
-        match &self.origin {
-            TabOrigin::Local => None,
-            TabOrigin::Remote { host, .. } => Some(format!(
+        let TabOrigin::Remote { host, .. } = &self.origin else {
+            return None;
+        };
+        let unavailable = || {
+            Some(format!(
                 "this tab runs on {host}; path checks on the server are not available yet"
-            )),
+            ))
+        };
+        if !self.uses_server_facts() {
+            return unavailable();
+        }
+        match self.live().and_then(AgentBackend::gate_root_fact) {
+            Some(agent::gate_facts::RootFact { is_boundary: true, .. }) => None,
+            Some(agent::gate_facts::RootFact {
+                not_a_boundary: Some(refusal),
+                ..
+            }) => Some(agent::project_boundary::note_on(refusal, host)),
+            _ => unavailable(),
         }
     }
 
@@ -993,6 +1031,7 @@ impl Tab {
             remote_agent_stopped: false,
             send_sync: Default::default(),
             root_note_dismissed: None,
+            server_root: None,
             pending_handoff: None,
             last_handoff: None,
             editing_draft: None,
@@ -1833,6 +1872,8 @@ pub const SHELL_LINES_REMOTE_UNAVAILABLE: &str = "shell lines are not available 
 pub struct TabSet {
     pub send_port: Option<crate::remote_sync::flush::SendPort>,
     last_link_states: BTreeMap<u64, (u64, Option<agent::RemoteLinkState>)>,
+    /// The own note of each remote tab as a pump last told the page showing it ([`Tab::root_note`]).
+    last_root_notes: BTreeMap<u64, Option<String>>,
     project_origin: TabOrigin,
     local_copy_host: Option<String>,
     tabs: Vec<Tab>,
@@ -2011,6 +2052,7 @@ impl TabSet {
         let mut set = TabSet {
             send_port: None,
             last_link_states: BTreeMap::new(),
+            last_root_notes: BTreeMap::new(),
             tabs: Vec::new(),
             history_clears: Vec::new(),
             observers: observers::Observers::default(),
@@ -2225,6 +2267,47 @@ impl TabSet {
             .filter(|tab| !self.moving.contains(&tab.id.0))
             .filter_map(|tab| tab.session.plan.next_sequence_release())
             .min()
+    }
+
+    /// How long until a remote tab's request held for the server's fact, or for a fresh check, is judged without it:
+    /// zero when one is already due, `None` when none waits. A fact or a fresh answer that arrives wakes the tab; the
+    /// time limits wake nothing, so the window runs a tick by then. A tab frozen for a move is left out.
+    pub fn next_gate_fact_release(&self) -> Option<std::time::Duration> {
+        self.tabs
+            .iter()
+            .filter(|tab| !self.moving.contains(&tab.id.0))
+            .filter_map(|tab| tab.session.human_allowed.next_fact_release())
+            .min()
+    }
+
+    /// The `root_note` envelope a page showing tab `id` is sent with the tab, for a remote tab (an empty text when it
+    /// has no note, which takes down one the page kept for it), recorded as what that page was told: a pump tells it
+    /// again only once the note changes. A local tab has none: its page draws the window's note.
+    pub fn shown_root_note(&mut self, id: TabId) -> Option<String> {
+        let tab = self.tabs.iter().find(|tab| tab.id == id && tab.is_remote())?;
+        let note = tab.root_note();
+        let payload = crate::agent_bridge::serialize_tab_root_note_for_js(
+            id,
+            note.as_deref().unwrap_or_default(),
+            tab.root_note_dismissed(),
+        );
+        self.last_root_notes.insert(id.0, note);
+        Some(payload)
+    }
+
+    /// Tells the remote tab `id` its root on the server as the window's trust scan named it ([`Tab::gate_root`]).
+    pub fn set_server_root(&mut self, id: TabId, root: Option<PathBuf>) {
+        if let Some(tab) = self.get_mut(id) {
+            tab.set_server_root(root);
+        }
+    }
+
+    /// Moves the start of a remote tab's wait for the fact of `permission_id` back to `since`. For tests of the limit.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn hold_for_fact_since(&mut self, id: TabId, permission_id: &str, since: std::time::Instant) {
+        if let Some(tab) = self.get_mut(id) {
+            tab.session.human_allowed.held_for_fact_since(permission_id, since);
+        }
     }
 
     /// Moves the start of the wait of a request on tab `id` that already waits for its call to `first_ms`
@@ -4181,6 +4264,8 @@ impl TabSet {
         self.observers.reap();
         self.last_link_states
             .retain(|id, _| self.tabs.iter().any(|tab| tab.id.0 == *id));
+        self.last_root_notes
+            .retain(|id, _| self.tabs.iter().any(|tab| tab.id.0 == *id));
         let active = self.active;
         self.project_root = Some(project_root.to_path_buf());
         let mut out = match self.held_pump.take() {
@@ -4260,6 +4345,27 @@ impl TabSet {
                     });
                     tick.last_link_states
                         .insert(tab.id.0, (tab.backend_generation, link_state));
+                }
+            }
+            // A remote tab's own note follows what the server says of its root: the page showing the tab is told
+            // when it changes, and an empty text takes the note down. Showing the tab tells the page its note and
+            // records it (`shown_root_note`); a first look with nothing recorded records the note as it is.
+            if tab.is_remote() && place.in_a_page {
+                let note = tab.root_note();
+                let told = self.last_root_notes.entry(tab.id.0).or_insert_with(|| note.clone());
+                if *told != note {
+                    out.view_payloads.push(ShownPayload {
+                        view: tab.view,
+                        tab: tab.id,
+                        payload: crate::agent_bridge::serialize_tab_root_note_for_js(
+                            tab.id,
+                            note.as_deref().unwrap_or_default(),
+                            tab.root_note_dismissed(),
+                        ),
+                        class: crate::panel_cadence::EnvelopeClass::Stream,
+                        first_text: false,
+                    });
+                    *told = note;
                 }
             }
         }
@@ -7958,7 +8064,9 @@ struct ArmOutcome {
 }
 
 fn refresh_offers(tab: &mut Tab, project_root: &Path) -> bool {
-    if tab.is_remote() {
+    // A remote tab is offered a rule only where the server's facts judge its paths, from the fact of each card.
+    let server_facts = matches!(tab.gate_root(project_root), agent::GateRoot::RemoteWithFacts);
+    if tab.is_remote() && !server_facts {
         let had = !tab.session.rule_offers.is_empty();
         tab.session.rule_offers.clear();
         tab.session.rule_offers_seen.clear();
@@ -7970,6 +8078,8 @@ fn refresh_offers(tab: &mut Tab, project_root: &Path) -> bool {
         tab.session.rule_offers_seen.clear();
         return had;
     };
+    // Each card's fact on a remote tab with the server's facts, asked for once and kept for its offer.
+    let mut facts = std::collections::BTreeMap::new();
     let pending: Vec<(String, String, serde_json::Value)> = {
         let projection = backend.projection();
         // The CLI's own prompts are never offered a rule: no saved rule answers one,
@@ -7984,6 +8094,16 @@ fn refresh_offers(tab: &mut Tab, project_root: &Path) -> bool {
                     && !tab.session.plan.cards.contains(&p.permission_id)
             })
             .collect();
+        // On a remote tab only a card whose fact is here is judged, so one whose fact comes later is looked at again.
+        if server_facts {
+            cards.retain(|p| match backend.gate_fact(&p.permission_id) {
+                agent::gate_facts::GateFactState::Have(have) => {
+                    facts.insert(p.permission_id.clone(), have);
+                    true
+                }
+                _ => false,
+            });
+        }
         cards.sort_by(|a, b| a.permission_id.cmp(&b.permission_id));
         // Compared by id before anything is copied: this runs on every tick, and a card's input
         // can be a whole file's content.
@@ -8000,11 +8120,23 @@ fn refresh_offers(tab: &mut Tab, project_root: &Path) -> bool {
             .map(|p| (p.permission_id.clone(), p.tool_name.clone(), p.input.clone()))
             .collect()
     };
-    tab.session.rule_offers_seen = pending.iter().map(|p| p.0.clone()).collect();
+    let seen = pending.iter().map(|p| p.0.clone()).collect();
+    let offer = |id: &str, tool: &str, input: &serde_json::Value| match server_facts {
+        // What the server's disk gave, with no rules and no mode: what the local offer judges by.
+        true => facts.get(id).and_then(|have| {
+            agent::permission_rules::offer_after(
+                tool,
+                input,
+                agent::classify_with_fact(tool, input, &have.fact, &agent::PrefixRules::default(), false),
+            )
+        }),
+        false => agent::permission_rules::offer(tool, input, project_root),
+    };
     let offers: std::collections::BTreeMap<String, agent::PrefixRule> = pending
         .into_iter()
-        .filter_map(|(id, tool, input)| agent::permission_rules::offer(&tool, &input, project_root).map(|r| (id, r)))
+        .filter_map(|(id, tool, input)| offer(&id, &tool, &input).map(|r| (id, r)))
         .collect();
+    tab.session.rule_offers_seen = seen;
     let changed = offers != tab.session.rule_offers;
     tab.session.rule_offers = offers;
     changed

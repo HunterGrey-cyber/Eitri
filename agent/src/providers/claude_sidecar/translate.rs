@@ -239,12 +239,10 @@ fn translate_one(event: ProtoSessionEvent, expect: CliExpectation) -> Option<Vec
             }
         },
         ProtoEvent::PermissionRequested(requested) => {
-            // A request the sidecar's hook is waiting on is never dropped for a malformed input: it
-            // arrives as the raw text, a non-object value the permission policy never allows (a card,
-            // or the CLI's own classifier under auto), so the turn cannot hang on a call nobody was asked about.
-            let input = serde_json::from_str(&requested.input_json).unwrap_or_else(|e| {
+            // A malformed input arrives as the raw text, which the permission policy never allows (a card, or the
+            // CLI's own classifier under auto).
+            let input = crate::permission_policy::request_input(&requested.input_json, |e| {
                 eprintln!("agent: ClaudeSidecarProvider: unparseable PermissionRequested.input_json, passing it on as text: {e}");
-                serde_json::Value::String(requested.input_json.clone())
             });
             one(AgentDomainEvent::PermissionRequested {
                 // Read before the fields below are moved out of `requested`.
@@ -476,8 +474,12 @@ fn drop_reason(reason: UserMessageDropReason) -> &'static str {
 /// that no earlier approval answers in Auto (`unrecognized_origin`, `needs_its_own_card`): an unknown
 /// kind of ask is a card of its own there. Bypass answers it like any other.
 fn provider_prompt_of(requested: &claude_runtime_protocol::v1::PermissionRequested) -> Option<crate::ProviderPrompt> {
+    if crate::permission_policy::is_gate_request(requested.origin) {
+        return None;
+    }
     let unrecognized_origin = match ProtoPermissionOrigin::try_from(requested.origin) {
-        Ok(ProtoPermissionOrigin::Unspecified) | Ok(ProtoPermissionOrigin::Hook) => return None,
+        // The gate's own requests; `is_gate_request` above answers for them first.
+        Ok(ProtoPermissionOrigin::Unspecified | ProtoPermissionOrigin::Hook) => return None,
         Ok(ProtoPermissionOrigin::ProviderPrompt) => None,
         Err(_) => {
             eprintln!(

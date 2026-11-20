@@ -310,6 +310,11 @@ impl RemoteConnection {
         &self.project.host
     }
 
+    /// The helper connection, for the sibling modules that wrap one of its services.
+    pub(super) fn helper_client(&self) -> &HelperClient {
+        &self.client
+    }
+
     /// What a new tab asks the helper to start: the root as recorded, the window's account by name, the
     /// installed sidecar, and a command id of its own.
     pub fn sidecar_start(&self, account: Option<&str>) -> SidecarStart {
@@ -353,16 +358,36 @@ impl RemoteConnection {
     }
 
     /// Continues the CLI's own session `provider_session_id` through a new sidecar, with the existing
-    /// resume request: a tab whose agent the server no longer runs. A sidecar left running by a failed resume is
-    /// kept to be stopped as [`Self::start_tab`] keeps one. Blocking.
+    /// resume request: a tab whose agent the server no longer runs, or a session the person chose from the
+    /// server's list. With the `transcripts` capability the server is asked first, before any sidecar starts:
+    /// a transcript it says is still being written refuses the resume as a local one does, and the history the
+    /// tab starts from is built from the transcript's tail ([`Self::resume_seed`]). `canonical_root` is the
+    /// tab's root as its trust scan named it, `config_dir` the directory a handshake reported, when one did;
+    /// a tab whose root is not named yet cannot be asked about the server's transcripts and is refused.
+    /// A sidecar left running by a failed resume is kept to be stopped as [`Self::start_tab`] keeps one.
+    /// Blocking.
+    #[allow(clippy::too_many_arguments)]
     pub fn resume_tab(
         &self,
         provider_session_id: &str,
         account: Option<&str>,
+        canonical_root: &str,
+        config_dir: Option<&str>,
         project: ProjectTrust,
         client_tools: Option<agent::ClientToolSet>,
         store: &RemoteProjects,
     ) -> Result<AgentBackend, BackendError> {
+        let seed = if self.offers_transcripts() {
+            let scope = self
+                .tab_scope(canonical_root, account, config_dir)
+                .map_err(|why| BackendError {
+                    message: format!("could not continue the previous session: {why}"),
+                    benign: false,
+                })?;
+            self.resume_seed(&scope, provider_session_id)?
+        } else {
+            None
+        };
         let kept = std::cell::Cell::new(None);
         let resumed = AgentBackend::resume_remote(
             self.client.clone(),
@@ -371,9 +396,21 @@ impl RemoteConnection {
             provider_session_id,
             project,
             client_tools,
+            seed,
             |sidecar| kept.set(Some(self.keep_or_hold(store, sidecar))),
         );
         resumed.map_err(|error| with_kept_stop(error, kept.take(), &self.project.host))
+    }
+
+    /// Whether the helper still runs the sidecar `sidecar_id`, as it lists them now; `Err` when it cannot say. Blocking:
+    /// a worker's call.
+    pub fn sidecar_running(&self, sidecar_id: &str) -> Result<bool, String> {
+        let listed = self.helper_client().list().map_err(|status| {
+            crate::onboarding::display::display_text_cut(status.message(), wire::TRANSCRIPT_REFUSAL_MAX)
+        })?;
+        Ok(listed
+            .iter()
+            .any(|sidecar| sidecar.sidecar_id == sidecar_id && sidecar.alive))
     }
 
     /// Stops the sidecar `sidecar_id` on the server (a tab closed while connected, a stop queued earlier).
@@ -412,7 +449,7 @@ impl RemoteConnection {
         }
     }
 
-    fn require_capability(&self, capability: &str) -> Result<(), String> {
+    pub(super) fn require_capability(&self, capability: &str) -> Result<(), String> {
         let capabilities = self.client.hello_capabilities().map_err(|error| error.to_string())?;
         check_capability(self.host(), &capabilities, capability)
     }

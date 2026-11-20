@@ -183,6 +183,20 @@ describe("a remote tab's note", () => {
     expect(banners(other.container)).toHaveLength(0);
   });
 
+  it("is taken down when told empty, giving way to the window's note, and the window's note is not", () => {
+    const { container } = mixed(true);
+    show(2);
+    expect(texts(container)).toEqual([`${REMOTE}Dismiss`]);
+    dispatch({ kind: "root_note", tab: 2, text: "" });
+    expect(texts(container)).toEqual([`${NOTE}Dismiss`]);
+    // An empty window note changes nothing.
+    dispatch({ kind: "root_note", text: "" });
+    expect(texts(container)).toEqual([`${NOTE}Dismiss`]);
+    // Told again later, it is drawn again.
+    dispatch({ kind: "root_note", tab: 2, text: REMOTE });
+    expect(texts(container)).toEqual([`${REMOTE}Dismiss`]);
+  });
+
   it("dismissing the window's note leaves the remote tab's", () => {
     const { container } = mixed(true);
     fireEvent.click(dismissOf(banners(container)[0]));

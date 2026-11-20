@@ -1,11 +1,9 @@
 //! The trust scan the helper runs for a laptop: project discovery over a server tree, as the server's account.
-use std::fs::File;
-use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
 use eitri_core::project_trust::{discover, Discovery, Limits, Profile, ProfileEnv};
 
-use super::sidecars::{canonical_root, open_root};
+use super::sidecars::{canonical_root, leads_to, open_root, refusal_text};
 
 /// The most JSON one scan sends. A gRPC client accepts 4 MiB per message unless it is told otherwise; this leaves
 /// room inside that for the response's other fields and framing.
@@ -36,8 +34,8 @@ fn scan_with(root: &str, profile_key: &str, before_discovery: impl FnOnce(&Path)
     // The same checks a sidecar start makes: absolute, normal form, an existing directory the account owns. The
     // scan then names the directory as a sidecar started there records it, through every link on the way, since
     // that is where the agent runs and the directories above it are the ones it loads configuration from.
-    let held = open_root(root).map_err(|status| status.message().to_owned())?;
-    let canonical = canonical_root(&held).map_err(|status| status.message().to_owned())?;
+    let held = open_root(root).map_err(|status| refusal_text(&status))?;
+    let canonical = canonical_root(&held).map_err(|status| refusal_text(&status))?;
     let home = super::login_env::minimal_environment()
         .map_err(|error| error.to_string())?
         .remove(std::ffi::OsStr::new("HOME"))
@@ -57,19 +55,10 @@ fn scan_with(root: &str, profile_key: &str, before_discovery: impl FnOnce(&Path)
     );
     // Discovery opens the path afresh from `/`. A directory renamed into its place after the checks above would
     // have been scanned in place of the one that passed them, and the answer would be about another tree.
-    if !same_directory(&held, &canonical) {
+    if !leads_to(&held, &canonical) {
         return Err("the project folder changed during the scan".to_owned());
     }
     encode(&discovery)
-}
-
-/// Whether `canonical` still leads to the directory `held` is open on.
-fn same_directory(held: &File, canonical: &str) -> bool {
-    let identity = |file: &File| file.metadata().map(|metadata| (metadata.dev(), metadata.ino())).ok();
-    match (identity(held), open_root(canonical).ok().as_ref().and_then(identity)) {
-        (Some(held), Some(now)) => held == now,
-        _ => false,
-    }
 }
 
 fn encode(discovery: &Discovery) -> Result<Vec<u8>, String> {

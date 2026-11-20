@@ -220,6 +220,26 @@ agent 和真正的仓库都在服务器上。你笔记本上的 `.git` 是**服�
 
 提示词总是会发出去。如果等待超时、你保存的某个文件有冲突、被排除或遇到同步错误、或者同步没在运行，你的消息下面会有一行话，写出文件和主机，例如「your last save of `src/main.rs` has not reached `example-host`」，被排除或同步不可用时还会带上原因。**提示词本身从不被改动**：agent 收到的恰好就是你输入的内容，这一行会和消息一起留在保存的标签页里。agent 提出的改动经由你的编辑器应用时，即使发送等待已关闭，Eitri 也会等到服务器上有了文件的新内容；如果还没到，Eitri 会说「the write to `<path>` has not reached `example-host` yet; it is saved on this laptop」。如果文件超过 64 MiB，Eitri 会提示文件太大，无法确认。
 
+<a id="permission-cards-on-a-remote-tab"></a>
+## 远程标签页上的权限卡片
+
+远程标签页的 agent 在服务器上干活，它说的路径是服务器上的路径。Eitri 的助手程序在服务器上、对着服务器的磁盘逐个检查 agent 的请求：路径是否留在项目里，路上的链接是否通到项目外面，以及项目文件夹本身算不算边界（归你所有，别的账户不能写）。然后面板就像对待一个同样情况的本地项目那样作答：
+
+- **Manual**：项目内的读取和只读命令直接放行；编辑，以及项目外面的、或经由通出项目的链接的操作，都会问你。
+- **Auto**：服务器认定项目文件夹是边界时，Eitri 把这次调用交给 Claude Code 自己的 auto 模式，和本地一样。跑不了 auto 模式的模型会把这个标签页转成 Manual。
+- **Bypass**：和本地标签页一样。
+
+Eitri 自己作答之前，会再问服务器一次（一次新的检查，最多大约三秒）。如果这期间答案变了，比如项目里的一个文件被换成了指向项目外面的链接，你会看到一张卡片。连接断开时到达的请求，等连接回来、做完新的检查之后，照样这样作答。
+
+服务器没法为某个标签页检查路径时，这个标签页会显示「this tab runs on `example-host`; path checks on the server are not available yet」，每个文件和命令都会问你。这种情况包括：旧版 Eitri 启动的 agent，它的助手程序还在服务器上运行；你刚把标签页挪到了另一个窗口；以及窗口重新打开时回来的标签页，在 Eitri 为它检查完服务器上的项目之前（标签页回来时就会检查）。项目文件夹不是边界时会显示「No project boundary on `example-host` (...)」，每个文件和命令都会问你，本地也是这样。
+
+<a id="sessions-on-the-server"></a>
+## 服务器上的会话
+
+远程窗口的会话选择器（`Ctrl+b w`）列出 Claude Code 在服务器上为这个项目记录的会话，最新的在前，带着标题：既有你的远程标签页启动的，也有你自己在服务器终端里用 `claude` 启动的。选中一个就接着它继续，历史从服务器上 Claude Code 自己的记录里读出来。记录还在被写入的会话（Claude Code 还在某处处理它）会被拒绝。
+
+远程标签页上的 `@buffers`、`@quickfix` 和 `@diagnostics` 遵循服务器上的 `Read` 拒绝规则：也就是服务器上这个项目的和你账户的 Claude 设置，而不是你笔记本上的。这些设置读不到时，编辑器里的内容一样都不附上，消息里会说明原因。
+
 <a id="syncthing-and-dropbox"></a>
 ## Syncthing 和 Dropbox
 

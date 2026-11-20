@@ -29,9 +29,19 @@ pub(super) struct RemotePrompts {
     /// Agents whose session's end was asked about, or needed no question, by tab: each end is asked about once. A
     /// tab that reaches another agent (a resume, a fresh start) is asked about that one's end afresh.
     endings_seen: BTreeSet<(TabId, AgentKey)>,
-    /// Resumes the person chose after the server lost a tab's agent, by tab: the CLI's session that may be
-    /// continued through a new sidecar, and nothing else.
+    /// Resumes the person chose on a remote tab, by tab: after the server lost the tab's agent (a rebuild among
+    /// them), or a session picked in the chooser. Each is the CLI's session that may be continued through a new
+    /// sidecar, and nothing else.
     resumes: BTreeMap<TabId, String>,
+    /// Tabs whose resume rebuilds the history after a gap: the tab says so once the session is back, if its history
+    /// was read from the CLI's transcript.
+    rebuilds: BTreeSet<TabId>,
+    /// The config directory the tab's own agent reported, kept from before its reset for the resume that follows: the
+    /// transcripts a resume reads are matched against it, and the reset takes the handshake it came from.
+    config_dirs: BTreeMap<TabId, String>,
+    /// The sidecar of the agent a tab's reset stopped, kept for the resume that follows: the resume goes on only once
+    /// the server no longer runs it, so two CLIs never continue one session.
+    old_sidecars: BTreeMap<TabId, String>,
     /// "Deny them and stop the agent" workers, each with the agent it was chosen for: what it reports acts on that
     /// agent only, never on one the tab holds since.
     running: Vec<(
@@ -55,8 +65,9 @@ enum About {
     Gap { waiting: Vec<String> },
     /// A close of a tab whose server could not be reached.
     Close,
-    /// The server no longer runs the tab's agent; the CLI's session can be continued.
-    Gone { cli_session: String },
+    /// The server no longer runs the tab's agent, or no longer holds the history of its session; the CLI's session
+    /// can be continued, its history read back from the server's transcript. `rebuild`: the second of those.
+    Gone { cli_session: String, rebuild: bool },
 }
 
 impl About {
@@ -93,7 +104,15 @@ impl RemotePrompts {
     pub(super) fn forget_tab(&mut self, tab: TabId) {
         self.open.remove(&tab);
         self.endings_seen.retain(|(seen, _)| *seen != tab);
+        self.forget_resume(tab);
+    }
+
+    /// What was kept for a resume in `tab`: the choice itself, whether it rebuilds, the config directory carried.
+    fn forget_resume(&mut self, tab: TabId) {
         self.resumes.remove(&tab);
+        self.rebuilds.remove(&tab);
+        self.config_dirs.remove(&tab);
+        self.old_sidecars.remove(&tab);
     }
 
     /// Whether a choice's worker is still running, so the tick keeps reading it.
@@ -125,7 +144,8 @@ impl RemotePrompts {
     }
 }
 
-fn host_of(state: &AgentPanelState, tab: TabId) -> String {
+/// The host `tab`'s project is on, as typed; "the server" for a tab that is not remote.
+pub(super) fn host_of(state: &AgentPanelState, tab: TabId) -> String {
     match state.tabs.get(tab).map(|t| t.origin()) {
         Some(eitri_core::remote_project::TabOrigin::Remote { host, .. }) => host.clone(),
         _ => "the server".to_string(),
@@ -162,6 +182,7 @@ pub(super) fn tick(state: &mut AgentPanelState, out: &mut Outbox) {
     drop_questions_about_other_agents(state, out);
     ask_about_endings(state, out);
     collect_choices(state, out);
+    super::remote_sessions::tick(state, out);
     keep_what_teardowns_did_not_stop(state, out);
     state.remote_stops.collect_writes(out);
     state.remote_stops.watch_links(&state.tabs);
@@ -199,7 +220,17 @@ pub(super) fn ask_about_endings(state: &mut AgentPanelState, out: &mut Outbox) {
             Some((t.id, key, ending, session))
         })
         .collect();
+    let offered = super::remote_sessions::transcripts_offered(state);
+    let transcripts = offered == Some(true);
     for (tab, key, ending, cli_session) in ended {
+        // A gap with nothing waiting is asked about only once the window knows whether the server offers
+        // transcripts: taken as seen before its Hello arrived, the rebuild question would never be asked.
+        let undecided = offered.is_none()
+            && cli_session.is_some()
+            && matches!(&ending, agent::RemoteEnding::Gap { waiting } if waiting.is_empty());
+        if undecided {
+            continue;
+        }
         state.remote_prompts.endings_seen.insert((tab, key.clone()));
         let host = host_of(state, tab);
         let number = number_of(state, tab);
@@ -243,17 +274,59 @@ pub(super) fn ask_about_endings(state: &mut AgentPanelState, out: &mut Outbox) {
                         format!("resume the session on {host}"),
                         RemotePromptAction::Resume,
                     )],
-                    About::Gone { cli_session },
+                    About::Gone {
+                        cli_session,
+                        rebuild: false,
+                    },
                 ),
                 None => continue,
             },
-            agent::RemoteEnding::Gap { .. } => continue,
+            // The journal no longer reaches what the tab missed and nothing waits for an answer: with the server's
+            // transcripts the panel can be rebuilt from the CLI's own record of the session.
+            agent::RemoteEnding::Gap { .. } => match cli_session {
+                Some(cli_session) if transcripts => (
+                    vec![format!(
+                        "tab {number}: {host} no longer holds what this tab missed; its history can be read back from the CLI's transcript there"
+                    )],
+                    // The agent may still be running there, and the rebuild ends it first: the label says so.
+                    vec![choice(
+                        'R',
+                        format!("stop the agent on {host} and rebuild from the CLI's transcript"),
+                        RemotePromptAction::Resume,
+                    )],
+                    About::Gone {
+                        cli_session,
+                        rebuild: true,
+                    },
+                ),
+                _ => continue,
+            },
         };
         // A question names the agent it is about when the tab knows it; one it cannot name is about the tab.
         let agent = (key != AgentKey::default()).then_some(key);
         let payload = state.remote_prompts.ask(tab, about, agent, &lines, &choices);
         send_to_tabs_page(state, tab, payload, out);
     }
+}
+
+/// Whether the end of `tab`'s session is [`ask_about_endings`]' to report: the helper said how it ended, the tab
+/// shows the end, and that end is still to be asked about or its question is open. A tab taken up from the saved
+/// tabs never sees its session open again (nothing replays the opening on a reattach), so an end folded right away
+/// reads as a session that never opened; failing the tab then would retire the agent the question is about before
+/// the question is asked. An end that needed no question is the never-opened report's again.
+pub(super) fn ending_still_asked_about(state: &AgentPanelState, tab: TabId) -> bool {
+    let Some(backend) = state.tabs.get(tab).filter(|t| t.is_remote()).and_then(|t| t.live()) else {
+        return false;
+    };
+    let shown = matches!(backend.projection().status, agent::ProjectionStatus::Unavailable { .. });
+    if !shown || backend.remote_ending().is_none() {
+        return false;
+    }
+    let key = backend
+        .helper_handoff()
+        .map(|h| (h.stop_key(), h.session_id))
+        .unwrap_or_default();
+    !state.remote_prompts.endings_seen.contains(&(tab, key)) || state.remote_prompts.open.contains_key(&tab)
 }
 
 /// A question about an agent the tab no longer holds (it was started over, or holds a new session) goes, from its
@@ -417,6 +490,7 @@ pub(super) fn close_tab_unasked(state: &mut AgentPanelState, tab: TabId, out: &m
     keep_stop_of_tab(state, tab).map_err(|_| "this tab's agent cannot be named to stop it later; close it alone")?;
     close_tab_as(state, tab, out, Ending::LetGo)?;
     state.remote_prompts.forget_tab(tab);
+    state.remote_sessions.forget_tab(tab);
     out.send(
         view,
         eitri_core::agent_bridge::serialize_notice_for_js(&format!(
@@ -424,6 +498,75 @@ pub(super) fn close_tab_unasked(state: &mut AgentPanelState, tab: TabId, out: &m
         )),
     );
     Ok(())
+}
+
+/// The resume of `provider_session_id` the person chose from the server's list, in `tab`: a start the gate puts off
+/// until the project's check, then the one resume a remote tab starts (`start_deferred` takes the choice back out).
+/// Refused when the helper offers no transcripts, for an agent other than Claude, and while the tab's folder on the
+/// server is not named by a trust check, since the server's answers cannot be matched to the project without it.
+pub(super) fn resume_from_server(
+    state: &mut AgentPanelState,
+    tab: TabId,
+    request_id: &str,
+    provider_session_id: String,
+) -> Result<(), String> {
+    if !super::remote_sessions::offers_transcripts(state) {
+        return Err(super::detail::REMOTE_RESUME_UNAVAILABLE.to_string());
+    }
+    if state.tabs.get(tab).is_some_and(|t| t.agent().is_external()) {
+        return Err("only Claude sessions on the server can be resumed from this list".to_string());
+    }
+    // The id comes from the page, and is sent to the server and used in paths there: only the form the CLI names its
+    // sessions in goes on, and a refusal does not repeat what was sent.
+    agent::remote_answers::checked_session_uuid("the session to resume", &provider_session_id)?;
+    state.remote_prompts.rebuilds.remove(&tab);
+    let start = DeferredStart::Resume {
+        request_id: request_id.to_string(),
+        resumed_title: state.remote_sessions.title_of(tab, &provider_session_id),
+        provider_session_id: provider_session_id.clone(),
+        resumed_name: None,
+    };
+    state.remote_prompts.resumes.insert(tab, provider_session_id);
+    let gated = gate_remote_resume(state, tab, start);
+    if gated.is_err() {
+        state.remote_prompts.forget_resume(tab);
+    }
+    gated
+}
+
+/// A rebuilt tab whose session is back says so, when its history really was read from the CLI's transcript on the
+/// server (Eitri's own copy, or none, is not a rebuild). Called when a start installed its backend in `tab`.
+pub(super) fn note_rebuilt(state: &mut AgentPanelState, tab: TabId, out: &mut Outbox) {
+    if !state.remote_prompts.rebuilds.remove(&tab) {
+        return;
+    }
+    let host = host_of(state, tab);
+    // Its own statement: the projection's guard is gone before the note is sent.
+    let note = state.tabs.get(tab).and_then(|t| t.live()).and_then(|backend| {
+        eitri_core::remote_project::resume::rebuilt_note_if_read_from_the_transcript(
+            &host,
+            backend.projection().history.as_ref(),
+        )
+    });
+    if let Some(note) = note {
+        send_to_tabs_page(state, tab, tab_notice(state, tab, &note), out);
+    }
+}
+
+/// A start in `tab` did not come up: a rebuild it was to be is over.
+pub(super) fn start_failed(state: &mut AgentPanelState, tab: TabId) {
+    state.remote_prompts.rebuilds.remove(&tab);
+}
+
+/// What the connect worker of a resume in `tab` is given: the tab's canonical root as its trust scan named it and the
+/// config directory a handshake reported, from the window's other tabs or kept from the agent this resume replaces.
+pub(super) fn resume_scope(state: &mut AgentPanelState, tab: TabId) -> ResumeScope {
+    let carried = state.remote_prompts.config_dirs.remove(&tab);
+    ResumeScope {
+        canonical_root: super::remote_sessions::canonical_root_of(state, tab),
+        config_dir: super::remote_sessions::reported_config_dir_of(state, tab).or(carried),
+        old_sidecar: state.remote_prompts.old_sidecars.remove(&tab),
+    }
 }
 
 /// The person's choice on a remote question: only the question open for `tab` under `nonce` is answered, only with a
@@ -467,29 +610,53 @@ pub(super) fn answer_prompt(
             }
             close_tab_asked_as(state, tab, out, Ending::LetGo).map_err(str::to_string)?;
         }
-        (About::Gone { cli_session }, _) => {
-            state.remote_prompts.resumes.insert(tab, cli_session.clone());
+        (About::Gone { cli_session, rebuild }, _) => {
+            // Read before the reset takes the tab's agent, and its handshake, away.
+            let config_dir = super::remote_sessions::reported_config_dir_of(state, tab);
+            let old_sidecar = state
+                .tabs
+                .get(tab)
+                .and_then(|t| t.live())
+                .and_then(|backend| backend.helper_handoff())
+                .map(|agent| agent.sidecar_id);
             let unreached = unreached_agent(state, tab);
+            // A wait an earlier choice left for this tab is over: its start did not happen.
+            state.resume_after.remove(&tab);
             match state.tabs.reset(tab) {
                 Ok(old) => {
                     keep_unreached(state, unreached);
                     if let Some(old) = old {
-                        state.retiring.backend(old);
+                        // The old agent is stopped on the server (after a gap it may still be running) before the
+                        // new sidecar continues its session: the start waits for that stop.
+                        let gone = state.retiring.backend_watched(old);
+                        state.resume_after.insert(tab, (cli_session.clone(), gone));
                     }
                 }
-                Err(why) => {
-                    state.remote_prompts.resumes.remove(&tab);
-                    return Err(why.to_string());
-                }
+                Err(why) => return Err(why.to_string()),
             }
             state.trust.forget_tab(tab);
+            state.remote_prompts.resumes.insert(tab, cli_session.clone());
+            if let Some(dir) = config_dir {
+                state.remote_prompts.config_dirs.insert(tab, dir);
+            }
+            match old_sidecar {
+                Some(sidecar) => state.remote_prompts.old_sidecars.insert(tab, sidecar),
+                None => state.remote_prompts.old_sidecars.remove(&tab),
+            };
+            if rebuild {
+                state.remote_prompts.rebuilds.insert(tab);
+            }
             let start = DeferredStart::Resume {
                 request_id: request_id.to_string(),
                 provider_session_id: cli_session,
                 resumed_title: None,
                 resumed_name: None,
             };
-            gate_remote_resume(state, tab, start)?;
+            if let Err(why) = gate_remote_resume(state, tab, start) {
+                state.remote_prompts.forget_resume(tab);
+                state.resume_after.remove(&tab);
+                return Err(why);
+            }
             note_start_page(state, tab, request_id, view);
             return Ok(());
         }
@@ -743,16 +910,46 @@ pub(super) fn stop_sender_for(connection: eitri_core::remote_project::RemoteConn
     })
 }
 
+/// What a resume on a server needs to know of the tab: its canonical root as its trust scan named it (empty before one
+/// did) and the config directory a handshake reported for its account there, when one did.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(super) struct ResumeScope {
+    pub(super) canonical_root: String,
+    pub(super) config_dir: Option<String>,
+    /// The sidecar of the tab's previous agent, which must no longer run on the server before its session is
+    /// continued.
+    pub(super) old_sidecar: Option<String>,
+}
+
+/// How long a resume waits for the tab's previous agent to be stopped on the server: the stop's own bounds (the
+/// session's close, then `StopSidecar` within the helper's quick-call limit), with room to spare.
+pub(super) const REMOTE_STOP_WAIT: std::time::Duration = std::time::Duration::from_secs(60);
+
 /// The connect worker of a remote tab: starts its agent on the server through the window's connection, spending the
-/// window's account, or continues `resume` there through a new sidecar.
+/// window's account, or continues `resume` there through a new sidecar, once `after_old` (the teardown of the tab's
+/// previous agent, which stops it there) is done.
 pub(super) fn spawn_remote_connect(
     connection: eitri_core::remote_project::RemoteConnection,
     resume: Option<String>,
+    scope: ResumeScope,
     project: ProjectTrust,
     client_tools: Option<agent::ClientToolSet>,
+    after_old: Option<mpsc::Receiver<()>>,
 ) -> mpsc::Receiver<Result<AgentBackend, BackendError>> {
     let (result_tx, result_rx) = mpsc::channel();
     std::thread::spawn(move || {
+        // The tab's previous agent is stopped on the server before its session is continued through a new sidecar,
+        // and nothing on the server refuses a second CLI on one session: so the resume goes on only once the helper
+        // no longer runs the old sidecar, and is refused when it still does or cannot say.
+        if let Some(after_old) = after_old {
+            let _ = after_old.recv_timeout(REMOTE_STOP_WAIT);
+        }
+        if let (Some(_), Some(sidecar)) = (&resume, &scope.old_sidecar) {
+            if let Some(message) = old_agent_refusal(connection.host(), connection.sidecar_running(sidecar)) {
+                let _ = result_tx.send(Err(BackendError { message, benign: false }));
+                return;
+            }
+        }
         let account = agent::account::configured().map(|account| account.name().to_string());
         // A start that fails leaving its sidecar running keeps that sidecar's stop here; the failure wakes the
         // window's stop sender ([`RemoteStops::send_now`]).
@@ -762,11 +959,33 @@ pub(super) fn spawn_remote_connect(
         );
         let result = match resume {
             None => connection.start_tab(account.as_deref(), project, client_tools, &store),
-            Some(session) => connection.resume_tab(&session, account.as_deref(), project, client_tools, &store),
+            Some(session) => connection.resume_tab(
+                &session,
+                account.as_deref(),
+                &scope.canonical_root,
+                scope.config_dir.as_deref(),
+                project,
+                client_tools,
+                &store,
+            ),
         };
         let _ = result_tx.send(result);
     });
     result_rx
+}
+
+/// Why a resume must not go on, given whether the helper on `host` still runs the tab's previous agent: still running,
+/// or no answer, is a refusal; gone is none.
+fn old_agent_refusal(host: &str, running: Result<bool, String>) -> Option<String> {
+    let why = match running {
+        Ok(false) => return None,
+        Ok(true) => "it is still running there".to_owned(),
+        Err(why) => format!("the helper could not say whether it still runs ({why})"),
+    };
+    let host = eitri_core::onboarding::display::display_name(host);
+    Some(format!(
+        "the agent on {host} could not be stopped, so its session is not continued by a second one: {why}"
+    ))
 }
 
 /// The remote tabs of the saved set this window was given, moved to the window's own keeping
@@ -835,6 +1054,13 @@ pub(super) fn reattach_saved(state: &mut AgentPanelState, out: &mut Outbox) -> u
                 resumed_name: tab.name.clone(),
             },
         );
+        // The tab starts without a trust question, and a page load scans no server for a tab that waits on nothing,
+        // so its project is scanned here, once: the scan names the canonical root its path facts and transcripts
+        // are matched against. Its result asks nothing; it only becomes the project's newest.
+        let subject = super::trust::trust_subject(state, id);
+        if state.trust.bound_discovery(subject.clone()).is_none() {
+            state.trust.refresh(subject);
+        }
         started += 1;
     }
     if started > 0 {
@@ -879,7 +1105,7 @@ fn reattach_connect(
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
     use super::{answer_prompt, ask_about_endings};
     use crate::agent_panel::tests::*;
@@ -1338,6 +1564,569 @@ mod tests {
         assert_eq!(*resumed.borrow(), [Some("claude-1".to_string())]);
     }
 
+    /// A helper that offers transcripts and answers nothing: enough for the tab to know it may rebuild from them.
+    struct IdleTranscripts;
+
+    type Items<T> = std::pin::Pin<
+        Box<
+            dyn agent::remote_client::terminal_transport::tokio_stream::Stream<
+                    Item = Result<T, agent::remote_client::terminal_transport::tonic::Status>,
+                > + Send,
+        >,
+    >;
+
+    #[agent::remote_client::terminal_transport::tonic::async_trait]
+    impl agent::remote_client::terminal_transport::wire::transcripts_server::Transcripts for IdleTranscripts {
+        async fn list_transcripts(
+            &self,
+            _: agent::remote_client::terminal_transport::tonic::Request<agent::remote_client::TranscriptScope>,
+        ) -> Result<
+            agent::remote_client::terminal_transport::tonic::Response<agent::remote_client::ListTranscriptsResponse>,
+            agent::remote_client::terminal_transport::tonic::Status,
+        > {
+            Err(agent::remote_client::terminal_transport::tonic::Status::unimplemented(
+                "idle",
+            ))
+        }
+        type ReadTranscriptTailStream = Items<agent::remote_client::TranscriptChunk>;
+        async fn read_transcript_tail(
+            &self,
+            _: agent::remote_client::terminal_transport::tonic::Request<agent::remote_client::ReadTranscriptRequest>,
+        ) -> Result<
+            agent::remote_client::terminal_transport::tonic::Response<Self::ReadTranscriptTailStream>,
+            agent::remote_client::terminal_transport::tonic::Status,
+        > {
+            Err(agent::remote_client::terminal_transport::tonic::Status::unimplemented(
+                "idle",
+            ))
+        }
+        async fn transcript_stable(
+            &self,
+            _: agent::remote_client::terminal_transport::tonic::Request<agent::remote_client::ReadTranscriptRequest>,
+        ) -> Result<
+            agent::remote_client::terminal_transport::tonic::Response<agent::remote_client::TranscriptStableResponse>,
+            agent::remote_client::terminal_transport::tonic::Status,
+        > {
+            Err(agent::remote_client::terminal_transport::tonic::Status::unimplemented(
+                "idle",
+            ))
+        }
+        type ReadDenySettingsStream = Items<agent::remote_client::ReadDenySettingsEvent>;
+        async fn read_deny_settings(
+            &self,
+            _: agent::remote_client::terminal_transport::tonic::Request<agent::remote_client::TranscriptScope>,
+        ) -> Result<
+            agent::remote_client::terminal_transport::tonic::Response<Self::ReadDenySettingsStream>,
+            agent::remote_client::terminal_transport::tonic::Status,
+        > {
+            Err(agent::remote_client::terminal_transport::tonic::Status::unimplemented(
+                "idle",
+            ))
+        }
+    }
+
+    pub(crate) fn connection_offering_transcripts() -> eitri_core::remote_project::RemoteConnection {
+        connection_offering(&[agent::remote_client::CAP_TRANSCRIPTS])
+    }
+
+    /// A connection whose helper's Hello, already held, lists `capabilities`.
+    fn connection_offering(capabilities: &[&str]) -> eitri_core::remote_project::RemoteConnection {
+        let client = agent::remote_client::HelperClient::serving_transcripts_for_test(
+            "example-host",
+            "SHA256:example",
+            capabilities,
+            IdleTranscripts,
+        );
+        let project = RemoteProject {
+            version: 1,
+            host: "example-host".into(),
+            host_key_sha256: "SHA256:example".into(),
+            root: "/srv/project".into(),
+            helper_version: "0.4.0".into(),
+            sync: None,
+            created_at: 1,
+            queued_stops: Vec::new(),
+        };
+        eitri_core::remote_project::RemoteConnection::with_client(client, project, String::new(), String::new())
+    }
+
+    const SESSION: &str = "0b7a7d3e-5f0c-4c52-9a0e-3a1f0c6d2b11";
+
+    /// The tab with a live agent whose CLI session is known, as a rebuild or a resume asks for it.
+    fn with_known_cli_session(state: &Rc<RefCell<AgentPanelState>>, tab: TabId, provider: &RecordingProvider) {
+        provider.queue(agent::AgentDomainEvent::SessionOpened {
+            session_id: "session-1".into(),
+            provider_session_id: "claude-1".into(),
+            model: "stand-in".into(),
+            cwd: "/srv/project".into(),
+        });
+        wait_until("the CLI's session known", || {
+            state
+                .borrow()
+                .tabs
+                .get(tab)
+                .unwrap()
+                .live()
+                .unwrap()
+                .provider_session_id()
+                .is_some()
+        });
+    }
+
+    /// A start the fake spawner was asked for: the session to continue and the wait for the tab's old agent.
+    type Spawned = Rc<RefCell<Vec<(Option<String>, Option<mpsc::Receiver<()>>)>>>;
+
+    /// Makes the window's connect workers a recording spawner whose answers the test sends by hand.
+    fn spawning_by_hand(
+        state: &Rc<RefCell<AgentPanelState>>,
+    ) -> (Spawned, mpsc::Sender<Result<AgentBackend, BackendError>>) {
+        let spawned: Spawned = Rc::default();
+        let into = spawned.clone();
+        let (answer, result_rx) = mpsc::channel();
+        let result_rx = RefCell::new(Some(result_rx));
+        state.borrow_mut().spawner = Spawner::Fake(Rc::new(RefCell::new(move |call: SpawnCall| match call {
+            SpawnCall::Remote { resume, after_old, .. } => {
+                into.borrow_mut().push((resume, after_old));
+                result_rx.borrow_mut().take().expect("one start")
+            }
+            _ => panic!("a remote tab starts through the window's connection"),
+        })));
+        (spawned, answer)
+    }
+
+    /// A helper whose Hello lists no transcripts has nothing to rebuild from: the gap is seen and nothing is asked.
+    #[test]
+    fn a_gap_is_offered_no_rebuild_by_a_helper_without_transcripts() {
+        let (state, tab, provider) = remote_panel("remote-gap-no-transcripts");
+        with_known_cli_session(&state, tab, &provider);
+        provider.set_remote(Some(agent::RemoteEnding::Gap { waiting: Vec::new() }), Some(handoff()));
+        end_session(&state, tab, &provider);
+        state.borrow_mut().server = Some(connection_offering(&[]));
+        let mut out = Outbox::default();
+        ask_about_endings(&mut state.borrow_mut(), &mut out);
+        assert!(prompt_in(&out).is_none(), "no transcripts, nothing to rebuild from");
+        assert_eq!(state.borrow().remote_prompts.endings_seen.len(), 1);
+    }
+
+    /// A tab taken up from the saved tabs never sees its session open again, so a gap folded at once reads as a
+    /// session that never opened. The never-opened report leaves it to the rebuild question while that end is still
+    /// to be asked about (before the Hello) and while the question is open; an end that needed no question is
+    /// reported as before.
+    #[test]
+    fn a_reattached_tab_ending_on_a_gap_before_it_opens_keeps_its_agent_for_the_rebuild_question() {
+        let report = super::super::starts::report_sessions_that_never_opened;
+        let live = |state: &Rc<RefCell<AgentPanelState>>, tab| state.borrow().tabs.get(tab).unwrap().live().is_some();
+        let (state, tab, provider) = remote_panel("remote-reattach-gap");
+        state.borrow_mut().tabs.get_mut(tab).unwrap().remote_agent = Some((handoff(), Some(SESSION.to_string())));
+        provider.set_remote(Some(agent::RemoteEnding::Gap { waiting: Vec::new() }), Some(handoff()));
+        end_session(&state, tab, &provider);
+        assert!(state
+            .borrow()
+            .tabs
+            .get(tab)
+            .unwrap()
+            .live()
+            .unwrap()
+            .terminated_before_opening()
+            .is_some());
+
+        // Before the Hello: not asked yet, so not reported as a session that never opened.
+        ask_about_endings(&mut state.borrow_mut(), &mut Outbox::default());
+        report(
+            &mut state.borrow_mut(),
+            &Screen::nothing_shown(),
+            &mut Outbox::default(),
+        );
+        assert!(live(&state, tab), "the agent stays for the question");
+
+        // The Hello lists transcripts: the rebuild is offered, and the open question keeps the agent.
+        state.borrow_mut().server = Some(connection_offering_transcripts());
+        let mut out = Outbox::default();
+        ask_about_endings(&mut state.borrow_mut(), &mut out);
+        let prompt = prompt_in(&out).expect("the gap is offered a rebuild");
+        assert_eq!(keys(&prompt), ["R"]);
+        report(
+            &mut state.borrow_mut(),
+            &Screen::nothing_shown(),
+            &mut Outbox::default(),
+        );
+        assert!(live(&state, tab), "the question is still open");
+        let mut again = Outbox::default();
+        ask_about_endings(&mut state.borrow_mut(), &mut again);
+        assert!(prompt_in(&again).is_none(), "asked once");
+
+        // A helper without transcripts: the end needs no question, so the tab is reported as before.
+        let (state, tab, provider) = remote_panel("remote-reattach-gap-no-transcripts");
+        state.borrow_mut().tabs.get_mut(tab).unwrap().remote_agent = Some((handoff(), Some(SESSION.to_string())));
+        provider.set_remote(Some(agent::RemoteEnding::Gap { waiting: Vec::new() }), Some(handoff()));
+        end_session(&state, tab, &provider);
+        state.borrow_mut().server = Some(connection_offering(&[]));
+        ask_about_endings(&mut state.borrow_mut(), &mut Outbox::default());
+        report(
+            &mut state.borrow_mut(),
+            &Screen::nothing_shown(),
+            &mut Outbox::default(),
+        );
+        assert!(
+            !live(&state, tab),
+            "nothing to ask: the never-opened report fails the tab"
+        );
+    }
+
+    /// A tab whose journal no longer reaches what it missed, with nothing waiting for an answer, is offered a rebuild
+    /// from the CLI's transcript on the server once the window knows its helper has transcripts. The agent may
+    /// still be running there, so the choice says it stops it, stops it before the session is continued through a new
+    /// sidecar, and says the history was rebuilt only once the session is back with a history read from the
+    /// transcript.
+    #[test]
+    fn a_gap_with_nothing_waiting_offers_a_rebuild_that_stops_the_agent_first() {
+        let (state, tab, provider) = remote_panel("remote-gap-rebuild");
+        with_known_cli_session(&state, tab, &provider);
+        provider.set_remote(Some(agent::RemoteEnding::Gap { waiting: Vec::new() }), Some(handoff()));
+        end_session(&state, tab, &provider);
+
+        // No Hello yet: whether the server offers transcripts is not known, so the end waits to be asked about.
+        let mut before_hello = Outbox::default();
+        ask_about_endings(&mut state.borrow_mut(), &mut before_hello);
+        assert!(prompt_in(&before_hello).is_none());
+        assert!(
+            state.borrow().remote_prompts.endings_seen.is_empty(),
+            "not taken as seen before the Hello"
+        );
+
+        // The Hello arrives, listing transcripts: the same end is offered a rebuild.
+        state.borrow_mut().server = Some(connection_offering_transcripts());
+        let mut out = Outbox::default();
+        ask_about_endings(&mut state.borrow_mut(), &mut out);
+        let prompt = prompt_in(&out).expect("the gap is offered a rebuild");
+        assert_eq!(keys(&prompt), ["R"]);
+        assert!(
+            prompt["choices"][0]["label"]
+                .as_str()
+                .unwrap()
+                .contains("stop the agent on example-host and rebuild from the CLI's transcript"),
+            "{prompt}"
+        );
+        let (spawned, answer) = spawning_by_hand(&state);
+        let release = provider.hold_remote_stop();
+        let mut out = Outbox::default();
+        answer_prompt(
+            &mut state.borrow_mut(),
+            tab,
+            prompt["nonce"].as_u64().unwrap(),
+            RemotePromptAction::Resume,
+            "r1",
+            ViewId::BASE,
+            &mut out,
+        )
+        .unwrap();
+        assert!(
+            !notices(&out).iter().any(|text| text.contains("rebuilt")),
+            "nothing is said of a rebuild before the session is back: {:?}",
+            notices(&out)
+        );
+        assert_eq!(
+            state.borrow().remote_prompts.old_sidecars.get(&tab),
+            Some(&handoff().sidecar_id),
+            "the resume checks the old agent's sidecar is gone before it goes on"
+        );
+        let start = state
+            .borrow_mut()
+            .tabs
+            .take_deferred(tab)
+            .expect("the rebuild is a gated resume");
+        assert!(
+            matches!(start, DeferredStart::Resume { ref provider_session_id, .. } if provider_session_id == "claude-1")
+        );
+        let _ = start_deferred(&mut state.borrow_mut(), tab, start, ProjectTrust::Untrusted);
+        let (resume, after_old) = spawned.borrow_mut().pop().expect("the resume was started");
+        assert_eq!(resume.as_deref(), Some("claude-1"));
+        let after_old = after_old.expect("the new sidecar waits for the old agent's stop");
+        assert_eq!(
+            after_old.try_recv(),
+            Err(mpsc::TryRecvError::Empty),
+            "the stop of the old agent has not gone yet"
+        );
+        assert_eq!(provider.remote_stops(), 0);
+        release.send(()).unwrap();
+        assert_eq!(after_old.recv_timeout(std::time::Duration::from_secs(10)), Ok(()));
+        assert_eq!(
+            provider.remote_stops(),
+            1,
+            "the old agent was stopped before the resume"
+        );
+
+        // A start that comes up with Eitri's own copy of the history, or none, is no rebuild from the transcript.
+        let backend = {
+            let dir = agent::state_dirs::test_workspace_dir("remote-gap-rebuilt");
+            let provider = std::sync::Arc::new(RecordingProvider::default());
+            let conversation = agent::AgentConversation::create(provider, &dir, ProjectTrust::Untrusted).unwrap();
+            AgentBackend::Conversation {
+                agent: AgentId::Claude,
+                conversation: Box::new(conversation),
+            }
+        };
+        answer.send(Ok(backend)).unwrap();
+        let mut out = Outbox::default();
+        wait_until("the start installed", || {
+            super::super::starts::collect_pending_starts(&mut state.borrow_mut(), &Screen::nothing_shown(), &mut out);
+            matches!(state.borrow().tabs.get(tab).unwrap().backend(), TabBackend::Live(_))
+        });
+        assert!(
+            !notices(&out).iter().any(|text| text.contains("rebuilt")),
+            "{:?}",
+            notices(&out)
+        );
+        assert!(state.borrow().remote_prompts.rebuilds.is_empty());
+    }
+
+    #[test]
+    fn a_resume_goes_on_only_once_the_old_agent_is_gone_on_the_server() {
+        assert_eq!(old_agent_refusal("example-host", Ok(false)), None);
+        let running = old_agent_refusal("example-host", Ok(true)).unwrap();
+        assert!(
+            running.starts_with("the agent on example-host could not be stopped"),
+            "{running}"
+        );
+        assert!(running.ends_with("it is still running there"), "{running}");
+        let unknown = old_agent_refusal("example\nhost", Err("unreachable".into())).unwrap();
+        assert!(
+            unknown.contains("could not say whether it still runs (unreachable)"),
+            "{unknown}"
+        );
+        assert!(!unknown.contains('\n'), "{unknown}");
+    }
+
+    /// A rebuilt tab says so when its history was read from the CLI's transcript on the server, and a rebuild whose
+    /// start failed says nothing and is forgotten.
+    #[test]
+    fn a_rebuild_is_noted_when_the_session_is_back_with_the_transcripts_history() {
+        let (state, tab, provider) = remote_panel("remote-gap-noted");
+        let _ = provider;
+        let transcript = format!(
+            "{}\n{}\n",
+            r#"{"type":"user","uuid":"u-1","version":"2.1.272","promptSource":"typed","message":{"role":"user","content":"question"}}"#,
+            r#"{"type":"assistant","uuid":"a-1","version":"2.1.272","message":{"role":"assistant","content":[{"type":"text","text":"answer"}]}}"#
+        );
+        let seed =
+            agent::history::seed_from_tail(transcript.as_bytes(), false, "conversation", SESSION, "example-host:/t");
+        let resumed = std::sync::Arc::new(Resuming(RecordingProvider::default()));
+        let conversation = agent::AgentConversation::resume_remote_with_tools(
+            resumed,
+            std::path::Path::new("/srv/remote-gap-noted"),
+            SESSION,
+            ProjectTrust::Untrusted,
+            None,
+            Some(seed),
+        )
+        .unwrap();
+        let backend = AgentBackend::Conversation {
+            agent: AgentId::Claude,
+            conversation: Box::new(conversation),
+        };
+        // Another tab, empty, is the one the rebuild starts in.
+        let other = state.borrow_mut().tabs.open(AgentId::Claude);
+        state.borrow_mut().remote_prompts.rebuilds.insert(other);
+        state
+            .borrow_mut()
+            .tabs
+            .get_mut(other)
+            .unwrap()
+            .set_backend(TabBackend::Live(backend));
+        let mut out = Outbox::default();
+        note_rebuilt(&mut state.borrow_mut(), other, &mut out);
+        assert_eq!(
+            notices(&out)
+                .iter()
+                .filter(|text| text.contains("rebuilt from the CLI's transcript on example-host"))
+                .count(),
+            1,
+            "{:?}",
+            notices(&out)
+        );
+        let mut again = Outbox::default();
+        note_rebuilt(&mut state.borrow_mut(), other, &mut again);
+        assert!(notices(&again).is_empty(), "said once");
+
+        state.borrow_mut().remote_prompts.rebuilds.insert(tab);
+        start_failed(&mut state.borrow_mut(), tab);
+        assert!(state.borrow().remote_prompts.rebuilds.is_empty());
+    }
+
+    /// A provider that resumes sessions, which the recording one does not.
+    struct Resuming(RecordingProvider);
+
+    impl agent::AgentProvider for Resuming {
+        fn capabilities(&self) -> agent::ProviderCapabilities {
+            agent::ProviderCapabilities {
+                resume: true,
+                ..agent::AgentProvider::capabilities(&self.0)
+            }
+        }
+        fn info(&self) -> agent::ProviderInfo {
+            agent::AgentProvider::info(&self.0)
+        }
+        fn create_session(&self, request: agent::CreateSessionRequest) -> Result<String, agent::ProviderError> {
+            agent::AgentProvider::create_session(&self.0, request)
+        }
+        fn resume_session(&self, _request: agent::ResumeSessionRequest) -> Result<String, agent::ProviderError> {
+            Ok("session-resumed".into())
+        }
+        fn send_turn(&self, request: agent::SendTurnRequest) -> Result<String, agent::ProviderError> {
+            agent::AgentProvider::send_turn(&self.0, request)
+        }
+        fn interrupt_turn(&self, request: agent::InterruptTurnRequest) -> Result<(), agent::ProviderError> {
+            agent::AgentProvider::interrupt_turn(&self.0, request)
+        }
+        fn resolve_permission(&self, request: agent::ResolvePermissionRequest) -> Result<(), agent::ProviderError> {
+            agent::AgentProvider::resolve_permission(&self.0, request)
+        }
+        fn close_session(&self, request: agent::CloseSessionRequest) -> Result<(), agent::ProviderError> {
+            agent::AgentProvider::close_session(&self.0, request)
+        }
+        fn answer_client_tool_call(&self, answer: agent::ClientToolAnswer) -> Result<(), agent::ProviderError> {
+            agent::AgentProvider::answer_client_tool_call(&self.0, answer)
+        }
+        fn client_tool_call_state(
+            &self,
+            session_id: &str,
+        ) -> Result<agent::TaskReply<agent::ClientToolCallState>, agent::ProviderError> {
+            agent::AgentProvider::client_tool_call_state(&self.0, session_id)
+        }
+        fn pump(&self) -> Vec<agent::AgentDomainEvent> {
+            agent::AgentProvider::pump(&self.0)
+        }
+    }
+
+    /// A window over a remote project with one empty tab, its connection to a helper that offers transcripts (or one
+    /// that is not given a connection yet), and a page.
+    fn remote_window(offering: bool) -> (AgentPanelHandle, Rc<RecordingPage>, TabId) {
+        agent::state_dirs::redirect_state_to_a_test_root();
+        let state = state_for_hooks(TabSet::new(BackendKind::Sidecar, SessionModeChoice::Auto));
+        let tab = {
+            let mut s = state.borrow_mut();
+            s.tabs.set_project_origin(origin()).unwrap();
+            if offering {
+                s.server = Some(connection_offering_transcripts());
+            }
+            s.tabs.active()
+        };
+        let page = Rc::new(RecordingPage::default());
+        page.visible.set(true);
+        let handle = AgentPanelHandle::over(
+            state,
+            Some(Rc::new(PanelPage::new(page.clone() as Rc<dyn PageSurface>))),
+        );
+        (handle, page, tab)
+    }
+
+    /// What `request_id`'s command was refused with, if it was.
+    fn refusal_of(page: &RecordingPage, request_id: &str) -> Option<String> {
+        page.sent
+            .borrow()
+            .iter()
+            .filter_map(|payload| serde_json::from_str::<serde_json::Value>(payload).ok())
+            .find(|v| v["kind"] == "command_result" && v["requestId"] == request_id && v["ok"] == false)
+            .and_then(|v| v["error"].as_str().map(str::to_string))
+    }
+
+    fn resume_message(tab: TabId, request_id: &str, id: &str) -> String {
+        format!(
+            r#"{{"type":"resume","request_id":"{request_id}","tab":{},"provider_session_id":"{id}"}}"#,
+            tab.0
+        )
+    }
+
+    /// The chooser's pick on a remote tab reaches the server's resume: the page's `resume` message is not refused
+    /// for being on a remote tab, holds no lease on this machine, and puts the resume behind the trust question. A
+    /// window whose helper offers no transcripts refuses it as before, and an id that is not a session's name
+    /// goes nowhere.
+    #[test]
+    fn a_session_picked_in_the_chooser_on_a_remote_tab_reaches_the_resume() {
+        let (handle, page, tab) = remote_window(true);
+        let tabs_before = handle.state.borrow().tabs.tabs().len();
+        handle.page_message(ViewId::BASE, &resume_message(tab, "bad", "not a session"));
+        assert_eq!(
+            handle.state.borrow().tabs.tabs().len(),
+            tabs_before,
+            "a malformed id opens no tab of its own"
+        );
+        let why = refusal_of(&page, "bad").expect("an id the CLI would not name is refused");
+        assert!(
+            why.contains("lowercase hyphenated UUID") && !why.contains("not a session"),
+            "{why}"
+        );
+        assert!(matches!(
+            handle.state.borrow().tabs.get(tab).unwrap().backend(),
+            TabBackend::NotStarted
+        ));
+
+        // A lease on this machine for the same id is no reason to refuse: the session is on the server.
+        let canonical = handle.state.borrow().canonical_project_dir.clone();
+        let _lease = agent::lease::SessionLease::try_acquire("claude", &canonical, SESSION).unwrap();
+        handle.page_message(ViewId::BASE, &resume_message(tab, "pick", SESSION));
+        assert_eq!(refusal_of(&page, "pick"), None);
+        let state = handle.state.borrow();
+        match state.tabs.get(tab).unwrap().backend() {
+            TabBackend::AwaitingTrust(waiting) => assert!(
+                matches!(&waiting.start, DeferredStart::Resume { provider_session_id, .. } if provider_session_id == SESSION)
+            ),
+            _ => panic!("the resume waits for the trust question"),
+        }
+        drop(state);
+
+        let (handle, page, tab) = remote_window(false);
+        handle.page_message(ViewId::BASE, &resume_message(tab, "pick", SESSION));
+        assert_eq!(
+            refusal_of(&page, "pick").as_deref(),
+            Some(super::super::detail::REMOTE_RESUME_UNAVAILABLE)
+        );
+        assert!(matches!(
+            handle.state.borrow().tabs.get(tab).unwrap().backend(),
+            TabBackend::NotStarted
+        ));
+    }
+
+    /// The config directory the tab's own agent reported goes with the resume that replaces it: the reset takes the
+    /// handshake it came from, and the transcripts the resume reads are matched against that directory.
+    #[test]
+    fn a_resume_after_a_lost_agent_carries_the_config_dir_its_agent_reported() {
+        let provider = RecordingProvider::default();
+        provider.set_info(agent::ProviderInfo {
+            account_config_dir: Some("/home/example/.claude".into()),
+            ..Default::default()
+        });
+        let (state, tab, provider) = remote_panel_with("remote-gone-config-dir", provider);
+        with_known_cli_session(&state, tab, &provider);
+        provider.set_remote(Some(agent::RemoteEnding::AgentGone), Some(handoff()));
+        end_session(&state, tab, &provider);
+        let mut out = Outbox::default();
+        ask_about_endings(&mut state.borrow_mut(), &mut out);
+        let prompt = prompt_in(&out).expect("the lost agent is asked about");
+        let mut out = Outbox::default();
+        answer_prompt(
+            &mut state.borrow_mut(),
+            tab,
+            prompt["nonce"].as_u64().unwrap(),
+            RemotePromptAction::Resume,
+            "r1",
+            ViewId::BASE,
+            &mut out,
+        )
+        .unwrap();
+        assert!(
+            state.borrow().tabs.get(tab).unwrap().live().is_none(),
+            "the tab was reset: its handshake is gone"
+        );
+        let scope = resume_scope(&mut state.borrow_mut(), tab);
+        assert_eq!(scope.config_dir.as_deref(), Some("/home/example/.claude"));
+        assert_eq!(
+            resume_scope(&mut state.borrow_mut(), tab).config_dir,
+            None,
+            "carried for one resume only"
+        );
+    }
+
     fn store() -> RemoteProjects {
         RemoteProjects::new(
             std::env::var_os("XDG_STATE_HOME").as_deref(),
@@ -1681,6 +2470,8 @@ mod tests {
     #[test]
     fn a_reopened_window_takes_up_its_own_servers_saved_tabs() {
         let (state, _tab, _provider) = remote_panel("remote-reattach-saved");
+        let scratch = agent::state_dirs::test_workspace_dir("remote-reattach-saved-trust");
+        state.borrow_mut().trust = super::super::trust_gate_for(None, None, &scratch);
         let taken: Rc<RefCell<Vec<String>>> = Rc::default();
         let into = taken.clone();
         state.borrow_mut().spawner = Spawner::Fake(Rc::new(RefCell::new(move |call: SpawnCall| {
@@ -1731,6 +2522,15 @@ mod tests {
         assert_eq!(modes, [SessionModeChoice::Manual, SessionModeChoice::Manual]);
         assert_eq!(s.unclaimed_remote.len(), 1);
         assert_eq!(s.unclaimed_remote[0].helper.sidecar_id, "sc-9");
+        // A tab taken up asks no trust question, so its project is scanned for it: the scan names the canonical root
+        // its path facts and transcripts are matched against.
+        let taken_up = s.tabs.tabs().iter().find(|t| t.remote_agent.is_some()).unwrap().id;
+        assert_eq!(
+            s.trust
+                .server_checks_of(super::super::trust::trust_subject(&s, taken_up)),
+            1,
+            "one scan for the project"
+        );
         assert_eq!(
             s.tabs.saved_snapshot("c").unwrap().remote.len(),
             3,

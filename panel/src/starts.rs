@@ -41,6 +41,9 @@ pub(super) enum SpawnCall {
         resume: Option<String>,
         project: ProjectTrust,
         client_tools: Option<agent::ClientToolSet>,
+        /// The teardown of the tab's previous agent, which a resume of its session waits for: the server's stop of
+        /// that agent goes before the new sidecar is asked to continue the session.
+        after_old: Option<mpsc::Receiver<()>>,
     },
     /// A saved remote tab taken up again through the window's connection: the agent `helper` names.
     Reattach { helper: agent::HelperHandoff },
@@ -70,7 +73,11 @@ pub(super) fn resume_in(
     select: bool,
 ) -> Result<(), String> {
     if state.tabs.get(tab).is_some_and(|t| t.is_remote()) {
-        return Err(super::detail::REMOTE_RESUME_UNAVAILABLE.to_string());
+        let resumed = super::remote_tabs::resume_from_server(state, tab, request_id, provider_session_id);
+        if resumed.is_ok() && select {
+            state.tabs.select(tab);
+        }
+        return resumed;
     }
     let agent = state.tabs.get(tab).map_or(AgentId::Claude, |t| t.agent().clone());
     let greeting = BackendGreeting::for_agent_titled(
@@ -130,12 +137,14 @@ pub(super) fn start_deferred(
         if !chosen {
             return put_off_start(state, tab, start, super::detail::REMOTE_RESUME_UNAVAILABLE);
         }
+        // Taken whatever happens to this start, so a wait left for it never holds a later one.
+        let wait = state.resume_after.remove(&tab);
         let RemoteConnect {
             request_id,
             result_rx,
             first_turn,
             resume,
-        } = match remote_connect(state, tab, start, project) {
+        } = match remote_connect(state, tab, start, project, wait) {
             Ok(connect) => connect,
             Err(out) => return out,
         };
@@ -275,6 +284,7 @@ fn remote_connect(
     tab: TabId,
     start: DeferredStart,
     project: ProjectTrust,
+    wait: Option<(String, mpsc::Receiver<()>)>,
 ) -> Result<RemoteConnect, Outbox> {
     let host = match state.tabs.get(tab).map(|t| t.origin()) {
         Some(eitri_core::remote_project::TabOrigin::Remote { host, .. }) => host.clone(),
@@ -299,9 +309,20 @@ fn remote_connect(
         } => (request_id, Some(provider_session_id), None),
         DeferredStart::Restore { .. } => return Err(Outbox::default()),
     };
+    // Only the resume of the session whose old agent it waits for.
+    let after_old = wait
+        .filter(|(id, _)| resume.as_deref() == Some(id.as_str()))
+        .map(|(_, gone)| gone);
     let result_rx = match &state.spawner {
         Spawner::Real => match state.server.clone() {
-            Some(connection) => spawn_remote_connect(connection, resume.clone(), project, client_tools),
+            Some(connection) => spawn_remote_connect(
+                connection,
+                resume.clone(),
+                super::remote_tabs::resume_scope(state, tab),
+                project,
+                client_tools,
+                after_old,
+            ),
             None => return Err(Outbox::default()),
         },
         #[cfg(test)]
@@ -309,6 +330,7 @@ fn remote_connect(
             resume: resume.clone(),
             project,
             client_tools,
+            after_old,
         }),
     };
     Ok(RemoteConnect {
@@ -716,12 +738,19 @@ pub(super) fn never_opened_message(reason: &str) -> String {
 /// `SessionUnavailable.reason` itself (see `agent/src/session.rs`), so `reason` below is already
 /// the specific one when the provider produced any stderr at all before dying. See
 /// `never_opened_message` for the one exception to the guess it otherwise wraps `reason` in.
+///
+/// A remote tab whose end the helper explained is left to the remote questions while that end is still to be asked
+/// about or its question is open (`remote_tabs::ending_still_asked_about`): a tab taken up from the saved tabs ends
+/// "before opening" when its journal no longer reaches back, and failing it here would retire the agent before the
+/// rebuild or the waiting requests were offered.
 pub(super) fn report_sessions_that_never_opened(state: &mut AgentPanelState, screen: &Screen, out: &mut Outbox) {
-    let failed: Vec<(TabId, String)> = state
+    let view: &AgentPanelState = state;
+    let failed: Vec<(TabId, String)> = view
         .tabs
         .tabs()
         .iter()
         .filter(|t| !t.session.reported_start_failure)
+        .filter(|t| !super::remote_tabs::ending_still_asked_about(view, t.id))
         .filter_map(|t| {
             t.live()
                 .and_then(AgentBackend::terminated_before_opening)
@@ -799,6 +828,7 @@ pub(super) fn collect_pending_starts(state: &mut AgentPanelState, screen: &Scree
                     Some(view) if view.is_base() || state.ready(view) => view_payloads(state, view, out),
                     _ => {}
                 }
+                super::remote_tabs::note_rebuilt(state, tab, out);
                 if !restored {
                     match first_turn {
                         Some(turn) => send_first_turn(state, screen, tab, &request_id, turn, out),
@@ -819,6 +849,7 @@ pub(super) fn collect_pending_starts(state: &mut AgentPanelState, screen: &Scree
                 }
             }
             StartCollected::Failed { tab, request_id, error } => {
+                super::remote_tabs::start_failed(state, tab);
                 eprintln!(
                     "[agent_panel] tab {}: backend failed to start: {}",
                     tab.0, error.message
@@ -1042,6 +1073,7 @@ mod tests {
                     resume,
                     project,
                     client_tools,
+                    ..
                 } => into.borrow_mut().push((resume, project, client_tools.is_some())),
                 _ => panic!("a remote tab never starts on this machine"),
             }

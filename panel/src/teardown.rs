@@ -765,6 +765,7 @@ pub(super) fn close_tab_asked_as(
     let last = state.tabs.base_tabs() == [tab];
     close_tab_as(state, tab, out, ending)?;
     state.remote_prompts.forget_tab(tab);
+    state.remote_sessions.forget_tab(tab);
     if last {
         out.effect(Effect::ChatMove(ChatMoveEvent::LastTabClosed));
     }

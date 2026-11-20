@@ -25,6 +25,19 @@ use std::sync::OnceLock;
 
 use crate::permission_policy::is_in_a_kernel_tree;
 
+/// The gate's reason for each [`NotABoundary`], named so a reason received as text can be mapped back to it
+/// (`crate::permission_policy::ALL_REASONS`).
+pub const REASON_ROOT_UNRESOLVABLE: &str = "the project root itself could not be resolved";
+pub const REASON_ROOT_IS_THE_FILESYSTEM_ROOT: &str = "the project root is the filesystem root, which is no boundary";
+pub const REASON_ROOT_IN_A_KERNEL_TREE: &str =
+    "the project root is in /proc, /sys or /dev, whose links lead somewhere different in each process";
+pub const REASON_ROOT_NO_LONGER_ITSELF: &str =
+    "the project root no longer resolves to itself: it was moved, or a link now stands in its place";
+pub const REASON_ROOT_IS_HOME_OR_ABOVE: &str =
+    "the project root is the home directory or above it, which is no boundary";
+pub const REASON_ROOT_NOT_YOURS: &str = "the project root belongs to another user, which is no boundary";
+pub const REASON_ROOT_OTHERS_CAN_WRITE: &str = "other users can write to the project root, which is no boundary";
+
 /// Why a directory is no project boundary. In the order [`refusal`] asks.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NotABoundary {
@@ -48,22 +61,37 @@ impl NotABoundary {
         NotABoundary::OthersCanWrite,
     ];
 
+    /// The name a remote helper sends for this refusal, fixed here rather than taken from `Debug`, so renaming a
+    /// variant cannot change what a server says.
+    pub fn name(self) -> &'static str {
+        match self {
+            NotABoundary::Unresolvable => "Unresolvable",
+            NotABoundary::FilesystemRoot => "FilesystemRoot",
+            NotABoundary::KernelTree => "KernelTree",
+            NotABoundary::NoLongerItself => "NoLongerItself",
+            NotABoundary::HomeOrAbove => "HomeOrAbove",
+            NotABoundary::NotYours => "NotYours",
+            NotABoundary::OthersCanWrite => "OthersCanWrite",
+        }
+    }
+
+    /// The refusal a remote helper named ([`NotABoundary::name`]), or `None` for a name this build does not know.
+    pub fn from_name(name: &str) -> Option<NotABoundary> {
+        NotABoundary::ALL.into_iter().find(|refusal| refusal.name() == name)
+    }
+
     /// The gate's words for this refusal. None is in
     /// [`REPLACEABLE_BY_A_RULE`](crate::permission_policy::REPLACEABLE_BY_A_RULE): a saved rule says
     /// a command is fine, not that the directory around it can be trusted.
     pub fn reason(self) -> &'static str {
         match self {
-            NotABoundary::Unresolvable => "the project root itself could not be resolved",
-            NotABoundary::FilesystemRoot => "the project root is the filesystem root, which is no boundary",
-            NotABoundary::KernelTree => {
-                "the project root is in /proc, /sys or /dev, whose links lead somewhere different in each process"
-            }
-            NotABoundary::NoLongerItself => {
-                "the project root no longer resolves to itself: it was moved, or a link now stands in its place"
-            }
-            NotABoundary::HomeOrAbove => "the project root is the home directory or above it, which is no boundary",
-            NotABoundary::NotYours => "the project root belongs to another user, which is no boundary",
-            NotABoundary::OthersCanWrite => "other users can write to the project root, which is no boundary",
+            NotABoundary::Unresolvable => REASON_ROOT_UNRESOLVABLE,
+            NotABoundary::FilesystemRoot => REASON_ROOT_IS_THE_FILESYSTEM_ROOT,
+            NotABoundary::KernelTree => REASON_ROOT_IN_A_KERNEL_TREE,
+            NotABoundary::NoLongerItself => REASON_ROOT_NO_LONGER_ITSELF,
+            NotABoundary::HomeOrAbove => REASON_ROOT_IS_HOME_OR_ABOVE,
+            NotABoundary::NotYours => REASON_ROOT_NOT_YOURS,
+            NotABoundary::OthersCanWrite => REASON_ROOT_OTHERS_CAN_WRITE,
         }
     }
 
@@ -270,10 +298,41 @@ pub fn note(refusal: NotABoundary) -> String {
     )
 }
 
+/// The line a remote tab's panel shows when the server says its root is no boundary there: the local line's
+/// words, naming the server. Only Claude tabs run on a server, so it says nothing of the others.
+pub fn note_on(refusal: NotABoundary, host: &str) -> String {
+    format!(
+        "No project boundary on {host} ({}): a Claude tab asks before every file and command.",
+        refusal.why()
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn the_remote_note_names_the_server_and_the_refusal() {
+        for refused in NotABoundary::ALL {
+            let line = note_on(refused, "example-host");
+            assert!(line.starts_with("No project boundary on example-host ("), "{line}");
+            assert!(line.contains(&format!("({})", refused.why())), "{line}");
+            assert!(!line.contains("Codex"), "{line}");
+        }
+    }
+
+    #[test]
+    fn every_refusal_has_one_wire_name() {
+        let names: std::collections::BTreeSet<_> = NotABoundary::ALL.iter().map(|refusal| refusal.name()).collect();
+        assert_eq!(names.len(), NotABoundary::ALL.len());
+        for refusal in NotABoundary::ALL {
+            assert_eq!(NotABoundary::from_name(refusal.name()), Some(refusal));
+        }
+        assert_eq!(NotABoundary::HomeOrAbove.name(), "HomeOrAbove");
+        assert_eq!(NotABoundary::from_name("homeorabove"), None);
+        assert_eq!(NotABoundary::from_name(""), None);
+    }
 
     const ME: u32 = 1000;
     const MY_GID: u32 = 1000;

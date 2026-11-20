@@ -362,6 +362,41 @@ is applied through your editor, Eitri waits for the server to hold the file's ne
 off; if it has not arrived Eitri says "the write to `<path>` has not reached `example-host` yet; it is saved on this
 laptop". Files over 64 MiB are reported as too large to confirm.
 
+## Permission cards on a remote tab
+
+The agent of a remote tab works on the server, so the paths it names are the server's. Eitri's helper checks them
+there, on the server's disk, for each request the agent makes: whether the path stays inside the project, whether a
+link on the way leads out of it, and whether the project folder is a boundary at all (yours, and not writable by other
+accounts). The panel then answers as it does for a local project of the same shape:
+
+- **Manual**: reads inside the project and read-only commands go through; edits, and anything outside the project or
+  through a link that leaves it, ask you.
+- **Auto**: at a project folder the server calls a boundary, Eitri leaves the call to Claude Code's own auto mode, as
+  it does locally. A model that cannot run auto mode turns the tab to Manual.
+- **Bypass**: as on a local tab.
+
+Before Eitri answers a request by itself, it asks the server once more (a fresh check, at most about three seconds).
+If the answer changed in between, for example a file inside the project was swapped for a link to one outside, you
+get a card instead. A request that arrives while the connection is down is answered the same way once it is back,
+after its fresh check.
+
+When the server cannot check paths for a tab, the tab says "this tab runs on `example-host`; path checks on the server
+are not available yet" and asks you about every file and command. That is the case for an agent started by an older
+Eitri whose helper still runs on the server, for a tab you just moved to another window, and for a tab that came back when
+its window was reopened, until Eitri has checked the project on the server for it, which it does as the tab comes back. A project folder that is not a boundary says "No project boundary on `example-host` (...)" and asks about
+every file and command, as a local one does.
+
+## Sessions on the server
+
+The session chooser (`Ctrl+b w`) of a remote window lists the sessions Claude Code recorded on the server for the
+project, newest first, with their titles: those your remote tabs started and those you started yourself with `claude`
+in a terminal on the server. Choosing one continues it, with its history read from Claude Code's own transcript on the
+server. A session whose transcript is still being written (Claude Code is still working in it somewhere) is refused.
+
+`@buffers`, `@quickfix` and `@diagnostics` on a remote tab follow the server's `Read` deny rules: the project's and
+your account's Claude settings on the server, not the ones on your laptop. When those cannot be read, nothing from the
+editor is attached and the message says why.
+
 ## Syncthing and Dropbox
 
 Do not let another sync tool carry the same folder. Two tools writing one tree race each other: Syncthing's

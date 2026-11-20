@@ -2415,8 +2415,29 @@ fn server_reboot_keeps_history_and_offers_resume() {
         &cli_session,
         ProjectTrust::Untrusted,
         None,
+        // The history the caller built from the server's transcript: the conversation starts from it.
+        Some(agent::history::seed_from_tail(
+            concat!(
+                r#"{"type":"user","uuid":"u-1","version":"2.1.272","promptSource":"typed","message":{"role":"user","content":"an earlier question"}}"#,
+                "\n"
+            )
+            .as_bytes(),
+            false,
+            &agent::conversation_id_for_cwd(&server.project),
+            &cli_session,
+            "example-host:/home/example/.claude/projects/-x/y.jsonl",
+        )),
     )
     .expect("the CLI's session continues through a new sidecar");
+    assert_eq!(
+        resumed
+            .projection()
+            .user_prompts
+            .first()
+            .map(|prompt| prompt.text.as_str()),
+        Some("an earlier question"),
+        "the conversation starts from the seed it was handed"
+    );
     assert!(
         std::fs::read(server.root.join("creates.bin")).unwrap().len() > creates_before,
         "the resume went out as a create request"
@@ -2787,4 +2808,152 @@ fn ownerless_records_are_gone_only_after_every_installation_answers() {
     client.stop_saved("", &saved.sidecar_id).unwrap();
     // A forgotten owner after a data-directory change uses that same exhaustive decision.
     client.stop_saved("forgotten-installation", &saved.sidecar_id).unwrap();
+}
+
+/// A remote tab whose helper is this window's own installation, so it serves facts this window uses. The test's
+/// helper runs from a build tree, keyed by its version alone, so the connection is told the installation's name.
+fn provider_with_facts(
+    server: &Server,
+    launcher: Arc<dyn ChannelLauncher>,
+    clock: Arc<dyn ReconnectClock>,
+) -> ClaudeSidecarProvider {
+    let hello = server.direct().hello().unwrap();
+    let installation = format!("{}-{}", hello.helper_version, &hello.helper_build[..7]);
+    let client = HelperClient::connect(launcher, HOST, Some(HOST_KEY))
+        .unwrap()
+        .with_own_installation(&installation);
+    ClaudeSidecarProvider::connect_through_helper_on(client, HOST_KEY, &server.start(None), clock).unwrap()
+}
+
+/// The stand-in asks to write `path` under the id `id`.
+fn ask_write(provider: &ClaudeSidecarProvider, session: &str, id: &str, path: &Path) {
+    let quoted = serde_json::to_string(&path.display().to_string()).unwrap();
+    send(provider, session, &format!("ask-write {id} {quoted}"));
+}
+
+fn have(provider: &ClaudeSidecarProvider, id: &str) -> Option<Arc<agent::gate_facts::ReceivedFact>> {
+    match provider.gate_fact(id) {
+        agent::gate_facts::GateFactState::Have(fact) => Some(fact),
+        _ => None,
+    }
+}
+
+/// A gate request gets the server's fact, for exactly that request, and loses it when it is answered; the fresh
+/// check returns the held fact and one computed now.
+#[test]
+fn facts_arrive_with_their_requests_and_leave_with_them() {
+    use agent::gate_facts::{FreshFact, GateFactState};
+    let server = Server::new(&[]);
+    let provider = provider_with_facts(&server, Arc::new(server.launcher()), real_clock());
+    let session = create(&provider, &server.project);
+    assert_eq!(provider.gate_fact("p1"), GateFactState::Waiting);
+    ask_write(&provider, &session, "p1", &server.project.join("notes.txt"));
+    wait_for("the fact for p1", || have(&provider, "p1").is_some());
+    let fact = have(&provider, "p1").unwrap();
+    assert!(fact.fact.root_is_boundary);
+    assert!(!fact.fact.classification.needs_a_human(), "{:?}", fact.fact);
+    assert_eq!(fact.fact.places_card, None);
+    let root = provider.gate_root_fact().expect("the root's fact");
+    assert!(root.is_boundary);
+
+    let (told, answers) = std::sync::mpsc::channel();
+    provider.check_fact(
+        "p1",
+        fact.request_digest,
+        Box::new(move |fresh| told.send(fresh).unwrap()),
+    );
+    match answers.recv_timeout(HANG).unwrap() {
+        FreshFact::Both { first, fresh } => {
+            assert_eq!(first, fact.fact);
+            assert_eq!(fresh, fact.fact);
+        }
+        other => panic!("{other:?}"),
+    }
+    // A digest for another request is refused by the helper.
+    let (told, answers) = std::sync::mpsc::channel();
+    provider.check_fact("p1", [7; 32], Box::new(move |fresh| told.send(fresh).unwrap()));
+    assert!(matches!(answers.recv_timeout(HANG).unwrap(), FreshFact::Refused(_)));
+
+    provider
+        .resolve_permission(ResolvePermissionRequest {
+            session_id: session.clone(),
+            permission_id: "p1".into(),
+            decision: PermissionDecision::Allow,
+        })
+        .unwrap();
+    wait_for("p1's fact to go with its answer", || {
+        provider.gate_fact("p1") == GateFactState::Waiting
+    });
+}
+
+/// A dropped link drops every fact; once it is back the stream sends them again.
+#[test]
+fn a_reconnect_clears_and_resubscribes() {
+    let server = Server::new(&[]);
+    let flaky = Flaky::new(&server);
+    let clock = Arc::new(FastClock::default());
+    let provider = provider_with_facts(&server, flaky.clone(), clock);
+    let session = create(&provider, &server.project);
+    ask_write(&provider, &session, "p1", &server.project.join("notes.txt"));
+    wait_for("the fact for p1", || have(&provider, "p1").is_some());
+    let before = have(&provider, "p1").unwrap();
+
+    flaky.cut();
+    wait_for("the facts to be dropped with the link", || {
+        have(&provider, "p1").is_none() && provider.gate_root_fact().is_none()
+    });
+    flaky.restore();
+    wait_for("the fact sent again", || have(&provider, "p1").is_some());
+    let after = have(&provider, "p1").unwrap();
+    assert_eq!(after.fact, before.fact);
+    assert_eq!(after.request_digest, before.request_digest);
+    assert!(after.received > before.received, "the fact came on the new stream");
+}
+
+/// A connection that names no installation of this window's (a probe's, or a helper another window started) gets
+/// no facts: the tab keeps the gate without them.
+#[test]
+fn a_helper_without_gate_facts_keeps_the_no_boundary_gate() {
+    use agent::gate_facts::GateFactState;
+    let server = Server::new(&[]);
+    let provider = server
+        .provider(Arc::new(server.launcher()), real_clock(), None)
+        .unwrap();
+    let session = create(&provider, &server.project);
+    ask_write(&provider, &session, "p1", &server.project.join("notes.txt"));
+    let mut seen = Vec::new();
+    pump_until(&provider, &mut seen, "the request", |seen| {
+        seen.iter()
+            .any(|event| matches!(event, AgentDomainEvent::PermissionRequested { .. }))
+    });
+    assert_eq!(provider.gate_fact("p1"), GateFactState::NoCapability);
+    assert_eq!(provider.gate_root_fact(), None);
+    let (told, answers) = std::sync::mpsc::channel();
+    provider.check_fact("p1", [0; 32], Box::new(move |fresh| told.send(fresh).unwrap()));
+    assert_eq!(answers.try_recv().unwrap(), agent::gate_facts::FreshFact::Unavailable);
+}
+
+/// A fresh check asked while the link is down answers `Unavailable`, once.
+#[test]
+fn check_fact_calls_done_once_on_timeout() {
+    use agent::gate_facts::FreshFact;
+    let server = Server::new(&[]);
+    let flaky = Flaky::new(&server);
+    let provider = provider_with_facts(&server, flaky.clone(), Arc::new(FastClock::default()));
+    let session = create(&provider, &server.project);
+    ask_write(&provider, &session, "p1", &server.project.join("notes.txt"));
+    wait_for("the fact for p1", || have(&provider, "p1").is_some());
+    let digest = have(&provider, "p1").unwrap().request_digest;
+    flaky.cut();
+    let (told, answers) = std::sync::mpsc::channel();
+    let started = Instant::now();
+    provider.check_fact("p1", digest, Box::new(move |fresh| told.send(fresh).unwrap()));
+    assert_eq!(answers.recv_timeout(HANG).unwrap(), FreshFact::Unavailable);
+    assert!(started.elapsed() < HANG);
+    // `done` is gone with its one call: the channel's only sender was dropped.
+    assert_eq!(
+        answers.recv_timeout(Duration::from_millis(200)),
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected)
+    );
+    flaky.restore();
 }

@@ -16138,6 +16138,38 @@ describe("chooser_titles", () => {
   });
 });
 
+/** A list that arrives after the chooser was sent (a remote tab's sessions) replaces the rows of a chooser still open
+ *  and opens none: a chooser the user closed meanwhile stays closed, so the keys it gave back are not taken again. */
+describe("chooser_update", () => {
+  const record = (id: string, title: string | null) => ({
+    providerSessionId: id, name: null, title, createdAt: "1", updatedAt: "2", heldElsewhere: false,
+  });
+  const OPEN = [{ tab: 1, label: "1 new", marker: null, pending: 0, resumable: true }];
+  const CHOOSER = { kind: "chooser", open: OPEN, records: [] };
+  const UPDATE = { kind: "chooser_update", open: OPEN, records: [record("s-1", "from the server")] };
+
+  it("fills the rows of a chooser still open", () => {
+    const { container } = render(<App />);
+    dispatch({ kind: "hello", ...HELLO });
+    dispatchEmptyTab();
+    dispatch(CHOOSER);
+    expect(container.querySelector(".chooser")!.textContent).not.toContain("from the server");
+    dispatch(UPDATE);
+    expect(container.querySelector(".chooser")!.textContent).toContain("from the server");
+  });
+
+  it("opens no chooser the user closed", () => {
+    const { container } = render(<App />);
+    dispatch({ kind: "hello", ...HELLO });
+    dispatchEmptyTab();
+    dispatch(CHOOSER);
+    fireEvent.keyDown(container.querySelector(".chooser")!, { key: "Escape" });
+    expect(container.querySelector(".chooser")).toBeNull();
+    dispatch(UPDATE);
+    expect(container.querySelector(".chooser")).toBeNull();
+  });
+});
+
 it("draws an unread prompt once above activity and keeps the running hint while nothing is held", () => {
   const { container } = render(<App />);
   dispatch({ kind: "hello", ...HELLO });

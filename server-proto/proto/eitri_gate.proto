@@ -1,0 +1,49 @@
+syntax = "proto3";
+package eitri.server.v1;
+
+// Path facts for a session's gate requests, computed on the server's disk: what the disk half of Eitri's permission
+// classifier answers there for each request the session's gate is waiting on. The helper decides nothing with them;
+// the laptop's policy takes them as an input it can only make stricter. Capability `gate-facts`.
+service Gate {
+  // The root's fact first, then the facts of the requests pending now, then each new one as it is computed.
+  rpc WatchFacts(WatchFactsRequest) returns (stream GateFactEvent);
+  // The fact held for one pending request, and a fresh one computed now.
+  rpc CheckFact(CheckFactRequest) returns (CheckFactResponse);
+}
+
+message WatchFactsRequest { string sidecar_id = 1; string session_id = 2; }
+
+// One verdict of the disk half: whether the call passes without a person, and the classifier's fixed label for why.
+// Not `allow`/`reason`: those names are the wire guard's decision fields in the forwarding trees.
+message GateVerdict { bool passes = 1; string why = 2; }
+
+message GateFactMsg {
+  // `project_boundary::checked_root` of the session's root on the server.
+  bool root_is_boundary = 1;
+  // The check of Eitri's own places alone; absent when it has nothing to say.
+  optional GateVerdict places_card = 2;
+  // The classifier with no saved rules and no mode, the places' check included.
+  GateVerdict classification = 3;
+  // `agent::permission_policy::request_digest` of the request this fact is about.
+  bytes request_digest = 4;
+  uint64 computed_unix_ms = 5;
+}
+
+// Whether the session's root is a project boundary on the server, and when not, the `NotABoundary` variant's name.
+message GateRootFact { bool is_boundary = 1; string not_a_boundary = 2; }
+
+message GateFactEvent {
+  oneof event {
+    GateRootFact root = 5;
+    GateRequestFact request = 6;
+  }
+}
+
+// The fact for one pending request, or why there is none (`refusal`, with `fact` absent).
+message GateRequestFact { string permission_id = 1; uint64 sequence = 2; GateFactMsg fact = 3; string refusal = 4; }
+
+message CheckFactRequest { string sidecar_id = 1; string session_id = 2; string permission_id = 3; bytes request_digest = 4; }
+
+// `first` is the fact held since the request was first seen, `fresh` one computed for this call. When either is
+// missing, `refusal` says why.
+message CheckFactResponse { GateFactMsg first = 1; GateFactMsg fresh = 2; string refusal = 3; }

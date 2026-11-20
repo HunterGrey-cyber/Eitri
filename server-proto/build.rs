@@ -3,7 +3,12 @@ use std::path::Path;
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Anchor generation and Cargo's input tracking to this checkout when targets are shared.
     let proto = Path::new(env!("CARGO_MANIFEST_DIR")).join("proto");
-    let files = [proto.join("eitri_server.proto"), proto.join("eitri_terminal.proto")];
+    let files = [
+        proto.join("eitri_server.proto"),
+        proto.join("eitri_terminal.proto"),
+        proto.join("eitri_transcripts.proto"),
+        proto.join("eitri_gate.proto"),
+    ];
     for file in &files {
         println!("cargo:rerun-if-changed={}", file.display());
     }

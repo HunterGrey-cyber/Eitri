@@ -54,6 +54,7 @@ pub mod child;
 pub mod external;
 pub mod external_link;
 pub mod external_writer;
+pub mod gate_facts;
 pub mod handoff;
 pub mod history;
 pub use history::{configure_history_turns, history_turns};
@@ -105,9 +106,12 @@ pub use move_seed::{
     ChatMoveCore, ConversationHandoff, HandoffRefused, MoveSeed, MovedProvider, PendingName, SeedRefused,
 };
 pub use permission_policy::{
-    classify_in_manual, classify_permission_request, classify_with_rules, classify_without_a_boundary,
-    eitri_places_card, judge_edit_path, judge_project_path, rule_that_allows, Classification, EitriPlaceInputs,
-    EitriPlaces, GateRoot, OutsideReason, PathJudgement, PermissionVerdict,
+    classify_in_manual, classify_permission_request, classify_with_fact, classify_with_rules,
+    classify_without_a_boundary, eitri_places_card, gate_fact, judge_edit_path, judge_project_path, known_reason,
+    request_digest, request_input, rule_that_allows, rule_that_allows_with_fact, Classification, EitriPlaceInputs,
+    EitriPlaces, FactSurroundings, GateFact, GateRoot, OutsideReason, PathJudgement, PermissionVerdict,
+    PLACE_VARIABLES, REASON_SERVER_FACT_CHANGED, REASON_SERVER_FACT_IMPOSSIBLE, REASON_SERVER_FACT_MISSING,
+    REASON_SERVER_FACT_UNKNOWN,
 };
 pub use permission_rules::{PrefixRule, PrefixRules, RuleRefusal};
 pub use persistence::{

@@ -1,5 +1,7 @@
 #[path = "exec/mod.rs"]
 pub mod exec;
+#[path = "gate/mod.rs"]
+pub mod gate;
 #[path = "login_env.rs"]
 pub mod login_env;
 #[path = "serve/mod.rs"]
@@ -14,6 +16,8 @@ pub mod terminals;
 #[cfg(test)]
 #[allow(dead_code)]
 pub mod test_exec;
+#[path = "transcripts.rs"]
+pub mod transcripts;
 #[path = "trust.rs"]
 pub mod trust;
 
@@ -134,6 +138,8 @@ fn capabilities(boot_id: &str) -> Vec<String> {
         CAP_SYNC_FILES.to_owned(),
         CAP_SYNC_MODES.to_owned(),
         CAP_EXEC.to_owned(),
+        CAP_TRANSCRIPTS.to_owned(),
+        CAP_GATE_FACTS.to_owned(),
     ];
     if !boot_id.is_empty() {
         caps.push(CAP_TERMINAL.to_owned());
@@ -741,7 +747,11 @@ pub async fn run_with_terminals(
                 boot_id: terminals::current_boot_id().unwrap_or_default(),
             }))
             .add_service(serve::Proxy(serving.clone()))
+            .add_service(eitri_server_proto::gate_server::GateServer::new(serve::GateFacts(
+                serving.clone(),
+            )))
             .add_service(serve::TerminalRoutes::new(hosts.clone(), daemon_instance.clone()))
+            .add_service(serve::transcripts_server(managed.clone()))
             .serve_with_incoming(incoming);
         tokio::pin!(server);
         let idle_exit = async {
@@ -850,7 +860,7 @@ fn mode_options() -> sync::modes::Options {
     }
 }
 
-fn mark_activity<T>(request: &Request<T>) {
+pub(crate) fn mark_activity<T>(request: &Request<T>) {
     if let Some(activity) = request.extensions().get::<Arc<AtomicBool>>() {
         activity.store(true, Ordering::Relaxed);
     }
@@ -1125,10 +1135,11 @@ mod tests {
             CAP_SYNC_FILES,
             CAP_SYNC_MODES,
             CAP_EXEC,
+            CAP_TRANSCRIPTS,
         ] {
             assert!(hello.capabilities.iter().any(|cap| cap == capability), "{capability}");
         }
-        assert_eq!(hello.protocol_minor, 2);
+        assert_eq!(hello.protocol_minor, 3);
     }
 
     #[tokio::test]
@@ -1224,6 +1235,7 @@ mod tests {
         let capabilities = super::capabilities("");
         assert!(capabilities.iter().any(|cap| cap == super::CAP_SIDECARS));
         assert!(capabilities.iter().any(|cap| cap == super::CAP_EXEC));
+        assert!(capabilities.iter().any(|cap| cap == super::CAP_GATE_FACTS));
         assert!(!capabilities.iter().any(|cap| cap == super::CAP_TERMINAL));
         assert!(super::capabilities("known-boot")
             .iter()

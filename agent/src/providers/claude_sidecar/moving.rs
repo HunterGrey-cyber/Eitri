@@ -408,6 +408,9 @@ impl ClaudeSidecarProvider {
             clock: Arc::new(crate::remote_client::SystemClock),
             asker: client.pending_asker(&helper.sidecar_id),
             ending: Arc::default(),
+            // Taken up here with no call to the helper, so with no Hello to judge its facts by: a moved tab keeps
+            // the gate without facts until it is reattached.
+            facts: None,
         };
         Ok(ClaudeSidecarProvider {
             transport: Mutex::new(Box::new(transport)),
