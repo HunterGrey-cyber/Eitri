@@ -175,7 +175,6 @@ pub(super) fn refusal_text(why: &RemoteRefusal) -> String {
         RemoteRefusal::WorkChanged => "work changed".to_owned(),
         RemoteRefusal::Duplicate => "duplicate command id".to_owned(),
         RemoteRefusal::Agent(text) | RemoteRefusal::Busy(text) => text.replace(['\n', '\r'], " "),
-        RemoteRefusal::NotYet => NOT_YET.to_owned(),
         RemoteRefusal::ModeNotAllowed => "mode not allowed".to_owned(),
         RemoteRefusal::NotStarted => "not started".to_owned(),
         RemoteRefusal::SlashOrBang => "starts with / or !".to_owned(),

@@ -984,14 +984,9 @@ fn every_new_kind_parses_and_is_refused_not_yet() {
         let lines = rig.until(&mut client, "the refusal", |l| l["kind"] == "refused");
         let refusal = lines.last().unwrap();
         // `more` is carried out: about a tab this connection does not follow, it is refused as such.
-        let why = if matches!(line, RvInbound::More { .. }) {
-            "not subscribed"
-        } else {
-            "not yet"
-        };
         assert_eq!(
             (&refusal["why"], &refusal["key"]),
-            (&serde_json::json!(why), &key),
+            (&serde_json::json!("not subscribed"), &key),
             "{line:?}"
         );
     }

@@ -79,9 +79,6 @@ const INBOUND_LINES: usize = 64;
 /// The most queued lines one pump handles; the rest raise the wake for the next.
 const INBOUND_PER_PUMP: usize = 64;
 
-/// The `why` of a line this build parses and does not carry out.
-const NOT_YET: &str = "not yet";
-
 /// The connection number of what the desk's own page asked for (the device list's requests): connections are
 /// numbered from 1, so nothing is answered on a socket for it, and a refusal is said in the base page instead.
 const DESK: u64 = 0;

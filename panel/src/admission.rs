@@ -415,55 +415,6 @@ pub(super) fn admit(
     })
 }
 
-/// A remote observer's message before its arm runs: the tab its key names in this window, and whether that tab may
-/// take it. Apart from a page's admission and never through it: a remote message names no view, so nothing here asks
-/// the page check or the window's gate, and no remote kind answers what they guard. Every kind is named, so a new one
-/// is classified when it is added.
-pub(super) fn admit_remote(
-    state: &AgentPanelState,
-    message: &RemoteInbound,
-    key: &eitri_core::tab_set::RowKey,
-) -> Result<TabId, RemoteRefusal> {
-    let tab = state.tabs.tab_by_key(key).ok_or(RemoteRefusal::NoSuchTab)?;
-    let held = state.tabs.get(tab).ok_or(RemoteRefusal::NoSuchTab)?;
-    match message {
-        // Stopping only stops work, so every mode takes it; but only of a Claude session that is here and running
-        // the work the stop was asked about.
-        RemoteInbound::Interrupt { expect_work, .. } => {
-            if *held.agent() != AgentId::Claude {
-                return Err(RemoteRefusal::NotClaude);
-            }
-            let Some(backend) = held.live().filter(|_| !state.tabs.is_moving(tab)) else {
-                return Err(RemoteRefusal::NotLive);
-            };
-            let projection = backend.projection();
-            let still_running = match expect_work {
-                ExpectWork::Turn { id, generation } => {
-                    held.backend_generation() == *generation
-                        && projection.active_turn_id.as_deref() == Some(id.as_str())
-                }
-                // The number only from a tick that counted every fold this projection shows.
-                ExpectWork::Unseen(stretch) => {
-                    projection.active_turn_id.is_none()
-                        && projection.cli_unseen_busy
-                        && held.unseen_stretch_at(projection.last_revision) == Some(*stretch)
-                }
-            };
-            if !still_running {
-                return Err(RemoteRefusal::WorkChanged);
-            }
-            Ok(tab)
-        }
-        // These are admitted by `admit_remote_arm`, which `handle_remote_message` sends every kind but `interrupt`
-        // to; one that reaches this path anyway is refused, and nothing reaches the tab.
-        RemoteInbound::Send { .. }
-        | RemoteInbound::Queue { .. }
-        | RemoteInbound::StopBackground { .. }
-        | RemoteInbound::StopTask { .. }
-        | RemoteInbound::TakeBack { .. } => Err(RemoteRefusal::NotYet),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

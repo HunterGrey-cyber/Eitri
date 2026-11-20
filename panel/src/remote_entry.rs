@@ -122,8 +122,6 @@ pub enum RemoteRefusal {
     Duplicate,
     /// The agent turned the command down or failed it, in its own words.
     Agent(String),
-    /// A kind that reached a path which does not carry it out.
-    NotYet,
     /// The tab's mode is Bypass, or wider than when a queued message was taken.
     ModeNotAllowed,
     /// The tab's session has not started; a phone never starts one.
@@ -252,9 +250,9 @@ pub(super) fn first_command_use(device: &str, id: &str) -> bool {
     REMOTE_COMMANDS.with_borrow_mut(|commands| commands.first_use(device, id))
 }
 
-/// A parsed remote message from `origin` about the tab named `key`: admitted ([`admit_remote`] for a stop of the
-/// turn, [`admit_remote_arm`] for the rest), then its arm. No view is taken and no request is answered on a page; the
-/// page that shows the tab gets a notice of what was done, once it was.
+/// A parsed remote message from `origin` about the tab named `key`: admitted ([`admit_remote`]), then its arm. No view
+/// is taken and no request is answered on a page; the page that shows the tab gets a notice of what was done, once it
+/// was.
 pub(super) fn handle_remote_message(
     state: &mut AgentPanelState,
     screen: &Screen,
@@ -263,10 +261,7 @@ pub(super) fn handle_remote_message(
     message: RemoteInbound,
     out: &mut Outbox,
 ) -> Result<RemoteAccepted, RemoteRefusal> {
-    let tab = match &message {
-        RemoteInbound::Interrupt { .. } => admit_remote(state, &message, key)?,
-        _ => admit_remote_arm(state, &message, key)?,
-    };
+    let tab = admit_remote(state, &message, key)?;
     // A phone's send is a provider call too, kept by the tab set while it is out.
     let calls_full = state.remote.calls.len() + state.tabs.remote_sends_out() >= REMOTE_CALLS_MAX;
     let full = || RemoteRefusal::Busy("too many of the phone's calls are out: wait for their results".to_owned());
@@ -411,11 +406,17 @@ pub(super) fn handle_remote_message(
     }
 }
 
-/// Admits every remote kind but `interrupt` (which [`admit_remote`] admits): a message resolves its tab by key, and
-/// only a Claude tab takes one. Words (`send`, `queue`) go only to a live session in Manual or Auto, never as a
-/// command or a shell line; a stop goes to a live session in any mode, a task's only while that task is listed;
-/// `take_back` needs only the tab, since it finds nothing of this device's anywhere else. Changes nothing.
-pub(super) fn admit_remote_arm(
+/// A remote observer's message before its arm runs: the tab its key names in this window, and whether that tab may
+/// take it. Apart from a page's admission and never through it: a remote message names no view, so nothing here asks
+/// the page check or the window's gate, and no remote kind answers what they guard. One closed match over every kind,
+/// so a new one is classified when it is added; it changes nothing.
+///
+/// A message resolves its tab by key. Words (`send`, `queue`) are never a command or a shell line, and go only to a
+/// live Claude session in Manual or Auto; `stop_background` goes to a live Claude session in any mode, `stop_task`
+/// only while that task is listed; `take_back` needs only the tab, since it finds nothing of this device's anywhere
+/// else. A stop of the turn (`interrupt`) only stops work, so every mode takes it, but only of a Claude session that
+/// is here, not frozen for a move, and running the work the stop was asked about.
+pub(super) fn admit_remote(
     state: &AgentPanelState,
     message: &RemoteInbound,
     key: &eitri_core::tab_set::RowKey,
@@ -425,25 +426,33 @@ pub(super) fn admit_remote_arm(
     }
     let tab = state.tabs.tab_by_key(key).ok_or(RemoteRefusal::NoSuchTab)?;
     let held = state.tabs.get(tab).ok_or(RemoteRefusal::NoSuchTab)?;
-    if matches!(message, RemoteInbound::TakeBack { .. }) {
-        return Ok(tab);
-    }
-    if *held.agent() != AgentId::Claude {
-        return Err(RemoteRefusal::NotClaude);
-    }
-    let live = match held.backend() {
-        TabBackend::NotStarted => return Err(RemoteRefusal::NotStarted),
-        TabBackend::Live(backend) if !state.tabs.is_moving(tab) && held.pending_handoff.is_none() => backend,
-        _ => return Err(RemoteRefusal::NotLive),
-    };
     match message {
-        RemoteInbound::Send { .. } | RemoteInbound::Queue { .. } => match held.mode() {
-            SessionModeChoice::Manual | SessionModeChoice::Auto => Ok(tab),
-            SessionModeChoice::Bypass => Err(RemoteRefusal::ModeNotAllowed),
-        },
-        RemoteInbound::StopBackground { .. } => Ok(tab),
+        RemoteInbound::TakeBack { .. } => Ok(tab),
+        RemoteInbound::Interrupt { expect_work, .. } => {
+            if *held.agent() != AgentId::Claude {
+                return Err(RemoteRefusal::NotClaude);
+            }
+            // Live here is `Tab::live` and not frozen for a move, so a tab never started (one handed off to a terminal
+            // included: the handoff takes its session) is `NotLive`, where `live_claude` says `NotStarted`.
+            let Some(backend) = held.live().filter(|_| !state.tabs.is_moving(tab)) else {
+                return Err(RemoteRefusal::NotLive);
+            };
+            if still_running(held, backend, expect_work) {
+                Ok(tab)
+            } else {
+                Err(RemoteRefusal::WorkChanged)
+            }
+        }
+        RemoteInbound::Send { .. } | RemoteInbound::Queue { .. } => {
+            live_claude(state, tab, held)?;
+            match held.mode() {
+                SessionModeChoice::Manual | SessionModeChoice::Auto => Ok(tab),
+                SessionModeChoice::Bypass => Err(RemoteRefusal::ModeNotAllowed),
+            }
+        }
+        RemoteInbound::StopBackground { .. } => live_claude(state, tab, held).map(|_| tab),
         RemoteInbound::StopTask { task, .. } => {
-            let listed = live
+            let listed = live_claude(state, tab, held)?
                 .projection()
                 .background_tasks
                 .rows
@@ -455,8 +464,35 @@ pub(super) fn admit_remote_arm(
                 Err(RemoteRefusal::WorkChanged)
             }
         }
-        RemoteInbound::Interrupt { .. } | RemoteInbound::TakeBack { .. } => {
-            unreachable!("admitted by admit_remote and above")
+    }
+}
+
+/// The live session of a Claude tab that a phone's words or a background stop may reach: not one that never started
+/// (a phone never starts a session, its hooks or its trust question), nor one frozen for a move. A handoff takes the
+/// session before it marks the tab, so its own check here is a second line, not the one that refuses.
+fn live_claude<'a>(state: &AgentPanelState, tab: TabId, held: &'a Tab) -> Result<&'a AgentBackend, RemoteRefusal> {
+    if *held.agent() != AgentId::Claude {
+        return Err(RemoteRefusal::NotClaude);
+    }
+    match held.backend() {
+        TabBackend::NotStarted => Err(RemoteRefusal::NotStarted),
+        TabBackend::Live(backend) if !state.tabs.is_moving(tab) && held.pending_handoff.is_none() => Ok(backend),
+        _ => Err(RemoteRefusal::NotLive),
+    }
+}
+
+/// Whether the work a stop names still runs: that turn of this session, or the unseen stretch the last tick counted
+/// (the number only from a tick that counted every fold this projection shows).
+fn still_running(held: &Tab, backend: &AgentBackend, expect_work: &ExpectWork) -> bool {
+    let projection = backend.projection();
+    match expect_work {
+        ExpectWork::Turn { id, generation } => {
+            held.backend_generation() == *generation && projection.active_turn_id.as_deref() == Some(id.as_str())
+        }
+        ExpectWork::Unseen(stretch) => {
+            projection.active_turn_id.is_none()
+                && projection.cli_unseen_busy
+                && held.unseen_stretch_at(projection.last_revision) == Some(*stretch)
         }
     }
 }
@@ -924,7 +960,6 @@ pub(super) fn refusal_words(why: &RemoteRefusal) -> &str {
         RemoteRefusal::WorkChanged => "the work has changed",
         RemoteRefusal::Duplicate => "this command was already received",
         RemoteRefusal::Agent(reason) | RemoteRefusal::Busy(reason) => reason,
-        RemoteRefusal::NotYet => "this command is unavailable",
         RemoteRefusal::ModeNotAllowed => "the tab's mode does not allow this message",
         RemoteRefusal::NotStarted => "the session has not started",
         RemoteRefusal::SlashOrBang => "commands and shell lines must come from the desk",
@@ -953,7 +988,7 @@ pub(super) enum RefusedAt {
 /// agent's or the host's own words (`Agent`, `Busy`) are never recorded, since an agent's can quote the conversation.
 pub(super) fn audit_reason(why: &RemoteRefusal, at: RefusedAt) -> Reason {
     match why {
-        RemoteRefusal::Parse | RemoteRefusal::NotYet => Reason::NotAllowed,
+        RemoteRefusal::Parse => Reason::NotAllowed,
         RemoteRefusal::NoSuchTab | RemoteRefusal::NotLive => Reason::TabNotLive,
         RemoteRefusal::NotClaude => Reason::NotClaude,
         RemoteRefusal::NotStarted => Reason::NotStarted,
@@ -2177,6 +2212,144 @@ mod tests {
         shut_down_every_tab(&handle);
     }
 
+    /// Every remote kind against the same tabs, through the one admission: where a stop of the turn and the other
+    /// kinds read a tab differently (a tab never started, or handed off), that difference is pinned here, so neither
+    /// reading moves without this table.
+    #[test]
+    fn every_remote_kind_is_admitted_by_one_reading_of_the_tab() {
+        agent::state_dirs::redirect_state_to_a_test_root();
+        let dir = agent::state_dirs::test_workspace_dir("remote-admission-table");
+        let (handle, _base, _second) = handle_with_two_pages();
+        let opened = |agent: AgentId| {
+            let mut state = handle.state.borrow_mut();
+            let tab = state.tabs.open(agent);
+            let key = state.tabs.get(tab).unwrap().row_key().clone();
+            (tab, key)
+        };
+        let codex = opened(AgentId::Codex);
+        let unstarted = opened(AgentId::Claude);
+        let (idle, _, idle_key) = interruptible_tab(&handle, &dir);
+        let (running, running_provider, running_key) = interruptible_tab(&handle, &dir);
+        let (handing, handing_provider, handing_key) = interruptible_tab(&handle, &dir);
+        let (frozen, _, frozen_key) = interruptible_tab(&handle, &dir);
+        let handed = opened(AgentId::Claude);
+        handle.tick();
+        start_turn(&handle, running, &running_provider, "t9");
+        start_turn(&handle, handing, &handing_provider, "t9");
+        let pend = |tab: TabId| {
+            let (closed_tx, closed_rx) = std::sync::mpsc::channel::<()>();
+            let (dropped_tx, dropped_rx) = std::sync::mpsc::channel::<()>();
+            drop((closed_tx, dropped_tx));
+            handle.state.borrow_mut().tabs.get_mut(tab).unwrap().pending_handoff = Some(PendingHandoff {
+                request_id: "h1".into(),
+                command: a_command(),
+                closed_rx,
+                dropped_rx,
+            });
+        };
+        // A handoff takes the session, then marks the tab: what a handed-off tab is.
+        pend(handed.0);
+        // A live session marked so is not reached by a handoff; the words' own check refuses it all the same.
+        pend(handing);
+        let _frozen = handle.state.borrow_mut().tabs.freeze_for_move(frozen).unwrap();
+        let kinds = |tab: TabId| {
+            [
+                interrupt("c1", turn(&handle, tab, "t9")),
+                send("c2", "hello"),
+                queue("c3", "hello"),
+                serde_json::json!({ "type": "stop_background", "command_id": "c4" }).to_string(),
+                serde_json::json!({ "type": "stop_task", "command_id": "c5", "task": "b1" }).to_string(),
+                serde_json::json!({ "type": "take_back", "command_id": "c6" }).to_string(),
+            ]
+        };
+        use RemoteRefusal::{NotClaude, NotLive, NotStarted, WorkChanged};
+        let table: [(&str, TabId, &RowKey, [Result<(), RemoteRefusal>; 6]); 7] = [
+            (
+                "codex",
+                codex.0,
+                &codex.1,
+                [
+                    Err(NotClaude),
+                    Err(NotClaude),
+                    Err(NotClaude),
+                    Err(NotClaude),
+                    Err(NotClaude),
+                    Ok(()),
+                ],
+            ),
+            (
+                "never started",
+                unstarted.0,
+                &unstarted.1,
+                [
+                    Err(NotLive),
+                    Err(NotStarted),
+                    Err(NotStarted),
+                    Err(NotStarted),
+                    Err(NotStarted),
+                    Ok(()),
+                ],
+            ),
+            (
+                "live, idle",
+                idle,
+                &idle_key,
+                [Err(WorkChanged), Ok(()), Ok(()), Ok(()), Err(WorkChanged), Ok(())],
+            ),
+            (
+                "live, turn running",
+                running,
+                &running_key,
+                [Ok(()), Ok(()), Ok(()), Ok(()), Err(WorkChanged), Ok(())],
+            ),
+            (
+                "live with a handoff marked",
+                handing,
+                &handing_key,
+                [Ok(()), Err(NotLive), Err(NotLive), Err(NotLive), Err(NotLive), Ok(())],
+            ),
+            (
+                "handed off",
+                handed.0,
+                &handed.1,
+                [
+                    Err(NotLive),
+                    Err(NotStarted),
+                    Err(NotStarted),
+                    Err(NotStarted),
+                    Err(NotStarted),
+                    Ok(()),
+                ],
+            ),
+            (
+                "frozen for a move",
+                frozen,
+                &frozen_key,
+                [
+                    Err(NotLive),
+                    Err(NotLive),
+                    Err(NotLive),
+                    Err(NotLive),
+                    Err(NotLive),
+                    Ok(()),
+                ],
+            ),
+        ];
+        for (name, tab, key, expected) in table {
+            for (raw, expected) in kinds(tab).iter().zip(expected) {
+                let message = parse_remote_inbound(raw).unwrap();
+                let admitted = admit_remote(&handle.state.borrow(), &message, key).map(|admitted| {
+                    assert_eq!(admitted, tab, "{name}: {raw}");
+                });
+                assert_eq!(admitted, expected, "{name}: {raw}");
+            }
+        }
+        for tab in [handing, handed.0] {
+            handle.state.borrow_mut().tabs.get_mut(tab).unwrap().pending_handoff = None;
+        }
+        shut_down_every_tab(&handle);
+    }
+
     #[test]
     fn send_refused_to_a_codex_tab() {
         agent::state_dirs::redirect_state_to_a_test_root();
@@ -3088,7 +3261,6 @@ mod tests {
         use eitri_core::remote_audit::Reason as R;
         let at_send = |why: RemoteRefusal| audit_reason(&why, RefusedAt::Send);
         assert_eq!(at_send(RemoteRefusal::Parse), R::NotAllowed);
-        assert_eq!(at_send(RemoteRefusal::NotYet), R::NotAllowed);
         assert_eq!(at_send(RemoteRefusal::NoSuchTab), R::TabNotLive);
         assert_eq!(at_send(RemoteRefusal::NotLive), R::TabNotLive);
         assert_eq!(at_send(RemoteRefusal::NotClaude), R::NotClaude);
