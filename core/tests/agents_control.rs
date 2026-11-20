@@ -140,10 +140,11 @@ fn the_socket_is_built_through_in_dir() {
         agent::socket_path::in_dir(scratch.dir(), &format!("ag-{INSTANCE}.sock")).unwrap()
     );
 
-    let source = source_scan::read_required("core/src/agents/control.rs");
+    // The name is spelled where both the agents and the remote socket are named.
+    let source = source_scan::read_required("core/src/control_listener.rs");
     assert!(
         source.text.contains(".sock\""),
-        "the socket's name is no longer spelled in control.rs; point this scan at where it moved"
+        "the socket's name is no longer spelled in control_listener.rs; point this scan at where it moved"
     );
     assert_eq!(sock_literals_outside_in_dir(&source.text), Vec::<usize>::new());
 
@@ -665,4 +666,78 @@ fn a_client_facing_a_full_accept_queue_leaves_no_connection_behind() {
         queued.len(),
         "a connection arrived after the client had given up"
     );
+}
+
+/// The agents control socket and the remote observation socket are bound, made private and removed by one
+/// sequence: either refusing what the other allows would leave one socket open to what the other keeps out.
+#[test]
+fn the_agents_and_remote_sockets_are_bound_and_removed_alike() {
+    use eitri_core::remote_rv::{rv_socket_path, RvListener};
+    use std::os::unix::fs::{symlink, MetadataExt};
+
+    type Bind = fn(&Path) -> io::Result<Box<dyn std::any::Any>>;
+    type Named = fn(&Path, &str) -> io::Result<PathBuf>;
+    fn agents(dir: &Path) -> io::Result<Box<dyn std::any::Any>> {
+        Server::bind(dir, INSTANCE, |_| Reply::Ok).map(|server| Box::new(server) as Box<dyn std::any::Any>)
+    }
+    fn remote(dir: &Path) -> io::Result<Box<dyn std::any::Any>> {
+        RvListener::bind(dir, INSTANCE, |_| true).map(|listener| Box::new(listener) as Box<dyn std::any::Any>)
+    }
+    let sockets: [(&str, Bind, Named); 2] = [("ag", agents, control::socket_path), ("rv", remote, rv_socket_path)];
+
+    for (prefix, bind, named) in sockets {
+        // Only an instance id names a socket, with the same refusal.
+        for bad in ["../a3f09c1d2e4b5f60", "A3F09C1D2E4B5F60", "a3f09c1d2e4b5f6"] {
+            let refused = named(Path::new("/run/x"), bad).unwrap_err();
+            assert_eq!(refused.kind(), io::ErrorKind::InvalidInput, "{prefix}");
+            assert_eq!(
+                refused.to_string(),
+                format!("{bad:?} is not an instance id (16 lowercase hex digits)"),
+                "{prefix}"
+            );
+        }
+
+        // Bound 0600, and removed with its owner.
+        let scratch = Scratch::new();
+        let path = named(scratch.dir(), INSTANCE).unwrap();
+        assert!(path.ends_with(format!("{prefix}-{INSTANCE}.sock")), "{prefix}");
+        let bound = bind(scratch.dir()).unwrap();
+        let meta = std::fs::symlink_metadata(&path).unwrap();
+        assert!(meta.file_type().is_socket(), "{prefix}");
+        assert_eq!(meta.mode() & 0o777, 0o600, "{prefix}");
+        // A second bind of a name in use is refused, and leaves the first in place.
+        assert!(bind(scratch.dir()).is_err(), "{prefix}: a name in use");
+        assert_eq!(std::fs::symlink_metadata(&path).unwrap().ino(), meta.ino(), "{prefix}");
+        drop(bound);
+        assert!(std::fs::symlink_metadata(&path).is_err(), "{prefix}: removed on drop");
+
+        // A name that holds something else by the time of the drop is not removed.
+        let bound = bind(scratch.dir()).unwrap();
+        let other = scratch.dir().join("other");
+        std::fs::write(&other, "not the socket").unwrap();
+        std::fs::rename(&other, &path).unwrap();
+        drop(bound);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "not the socket", "{prefix}");
+        std::fs::remove_file(&path).unwrap();
+
+        // A link at the name is refused, and nothing is made where it points.
+        let target = scratch.dir().join("elsewhere.sock");
+        symlink(&target, &path).unwrap();
+        assert!(bind(scratch.dir()).is_err(), "{prefix}: a link at the name");
+        assert!(
+            std::fs::symlink_metadata(&target).is_err(),
+            "{prefix}: nothing made through the link"
+        );
+        assert!(
+            std::fs::symlink_metadata(&path).unwrap().file_type().is_symlink(),
+            "{prefix}"
+        );
+        std::fs::remove_file(&path).unwrap();
+
+        // A directory others can write in is refused, with nothing made in it.
+        std::fs::set_permissions(scratch.dir(), std::fs::Permissions::from_mode(0o777)).unwrap();
+        let refused = bind(scratch.dir()).map(|_| ()).unwrap_err();
+        assert_eq!(refused.kind(), io::ErrorKind::PermissionDenied, "{prefix}: {refused}");
+        assert!(std::fs::symlink_metadata(&path).is_err(), "{prefix}");
+    }
 }

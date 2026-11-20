@@ -6,7 +6,7 @@
 //! permission card, a question or a trust prompt, sends text, or changes a mode; whether a person's
 //! gesture started the request is judged where it starts, not here.
 //!
-//! The posture is the panel control socket's: the control directory 0700 and checked
+//! The posture is the panel control socket's, bound through `control_listener`: the control directory checked
 //! (`panel_control::ensure_dir`), the socket 0600 and built through `agent::socket_path::in_dir`, a
 //! peer served only when its uid is this process's effective uid, checked before a byte is read, and
 //! one line of at most [`MAX_LINE`] bytes that has to arrive within [`DEADLINE`], unknown fields
@@ -17,17 +17,14 @@
 //! [`send`] blocks for up to two deadlines and is for a worker thread, never the GTK thread.
 
 use crate::agents::Intent;
-use crate::panel_control::{ensure_dir, euid, read_line, reply_line, LineFail};
-use agent::private_fs::{remove_if_same, FileIdentity};
+use crate::control_listener::ControlListener;
+use crate::panel_control::{euid, read_line, reply_line, LineFail};
 use serde::{Deserialize, Serialize};
-use std::ffi::OsString;
 use std::io::{self, Write};
 use std::os::fd::AsRawFd;
-use std::os::unix::fs::MetadataExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 /// The longest request line, newline not counted.
@@ -38,9 +35,6 @@ pub const DEADLINE: Duration = Duration::from_secs(1);
 
 /// The only version of the request lines this build speaks.
 pub const PROTOCOL_V: u32 = 1;
-
-/// How many lowercase hex digits an instance id has.
-const INSTANCE_HEX: usize = 16;
 
 /// The pause after a failed `poll` or `accept` (descriptors exhausted, say), so the thread never spins.
 const ACCEPT_BACKOFF: Duration = Duration::from_millis(50);
@@ -121,12 +115,7 @@ impl Reply {
 /// and never waits for the thread: a handler may be waiting for the very thread that stops it. The
 /// thread ends once a request in progress has been answered.
 pub struct Server {
-    dir: std::fs::File,
-    name: OsString,
-    bound: FileIdentity,
-    stop: Arc<AtomicBool>,
-    /// The other end of the thread's wake pair: closing it wakes the thread's `poll`.
-    wake: Option<UnixStream>,
+    _listening: ControlListener,
 }
 
 impl Server {
@@ -149,30 +138,11 @@ impl Server {
     }
 }
 
-impl Drop for Server {
-    fn drop(&mut self) {
-        self.stop.store(true, Ordering::Release);
-        // Unlinked first, so no new peer finds it while the thread winds down.
-        let _ = remove_if_same(&self.dir, &self.name, self.bound);
-        self.wake.take();
-    }
-}
-
 /// `control_dir/ag-<instance>.sock`, through `agent::socket_path::in_dir`, which refuses a path over
 /// the socket path limit. `instance` must be 16 lowercase hex digits, so no id read from elsewhere
 /// can name a path outside the directory.
 pub fn socket_path(control_dir: &Path, instance: &str) -> io::Result<PathBuf> {
-    if !is_instance(instance) {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!("{instance:?} is not an instance id ({INSTANCE_HEX} lowercase hex digits)"),
-        ));
-    }
-    agent::socket_path::in_dir(control_dir, &format!("ag-{instance}.sock"))
-}
-
-fn is_instance(id: &str) -> bool {
-    id.len() == INSTANCE_HEX && id.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    crate::control_listener::socket_path(control_dir, "ag", instance)
 }
 
 /// Sends `req` to the process `instance` and returns its reply. Checks that the socket is served by
@@ -190,44 +160,13 @@ where
     H: Fn(Request) -> Reply + Send + 'static,
 {
     let path = socket_path(control_dir, instance)?;
-    let name = path
-        .file_name()
-        .map(OsString::from)
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "a socket path with no file name"))?;
-    ensure_dir(control_dir).map_err(|why| io::Error::new(io::ErrorKind::PermissionDenied, why))?;
-    let dir = agent::private_fs::open_dir(control_dir)?;
-    let listener = crate::panel_control::bind_unfollowed(&path)?;
-    let meta = path.symlink_metadata()?;
-    let bound = FileIdentity {
-        dev: meta.dev(),
-        ino: meta.ino(),
-    };
-    // `bind` leaves the umask's mode on the file.
-    let permissions = crate::panel_control::make_control_socket_private(&dir, &path, bound);
-    let started = (move || -> io::Result<(UnixStream, Arc<AtomicBool>)> {
-        permissions?;
-        listener.set_nonblocking(true)?;
-        let (wake, wake_rx) = UnixStream::pair()?;
-        let stop = Arc::new(AtomicBool::new(false));
-        let thread_stop = Arc::clone(&stop);
-        std::thread::Builder::new()
-            .name("eitri-agents-control".into())
-            .spawn(move || run(&listener, &wake_rx, &thread_stop, peer_uid, &handle))?;
-        Ok((wake, stop))
-    })();
-    match started {
-        Ok((wake, stop)) => Ok(Server {
-            dir,
-            name,
-            bound,
-            stop,
-            wake: Some(wake),
-        }),
-        Err(e) => {
-            let _ = remove_if_same(&dir, &name, bound);
-            Err(e)
-        }
-    }
+    let listening = ControlListener::bind(
+        control_dir,
+        &path,
+        "eitri-agents-control",
+        move |listener, wake, stop| run(&listener, &wake, &stop, peer_uid, &handle),
+    )?;
+    Ok(Server { _listening: listening })
 }
 
 /// The server thread: wait for a peer or the wake, serve one connection at a time, end when stopped.

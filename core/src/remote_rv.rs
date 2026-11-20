@@ -18,21 +18,18 @@
 //! a byte is read) and hands each such peer to its owner; [`RvClient`] checks the other way, that the socket is served
 //! by this user, before it writes a byte. `serve`'s own socket, `remote.sock`, is named by [`serve_socket_path`].
 
+use crate::control_listener::ControlListener;
 use crate::panel_control::euid;
 use crate::remote_devices::Grant;
 pub use crate::remote_pairing::PairMode;
 use crate::tab_set::{GoneWhy, ObserverFrame, RowKey, WorkMark};
-use agent::private_fs::{remove_if_same, FileIdentity};
 use serde::{Deserialize, Serialize};
-use std::ffi::OsString;
 use std::io::{self, Read, Write};
 use std::net::Shutdown;
 use std::os::fd::AsRawFd;
-use std::os::unix::fs::MetadataExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 /// The only version of the `rv-` lines this build speaks.
@@ -83,9 +80,6 @@ const SERVE_CONTROL_SOCKET: &str = "remote-ctl.sock";
 /// How long [`RvClient::connect`] waits for the server to accept.
 const CONNECT_WITHIN: Duration = Duration::from_secs(2);
 
-/// How many lowercase hex digits an instance id has.
-const INSTANCE_HEX: usize = 16;
-
 /// The pause after a failed `poll` or `accept` (descriptors exhausted, say), so the thread never spins.
 const ACCEPT_BACKOFF: Duration = Duration::from_millis(50);
 
@@ -93,17 +87,7 @@ const ACCEPT_BACKOFF: Duration = Duration::from_millis(50);
 /// limit. `instance` must be 16 lowercase hex digits, so no id read from elsewhere can name a path outside the
 /// directory.
 pub fn rv_socket_path(control_dir: &Path, instance: &str) -> io::Result<PathBuf> {
-    let is_instance = instance.len() == INSTANCE_HEX
-        && instance
-            .bytes()
-            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b));
-    if !is_instance {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!("{instance:?} is not an instance id ({INSTANCE_HEX} lowercase hex digits)"),
-        ));
-    }
-    agent::socket_path::in_dir(control_dir, &format!("rv-{instance}.sock"))
+    crate::control_listener::socket_path(control_dir, "rv", instance)
 }
 
 /// `runtime_dir/remote.sock`, `eitri remote serve`'s socket, through `agent::socket_path::in_dir`, which refuses a path
@@ -642,12 +626,7 @@ pub fn pong_line() -> String {
 /// Dropping it removes the socket only while the name still holds the one bound, and ends the accepting thread
 /// without waiting for it; connections already handed on are their owner's.
 pub struct RvListener {
-    dir: std::fs::File,
-    name: OsString,
-    bound: FileIdentity,
-    stop: Arc<AtomicBool>,
-    /// The other end of the thread's wake pair: closing it wakes the thread's `poll`.
-    stop_pair: Option<UnixStream>,
+    _listening: ControlListener,
 }
 
 impl RvListener {
@@ -683,15 +662,6 @@ impl RvListener {
     }
 }
 
-impl Drop for RvListener {
-    fn drop(&mut self) {
-        self.stop.store(true, Ordering::Release);
-        // Unlinked first, so no new peer finds it while the thread winds down.
-        let _ = remove_if_same(&self.dir, &self.name, self.bound);
-        self.stop_pair.take();
-    }
-}
-
 type PeerUid = fn(&UnixStream) -> io::Result<u32>;
 
 fn bind_with<S>(control_dir: &Path, instance: &str, peer_uid: PeerUid, serve: S) -> io::Result<RvListener>
@@ -712,45 +682,13 @@ where
     S: FnMut(UnixStream) -> bool + Send + 'static,
 {
     let path = rv_socket_path(control_dir, instance)?;
-    let name = path
-        .file_name()
-        .map(OsString::from)
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "a socket path with no file name"))?;
-    crate::panel_control::ensure_dir(control_dir)
-        .map_err(|why| io::Error::new(io::ErrorKind::PermissionDenied, why))?;
-    let dir = agent::private_fs::open_dir(control_dir)?;
-    let listener = crate::panel_control::bind_unfollowed(&path)?;
-    let meta = path.symlink_metadata()?;
-    let bound = FileIdentity {
-        dev: meta.dev(),
-        ino: meta.ino(),
-    };
-    // `bind` leaves the umask's mode on the file.
-    let permissions = crate::panel_control::make_control_socket_private(&dir, &path, bound);
-    let started = (move || -> io::Result<(UnixStream, Arc<AtomicBool>)> {
-        permissions?;
-        listener.set_nonblocking(true)?;
-        let (stop_pair, stop_rx) = UnixStream::pair()?;
-        let stop = Arc::new(AtomicBool::new(false));
-        let thread_stop = Arc::clone(&stop);
-        std::thread::Builder::new()
-            .name("eitri-remote-accept".into())
-            .spawn(move || accept_loop(&listener, &stop_rx, &thread_stop, peer_uid, serve, maintenance))?;
-        Ok((stop_pair, stop))
-    })();
-    match started {
-        Ok((stop_pair, stop)) => Ok(RvListener {
-            dir,
-            name,
-            bound,
-            stop,
-            stop_pair: Some(stop_pair),
-        }),
-        Err(e) => {
-            let _ = remove_if_same(&dir, &name, bound);
-            Err(e)
-        }
-    }
+    let listening = ControlListener::bind(
+        control_dir,
+        &path,
+        "eitri-remote-accept",
+        move |listener, stop_rx, stop| accept_loop(&listener, &stop_rx, &stop, peer_uid, serve, maintenance),
+    )?;
+    Ok(RvListener { _listening: listening })
 }
 
 /// The accepting thread: wait for a peer or the stop, check the peer, hand it on.
@@ -1100,6 +1038,7 @@ mod tests {
         let end = client.recv(Duration::from_secs(5)).unwrap_err();
         assert_eq!(end.kind(), io::ErrorKind::UnexpectedEof);
     }
+    use std::os::unix::fs::MetadataExt;
     use std::sync::Arc;
 
     const INSTANCE: &str = "a3f09c1d2e4b5f60";

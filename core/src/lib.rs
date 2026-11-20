@@ -23,6 +23,7 @@ pub mod companion;
 pub mod compositor;
 pub mod config_dir;
 pub mod config_switch;
+mod control_listener;
 pub mod crash_trace;
 pub mod display_env;
 pub mod editor_context;

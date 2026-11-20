@@ -229,11 +229,14 @@ const fn fnv1a(mut hash: u64, bytes: &[u8]) -> u64 {
     hash
 }
 
-/// A hash of what `serve` and a window must agree on: the `rv-` grammar, the phone's, and this record. Two builds of
-/// the same version that differ there differ here.
+/// A hash of what `serve` and a window must agree on: the `rv-` grammar, the socket's name and the instance grammar in
+/// it, the phone's grammar, and this record. Two builds of the same version that differ there differ here.
 const SPOKEN_HASH: u64 = fnv1a(
     fnv1a(
-        fnv1a(0xcbf2_9ce4_8422_2325, include_bytes!("../../../core/src/remote_rv.rs")),
+        fnv1a(
+            fnv1a(0xcbf2_9ce4_8422_2325, include_bytes!("../../../core/src/remote_rv.rs")),
+            include_bytes!("../../../core/src/control_listener.rs"),
+        ),
         include_bytes!("../../../core/src/remote_wire.rs"),
     ),
     include_bytes!("config.rs"),

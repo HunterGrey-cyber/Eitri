@@ -32,10 +32,8 @@ pub fn new_instance() -> String {
     uuid::Uuid::new_v4().simple().to_string()[..16].to_owned()
 }
 
-/// Whether `s` can be an instance name: exactly 16 lowercase hex digits, so it can never name another path.
-pub fn is_instance(s: &str) -> bool {
-    s.len() == 16 && s.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
-}
+/// An instance name's grammar is spelled where the sockets it names are, a file `eitri remote serve`'s build hash reads.
+pub use crate::control_listener::{is_instance, INSTANCE_HEX};
 
 /// The start time of `pid` in clock ticks since boot (field 22 of `/proc/<pid>/stat`), which tells a process
 /// apart from a later one given the same pid. `None` where there is no `/proc` or the process is gone.
