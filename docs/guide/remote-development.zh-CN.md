@@ -1,5 +1,5 @@
 [English](remote-development.md) | 简体中文
-<!-- translated-from: remote-development.md sha256=16a2adfafcaf838e012858aa67358b71e1fbef8f6f568f0519b6e041eb601617 -->
+<!-- translated-from: remote-development.md sha256=69d9c18a57606f225b816bea37bdf990ec0042bcf99bd21e001fb5854ef9702d -->
 
 # 远程开发
 
