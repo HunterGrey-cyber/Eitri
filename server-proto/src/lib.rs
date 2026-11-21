@@ -2,7 +2,7 @@ pub mod args_hex;
 pub mod probe;
 
 pub const PROTOCOL_MAJOR: u32 = 1;
-pub const PROTOCOL_MINOR: u32 = 3;
+pub const PROTOCOL_MINOR: u32 = 4;
 pub const CAP_SIDECARS: &str = "sidecars";
 pub const CAP_JOURNAL: &str = "journal";
 pub const CAP_PENDING: &str = "pending";

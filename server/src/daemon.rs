@@ -1157,7 +1157,7 @@ mod tests {
                 "{capability}"
             );
         }
-        assert_eq!(hello.protocol_minor, 3);
+        assert_eq!(hello.protocol_minor, 4);
     }
 
     #[tokio::test]
