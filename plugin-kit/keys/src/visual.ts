@@ -17,8 +17,10 @@ type Place = { node: Node; offset: number };
 
 /** A word character for `w`, `b` and `e`, as vim's 'iskeyword' reads letters, digits and `_` in every script. */
 const WORD = /[\p{L}\p{N}_]/u;
-/** The kit's own elements, and text nobody reads as the page's: a selection never reaches into them. */
-const NOT_PAGE = "#eitri-keys-hud, #eitri-keys-sheet, #eitri-keys-find, #eitri-keys-hints, [aria-hidden='true']";
+/** The kit's own elements: a selection never reaches into them, and the page's text ends where they start. */
+const KIT = "#eitri-keys-hud, #eitri-keys-sheet, #eitri-keys-find, #eitri-keys-hints";
+/** Text nobody reads as the page's, besides what the page excludes from find: KaTeX draws its glyphs in it. */
+const HIDDEN = "[aria-hidden='true']";
 /** How far from the view's edges the cursor is kept on a page that does not place it itself. */
 const MARGIN_SHARE = 1 / 8;
 
@@ -34,6 +36,8 @@ let anchor: Place | null = null;
 let cursor: Place | null = null;
 let options: VisualOptions & {
   root?: () => Element | null;
+  /** The page's `find.exclude`: text under it is not the page's, here as in find. */
+  exclude?: string;
   messages?: Partial<Record<KitMessage, string>>;
   /** Told when the mode ends, so the HUD shows it. */
   ended?: () => void;
@@ -94,7 +98,8 @@ onRemove(() => {
   pending = "";
 });
 
-/** What the page told `install` about visual mode, the find root the selection is kept inside, and the messages. */
+/** What the page told `install` about visual mode, the find root the selection is kept inside, the text find leaves
+ *  out, and the messages. */
 export function configureVisual(next: typeof options): void {
   options = next;
   resolver = null;
@@ -131,14 +136,68 @@ function rootOf(): Element {
   } catch (error) {
     console.warn("eitri keys: the page's find root failed", error);
   }
-  return root ?? document.body;
+  // Before the body exists (a script in the head) the whole document is the root.
+  return root ?? document.body ?? document.documentElement;
 }
 
-/** Whether a place is the page's text: inside the root and outside the kit's own elements. */
-function onPage(node: Node | null): boolean {
-  if (!node) return false;
-  const el = node.nodeType === Node.ELEMENT_NODE ? (node as Element) : node.parentElement;
-  return !!el && rootOf().contains(el) && !el.closest(NOT_PAGE);
+function elementOf(node: Node): Element | null {
+  return node.nodeType === Node.ELEMENT_NODE ? (node as Element) : node.parentElement;
+}
+
+/** Whether an element is text the page leaves out: `aria-hidden`, or under an element of the root that the page's
+ *  `find.exclude` matches (KaTeX's MathML copy, which is clipped to a pixel and drawn by nobody). A selector the
+ *  engine cannot parse leaves nothing out, as in find. */
+function leftOut(el: Element, root: Element): boolean {
+  if (el.closest(HIDDEN)) return true;
+  if (!options.exclude) return false;
+  try {
+    const hit = el.closest(options.exclude);
+    return !!hit && root.contains(hit);
+  } catch {
+    return false;
+  }
+}
+
+/** Whether a place is the page's text: inside the root (the page's, unless the caller resolved it once), outside the
+ *  kit's own elements, and not left out. */
+function onPage(node: Node | null, root: Element = rootOf()): boolean {
+  const el = node && elementOf(node);
+  return !!el && root.contains(el) && !el.closest(KIT) && !leftOut(el, root);
+}
+
+/** Whether a place is inside the root in text the page leaves out: the walk passes such text as it passes an image,
+ *  and a motion that lands in it moves out. */
+function aside(node: Node, root: Element): boolean {
+  const el = elementOf(node);
+  return !!el && root.contains(el) && !el.closest(KIT) && leftOut(el, root);
+}
+
+/** The outermost element inside the root (the root included) that leaves a node's text out: `aria-hidden`, or one
+ *  the page's `find.exclude` matches. The walk passes it whole, in one move, however much text it holds. */
+function leftOutElement(node: Node, root: Element): Element | null {
+  let out: Element | null = null;
+  for (let el = elementOf(node); el && root.contains(el); el = el.parentElement) {
+    if (el.matches(HIDDEN) || excluded(el)) out = el;
+  }
+  return out;
+}
+
+/** Whether the page's `find.exclude` matches an element itself; a selector the engine cannot parse matches nothing. */
+function excluded(el: Element): boolean {
+  if (!options.exclude) return false;
+  try {
+    return el.matches(options.exclude);
+  } catch {
+    return false;
+  }
+}
+
+/** The place just past an element in a direction: after it going forward, before it going back. */
+function past(el: Element, direction: Direction): Place | null {
+  const parent = el.parentNode;
+  if (!parent) return null;
+  const index = Array.prototype.indexOf.call(parent.childNodes, el) as number;
+  return { node: parent, offset: direction === "forward" ? index + 1 : index };
 }
 
 /** Below 0 when `a` comes before `b`, 0 at the same place, above 0 after it. */
@@ -155,7 +214,7 @@ function order(a: Place, b: Place): number {
 /** Whether a place still exists: its node's text (or children) can have shrunk under it in an update. */
 function exists(p: Place): boolean {
   const max = p.node.nodeType === Node.TEXT_NODE ? (p.node as Text).data.length : p.node.childNodes.length;
-  return p.offset <= max;
+  return p.offset >= 0 && p.offset <= max;
 }
 
 function focusOf(s: Selection): Place | null {
@@ -165,27 +224,154 @@ function focusOf(s: Selection): Place | null {
 /* Movement, as Vimium's: the selection's own `modify`, with word moves done a character at a time so they behave
    the same on every platform. Each runs from a caret at a place and gives the place it reaches. */
 
-/** The character after the focus (a whole code point: a letter outside the BMP is two UTF-16 units), the selection
- *  left as it was. */
-function nextCharacter(s: Alterable): string | undefined {
-  const before = s.toString();
-  s.modify("extend", "forward", "character");
-  const after = s.toString();
-  if (before === after) return undefined;
-  s.modify("extend", "backward", "character");
-  return [...after.slice(before.length)][0];
+function samePlace(a: Place | null, b: Place | null): boolean {
+  return !!a && !!b && a.node === b.node && a.offset === b.offset;
 }
 
-function nextIsWord(s: Alterable): boolean {
-  const ch = nextCharacter(s);
-  return ch !== undefined && WORD.test(ch);
-}
-
-/** Extends by one character; how much longer the selection got (0 at the end of the text). */
-function extendOne(s: Alterable, direction: Direction): number {
-  const length = s.toString().length;
+/** Takes one character step; whether the focus moved (it does not at the start or the end of the text). */
+function stepOn(s: Alterable, direction: Direction): boolean {
+  const focus = focusOf(s);
   s.modify("extend", direction, "character");
-  return s.toString().length - length;
+  return !samePlace(focusOf(s), focus);
+}
+
+/** The text of the DOM between two places, split into the page's own and whether any of it is left out (inside the
+ *  root). A character step spans one character, so this reads a few nodes. */
+function textBetween(a: Place, b: Place, root: Element): { page: string; hidden: boolean } {
+  const range = document.createRange();
+  const [first, last] = order(a, b) <= 0 ? [a, b] : [b, a];
+  range.setStart(first.node, first.offset);
+  range.setEnd(last.node, last.offset);
+  let page = "";
+  let hidden = false;
+  const walker = document.createTreeWalker(range.commonAncestorContainer, NodeFilter.SHOW_TEXT);
+  walker.currentNode = range.startContainer;
+  let node: Node | null = range.startContainer.nodeType === Node.TEXT_NODE ? range.startContainer : walker.nextNode();
+  for (; node && range.comparePoint(node, 0) <= 0; node = walker.nextNode()) {
+    if (!range.intersectsNode(node)) continue;
+    const text = (node as Text).data;
+    const part = text.slice(node === range.startContainer ? range.startOffset : 0,
+      node === range.endContainer ? range.endOffset : text.length);
+    if (part === "") continue;
+    if (onPage(node, root)) page += part;
+    else if (aside(node, root)) hidden = true;
+  }
+  return { page, hidden };
+}
+
+/** What a character step from `a` to `b` passed: the character the engine's selection text gained by it (a whole
+ *  code point: a letter outside the BMP is two UTF-16 units), or "" where it passed nothing of the page's text: an
+ *  inline atom (an image, a checkbox: the engine steps over it with no text), only text the page leaves out, or
+ *  nothing of the page's from or into such text (around KaTeX's MathML copy, which the engine lays out as a block,
+ *  the selection's text gains line breaks). The gain can carry line breaks and spaces the engine writes at block and
+ *  cell edges besides the character (Blink: `"a\n"` for the `a` before a formula that ends a paragraph), so the
+ *  character is the one that is not white space, if there is one. A step between the page's places with no text in
+ *  the DOM (a line break, a block's edge) keeps the engine's character. */
+function passed(a: Place, b: Place, text: string, direction: Direction, root: Element): string {
+  const points = [...text];
+  const solid = points.filter((c) => !/\s/.test(c));
+  const pick = solid.length ? solid : points;
+  const ch = (direction === "forward" ? pick[0] : pick[pick.length - 1]) ?? "";
+  if (ch === "") return "";
+  const { page, hidden } = textBetween(a, b, root);
+  if (page.includes(ch) || (/\s/.test(ch) && /\s/.test(page))) return ch;
+  return hidden || aside(a.node, root) || aside(b.node, root) ? "" : ch;
+}
+
+/** A step of the walk: the place it started from, where it landed, the engine's selection text for it, and what it
+ *  passed (`passed`: a character, or "" for an inline atom or left-out text). */
+type Step = { from: Place; to: Place; text: string; ch: string; jumped?: boolean; last?: boolean };
+
+/** One step on from a caret at `from` (back with `backward`), or null where the focus cannot move (the text's start
+ *  or end). The selection holds only the step while its text is read, so a step costs the same however far the walk
+ *  has come. Left-out text is passed whole: a step that passes none of the page's text and lands in it goes on past
+ *  the outermost left-out element holding it (`jump`), as does a step from left-out text where the engine cannot
+ *  move (Blink stops going back at a zero-width space in KaTeX's glyphs), or from the place right next to a left-out
+ *  element where the engine cannot move (Blink cannot step back from the place between KaTeX's MathML copy and its
+ *  glyphs). Where the engine cannot move from an element place next to an element of the page's, the step goes into
+ *  it or past it (`into`). Moved with "" is not the text's end. */
+function cross(s: Alterable, from: Place, direction: Direction, root: Element): Step | null {
+  s.collapse(from.node, from.offset);
+  const sign = direction === "forward" ? 1 : -1;
+  stepOn(s, direction);
+  const to = focusOf(s);
+  // A focus that is not further on did not move: at the text's edge the engine (or a canonical place) can report
+  // another node's place at the same point, or one behind.
+  if (!to || order(to, from) * sign <= 0) {
+    const inside = aside(from.node, root) ? from.node : beside(from, direction);
+    if (!inside) return null;
+    return aside(inside, root) ? jump(from, inside, direction, root) : into(from, inside, direction, root);
+  }
+  const text = s.toString();
+  const ch = passed(from, to, text, direction, root);
+  return (ch === "" && jump(from, to.node, direction, root)) || { from, to, text, ch };
+}
+
+/** The node right next to a place in a direction, at the same level: the child after (before) an element place, the
+ *  sibling after (before) a text's end (start). */
+function beside(p: Place, direction: Direction): Node | null {
+  const forward = direction === "forward";
+  if (p.node.nodeType !== Node.TEXT_NODE) return p.node.childNodes[forward ? p.offset : p.offset - 1] ?? null;
+  const edge = forward ? p.offset === (p.node as Text).data.length : p.offset === 0;
+  return edge ? (forward ? p.node.nextSibling : p.node.previousSibling) : null;
+}
+
+/** A step from `from` past the outermost left-out element holding `inside`, which passes an atom; null where
+ *  `inside` is not left out or the place past the element is not further on than `from`. Where none of the page's
+ *  text lies beyond the element (a document that opens with a diagram has nothing before it to go back to) the step
+ *  is the `last`: a word walk going back does not take it. */
+function jump(from: Place, inside: Node, direction: Direction, root: Element): Step | null {
+  const el = aside(inside, root) ? leftOutElement(inside, root) : null;
+  const to = el && past(el, direction);
+  if (!to || order(to, from) * (direction === "forward" ? 1 : -1) <= 0) return null;
+  return { from, to, text: "", ch: "", jumped: true, last: !beyond(el, direction, root) };
+}
+
+/** A step from an element place into the page's element right next to it, where the engine does not move: both
+ *  engines stop going back at the place just after an `<hr>` or a table that is a child of the root. The step goes to
+ *  the nearest place of the page's text inside the element (its last text's end going back, its first text's start
+ *  going forward), or past the element where it holds none (the `last` step where none lies beyond it either); it
+ *  passes an atom. Null from a text, or beside an element that is not the page's. */
+function into(from: Place, el: Node, direction: Direction, root: Element): Step | null {
+  if (from.node.nodeType === Node.TEXT_NODE || el.nodeType !== Node.ELEMENT_NODE || !onPage(el, root)) return null;
+  const inside = texts(el as Element);
+  const text = direction === "forward" ? inside[0] : inside[inside.length - 1];
+  const to = text ? { node: text, offset: direction === "forward" ? 0 : text.data.length }
+    : past(el as Element, direction);
+  return to && { from, to, text: "", ch: "", last: !text && !beyond(el as Element, direction, root) };
+}
+
+/** Walks on from the focus while the character ahead is a word character (`word`) or is not one, and leaves a caret
+ *  where it stopped; an inline atom, or text the page leaves out, is not one, so the walk passes it as it passes a
+ *  space. */
+function over(s: Alterable, direction: Direction, word: boolean, root: Element): void {
+  let at = focusOf(s);
+  if (!at) return;
+  let jumped = false;
+  // Going back, the walk does not take a step into left-out text with none of the page's before it: the page's text
+  // starts after it, so the walk stays on its first character, as at the start of any page. Going forward such a step
+  // leads off the page's text, as past the end of any page.
+  const takes = (step: Step) => !step.last || direction === "forward";
+  for (let next = cross(s, at, direction, root); next && takes(next); next = cross(s, at, direction, root)) {
+    if (WORD.test(next.ch) !== word) {
+      // Stopped going forward right past left-out text, or at any place that is not in a text (after an `<hr>`, a
+      // table, an image): such a place can be in another block than the character after it, so the walk stands
+      // just before that character instead.
+      if (direction === "forward" && (jumped || at.node.nodeType !== Node.TEXT_NODE)) at = charBefore(next) ?? at;
+      break;
+    }
+    at = next.to;
+    jumped = !!next.jumped;
+  }
+  s.collapse(at.node, at.offset);
+}
+
+/** The place just before the character a forward step passed, where it lies at the end of the step in a text. */
+function charBefore(step: Step): Place | null {
+  const { to, ch } = step;
+  if (ch === "" || to.node.nodeType !== Node.TEXT_NODE || to.offset < ch.length) return null;
+  const start = to.offset - ch.length;
+  return (to.node as Text).data.slice(start, to.offset) === ch ? { node: to.node, offset: start } : null;
 }
 
 /** Where `run` takes a caret standing at `from`. */
@@ -202,26 +388,32 @@ function step(s: Alterable, at: Place, direction: Direction): Place {
 
 /** The cursor's next place for a motion, vim's: the cursor stands on a character, so a motion that ends after one
  *  (`e`, `$`) comes back one to stand on it. */
-function moveCursor(s: Alterable, at: Place, motion: string): Place | null {
+function moveCursor(s: Alterable, at: Place, motion: string, root: Element): Place | null {
   switch (motion) {
     case "h": return step(s, at, "backward");
     case "l": return step(s, at, "forward");
     case "j": return rowMove(at, "forward") ?? from(s, at, (sel) => sel.modify("extend", "forward", "line"));
     case "k": return rowMove(at, "backward") ?? from(s, at, (sel) => sel.modify("extend", "backward", "line"));
-    case "b": return from(s, at, (sel) => sel.modify("extend", "backward", "word"));
+    case "b":
+      // Back over what is not a word, then over the word's characters to its first: a character at a time with the
+      // same WORD as `w` and `e`, not the engine's word granularity (which splits a Chinese run in the middle).
+      return from(s, at, (sel) => {
+        over(sel, "backward", false, root);
+        over(sel, "backward", true, root);
+      });
     case "0": return from(s, at, (sel) => sel.modify("extend", "backward", "lineboundary"));
     case "w":
       // To the end of this word, then over what follows it up to the next word.
       return from(s, at, (sel) => {
-        while (nextIsWord(sel)) if (extendOne(sel, "forward") === 0) return;
-        while (nextCharacter(sel) !== undefined && !nextIsWord(sel)) if (extendOne(sel, "forward") === 0) return;
+        over(sel, "forward", true, root);
+        over(sel, "forward", false, root);
       });
     case "e": {
       // Past the cursor's own character, over what is not a word, to the end of the next word's last character.
       const end = from(s, at, (sel) => {
-        extendOne(sel, "forward");
-        while (nextCharacter(sel) !== undefined && !nextIsWord(sel)) if (extendOne(sel, "forward") === 0) return;
-        while (nextIsWord(sel)) if (extendOne(sel, "forward") === 0) return;
+        stepOn(sel, "forward");
+        over(sel, "forward", false, root);
+        over(sel, "forward", true, root);
       });
       return order(end, at) > 0 ? step(s, end, "backward") : at;
     }
@@ -232,7 +424,7 @@ function moveCursor(s: Alterable, at: Place, motion: string): Place | null {
     case "}": return blockMove(at, "forward");
     case "{": return blockMove(at, "backward");
     case "gg": case "G": {
-      const all = texts(rootOf());
+      const all = texts(root);
       const text = motion === "G" ? all[all.length - 1] : all[0];
       if (!text) return null;
       return motion === "G" ? step(s, { node: text, offset: text.data.length }, "backward") : { node: text, offset: 0 };
@@ -245,23 +437,203 @@ function moveCursor(s: Alterable, at: Place, motion: string): Place | null {
   }
 }
 
+/** The motions `normalMotion` answers: the cursor moves of a line, as Normal mode keeps its cursor on one character. */
+const NORMAL_MOTIONS = new Set(["h", "l", "w", "b", "e", "0", "$"]);
+
+/** What `normalMotion` borrows of the document's selection: its two ends, and the Range it held. */
+type Held = { a: Node; ao: number; b: Node; bo: number; range: Range } | null;
+
+function hold(s: Selection): Held {
+  if (s.rangeCount === 0 || !s.anchorNode || !s.focusNode) return null;
+  return { a: s.anchorNode, ao: s.anchorOffset, b: s.focusNode, bo: s.focusOffset, range: s.getRangeAt(0) };
+}
+
+/** Puts the borrowed selection back, never throwing: a forward one as the very Range it was (a plugin holding
+ *  `getRangeAt(0)` still holds the live one), a backward one by its ends; where the saved ends are gone, no selection
+ *  rather than the walker's. */
+function putBack(s: Selection, held: Held): void {
+  try {
+    s.removeAllRanges();
+    if (!held) return;
+    const r = held.range;
+    if (r.startContainer === held.a && r.startOffset === held.ao && r.endContainer === held.b && r.endOffset === held.bo) {
+      s.addRange(r);
+    } else {
+      s.setBaseAndExtent(held.a, held.ao, held.b, held.bo);
+    }
+  } catch {
+    try {
+      s.removeAllRanges();
+    } catch {
+      // Nothing is left to undo.
+    }
+  }
+}
+
+/** Whether a field or an editable element has the focus: the document's selection then belongs to it (it reads as the
+ *  element's host, and putting it back by its ends would drop the field's own caret). */
+function editing(): boolean {
+  return !!document.activeElement?.closest("input, textarea, select, [contenteditable]:not([contenteditable='false'])");
+}
+
+/** The line a place is on, for a place in left-out text too: the layout block of its nearest element that is the
+ *  page's (KaTeX lays its hidden copy out as blocks and table cells of its own, inside an inline span). */
+function lineOf(node: Node, root: Element): Element | null {
+  let el = elementOf(node);
+  while (el && root.contains(el) && !onPage(el, root)) el = el.parentElement;
+  return el ? layoutBlock(el) : null;
+}
+
+/** The place before the one character a step passed, when it passed exactly one inside a text on `line`: not a line
+ *  break (the engine's selection text has one where a line ends) and not into another block. */
+function characterOf(step: Step, line: Element | null): Place | null {
+  const { to, text } = step;
+  if (to.node.nodeType !== Node.TEXT_NODE || [...text].length !== 1) return null;
+  const start = to.offset - text.length;
+  if (start < 0 || (to.node as Text).data.slice(start, to.offset) !== text) return null;
+  return layoutBlock(to.node) === line ? { node: to.node, offset: start } : null;
+}
+
+/** The place just before the character the cursor is on, for a place the engine reports at a boundary: the end of a
+ *  text (or an element place) in front of an inline element's text is reported as the end of the one before, not the
+ *  start of the next. The engine's own next step says which character follows: past any inline atoms and left-out
+ *  text, the one it passes, if on the same line. A place of the page's with nothing after it on its line (its end)
+ *  stays as it is; a place in left-out text with nothing after it is null. */
+function beforeCharacter(s: Alterable, at: Place, root: Element): Place | null {
+  const text = at.node.nodeType === Node.TEXT_NODE;
+  if (text && onPage(at.node, root) && at.offset < (at.node as Text).data.length) return at;
+  // An element place in a block with none of the page's text (before a diagram's SVG) is on no line of the page's,
+  // as a place in left-out text is.
+  const line = lineOf(at.node, root);
+  const end = onPage(at.node, root) && (text || (!!line && texts(line, 1).length > 0)) ? at : null;
+  // A step out of the root passes no atom (`passed`): the page's text has ended there.
+  for (let step = cross(s, at, "forward", root); step && !step.last; step = cross(s, step.to, "forward", root)) {
+    if (step.ch !== "") return (onPage(step.to.node, root) && characterOf(step, line)) || end;
+  }
+  return end;
+}
+
+/** Whether an element place stands between blocks (after an `<hr>` or a table, between two paragraphs): a place in a
+ *  block of the page's with nothing but blocks and white space on either side of it. */
+function betweenBlocks(p: Place, root: Element): boolean {
+  if (p.node.nodeType !== Node.ELEMENT_NODE || !onPage(p.node, root) || layoutBlock(p.node) !== p.node) return false;
+  const kids = p.node.childNodes;
+  const flat = (n: Node | undefined) => !n || (n.nodeType === Node.TEXT_NODE ? (n as Text).data.trim() === "" :
+    n.nodeType === Node.ELEMENT_NODE && layoutBlock(n) === n);
+  return flat(kids[p.offset - 1]) && flat(kids[p.offset]);
+}
+
+/** The motions whose last step goes back onto a character (`e` and `$` step back from the end they reach). */
+const ENDS_BACK = new Set(["h", "e", "$"]);
+
+/** Whether `settle` goes on back from `p`: a place that stands before an inline atom or left-out text is not the
+ *  character the motion stepped back onto, nor is a place in left-out text unless the engine reports it for the
+ *  page's character after it (WebKit gives the place before the space after a formula as one inside the formula). */
+function goesBack(s: Alterable, p: Place, root: Element): boolean {
+  const ahead = cross(s, p, "forward", root);
+  if (!ahead) return aside(p.node, root);
+  if (ahead.ch === "") return true;
+  return aside(p.node, root) && !(onPage(ahead.to.node, root) && characterOf(ahead, lineOf(p.node, root)));
+}
+
+/** The answer for a place a motion reached: when the motion ends going back, a place in left-out text or before an
+ *  inline atom goes back past them (`h` from the text after an image or a formula reaches the character before it);
+ *  then it is the place before the character the cursor is on. A place still in left-out text (the root's text
+ *  starts with it, or the motion does not end going back) goes on to the next character on its line, and where there
+ *  is none, back as `h` goes (`l` from the last character before a formula that ends the line stays on it); null
+ *  where neither finds one. */
+function settle(s: Alterable, at: Place, root: Element, back: boolean): Place | null {
+  let p = at;
+  while (back && goesBack(s, p, root)) {
+    const q = cross(s, p, "backward", root)?.to;
+    if (!q || !(onPage(q.node, root) || aside(q.node, root))) break;
+    p = q;
+  }
+  if (back) p = lineEndBefore(p, root);
+  return beforeCharacter(s, p, root) ?? (back ? null : settle(s, at, root, true));
+}
+
+/** Going back from a block's first character the engine stops between blocks after an `<hr>` or a table: that place
+ *  is the end of the line before, the end of the page's last text before it, as the end of the text before is after
+ *  a paragraph (with no text before it, the page's text starts after it: `h` there stays on its first character).
+ *  Any other place is itself. */
+function lineEndBefore(p: Place, root: Element): Place {
+  if (!betweenBlocks(p, root)) return p;
+  return textBeside(p, "backward", root) ?? textBeside(p, "forward", root) ?? p;
+}
+
+/** The nearest of the page's texts on one side of an element place: the end of the last one before it going back,
+ *  the start of the first one after it going forward. */
+function textBeside(p: Place, direction: Direction, root: Element): Place | null {
+  const forward = direction === "forward";
+  const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
+  const child: Node | undefined = p.node.childNodes[forward ? p.offset : p.offset - 1];
+  // The walk starts at the side's nearest node: the child after the place, the last node inside the child before it,
+  // or (with no child on that side) the last node inside the place's own element going forward, that element going
+  // back, so it reads only what lies on that side.
+  let start: Node = child ?? p.node;
+  if (child ? !forward : forward) while (start.lastChild) start = start.lastChild;
+  walker.currentNode = start;
+  const next = () => (forward ? walker.nextNode() : walker.previousNode()) as Text | null;
+  let t = child && start.nodeType === Node.TEXT_NODE ? (start as Text) : next();
+  while (t && !pageText(t, root)) t = next();
+  return t && { node: t, offset: forward ? 0 : t.data.length };
+}
+
+/** Where one of `h l w b e 0 $` takes a cursor standing just before a character at `at`, by the walker visual mode
+ *  moves its cursor with, for a page that keeps a cursor of its own in Normal mode (kit 6). The answer is the place
+ *  just before the character the cursor is then on: for `e` and `$` that is their last character (the walker's cursor
+ *  is already the place before its character, as visual mode keeps it, so nothing is converted), and a place the
+ *  engine reports at the end of a text with a character after it on the line is that character's. An inline atom (an
+ *  image, a checkbox) is no character, nor is text the page leaves out (`aria-hidden`, its `find.exclude`: KaTeX's
+ *  glyphs and its hidden MathML copy): `h`, `e` and `$` go back past it, the others on, and a step that lands inside
+ *  such text moves out of it. Where nothing follows on the line, the answer is its end as the engine gives it (a
+ *  text's end or an element place); the engine can also stand it before a character that draws nothing (a collapsed
+ *  newline or space), so a page checks the character's box. The document's selection is borrowed for the walk and put
+ *  back as it was (anchor and focus, so a backward selection stays backward; none stays none); the page's root is
+ *  resolved once, before. Null for a start outside the page's text, a place its text no longer has, a key that is not
+ *  one of the seven, an engine without `Selection.modify`, a focus in a field, and a result outside the root (or in
+ *  left-out text with no character of the page's on its line either way). */
+export function normalMotion(from: Place, motion: string): Place | null {
+  const s = selection();
+  if (!s || !NORMAL_MOTIONS.has(motion) || editing()) return null;
+  const root = rootOf();
+  if (!from.node.isConnected || !onPage(from.node, root) || !exists(from)) return null;
+  const held = hold(s);
+  try {
+    const next = moveCursor(s, from, motion, root);
+    if (!next || !(onPage(next.node, root) || aside(next.node, root))) return null;
+    const placed = settle(s, next, root, ENDS_BACK.has(motion));
+    return placed && onPage(placed.node, root) ? placed : null;
+  } catch {
+    return null;
+  } finally {
+    putBack(s, held);
+  }
+}
+
 /** The offset of a text's last character (a whole code point: a letter outside the BMP is two UTF-16 units). */
 function lastCharOffset(t: Text): number {
   const points = [...t.data];
   return Math.max(0, t.data.length - (points[points.length - 1]?.length ?? 1));
 }
 
-/** The block a place belongs to for `{` and `}`: its table row, else its nearest ancestor laid out as a block (a
- *  paragraph, a list item's own text, a heading, a code block), not inline. */
+/** The nearest element laid out as a block (a paragraph, a list item's own text, a heading, a code block, a table
+ *  cell) holding a place, itself included: not inline. */
+function layoutBlock(node: Node): Element | null {
+  for (let el = node.nodeType === Node.ELEMENT_NODE ? (node as Element) : node.parentElement; el; el = el.parentElement) {
+    const display = getComputedStyle(el).display;
+    if (display && !display.startsWith("inline") && display !== "contents") return el;
+  }
+  return null;
+}
+
+/** The block a place belongs to for `{` and `}`: its table row, else its layout block. */
 function blockOf(node: Node, known: Map<Node, Element | null>): Element | null {
   const had = known.get(node);
   if (had !== undefined) return had;
-  let el: Element | null = node.nodeType === Node.ELEMENT_NODE ? (node as Element) : node.parentElement;
-  let block: Element | null = el?.closest("tr") ?? null;
-  for (; !block && el; el = el.parentElement) {
-    const display = getComputedStyle(el).display;
-    if (display && !display.startsWith("inline") && display !== "contents") block = el;
-  }
+  const el = node.nodeType === Node.ELEMENT_NODE ? (node as Element) : node.parentElement;
+  const block = el?.closest("tr") ?? layoutBlock(node);
   known.set(node, block);
   return block;
 }
@@ -344,13 +716,22 @@ function rowMove(at: Place, direction: Direction): Place | null {
     const last = inCell[inCell.length - 1];
     return { node: last, offset: lastCharOffset(last) };
   }
-  const all = texts(rootOf()).filter((t) => !table.contains(t));
-  if (direction === "forward") {
-    const after = all.find((t) => (table.compareDocumentPosition(t) & Node.DOCUMENT_POSITION_FOLLOWING) !== 0);
-    return after ? { node: after, offset: 0 } : at;
+  return beyond(table, direction, rootOf()) ?? at;
+}
+
+/** Past an element a line move went into or across: the start of the page's first text after it (forward), or the
+ *  last character of its last text before it (back); null where there is none. */
+function beyond(el: Element, direction: Direction, root: Element): Place | null {
+  const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
+  // The walk starts at the element's last node going forward, so it reads only what lies beyond the element.
+  let start: Node = el;
+  if (direction === "forward") while (start.lastChild) start = start.lastChild;
+  walker.currentNode = start;
+  const next = () => (direction === "forward" ? walker.nextNode() : walker.previousNode()) as Text | null;
+  for (let t = next(); t; t = next()) {
+    if (pageText(t, root)) return { node: t, offset: direction === "forward" ? 0 : lastCharOffset(t) };
   }
-  const before = all.reverse().find((t) => (table.compareDocumentPosition(t) & Node.DOCUMENT_POSITION_PRECEDING) !== 0);
-  return before ? { node: before, offset: lastCharOffset(before) } : at;
+  return null;
 }
 
 /** Linewise: both ends go out to the boundaries of the lines they are on, the focus's end last. */
@@ -401,8 +782,9 @@ function wholeRows(s: Alterable): void {
 function draw(s: Alterable): void {
   if (!anchor || !cursor) return;
   const forward = order(cursor, anchor) >= 0;
-  const a = forward ? anchor : step(s, anchor, "forward");
-  const c = forward ? step(s, cursor, "forward") : cursor;
+  const root = rootOf();
+  const a = forward ? anchor : pastCharacter(s, anchor, root);
+  const c = forward ? pastCharacter(s, cursor, root) : cursor;
   s.setBaseAndExtent(a.node, a.offset, c.node, c.offset);
   if (kind === "line") {
     wholeLines(s);
@@ -411,18 +793,33 @@ function draw(s: Alterable): void {
   paint(s);
 }
 
-/* The page's first and last text: `gg` and `G` stop there, and the selection never takes in what follows the
-   page's text (the kit's HUD). */
-function texts(root: Element): Text[] {
+/** The place just past the character after `at`, where the selection drawn ends. A step that lands in left-out text
+ *  (the engine reports the end of a character before a formula inside it, and steps into a diagram from the end of
+ *  the text before it) ends at the character's end in its own text instead, or at `at` where it is a text's end. */
+function pastCharacter(s: Alterable, at: Place, root: Element): Place {
+  const next = step(s, at, "forward");
+  if (!aside(next.node, root)) return next;
+  if (at.node.nodeType !== Node.TEXT_NODE) return at;
+  const point = (at.node as Text).data.codePointAt(at.offset);
+  return point === undefined ? at : { node: at.node, offset: at.offset + (point > 0xffff ? 2 : 1) };
+}
+
+/* The page's texts under `scope` (only the first `most`): `gg` and `G` stop at the first and last, and the selection
+   never takes in what follows the page's text (the kit's HUD). */
+function texts(scope: Element, most = Infinity): Text[] {
   const out: Text[] = [];
-  const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
-  for (let n = walker.nextNode(); n; n = walker.nextNode()) {
-    const text = n as Text;
-    if (text.data.trim() !== "" && onPage(text) && !text.parentElement?.closest("[hidden], script, style, template")) {
-      out.push(text);
-    }
+  const root = rootOf();
+  const walker = document.createTreeWalker(scope, NodeFilter.SHOW_TEXT);
+  for (let n = walker.nextNode(); n && out.length < most; n = walker.nextNode()) {
+    if (pageText(n as Text, root)) out.push(n as Text);
   }
   return out;
+}
+
+/** Whether a text is one `texts` lists: not white space only, the page's, and not in hidden or non-content markup. */
+function pageText(text: Text, root: Element): boolean {
+  return text.data.trim() !== "" && onPage(text, root) &&
+    !text.parentElement?.closest("[hidden], script, style, template");
 }
 
 /** Where `v` starts without a page cursor: the first text in the view, as Vimium's caret does. */
@@ -461,14 +858,23 @@ export function focusRect(s: Selection): DOMRect | null {
   return box && (box.width || box.height) ? box : null;
 }
 
+/** Draws the selection and keeps the cursor in view. The page's `follow` also gets the cursor's place in `motion`'s
+ *  shape (the place just before its character, or the line's end as the engine gives it), worked out before the
+ *  selection is drawn: under `V` the selection's focus is the end of the line (or of a table row), not the cursor. */
+function show(s: Alterable): void {
+  const at = cursor && (beforeCharacter(s, cursor, rootOf()) ?? cursor);
+  draw(s);
+  follow(s, at);
+}
+
 /** Keeps the cursor in view: the page places it (and its own cursor) when it can, else the window moves the least
  *  that keeps it an eighth of the view from either edge. */
-function follow(s: Selection): void {
+function follow(s: Selection, at: Place | null): void {
   const rect = focusRect(s);
   if (!rect) return;
   if (options.follow) {
     try {
-      options.follow(rect);
+      options.follow(rect, at ? { node: at.node, offset: at.offset } : undefined);
     } catch (error) {
       console.warn("eitri keys: the page's visual follow failed", error);
     }
@@ -523,8 +929,7 @@ export function startVisual(next: VisualKind): boolean {
   }
   kind = next;
   mark(kind);
-  draw(s);
-  follow(s);
+  show(s);
   return true;
 }
 
@@ -618,6 +1023,34 @@ export function visualKey(stroke: KeyStroke, ev: KeyboardEvent, timeoutlen: () =
   return true;
 }
 
+/** The line and block motions: a move of theirs into left-out text goes on past it in the motion's direction. */
+const VERTICAL = new Map<string, Direction>([["j", "forward"], ["}", "forward"], ["k", "backward"], ["{", "backward"]]);
+
+/** Where a cursor move from `start` that landed in left-out text goes: out of it as the Normal-mode cursor does
+ *  (`settle`), except a line or block move onto a line with none of the page's text (a diagram, a display formula),
+ *  which goes on past the left-out element to the page's text beyond it, as past a table's last row. A line move
+ *  onto an inline formula stays on that formula's line unless settling there would not take the cursor on in the
+ *  move's direction (Blink's line move from the text before a formula that ends its line lands in that formula's
+ *  MathML copy). */
+function outOf(s: Alterable, start: Place, at: Place, action: string, root: Element): Place | null {
+  const direction = VERTICAL.get(action);
+  const el = direction ? leftOutElement(at.node, root) : null;
+  if (!direction || !el) return settle(s, at, root, ENDS_BACK.has(action));
+  const block = blockHolding(el);
+  const placed = block && texts(block, 1).length > 0 ? settle(s, at, root, false) : null;
+  const onward = placed && order(placed, start) * (direction === "forward" ? 1 : -1) > 0;
+  return onward ? placed : beyond(el, direction, root);
+}
+
+/** The block whose lines a left-out element is laid out on: itself where it is a block in the flow (an
+ *  `aria-hidden` block, a display formula's glyphs), else its parent's (an inline formula's glyphs, or KaTeX's MathML
+ *  copy, which is absolutely positioned on its formula's line). */
+function blockHolding(el: Element): Element | null {
+  const position = getComputedStyle(el).position;
+  if (layoutBlock(el) === el && position !== "absolute" && position !== "fixed") return el;
+  return el.parentElement && layoutBlock(el.parentElement);
+}
+
 /** Runs one of the mode's own keys. */
 function act(s: Alterable, action: string, ev: KeyboardEvent,
   scroll: (action: "scroll.down" | "scroll.up", ev: KeyboardEvent) => void): void {
@@ -636,11 +1069,13 @@ function act(s: Alterable, action: string, ev: KeyboardEvent,
     }
     case "o": [anchor, cursor] = [cursor, anchor]; break;
     default: {
-      const next = moveCursor(s, cursor, action);
+      const root = rootOf();
+      let next = moveCursor(s, cursor, action, root);
+      if (next && aside(next.node, root)) next = outOf(s, cursor, next, action, root);
+      else if (next && ENDS_BACK.has(action)) next = lineEndBefore(next, root);
       // The cursor stays on the page's text: a move that would leave it (or found nothing) moves nothing.
-      if (next && onPage(next.node)) cursor = next;
+      if (next && onPage(next.node, root)) cursor = next;
     }
   }
-  draw(s);
-  follow(s);
+  show(s);
 }

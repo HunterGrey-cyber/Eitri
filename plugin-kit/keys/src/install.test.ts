@@ -141,7 +141,7 @@ describe("installation", () => {
   });
 
   it("publishes the versioned API", () => {
-    expect(window.eitriKeys).toMatchObject({ version: 5, install, setCurrent });
+    expect(window.eitriKeys).toMatchObject({ version: 6, install, setCurrent, motion: expect.any(Function) });
     for (const name of ["message", "status", "keys", "findRefresh", "findSeed"] as const) {
       expect(typeof window.eitriKeys[name]).toBe("function");
     }

@@ -3,13 +3,17 @@ import { showMessage, showStatus } from "./hud";
 import { GENERIC_ROWS as genericRows } from "./rows";
 import { refreshFind, seedFind } from "./find";
 import { scrollToAnimated, settleGlide, windowDestination } from "./glide";
-import { endVisual as endVisualMode, visualKind } from "./visual";
+import { endVisual as endVisualMode, normalMotion, visualKind } from "./visual";
 
 // Keep the public types here so the emitted declaration travels with the single script.
 export type Row = { action: string; keys: string[]; context: string; desc: string };
 export type Mode = "normal" | "hint" | "insert" | "visual" | "visual_line";
 /** Visual mode's kind: charwise (`v`) or linewise (`V`). */
 export type VisualKind = "char" | "line";
+/** The cursor motions `motion` answers (kit 6). */
+export type CursorMotion = "h" | "l" | "w" | "b" | "e" | "0" | "$";
+/** A place in the text: just before a character, as a caret stands. */
+export type CursorPlace = { node: Node; offset: number };
 export type KeyStroke = { key: string; ctrl: boolean; shift: boolean };
 export type KeySeq = KeyStroke[];
 export type HintTarget = { el: Element; rank?: number };
@@ -27,9 +31,12 @@ export type VisualOptions = {
   /** Where `v` and `V` start: a range at the page's own cursor (its start is used). `null`, a throw or no function:
    *  a selection the reader made that is in view, else the first text in the view. */
   start?: () => Range | null;
-  /** Called with the box (window coordinates) of the selection's moving end after every move, so the page keeps it
-   *  inside its own margins (and its cursor on it); without it the kit keeps that end in view itself. */
-  follow?: (focus: DOMRect) => void;
+  /** Called with the box (window coordinates) of the selection's moving end after every move and when the mode
+   *  starts, so the page keeps it inside its own margins; without it the kit keeps that end in view itself. `cursor`
+   *  (kit 6) is where visual mode's cursor stands, in `motion`'s shape: the place just before the cursor's character,
+   *  or the end of its line as the engine gives it. Under `V` the moving end is the line's (a table row's) end, so a
+   *  page that draws its own cursor on the visual cursor reads `cursor`, not the selection's focus. */
+  follow?: (focus: DOMRect, cursor?: CursorPlace) => void;
   /** The page's own keys in visual mode, in key notation (`<CR>`, `Y`), each run with the mode's kind while the
    *  selection is still there; one returning true ends visual mode, as `y` does. A key here replaces the kit's own
    *  visual key of the same notation. */
@@ -51,7 +58,8 @@ export type InstallOptions = {
   targets?: () => HintTarget[];
   initial?: { timeoutlen: number; hasKeys: boolean; prefix?: string | null; settings?: unknown };
   labels?: KitLabels;
-  /** What `/` searches: the root's rendered text (default `document.body`), less the elements `exclude` matches. */
+  /** What `/` searches: the root's rendered text (default `document.body`), less the elements `exclude` matches.
+   *  Visual mode and `motion` keep to the same text: what `exclude` matches is passed as an image is. */
   find?: { root?: () => Element | null; exclude?: string };
   /** Where `G` takes the window (`null`, or no function: the end of the scroll range). */
   bottom?: () => number | null;
@@ -85,10 +93,13 @@ export const settle: () => void = settleGlide;
 export const endVisual: () => void = endVisualMode;
 /** Visual mode's kind while it runs, else null; a mode whose text the page replaced is ended first. */
 export const visualMode: () => VisualKind | null = visualKind;
+/** Where a cursor standing just before a character at `at` goes for `h l w b e 0 $`, by visual mode's own walker
+ *  (kit 6); the document's selection is left as it was. Null for a start or a result outside the page's text. */
+export const motion: (at: CursorPlace, motion: CursorMotion) => CursorPlace | null = normalMotion;
 
 export const eitriKeys = {
-  version: 5 as const, install, setCurrent, message, status, keys, findRefresh, findSeed, scrollTo, destination, settle,
-  endVisual, visualMode,
+  version: 6 as const, install, setCurrent, message, status, keys, findRefresh, findSeed, scrollTo, destination, settle,
+  endVisual, visualMode, motion,
 };
 
 declare global {

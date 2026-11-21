@@ -1,5 +1,5 @@
 [English](write-a-plugin.md) | 简体中文
-<!-- translated-from: write-a-plugin.md sha256=19c9cfd77c63e1cee939bb4c1db2af3b9daa4adce2737cc2b072132817a52f06 -->
+<!-- translated-from: write-a-plugin.md sha256=8d3536b8d43ab62ce02f366fe449a293683dc080ce5a5be7a9c21d6fbf03f29a -->
 
 # 写一个插件
 
@@ -260,11 +260,11 @@ const remove = await window.eitriKeys.install({
 
 - **`install(options)`** 把这些行声明给 Eitri（`keys.declare`，所以 `?` 和 Eitri 的按键表会列出它们），返回一个 promise，兑现为一个移除这次安装的函数。再次安装会替换先前的安装。按下你的某个键时会调用 `run(action, event)`，它处理了就返回 `true`。一行是 `{action, keys, context, desc}`：`action` 由小写字母、数字和 `_.-` 组成，最多 40 个字符；一到十个键，用 Vim 的写法（`j`、`gg`、`<C-d>`、`<CR>`、`<Esc>`）；`context` 最多 40 个字符，`desc` 最多 80 个。Eitri 保留的键（前缀键、`Ctrl+h/j/k/l`、`Ctrl+=`、`Ctrl+-`、`Ctrl+0`、`F11`、任何 `Ctrl+Shift` 或 Super 组合）会被拒绝，你的两个动作共用一个键也会被拒绝。
 - **共用的行在前面：** 滚动（`j`/`k`、`d`/`u`、`Ctrl+f`/`Ctrl+b`、`gg`/`G` 等）、历史（`H`/`L`）、`[[`/`]]`、查找（`/`、`n`、`N`）、提示（`f`）、按键表（`?`）、`Esc`，以及可视模式（`v`、`V`）。你的某一行和共用的行 `action` 相同，就替换那一行；你的行用到的键会从共用的行里拿走，所以你的 `j` 胜过滚动。
-- **其他选项：** `targets()`（除了链接和控件之外，`f` 还要标注什么）、`labels`（`?` 表和状态行里的文字，给用别的语言的页面）、`find`（`{root, exclude}`：`/` 查找的范围）、`bottom()`（`G` 去哪里）、`onJump(when)`（在工具包自己的跳转之前和之后告诉页面，给记录历史的页面用），以及 `visual`（`{start, follow, keys}`：`v` 和 `V` 从哪里开始、页面如何跟随选区、选区存在时页面自己的键）。
-- **`window.eitriKeys` 的其余部分：** `version`、`setCurrent(element)`（给页面当作当前的元素加上类名 `eitri-keys-current`）、`message(text)` 和 `status(text)`（工具包在页面底部的那一行）、`keys(action)`（一个动作现在的键，已算上 `init.lua` 的修改）、`findRefresh()` 和 `findSeed(query)`（告诉 `/` 页面改了文字，或设定 `n` 和 `N` 要找的内容）、`scrollTo(top)`、`destination()` 和 `settle()`（工具包自己的平滑滚动），以及 `endVisual()` 和 `visualMode()`。
+- **其他选项：** `targets()`（除了链接和控件之外，`f` 还要标注什么）、`labels`（`?` 表和状态行里的文字，给用别的语言的页面）、`find`（`{root, exclude}`：`/` 查找的范围，也是可视模式和 `motion` 走的文字范围）、`bottom()`（`G` 去哪里）、`onJump(when)`（在工具包自己的跳转之前和之后告诉页面，给记录历史的页面用），以及 `visual`（`{start, follow, keys}`：`v` 和 `V` 从哪里开始、页面如何跟随选区、选区存在时页面自己的键）。`follow(rect, cursor)` 在每次移动之后和进入模式时收到选区活动端的布局框；从版本 6 起还收到 `cursor`：可视模式光标所在的位置，形式和 `motion` 的返回值相同。在 `V` 下选区延伸到这一行（或表格一整行）的末尾，所以在可视模式光标上画自己光标的页面用 `cursor`，而不是选区的焦点。
+- **`window.eitriKeys` 的其余部分：** `version`、`setCurrent(element)`（给页面当作当前的元素加上类名 `eitri-keys-current`）、`message(text)` 和 `status(text)`（工具包在页面底部的那一行）、`keys(action)`（一个动作现在的键，已算上 `init.lua` 的修改）、`findRefresh()` 和 `findSeed(query)`（告诉 `/` 页面改了文字，或设定 `n` 和 `N` 要找的内容）、`scrollTo(top)`、`destination()` 和 `settle()`（工具包自己的平滑滚动），`endVisual()` 和 `visualMode()`，以及 `motion(at, key)`（版本 6：光标站在 `at`（`{node, offset}`）所指字符之前，按 `h`、`l`、`w`、`b`、`e`、`0` 或 `$` 会走到哪里，用的是可视模式同一套移动逻辑，所以自己画光标的页面能和可视模式移动得一样。返回的是光标此时所在字符之前的位置，一个文本节点和小于其长度的偏移：`e` 和 `$` 给出单词或这一行的最后一个字符，跨过行内元素的边缘时给出下一段文字的第一个字符。图片和复选框不算字符：`h` 退过它，其他键越过它往后走。`find.exclude` 指定的文字和带 `aria-hidden` 的文字（KaTeX 隐藏的 MathML 副本和它画出的字形）也不算：这些键像越过图片一样越过它，返回值也不会落在它里面。越过一行的最后一个字符、后面已没有字符时，返回的是这一行的末尾：文字的末尾，或元素里的一个位置。返回值也可能是一个不绘制任何东西的字符（折叠掉的换行或空格）之前的位置，这同样表示行尾，所以在字符上绘制之前，先检查它的布局框。页面的选区保持原样；一次调用会排队一个 `selectionchange` 事件；起点或结果在页面文字之外、或文本输入框有焦点时返回 `null`）。
 - **用户自己的键优先。** `init.lua` 里的 `eitri.keymap.set("plugin:<id>", "<key>", "<action>")` 可以改你页面的某个键；工具包会应用它，`keys(action)` 也会报出它。
 
-工具包的 `version` 是 5。到目前为止它只靠增加来扩展（4 加了 `scrollTo`、`destination`、`settle`、`bottom` 和 `onJump`；5 加了可视模式），所以用到这些的页面要先检查 `window.eitriKeys.version`。
+工具包的 `version` 是 6。到目前为止它只靠增加来扩展（4 加了 `scrollTo`、`destination`、`settle`、`bottom` 和 `onJump`；5 加了可视模式；6 加了 `motion` 和 `follow` 的 `cursor`），所以用到这些的页面要先检查 `window.eitriKeys.version`。
 
 <a id="colours-and-fonts-the---nv--tokens"></a>
 ## 颜色和字体：`--nv-*` 变量
@@ -277,7 +277,10 @@ Eitri 在 `host.hello` 时、以及每次配色方案变化时，把这些 CSS �
 | `--nv-surface`、`--nv-surface-fg`、`--nv-surface-muted` | 一层浮起的表面（Neovim 的浮动窗口）和在它上面可读的文字 | 面板、输入框、卡片 |
 | `--nv-chrome`、`--nv-chrome-fg`、`--nv-chrome-muted` | 状态栏的填充色和在它上面可读的文字 | 应该看起来像 Eitri 栏条的标题行或底栏 |
 | `--nv-chrome-accent` | 状态栏的强调色 | 边框、分隔线、填充或图标，永远不用于文字 |
-| `--nv-border`、`--nv-cursorline`、`--nv-search` | 分隔线、编辑器当前行的色带、搜索匹配 | 各部分之间的线、选中的行、高亮的匹配 |
+| `--nv-border`、`--nv-cursorline`、`--nv-search` | 分隔线、高亮色带（编辑器 Visual 的背景色，也就是选区的颜色；不是编辑器的当前行，当前行见 `--nv-editor-cursorline`）、搜索匹配 | 各部分之间的线、选中的行、高亮的匹配 |
+| `--nv-editor-cursorline` | 编辑器的 `CursorLine` 背景色，已做对比度保护，文字在它上面可读；配色方案没有设置时用 `--nv-cursorline` | 自己画光标的页面里，当前行下面的色带 |
+| `--nv-cursor-bg`、`--nv-cursor-fg` | 编辑器 Normal 模式光标的填充色和它上面的文字色，取自 Normal 模式 `guicursor` 条目所指的高亮组，没有时用反色的 `Normal` | 自己画的块状光标 |
+| `--nv-cursor-blinkwait-ms`、`--nv-cursor-blinkon-ms`、`--nv-cursor-blinkoff-ms` | Normal 模式 `guicursor` 的闪烁时间，各以 `<n>ms` 的形式给出；`0ms` 表示不闪 | 像编辑器那样闪烁的光标（三者中有一个是 `0ms` 就不闪） |
 | `--nv-focus-ring`、`--nv-focus-ring-inactive` | 有焦点的控件的轮廓，以及它为没有焦点的控件调淡的版本 | 轮廓和边框，永远不用于文字 |
 | `--nv-hint-bg`、`--nv-hint-fg` | `f` 的标签 | 你自己的标签 |
 | `--nv-warn`、`--nv-error`、`--nv-ok` | 信号色 | 只用于边框、圆点和图标：不保证作为文字可读 |

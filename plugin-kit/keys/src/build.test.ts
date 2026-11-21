@@ -15,7 +15,7 @@ it("emits a keys declaration that can be copied without sibling modules", () => 
   const files = new Map([
     [`${root}/standalone-keys.d.ts`, declaration],
     [`${root}/consumer.ts`, `
-      import type { Row, InstallOptions, KeyStroke, KitLabels, GenericAction, VisualKind } from "./standalone-keys";
+      import type { Row, InstallOptions, KeyStroke, KitLabels, GenericAction, VisualKind, CursorMotion, CursorPlace } from "./standalone-keys";
       const row: Row = {action: "test.action", keys: ["x"], context: "page", desc: "test"};
       const labels: KitLabels = {modes: {normal: "N"}, page: "page", generic: {"scroll.down": "down"},
         sheetTitle: "Keys", sheetFooter: "Esc closes", sheetClose: "Close"};
@@ -28,13 +28,22 @@ it("emits a keys declaration that can be copied without sibling modules", () => 
       window.eitriKeys.findSeed("query");
       const stroke: KeyStroke = {key: "x", ctrl: false, shift: false};
       const action: GenericAction = "hint.start";
-      const version: 5 = window.eitriKeys.version;
+      const version: 6 = window.eitriKeys.version;
       const v4: InstallOptions = { rows: [row], run: () => true, bottom: () => null, onJump: (when) => void when };
       const v5: InstallOptions = { rows: [row], run: () => true, visual: { start: () => null,
         follow: (rect) => void rect.top, keys: { "<CR>": (kind: VisualKind) => kind === "line" } } };
       window.eitriKeys.install(v5);
+      const v6: InstallOptions = { rows: [row], run: () => true, visual: {
+        follow: (rect: DOMRect, cursor?: CursorPlace) => void [rect.top, cursor?.node, cursor?.offset] } };
+      window.eitriKeys.install(v6);
       const visual: VisualKind | null = window.eitriKeys.visualMode();
       window.eitriKeys.endVisual();
+      const here: CursorPlace = { node: document.body, offset: 0 };
+      const how: CursorMotion = "w";
+      const there: CursorPlace | null = window.eitriKeys.motion(here, how);
+      void there;
+      // @ts-expect-error only the seven cursor motions are declared
+      window.eitriKeys.motion(here, "j");
       const generic: GenericAction = "visual.line";
       void [visual, generic];
       window.eitriKeys.install(opts);

@@ -332,20 +332,35 @@ const remove = await window.eitriKeys.install({
   (`H`/`L`), `[[`/`]]`, find (`/`, `n`, `N`), hints (`f`), the key sheet (`?`), `Esc`, and visual mode (`v`, `V`). A row of yours with the same `action` replaces that shared row, and a key one of your
   rows uses is taken away from the shared rows, so your `j` wins over scrolling.
 - **The other options:** `targets()` (what `f` labels, besides links and controls), `labels` (the words of the `?`
-  sheet and the status line, for a page in another language), `find` (`{root, exclude}`: what `/` searches),
+  sheet and the status line, for a page in another language), `find` (`{root, exclude}`: what `/` searches, and the text visual mode and `motion` keep to),
   `bottom()` (where `G` goes), `onJump(when)` (told before and after the kit's own jumps, for a page that keeps a
   history), and `visual` (`{start, follow, keys}`: where `v` and `V` start, how the page follows the selection, and
-  keys of its own while it lasts).
+  keys of its own while it lasts). `follow(rect, cursor)` gets the box of the selection's moving end after every
+  move and when the mode starts, and, from version 6, `cursor`: where visual mode's cursor stands, in the shape
+  `motion` answers. Under `V` the selection runs to the end of the line (or of a table row), so a page that draws
+  its own cursor on visual mode's cursor uses `cursor`, not the selection's focus.
 - **The rest of `window.eitriKeys`:** `version`, `setCurrent(element)` (marks the element the page treats as current
   with the class `eitri-keys-current`), `message(text)` and `status(text)` (the kit's line at the bottom of the page),
   `keys(action)` (the keys an action has now, after `init.lua`'s changes), `findRefresh()` and `findSeed(query)`
   (tell `/` the page changed its text, or set what `n` and `N` look for), `scrollTo(top)`, `destination()` and
-  `settle()` (the kit's own smooth scrolling), and `endVisual()` and `visualMode()`.
+  `settle()` (the kit's own smooth scrolling), `endVisual()` and `visualMode()`, and `motion(at, key)` (version 6: where
+  a cursor standing just before the character at `at`, `{node, offset}`, goes for `h`, `l`, `w`, `b`, `e`, `0` or `$`,
+  by the same walker visual mode uses, so a page that draws a cursor of its own moves it as visual mode does. The
+  answer is the place just before the character the cursor is then on, a text node and an offset below its length:
+  for `e` and `$` the last character of the word or the line, and across an inline element's edge the next text's
+  first character. An image or a checkbox is not a character: `h` goes back past it, the other keys go on past it.
+  Nor is text that `find.exclude` names or that is `aria-hidden` (KaTeX's hidden MathML copy and its glyphs): the keys
+  pass it as they pass an image, and the answer is never inside it.
+  Past a line's last character, where none follows, the answer is the line's end: the end of its text or a place in
+  an element. It can also be a place before a character that draws nothing (a collapsed newline or space), which
+  means the line's end too, so check the character's box before you draw on it. The page's selection is left as it
+  was; the call queues one `selectionchange` event; the answer is `null` for a place or a
+  result outside the page's text, and while a text field has the focus).
 - **The person's own keys win.** `eitri.keymap.set("plugin:<id>", "<key>", "<action>")` in `init.lua` changes a key of
   your page; the kit applies it, and `keys(action)` reports it.
 
-The kit's `version` is 5. It has grown by additions so far (4 added `scrollTo`, `destination`, `settle`, `bottom` and
-`onJump`; 5 added visual mode), so a page that uses one checks `window.eitriKeys.version` first.
+The kit's `version` is 6. It has grown by additions so far (4 added `scrollTo`, `destination`, `settle`, `bottom` and
+`onJump`; 5 added visual mode; 6 added `motion` and `follow`'s `cursor`), so a page that uses one checks `window.eitriKeys.version` first.
 
 ## Colours and fonts: the `--nv-*` tokens
 
@@ -359,7 +374,10 @@ the `--nv-` names on the root: a page's own values under those names are overwri
 | `--nv-surface`, `--nv-surface-fg`, `--nv-surface-muted` | a raised surface (Neovim's floating windows) and the text that reads on it | panels, inputs, cards |
 | `--nv-chrome`, `--nv-chrome-fg`, `--nv-chrome-muted` | the statusline's fill and the text that reads on it | a header or footer line that should look like Eitri's bars |
 | `--nv-chrome-accent` | the status bar's accent | a border, rule, fill or glyph, never text |
-| `--nv-border`, `--nv-cursorline`, `--nv-search` | dividers, the editor's current-line band, a search match | lines between parts, the selected row, a highlighted match |
+| `--nv-border`, `--nv-cursorline`, `--nv-search` | dividers, the highlight band (the editor's Visual background, so the colour of a selection; not the editor's current line, see `--nv-editor-cursorline`), a search match | lines between parts, the selected row, a highlighted match |
+| `--nv-editor-cursorline` | the editor's `CursorLine` background, guarded so that text reads on it; `--nv-cursorline` when the colourscheme sets none | the band under the current row of a page that draws its own cursor |
+| `--nv-cursor-bg`, `--nv-cursor-fg` | the editor's Normal-mode cursor fill and the text on it, from the highlight group the Normal-mode `guicursor` entry names, else `Normal` reversed | a block cursor of your own |
+| `--nv-cursor-blinkwait-ms`, `--nv-cursor-blinkon-ms`, `--nv-cursor-blinkoff-ms` | the Normal-mode `guicursor` blink times, each as `<n>ms`; `0ms` means steady | a cursor that blinks as the editor's does (steady when any of the three is `0ms`) |
 | `--nv-focus-ring`, `--nv-focus-ring-inactive` | the outline of a focused control, and a lighter mix of it for one that is not focused | outlines and borders, never text |
 | `--nv-hint-bg`, `--nv-hint-fg` | the labels of `f` | labels of your own |
 | `--nv-warn`, `--nv-error`, `--nv-ok` | signal colours | borders, dots and glyphs only: they are not guaranteed to read as text |
