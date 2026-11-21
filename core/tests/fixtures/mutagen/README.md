@@ -30,3 +30,13 @@ replies still take precedence. Optional fixture controls are `once` (consume a r
 that retains stdout/stderr until the marker exists, then acknowledges release at `<marker>.done`). They exercise
 recovery, concurrent commands and timeout
 drain detachment without a real daemon. `SSH_ASKPASS_REQUIRE` is included in the environment log.
+
+The fake also plays the daemon. A scripted `daemon start` that succeeds launches a detached helper (the fixture
+itself, run as `--serve`) that behaves like Mutagen's `daemon run`: it takes `<MUTAGEN_DATA_DIRECTORY>/daemon/daemon.lock`
+without waiting and ends if another daemon holds it (so a second `daemon start` is a no-op), binds `daemon/daemon.sock`,
+accepts and drops connections, and ends when the socket file is removed or after ten minutes. A successful `daemon stop`
+returns at once: the listener closes and the socket goes, the lock is held for `stop_lag` seconds more. Reply controls:
+`ready_after` (seconds between `daemon start` returning and the socket being bound, as on a loaded machine),
+`no_listener` (never bind) and `stop_lag`. With `FAKE_MUTAGEN_NEED_DAEMON=1` in the environment every command except
+`version` and `daemon ...` fails with Mutagen's "unable to connect to daemon: connection timed out" until the socket
+accepts a connection; without it the commands answer from the script alone.

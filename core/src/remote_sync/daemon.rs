@@ -6,21 +6,37 @@ use super::SyncError;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::ffi::OsString;
+use std::io::ErrorKind;
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::time::{Duration, Instant};
 
+/// The gap between probes of a daemon's socket after it starts: this to begin with, doubling up to [`READY_MAX_GAP`].
+const READY_FIRST_GAP: Duration = Duration::from_millis(2);
+const READY_MAX_GAP: Duration = Duration::from_millis(50);
+/// How long a daemon's socket may stay unreachable before the wait starts the daemon again.
+const READY_RESTART_GAP: Duration = Duration::from_millis(500);
+/// The longest the wait for a started daemon's socket goes on (within the command's own deadline).
+const READY_CAP: Duration = Duration::from_secs(10);
+
 #[derive(Clone, Debug)]
 pub struct Daemon {
     binary: PathBuf,
     data_dir: PathBuf,
+    /// Where Mutagen's daemon listens: `<data dir>/daemon/daemon.sock`, within the socket path cap.
+    socket: PathBuf,
     transport: Option<PathBuf>,
     transport_exe: Option<PathBuf>,
     path: Option<OsString>,
     #[cfg(test)]
     pub(super) test_env: Vec<(OsString, OsString)>,
+    #[cfg(test)]
+    pub(super) test_ready_cap: Option<Duration>,
+    /// Long by default, so a slow test machine never sees a second `daemon start` it did not ask for.
+    #[cfg(test)]
+    pub(super) test_restart_gap: Duration,
 }
 
 #[derive(Deserialize, Serialize, PartialEq, Eq)]
@@ -57,7 +73,7 @@ impl Daemon {
             })
             .transpose()?;
         let data_dir = state_home.join("eitri/mutagen");
-        agent::socket_path::in_dir(&data_dir.join("daemon"), "daemon.sock")
+        let socket = agent::socket_path::in_dir(&data_dir.join("daemon"), "daemon.sock")
             .map_err(|e| SyncError::Io(e.to_string()))?;
         let binary = match configured {
             Some(path) if path.is_absolute() => match path.try_exists() {
@@ -78,11 +94,16 @@ impl Daemon {
         Ok(Self {
             binary,
             data_dir,
+            socket,
             transport,
             transport_exe,
             path,
             #[cfg(test)]
             test_env: Vec::new(),
+            #[cfg(test)]
+            test_ready_cap: None,
+            #[cfg(test)]
+            test_restart_gap: Duration::from_secs(3),
         })
     }
 
@@ -186,7 +207,77 @@ impl Daemon {
             }
         }
         let identity = serde_json::to_vec(&identity).map_err(|e| FlushOutcome::Failed(e.to_string()))?;
-        agent::private_fs::write_private(&identity_file, &identity).map_err(|e| FlushOutcome::Failed(e.to_string()))
+        // What the start was given, recorded before the wait so that a start slow to listen still has it on file.
+        agent::private_fs::write_private(&identity_file, &identity).map_err(|e| FlushOutcome::Failed(e.to_string()))?;
+        self.wait_ready(&starter, deadline)
+    }
+
+    /// `daemon start` returns once the daemon is launched, before it binds its socket (a few milliseconds on an idle
+    /// machine, more on a loaded one), and a command run in that window fails with "unable to connect to daemon".
+    /// Waits until a connection to the socket succeeds, probing with a short growing gap, and ends at `deadline`
+    /// (`COMMAND_CAP` from now when there is none) as a timeout. A daemon that never listens (it dies at launch for a
+    /// reason that lasts) is given up on after [`READY_CAP`], with the reason when there is one, rather than holding the
+    /// caller's locks until the deadline. A launched daemon can also die at once because the previous one still holds
+    /// Mutagen's daemon lock while it shuts down; a second `daemon start` (a no-op while a daemon runs or holds the
+    /// lock) is issued each time the socket has stayed unreachable for [`READY_RESTART_GAP`].
+    pub(super) fn wait_ready(&self, starter: &Self, deadline: Option<Instant>) -> Result<(), FlushOutcome> {
+        let deadline = deadline.unwrap_or_else(|| Instant::now() + COMMAND_CAP);
+        let give_up = Instant::now() + self.ready_cap();
+        let limit = deadline.min(give_up);
+        let mut gap = READY_FIRST_GAP;
+        let mut started = Instant::now();
+        let mut start_failure = None;
+        loop {
+            match crate::instance_dir::connect_by(&self.socket, limit) {
+                // Dropping the stream closes it; nothing was sent.
+                Ok(_) => return Ok(()),
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        ErrorKind::NotFound | ErrorKind::ConnectionRefused | ErrorKind::TimedOut
+                    ) => {}
+                Err(e) => {
+                    return Err(FlushOutcome::Failed(format!(
+                        "Mutagen daemon socket {}: {e}",
+                        self.socket.display()
+                    )))
+                }
+            }
+            let now = Instant::now();
+            if now >= deadline {
+                return Err(FlushOutcome::TimedOut);
+            }
+            if now >= give_up {
+                let why = start_failure.map(|why| format!(" ({why})")).unwrap_or_default();
+                return Err(FlushOutcome::Failed(format!(
+                    "Mutagen daemon did not start listening on {}{why}",
+                    self.socket.display()
+                )));
+            }
+            if started.elapsed() >= self.restart_gap() {
+                let output = output_until(starter, &words(&["daemon", "start"]), Some(deadline))?;
+                // A start that cannot fork may succeed on the next try, and the daemon launched before may yet bind.
+                start_failure = (!output.status.success()).then(|| last_error(&output));
+                started = Instant::now();
+            }
+            std::thread::sleep(gap.min(limit.saturating_duration_since(Instant::now())));
+            gap = (gap * 2).min(READY_MAX_GAP);
+        }
+    }
+
+    fn ready_cap(&self) -> Duration {
+        #[cfg(test)]
+        if let Some(cap) = self.test_ready_cap {
+            return cap;
+        }
+        READY_CAP
+    }
+
+    fn restart_gap(&self) -> Duration {
+        #[cfg(test)]
+        return self.test_restart_gap;
+        #[cfg(not(test))]
+        READY_RESTART_GAP
     }
 
     fn stop_until(&self, deadline: Option<Instant>) -> Result<(), FlushOutcome> {

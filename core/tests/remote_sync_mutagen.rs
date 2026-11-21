@@ -13,8 +13,8 @@ struct Scratch {
     binary: PathBuf,
 }
 
-impl Drop for Scratch {
-    fn drop(&mut self) {
+impl Scratch {
+    fn stop_daemon(&self) {
         let result = Command::new(&self.binary)
             .args(["daemon", "stop"])
             .env("MUTAGEN_DATA_DIRECTORY", self.root.join("eitri/mutagen"))
@@ -36,6 +36,12 @@ impl Drop for Scratch {
             Err(error) => eprintln!("private Mutagen daemon cleanup failed: {error}"),
             _ => {}
         }
+    }
+}
+
+impl Drop for Scratch {
+    fn drop(&mut self) {
+        self.stop_daemon();
         let _ = fs::remove_dir_all(&self.root);
     }
 }
@@ -84,6 +90,26 @@ impl Real {
     fn flush(&self, name: &str) {
         assert_eq!(self.engine.flush(name, Duration::from_secs(30)), FlushOutcome::Flushed);
     }
+}
+
+#[test]
+#[ignore = "requires EITRI_TEST_MUTAGEN and permission to bind a private daemon socket"]
+fn real_first_connect_after_a_stop_does_not_race_the_daemon() {
+    // `EITRI_TEST_MUTAGEN_ROUNDS` (default 20) first connects in a row, each against a stopped daemon.
+    let rounds: usize = std::env::var("EITRI_TEST_MUTAGEN_ROUNDS")
+        .ok()
+        .and_then(|rounds| rounds.parse().ok())
+        .unwrap_or(20);
+    let real = Real::open();
+    let mut failures = Vec::new();
+    for round in 0..rounds {
+        real.scratch.stop_daemon();
+        if let Err(error) = real.engine.start() {
+            failures.push(format!("round {round}: {error}"));
+        }
+    }
+    eprintln!("first connects failed: {} of {rounds}", failures.len());
+    assert!(failures.is_empty(), "{failures:#?}");
 }
 
 #[test]

@@ -1,12 +1,120 @@
 #!/usr/bin/env python3
 """Replay Mutagen commands without a daemon, network, or global environment changes."""
+import fcntl
 import json
 import os
 from pathlib import Path
+import signal
+import socket
+import subprocess
 import sys
 import time
 
 argv = sys.argv[1:]
+
+
+def daemon_dir():
+    return Path(os.environ["MUTAGEN_DATA_DIRECTORY"]) / "daemon"
+
+
+def serve(delay):
+    """The fake daemon, as Mutagen's `daemon run` behaves: it takes `daemon/daemon.lock` without waiting and ends if
+    another daemon holds it, binds `daemon.sock` after `delay` seconds, accepts and drops connections, and on SIGTERM
+    closes its listener at once but keeps the lock for the seconds in `daemon/stop-lag` (a daemon shutting down). It
+    also ends when its socket file is removed (a test's scratch directory going away) or after ten minutes."""
+    directory = daemon_dir()
+    if not directory.parent.is_dir():
+        return
+    directory.mkdir(exist_ok=True)
+    lock = open(directory / "daemon.lock", "a")
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        return
+    (directory / "daemon.pid").write_text(str(os.getpid()))
+
+    class Stopping(Exception):
+        pass
+
+    def on_term(*_):
+        raise Stopping()
+
+    signal.signal(signal.SIGTERM, on_term)
+    path = directory / "daemon.sock"
+    listener = None
+    try:
+        time.sleep(delay)
+        try:
+            path.unlink()  # a stale file from a daemon that died; the lock is ours, so it is not a live one's
+        except OSError:
+            pass
+        listener = socket.socket(socket.AF_UNIX)
+        listener.bind(str(path))
+        listener.listen(16)
+        listener.settimeout(0.1)
+        end = time.monotonic() + 600
+        while path.exists() and time.monotonic() < end:
+            try:
+                listener.accept()[0].close()
+            except OSError:
+                pass
+    except Stopping:
+        pass
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+    if listener is not None:
+        listener.close()
+    try:
+        path.unlink()
+    except OSError:
+        pass
+    try:
+        time.sleep(float((directory / "stop-lag").read_text()))
+    except (OSError, ValueError):
+        pass
+
+
+def start_daemon(delay):
+    subprocess.Popen([sys.executable, __file__, "--serve", str(delay)], start_new_session=True,
+                     stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+def stop_daemon(lag):
+    """Returns at once, like `mutagen daemon stop`: the daemon ends its listener and later its lock."""
+    directory = daemon_dir()
+    try:
+        (directory / "stop-lag").write_text(str(lag))
+    except OSError:
+        pass
+    lock = open(directory / "daemon.lock", "a") if directory.is_dir() else None
+    try:
+        if lock is not None:
+            try:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except OSError:
+                # Held: a daemon is running, and its pid file (written just after it took the lock) names it.
+                os.kill(int((directory / "daemon.pid").read_text()), signal.SIGTERM)
+    except (OSError, ValueError):
+        pass
+    try:
+        (directory / "daemon.sock").unlink()
+    except OSError:
+        pass
+
+
+def daemon_listening():
+    probe = socket.socket(socket.AF_UNIX)
+    try:
+        probe.connect(str(daemon_dir() / "daemon.sock"))
+        return True
+    except OSError:
+        return False
+    finally:
+        probe.close()
+
+
+if argv[:1] == ["--serve"]:
+    serve(float(argv[1]))
+    sys.exit(0)
 env_keys = (
     "MUTAGEN_DATA_DIRECTORY", "MUTAGEN_DISABLE_AUTOSTART", "MUTAGEN_SSH_PATH",
     "EITRI_MUTAGEN_TRANSPORT_EXE",
@@ -17,6 +125,9 @@ if os.environ.get("FAKE_MUTAGEN_LOG"):
         log.write(json.dumps({"argv": argv, "env": {key: os.environ.get(key) for key in env_keys}, "pid": os.getpid(), "cwd": os.getcwd()}) + "\n")
 with open(os.environ["FAKE_MUTAGEN_SCRIPT"], encoding="utf-8") as script:
     replies = json.load(script)
+if os.environ.get("FAKE_MUTAGEN_NEED_DAEMON") and argv[:1] not in (["daemon"], ["version"]) and not daemon_listening():
+    sys.stderr.write("unable to connect to daemon: connection timed out (is the daemon running?)\n")
+    sys.exit(1)
 for reply in replies:
     prefix = reply["match"]
     if argv[:len(prefix)] != prefix:
@@ -42,6 +153,11 @@ for reply in replies:
     else:
         sys.stdout.write(reply.get("stdout", ""))
     sys.stderr.write(reply.get("stderr", ""))
+    if not reply.get("exit", 0):
+        if argv == ["daemon", "start"] and not reply.get("no_listener"):
+            start_daemon(reply.get("ready_after", 0))
+        elif argv == ["daemon", "stop"]:
+            stop_daemon(reply.get("stop_lag", 0))
     sys.exit(reply.get("exit", 0))
 if argv[:2] in (["sync", "list"], ["sync", "monitor"]):
     if "--label-selector" in argv:

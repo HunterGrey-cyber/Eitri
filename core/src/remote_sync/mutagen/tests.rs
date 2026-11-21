@@ -8,6 +8,11 @@ use std::path::{Path, PathBuf};
 
 struct Fake {
     root: PathBuf,
+    /// Commands other than `version` and `daemon ...` fail with Mutagen's connection error until the fake daemon
+    /// that `daemon start` launches is listening on its socket.
+    need_daemon: bool,
+    /// The wait for a started daemon: the gap before `daemon start` is issued again, and how long it goes on.
+    ready: (Option<Duration>, Option<Duration>),
 }
 
 impl Fake {
@@ -34,7 +39,21 @@ impl Fake {
             json!({"match":["sync","flush"], "stdout":""}),
         ]);
         fs::write(root.join("script.json"), serde_json::to_vec(&replies).unwrap()).unwrap();
-        Self { root }
+        Self {
+            root,
+            need_daemon: false,
+            ready: (None, None),
+        }
+    }
+
+    fn needing_daemon(mut self) -> Self {
+        self.need_daemon = true;
+        self
+    }
+
+    fn waiting_for_the_daemon(mut self, restart_gap: Duration, ready_cap: Option<Duration>) -> Self {
+        self.ready = (Some(restart_gap), ready_cap);
+        self
     }
 
     fn engine(&self) -> Result<MutagenEngine, SyncError> {
@@ -67,6 +86,13 @@ impl Fake {
             ("WAYLAND_DISPLAY".into(), "must-be-removed".into()),
             ("MUTAGEN_SSH_PATH".into(), "must-be-replaced".into()),
         ];
+        if let Some(gap) = self.ready.0 {
+            daemon.test_restart_gap = gap;
+        }
+        daemon.test_ready_cap = self.ready.1;
+        if self.need_daemon {
+            daemon.test_env.push(("FAKE_MUTAGEN_NEED_DAEMON".into(), "1".into()));
+        }
         MutagenEngine::from_daemon(daemon)
     }
 
@@ -100,6 +126,16 @@ fn tree() -> SessionSpec {
         "/srv/project-laptop".into(),
         "/srv/project".into(),
     )
+}
+
+fn count_starts(log: &[Value]) -> usize {
+    log.iter()
+        .filter(|entry| entry["argv"] == json!(["daemon", "start"]))
+        .count()
+}
+
+fn is_listing(entry: &Value) -> bool {
+    entry["argv"][0] == "sync" && entry["argv"][1] == "list"
 }
 
 fn arg_strings(args: Vec<OsString>) -> Vec<String> {
@@ -962,6 +998,132 @@ fn operations_start_a_missing_daemon_and_retry_only_once() {
             fake.log().iter().filter(|entry| entry["argv"][1] == "resume").count(),
             2
         );
+    }
+}
+
+#[test]
+fn the_first_connect_waits_for_a_daemon_that_is_slow_to_listen() {
+    // `daemon start` returns at once, and the daemon only binds its socket 400 ms later, as on a loaded machine.
+    let fake = Fake::new(vec![json!({"match":["daemon","start"],"ready_after":0.4})]).needing_daemon();
+    let engine = fake.engine().unwrap();
+    SyncEngine::start(&engine).unwrap();
+    let log = fake.log();
+    assert_eq!(count_starts(&log), 1);
+    assert_eq!(log.iter().filter(|entry| is_listing(entry)).count(), 2);
+    engine.stop_if_idle().unwrap();
+}
+
+#[test]
+fn a_create_waits_for_a_daemon_that_is_slow_to_listen() {
+    let fake = Fake::new(vec![json!({"match":["daemon","start"],"ready_after":0.4})]).needing_daemon();
+    let engine = fake.engine().unwrap();
+    engine.create(&tree()).unwrap();
+    engine.stop_if_idle().unwrap();
+}
+
+#[test]
+fn waiting_for_a_daemon_that_never_listens_ends_at_the_deadline() {
+    let fake = Fake::new(vec![json!({"match":["daemon","start"],"no_listener":true})]).needing_daemon();
+    let mut engine = fake.engine().unwrap();
+    let cap = Duration::from_millis(300);
+    engine.test_cap = Some(cap);
+    let started = Instant::now();
+    let error = SyncEngine::start(&engine).unwrap_err();
+    assert_eq!(error.to_string(), "Mutagen command timed out");
+    assert!(started.elapsed() >= cap);
+    // The command is not run against a daemon that is not there, and (the cap being under the 3 s a test waits
+    // before issuing `daemon start` again) the daemon is started once.
+    let log = fake.log();
+    assert_eq!(count_starts(&log), 1);
+    assert_eq!(log.iter().filter(|entry| is_listing(entry)).count(), 1);
+}
+
+#[test]
+fn a_daemon_that_never_listens_is_given_up_on_before_the_deadline_with_its_reason() {
+    // The first `daemon start` launches nothing, and every later one fails to fork.
+    let fake = Fake::new(vec![
+        json!({"match":["daemon","start"],"once":true,"no_listener":true}),
+        json!({"match":["daemon","start"],"exit":1,"stderr":"fork failed\n"}),
+    ])
+    .needing_daemon()
+    .waiting_for_the_daemon(Duration::from_millis(50), Some(Duration::from_millis(400)));
+    let engine = fake.engine().unwrap();
+    let error = SyncEngine::start(&engine).unwrap_err().to_string();
+    assert!(
+        error.contains("did not start listening") && error.contains("fork failed"),
+        "{error}"
+    );
+    let log = fake.log();
+    let starts = count_starts(&log);
+    // Started again while it waited (a failed start does not end the wait), but not without bound.
+    assert!((3..=20).contains(&starts), "{starts} starts");
+    assert_eq!(log.iter().filter(|entry| is_listing(entry)).count(), 1);
+}
+
+#[test]
+fn a_restart_that_meets_the_old_daemons_shutdown_is_started_again() {
+    // The old daemon closes its listener at once but holds Mutagen's daemon lock for 600 ms more, so the daemon the
+    // restart launches ends on the lock and nothing listens until `daemon start` is issued again.
+    let fake = Fake::new(vec![json!({"match":["daemon","stop"],"stop_lag":0.6})])
+        .needing_daemon()
+        .waiting_for_the_daemon(Duration::from_millis(100), None);
+    let transport = fake.root.join("transport");
+    fs::create_dir(&transport).unwrap();
+    fs::write(transport.join("ssh"), "first transport").unwrap();
+    fake.with_transport(Some(transport.clone()))
+        .unwrap()
+        .create(&tree())
+        .unwrap();
+    fs::write(transport.join("ssh"), "changed transport").unwrap();
+    let engine = fake.with_transport(Some(transport)).unwrap();
+    SyncEngine::start(&engine).unwrap();
+    let starts = count_starts(&fake.log());
+    assert!((3..=20).contains(&starts), "{starts} starts");
+    engine.stop_if_idle().unwrap();
+}
+
+#[test]
+fn the_readiness_wait_takes_a_stale_socket_file_for_a_daemon_not_listening_yet() {
+    let fake = Fake::new(vec![]);
+    let engine = fake.engine().unwrap();
+    let socket = agent::socket_path::in_dir(&engine.data_dir().join("daemon"), "daemon.sock").unwrap();
+    fs::create_dir_all(socket.parent().unwrap()).unwrap();
+    // A socket file nobody listens on refuses connections instead of being absent.
+    drop(std::os::unix::net::UnixListener::bind(&socket).unwrap());
+    assert!(socket.exists());
+    let done = std::sync::atomic::AtomicBool::new(false);
+    thread::scope(|scope| {
+        scope.spawn(|| {
+            thread::sleep(Duration::from_millis(100));
+            fs::remove_file(&socket).unwrap();
+            let _listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+            while !done.load(std::sync::atomic::Ordering::SeqCst) {
+                thread::sleep(Duration::from_millis(5));
+            }
+        });
+        let started = Instant::now();
+        let waited = engine
+            .daemon
+            .wait_ready(&engine.daemon, deadline_after(Duration::from_secs(60)));
+        done.store(true, std::sync::atomic::Ordering::SeqCst);
+        waited.unwrap();
+        assert!(started.elapsed() >= Duration::from_millis(100));
+    });
+}
+
+#[test]
+fn the_readiness_wait_fails_at_once_on_an_error_that_waiting_cannot_fix() {
+    let fake = Fake::new(vec![]);
+    let engine = fake.engine().unwrap();
+    // A file where the daemon's directory belongs: connecting answers ENOTDIR, not "not there yet".
+    fs::write(engine.data_dir().join("daemon"), "").unwrap();
+    let error = engine
+        .daemon
+        .wait_ready(&engine.daemon, deadline_after(Duration::from_secs(60)))
+        .unwrap_err();
+    match error {
+        FlushOutcome::Failed(why) => assert!(why.contains("daemon socket"), "{why}"),
+        other => panic!("{other:?}"),
     }
 }
 
