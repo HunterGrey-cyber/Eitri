@@ -1286,3 +1286,86 @@ fn interrupted_reboot_repair_keeps_a_durable_gap_and_retries_cleanup() {
         gap(journal.read_after(1, 1000), 2, 8, GapWhy::WriteFailed);
     }
 }
+
+#[test]
+fn a_held_journal_whose_segments_were_evicted_reports_the_gap_and_never_recreates_them() {
+    let root = Scratch::new();
+    let dir = root.path().join("journal/held");
+    let mut held = Journal::open(&dir, &config()).unwrap();
+    for sequence in 1..=6 {
+        held.append(sequence, &[7; 40]).unwrap();
+    }
+    held.turn_ended().unwrap();
+    // The segments go while this instance still holds their index, as when another holder evicts them.
+    let clock = ManualClock::default();
+    let usage = SessionUsage {
+        session: "held".into(),
+        bytes: bytes_under(&dir),
+        closed_at: Some(clock.now()),
+    };
+    let cfg = JournalConfig { cap_bytes: 1, ..config() };
+    assert!(matches!(
+        enforce_budget_with(root.path(), &[usage], &cfg, &plentiful, &Disk, &clock),
+        BudgetOutcome::Evicted(_)
+    ));
+    gap(held.read_after(0, usize::MAX), 1, 6, GapWhy::Evicted);
+    // A later event cannot be written into the evicted segment's name; the loss is a write-failed gap.
+    assert!(held.append(7, b"closed").is_err());
+    gap(held.read_after(6, usize::MAX), 7, 7, GapWhy::WriteFailed);
+    // Later events are refused too; the gap a reader gets covers them all, so its cursor moves past it.
+    assert!(held.append(8, b"eight").is_err());
+    assert!(held.append(9, b"nine").is_err());
+    gap(held.read_after(6, usize::MAX), 7, 9, GapWhy::WriteFailed);
+    gap(held.read_after(7, usize::MAX), 7, 9, GapWhy::WriteFailed);
+    assert!(held.read_after(9, usize::MAX).unwrap().is_empty());
+    let _ = held.turn_ended();
+    drop(held);
+    assert!(!dir.join("seg-00000000000000000001.log").exists());
+    let reopened = Journal::open(&dir, &config()).unwrap();
+    gap(reopened.read_after(0, usize::MAX), 1, 6, GapWhy::Evicted);
+    gap(reopened.read_after(6, usize::MAX), 7, 9, GapWhy::WriteFailed);
+}
+
+#[test]
+fn a_dirty_segment_evicted_under_its_writer_is_not_recreated_by_the_sync() {
+    let root = Scratch::new();
+    let dir = root.path().join("journal/held");
+    let clock = Arc::new(ManualClock::default());
+    let mut held = Journal::open_with(&dir, &config(), Arc::new(Disk), clock.clone()).unwrap();
+    for sequence in 1..=6 {
+        held.append(sequence, &[7; 40]).unwrap();
+    }
+    let usage = SessionUsage {
+        session: "held".into(),
+        bytes: bytes_under(&dir),
+        closed_at: Some(clock.now()),
+    };
+    let cfg = JournalConfig { cap_bytes: 1, ..config() };
+    assert!(matches!(
+        enforce_budget_with(root.path(), &[usage], &cfg, &plentiful, &Disk, &*clock),
+        BudgetOutcome::Evicted(_)
+    ));
+    // The pending sync finds the segment gone: it fails rather than leaving an empty file under the old name.
+    clock.advance(1_000);
+    assert!(held.sync_due().is_err());
+    assert!(!dir.join("seg-00000000000000000001.log").exists());
+    assert!(held.read_after(0, usize::MAX).is_err());
+    drop(held);
+    let reopened = Journal::open(&dir, &config()).unwrap();
+    gap(reopened.read_after(0, usize::MAX), 1, 6, GapWhy::Evicted);
+}
+
+#[test]
+fn a_record_that_went_with_its_segments_rename_reads_as_evicted() {
+    let root = Scratch::new();
+    let dir = root.path().join("journal/held");
+    let mut held = Journal::open(&dir, &config()).unwrap();
+    for sequence in 1..=7 {
+        held.append(sequence, &[7; 40]).unwrap();
+    }
+    held.turn_ended().unwrap();
+    // The marker names only 1..=6 (what eviction read), while the file it renamed also held 7.
+    std::fs::rename(dir.join("seg-00000000000000000001.log"), segment::evicted_path(&dir, 1, 6)).unwrap();
+    gap(held.read_after(0, usize::MAX), 1, 6, GapWhy::Evicted);
+    gap(held.read_after(6, usize::MAX), 1, 7, GapWhy::Evicted);
+}

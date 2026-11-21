@@ -612,8 +612,19 @@ impl Journal {
             });
         }
         let segment = self.segments.last_mut().unwrap();
-        if let Err(error) = self.fs.append(&segment.path, &frame) {
-            if self.fs.truncate(&segment.path, segment.bytes).is_err() {
+        // Only a segment with no frames yet may create its file; see `FileSystem::append_existing`.
+        let written = if segment.bytes == 0 {
+            self.fs.append(&segment.path, &frame)
+        } else {
+            self.fs.append_existing(&segment.path, &frame)
+        };
+        if let Err(error) = written {
+            // A new segment whose file was never created has nothing to roll back.
+            let rolled_back = match self.fs.truncate(&segment.path, segment.bytes) {
+                Err(missing) if missing.kind() == io::ErrorKind::NotFound && segment.bytes == 0 => Ok(()),
+                other => other,
+            };
+            if rolled_back.is_err() {
                 sync.failed.push(bounds(record));
                 fail_sync(&mut sync, copy_error(&error));
                 drop(sync);
@@ -667,9 +678,11 @@ impl Journal {
                 if !records.is_empty() {
                     break;
                 }
+                // A poisoned writer folds later refused events into the same unwritten entry, which can reach past
+                // the failed range; the gap ends at the later of the two so a reader's cursor always moves past it.
                 return Err(ReadError::Gap {
-                    first,
-                    last,
+                    first: first.min(entry.first),
+                    last: last.max(entry.last),
                     why: GapWhy::WriteFailed,
                 });
             }
@@ -688,12 +701,23 @@ impl Journal {
                 break;
             }
             if reader.as_ref().is_none_or(|(path, _)| *path != location.path) {
-                reader = Some((
-                    &location.path,
-                    self.fs
-                        .open_segment(&location.path)
-                        .map_err(|error| corruption(&location.path, location.offset, &error.to_string()))?,
-                ));
+                match self.fs.open_segment(&location.path) {
+                    Ok(segment) => reader = Some((&location.path, segment)),
+                    Err(error) => {
+                        let evicted = self.evicted_over(&location.path, entry.first, entry.last, &error);
+                        if evicted.is_some() && !records.is_empty() {
+                            break;
+                        }
+                        return Err(match evicted {
+                            Some((first, last)) => ReadError::Gap {
+                                first,
+                                last,
+                                why: GapWhy::Evicted,
+                            },
+                            None => corruption(&location.path, location.offset, &error.to_string()).into(),
+                        });
+                    }
+                }
             }
             let data = reader
                 .as_ref()
@@ -717,6 +741,34 @@ impl Journal {
             }
         }
         Ok(records)
+    }
+    /// The evicted range holding `first..=last` when opening its indexed segment `path` failed because the file is
+    /// gone: this instance's index predates an eviction it did not see, and the range is reported as the evicted
+    /// gap it now is, so a replay ends with that gap instead of failing on the same missing file every time. A
+    /// marker starting where the missing segment started replaced that very file, whatever its name says about the
+    /// end: a record this instance appended after eviction read the segment went with the rename.
+    fn evicted_over(&self, path: &Path, first: u64, last: u64, error: &io::Error) -> Option<(u64, u64)> {
+        if error.kind() != io::ErrorKind::NotFound {
+            return None;
+        }
+        let segment_first = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .and_then(|name| name.strip_prefix("seg-")?.strip_suffix(".log")?.parse::<u64>().ok());
+        segment_paths(&*self.fs, &self.dir)
+            .ok()?
+            .iter()
+            .find_map(|(_, marker)| {
+                let (evicted_first, evicted_last) = evicted_range(marker).ok().flatten()?;
+                if evicted_first > first {
+                    return None;
+                }
+                if last <= evicted_last {
+                    Some((evicted_first, evicted_last))
+                } else {
+                    (segment_first == Some(evicted_first)).then_some((evicted_first, last))
+                }
+            })
     }
     pub fn turn_ended(&mut self) -> io::Result<()> {
         let written = self.persist_unwritten();

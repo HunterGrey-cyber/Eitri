@@ -24,7 +24,7 @@ pub mod transcripts;
 pub mod trust;
 
 use std::io;
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::pin::Pin;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
@@ -647,7 +647,12 @@ pub async fn run_with_terminals(
     let servers = Arc::new(lsp::Servers::new(paths.clone(), managed.clone()));
     let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
     let listener = UnixListener::bind(paths.bind_socket()?)?;
-    let _cleanup = Cleanup(paths.clone());
+    let mut cleanup = Cleanup {
+        paths: paths.clone(),
+        socket: file_id(&paths.bind_socket()?).ok(),
+        info: None,
+    };
+    let owned_run = OwnedRun::taken(&paths, &live)?;
     std::fs::set_permissions(
         paths.bind_socket()?,
         std::fs::Permissions::from_mode(agent::private_fs::PRIVATE_FILE_MODE),
@@ -671,6 +676,7 @@ pub async fn run_with_terminals(
         std::ffi::OsStr::new("info"),
         &serde_json::to_vec(&published).map_err(io::Error::other)?,
     )?;
+    cleanup.info = file_id(&paths.metadata_run().join("info")).ok();
     let _ = crate::audit::record(
         &paths.state,
         "daemon-start",
@@ -761,9 +767,14 @@ pub async fn run_with_terminals(
             .add_service(serve::lsp_server(servers.clone()))
             .serve_with_incoming(incoming);
         tokio::pin!(server);
+        // Also ends (true) as soon as the run directory is no longer the one this daemon locked, so a daemon whose
+        // state was replaced stops within a tenth of a second rather than at its next maintenance pass.
         let idle_exit = async {
             loop {
                 tokio::time::sleep(idle.min(Duration::from_millis(100))).await;
+                if !owned_run.holds(&paths) {
+                    break true;
+                }
                 owned.lock().await.reap_exited(&paths.state);
                 managed.observe_exits();
                 hosts.observe();
@@ -776,26 +787,41 @@ pub async fn run_with_terminals(
                     && !servers.any_live();
                 let state = connections.lock().expect("connection state");
                 if empty && state.active == 0 && state.last_closed.elapsed() >= idle {
-                    break;
+                    break false;
                 }
             }
         };
         let maintenance = async {
             let mut tick = tokio::time::interval(Duration::from_secs(10));
             tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            // Every pass, and again before the journal budget, adoption and the keepers, the daemon checks that its run
+            // directory is still the one it locked; once it is not, its paths lead to another daemon's state and
+            // the loop ends, which ends the daemon.
             loop {
                 tick.tick().await;
+                if !owned_run.holds(&paths) {
+                    break;
+                }
                 let manager = managed.clone();
                 let _ = tokio::task::spawn_blocking(move || manager.trim_logs()).await;
                 let language_servers = servers.clone();
                 let _ = tokio::task::spawn_blocking(move || language_servers.trim_logs()).await;
                 managed.refresh_handshakes().await;
                 hosts.maintain().await;
+                if !owned_run.holds(&paths) {
+                    break;
+                }
                 if let Err(error) = serving.maintain().await {
                     serving.audit_budget_error(&error.to_string()).await;
                 }
+                if !owned_run.holds(&paths) {
+                    break;
+                }
                 if let Err(error) = serving.adopt().await {
                     let _ = crate::audit::record(&paths.state, "watch-adoption", &error.to_string());
+                }
+                if !owned_run.holds(&paths) {
+                    break;
                 }
                 // A root another daemon kept, or one that could not be kept, is tried again.
                 let keepers = modes.clone();
@@ -803,12 +829,28 @@ pub async fn run_with_terminals(
             }
         };
         tokio::pin!(maintenance);
-        let (result, terminate) = tokio::select! {
-            result = &mut server => (result.map_err(io::Error::other), false),
-            _ = term.recv() => (Ok(()), true),
-            _ = idle_exit => (Ok(()), false),
-            _ = &mut maintenance => unreachable!(),
+        let (result, terminate, lost) = tokio::select! {
+            result = &mut server => (result.map_err(io::Error::other), false, false),
+            _ = term.recv() => (Ok(()), true, false),
+            lost = idle_exit => (Ok(()), false, lost),
+            () = &mut maintenance => (Ok(()), false, true),
         };
+        // A run directory removed under a daemon still in its own state took the sidecars' and terminal hosts'
+        // records and sockets with it: no later daemon can reach or stop them, so they stop now as on SIGTERM. When
+        // the state directory was replaced instead (a mount, a rename), their records come back with it and they
+        // are left running, as maintenance trouble never stops agents.
+        let lost_in_own_state = lost && owned_run.owns_state(&paths);
+        let terminate = terminate || lost_in_own_state;
+        if lost_in_own_state {
+            let _ = crate::audit::record(
+                &paths.state,
+                "daemon-run-dir-lost",
+                &format!(
+                    "pid={}: run/{} is no longer the directory this daemon locked",
+                    info.pid, paths.key
+                ),
+            );
+        }
         // Terminal hosts, sidecars, Exec runs and language servers stop together, so the stop takes the longest of
         // their bounds, not their sum, while the server still carries the hosts' final frames.
         let stops = if terminate {
@@ -834,19 +876,24 @@ pub async fn run_with_terminals(
             stop_runs_and_keepers(&runs, &modes, &paths.state).await;
             (Ok(()), Ok(()), Ok(()), Vec::new())
         };
-        (result, stops)
+        (result, stops, lost)
         // Dropping the server stops acceptance without waiting for open RPC streams.
     };
     environment.abort();
-    let (result, (hosts_stopped, managed_stopped, stopped, pids)) = result;
+    let (result, (hosts_stopped, managed_stopped, stopped, pids), lost) = result;
     for pid in pids {
         crate::audit::record(&paths.state, "sidecar-stop", &format!("pid={pid}"))?;
     }
-    let audited = crate::audit::record(
-        &paths.state,
-        "daemon-stop",
-        &format!("version={} pid={}", paths.version, info.pid),
-    );
+    // A daemon whose state directory was replaced writes no stop line of its own into the one now at its path.
+    let audited = if lost && !owned_run.owns_state(&paths) {
+        Ok(())
+    } else {
+        crate::audit::record(
+            &paths.state,
+            "daemon-stop",
+            &format!("version={} pid={}", paths.version, info.pid),
+        )
+    };
     result.and(hosts_stopped).and(managed_stopped).and(stopped).and(audited)
 }
 
@@ -877,14 +924,89 @@ pub(crate) fn mark_activity<T>(request: &Request<T>) {
     }
 }
 
-struct Cleanup(Paths);
+/// A file's device and inode: which file a path named when the daemon looked.
+type FileId = (u64, u64);
+
+fn file_id(path: &std::path::Path) -> io::Result<FileId> {
+    let meta = std::fs::symlink_metadata(path)?;
+    Ok((meta.dev(), meta.ino()))
+}
+
+/// The run directory and state directory this daemon took at start. Its paths are names: once the run directory is
+/// removed, or the state directory is replaced (a mount over it, a rename), the same names lead to another daemon's
+/// files, and a daemon acting there would treat that daemon's sessions as its own.
+struct OwnedRun {
+    /// The `live.lock` this daemon locked; `None` when the file system reports another identity for the path than
+    /// for the open file, where the check cannot be trusted and is left off.
+    live: Option<FileId>,
+    /// The state directory, followed through a link to it, as it is by every path under it.
+    state: Option<FileId>,
+}
+
+impl OwnedRun {
+    fn taken(paths: &Paths, live: &agent::private_fs::PrivateLock) -> io::Result<Self> {
+        let meta = live.as_file().metadata()?;
+        let locked = (meta.dev(), meta.ino());
+        let named = file_id(&paths.metadata_run().join("live.lock")).ok();
+        if named != Some(locked) {
+            let _ = crate::audit::record(
+                &paths.state,
+                "daemon-run-dir-check-off",
+                &format!(
+                    "pid={}: the lock file's path and open file disagree",
+                    std::process::id()
+                ),
+            );
+        }
+        Ok(Self {
+            live: (named == Some(locked)).then_some(locked),
+            state: std::fs::metadata(&paths.state)
+                .ok()
+                .map(|meta| (meta.dev(), meta.ino())),
+        })
+    }
+
+    /// Whether `run/<key>/live.lock` is still the file this daemon locked. A missing file or directory on the way
+    /// means it is not; any other failure to look (a permission change) shows no other daemon, so it still holds.
+    fn holds(&self, paths: &Paths) -> bool {
+        let Some(live) = self.live else {
+            return true;
+        };
+        match file_id(&paths.metadata_run().join("live.lock")) {
+            Ok(id) => id == live,
+            Err(error) => !matches!(error.kind(), io::ErrorKind::NotFound | io::ErrorKind::NotADirectory),
+        }
+    }
+
+    /// Whether the state directory at its path is still the one this daemon started in, so its audit is its own.
+    fn owns_state(&self, paths: &Paths) -> bool {
+        self.state.is_some()
+            && std::fs::metadata(&paths.state)
+                .ok()
+                .map(|meta| (meta.dev(), meta.ino()))
+                == self.state
+    }
+}
+
+/// Removes the daemon's socket and `info` at exit, each only while its path still names the file this daemon made:
+/// after its run directory was replaced, those names belong to another daemon.
+struct Cleanup {
+    paths: Paths,
+    socket: Option<FileId>,
+    info: Option<FileId>,
+}
 
 impl Drop for Cleanup {
     fn drop(&mut self) {
-        if let Ok(socket) = self.0.bind_socket() {
-            let _ = std::fs::remove_file(socket);
+        let remove_if_made = |path: std::path::PathBuf, made: Option<FileId>| {
+            if made.is_some() && file_id(&path).ok() == made {
+                let _ = std::fs::remove_file(path);
+            }
+        };
+        if let Ok(socket) = self.paths.bind_socket() {
+            remove_if_made(socket, self.socket);
         }
-        let _ = std::fs::remove_file(self.0.metadata_run().join("info"));
+        remove_if_made(self.paths.metadata_run().join("info"), self.info);
     }
 }
 

@@ -754,3 +754,56 @@ fn ensure_waits_for_a_starting_or_stopping_lifetime_lock() {
     assert!(child.0.wait().unwrap().success());
     assert!(runtime().block_on(ensure::hello(&paths)).is_ok());
 }
+
+/// Waits for `process` to exit, failing if it is still running when `limit` has passed (a hang guard spanning the
+/// daemon's ten-second maintenance interval, not a speed bound).
+fn exit_within(process: &mut Process, limit: Duration) -> std::process::ExitStatus {
+    let deadline = Instant::now() + limit;
+    loop {
+        if let Some(status) = process.0.try_wait().unwrap() {
+            return status;
+        }
+        assert!(Instant::now() < deadline, "the daemon kept running");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+#[test]
+fn a_daemon_whose_state_directory_was_replaced_stops_and_leaves_the_new_daemon_alone() {
+    let sandbox = Sandbox::new();
+    let paths = sandbox.paths();
+    let mut first = sandbox.start(600);
+    let first_pid = first.0.id();
+    // The state directory goes from under the running daemon and an empty one takes its place, as a mount over it
+    // does; a second daemon of the same installation then starts there.
+    std::fs::rename(&paths.state, sandbox.root.join("s-hidden")).unwrap();
+    let second = sandbox.start(600);
+    let status = exit_within(&mut first, Duration::from_secs(40));
+    assert!(status.success(), "{status:?}");
+    // The new daemon's socket and identity are untouched, and it still answers.
+    assert!(paths.socket().unwrap().exists());
+    assert_eq!(paths.published().unwrap().info.pid, second.0.id());
+    assert!(runtime().block_on(ensure::hello(&paths)).is_ok());
+    // Nothing of the first daemon's lands in the state that is not its own.
+    let audit = std::fs::read_to_string(paths.state.join("audit.log")).unwrap();
+    assert!(!audit.contains(&format!("pid={first_pid}\n")), "{audit}");
+    assert!(!audit.contains("run-dir-lost"), "{audit}");
+}
+
+#[test]
+fn a_daemon_whose_run_directory_was_removed_audits_it_and_stops() {
+    let sandbox = Sandbox::new();
+    let paths = sandbox.paths();
+    let mut daemon = sandbox.start(600);
+    let pid = daemon.0.id();
+    std::fs::remove_dir_all(paths.metadata_run()).unwrap();
+    let status = exit_within(&mut daemon, Duration::from_secs(40));
+    assert!(status.success(), "{status:?}");
+    // The state is still its own, so the loss is audited there before the daemon's stop.
+    let audit = std::fs::read_to_string(paths.state.join("audit.log")).unwrap();
+    let lost = audit.find("run-dir-lost").expect(&audit);
+    let stopped = audit
+        .find(&format!("daemon-stop version={VERSION} pid={pid}"))
+        .expect(&audit);
+    assert!(lost < stopped, "{audit}");
+}

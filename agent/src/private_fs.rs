@@ -519,6 +519,17 @@ pub fn append_private(path: &Path) -> std::io::Result<std::fs::File> {
     Ok(file)
 }
 
+/// Opens an existing private regular file for append without following a link; a missing file stays missing
+/// (`NotFound`), so a writer holding a stale name cannot bring back a file someone else renamed or removed.
+pub fn append_existing_private(path: &Path) -> std::io::Result<std::fs::File> {
+    let file = std::fs::OpenOptions::new()
+        .append(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
+        .open(path)?;
+    require_private(&file, path)?;
+    Ok(file)
+}
+
 fn require_private(file: &std::fs::File, path: &Path) -> std::io::Result<()> {
     let meta = file.metadata()?;
     if !meta.is_file() || meta.uid() != euid() || meta.mode() & 0o077 != 0 {

@@ -88,14 +88,24 @@ pub trait FileSystem: Send + Sync {
     fn state_root(&self, path: &Path) -> io::Result<PathBuf> {
         std::fs::canonicalize(path)
     }
+    /// Writes the first frame of a new segment, creating its file.
     fn append(&self, path: &Path, bytes: &[u8]) -> io::Result<()> {
         agent::private_fs::append_private(path)?.write_all(bytes)
     }
+    /// Writes to a segment that already holds frames. Eviction renames segments, so a file that is gone is not
+    /// created again under its old name: that would put later records where the directory says the evicted
+    /// range starts, and no reader could open the journal again. This default goes through `append`, so an
+    /// injected file system's faults apply; `Disk` opens without creating.
+    fn append_existing(&self, path: &Path, bytes: &[u8]) -> io::Result<()> {
+        path.symlink_metadata()?;
+        self.append(path, bytes)
+    }
+    // Truncation and sync act only on files that exist, for the same reason as `append_existing`.
     fn truncate(&self, path: &Path, len: u64) -> io::Result<()> {
-        agent::private_fs::append_private(path)?.set_len(len)
+        agent::private_fs::append_existing_private(path)?.set_len(len)
     }
     fn sync(&self, path: &Path) -> io::Result<()> {
-        agent::private_fs::append_private(path)?.sync_all()
+        agent::private_fs::append_existing_private(path)?.sync_all()
     }
     fn sync_dir(&self, path: &Path) -> io::Result<()> {
         std::fs::File::open(path)?.sync_all()
@@ -170,7 +180,11 @@ pub struct FileEntry {
 }
 
 pub struct Disk;
-impl FileSystem for Disk {}
+impl FileSystem for Disk {
+    fn append_existing(&self, path: &Path, bytes: &[u8]) -> io::Result<()> {
+        agent::private_fs::append_existing_private(path)?.write_all(bytes)
+    }
+}
 
 pub trait Clock: Send + Sync {
     fn elapsed(&self) -> Duration;
