@@ -375,8 +375,32 @@ fn an_auto_allow_waits_for_the_fresh_check() {
         }),
         1
     );
-    assert_eq!(bench.settle("p1"), Some(PermissionDecision::Allow));
+    // The answer goes out on the pump that brings the check's answer, with no further call to the helper.
+    bench.pump();
+    assert_eq!(bench.answer("p1"), Some(PermissionDecision::Allow));
     assert_eq!(bench.provider.fresh_checks(), ["p1"]);
+    bench.shut_down();
+}
+
+/// A card whose fact the helper has already pushed when the gate first looks costs no call to the helper: it is shown
+/// after that first pump, never held for its fact, and no fresh check starts.
+#[test]
+fn a_card_with_its_fact_in_hand_is_drawn_on_the_first_look_with_no_fresh_check() {
+    let mut bench = Bench::remote("gate-facts-trips", SessionModeChoice::Auto);
+    let elsewhere = workspace("gate-facts-trips-elsewhere");
+    let outside = json!({"file_path": elsewhere.join("main.rs")});
+    let fact = fact_at(&bench.dir, "Read", &outside);
+    assert!(fact.classification.needs_a_human(), "{fact:?}");
+    bench.provider.set_fact("out", have(fact));
+    // Folded on the ingestion thread, so the one pump below is the gate's first look at the request.
+    bench.provider.queue(request("out", "Read", outside));
+    until("the request folded", || bench.pending("out"));
+    bench.pump();
+    // A request the gate holds for its fact is hidden (a fact wait), so a card shown after this one pump was not held.
+    assert!(bench.card("out"), "shown after the first pump, not held");
+    assert!(bench.provider.fresh_checks().is_empty());
+    assert_eq!(bench.answers("out"), 0);
+    assert_eq!(bench.set.next_gate_fact_release(), None);
     bench.shut_down();
 }
 
