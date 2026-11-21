@@ -668,7 +668,8 @@ pub const BUNDLED_SIDECAR_REVISION: &str = "0de7cbf";
 pub(crate) struct VerdandiCheckout {
     pub(crate) path: PathBuf,
     /// `git rev-parse --short HEAD`, or `None` when the checkout is not a git repo or `git` is
-    /// unavailable. Best-effort diagnostics only -- never a reason to refuse to start.
+    /// unavailable. Best-effort diagnostics only -- never a reason to refuse to start. Left `None`
+    /// by `choose_sidecar_program`, which starts no process; `resolve_sidecar_program` fills it.
     pub(crate) revision: Option<String>,
     /// True when `EITRI_VERDANDI_CHECKOUT` chose this path rather than the default.
     pub(crate) from_override: bool,
@@ -752,7 +753,7 @@ const DEFAULT_CHECKOUT_UNDER_HOME: &str = "src/verdandi";
 /// profiles remain separately deferred.
 ///
 /// Takes the override -- and `$HOME` -- as arguments rather than reading
-/// either here. `resolve_sidecar_program` already has to know whether an override was supplied, in
+/// either here. `choose_sidecar_program` already has to know whether an override was supplied, in
 /// order to rank it against a packaged artifact, so reading it in both places made the value and the
 /// decision two separate sources of truth -- a test could pass one path and this function would use
 /// another. Found by exactly that test. `home` joined the same reasoning when step 5 (the default
@@ -791,11 +792,10 @@ fn locate_verdandi_checkout(explicit: Option<&str>, home: Option<&OsStr>) -> std
         ));
     }
 
-    let revision = git_short_revision(&path);
     let prebuilt = prebuilt_artifact_in(&path);
     Ok(VerdandiCheckout {
         path,
-        revision,
+        revision: None,
         from_override,
         prebuilt,
     })
@@ -1026,7 +1026,7 @@ fn upload_choice(
                     }
                     _ => {}
                 }
-                match resolve_sidecar_program(explicit_binary, explicit_checkout, exe_dir, data_home, home)
+                match choose_sidecar_program(explicit_binary, explicit_checkout, exe_dir, data_home, home)
                     .map_err(|error| error.to_string())?
                 {
                     SidecarProgram::Named(_) => return Err(
@@ -1147,7 +1147,12 @@ pub fn sidecar_origin(info: &ProviderInfo) -> String {
 ///
 /// A selected update ranks between 2 and 3, and is not decided here: [`update_choice`] answers ahead
 /// of this function, so that a tab whose update failed can come back here for what is left.
-fn resolve_sidecar_program(
+///
+/// This is the one place the precedence of the sources it decides lives (steps 1 and 3-5; the
+/// update is [`update_choice`]'s), and it starts no process: `spawn` reaches it through
+/// [`resolve_sidecar_program`], `upload_choice` and the startup line through
+/// [`sidecar_availability_in`], so they cannot rank the sources differently.
+fn choose_sidecar_program(
     explicit_binary: Option<&str>,
     explicit_checkout: Option<&str>,
     exe_dir: Option<&Path>,
@@ -1192,6 +1197,22 @@ fn resolve_sidecar_program(
     ))
 }
 
+/// [`choose_sidecar_program`]'s answer with a checkout's git revision added, which is what a spawn
+/// reports and the startup line has no use for.
+fn resolve_sidecar_program(
+    explicit_binary: Option<&str>,
+    explicit_checkout: Option<&str>,
+    exe_dir: Option<&Path>,
+    xdg_data_home: Option<&OsStr>,
+    home: Option<&OsStr>,
+) -> std::io::Result<SidecarProgram> {
+    let mut program = choose_sidecar_program(explicit_binary, explicit_checkout, exe_dir, xdg_data_home, home)?;
+    if let SidecarProgram::Checkout(checkout) = &mut program {
+        checkout.revision = git_short_revision(&checkout.path);
+    }
+    Ok(program)
+}
+
 /// What a session start will find, as far as backend selection's one startup line cares
 /// (`eitri_core::agent_backend::BackendKind::choose`).
 ///
@@ -1200,7 +1221,7 @@ fn resolve_sidecar_program(
 /// default backend when `EITRI_AGENT_BACKEND` was unset: `true` selected the sidecar, `false` fell
 /// back to legacy. Legacy is compiled out of every release now and is never a fallback, so every
 /// build selects the sidecar whatever this answers, and the answer only picks the sentence `choose`
-/// prints. It became three-way, ranked exactly like `resolve_sidecar_program`, because the `bool`
+/// prints. It became three-way, ranked by `choose_sidecar_program`, because the `bool`
 /// made that sentence read "not installed. Run eitri setup" to a developer whose named
 /// `EITRI_VERDANDI_CHECKOUT` the spawn was about to build. The paragraphs below are why
 /// [`SidecarAvailability::Runnable`] means "with nothing to build"; the backend they name as the
@@ -1226,23 +1247,12 @@ fn resolve_sidecar_program(
 /// (before backend selection printed a line), and would now print the "not installed" line above a
 /// session that then starts fine from step 4.
 pub fn sidecar_availability() -> SidecarAvailability {
-    // Read once and pass in, not once per call site: `checkout_path_for` and
-    // `sidecar_availability_in` both need `HOME`, and reading it twice (a `var_os` here and a `var`
-    // inside `checkout_path_for`) would make them two independent sources of truth that could
-    // disagree on a non-UTF-8 `HOME` -- `var` fails closed on one, `var_os` never does.
-    let home = std::env::var_os("HOME");
-    let explicit_checkout = std::env::var("EITRI_VERDANDI_CHECKOUT").ok();
-    let checkout_is_explicit = explicit_checkout
-        .as_deref()
-        .map(str::trim)
-        .is_some_and(|c| !c.is_empty());
     sidecar_availability_in(
         std::env::var("EITRI_SIDECAR_BINARY").ok().as_deref(),
+        std::env::var("EITRI_VERDANDI_CHECKOUT").ok().as_deref(),
         running_exe_dir().as_deref(),
-        checkout_path_for(explicit_checkout.as_deref(), home.as_deref()).as_deref(),
-        checkout_is_explicit,
         std::env::var_os("XDG_DATA_HOME").as_deref(),
-        home.as_deref(),
+        std::env::var_os("HOME").as_deref(),
         &failed_updates(),
     )
 }
@@ -1264,7 +1274,8 @@ pub enum SidecarAvailability {
     /// builds (step 5).
     BuildsNamedCheckout,
     /// Nothing to run: a session start fails with [`NO_SIDECAR_HINT`] (or, for a named binary that
-    /// is not a file, `sidecar_missing_message`).
+    /// is not a file, `sidecar_missing_message`; for a named checkout that has no
+    /// `apps/claude-sidecar/package.json`, `locate_verdandi_checkout`'s refusal).
     Missing,
 }
 
@@ -1272,68 +1283,33 @@ pub enum SidecarAvailability {
 /// the process environment -- the same reason `BackendKind::choose` takes the answer as an
 /// argument rather than calling this.
 ///
-/// **Ranked exactly like `resolve_sidecar_program`**: the first step that applies
-/// decides, so the startup line and the spawn cannot describe different sidecars. This used to be an
-/// OR over the same inputs, which answered "available" for an explicit checkout with nothing built
-/// beside an installed artifact while the spawn built that checkout; that was harmless while the
-/// answer only chose the default backend, and wrong once it chose the words. `checkout` is
-/// `checkout_path_for`'s answer and `checkout_is_explicit` says whether it came from
-/// `EITRI_VERDANDI_CHECKOUT` (step 2) or the default location (step 5).
+/// **Not ranked by hand**: this asks `choose_sidecar_program`, the resolver `spawn` uses, and puts
+/// the selected update ahead of it as `spawn`'s caller does, so the startup line and the spawn
+/// cannot describe different sidecars. A named checkout that is not a checkout (no
+/// `apps/claude-sidecar/package.json`) is refused by the resolver and so is `Missing` here, not
+/// `BuildsNamedCheckout`: a build there would fail before it began.
 fn sidecar_availability_in(
     named_binary: Option<&str>,
+    explicit_checkout: Option<&str>,
     exe_dir: Option<&Path>,
-    checkout: Option<&Path>,
-    checkout_is_explicit: bool,
     xdg_data_home: Option<&OsStr>,
     home: Option<&OsStr>,
     failed: &HashSet<String>,
 ) -> SidecarAvailability {
-    let prebuilt = |path: &Path| prebuilt_artifact_in(path).is_some();
-    // Step 1: a named binary wins, and `resolve_sidecar_program` refuses one that is not a file.
-    if let Some(binary) = named_binary.map(str::trim).filter(|b| !b.is_empty()) {
-        return if Path::new(binary).is_file() {
-            SidecarAvailability::Runnable
-        } else {
-            SidecarAvailability::Missing
-        };
-    }
-    // Step 2: a named checkout wins over everything below it, built or not.
-    if checkout_is_explicit {
-        return match checkout {
-            Some(path) if prebuilt(path) => SidecarAvailability::Runnable,
-            _ => SidecarAvailability::BuildsNamedCheckout,
-        };
-    }
     if matches!(
-        update_choice(None, None, exe_dir, xdg_data_home, home, failed),
+        update_choice(named_binary, explicit_checkout, exe_dir, xdg_data_home, home, failed),
         UpdateChoice::Use { .. }
     ) {
         return SidecarAvailability::Runnable;
     }
-    // Steps 3-5: the sibling, the per-user build, a default checkout holding a prebuilt artifact.
-    let sibling = exe_dir.is_some_and(|dir| dir.join(PACKAGED_SIDECAR_BINARY).is_file());
-    let user_build =
-        user_sidecar_path(xdg_data_home, home, BUNDLED_SIDECAR_REVISION).is_some_and(|path| path.is_file());
-    if sibling || user_build || checkout.is_some_and(prebuilt) {
-        SidecarAvailability::Runnable
-    } else {
-        SidecarAvailability::Missing
+    match choose_sidecar_program(named_binary, explicit_checkout, exe_dir, xdg_data_home, home) {
+        // Only a named checkout comes back unbuilt (the doc of `choose_sidecar_program`, step 5).
+        Ok(SidecarProgram::Checkout(VerdandiCheckout { prebuilt: None, .. })) => {
+            SidecarAvailability::BuildsNamedCheckout
+        }
+        Ok(_) => SidecarAvailability::Runnable,
+        Err(_) => SidecarAvailability::Missing,
     }
-}
-
-/// The checkout path that would be used, override first, `$HOME` default second. Unvalidated on
-/// purpose: this feeds a "does an artifact exist" probe, and a path that is not a checkout simply
-/// holds no artifact. Refusing belongs in `locate_verdandi_checkout`, where it can say so.
-///
-/// Takes `home` rather than reading `$HOME` itself, for the same reason `locate_verdandi_checkout`
-/// does: its one caller (`sidecar_availability`) already reads it once for
-/// `sidecar_availability_in`, and reading it a second time here would let the two disagree on a
-/// non-UTF-8 `HOME` (`std::env::var` fails on one; `var_os` never does).
-fn checkout_path_for(explicit: Option<&str>, home: Option<&OsStr>) -> Option<PathBuf> {
-    if let Some(path) = explicit.map(str::trim).filter(|p| !p.is_empty()) {
-        return Some(PathBuf::from(path));
-    }
-    home.map(|home| PathBuf::from(home).join(DEFAULT_CHECKOUT_UNDER_HOME))
 }
 
 /// `$XDG_DATA_HOME/eitri/sidecar/<rev>/verdandi-claude-sidecar`: where a
@@ -1581,7 +1557,7 @@ impl UpdateTrouble {
 /// this constant alone.
 pub const NO_SIDECAR_HINT: &str = "The agent sidecar is not installed. Run \"eitri setup\" -- it builds one for you.";
 
-/// The full message for `resolve_sidecar_program`'s last resort (step 5 finding no prebuilt
+/// The full message for `choose_sidecar_program`'s last resort (step 5 finding no prebuilt
 /// checkout, after steps 1-4 already found nothing): `NO_SIDECAR_HINT` plus the pinned revision and
 /// the exact path `eitri setup` would write to -- the same path `user_sidecar_path` (step 4) just
 /// looked at and did not find. Falls back to naming what is missing, rather than silently omitting
@@ -2769,12 +2745,12 @@ mod tests {
     #[test]
     fn a_checkout_holding_a_built_artifact_counts_as_available() {
         let suffix = node_platform_suffix().expect("this test target has a known Node platform name");
-        let root = fake_checkout(&[&format!("{PACKAGED_SIDECAR_BINARY}-0.1.0-{suffix}")]);
+        let home = fake_home_with_default_checkout(&[&format!("{PACKAGED_SIDECAR_BINARY}-0.1.0-{suffix}")]);
         assert_eq!(
-            sidecar_availability_in(None, None, Some(&root), false, None, None, &HashSet::new()),
+            sidecar_availability_in(None, None, None, None, Some(home.as_os_str()), &HashSet::new()),
             SidecarAvailability::Runnable
         );
-        std::fs::remove_dir_all(&root).unwrap();
+        std::fs::remove_dir_all(&home).unwrap();
     }
 
     /// And the half of the original guarantee that was actually about something: a checkout with
@@ -2782,12 +2758,12 @@ mod tests {
     /// into `npm ci` and a TypeScript build, with no UI saying why, behind a backend nobody chose.
     #[test]
     fn a_checkout_with_nothing_built_is_not_availability() {
-        let root = fake_checkout(&[]);
+        let home = fake_home_with_default_checkout(&[]);
         assert_eq!(
-            sidecar_availability_in(None, None, Some(&root), false, None, None, &HashSet::new()),
+            sidecar_availability_in(None, None, None, None, Some(home.as_os_str()), &HashSet::new()),
             SidecarAvailability::Missing
         );
-        std::fs::remove_dir_all(&root).unwrap();
+        std::fs::remove_dir_all(&home).unwrap();
     }
 
     /// An artifact built for a different machine is not an artifact. `dist-bin/` holds whatever was
@@ -2796,16 +2772,16 @@ mod tests {
     /// message naming neither the platform nor this decision.
     #[test]
     fn an_artifact_built_for_another_platform_is_neither_picked_nor_counted() {
-        let root = fake_checkout(&[&format!(
+        let home = fake_home_with_default_checkout(&[&format!(
             "{PACKAGED_SIDECAR_BINARY}-0.1.0-{}",
             foreign_platform_suffix()
         )]);
-        assert_eq!(prebuilt_artifact_in(&root), None);
+        assert_eq!(prebuilt_artifact_in(&home.join(DEFAULT_CHECKOUT_UNDER_HOME)), None);
         assert_eq!(
-            sidecar_availability_in(None, None, Some(&root), false, None, None, &HashSet::new()),
+            sidecar_availability_in(None, None, None, None, Some(home.as_os_str()), &HashSet::new()),
             SidecarAvailability::Missing
         );
-        std::fs::remove_dir_all(&root).unwrap();
+        std::fs::remove_dir_all(&home).unwrap();
     }
 
     /// Several versions in one `dist-bin/` resolve to the newest, the same rule `publish.sh` stages
@@ -3297,7 +3273,7 @@ mod tests {
 
     /// The default checkout counts only when it already holds a prebuilt
     /// artifact. One present but unbuilt must not be picked up as a build opportunity -- resolution
-    /// ends in the shared `NO_SIDECAR_HINT` rather than reaching for `npm`. `resolve_sidecar_program`
+    /// ends in the shared `NO_SIDECAR_HINT` rather than reaching for `npm`. `choose_sidecar_program`
     /// itself calls neither `ensure_sidecar_built` nor `Command::new("npm")` in any of its branches
     /// (see its own doc comment), so this is a structural guarantee this test pins, not a timing one
     /// that could flake.
@@ -3375,15 +3351,7 @@ mod tests {
 
         // Availability and resolution must agree, or the startup line and the spawn disagree.
         assert_eq!(
-            sidecar_availability_in(
-                None,
-                None,
-                checkout_path_for(None, Some(home.as_os_str())).as_deref(),
-                false,
-                None,
-                Some(home.as_os_str()),
-                &HashSet::new(),
-            ),
+            sidecar_availability_in(None, None, None, None, Some(home.as_os_str()), &HashSet::new()),
             SidecarAvailability::Runnable
         );
 
@@ -3503,15 +3471,7 @@ mod tests {
         std::fs::write(&artifact, b"#!/bin/sh\nexit 0\n").unwrap();
 
         assert_eq!(
-            sidecar_availability_in(
-                None,
-                None,
-                None,
-                false,
-                Some(xdg_data_home.as_os_str()),
-                None,
-                &HashSet::new()
-            ),
+            sidecar_availability_in(None, None, None, Some(xdg_data_home.as_os_str()), None, &HashSet::new()),
             SidecarAvailability::Runnable
         );
         let _ = std::fs::remove_dir_all(&xdg_data_home);
@@ -3530,15 +3490,7 @@ mod tests {
         std::fs::write(&other_rev_artifact, b"#!/bin/sh\nexit 0\n").unwrap();
 
         assert_eq!(
-            sidecar_availability_in(
-                None,
-                None,
-                None,
-                false,
-                Some(xdg_data_home.as_os_str()),
-                None,
-                &HashSet::new()
-            ),
+            sidecar_availability_in(None, None, None, Some(xdg_data_home.as_os_str()), None, &HashSet::new()),
             SidecarAvailability::Missing
         );
         let _ = std::fs::remove_dir_all(&xdg_data_home);
@@ -3553,7 +3505,7 @@ mod tests {
     fn a_named_checkout_with_nothing_prebuilt_builds_even_beside_an_installed_artifact() {
         let root = fake_checkout(&[]);
         assert_eq!(
-            sidecar_availability_in(None, None, Some(&root), true, None, None, &HashSet::new()),
+            sidecar_availability_in(None, root.to_str(), None, None, None, &HashSet::new()),
             SidecarAvailability::BuildsNamedCheckout
         );
 
@@ -3561,20 +3513,20 @@ mod tests {
         std::fs::create_dir_all(&exe_dir).unwrap();
         std::fs::write(exe_dir.join(PACKAGED_SIDECAR_BINARY), b"#!/bin/sh\nexit 0\n").unwrap();
         assert_eq!(
-            sidecar_availability_in(None, Some(&exe_dir), Some(&root), true, None, None, &HashSet::new()),
+            sidecar_availability_in(None, root.to_str(), Some(&exe_dir), None, None, &HashSet::new()),
             SidecarAvailability::BuildsNamedCheckout,
             "step 2 outranks step 3, as in resolve_sidecar_program"
         );
         // The same sibling with no named checkout is runnable (step 3).
         assert_eq!(
-            sidecar_availability_in(None, Some(&exe_dir), Some(&root), false, None, None, &HashSet::new()),
+            sidecar_availability_in(None, None, Some(&exe_dir), None, None, &HashSet::new()),
             SidecarAvailability::Runnable
         );
 
         let suffix = node_platform_suffix().expect("this test target has a known Node platform name");
         let built = fake_checkout(&[&format!("{PACKAGED_SIDECAR_BINARY}-0.1.0-{suffix}")]);
         assert_eq!(
-            sidecar_availability_in(None, None, Some(&built), true, None, None, &HashSet::new()),
+            sidecar_availability_in(None, built.to_str(), None, None, None, &HashSet::new()),
             SidecarAvailability::Runnable,
             "a named checkout holding a prebuilt artifact runs it without building"
         );
@@ -3582,6 +3534,87 @@ mod tests {
         std::fs::remove_dir_all(&root).unwrap();
         std::fs::remove_dir_all(&built).unwrap();
         let _ = std::fs::remove_dir_all(&exe_dir);
+    }
+
+    /// A named checkout without `apps/claude-sidecar/package.json` is refused by
+    /// `resolve_sidecar_program`, so the startup line must not say it builds or runs.
+    #[test]
+    fn a_checkout_without_package_json_gets_the_same_answer_from_the_hint_and_from_spawn() {
+        let bare = std::env::temp_dir().join(format!("nv-avail-bare-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&bare).unwrap();
+        let named = bare.to_str().unwrap();
+        assert!(
+            resolve_sidecar_program(None, Some(named), None, None, None).is_err(),
+            "spawn refuses a named checkout that has no package.json"
+        );
+        assert_eq!(
+            sidecar_availability_in(None, bare.to_str(), None, None, None, &HashSet::new()),
+            SidecarAvailability::Missing,
+            "the hint must not read it as a checkout the first start builds"
+        );
+        let _ = std::fs::remove_dir_all(&bare);
+    }
+
+    /// `resolve_sidecar_program` adds the git revision that `choose_sidecar_program`, which the
+    /// startup line asks, leaves out because it starts no process.
+    #[test]
+    fn only_the_spawn_resolver_reads_the_checkouts_git_revision() {
+        let root = fake_checkout(&[]);
+        let git = |args: &[&str]| {
+            let status = Command::new("git")
+                .args([
+                    "-c",
+                    "user.name=t",
+                    "-c",
+                    "user.email=t@t",
+                    "-c",
+                    "commit.gpgsign=false",
+                ])
+                .args(args)
+                .current_dir(&root)
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .env_remove("GIT_DIR")
+                .env_remove("GIT_WORK_TREE")
+                .env_remove("GIT_INDEX_FILE")
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .unwrap();
+            assert!(status.success(), "git {args:?}");
+        };
+        git(&["init", "-q"]);
+        git(&["commit", "-q", "--allow-empty", "-m", "x"]);
+        let named = root.to_str();
+        let chosen = choose_sidecar_program(None, named, None, None, None).expect("the checkout resolves");
+        let SidecarProgram::Checkout(chosen) = chosen else {
+            panic!("a checkout was named")
+        };
+        assert_eq!(chosen.revision, None);
+        let resolved = resolve_sidecar_program(None, named, None, None, None).expect("the checkout resolves");
+        let SidecarProgram::Checkout(resolved) = resolved else {
+            panic!("a checkout was named")
+        };
+        assert!(resolved.revision.is_some_and(|revision| !revision.is_empty()));
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// The default checkout too: one holding an artifact but no `package.json` is not a checkout to
+    /// `locate_verdandi_checkout`, so step 5 skips it and the hint must not count its artifact.
+    #[test]
+    fn a_default_checkout_without_package_json_but_with_an_artifact_gets_the_same_answer() {
+        let suffix = node_platform_suffix().expect("this test target has a known Node platform name");
+        let home = fake_home_with_default_checkout(&[&format!("{PACKAGED_SIDECAR_BINARY}-0.1.0-{suffix}")]);
+        let checkout = home.join(DEFAULT_CHECKOUT_UNDER_HOME);
+        std::fs::remove_file(checkout.join("apps/claude-sidecar/package.json")).unwrap();
+        assert!(prebuilt_artifact_in(&checkout).is_some());
+        assert!(resolve_sidecar_program(None, None, None, None, Some(home.as_os_str())).is_err());
+        assert_eq!(
+            sidecar_availability_in(None, None, None, None, Some(home.as_os_str()), &HashSet::new()),
+            SidecarAvailability::Missing
+        );
+        let _ = std::fs::remove_dir_all(&home);
     }
 
     /// A named `EITRI_SIDECAR_BINARY` decides alone (step 1), and one that is not a file is
@@ -3596,19 +3629,11 @@ mod tests {
         let missing = exe_dir.join("not-there");
 
         assert_eq!(
-            sidecar_availability_in(sibling.to_str(), None, None, false, None, None, &HashSet::new()),
+            sidecar_availability_in(sibling.to_str(), None, None, None, None, &HashSet::new()),
             SidecarAvailability::Runnable
         );
         assert_eq!(
-            sidecar_availability_in(
-                missing.to_str(),
-                Some(&exe_dir),
-                None,
-                false,
-                None,
-                None,
-                &HashSet::new()
-            ),
+            sidecar_availability_in(missing.to_str(), None, Some(&exe_dir), None, None, &HashSet::new()),
             SidecarAvailability::Missing,
             "step 1 names a binary that is not a file; the sibling below it is never reached"
         );
@@ -4121,9 +4146,8 @@ mod tests {
         let availability = |failed: &HashSet<String>| {
             sidecar_availability_in(
                 None,
-                Some(&fixture.exe_dir),
                 None,
-                false,
+                Some(&fixture.exe_dir),
                 Some(fixture.data.as_os_str()),
                 None,
                 failed,
@@ -4141,9 +4165,8 @@ mod tests {
         assert_eq!(
             sidecar_availability_in(
                 None,
-                Some(&fixture.exe_dir),
                 None,
-                false,
+                Some(&fixture.exe_dir),
                 Some(fixture.data.as_os_str()),
                 None,
                 &HashSet::new(),
@@ -4161,15 +4184,36 @@ mod tests {
         assert_eq!(
             sidecar_availability_in(
                 Some("/no/such/sidecar"),
-                Some(&fixture.exe_dir),
                 None,
-                false,
+                Some(&fixture.exe_dir),
                 Some(fixture.data.as_os_str()),
                 None,
                 &HashSet::new(),
             ),
             SidecarAvailability::Missing
         );
+    }
+
+    /// A named checkout outranks a selected update, built or not: the spawn runs or builds the
+    /// checkout, so the startup line must not call the update runnable.
+    #[test]
+    fn a_named_checkout_outranks_an_update_in_availability() {
+        let fixture = UpdateFixture::new();
+        fixture.build("0.5.2");
+        fixture.select("version=0.5.2\n");
+        let unbuilt = fake_checkout(&[]);
+        assert_eq!(
+            sidecar_availability_in(
+                None,
+                unbuilt.to_str(),
+                Some(&fixture.exe_dir),
+                Some(fixture.data.as_os_str()),
+                None,
+                &HashSet::new(),
+            ),
+            SidecarAvailability::BuildsNamedCheckout
+        );
+        std::fs::remove_dir_all(&unbuilt).unwrap();
     }
 
     /// A `.deb` upgrade leaves the new bundled sidecar unbuilt and `selected` older than it: the

@@ -432,7 +432,8 @@ impl BackendKind {
             // Said every time, not once: this is the line that explains why the panel's greeting
             // names no session, and a reader who does not see it will look for the reason in the
             // code. `NO_SIDECAR_HINT` names the way out (`eitri setup`) because starting the
-            // sidecar path anyway is about to fail with that identical sentence.
+            // sidecar path anyway usually fails with that sentence; a named binary that is not a file
+            // or a named checkout that is not one fails with its own message instead.
             agent::SidecarAvailability::Missing => {
                 eprintln!("[agent_backend] using the sidecar backend: {}", agent::NO_SIDECAR_HINT);
             }
