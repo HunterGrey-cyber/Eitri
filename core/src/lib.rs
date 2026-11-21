@@ -19,6 +19,7 @@ pub mod agents;
 pub mod attachments;
 pub mod attention;
 pub mod buffer_reload;
+pub(crate) mod child_wait;
 pub mod companion;
 pub mod compositor;
 pub mod config_dir;

@@ -673,7 +673,24 @@ fn read_pid_record(pid_file: &Path) -> Option<PidRecord> {
 /// caller's stale-socket check judges what is there (a link is never this user's socket). A link put at the name
 /// between that look and the bind would still be followed. The 0700 control directory and its immediate parent
 /// are checked, but a replaceable ancestor above them still permits pathname substitution.
+///
+/// Every answer that means "the name is taken" comes back as `AddrInUse`: macOS's `bind` answers `EEXIST` instead
+/// when another claimant makes the same name between the kernel's own lookup of it and its create, which two
+/// claimants binding a freed name at once can do.
 pub(crate) fn bind_unfollowed(sock: &Path) -> io::Result<UnixListener> {
+    bind_unmapped(sock).map_err(|e| match e.kind() {
+        io::ErrorKind::AlreadyExists => io::Error::new(io::ErrorKind::AddrInUse, e),
+        _ => e,
+    })
+}
+
+/// [`bind_unfollowed`] before its errors are mapped. A test's error for this thread's next bind
+/// ([`next_bind_error`]) stands in for both the macOS look at the name and the kernel's answer.
+fn bind_unmapped(sock: &Path) -> io::Result<UnixListener> {
+    #[cfg(test)]
+    if let Some(e) = next_bind_error::take() {
+        return Err(e);
+    }
     #[cfg(target_os = "macos")]
     if sock.symlink_metadata().is_ok() {
         return Err(io::Error::new(
@@ -682,6 +699,25 @@ pub(crate) fn bind_unfollowed(sock: &Path) -> io::Result<UnixListener> {
         ));
     }
     UnixListener::bind(sock)
+}
+
+/// An error a test makes this thread's next [`bind_unfollowed`] meet in place of the look at the name and the
+/// kernel's answer.
+#[cfg(test)]
+mod next_bind_error {
+    use std::cell::RefCell;
+
+    thread_local! {
+        static NEXT: RefCell<Option<std::io::Error>> = const { RefCell::new(None) };
+    }
+
+    pub(super) fn set(error: std::io::Error) {
+        NEXT.with(|cell| *cell.borrow_mut() = Some(error));
+    }
+
+    pub(super) fn take() -> Option<std::io::Error> {
+        NEXT.with(|cell| cell.borrow_mut().take())
+    }
 }
 
 /// Makes a newly bound control socket private through its held directory. The pathname and the entry in
@@ -2048,6 +2084,22 @@ mod tests {
         let claimed = claim_for(&dir, &ControlKey::Project(&root()), None);
         assert!(matches!(claimed, Ok(Claim::Unresponsive { pid: 0 })), "{claimed:?}");
         assert!(sock.symlink_metadata().unwrap().file_type().is_socket());
+    }
+
+    /// macOS answers a bind that lost a race for a freed name `EEXIST`; the claimant must judge
+    /// the socket that won, as it does for `EADDRINUSE`, and forward to the panel there.
+    #[test]
+    fn a_bind_answered_file_exists_forwards_to_the_panel_that_won_the_name() {
+        let scratch = ScratchDir::new("eitri-pc", "eexist");
+        let dir = scratch.join("c");
+        ensure_dir(&dir).unwrap();
+        let Ok(Claim::Ours(server)) = claim_for(&dir, &ControlKey::Project(&root()), None) else {
+            panic!("the first claim must win");
+        };
+        next_bind_error::set(io::Error::from_raw_os_error(libc::EEXIST));
+        let claimed = claim_for(&dir, &ControlKey::Project(&root()), None);
+        server.cleanup();
+        assert!(matches!(claimed, Ok(Claim::Forwarded(Reply::Ok))), "{claimed:?}");
     }
 
     #[test]

@@ -23,12 +23,13 @@
 //! where a project's common git directory is ([`user_read_only`]). Neither writes anything. Path
 //! completion lists a project's names through [`user_read_only`] too, for the same reason.
 
+use crate::child_wait::wait_until;
 use std::ffi::{OsStr, OsString};
 use std::io::{Read, Write};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, ExitStatus, Output, Stdio};
+use std::process::{Command, ExitStatus, Output, Stdio};
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
@@ -382,24 +383,6 @@ fn join_quietly(writer: Option<std::thread::JoinHandle<std::io::Result<()>>>, ou
     }
     let _ = collect(out);
     let _ = collect(err);
-}
-
-/// Polls the child until it exits or `deadline` passes (`Ok(None)`). Polling rather than a waiting
-/// thread keeps this thread the only one that can reap the child, so the pid a timeout kills is
-/// still the child's.
-fn wait_until(child: &mut Child, deadline: Instant, now: &dyn Fn() -> Instant) -> std::io::Result<Option<ExitStatus>> {
-    let mut pause = Duration::from_micros(200);
-    loop {
-        if let Some(status) = child.try_wait()? {
-            return Ok(Some(status));
-        }
-        let now = now();
-        if now >= deadline {
-            return Ok(None);
-        }
-        std::thread::sleep(pause.min(deadline - now));
-        pause = (pause * 2).min(Duration::from_millis(10));
-    }
 }
 
 fn kill_group(pid: u32) {

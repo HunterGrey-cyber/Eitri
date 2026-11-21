@@ -525,9 +525,10 @@ fn main() -> glib::ExitCode {
             if let Some(path) = choice.neovim_bin_to_set() {
                 // SAFETY: nothing else in this process has spawned a thread that touches the
                 // environment. `resolve()`'s own version probe (if it ran one) never calls
-                // `.env`/`.env_clear` on the `Command` it spawns, so it never calls `getenv` and
-                // cannot race this `setenv` even if, past its own 2s deadline, it is still running
-                // in the background (see `eitri_core::nvim_bin::version_of_binary`'s own doc).
+                // `.env`/`.env_clear` on the `Command` it spawns, so it never calls `getenv`, and its
+                // reader thread, which can still be running after `resolve()` returns, only reads
+                // the pipe: neither can race this `setenv` (see
+                // `eitri_core::nvim_bin::version_of_binary`'s own doc).
                 unsafe { std::env::set_var(eitri_core::nvim_bin::NEOVIM_BIN_ENV, path) };
             }
         }

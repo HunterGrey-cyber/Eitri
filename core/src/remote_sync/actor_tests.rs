@@ -935,7 +935,12 @@ fn repeated_tree_listings_in_the_same_cycle_keep_the_status_file() {
 fn holder_reports_changed_status_even_when_status_cannot_be_written() {
     let lab = Lab::new();
     let (actor, events) = lab.synced();
-    wait(|| status_file_of(&actor.port()).is_ok());
+    // `synced` returns once the record says so, and the holder writes the record earlier in its step than the status;
+    // the git session's first status comes through its own monitor and can be folded in a step later still, after a
+    // passing "watching". Wait for "history" (the tree watching, the git session still scanning), the last status this
+    // setup produces, so that no write of the holder's can land between the removal below and the directory taking
+    // the name.
+    wait(|| status_file_of(&actor.port()).is_ok_and(|s| s.phase == "history"));
     let path = status_file::status_path(&actor.port().dir);
     std::fs::remove_file(&path).unwrap();
     std::fs::create_dir(&path).unwrap();

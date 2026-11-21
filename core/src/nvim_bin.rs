@@ -352,30 +352,45 @@ const VERSION_PROBE_MAX_OUTPUT_BYTES: u64 = 4096;
 /// [`VERSION_PROBE_MAX_OUTPUT_BYTES`]-capped [`std::io::Read::take`] rather than
 /// `Command::output()`'s unbounded buffer, so a binary that never stops printing cannot grow this
 /// process's memory without bound; and the child is always `kill()`ed before `wait()`, on every
-/// path out of this function, not only the timeout one -- a capped read can finish (having read
-/// its fill) well before such a binary would ever exit on its own, and an unkilled child still
-/// writing into a pipe nobody is draining would otherwise block `wait()` forever. Signalling an
-/// already-exited, unreaped child is a harmless no-op on Unix (there is nothing left to receive
-/// it), so `wait()` still reports that real exit status rather than the kill's, and a well-behaved
-/// `nvim --version` (which closes stdout and exits immediately after printing) is unaffected.
-/// stdin is null and stderr is discarded; neither is read.
+/// path out of this function that has not already seen it exit, so an unkilled child still writing
+/// into a pipe nobody is draining can never block `wait()` forever. stdin is null and stderr is
+/// discarded; neither is read.
 ///
-/// The reader thread is **not joined** on the timeout path: past the deadline it is abandoned
-/// rather than made this function's problem, the same trade this codebase already makes for other
-/// bounded subprocess waits -- killing the child there closes its end of the pipe, which is what
-/// lets that thread's own blocked read return and the thread end on its own. This never touches
-/// this process's own environment -- no `.env`/`.env_clear` call, so `Command::spawn` inherits
-/// `environ` directly at `exec` time rather than reading it through `getenv` -- which is what makes
-/// `main()`'s later `unsafe { std::env::set_var(NEOVIM_BIN_ENV, ..) }` (documented at that call
-/// site) safe even if a probe from an earlier `resolve()` call is still outstanding: nothing here
-/// ever calls `getenv`/`setenv` concurrently with it.
+/// **The child's exit, not the end of its stdout, ends the probe.** The first line is all
+/// [`parse_nvim_version_line`] reads, so the reader hands it over as soon as it has a newline (or
+/// the cap, or end-of-file) and goes on draining the rest, so a real `nvim` printing its remaining
+/// lines never meets a closed pipe. Then the child's exit status is awaited, within the same
+/// deadline, and must be a success. End-of-file alone would say nothing about the child: any
+/// process that holds a copy of the pipe's write end keeps it open after the child has exited --
+/// a background process the binary started, or an unrelated child that another thread of this
+/// process spawned in the instant between `pipe()` and setting close-on-exec, which is two calls
+/// on macOS, where the standard library has no `pipe2`.
+///
+/// The reader thread is **not joined**: it ends at end-of-file or the cap, which may be after this
+/// function returns when such a copy is held, and it owns nothing but the pipe's read end. This
+/// never touches this process's own environment -- no `.env`/`.env_clear` call, so `Command::spawn`
+/// inherits `environ` directly at `exec` time rather than reading it through `getenv` -- which is
+/// what makes `main()`'s later `unsafe { std::env::set_var(NEOVIM_BIN_ENV, ..) }` (documented at
+/// that call site) safe even if a probe's reader from an earlier `resolve()` call is still
+/// outstanding: nothing here ever calls `getenv`/`setenv` concurrently with it.
 fn version_of_binary(path: &Path) -> Option<(u64, u64, u64)> {
-    version_of_binary_with_wait(path, |rx, _child| rx.recv_timeout(VERSION_PROBE_TIMEOUT))
+    version_of_binary_within(path, VERSION_PROBE_TIMEOUT)
 }
 
+/// [`version_of_binary`] with its whole budget, from the spawn to the child's exit, given.
+fn version_of_binary_within(path: &Path, budget: Duration) -> Option<(u64, u64, u64)> {
+    let deadline = std::time::Instant::now() + budget;
+    version_of_binary_with_wait(path, deadline, |rx, _child| {
+        rx.recv_timeout(deadline.saturating_duration_since(std::time::Instant::now()))
+    })
+}
+
+/// [`version_of_binary`] with the wait for the first line given, so a test can hold or answer it;
+/// the wait for the child's exit runs to `deadline`.
 fn version_of_binary_with_wait(
     path: &Path,
-    wait: impl FnOnce(
+    deadline: std::time::Instant,
+    wait_first_line: impl FnOnce(
         std::sync::mpsc::Receiver<Vec<u8>>,
         &mut std::process::Child,
     ) -> Result<Vec<u8>, std::sync::mpsc::RecvTimeoutError>,
@@ -387,29 +402,43 @@ fn version_of_binary_with_wait(
         .stderr(std::process::Stdio::null())
         .spawn()
         .ok()?;
-    let stdout = child.stdout.take()?;
-
-    let (tx, rx) = std::sync::mpsc::channel();
-    std::thread::spawn(move || {
-        use std::io::Read;
-        let mut buf = Vec::new();
-        let _ = stdout.take(VERSION_PROBE_MAX_OUTPUT_BYTES).read_to_end(&mut buf);
-        let _ = tx.send(buf);
-    });
-
-    let Ok(stdout_bytes) = wait(rx, &mut child) else {
+    let Some(stdout) = child.stdout.take() else {
         let _ = child.kill();
         let _ = child.wait();
         return None;
     };
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || read_first_line_then_drain(stdout, tx));
 
-    let _ = child.kill();
-    let status = child.wait().ok()?;
-    if !status.success() {
-        return None;
+    let version = wait_first_line(rx, &mut child)
+        .ok()
+        .and_then(|bytes| parse_nvim_version_line(String::from_utf8_lossy(&bytes).lines().next()?));
+    let exited = match version {
+        Some(_) => crate::child_wait::wait_until(&mut child, deadline, &std::time::Instant::now)
+            .ok()
+            .flatten(),
+        None => None,
+    };
+    match exited {
+        Some(status) if status.success() => version,
+        Some(_) => None,
+        None => {
+            let _ = child.kill();
+            let _ = child.wait();
+            None
+        }
     }
-    let text = String::from_utf8_lossy(&stdout_bytes);
-    parse_nvim_version_line(text.lines().next()?)
+}
+
+/// Sends `stdout`'s first line (up to and including its newline, or what came before the cap or
+/// end-of-file) on `tx`, then reads on to end-of-file or the cap, dropping the rest.
+fn read_first_line_then_drain(stdout: std::process::ChildStdout, tx: std::sync::mpsc::Sender<Vec<u8>>) {
+    use std::io::{BufRead, Read};
+    let mut stdout = std::io::BufReader::new(stdout.take(VERSION_PROBE_MAX_OUTPUT_BYTES));
+    let mut first = Vec::new();
+    let _ = stdout.read_until(b'\n', &mut first);
+    let _ = tx.send(first);
+    let _ = std::io::copy(&mut stdout, &mut std::io::sink());
 }
 
 /// The one impure caller `shell`'s `main()` needs: reads [`NVIM_OVERRIDE_ENV`], [`NEOVIM_BIN_ENV`],
@@ -924,6 +953,19 @@ mod tests {
         assert!(status.success(), "writing the test script failed: {status}");
     }
 
+    /// The budget of a probe whose test expects an answer. Starting a script a test has just written
+    /// took 1.5 to 2 s on the Mac CI runner under the suite's load, against the product's 2 s, so
+    /// only the test of the default budget itself runs with it.
+    const TEST_PROBE_BUDGET: Duration = Duration::from_secs(20);
+
+    /// Asserts that the probe's child `pid` was reaped: a reaped child has no waitable status left.
+    fn assert_reaped(pid: u32) {
+        let mut status = 0;
+        // SAFETY: `waitpid` writes only into `status`, which outlives the call.
+        assert_eq!(unsafe { libc::waitpid(pid as i32, &mut status, libc::WNOHANG) }, -1);
+        assert_eq!(std::io::Error::last_os_error().raw_os_error(), Some(libc::ECHILD));
+    }
+
     #[test]
     fn version_of_binary_parses_a_normal_versions_output() {
         let scratch = std::env::temp_dir().join(format!(
@@ -939,35 +981,74 @@ mod tests {
             "#!/bin/sh\necho 'NVIM v0.11.4'\necho 'more build info'\nexit 0\n",
         );
 
-        assert_eq!(version_of_binary(&script), Some((0, 11, 4)));
+        assert_eq!(version_of_binary_within(&script, TEST_PROBE_BUDGET), Some((0, 11, 4)));
 
         let _ = std::fs::remove_dir_all(&scratch);
     }
 
+    /// The version line comes, then the binary exits while a process it started still holds its
+    /// stdout: the pipe stays open, and only the child's exit can end the probe in time. A copy of
+    /// the write end leaked into another test's child, as on macOS, is held the same way. The
+    /// holder is waited for before the test ends, so it never outlives the test holding copies of
+    /// other tests' descriptors.
     #[test]
-    fn the_default_version_wait_accepts_output_released_after_the_probe_starts() {
+    fn version_of_binary_answers_at_the_childs_exit_while_another_process_holds_its_stdout() {
+        let scratch = crate::test_scratch_dir::ScratchDir::new("nvim-version", "held-stdout");
+        let script = scratch.join("nvim");
+        let release = scratch.join("release");
+        let gone = scratch.join("gone");
+        write_executable_script(&script, &format!(
+            "#!/bin/sh\necho 'NVIM v0.11.4'\n(i=0; while [ ! -e '{}' ] && [ $i -lt 3000 ]; do i=$((i+1)); sleep 0.02; done; touch '{}') &\nexit 0\n",
+            release.display(), gone.display()));
+
+        let answer = version_of_binary_within(&script, TEST_PROBE_BUDGET);
+        std::fs::write(&release, b"").unwrap();
+        let until = std::time::Instant::now() + Duration::from_secs(60);
+        while !gone.exists() {
+            assert!(std::time::Instant::now() < until, "the stdout holder never ended");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(answer, Some((0, 11, 4)));
+    }
+
+    #[test]
+    fn version_of_binary_refuses_a_good_line_from_a_binary_that_fails() {
+        let scratch = crate::test_scratch_dir::ScratchDir::new("nvim-version", "fails");
+        let script = scratch.join("nvim");
+        write_executable_script(&script, "#!/bin/sh\necho 'NVIM v0.11.4'\nexit 3\n");
+        assert_eq!(version_of_binary_within(&script, TEST_PROBE_BUDGET), None);
+    }
+
+    #[test]
+    fn version_of_binary_gives_up_and_reaps_a_binary_that_prints_its_line_and_never_exits() {
+        let scratch = crate::test_scratch_dir::ScratchDir::new("nvim-version", "never-exits");
+        let script = scratch.join("nvim");
+        write_executable_script(
+            &script,
+            "#!/bin/sh\necho 'NVIM v0.11.4'\nwhile true; do sleep 1; done\n",
+        );
+
+        let mut pid = None;
+        let deadline = std::time::Instant::now() + Duration::from_millis(200);
+        let result = version_of_binary_with_wait(&script, deadline, |rx, child| {
+            pid = Some(child.id());
+            rx.recv_timeout(Duration::from_secs(60))
+        });
+        assert_eq!(result, None);
+        assert_reaped(pid.unwrap());
+    }
+
+    /// The default probe waits its whole budget for a binary that says nothing. A deadline cannot
+    /// pass early, so this holds however slowly the machine starts the script; an upper bound
+    /// would not.
+    #[test]
+    fn the_default_probe_waits_its_whole_budget_for_a_binary_that_says_nothing() {
         let scratch = crate::test_scratch_dir::ScratchDir::new("nvim-version", "default-wait");
         let script = scratch.join("nvim");
-        let ready = scratch.join("ready");
-        let release = scratch.join("release");
-        write_executable_script(&script, &format!(
-            "#!/bin/sh\ntouch '{}'; i=0; while [ ! -e '{}' ] && [ $i -lt 3000 ]; do i=$((i+1)); sleep 0.02; done\necho 'NVIM v0.11.4'\n",
-            ready.display(), release.display()));
-        let (answer, outcome) = std::sync::mpsc::channel();
-        let worker = std::thread::spawn(move || {
-            let _ = answer.send(version_of_binary(&script));
-        });
-        let until = std::time::Instant::now() + Duration::from_secs(60);
-        while !ready.exists() {
-            if let Ok(answer) = outcome.try_recv() {
-                panic!("the default wait returned before the probe could answer: {answer:?}");
-            }
-            assert!(std::time::Instant::now() < until, "the probe never started");
-            std::thread::yield_now();
-        }
-        std::fs::write(release, b"").unwrap();
-        assert_eq!(outcome.recv_timeout(Duration::from_secs(60)).unwrap(), Some((0, 11, 4)));
-        worker.join().unwrap();
+        write_executable_script(&script, "#!/bin/sh\nexec sleep 30\n");
+        let started = std::time::Instant::now();
+        assert_eq!(version_of_binary(&script), None);
+        assert!(started.elapsed() >= VERSION_PROBE_TIMEOUT, "{:?}", started.elapsed());
     }
 
     #[test]
@@ -986,7 +1067,8 @@ mod tests {
             "#!/bin/sh\ntrap '' PIPE\nwhile true; do printf '%01024d' 0; done\n",
         );
 
-        let result = version_of_binary_with_wait(&script, |rx, child| {
+        let deadline = std::time::Instant::now() + Duration::from_secs(60);
+        let result = version_of_binary_with_wait(&script, deadline, |rx, child| {
             let bytes = rx
                 .recv_timeout(Duration::from_secs(60))
                 .expect("the capped reader finishes");
@@ -1009,20 +1091,15 @@ mod tests {
         write_executable_script(&script, "#!/bin/sh\nwhile true; do sleep 1; done\n");
 
         let mut pid = None;
-        let result = version_of_binary_with_wait(&script, |rx, child| {
+        let deadline = std::time::Instant::now() + Duration::from_secs(60);
+        let result = version_of_binary_with_wait(&script, deadline, |rx, child| {
             assert!(rx.try_recv().is_err(), "no stdout was available");
             assert!(child.try_wait().unwrap().is_none());
             pid = Some(child.id());
             Err(std::sync::mpsc::RecvTimeoutError::Timeout)
         });
         assert_eq!(result, None);
-        let mut status = 0;
-        // SAFETY: this is the probe's child; a reaped child has no waitable status left.
-        assert_eq!(
-            unsafe { libc::waitpid(pid.unwrap() as i32, &mut status, libc::WNOHANG) },
-            -1
-        );
-        assert_eq!(std::io::Error::last_os_error().raw_os_error(), Some(libc::ECHILD));
+        assert_reaped(pid.unwrap());
 
         let _ = std::fs::remove_dir_all(&scratch);
     }
