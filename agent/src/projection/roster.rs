@@ -70,6 +70,91 @@ impl BackgroundTaskRecord {
         self.live = false;
         self.finished_seq = Some(seq);
     }
+
+    /// What the event's edge says about the row, apart from the status it carries: only a progress
+    /// edge replaces the workflow progress, only a started edge takes the provider's clock, and a
+    /// backgrounded start makes a row that has not ended live.
+    fn note_edge(
+        &mut self,
+        edge: TaskEdge,
+        occurred_at: Option<i64>,
+        is_backgrounded: Option<bool>,
+        workflow_progress: &Option<WorkflowProgress>,
+    ) {
+        if edge == TaskEdge::Progress {
+            self.workflow_progress = workflow_progress.clone();
+        }
+        if edge == TaskEdge::Started {
+            if let Some(at) = occurred_at {
+                self.started_at = at;
+            }
+            if is_backgrounded == Some(true) && !terminal(self.status) {
+                self.live = true;
+            }
+        }
+    }
+
+    /// The status an event carries, a restart of the worker, and the CLI's own end time.
+    fn apply_status(
+        &mut self,
+        status: Option<TaskStatus>,
+        reason: Option<&str>,
+        end_time_ms: Option<i64>,
+        seq: u64,
+        at: i64,
+    ) {
+        if let Some(status) = status {
+            if terminal(status) {
+                self.end(status, seq, at);
+            } else if !terminal(self.status) && self.status != TaskStatus::Stopping {
+                self.status = status;
+            }
+        }
+        if reason == Some("worker_restart") {
+            self.end(TaskStatus::Stopped, seq, at);
+            self.summary = Some("stopped (Claude Code restarted)".into());
+        }
+        // The CLI's own end time beats arrival time, but only for a row that has ended: a running
+        // task carries no end.
+        if let Some(end) = end_time_ms {
+            if terminal(self.status) {
+                self.ended_at = Some(end);
+            }
+        }
+    }
+
+    /// The notice a notification of an outcome (or of running) leaves, unless the task is ambient.
+    fn notice(
+        &self,
+        edge: TaskEdge,
+        status: Option<TaskStatus>,
+        summary: &Option<String>,
+        seq: u64,
+    ) -> Option<NoticeRecord> {
+        if edge != TaskEdge::Notified
+            || !status.is_some_and(|s| terminal(s) || s == TaskStatus::Running)
+            || self.task.ambient
+        {
+            return None;
+        }
+        Some(NoticeRecord {
+            seq,
+            kind: SessionNoticeKind::Task,
+            level: NoticeLevel::Notice,
+            content: summary.clone(),
+            scalars: Default::default(),
+            task_id: Some(self.task.task_id.clone()),
+            tool_use_id: self.task.tool_use_id.clone(),
+            task_status: status.map(|s| serde_json::to_value(s).unwrap().as_str().unwrap().to_owned()),
+        })
+    }
+}
+
+/// Replaces `slot` with a clone of `new` when the event carried one.
+fn keep<T: Clone>(slot: &mut Option<T>, new: &Option<T>) {
+    if let Some(value) = new {
+        *slot = Some(value.clone());
+    }
 }
 
 impl TaskRoster {
@@ -171,138 +256,10 @@ impl TaskRoster {
         let at = occurred_at.unwrap_or(seq as i64);
         let mut notice = None;
         match event {
-            AgentDomainEvent::BackgroundTasksChanged { tasks, .. } => {
-                if tasks.is_empty() && self.query_start {
-                    self.rows.clear();
-                }
-                self.query_start = false;
-                let previous_live: Vec<_> = self.rows.iter().map(|r| (r.task.task_id.clone(), r.live)).collect();
-                for row in &mut self.rows {
-                    row.live = false;
-                }
-                for task in tasks.iter().take(256) {
-                    if let Some(index) = self.row(&task.task_id, task.run_id.as_deref(), Some(task), at, true) {
-                        let row = &mut self.rows[index];
-                        // The level owns membership; pause and a pending stop survive repeated levels.
-                        row.live = true;
-                        if !matches!(row.status, TaskStatus::Stopping | TaskStatus::Paused) {
-                            row.status = TaskStatus::Running;
-                        }
-                        row.ended_at = None;
-                        row.finished_seq = None;
-                    } else if let Some(row) = self.rows.iter_mut().find(|r| r.task.task_id == task.task_id) {
-                        row.live = previous_live
-                            .iter()
-                            .find(|(id, _)| *id == task.task_id)
-                            .is_some_and(|(_, live)| *live);
-                    }
-                }
-                for row in &mut self.rows {
-                    if !row.live && row.status == TaskStatus::Stopping {
-                        row.end(TaskStatus::Stopped, seq, at);
-                    }
-                }
-            }
-            AgentDomainEvent::TaskEvent {
-                edge,
-                task_id,
-                run_id,
-                task,
-                status,
-                summary,
-                last_tool_name,
-                usage,
-                end_time_ms,
-                error,
-                is_backgrounded,
-                reason,
-                output_file,
-                workflow_progress,
-                ..
-            } => {
-                if task.is_none()
-                    && status.is_none()
-                    && summary.is_none()
-                    && last_tool_name.is_none()
-                    && usage.is_none()
-                    && error.is_none()
-                    && is_backgrounded.is_none()
-                    && reason.is_none()
-                    && output_file.is_none()
-                    && workflow_progress.is_none()
-                    && end_time_ms.is_none()
-                    && !self.rows.iter().any(|row| row.task.task_id == *task_id)
-                {
-                    return None;
-                }
-                let run = run_id
-                    .as_deref()
-                    .or_else(|| task.as_ref().and_then(|t| t.run_id.as_deref()));
-                let index = self.row(task_id, run, task.as_ref(), at, false)?;
-                let row = &mut self.rows[index];
-                if let Some(v) = summary {
-                    row.summary = Some(v.clone());
-                }
-                if let Some(v) = last_tool_name {
-                    row.last_tool_name = Some(v.clone());
-                }
-                if let Some(v) = usage {
-                    row.usage = Some(v.clone());
-                }
-                if let Some(v) = error {
-                    row.error = Some(v.clone());
-                }
-                if let Some(v) = is_backgrounded {
-                    row.is_backgrounded = Some(*v);
-                }
-                if let Some(v) = reason {
-                    row.reason = Some(v.clone());
-                }
-                if let Some(v) = output_file {
-                    row.output_file = Some(v.clone());
-                }
-                if *edge == TaskEdge::Progress {
-                    row.workflow_progress = workflow_progress.clone();
-                }
-                if *edge == TaskEdge::Started && occurred_at.is_some() {
-                    row.started_at = at;
-                }
-                if *edge == TaskEdge::Started && *is_backgrounded == Some(true) && !terminal(row.status) {
-                    row.live = true;
-                }
-                if let Some(status) = status {
-                    if terminal(*status) {
-                        row.end(*status, seq, at);
-                    } else if !terminal(row.status) && row.status != TaskStatus::Stopping {
-                        row.status = *status;
-                    }
-                }
-                if reason.as_deref() == Some("worker_restart") {
-                    row.end(TaskStatus::Stopped, seq, at);
-                    row.summary = Some("stopped (Claude Code restarted)".into());
-                }
-                // The CLI's own end time beats arrival time, but only for a row that has ended: a running
-                // task carries no end.
-                if let Some(end) = end_time_ms {
-                    if terminal(row.status) {
-                        row.ended_at = Some(*end);
-                    }
-                }
-                if *edge == TaskEdge::Notified
-                    && status.is_some_and(|s| terminal(s) || s == TaskStatus::Running)
-                    && !row.task.ambient
-                {
-                    notice = Some(NoticeRecord {
-                        seq,
-                        kind: SessionNoticeKind::Task,
-                        level: NoticeLevel::Notice,
-                        content: summary.clone(),
-                        scalars: Default::default(),
-                        task_id: Some(task_id.clone()),
-                        tool_use_id: row.task.tool_use_id.clone(),
-                        task_status: status.map(|s| serde_json::to_value(s).unwrap().as_str().unwrap().to_owned()),
-                    });
-                }
+            AgentDomainEvent::BackgroundTasksChanged { tasks, .. } => self.apply_level(tasks, seq, at),
+            AgentDomainEvent::TaskEvent { .. } => {
+                // `None`: the event named nothing to record, or an older run, and the roster stays as it was.
+                notice = self.apply_task_event(event, seq, at)?;
             }
             AgentDomainEvent::TurnCompleted { .. } => {
                 for row in &mut self.rows {
@@ -315,24 +272,122 @@ impl TaskRoster {
             // says nothing about the tasks that process runs.
             AgentDomainEvent::SessionClosed { .. }
             | AgentDomainEvent::SessionUnavailable { .. }
-            | AgentDomainEvent::ResumeOutcome { .. } => {
-                for row in &mut self.rows {
-                    if !terminal(row.status) {
-                        row.end(TaskStatus::Ended, seq, at);
-                        row.summary = Some("stopped with the session".into());
-                    }
-                }
-                // The process is gone, so the next level is the empty one a new query begins with. A
-                // resume's outcome arrives after that level, so it does not arm the clear: the next empty
-                // level then is an ordinary one inside the new process.
-                if !matches!(event, AgentDomainEvent::ResumeOutcome { .. }) {
-                    self.query_start = !self.rows.is_empty();
-                }
-            }
+            | AgentDomainEvent::ResumeOutcome { .. } => self.end_with_session(event, seq, at),
             _ => {}
         }
         self.trim();
         notice
+    }
+
+    /// A level of the CLI's running tasks: it owns membership, and the rows it no longer lists are
+    /// left to wait for an outcome, except a pending stop, which it settles.
+    fn apply_level(&mut self, tasks: &[BackgroundTask], seq: u64, at: i64) {
+        if tasks.is_empty() && self.query_start {
+            self.rows.clear();
+        }
+        self.query_start = false;
+        let previous_live: Vec<_> = self.rows.iter().map(|r| (r.task.task_id.clone(), r.live)).collect();
+        for row in &mut self.rows {
+            row.live = false;
+        }
+        for task in tasks.iter().take(256) {
+            self.admit_listed(task, &previous_live, at);
+        }
+        for row in &mut self.rows {
+            if !row.live && row.status == TaskStatus::Stopping {
+                row.end(TaskStatus::Stopped, seq, at);
+            }
+        }
+    }
+
+    /// One task a level lists. A listing of an older run is ignored and the row keeps the liveness
+    /// it had before the level.
+    fn admit_listed(&mut self, task: &BackgroundTask, previous_live: &[(String, bool)], at: i64) {
+        if let Some(index) = self.row(&task.task_id, task.run_id.as_deref(), Some(task), at, true) {
+            let row = &mut self.rows[index];
+            // The level owns membership; pause and a pending stop survive repeated levels.
+            row.live = true;
+            if !matches!(row.status, TaskStatus::Stopping | TaskStatus::Paused) {
+                row.status = TaskStatus::Running;
+            }
+            row.ended_at = None;
+            row.finished_seq = None;
+        } else if let Some(row) = self.rows.iter_mut().find(|r| r.task.task_id == task.task_id) {
+            row.live = previous_live
+                .iter()
+                .find(|(id, _)| *id == task.task_id)
+                .is_some_and(|(_, live)| *live);
+        }
+    }
+
+    /// A `TaskEvent`. `None` when it changed nothing: it carried nothing and names no known row, or
+    /// it belongs to an older run. Otherwise `Some` of the notice it leaves, which may itself be `None`.
+    fn apply_task_event(&mut self, event: &AgentDomainEvent, seq: u64, at: i64) -> Option<Option<NoticeRecord>> {
+        let AgentDomainEvent::TaskEvent {
+            edge,
+            task_id,
+            run_id,
+            task,
+            status,
+            summary,
+            last_tool_name,
+            usage,
+            end_time_ms,
+            error,
+            is_backgrounded,
+            reason,
+            output_file,
+            workflow_progress,
+            occurred_at,
+        } = event
+        else {
+            return None;
+        };
+        let says_nothing = task.is_none()
+            && status.is_none()
+            && summary.is_none()
+            && last_tool_name.is_none()
+            && usage.is_none()
+            && error.is_none()
+            && is_backgrounded.is_none()
+            && reason.is_none()
+            && output_file.is_none()
+            && workflow_progress.is_none()
+            && end_time_ms.is_none();
+        if says_nothing && !self.rows.iter().any(|row| row.task.task_id == *task_id) {
+            return None;
+        }
+        let run = run_id
+            .as_deref()
+            .or_else(|| task.as_ref().and_then(|t| t.run_id.as_deref()));
+        let index = self.row(task_id, run, task.as_ref(), at, false)?;
+        let row = &mut self.rows[index];
+        keep(&mut row.summary, summary);
+        keep(&mut row.last_tool_name, last_tool_name);
+        keep(&mut row.usage, usage);
+        keep(&mut row.error, error);
+        keep(&mut row.is_backgrounded, is_backgrounded);
+        keep(&mut row.reason, reason);
+        keep(&mut row.output_file, output_file);
+        row.note_edge(*edge, *occurred_at, *is_backgrounded, workflow_progress);
+        row.apply_status(*status, reason.as_deref(), *end_time_ms, seq, at);
+        Some(row.notice(*edge, *status, summary, seq))
+    }
+
+    /// The end of the process, or a resume's outcome: every row without an outcome is settled. The
+    /// process is gone, so the next level is the empty one a new query begins with. A resume's outcome
+    /// arrives after that level, so it does not arm the clear: the next empty level then is an
+    /// ordinary one inside the new process.
+    fn end_with_session(&mut self, event: &AgentDomainEvent, seq: u64, at: i64) {
+        for row in &mut self.rows {
+            if !terminal(row.status) {
+                row.end(TaskStatus::Ended, seq, at);
+                row.summary = Some("stopped with the session".into());
+            }
+        }
+        if !matches!(event, AgentDomainEvent::ResumeOutcome { .. }) {
+            self.query_start = !self.rows.is_empty();
+        }
     }
 }
 
@@ -573,5 +628,891 @@ mod tests {
                 }
             }
         }
+    }
+
+    // The tests below drive `TaskRoster::update` directly, so each branch of it is pinned on its
+    // own: the fixture test above checks selected keys of whole scenarios, and says nothing about
+    // a branch that a scenario happens to pass through without asserting on it.
+
+    fn task(id: &str) -> BackgroundTask {
+        BackgroundTask {
+            task_id: id.into(),
+            run_id: None,
+            kind: TaskKind::Shell,
+            task_type: "bash".into(),
+            description: format!("task {id}"),
+            subagent_type: None,
+            parent_task_id: None,
+            tool_use_id: None,
+            ambient: false,
+            workflow_name: None,
+        }
+    }
+
+    fn level(tasks: &[BackgroundTask]) -> AgentDomainEvent {
+        AgentDomainEvent::BackgroundTasksChanged {
+            occurred_at: None,
+            tasks: tasks.to_vec(),
+        }
+    }
+
+    /// A `TaskEvent` with every optional field empty, filled in by struct update.
+    #[derive(Default)]
+    struct Ev {
+        at: Option<i64>,
+        run: Option<&'static str>,
+        task: Option<BackgroundTask>,
+        status: Option<TaskStatus>,
+        summary: Option<&'static str>,
+        tool: Option<&'static str>,
+        usage: Option<TaskUsage>,
+        end: Option<i64>,
+        error: Option<&'static str>,
+        backgrounded: Option<bool>,
+        reason: Option<&'static str>,
+        file: Option<&'static str>,
+        progress: Option<WorkflowProgress>,
+    }
+
+    impl Ev {
+        /// An event that says something (a summary), so that it is not passed over as empty.
+        fn said(summary: &'static str) -> Ev {
+            Ev {
+                summary: Some(summary),
+                ..Ev::default()
+            }
+        }
+
+        fn on(self, edge: TaskEdge, id: &str) -> AgentDomainEvent {
+            AgentDomainEvent::TaskEvent {
+                occurred_at: self.at,
+                edge,
+                task_id: id.into(),
+                run_id: self.run.map(str::to_owned),
+                task: self.task,
+                status: self.status,
+                summary: self.summary.map(str::to_owned),
+                last_tool_name: self.tool.map(str::to_owned),
+                usage: self.usage,
+                end_time_ms: self.end,
+                error: self.error.map(str::to_owned),
+                is_backgrounded: self.backgrounded,
+                reason: self.reason.map(str::to_owned),
+                output_file: self.file.map(str::to_owned),
+                workflow_progress: self.progress,
+            }
+        }
+    }
+
+    fn ev(status: TaskStatus) -> Ev {
+        Ev {
+            status: Some(status),
+            ..Ev::default()
+        }
+    }
+
+    fn from_json(value: serde_json::Value) -> AgentDomainEvent {
+        serde_json::from_value(value).unwrap()
+    }
+
+    fn closed() -> AgentDomainEvent {
+        from_json(serde_json::json!({"type": "session_closed", "reason": "done"}))
+    }
+
+    fn turn_completed() -> AgentDomainEvent {
+        from_json(serde_json::json!({
+            "type": "turn_completed", "turn_id": "t", "outcome": "completed", "result_text": "",
+            "stop_reason": null, "usage": null,
+            "detail": {"api_error_status": null, "message": null, "reason": null}
+        }))
+    }
+
+    fn row<'a>(roster: &'a TaskRoster, id: &str) -> &'a BackgroundTaskRecord {
+        roster
+            .rows
+            .iter()
+            .find(|row| row.task.task_id == id)
+            .unwrap_or_else(|| panic!("no row {id}"))
+    }
+
+    /// Folds `events` in order, with sequence numbers 1, 2, 3, ...
+    fn fold_all(events: &[AgentDomainEvent]) -> (TaskRoster, Vec<Option<NoticeRecord>>) {
+        let mut roster = TaskRoster::default();
+        let notices = events
+            .iter()
+            .enumerate()
+            .map(|(index, event)| roster.update(event, index as u64 + 1))
+            .collect();
+        (roster, notices)
+    }
+
+    #[test]
+    fn a_level_owns_membership_and_keeps_pause_and_a_pending_stop() {
+        let (roster, _) = fold_all(&[
+            level(&[task("a"), task("b"), task("c")]),
+            ev(TaskStatus::Paused).on(TaskEdge::Updated, "a"),
+            ev(TaskStatus::Stopping).on(TaskEdge::Updated, "b"),
+            level(&[task("a"), task("b")]),
+        ]);
+        let a = row(&roster, "a");
+        assert!(a.live);
+        assert_eq!(a.status, TaskStatus::Paused);
+        let b = row(&roster, "b");
+        assert!(b.live);
+        assert_eq!(b.status, TaskStatus::Stopping);
+        let c = row(&roster, "c");
+        assert!(!c.live, "a row missing from the level leaves it");
+        assert_eq!(c.status, TaskStatus::Running, "and waits for an outcome");
+        assert_eq!(c.finished_seq, None);
+    }
+
+    #[test]
+    fn a_level_clears_finished_markers_and_resets_a_running_row() {
+        let (roster, _) = fold_all(&[
+            level(&[task("a")]),
+            ev(TaskStatus::Completed).on(TaskEdge::Updated, "a"),
+            level(&[task("a")]),
+        ]);
+        let a = row(&roster, "a");
+        assert!(a.live);
+        assert_eq!(a.status, TaskStatus::Running);
+        assert_eq!((a.ended_at, a.finished_seq), (None, None));
+    }
+
+    #[test]
+    fn a_stopping_row_that_leaves_the_level_is_stopped_at_that_event() {
+        let (roster, _) = fold_all(&[
+            level(&[task("a")]),
+            ev(TaskStatus::Stopping).on(TaskEdge::Updated, "a"),
+            AgentDomainEvent::BackgroundTasksChanged {
+                occurred_at: Some(900),
+                tasks: vec![],
+            },
+        ]);
+        let a = row(&roster, "a");
+        assert_eq!(a.status, TaskStatus::Stopped);
+        assert_eq!(a.finished_seq, Some(3));
+        assert_eq!(a.ended_at, Some(900));
+        assert!(!a.live);
+    }
+
+    #[test]
+    fn an_empty_level_clears_the_roster_only_after_the_process_ended() {
+        let mut roster = TaskRoster::default();
+        roster.update(&level(&[task("a")]), 1);
+        roster.update(&level(&[]), 2);
+        assert_eq!(roster.rows.len(), 1, "an ordinary empty level keeps the row");
+        assert!(!roster.query_start);
+
+        roster.update(&closed(), 3);
+        assert!(roster.query_start, "a closed process with rows arms the clear");
+        roster.update(&level(&[]), 4);
+        assert!(roster.rows.is_empty());
+        assert!(!roster.query_start);
+    }
+
+    #[test]
+    fn a_non_empty_level_after_the_process_ended_disarms_the_clear_and_keeps_rows() {
+        let mut roster = TaskRoster::default();
+        roster.update(&level(&[task("a")]), 1);
+        roster.update(&closed(), 2);
+        roster.update(&level(&[task("b")]), 3);
+        assert!(!roster.query_start);
+        assert_eq!(roster.rows.len(), 2);
+    }
+
+    #[test]
+    fn a_level_row_of_an_older_run_is_ignored_and_keeps_the_rows_previous_liveness() {
+        let mut older = task("a");
+        older.run_id = Some("1".into());
+        let mut newer = task("a");
+        newer.run_id = Some("2".into());
+
+        let mut roster = TaskRoster::default();
+        roster.update(&level(&[newer.clone()]), 1);
+        roster.update(&level(&[older.clone()]), 2);
+        let a = row(&roster, "a");
+        assert!(a.live, "the stale level row does not take the live flag away");
+        assert_eq!(a.task.run_id.as_deref(), Some("2"));
+
+        roster.update(&level(&[]), 3);
+        assert!(!row(&roster, "a").live);
+        roster.update(&level(&[older]), 4);
+        let a = row(&roster, "a");
+        assert!(!a.live, "nor does it give the flag to a row that was not live");
+        assert_eq!(a.task.run_id.as_deref(), Some("2"));
+    }
+
+    #[test]
+    fn a_level_takes_at_most_256_tasks() {
+        let tasks: Vec<_> = (0..300).map(|n| task(&format!("t{n}"))).collect();
+        let (roster, _) = fold_all(&[level(&tasks)]);
+        assert_eq!(roster.rows.len(), 256);
+        assert_eq!(roster.running(), 256);
+    }
+
+    #[test]
+    fn a_task_event_that_says_nothing_about_an_unknown_task_makes_no_row() {
+        let (roster, notices) = fold_all(&[Ev::default().on(TaskEdge::Updated, "ghost")]);
+        assert!(roster.rows.is_empty());
+        assert_eq!(notices, vec![None]);
+    }
+
+    #[test]
+    fn any_one_field_makes_a_task_event_about_an_unknown_task_count() {
+        let fields: Vec<(&str, Ev)> = vec![
+            (
+                "task",
+                Ev {
+                    task: Some(task("x")),
+                    ..Ev::default()
+                },
+            ),
+            ("status", ev(TaskStatus::Running)),
+            (
+                "summary",
+                Ev {
+                    summary: Some("s"),
+                    ..Ev::default()
+                },
+            ),
+            (
+                "tool",
+                Ev {
+                    tool: Some("Bash"),
+                    ..Ev::default()
+                },
+            ),
+            (
+                "usage",
+                Ev {
+                    usage: Some(TaskUsage {
+                        total_tokens: 1,
+                        tool_uses: 1,
+                        duration_ms: 1,
+                    }),
+                    ..Ev::default()
+                },
+            ),
+            (
+                "error",
+                Ev {
+                    error: Some("e"),
+                    ..Ev::default()
+                },
+            ),
+            (
+                "backgrounded",
+                Ev {
+                    backgrounded: Some(false),
+                    ..Ev::default()
+                },
+            ),
+            (
+                "reason",
+                Ev {
+                    reason: Some("r"),
+                    ..Ev::default()
+                },
+            ),
+            (
+                "file",
+                Ev {
+                    file: Some("/tmp/o"),
+                    ..Ev::default()
+                },
+            ),
+            (
+                "progress",
+                Ev {
+                    progress: Some(WorkflowProgress {
+                        phases: vec![],
+                        agents: vec![],
+                    }),
+                    ..Ev::default()
+                },
+            ),
+            (
+                "end",
+                Ev {
+                    end: Some(5),
+                    ..Ev::default()
+                },
+            ),
+        ];
+        for (name, fields) in fields {
+            let (roster, _) = fold_all(&[fields.on(TaskEdge::Updated, "x")]);
+            assert_eq!(roster.rows.len(), 1, "{name} alone must open a row");
+        }
+        let (roster, _) = fold_all(&[level(&[task("x")]), Ev::default().on(TaskEdge::Updated, "x")]);
+        assert_eq!(roster.rows.len(), 1, "an empty event for a known task is harmless");
+    }
+
+    #[test]
+    fn an_event_for_an_unknown_task_opens_a_row_with_the_run_taken_from_the_event_or_its_task() {
+        let mut with_run = task("a");
+        with_run.run_id = Some("r7".into());
+        let (roster, _) = fold_all(&[
+            Ev {
+                task: Some(with_run),
+                ..Ev::default()
+            }
+            .on(TaskEdge::Started, "a"),
+            Ev {
+                run: Some("r2"),
+                summary: Some("s"),
+                ..Ev::default()
+            }
+            .on(TaskEdge::Progress, "b"),
+        ]);
+        assert_eq!(row(&roster, "a").task.run_id.as_deref(), Some("r7"));
+        let b = row(&roster, "b");
+        assert_eq!(b.task.run_id.as_deref(), Some("r2"));
+        assert_eq!(b.task.kind, TaskKind::Other);
+        assert_eq!(b.status, TaskStatus::Running);
+    }
+
+    #[test]
+    fn each_optional_field_is_recorded_and_survives_an_event_without_it() {
+        let usage = TaskUsage {
+            total_tokens: 7,
+            tool_uses: 2,
+            duration_ms: 90,
+        };
+        let (roster, _) = fold_all(&[
+            level(&[task("a")]),
+            Ev {
+                summary: Some("sum"),
+                tool: Some("Grep"),
+                usage: Some(usage.clone()),
+                error: Some("boom"),
+                backgrounded: Some(true),
+                reason: Some("why"),
+                file: Some("/o.txt"),
+                ..Ev::default()
+            }
+            .on(TaskEdge::Updated, "a"),
+            Ev {
+                summary: Some("later"),
+                ..Ev::default()
+            }
+            .on(TaskEdge::Updated, "a"),
+        ]);
+        let a = row(&roster, "a");
+        assert_eq!(a.summary.as_deref(), Some("later"));
+        assert_eq!(a.last_tool_name.as_deref(), Some("Grep"));
+        assert_eq!(a.usage, Some(usage));
+        assert_eq!(a.error.as_deref(), Some("boom"));
+        assert_eq!(a.is_backgrounded, Some(true));
+        assert_eq!(a.reason.as_deref(), Some("why"));
+        assert_eq!(a.output_file.as_deref(), Some("/o.txt"));
+    }
+
+    #[test]
+    fn workflow_progress_is_taken_on_the_progress_edge_only_and_replaced_there() {
+        let progress = WorkflowProgress {
+            phases: vec![],
+            agents: vec![],
+        };
+        let mut roster = TaskRoster::default();
+        roster.update(&level(&[task("a")]), 1);
+        let with = || Ev {
+            progress: Some(progress.clone()),
+            ..Ev::default()
+        };
+        roster.update(&with().on(TaskEdge::Updated, "a"), 2);
+        assert_eq!(
+            row(&roster, "a").workflow_progress,
+            None,
+            "another edge does not take it"
+        );
+        roster.update(&with().on(TaskEdge::Progress, "a"), 3);
+        assert_eq!(row(&roster, "a").workflow_progress, Some(progress));
+        roster.update(&Ev::default().on(TaskEdge::Progress, "a"), 4);
+        assert_eq!(
+            row(&roster, "a").workflow_progress,
+            None,
+            "a progress edge without one clears it"
+        );
+    }
+
+    #[test]
+    fn the_started_edge_takes_the_providers_clock_only_when_it_gave_one() {
+        let (roster, _) = fold_all(&[
+            Ev {
+                at: Some(5000),
+                summary: Some("s"),
+                ..Ev::default()
+            }
+            .on(TaskEdge::Started, "a"),
+            Ev {
+                summary: Some("s"),
+                ..Ev::default()
+            }
+            .on(TaskEdge::Started, "b"),
+            Ev {
+                at: Some(7000),
+                summary: Some("s"),
+                ..Ev::default()
+            }
+            .on(TaskEdge::Started, "a"),
+            Ev {
+                at: Some(8000),
+                summary: Some("s"),
+                ..Ev::default()
+            }
+            .on(TaskEdge::Updated, "b"),
+        ]);
+        assert_eq!(row(&roster, "a").started_at, 7000);
+        assert_eq!(
+            row(&roster, "b").started_at,
+            2,
+            "the arrival sequence stands in, and only a started edge moves it"
+        );
+    }
+
+    #[test]
+    fn a_backgrounded_start_makes_a_live_row_unless_it_already_ended() {
+        let backgrounded = || Ev {
+            backgrounded: Some(true),
+            ..Ev::default()
+        };
+        let (roster, _) = fold_all(&[
+            backgrounded().on(TaskEdge::Started, "a"),
+            backgrounded().on(TaskEdge::Updated, "b"),
+            Ev {
+                backgrounded: Some(false),
+                ..Ev::default()
+            }
+            .on(TaskEdge::Started, "c"),
+            ev(TaskStatus::Completed).on(TaskEdge::Updated, "d"),
+            backgrounded().on(TaskEdge::Started, "d"),
+        ]);
+        assert!(row(&roster, "a").live);
+        assert!(!row(&roster, "b").live, "only the started edge does this");
+        assert!(!row(&roster, "c").live, "and only a backgrounded one");
+        assert!(!row(&roster, "d").live, "an ended row stays out");
+    }
+
+    #[test]
+    fn a_status_moves_a_row_unless_it_has_ended_or_is_stopping() {
+        let (roster, _) = fold_all(&[
+            level(&[task("a"), task("b"), task("c")]),
+            ev(TaskStatus::Paused).on(TaskEdge::Updated, "a"),
+            ev(TaskStatus::Stopping).on(TaskEdge::Updated, "b"),
+            ev(TaskStatus::Running).on(TaskEdge::Updated, "b"),
+            ev(TaskStatus::Completed).on(TaskEdge::Updated, "c"),
+            ev(TaskStatus::Running).on(TaskEdge::Updated, "c"),
+        ]);
+        assert_eq!(row(&roster, "a").status, TaskStatus::Paused);
+        assert_eq!(row(&roster, "b").status, TaskStatus::Stopping);
+        assert_eq!(row(&roster, "c").status, TaskStatus::Completed);
+    }
+
+    #[test]
+    fn a_terminal_status_settles_the_row_at_the_event() {
+        let (roster, _) = fold_all(&[
+            level(&[task("a")]),
+            Ev {
+                at: Some(400),
+                ..ev(TaskStatus::Failed)
+            }
+            .on(TaskEdge::Updated, "a"),
+            Ev {
+                at: Some(999),
+                ..ev(TaskStatus::Failed)
+            }
+            .on(TaskEdge::Notified, "a"),
+        ]);
+        let a = row(&roster, "a");
+        assert_eq!(a.status, TaskStatus::Failed);
+        assert!(!a.live);
+        assert_eq!(a.finished_seq, Some(3));
+        assert_eq!(a.ended_at, Some(400), "the first recorded end stands");
+    }
+
+    #[test]
+    fn a_worker_restart_stops_the_row_with_its_own_summary() {
+        let mut roster = TaskRoster::default();
+        roster.update(&level(&[task("a")]), 1);
+        let restart = Ev {
+            reason: Some("worker_restart"),
+            summary: Some("ignored"),
+            ..Ev::default()
+        };
+        roster.update(&restart.on(TaskEdge::Updated, "a"), 2);
+        let a = row(&roster, "a");
+        assert_eq!(a.status, TaskStatus::Stopped);
+        assert_eq!(a.summary.as_deref(), Some("stopped (Claude Code restarted)"));
+        assert_eq!(a.finished_seq, Some(2));
+        let other = Ev {
+            reason: Some("exit"),
+            ..Ev::default()
+        };
+        roster.update(&other.on(TaskEdge::Updated, "a"), 3);
+        let a = row(&roster, "a");
+        assert_eq!(a.reason.as_deref(), Some("exit"));
+        assert_eq!(a.status, TaskStatus::Stopped, "another reason does not undo it");
+    }
+
+    #[test]
+    fn the_clis_end_time_replaces_the_arrival_time_of_a_row_that_has_ended_only() {
+        let (roster, _) = fold_all(&[
+            level(&[task("a"), task("b")]),
+            Ev {
+                end: Some(1234),
+                ..ev(TaskStatus::Completed)
+            }
+            .on(TaskEdge::Updated, "a"),
+            Ev {
+                end: Some(1234),
+                ..ev(TaskStatus::Running)
+            }
+            .on(TaskEdge::Updated, "b"),
+        ]);
+        assert_eq!(row(&roster, "a").ended_at, Some(1234));
+        assert_eq!(row(&roster, "b").ended_at, None);
+    }
+
+    #[test]
+    fn a_notification_of_an_outcome_or_of_running_makes_a_notice_with_the_rows_tool_use() {
+        let mut shell = task("a");
+        shell.tool_use_id = Some("toolu_1".into());
+        for status in [TaskStatus::Completed, TaskStatus::Running, TaskStatus::Failed] {
+            let (_, notices) = fold_all(&[
+                level(&[shell.clone()]),
+                Ev {
+                    summary: Some("all done"),
+                    ..ev(status)
+                }
+                .on(TaskEdge::Notified, "a"),
+            ]);
+            let notice = notices[1].clone().expect("a notice");
+            assert_eq!(notice.seq, 2);
+            assert_eq!(notice.kind, SessionNoticeKind::Task);
+            assert_eq!(notice.level, NoticeLevel::Notice);
+            assert_eq!(notice.content.as_deref(), Some("all done"));
+            assert_eq!(notice.task_id.as_deref(), Some("a"));
+            assert_eq!(notice.tool_use_id.as_deref(), Some("toolu_1"));
+            let word = serde_json::to_value(status).unwrap();
+            assert_eq!(notice.task_status.as_deref(), word.as_str());
+        }
+    }
+
+    #[test]
+    fn a_notification_makes_no_notice_for_other_statuses_other_edges_or_an_ambient_task() {
+        let mut ambient = task("amb");
+        ambient.ambient = true;
+        let (_, notices) = fold_all(&[
+            level(&[task("a"), ambient]),
+            ev(TaskStatus::Paused).on(TaskEdge::Notified, "a"),
+            ev(TaskStatus::Stopping).on(TaskEdge::Notified, "a"),
+            Ev::default().on(TaskEdge::Notified, "a"),
+            ev(TaskStatus::Completed).on(TaskEdge::Updated, "a"),
+            ev(TaskStatus::Completed).on(TaskEdge::Notified, "amb"),
+        ]);
+        assert!(notices.iter().all(Option::is_none), "{notices:?}");
+    }
+
+    #[test]
+    fn a_turn_ends_the_rows_that_left_the_level_and_leaves_live_and_finished_ones() {
+        let mut roster = TaskRoster::default();
+        roster.update(&level(&[task("a"), task("b"), task("c")]), 1);
+        roster.update(&ev(TaskStatus::Completed).on(TaskEdge::Updated, "c"), 2);
+        roster.update(&level(&[task("a")]), 3);
+        roster.update(&turn_completed(), 4);
+        assert_eq!(row(&roster, "a").status, TaskStatus::Running, "a live row waits");
+        let b = row(&roster, "b");
+        assert_eq!((b.status, b.finished_seq, b.live), (TaskStatus::Ended, Some(4), false));
+        assert_eq!(row(&roster, "c").status, TaskStatus::Completed);
+        assert_eq!(row(&roster, "c").finished_seq, Some(2));
+    }
+
+    #[test]
+    fn the_end_of_a_session_settles_every_unfinished_row_and_arms_the_clear() {
+        for event in [
+            closed(),
+            from_json(serde_json::json!({"type": "session_unavailable", "reason": "gone"})),
+        ] {
+            let (roster, _) = fold_all(&[
+                level(&[task("a"), task("b")]),
+                ev(TaskStatus::Failed).on(TaskEdge::Updated, "b"),
+                event,
+            ]);
+            let a = row(&roster, "a");
+            assert_eq!((a.status, a.live, a.finished_seq), (TaskStatus::Ended, false, Some(3)));
+            assert_eq!(a.summary.as_deref(), Some("stopped with the session"));
+            let b = row(&roster, "b");
+            assert_eq!(b.status, TaskStatus::Failed);
+            assert_eq!(b.summary, None, "a row that had finished keeps its own outcome");
+            assert!(roster.query_start);
+        }
+    }
+
+    #[test]
+    fn the_end_of_a_session_with_no_rows_does_not_arm_the_clear() {
+        let (roster, _) = fold_all(&[closed()]);
+        assert!(!roster.query_start);
+    }
+
+    #[test]
+    fn a_resume_outcome_settles_rows_but_does_not_arm_the_clear() {
+        let outcome = from_json(serde_json::json!({
+            "type": "resume_outcome", "requested_provider_session_id": "old", "status": "rejected",
+            "attached_provider_session_id": null, "forked": false, "detail": null
+        }));
+        let (roster, _) = fold_all(&[level(&[task("a")]), outcome]);
+        let a = row(&roster, "a");
+        assert_eq!(a.status, TaskStatus::Ended);
+        assert_eq!(a.summary.as_deref(), Some("stopped with the session"));
+        assert!(!roster.query_start);
+    }
+
+    #[test]
+    fn the_provider_clock_orders_an_event_and_the_sequence_stands_in_without_one() {
+        let (roster, _) = fold_all(&[
+            AgentDomainEvent::BackgroundTasksChanged {
+                occurred_at: Some(5000),
+                tasks: vec![task("a")],
+            },
+            level(&[task("a"), task("b")]),
+        ]);
+        assert_eq!(row(&roster, "a").started_at, 5000);
+        assert_eq!(row(&roster, "b").started_at, 2);
+    }
+
+    #[test]
+    fn an_event_of_another_kind_changes_no_row() {
+        let mut roster = TaskRoster::default();
+        roster.update(&level(&[task("a")]), 1);
+        let before = roster.clone();
+        let notice = roster.update(
+            &from_json(serde_json::json!({"type": "turn_started", "turn_id": "t"})),
+            2,
+        );
+        assert_eq!(notice, None);
+        assert_eq!(roster, before);
+    }
+
+    #[test]
+    fn at_most_twenty_finished_and_256_unfinished_rows_are_kept_newest_finished_first() {
+        let mut roster = TaskRoster::default();
+        for n in 0..25 {
+            let id = format!("f{n}");
+            roster.update(&Ev::said("s").on(TaskEdge::Started, &id), n as u64 + 1);
+            roster.update(&ev(TaskStatus::Completed).on(TaskEdge::Updated, &id), n as u64 + 100);
+        }
+        assert_eq!(roster.rows.len(), 20);
+        let kept: Vec<_> = roster.rows.iter().map(|row| row.task.task_id.as_str()).collect();
+        let expected: Vec<String> = (5..25).rev().map(|n| format!("f{n}")).collect();
+        assert_eq!(kept, expected);
+        for n in 0..300 {
+            roster.update(&Ev::said("s").on(TaskEdge::Started, &format!("p{n}")), 1000 + n as u64);
+        }
+        let pending = roster.rows.iter().filter(|row| !terminal(row.status)).count();
+        assert_eq!(pending, 256);
+        assert_eq!(roster.rows.len() - pending, 20, "finished rows are capped on their own");
+    }
+
+    #[test]
+    fn a_new_run_of_a_task_starts_its_row_over_and_an_older_run_is_dropped() {
+        let mut roster = TaskRoster::default();
+        let first = Ev {
+            run: Some("2"),
+            summary: Some("first"),
+            ..ev(TaskStatus::Completed)
+        };
+        roster.update(&first.on(TaskEdge::Updated, "a"), 1);
+        let late = Ev {
+            run: Some("1"),
+            summary: Some("late"),
+            ..ev(TaskStatus::Failed)
+        };
+        roster.update(&late.on(TaskEdge::Updated, "a"), 2);
+        let a = row(&roster, "a");
+        assert_eq!((a.status, a.summary.as_deref()), (TaskStatus::Completed, Some("first")));
+        assert_eq!(a.task.run_id.as_deref(), Some("2"));
+        let newer = Ev {
+            run: Some("3"),
+            ..Ev::default()
+        };
+        roster.update(&newer.on(TaskEdge::Started, "a"), 3);
+        let a = row(&roster, "a");
+        assert_eq!(a.task.run_id.as_deref(), Some("3"));
+        assert_eq!(a.status, TaskStatus::Running, "a newer run reopens the row");
+        assert_eq!(a.summary, None);
+        assert_eq!(a.finished_seq, None);
+    }
+
+    #[test]
+    fn a_task_description_carried_by_a_later_event_keeps_what_the_first_one_set() {
+        let mut first = task("a");
+        first.tool_use_id = Some("toolu_9".into());
+        first.workflow_name = Some("wf".into());
+        first.subagent_type = Some("explorer".into());
+        first.parent_task_id = Some("p".into());
+        let mut later = task("a");
+        later.description = String::new();
+        later.task_type = String::new();
+        let (roster, _) = fold_all(&[
+            Ev {
+                task: Some(first),
+                ..Ev::default()
+            }
+            .on(TaskEdge::Started, "a"),
+            Ev {
+                task: Some(later),
+                ..Ev::default()
+            }
+            .on(TaskEdge::Updated, "a"),
+        ]);
+        let a = row(&roster, "a");
+        assert_eq!(a.task.tool_use_id.as_deref(), Some("toolu_9"));
+        assert_eq!(a.task.workflow_name.as_deref(), Some("wf"));
+        assert_eq!(a.task.subagent_type.as_deref(), Some("explorer"));
+        assert_eq!(a.task.parent_task_id.as_deref(), Some("p"));
+        assert_eq!(a.task.description, "task a");
+        assert_eq!(a.task.task_type, "bash");
+    }
+
+    #[test]
+    fn a_provisional_shell_from_a_level_does_not_undo_the_kind_a_started_event_joined() {
+        let mut monitor = task("a");
+        monitor.kind = TaskKind::Monitor;
+        monitor.tool_use_id = Some("toolu_m".into());
+        let (roster, _) = fold_all(&[
+            Ev {
+                task: Some(monitor),
+                ..Ev::default()
+            }
+            .on(TaskEdge::Started, "a"),
+            level(&[task("a")]),
+        ]);
+        let a = row(&roster, "a");
+        assert_eq!(a.task.kind, TaskKind::Monitor);
+        assert_eq!(a.task.tool_use_id.as_deref(), Some("toolu_m"));
+        let (roster, _) = fold_all(&[
+            Ev {
+                task: Some(task("a")),
+                ..Ev::default()
+            }
+            .on(TaskEdge::Started, "a"),
+            Ev {
+                task: Some({
+                    let mut other = task("a");
+                    other.kind = TaskKind::Workflow;
+                    other
+                }),
+                ..Ev::default()
+            }
+            .on(TaskEdge::Updated, "a"),
+        ]);
+        assert_eq!(
+            row(&roster, "a").task.kind,
+            TaskKind::Workflow,
+            "a real event may change the kind"
+        );
+    }
+
+    #[test]
+    fn a_started_edge_without_a_clock_leaves_the_rows_start_where_it_was() {
+        let (roster, _) = fold_all(&[
+            level(&[task("a")]),
+            level(&[task("a"), task("b")]),
+            Ev::said("s").on(TaskEdge::Started, "a"),
+        ]);
+        assert_eq!(row(&roster, "a").started_at, 1);
+    }
+
+    #[test]
+    fn a_live_row_outlasts_idle_ones_when_the_unfinished_cap_is_reached() {
+        let mut roster = TaskRoster::default();
+        for n in 0..256 {
+            roster.update(&Ev::said("s").on(TaskEdge::Started, &format!("idle{n}")), n as u64 + 1);
+        }
+        assert_eq!(roster.rows.len(), 256);
+        roster.update(&level(&[task("late")]), 1000);
+        assert_eq!(roster.rows.len(), 256);
+        assert!(row(&roster, "late").live, "the listed row is kept over an idle one");
+    }
+
+    #[test]
+    fn an_event_that_changes_nothing_does_not_trim_the_roster() {
+        let finished = |n: usize| {
+            let mut record = BackgroundTaskRecord::new(task(&format!("f{n}")), n as i64);
+            record.end(TaskStatus::Completed, n as u64, n as i64);
+            record
+        };
+        let mut roster = TaskRoster {
+            rows: (0..25).map(finished).collect(),
+            query_start: false,
+        };
+        roster.rows[3].task.run_id = Some("2".into());
+        let empty = Ev::default().on(TaskEdge::Updated, "ghost");
+        let stale = Ev {
+            run: Some("1"),
+            ..Ev::said("s")
+        }
+        .on(TaskEdge::Updated, "f3");
+        assert_eq!(roster.update(&empty, 100), None);
+        assert_eq!(roster.update(&stale, 101), None);
+        assert_eq!(
+            roster.rows.len(),
+            25,
+            "an event that is passed over leaves the roster as it is"
+        );
+        roster.update(&Ev::said("s").on(TaskEdge::Updated, "f4"), 102);
+        assert_eq!(roster.rows.len(), 20, "an event that is recorded trims it");
+    }
+
+    #[test]
+    fn a_task_event_without_a_run_takes_the_run_of_its_task_for_the_stale_check() {
+        let mut roster = TaskRoster::default();
+        let mut newer = task("a");
+        newer.run_id = Some("2".into());
+        roster.update(&level(&[newer]), 1);
+        let mut older = task("a");
+        older.run_id = Some("1".into());
+        let from_task = Ev {
+            task: Some(older),
+            ..ev(TaskStatus::Failed)
+        };
+        assert_eq!(roster.update(&from_task.on(TaskEdge::Updated, "a"), 2), None);
+        let a = row(&roster, "a");
+        assert_eq!(
+            a.status,
+            TaskStatus::Running,
+            "the older run in the carried task is refused"
+        );
+        assert_eq!(a.task.run_id.as_deref(), Some("2"));
+    }
+
+    #[test]
+    fn a_notice_carries_the_events_own_summary_and_status_not_the_rows() {
+        let mut roster = TaskRoster::default();
+        roster.update(&level(&[task("a")]), 1);
+        roster.update(&ev(TaskStatus::Stopping).on(TaskEdge::Updated, "a"), 2);
+        roster.update(&Ev::said("row summary").on(TaskEdge::Updated, "a"), 3);
+        let notice = roster
+            .update(&ev(TaskStatus::Running).on(TaskEdge::Notified, "a"), 4)
+            .expect("a notice for a task that runs");
+        assert_eq!(notice.content, None);
+        assert_eq!(notice.task_status.as_deref(), Some("running"));
+        assert_eq!(row(&roster, "a").status, TaskStatus::Stopping);
+    }
+
+    #[test]
+    fn a_task_that_was_already_a_row_is_not_admitted_past_the_256th_listed_of_a_level() {
+        let mut roster = TaskRoster::default();
+        roster.update(&Ev::said("s").on(TaskEdge::Started, "t256"), 1);
+        let tasks: Vec<_> = (0..300).map(|n| task(&format!("t{n}"))).collect();
+        roster.update(&level(&tasks), 2);
+        assert!(
+            roster.rows.iter().all(|row| row.task.task_id != "t256"),
+            "listed 257th, not admitted"
+        );
+        assert_eq!(roster.rows.len(), 256);
+        assert!(roster.rows.iter().any(|row| row.task.task_id == "t255"));
+        assert_eq!(roster.running(), 256);
     }
 }
