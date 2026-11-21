@@ -140,7 +140,13 @@ Give the preview the keys with your key, with `Ctrl+l` from the editor, or by cl
   shorter line gets its last character, and the column comes back on a longer one); every other jump (`gg`, `G`, `}`,
   `{`, `]]`, `[[`, a link inside the document, `H` and `L`) puts it on the line's first character that is not a space,
   a search on the match, and a click on the character you clicked. `w`, `b` and `e` find the same words as they do
-  when selecting. Moving along a line does not move Neovim's cursor; moving to another line does, as `j` does.
+  when selecting. On a line with no text (an image, a diagram, a rule, an empty line in a code block), `w` and `e`
+  go to the first word after it and `b` to the last word before it, as from an empty line in Neovim; `h`, `l`, `0`
+  and `$` do nothing there. Moving along a line does not move Neovim's cursor; moving to another line does, as `j`
+  does.
+- In a block that scrolls sideways (a wide code block, table or formula), a move that takes the cursor past the
+  block's edge scrolls the block just far enough to show it, as Neovim does on a line that does not wrap. `zh` and
+  `zl` scroll without moving the cursor: it hides while its character is out of view, and `v` still starts there.
 - The block wears the colours Neovim gives its Normal-mode cursor: the highlight group your `guicursor` names for
   Normal mode, or, as with Neovim's default `guicursor`, which names none, your text's colours reversed. It does not blink unless that `guicursor` entry sets `blinkwait`, `blinkon` and
   `blinkoff` to times above zero, as in `n-v-c:block-Cursor/lCursor-blinkwait700-blinkon400-blinkoff250`; then it blinks
@@ -202,7 +208,7 @@ Give the preview the keys with your key, with `Ctrl+l` from the editor, or by cl
 Change any of these keys in `init.lua`, as for any plugin, in the `plugin:markdown` table:
 
 ```lua
-eitri.keymap.set("plugin:markdown", "e", "edit.here")
+eitri.keymap.set("plugin:markdown", "i", "edit.here")
 ```
 
 `<prefix> ?` with the preview focused lists its keys first in Eitri's own key list. The actions are `cursor.down`,
@@ -215,7 +221,10 @@ eitri.keymap.set("plugin:markdown", "e", "edit.here")
 viewer is open it answers `cursor.down`, `cursor.up`, `cursor.left`, `cursor.right`, `cursor.line_start`,
 `cursor.line_end` and the page moves itself. If you changed these keys for a release candidate, rename an override
 of `scroll.half_down`, `scroll.half_up`, `scroll.page_down`, `scroll.page_up`, `scroll.top` or `scroll.bottom` to the
-matching `cursor.` action (`cursor.half_down`, ..., `cursor.first`, `cursor.last`): the preview no longer has those `scroll.` actions.
+matching `cursor.` action (`cursor.half_down`, ..., `cursor.first`, `cursor.last`), and one of `viewer.left`,
+`viewer.right`, `viewer.left_edge` or `viewer.right_edge` to `cursor.left`, `cursor.right`, `cursor.line_start` or
+`cursor.line_end`: the preview no longer has those `scroll.` and `viewer.` actions, and ignores an override that
+still names one.
 
 How far a step scrolls, whether scrolling is animated, how long a key such as `g` waits, when the list of following
 keys appears, the letters hint labels use and how the search treats case are settings shared by every plugin page:

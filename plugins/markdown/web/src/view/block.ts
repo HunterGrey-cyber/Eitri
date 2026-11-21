@@ -1,5 +1,5 @@
 import { kit } from "../kit";
-import { charLength, charsBetween, charStart, hasRtl, lowerIndex, oddsOf } from "./chars";
+import { breakRuns, charLength, charsBetween, charStart, hasRtl, joinedGlyph, lowerIndex, oddsOf } from "./chars";
 import { ATOM, SKIP } from "./rows";
 import { eachTextAt, textSpan } from "./text-from";
 
@@ -62,12 +62,19 @@ function readBlink(): Blink | null {
   return wait > 0 && on > 0 && off > 0 ? { wait, on, off } : null;
 }
 
-/** From `o` in `data`, the first offset going `dir` that is not a line break (`o` itself when it is not one); past
- *  the end (or -1) when all are. Pure string work: a code block's line breaks draw nothing, so none is read. */
-function pastBreaks(data: string, o: number, dir: 1 | -1): number {
-  while (o >= 0 && o < data.length && data.charCodeAt(o) === 10) o += dir;
-  return o;
+/** From `o` in `t` (whose data is `data`), the first offset going `dir` that is not a line break (`o` itself when it
+ *  is not one); past the end (or -1) when all are. No layout is read (a code block's line breaks draw nothing), and
+ *  no run of them is walked: a run is jumped by halving over the node's runs (`chars.ts::breakRuns`), found once per
+ *  value of its data, so the halving that visits a long blank run from every row costs the same as a short one. */
+function pastBreaks(t: Text, data: string, o: number, dir: 1 | -1): number {
+  if (o < 0 || o >= data.length || data.charCodeAt(o) !== 10) return o;
+  const { starts, ends } = breakRuns(t, data);
+  const k = lowerIndex(ends, o + 1);
+  if (k < starts.length && starts[k] <= o) return dir > 0 ? ends[k] : starts[k] - 1;
+  return o + dir;
 }
+
+function same(a: Caret, b: Caret): boolean { return a.node === b.node && a.offset === b.offset; }
 
 /**
  * The block cursor: one character of the cursor's band drawn as a block in the editor cursor's colours, with the
@@ -92,8 +99,11 @@ export class BlockCursor {
    *  replaces them without the band or the layout object changing at once), and for `LAYOUT_ATTRS` (a `details`
    *  closed in a table cell folds text off a row whose box stays as it was). */
   private readonly changes: MutationObserver;
-  /** The band the caret sits on while the block is placed, else null: the row `0` and `$` read. */
+  /** The band the caret sits on while the block is placed (drawn, or scrolled out of its sideways block), else
+   *  null: the row `0` and `$` read. */
   private rowBand: Span | null = null;
+  /** The band of the last draw, with or without a character on it: where `w` `b` `e` start on a row with none. */
+  private drawnBand: Span | null = null;
   /** Vim's curswant: the window x `j` `k` and the page moves keep. null until a vertical move reads it from the
    *  caret; Infinity after `$`. Every horizontal move, jump and click clears it. */
   private want: number | null = null;
@@ -122,7 +132,7 @@ export class BlockCursor {
   remove(): void { this.stopBlink(); this.el.remove(); this.changes.disconnect(); this.rowRead = null; }
 
   /** Hides the block, and with it the blink: nothing is scheduled while the block is away. */
-  hide(): void { this.el.hidden = true; this.stopBlink(); }
+  hide(): void { this.el.hidden = true; this.rowBand = null; this.drawnBand = null; this.stopBlink(); }
 
   /** Forgets the caret and the column: the next draw puts the block on the band's first character that is not
    *  blank (a jump's landing). */
@@ -162,28 +172,83 @@ export class BlockCursor {
     if (!c) return false;
     this.caret = c;
     this.counted = null;
+    this.reveal();
     return true;
   }
 
   /** One Normal-mode move of the block's character; true when it moved. `h` `l` stay inside the block element (its
    *  wrapped rows, not past a code line's end); `0` `$` go to the first and the last character of the band's row; `w`
    *  `b` `e` are the kit's walker, which is what visual mode uses. A move clears the column (`$` holds the row's
-   *  end, and a `0` that has nowhere to go still ends it). */
-  move(motion: BlockMotion): boolean {
+   *  end, and a `0` that has nowhere to go still ends it). On a row with no character (`start`, the row's first text
+   *  or the first below it, as `draw`'s fallback) `w` `b` `e` go as from a line with nothing on it and `h` `l` `0` `$`
+   *  do nothing (`fromEmptyRow`). A character the move brings outside its sideways block's scrollport is scrolled
+   *  into it (`reveal`). */
+  move(motion: BlockMotion, start: () => Range | null = () => null): boolean {
     const c = this.caret;
     const band = this.rowBand;
-    if (!band || !this.valid(c)) return false;
+    if (!band || !this.valid(c)) {
+      const words = this.drawnBand !== null && (motion === "w" || motion === "b" || motion === "e");
+      const next = words ? this.fromEmptyRow(motion, start) : null;
+      return next !== null && this.moveTo(next);
+    }
     let next: Caret | null;
     if (motion === "h" || motion === "l") next = this.stepLine(c, motion === "l" ? 1 : -1);
     else if (motion === "0" || motion === "$") next = this.edge(c, band, motion === "$" ? 1 : -1);
     else next = this.byKit(c, motion);
     if (motion === "$") this.want = Number.POSITIVE_INFINITY;
     else if (motion === "0") this.want = null;
-    if (!next || (next.node === c.node && next.offset === c.offset)) return false;
+    if (!next || same(next, c)) return false;
+    this.moveTo(next);
+    if (motion === "$") this.want = Number.POSITIVE_INFINITY;
+    return true;
+  }
+
+  private moveTo(next: Caret): true {
     this.counted = null;
     this.caret = next;
-    if (motion !== "$") this.want = null;
+    this.want = null;
+    this.reveal();
     return true;
+  }
+
+  /* `w` `b` `e` from a row with no drawn character (an image, a diagram, display math, a rule, an empty code line, a
+     cell of inline math alone), as Neovim's from an empty line: `w` to the first word that starts after the row, `e`
+     to the end of the first word after it, `b` to the start of the last word before it. They are asked from the
+     first drawn character after the row (`start`'s, which passes white space over) and the last before it: one that
+     starts (ends) a word is the landing itself, else the kit's walker goes on from it. */
+  private fromEmptyRow(motion: "w" | "b" | "e", start: () => Range | null): Caret | null {
+    const s = start();
+    const after = s ? this.caretFrom(s.startContainer, s.startOffset) : null;
+    if (motion === "b") {
+      let before = after ? this.stepDrawn(after, -1) : this.lastDrawn();
+      while (before && this.blankAt(before)) before = this.stepDrawn(before, -1);
+      return before && (this.startsWord(before) ? before : this.byKit(before, "b"));
+    }
+    if (!after) return null;
+    if (motion === "w") return this.startsWord(after) ? after : this.byKit(after, "w");
+    return this.endsWord(after) ? after : this.byKit(after, "e");
+  }
+
+  private blankAt(c: Caret): boolean {
+    return /\s/u.test(String.fromCodePoint(c.node.data.codePointAt(c.offset) ?? 0));
+  }
+
+  /** Whether the word walker starts a word at `c`: after nothing, after white space, or where its `w` from the drawn
+   *  character before lands. */
+  private startsWord(c: Caret): boolean {
+    const p = this.stepDrawn(c, -1);
+    if (!p || this.blankAt(p)) return true;
+    const w = this.byKit(p, "w");
+    return w !== null && same(w, c);
+  }
+
+  /** Whether the word walker ends a word at `c`: before nothing, before white space, or where its `w` lands on the
+   *  drawn character after. */
+  private endsWord(c: Caret): boolean {
+    const n = this.stepDrawn(c, 1);
+    if (!n || this.blankAt(n)) return true;
+    const w = this.byKit(c, "w");
+    return w !== null && same(w, n);
   }
 
   /** The block to visual mode's cursor character, from the selection: the one before the focus when the focus comes
@@ -197,11 +262,7 @@ export class BlockCursor {
     const forward = from.comparePoint(focusNode, s.focusOffset) > 0;
     const at = this.textCaret(focusNode, s.focusOffset);
     const c = !at ? this.lastDrawn() : forward ? this.stepDrawn(at, -1) : this.drawnFrom(at);
-    if (!c) return false;
-    this.caret = c;
-    this.counted = null;
-    this.want = null;
-    return true;
+    return c !== null && this.moveTo(c);
   }
 
   /** The block to visual mode's cursor as the kit gives it (`at`, a place as `motion` answers: just before the
@@ -216,18 +277,43 @@ export class BlockCursor {
       this.reset();
       return true;
     }
-    this.caret = c;
-    this.counted = null;
-    this.want = null;
-    return true;
+    return this.moveTo(c);
   }
 
-  /** A collapsed range before the block's character while the block shows, else null. */
+  /** A collapsed range before the block's character while the block is on the band's row, else null: drawn, or
+   *  scrolled out of its sideways block (`$` past the scrollport, `zl`), where the cursor still is. */
   caretRange(): Range | null {
-    if (this.el.hidden || !this.valid(this.caret)) return null;
+    if (!this.rowBand || !this.valid(this.caret)) return null;
     const r = document.createRange();
     r.setStart(this.caret.node, this.caret.offset);
     return r;
+  }
+
+  /** Scrolls the sideways block (`.mdp-wide`) the caret's character is in by the least that brings the block's box
+   *  (the character at its `MIN_WIDTH_EM` width) inside the scrollport, when the character is outside it, as
+   *  Neovim's 'sidescroll' follows the cursor along a line that does not wrap (the held column moving with the text);
+   *  true when it scrolled. A `zh` or `zl` that scrolls the character out is not followed: the block hides until a
+   *  move brings it back. */
+  reveal(): boolean {
+    const c = this.caret;
+    const parent = this.valid(c) ? c.node.parentElement : null;
+    const scroller = parent?.closest<HTMLElement>(SCROLLER);
+    const r = scroller && this.root.contains(scroller) ? this.rectOf(c!) : null;
+    const clip = r && this.clipBox(parent!);
+    if (!r || !clip || (r.left >= clip.left - 0.5 && r.right <= clip.right + 0.5)) return false;
+    const width = this.widthOf(r, getComputedStyle(parent!));
+    const left = r.left - (width - r.width) / 2;
+    const from = scroller!.scrollLeft;
+    scroller!.scrollLeft = from + (left < clip.left ? left - clip.left : left + width - clip.right);
+    // The column `j` and `k` keep is the caret's window x: it moves with the text, as Neovim's curswant is a column.
+    if (this.want !== null && Number.isFinite(this.want)) this.want -= scroller!.scrollLeft - from;
+    return true;
+  }
+
+  /** The block's width over a character's box `r` in the style `cs`: the glyph's, or `MIN_WIDTH_EM` of its font
+   *  size. */
+  private widthOf(r: DOMRect, cs: CSSStyleDeclaration): number {
+    return Math.max(r.width, MIN_WIDTH_EM * (parseFloat(cs.fontSize) || r.height));
   }
 
   /** The block's index among the drawn characters of its row, once it has been on one. */
@@ -239,6 +325,7 @@ export class BlockCursor {
   draw(band: { top: number; bottom: number } | null, fallback: () => Range | null): void {
     this.el.hidden = true;
     const c = band ? this.place(band, fallback) : null;
+    this.drawnBand = band;
     this.rowBand = c && band ? band : null;
     if (c && band) this.paint(c, band);
     if (this.el.hidden || !c) this.stopBlink();
@@ -278,12 +365,14 @@ export class BlockCursor {
   /* Where the block goes on `band`. A caret chosen since the last draw (a move, a find, a click, the column `j` keeps)
      that is on the band stays, and its index is counted again. A caret that is as it was, on a band the layout made
      again, and one that is gone or off the band (a render replaced its text, the row re-wrapped), go to the saved index
-     of the row, clamped to its last character, even where the caret's own text node survived the render. */
+     of the row, clamped to its last character, even where the caret's own text node survived the render. The same
+     band with nothing changed under the root keeps the caret unread; a change (a disclosure closed over the caret's
+     text, which leaves the band and the node as they were) has it placed again. */
   private place(band: { top: number; bottom: number }, fallback: () => Range | null): Caret | null {
     const k = this.counted;
     const c = this.caret;
     const unmoved = k !== null && c !== null && k.node === c.node && k.offset === c.offset;
-    if (unmoved && k.band === band && this.valid(c)) return c;
+    if (unmoved && k.band === band && this.valid(c) && this.unchanged()) return c;
     if (!unmoved && c && this.valid(c) && this.inBand(c, band)) return this.settle(c, band);
     const start = fallback();
     const blank = start ? this.caretFrom(start.startContainer, start.startOffset) : null;
@@ -373,7 +462,8 @@ export class BlockCursor {
      block it scrolls in; as tall as the character's line box (its own box when the line box has no height, as a
      superscript's has none), within the band. Inside, the character again with the same font, on the text's baseline:
      a line box exactly as tall as the glyph's own box puts the baseline where the text has it. Copied as text: the
-     character is the document's. */
+     character is the document's, with a zero-width joiner on a side where a joining script connects it to its
+     neighbour (`chars.ts::joinedGlyph`), so it keeps the form it has in its word, set in the letter's direction. */
   private paint(c: Caret, band: { top: number; bottom: number }): void {
     const r = this.rectOf(c);
     const parent = c.node.parentElement;
@@ -381,7 +471,7 @@ export class BlockCursor {
     const clip = this.clipBox(parent);
     if (clip && (r.left < clip.left - 0.5 || r.right > clip.right + 0.5)) return;
     const cs = getComputedStyle(parent);
-    const width = Math.max(r.width, MIN_WIDTH_EM * (parseFloat(cs.fontSize) || r.height));
+    const width = this.widthOf(r, cs);
     const left = Math.max(r.left - (width - r.width) / 2, clip?.left ?? -Infinity);
     const right = Math.min(r.left + (width + r.width) / 2, clip?.right ?? Infinity);
     const line = parseFloat(cs.lineHeight);
@@ -392,7 +482,10 @@ export class BlockCursor {
     Object.assign(this.el.style, {
       left: `${left + window.scrollX}px`, top: `${top}px`, width: `${right - left}px`, height: `${bottom - top}px`,
     });
-    this.glyph.textContent = c.node.data.slice(c.offset, c.offset + charLength(c.node, c.offset));
+    this.glyph.textContent = joinedGlyph(c.node.data, c.offset, charLength(c.node, c.offset));
+    // The joiners take the direction around them: in a left-to-right copy they would be runs of their own, apart from
+    // a right-to-left letter, and WebKit shapes the letter alone.
+    this.glyph.style.direction = hasRtl(this.glyph.textContent) ? "rtl" : "ltr";
     Object.assign(this.glyph.style, {
       left: `${r.left - left}px`, top: `${r.top + window.scrollY - top}px`, height: `${r.height}px`, lineHeight: `${r.height}px`,
       fontFamily: cs.fontFamily, fontSize: cs.fontSize, fontWeight: cs.fontWeight, fontStyle: cs.fontStyle,
@@ -660,7 +753,7 @@ export class BlockCursor {
     const data = t.data;
     const code = this.inCode(t);
     for (let o = charStart(t, i); ; o += charLength(t, o)) {
-      if (code) o = pastBreaks(data, o, 1);
+      if (code) o = pastBreaks(t, data, o, 1);
       if (o >= data.length) return null;
       const r = this.rectOf({ node: t, offset: o });
       if (r) return { offset: o, r };
@@ -686,7 +779,7 @@ export class BlockCursor {
    *  rows' cells, and all are read), else the nearest source-mapped block, else the nearest block-level element. Read
    *  once per band and layout, while no text under the root changes: every key on the row uses the same reading. */
   private row(t: Text, band: Span): Row {
-    if (this.changes.takeRecords().length > 0) this.rowRead = null;
+    this.unchanged();
     const scope = this.rowScope(t);
     const layout = this.layout();
     const k = this.rowRead;
@@ -702,6 +795,13 @@ export class BlockCursor {
     const row: Row = { band, layout, scope, segs, at: new Map(segs.map((s, i) => [s.t, i])), before: [], drawn: new Map(), rtl: null };
     this.rowRead = row;
     return row;
+  }
+
+  /** Whether nothing under the root changed since the last row was read (the observer's pending records drained
+   *  here, dropping that row when there are any). */
+  private unchanged(): boolean {
+    if (this.changes.takeRecords().length > 0) this.rowRead = null;
+    return this.rowRead !== null;
   }
 
   private rowScope(t: Text): Element {
@@ -733,7 +833,7 @@ export class BlockCursor {
     const code = this.inCode(t);
     for (let o = charStart(t, i); ; o = charStart(t, o - 1)) {
       if (code && data.charCodeAt(o) === 10) {
-        o = pastBreaks(data, o, -1);
+        o = pastBreaks(t, data, o, -1);
         if (o >= 0) o = charStart(t, o);
       }
       if (o < 0) return null;

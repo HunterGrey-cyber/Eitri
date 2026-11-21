@@ -846,11 +846,12 @@ export class Preview {
 
   /** One move of the block's character (`h` `l` `w` `b` `e` `0` `$`); true when it moved. Inside the row the band
    *  stays and nothing is sent to nvim; onto another row the cursor moves there as a jump does (the page scrolls only
-   *  when the row is outside the margins, nvim hears of it as of any move). */
+   *  when the row is outside the margins, nvim hears of it as of any move). From a row with no text `w` `b` `e` start
+   *  at the first text after it (`rowStart`) or the last before it. */
   blockMove(motion: BlockMotion): boolean {
     if (!this.blockOn() || !this.cursorBand()) return false;
     this.drawBlock();
-    if (!this.block.move(motion)) return false;
+    if (!this.block.move(motion, () => this.rowStart())) return false;
     const box = this.block.caretBox();
     const b = this.cursorBand();
     const mid = box ? (box.top + box.bottom) / 2 + window.scrollY : null;

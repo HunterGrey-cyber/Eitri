@@ -3,6 +3,7 @@ import type { InstallOptions } from "../kit";
 import type { Bridge, EditorView } from "../protocol";
 import type { MermaidRunner } from "../render/mermaid";
 import { installFakeLayout, type FakeLayout } from "./fakelayout";
+import type { BlockMotion } from "./block";
 import { installKeys } from "./keys";
 import { Preview } from "./preview";
 
@@ -198,6 +199,100 @@ describe("w b e", () => {
     motion = () => null;
     expect(p.blockMove("w")).toBe(false);
     expect(glyph()).toBe("h");
+  });
+});
+
+/** A word walker over the page's text in document order, standing in for the kit's: a word is a run of letters and
+ *  digits or a run of other characters that are not blank; each paragraph's text is a line of its own, unless
+ *  `glued` (text going on past an inline image, which the kit's walker passes over as if it were not there). */
+function words(glued = false): Motion {
+  return (at, m) => {
+    const flat: (Place & { ch: string })[] = [];
+    const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
+    let last: Element | null = null;
+    for (let n = walker.nextNode() as Text | null; n; n = walker.nextNode() as Text | null) {
+      const block = n.parentElement!.closest("p, pre");
+      if (!block) continue;
+      if (!glued && last && block !== last) flat.push({ node: n, offset: -1, ch: "\n" });
+      last = block;
+      for (let i = 0; i < n.data.length; i++) flat.push({ node: n, offset: i, ch: n.data[i] });
+    }
+    const kind = (k: number) => (/\s/.test(flat[k].ch) ? 0 : /\w/.test(flat[k].ch) ? 1 : 2);
+    let k = flat.findIndex((c) => c.node === at.node && c.offset === at.offset);
+    if (k < 0) return null;
+    const blank = (j: number) => j >= 0 && j < flat.length && kind(j) === 0;
+    if (m === "w") {
+      const own = kind(k);
+      if (own !== 0) while (k < flat.length && kind(k) === own) k++;
+      while (blank(k)) k++;
+    } else if (m === "e") {
+      k++;
+      while (blank(k)) k++;
+      if (k < flat.length) { const own = kind(k); while (k + 1 < flat.length && kind(k + 1) === own) k++; }
+    } else if (m === "b") {
+      k--;
+      while (blank(k)) k--;
+      if (k >= 0) { const own = kind(k); while (k > 0 && kind(k - 1) === own) k--; }
+    } else return null;
+    return k >= 0 && k < flat.length ? { node: flat[k].node, offset: flat[k].offset } : null;
+  };
+}
+
+describe("w b e from a row with no text", () => {
+  it("go as from an empty line: w to the next word, e to its end, b to the start of the word before", () => {
+    show(paras(["hello world", "---", "next word more"]));
+    p.onFocus(true);
+    motion = words();
+    const onRule = () => { p.jumpCursorTo(rowTop(root.querySelector("hr")!)); expect(shown()).toBe(false); };
+    onRule();
+    expect(p.blockMove("w")).toBe(true);
+    expect([glyph(), p.block.index(), bandTop()]).toEqual(["n", 0, 60]);
+    onRule();
+    expect(p.blockMove("e")).toBe(true);
+    expect([glyph(), p.block.index(), bandTop()]).toEqual(["t", 3, 60]);
+    onRule();
+    expect(p.blockMove("b")).toBe(true);
+    expect([glyph(), p.block.index(), bandTop()]).toEqual(["w", 6, 0]);
+    // h l 0 $ still have nothing to move.
+    onRule();
+    expect(["l", "h", "0", "$"].map((m) => p.blockMove(m as BlockMotion))).toEqual([false, false, false, false]);
+  });
+
+  it("go on with the kit's walker from a first character after the row inside a word, and the last before", () => {
+    show(paras(["hello", "---", "world more"]));
+    p.onFocus(true);
+    motion = words(true);
+    const onRule = () => p.jumpCursorTo(rowTop(root.querySelector("hr")!));
+    onRule();
+    expect(p.blockMove("w")).toBe(true);
+    expect([glyph(), p.block.index()]).toEqual(["m", 6]);
+    onRule();
+    expect(p.blockMove("e")).toBe(true);
+    expect([glyph(), p.block.index()]).toEqual(["d", 4]);
+    onRule();
+    expect(p.blockMove("b")).toBe(true);
+    expect([glyph(), p.block.index(), bandTop()]).toEqual(["h", 0, 0]);
+  });
+
+  it("from an empty code line, and nowhere to go past the document's ends", () => {
+    show("```\nab cd\n\nef gh\n```");
+    p.onFocus(true);
+    motion = words();
+    const pre = rowTop(root.querySelector("pre")!);
+    const onEmpty = () => { p.jumpCursorTo(pre + 21); expect(shown()).toBe(false); };
+    onEmpty();
+    p.blockMove("w");
+    expect([glyph(), bandTop()]).toEqual(["e", pre + 40]);
+    onEmpty();
+    p.blockMove("b");
+    expect([glyph(), bandTop()]).toEqual(["c", pre]);
+    onEmpty();
+    p.blockMove("e");
+    expect(glyph()).toBe("f");
+    show(paras(["only", "---"]));
+    p.jumpCursorTo(rowTop(root.querySelector("hr")!));
+    expect(p.blockMove("w")).toBe(false);
+    expect(p.blockMove("e")).toBe(false);
   });
 });
 

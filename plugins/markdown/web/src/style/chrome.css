@@ -83,23 +83,49 @@ div.mdp-box {
   pointer-events: none;
 }
 
-/* The cursor's row band and visual mode's paint lie over the text, so they blend: on a dark scheme only what is
-   darker than the paint (the background) takes its colour, on a light one only what is lighter, and the text keeps
-   its own colour either way. The page sets data-scheme from --nv-color-scheme. Visual mode paints in the selection
-   colour (--nv-cursorline, from the editor's Visual); the band is the editor's own CursorLine colour, so the two do
-   not read alike. */
-.mdp-cursor-line, .mdp-visual-band, .mdp-visual-box {
+/* Visual mode's paint lies over the text, so it blends: on a dark scheme only what is darker than the paint (the
+   background) takes its colour, on a light one only what is lighter, and the text keeps its own colour either way.
+   The page sets data-scheme from --nv-color-scheme. It paints in the selection colour (--nv-cursorline, from the
+   editor's Visual). */
+.mdp-visual-band, .mdp-visual-box {
   position: absolute;
   pointer-events: none;
   background-color: var(--nv-cursorline);
   mix-blend-mode: lighten;
 }
 
+.mdp-visual-band[data-scheme="light"], .mdp-visual-box[data-scheme="light"] {
+  mix-blend-mode: darken;
+}
+
+/* The cursor's row band is the editor's own CursorLine colour (so it does not read as visual mode's selection), and a
+   background, as Neovim draws CursorLine behind the characters: its first layer is beneath the page's content
+   (z-index -1 in the page's stacking context, above only the page's background, which .mdp-root leaves to html so
+   the layer shows through), in the colour as it is, darker or lighter than Normal, with the text drawn over it in its
+   own colour. Boxes with a background of their own (a code block, a header cell, inline code) cover that layer, so a
+   second one over the content blends as visual mode's paint does; where CursorLine is lighter than Normal on a dark
+   scheme (darker on a light one), as most themes have it, the two give the same colour over the page. */
 .mdp-cursor-line {
+  position: absolute;
+  pointer-events: none;
+}
+
+.mdp-cursor-line::before, .mdp-cursor-line::after {
+  content: "";
+  position: absolute;
+  inset: 0;
   background-color: var(--nv-editor-cursorline, var(--nv-cursorline));
 }
 
-.mdp-cursor-line[data-scheme="light"], .mdp-visual-band[data-scheme="light"], .mdp-visual-box[data-scheme="light"] {
+.mdp-cursor-line::before {
+  z-index: -1;
+}
+
+.mdp-cursor-line::after {
+  mix-blend-mode: lighten;
+}
+
+.mdp-cursor-line[data-scheme="light"]::after {
   mix-blend-mode: darken;
 }
 

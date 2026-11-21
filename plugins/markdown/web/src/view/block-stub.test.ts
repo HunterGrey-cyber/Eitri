@@ -342,6 +342,91 @@ describe("a disclosure closing in a table cell", () => {
   });
 });
 
+describe("a disclosure closing over the block's own text", () => {
+  it("takes the block off the folded text at the next draw of the same band", () => {
+    const root = mount("<table><tbody><tr><td>abc</td><td><details open><summary>S</summary>XYZ</details></td></tr>" +
+      "</tbody></table>");
+    const [left, right] = root.querySelectorAll("td");
+    boxes.set(root.querySelector("tr")!, rect(0, 0, 190, 60));
+    boxes.set(left, rect(0, 0, 90, 60));
+    boxes.set(right, rect(100, 0, 90, 60));
+    const abc = put(left.firstChild!, run(3, 0, 20));
+    put(root.querySelector("summary")!.firstChild!, run(1, 100, 0));
+    const details = root.querySelector("details")!;
+    const xyz = put(details.lastChild!, run(3, 100, 20));
+    const band = { top: 20, bottom: 40 };
+    const block = new BlockCursor(root);
+    block.draw(band, () => at(abc, 0));
+    expect(block.move("$")).toBe(true);
+    block.draw(band, () => at(abc, 0));
+    const where = () => [block.caretRange()!.startContainer, block.caretRange()!.startOffset];
+    expect(where()).toEqual([xyz, 2]);
+    // The band object, the row's size and the caret's node all stay; only the attribute changes.
+    details.open = false;
+    spots.delete(xyz);
+    block.draw(band, () => at(abc, 0));
+    expect(where()).toEqual([abc, 2]);
+    expect(block.el.hidden).toBe(false);
+    block.remove();
+  });
+});
+
+describe("the first text below a row with none, in a section with a cell spanning rows", () => {
+  /** A table of `rows` rows of 20 px: the first holds an image beside a cell spanning five rows whose text is drawn
+   *  in its third row (vertically centred), the second has text in its right cell, the rest text in both. */
+  function table(rows: number) {
+    const rest = Array.from({ length: rows - 2 }, (_, i) => `<tr><td>l${i}</td><td>r${i}</td></tr>`).join("");
+    const root = mount(`<table><tbody><tr><td><img></td><td rowspan="5">mid</td></tr><tr><td>near</td></tr>${rest}` +
+      "</tbody></table>");
+    const trs = [...root.querySelectorAll("tr")];
+    boxes.set(root.querySelector("tbody")!, rect(0, 0, 190, 20 * rows));
+    trs.forEach((tr, i) => boxes.set(tr, rect(0, 20 * i, 190, 20)));
+    const [image, spanning] = trs[0].querySelectorAll("td");
+    boxes.set(image, rect(0, 0, 90, 20));
+    boxes.set(spanning, rect(100, 0, 90, 100));
+    put(spanning.firstChild!, run(3, 100, 40));
+    const near = put(trs[1].querySelector("td")!.firstChild!, run(4, 0, 20));
+    trs.slice(2).forEach((tr, i) => {
+      const cells = [...tr.querySelectorAll("td")];
+      boxes.set(cells[0], rect(0, 20 * (i + 2), 90, 20));
+      put(cells[0].firstChild!, run(2, 0, 20 * (i + 2)));
+      if (i + 2 < 5) return;
+      boxes.set(cells[1], rect(100, 20 * (i + 2), 90, 20));
+      put(cells[1].firstChild!, run(2, 100, 20 * (i + 2)));
+    });
+    return { root, near };
+  }
+
+  it("is the nearest row's, not a spanning cell's drawn further down", () => {
+    const { root, near } = table(8);
+    const start = textFrom(root, { top: 0, bottom: 20 })!;
+    expect([start.startContainer, start.startOffset]).toEqual([near, 0]);
+  });
+
+  it("reads the cells down to the first row with text, however many rows follow", () => {
+    const reads = (rows: number) => {
+      const { root } = table(rows);
+      let cells = 0;
+      const box = Element.prototype.getBoundingClientRect;
+      Element.prototype.getBoundingClientRect = function (this: Element) {
+        if (this.tagName === "TD") cells++;
+        return box.call(this);
+      };
+      try {
+        expect(textFrom(root, { top: 0, bottom: 20 })!.startContainer.textContent).toBe("near");
+      } finally {
+        Element.prototype.getBoundingClientRect = box;
+      }
+      root.remove();
+      return cells;
+    };
+    const few = reads(12);
+    // Collecting and sorting every cell below the band reads each: 2 a row here.
+    expect(reads(1000)).toBe(few);
+    expect(few).toBeLessThanOrEqual(8);
+  });
+});
+
 describe("visual mode's cursor at a line's end", () => {
   it("keeps a line's own last character, and leaves no block on a line that has none", () => {
     const root = mount("<p>one<br><img><br>two</p><p>end</p><p><img></p>");

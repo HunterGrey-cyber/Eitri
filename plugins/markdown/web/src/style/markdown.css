@@ -34,11 +34,10 @@ body {
 }
 
 /* The content root. Room below the last block lets the end of the document come to the top, as nvim's own window
-   can scroll its last line up, so the two stay in step to the end. */
+   can scroll its last line up, so the two stay in step to the end. Its background and text colour are html's: a
+   background of its own would cover the cursor's band, which is drawn beneath the content (chrome.css). */
 .mdp-root {
   position: relative;
-  background-color: var(--nv-bg);
-  color: var(--nv-fg);
   margin-bottom: calc(100vh - var(--mdp-line));
 }
 

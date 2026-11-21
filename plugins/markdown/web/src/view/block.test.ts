@@ -268,7 +268,9 @@ describe("the block cursor", () => {
     sheet(readFileSync(resolve(here, "../style/chrome.css"), "utf8"));
     show("hello\n\nnext");
     p.onFocus(true);
-    expect(getComputedStyle(band()).backgroundColor).toBe("var(--nv-editor-cursorline, var(--nv-cursorline))");
+    // The colour is on the band's two layers (`style.test.ts`), the band itself paints none.
+    expect(band().hidden).toBe(false);
+    expect(getComputedStyle(band()).backgroundColor).not.toContain("var(");
     for (const cls of ["mdp-visual-band", "mdp-visual-box"]) {
       const el = document.createElement("div");
       el.className = cls;
@@ -345,6 +347,29 @@ function costOf(moves: () => void): Cost {
   } finally {
     for (const undo of restore.reverse()) undo();
     Error.stackTraceLimit = limit;
+  }
+  return n;
+}
+/** How many character codes the block's own code reads from strings (`charCodeAt`) during `moves`: a loop over a
+ *  node's data that asks the layout nothing (a run of line breaks passed one by one) shows here, not in `costOf`. */
+function codeReads(moves: () => void): number {
+  const real = String.prototype.charCodeAt;
+  let n = 0;
+  let busy = false;
+  String.prototype.charCodeAt = function (this: string, i: number) {
+    if (!busy) {
+      // The stack is read with the counting off: reading it decodes source maps, which reads character codes too.
+      busy = true;
+      try {
+        if (/\/view\/(block|text-from|chars)\.ts/.test(new Error().stack?.split("\n")[2] ?? "")) n++;
+      } finally { busy = false; }
+    }
+    return real.call(this, i);
+  };
+  try {
+    moves();
+  } finally {
+    String.prototype.charCodeAt = real;
   }
   return n;
 }
@@ -477,6 +502,25 @@ describe("the cost of the block", () => {
       expect(long.reads).toBeLessThanOrEqual(100);
       noMoreThan(long, { ...short, reads: 1.5 * short.reads, rects: 1.5 * short.rects, chars: 1.5 * short.chars }, 0);
     }
+  });
+
+  it("passes a long run of line breaks by halving, not by a walk over it, from each row it visits", () => {
+    // A few lines, then the run at the fence's end: every row's halving and its last-character search meet the run.
+    const top = Array.from({ length: 4 }, (_, i) => `top ${i}`).join("\n");
+    const fence = (blank: number) => `\`\`\`\n${top}${"\n".repeat(blank)}\n\`\`\``;
+    const cost = (blank: number) => {
+      show(fence(blank));
+      p.onFocus(true);
+      p.jumpCursorTo(layout.boxOf(root.querySelector("pre")!)!.top + 1);
+      expect(glyph().textContent).toBe("t");
+      const n = codeReads(() => p.moveRows(1));
+      expect(p.cursorBand()!.top).toBe(layout.boxOf(root.querySelector("pre")!)!.top + 20);
+      return n;
+    };
+    const short = cost(100);
+    // A walk over the run from each probe that lands in it: 436 reads with 100 line breaks, 150,458 with 10,000.
+    expect(cost(10000)).toBeLessThanOrEqual(short + 20);
+    expect(short).toBeLessThanOrEqual(200);
   });
 
   it("reads only the row's characters for its direction: a Hebrew line in one text node leaves the others halved", () => {
@@ -650,6 +694,104 @@ describe("a character is a grapheme cluster", () => {
     place("e", 1);
     expect(glyph().textContent).toBe("é");
     expect(p.block.caretRange()!.startOffset).toBe(1);
+  });
+});
+
+describe("a block that scrolls sideways follows the block, as Neovim's 'sidescroll' follows the cursor", () => {
+  const wide = (lines: string[]) => show(`\`\`\`\n${lines.join("\n")}\n\`\`\`\n\nnext`);
+  const pre = () => root.querySelector<HTMLElement>("pre.mdp-wide")!;
+
+  it("scrolls by the least that shows the character at its 0.6 em width, for $ and 0, l and w", () => {
+    wide(["x".repeat(100)]);
+    p.onFocus(true);
+    expect(pre().scrollLeft).toBe(0);
+    expect(p.blockMove("$")).toBe(true);
+    // The last `x` is at 792 to 800 px and its block 0.8 px wider each side: 200.8 px brings its right edge to 600.
+    expect(pre().scrollLeft).toBeCloseTo(200.8);
+    expect(block().hidden).toBe(false);
+    expect(glyph().textContent).toBe("x");
+    expect(box().left + box().width).toBeCloseTo(600);
+    expect(p.blockMove("0")).toBe(true);
+    expect(block().hidden).toBe(false);
+    expect(box().left).toBeCloseTo(0);
+    // l along a line inside the scrollport scrolls nothing; past its right edge, a character's width at a time.
+    for (let i = 0; i < 73; i++) p.blockMove("l");
+    expect(pre().scrollLeft).toBeCloseTo(-0.8);
+    p.blockMove("l");
+    expect(block().hidden).toBe(false);
+    expect(pre().scrollLeft).toBeCloseTo(0.8);
+  });
+
+  it("keeps the column for j and k with the text it scrolled, not with the window", () => {
+    wide(["x".repeat(100), "y".repeat(100), "z".repeat(100)]);
+    p.onFocus(true);
+    // A find's match past the scrollport: the block is there, hidden, until a move.
+    place("x", 90);
+    expect(block().hidden).toBe(true);
+    p.moveRows(1);
+    expect(glyph().textContent).toBe("y");
+    expect(p.block.index()).toBe(90);
+    expect(block().hidden).toBe(false);
+    p.moveRows(1);
+    expect(p.block.index()).toBe(90);
+    expect(block().hidden).toBe(false);
+  });
+
+  it("is not followed for zh and zl, and v then starts at the block's character, scrolled out or not", () => {
+    wide(["x".repeat(100)]);
+    p.onFocus(true);
+    p.blockMove("$");
+    const scrollTo = (x: number) => { pre().scrollLeft = x; pre().dispatchEvent(new Event("scroll")); };
+    scrollTo(0);
+    expect(block().hidden).toBe(true);
+    expect(p.block.caretRange()!.startOffset).toBe(99);
+    expect(p.visualStart()!.startOffset).toBe(99);
+    expect(pre().scrollLeft).toBe(0);
+  });
+});
+
+describe("a code line of spaces alone", () => {
+  it("has the block on a space: j onto it, a click on its second space, v from it", () => {
+    show("```\nfoo\n   \nbar\n```");
+    p.onFocus(true);
+    p.moveRows(1);
+    expect(block().hidden).toBe(false);
+    expect(glyph().textContent).toBe(" ");
+    expect(p.block.index()).toBe(0);
+    expect(p.visualStart()!.startOffset).toBe(4);
+    const top = layout.boxOf(root.querySelector("pre")!)!.top;
+    p.cursorToPoint(5, top + 30);
+    expect(p.block.index()).toBe(1);
+    expect(p.cursorBand()!.top).toBe(top + 20);
+    // A line with nothing at all still has the band alone.
+    show("```\nfoo\n\nbar\n```");
+    p.jumpCursorTo(top + 21);
+    expect(block().hidden).toBe(true);
+  });
+});
+
+describe("a letter of a joining script", () => {
+  it("is copied with a zero-width joiner on each side it connects to its neighbour", () => {
+    const zwj = "\u200d";
+    show("\u0628\u062a\u0628 \u0627\u0628 \u0628\u064e\u062a x\n\nnext");
+    p.onFocus(true);
+    const copy = (text: string, offset: number) => { place(text, offset); return glyph().textContent; };
+    // Beh teh beh: the middle letter connects on both sides, the first only to the next, the last only back.
+    expect(copy("\u0628\u062a\u0628", 1)).toBe(`${zwj}\u062a${zwj}`);
+    expect(copy("\u0628\u062a\u0628", 0)).toBe(`\u0628${zwj}`);
+    expect(copy("\u0628\u062a\u0628", 2)).toBe(`${zwj}\u0628`);
+    // Alef connects only to the letter before it: nothing on its left, and the beh after it starts a new form.
+    expect(copy("\u0627\u0628", 0)).toBe("\u0627");
+    expect(copy("\u0627\u0628", 1)).toBe("\u0628");
+    // A mark is passed over: beh with its fatha connects to the teh after them.
+    expect(copy("\u0628\u064e\u062a", 0)).toBe(`\u0628\u064e${zwj}`);
+    expect(copy("\u0628\u064e\u062a", 2)).toBe(`${zwj}\u062a`);
+    expect(copy("x", 0)).toBe("x");
+    expect(glyph().style.direction).toBe("ltr");
+    // In the letter's direction: a left-to-right copy makes the joiners runs of their own, and WebKit then shapes
+    // the letter alone, in its isolated form.
+    copy("\u0628\u062a\u0628", 1);
+    expect(glyph().style.direction).toBe("rtl");
   });
 });
 

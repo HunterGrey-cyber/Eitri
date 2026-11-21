@@ -50,12 +50,13 @@ describe("the page's stylesheets", () => {
   });
 
   it("colour the page's background and text together, from the theme", () => {
-    for (const selector of ["html", ".mdp-root"]) {
-      const rule = rules(css["markdown.css"]).find((r) => r.selector === selector)!;
-      expect(rule, selector).toBeDefined();
-      expect(rule.body, selector).toMatch(/background-color:\s*var\(--nv-bg\)/);
-      expect(rule.body, selector).toMatch(/(^|[^-])color:\s*var\(--nv-fg\)/);
-    }
+    const rule = rules(css["markdown.css"]).find((r) => r.selector === "html")!;
+    expect(rule.body).toMatch(/background-color:\s*var\(--nv-bg\)/);
+    expect(rule.body).toMatch(/(^|[^-])color:\s*var\(--nv-fg\)/);
+    // The content root takes both from html: a background of its own would cover the cursor's band beneath it.
+    const content = rules(all).filter((r) => r.selector.split(",").some((s) => s.trim() === ".mdp-root"));
+    expect(content.length).toBeGreaterThan(0);
+    for (const r of content) expect(r.body).not.toMatch(/background|(^|[^-])color:/);
     expect(rules(css["markdown.css"]).find((r) => r.selector === "html")!.body).toMatch(/color-scheme:\s*var\(--nv-color-scheme\)/);
     expect(rules(css["markdown.css"]).find((r) => r.selector === "html")!.body).toMatch(/scroll-padding-top:\s*var\(--mdp-reserve, 110px\)/);
     expect(rules(css["markdown.css"]).find((r) => r.selector === "html")!.body).toMatch(/scroll-padding-bottom:\s*20px/);
@@ -118,6 +119,24 @@ describe("the page's stylesheets", () => {
     ]) {
       expect(all, cls).toContain(cls);
     }
+  });
+
+  it("draw the cursor's band beneath the text as it is, and again over the content blended", () => {
+    const named = (sel: string) =>
+      rules(css["chrome.css"]).filter((r) => r.selector.split(",").some((s) => s.trim() === sel));
+    const band = named(".mdp-cursor-line");
+    // The band itself paints nothing and blends nothing: a blend would make it a stacking context of its own, and
+    // the layer beneath would then be drawn over the text instead of under it.
+    for (const r of band) expect(r.body).not.toMatch(/background|mix-blend-mode|z-index|opacity|transform|isolation/);
+    const layer = (sel: string) => named(sel).map((r) => r.body).join(";").replace(/\s+/g, "");
+    for (const sel of [".mdp-cursor-line::before", ".mdp-cursor-line::after"]) {
+      expect(layer(sel), sel).toContain("background-color:var(--nv-editor-cursorline,var(--nv-cursorline));");
+      expect(layer(sel), sel).toContain('content:"";');
+    }
+    expect(layer(".mdp-cursor-line::before")).toContain("z-index:-1;");
+    expect(layer(".mdp-cursor-line::before")).not.toContain("mix-blend-mode");
+    expect(layer(".mdp-cursor-line::after")).toContain("mix-blend-mode:lighten;");
+    expect(layer('.mdp-cursor-line[data-scheme="light"]::after')).toContain("mix-blend-mode:darken;");
   });
 
   it("drop the cursor's band over the text while the kit's visual mode draws the selection", () => {

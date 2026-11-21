@@ -1,5 +1,5 @@
 [English](markdown-preview.md) | 简体中文
-<!-- translated-from: markdown-preview.md sha256=30d1c936b6ac140e2f723099fee7a136f16a3ab7834536d7fdfcb71edbdc20c4 -->
+<!-- translated-from: markdown-preview.md sha256=ce32d37e3debd884489043236ce5bf028bcd29abe134c2ba938727227daee4d2 -->
 
 # Markdown 预览
 
@@ -99,7 +99,8 @@ eitri.plugin.load("markdown", { auto = true })
 | `?` | 列出这些按键 |
 | `Esc` | 退出当前模式；同时清除搜索高亮 |
 
-- 光标落在它那一行的某一个字符上，画成一个方块。`j`、`k` 和翻页会保持它的列（遇到更短的行就落在最后一个字符上，到了更长的行又回到原来的列）；其他跳转（`gg`、`G`、`}`、`{`、`]]`、`[[`、文档内的链接、`H` 和 `L`）把它放在那一行第一个不是空格的字符上，搜索把它放在匹配处，点击把它放在你点的字符上。`w`、`b`、`e` 找到的词和选中文字时一样。沿着一行移动不会移动 Neovim 的光标；移到另一行时会，和 `j` 一样。
+- 光标落在它那一行的某一个字符上，画成一个方块。`j`、`k` 和翻页会保持它的列（遇到更短的行就落在最后一个字符上，到了更长的行又回到原来的列）；其他跳转（`gg`、`G`、`}`、`{`、`]]`、`[[`、文档内的链接、`H` 和 `L`）把它放在那一行第一个不是空格的字符上，搜索把它放在匹配处，点击把它放在你点的字符上。`w`、`b`、`e` 找到的词和选中文字时一样。在没有文字的行上（图片、图表、分隔线、代码块里的空行），`w` 和 `e` 去往这一行之后的第一个词，`b` 去往这一行之前的最后一个词，和 Neovim 里从空行出发一样；`h`、`l`、`0` 和 `$` 在这种行上什么也不做。沿着一行移动不会移动 Neovim 的光标；移到另一行时会，和 `j` 一样。
+- 在可以左右滚动的块里（很宽的代码块、表格或公式），一次移动让光标越过块的边缘时，块会滚动到刚好能看到它为止，和 Neovim 在不折行的行上一样。`zh` 和 `zl` 只滚动、不移动光标：光标所在的字符移出视野时方块隐藏，`v` 仍从那里开始。
 - 方块用的是 Neovim 给 Normal 模式光标的颜色：你的 `guicursor` 里 Normal 模式那一项指定的高亮组；Neovim 默认的 `guicursor` 那一项没有指定高亮组，这时就是正文颜色反过来。它默认不闪烁，只有那一项把 `blinkwait`、`blinkon`、`blinkoff` 都设成大于零的时间才会闪，例如 `n-v-c:block-Cursor/lCursor-blinkwait700-blinkon400-blinkoff250`；这时它像 Neovim 里的光标一样闪，每次移动都会重新开始等待。桌面要求减少动态效果时，它保持不闪。预览开着的时候，`:set guicursor` 和 `:colorscheme` 改了，时间和颜色也跟着变。
 - 当前块是光标所在的那一块；边栏里另有一条竖线标出它。点击会把光标放到你点的那一行。双击一个块，等于在那里按 `Enter`。
 - 如果 Neovim 的光标已经在预览光标所在的那一行上（移动时放到那里的，或者进入预览时带进来的那一行，这时连所在的列也不变），`Enter` 让它留在那一行，所以 Neovim 的窗口不会滚动。
@@ -137,10 +138,10 @@ eitri.plugin.load("markdown", { auto = true })
 和任何插件一样，在 `init.lua` 里用 `plugin:markdown` 这张表修改这些按键：
 
 ```lua
-eitri.keymap.set("plugin:markdown", "e", "edit.here")
+eitri.keymap.set("plugin:markdown", "i", "edit.here")
 ```
 
-焦点在预览上时，`<prefix> ?` 会在 Eitri 自己的按键列表里先列出它的按键。动作名是 `cursor.down`、`cursor.up`、`cursor.half_down`、`cursor.half_up`、`cursor.page_down`、`cursor.page_up`、`cursor.first`、`cursor.last`、`cursor.left`、`cursor.right`、`cursor.word_next`、`cursor.word_prev`、`cursor.word_end`、`cursor.line_start`、`cursor.line_end`、`block.next`、`block.prev`、`scroll.down`、`scroll.up`、`heading.next`、`heading.prev`、`scroll.left`、`scroll.right`、`find.start`、`find.next`、`find.prev`、`hint.start`、`block.yank`、`edit.here`、`history.back`、`history.forward`、`sheet.open`、`mode.escape`、`visual.char`、`visual.line`，以及查看器的 `viewer.open`、`viewer.close`、`viewer.zoom_in`、`viewer.zoom_out`、`viewer.actual`、`viewer.fit`、`viewer.fit_width` 和 `count`（数字 `1` 到 `9`）。查看器打开时，`cursor.down`、`cursor.up`、`cursor.left`、`cursor.right`、`cursor.line_start`、`cursor.line_end` 和翻页动作由它自己响应。如果你在候选版本里改过这些按键，把对 `scroll.half_down`、`scroll.half_up`、`scroll.page_down`、`scroll.page_up`、`scroll.top` 或 `scroll.bottom` 的修改改成对应的 `cursor.` 动作（`cursor.half_down`……`cursor.first`、`cursor.last`）：预览里已经没有这几个 `scroll.` 动作了。
+焦点在预览上时，`<prefix> ?` 会在 Eitri 自己的按键列表里先列出它的按键。动作名是 `cursor.down`、`cursor.up`、`cursor.half_down`、`cursor.half_up`、`cursor.page_down`、`cursor.page_up`、`cursor.first`、`cursor.last`、`cursor.left`、`cursor.right`、`cursor.word_next`、`cursor.word_prev`、`cursor.word_end`、`cursor.line_start`、`cursor.line_end`、`block.next`、`block.prev`、`scroll.down`、`scroll.up`、`heading.next`、`heading.prev`、`scroll.left`、`scroll.right`、`find.start`、`find.next`、`find.prev`、`hint.start`、`block.yank`、`edit.here`、`history.back`、`history.forward`、`sheet.open`、`mode.escape`、`visual.char`、`visual.line`，以及查看器的 `viewer.open`、`viewer.close`、`viewer.zoom_in`、`viewer.zoom_out`、`viewer.actual`、`viewer.fit`、`viewer.fit_width` 和 `count`（数字 `1` 到 `9`）。查看器打开时，`cursor.down`、`cursor.up`、`cursor.left`、`cursor.right`、`cursor.line_start`、`cursor.line_end` 和翻页动作由它自己响应。如果你在候选版本里改过这些按键，把对 `scroll.half_down`、`scroll.half_up`、`scroll.page_down`、`scroll.page_up`、`scroll.top` 或 `scroll.bottom` 的修改改成对应的 `cursor.` 动作（`cursor.half_down`……`cursor.first`、`cursor.last`），把对 `viewer.left`、`viewer.right`、`viewer.left_edge` 或 `viewer.right_edge` 的修改改成 `cursor.left`、`cursor.right`、`cursor.line_start` 或 `cursor.line_end`：预览里已经没有这几个 `scroll.` 和 `viewer.` 动作了，仍写着它们的修改会被忽略。
 
 一步滚动多远、滚动是否带动画、`g` 这样的键等多久、什么时候列出接下来的键、提示标签用哪些字母、搜索怎样处理大小写，这些是所有插件页面共用的设置：见[插件页面里的按键](configuration.zh-CN.md#keys-in-a-plugin-page)。
 
