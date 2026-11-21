@@ -50,15 +50,62 @@ end
 
 -- What the editor draws for a Normal-mode cursor, read from `'guicursor'` here because the editor's own cursor
 -- table belongs to Neovide and this feed never reads that. The entries that name mode `n` or `a` apply in order
--- and a later one overrides only the fields it sets. An entry's arguments are `block`, `ver<n>`, `hor<n>`,
--- `blinkwait<n>`, `blinkon<n>`, `blinkoff<n>`, or a highlight group (the part before `/`, which names the
--- `lCursor` group). nvim reads the modes and those keywords without regard to case (`N:BLOCK-Cursor` is the same
--- entry as `n:block-Cursor`), so they are compared lowercased; the group keeps its own spelling. Blink times unset
--- stay 0, which the host reads as steady. They are capped well below the largest u32 so a silly number cannot make
--- the whole payload unparsable. A group name nvim would refuse (anything outside ASCII letters, digits, `_`, `.` and
--- `@`) leaves the option set but gives the cursor no group, so nvim draws Normal reversed; the name is not sent,
--- because `:set` accepts a name that is not valid UTF-8 and the host rejects a whole frame that is.
+-- and a later one overrides only the fields it sets. An entry's arguments are read the way nvim's own parser reads
+-- them, front to back with no separator needed after a keyword: `ver<n>` and `hor<n>` (shape, skipped here),
+-- `blinkwait<n>`, `blinkon<n>`, `blinkoff<n>`, `block` (skipped), or else a highlight group running to the next `-`
+-- (the part before a `/` there, which names the `lCursor` group). So `BlockCursor` is `block` and the group
+-- `Cursor`, and `blinkwait7Foo` is a blink time and the group `Foo`. The modes and keywords are read without regard
+-- to case (`N:BLOCK-Cursor` is the same entry as `n:block-Cursor`), so they are compared lowercased; the group keeps
+-- its own spelling. Blink times unset stay 0, which the host reads as steady, and so does one nvim cannot hold in an
+-- int (above 2147483647 it reads 0). A group name nvim would refuse (empty, over 200 bytes, or anything outside
+-- ASCII letters, digits, `_`, `.` and `@`) leaves the option set but gives the cursor no group, so nvim draws Normal
+-- reversed; the name is not sent, because `:set` accepts a name that is not valid UTF-8 and the host rejects a whole
+-- frame that is, and a name of 270 KB would take the frame past the feed's size limit with it.
 local MAX_BLINK = 0x7fffffff
+local MAX_GROUP_NAME = 200
+local NUMBERED = { "ver", "hor", "blinkwait", "blinkon", "blinkoff" }
+
+local function valid_group(name)
+  return #name > 0 and #name <= MAX_GROUP_NAME and name:find("^[A-Za-z0-9_.@]+$") ~= nil
+end
+
+-- Reads one entry's arguments into `blink` and returns the group they name last (`prev` when they name none).
+local function read_args(args, blink, prev)
+  local lowered, group, at = args:lower(), prev, 1
+  while at <= #args do
+    local keyword = nil
+    for _, kw in ipairs(NUMBERED) do
+      if lowered:sub(at, at + #kw - 1) == kw then
+        keyword = kw
+        break
+      end
+    end
+    if keyword then
+      local digits_at = at + #keyword
+      local digits = lowered:match("^%d+", digits_at)
+      if not digits then
+        return group
+      end
+      if keyword:sub(1, 5) == "blink" then
+        local value = tonumber(digits)
+        blink[keyword:sub(6)] = value <= MAX_BLINK and value or 0
+      end
+      at = digits_at + #digits
+    elseif lowered:sub(at, at + 4) == "block" then
+      at = at + 5
+    else
+      local stop = args:find("-", at, true) or #args + 1
+      local name = args:sub(at, stop - 1):match("^([^/]*)")
+      group = valid_group(name) and name or nil
+      at = stop
+    end
+    if args:sub(at, at) == "-" then
+      at = at + 1
+    end
+  end
+  return group
+end
+
 local function normal_cursor()
   local group, blink = nil, { wait = 0, on = 0, off = 0 }
   for entry in vim.gsplit(vim.o.guicursor, ",", { plain = true }) do
@@ -68,18 +115,7 @@ local function normal_cursor()
       applies = applies or mode == "n" or mode == "a"
     end
     if applies then
-      for arg in vim.gsplit(args, "-", { plain = true }) do
-        local lowered = arg:lower()
-        local kind, digits = lowered:match("^blink(%a+)(%d+)$")
-        if kind and blink[kind] then
-          blink[kind] = math.min(tonumber(digits), MAX_BLINK)
-        elseif lowered ~= "block" and not lowered:match("^ver%d+$") and not lowered:match("^hor%d+$") then
-          local name = arg:match("^([^/]*)")
-          if name ~= "" then
-            group = name:find("^[A-Za-z0-9_.@]+$") and name or nil
-          end
-        end
-      end
+      group = read_args(args, blink, group)
     end
   end
   local cursor = { group = group, blinkwait = blink.wait, blinkon = blink.on, blinkoff = blink.off }

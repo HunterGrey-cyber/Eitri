@@ -681,6 +681,59 @@ mod tests {
 
     #[test]
     #[ignore = "spawns a real nvim; run with: cargo test -p eitri-core theme::feed -- --ignored"]
+    fn guicursor_a_group_name_over_nvims_limit_is_not_sent() {
+        // nvim keeps an option whose group name is over 200 bytes (E1249) and draws no group; a name this long in the
+        // frame would take it past the feed's size limit and every later theme frame with it, so the payload must
+        // arrive (the colorscheme it waits for comes after the option) and carry no group.
+        assert_eq!(
+            cursor_for_lua_tail("string.rep('a', 200)").group.as_deref(),
+            Some("a".repeat(200).as_str())
+        );
+        for count in [201, 270_000] {
+            let cursor = cursor_for_lua_tail(&format!("string.rep('a', {count})"));
+            assert_eq!(cursor.group, None, "{count} bytes");
+        }
+    }
+
+    #[test]
+    #[ignore = "spawns a real nvim; run with: cargo test -p eitri-core theme::feed -- --ignored"]
+    fn guicursor_a_shape_keyword_is_read_even_when_the_argument_goes_on() {
+        // nvim reads `block`, `ver<n>`, `hor<n>` and the blink keywords off the front of an argument and takes what is
+        // left as the group: `BlockCursor` is `block` and `Cursor`, never a group called `BlockCursor`.
+        for (set, group) in [
+            ("n:BlockCursor", Some("Cursor")),
+            ("n:blockFoo/Bar", Some("Foo")),
+            ("n:ver25x", Some("x")),
+            ("n:HOR30Foo", Some("Foo")),
+            ("n:Block", None),
+            ("n:Foo-block", Some("Foo")),
+            ("n:blinkx", Some("blinkx")),
+            ("n:block--Foo", Some("Foo")),
+            ("n:Foo--", None),
+        ] {
+            assert_eq!(cursor_for(set).group.as_deref(), group, "{set}");
+        }
+        let cursor = cursor_for("n:blinkwait7Foo-blinkon5blinkoff6");
+        assert_eq!((cursor.group.as_deref(), blink(&cursor)), (Some("Foo"), (7, 5, 6)));
+    }
+
+    #[test]
+    #[ignore = "spawns a real nvim; run with: cargo test -p eitri-core theme::feed -- --ignored"]
+    fn guicursor_a_blink_time_nvim_cannot_hold_reads_zero() {
+        // nvim keeps the option but reads a number over 2147483647 (what an int holds) as 0, so its editor does not
+        // blink there; the page must not be told 2147483647 (99999 ms) and blink while the editor is steady.
+        for set in [
+            "n:blinkwait2147483648-blinkon5",
+            "n:blinkwait4294967296-blinkon5",
+            "n:blinkwait99999999999999999999-blinkon5",
+        ] {
+            assert_eq!(blink(&cursor_for(set)), (0, 5, 0), "{set}");
+        }
+        assert_eq!(blink(&cursor_for("n:blinkwait2147483647")), (2_147_483_647, 0, 0));
+    }
+
+    #[test]
+    #[ignore = "spawns a real nvim; run with: cargo test -p eitri-core theme::feed -- --ignored"]
     fn guicursor_a_group_name_with_dots_and_at_signs_is_sent() {
         let cursor = cursor_for_lua_tail("'My.Group@x'");
         assert_eq!(cursor.group.as_deref(), Some("My.Group@x"));
