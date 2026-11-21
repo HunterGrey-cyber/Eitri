@@ -1862,6 +1862,8 @@ pub mod in_process {
                     hello: Mutex::new(None),
                     host: host.to_string(),
                     daemon: String::new(),
+                    own_installation: Arc::new(Mutex::new(String::new())),
+                    own_route: true,
                     routes: Default::default(),
                     installations: Default::default(),
                     state: Default::default(),
