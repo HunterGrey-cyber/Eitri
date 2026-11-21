@@ -26,19 +26,23 @@ export const PAGE_ROWS: Row[] = [
   { action: "block.prev", keys: ["{"], context: PAGE_CONTEXT, desc: "previous block" },
   { action: "heading.next", keys: ["]]"], context: PAGE_CONTEXT, desc: "next heading" },
   { action: "heading.prev", keys: ["[["], context: PAGE_CONTEXT, desc: "previous heading" },
+  // The block cursor's moves inside a row and between words; the viewer answers `h` `l` `0` `$` while it is open.
+  { action: "cursor.left", keys: ["h"], context: PAGE_CONTEXT, desc: "cursor a character left (viewer: move left)" },
+  { action: "cursor.right", keys: ["l"], context: PAGE_CONTEXT, desc: "cursor a character right (viewer: move right)" },
+  { action: "cursor.word_next", keys: ["w"], context: PAGE_CONTEXT, desc: "cursor to the next word" },
+  { action: "cursor.word_prev", keys: ["b"], context: PAGE_CONTEXT, desc: "cursor to the previous word" },
+  { action: "cursor.word_end", keys: ["e"], context: PAGE_CONTEXT, desc: "cursor to the end of the word" },
+  { action: "cursor.line_start", keys: ["0"], context: PAGE_CONTEXT, desc: "first character of the row (viewer: left edge)" },
+  { action: "cursor.line_end", keys: ["$"], context: PAGE_CONTEXT, desc: "last character of the row (viewer: right edge)" },
   { action: "scroll.left", keys: ["zh"], context: PAGE_CONTEXT, desc: "scroll the block left" },
   { action: "scroll.right", keys: ["zl"], context: PAGE_CONTEXT, desc: "scroll the block right" },
   { action: "block.yank", keys: ["yy"], context: PAGE_CONTEXT, desc: "copy the block's Markdown" },
   { action: "edit.here", keys: ["<CR>"], context: PAGE_CONTEXT, desc: "edit here in the editor" },
   { action: "viewer.open", keys: ["o"], context: PAGE_CONTEXT, desc: "open the diagram or image at the cursor" },
-  // The viewer's own keys (`viewer.ts`); in it `j`/`k`, `d`/`u`, `<C-d>`/`<C-u>`, `<C-f>`/`<C-b>`, `gg`/`G`, `<CR>` and
-  // `<Esc>` are the rows above, acting on the view. zathura's and nsxiv's keys: `+`/`-` zoom, `=` 100% (`150=`:
+  // The viewer's own keys (`viewer.ts`); in it `h`/`j`/`k`/`l`, `d`/`u`, `<C-d>`/`<C-u>`, `<C-f>`/`<C-b>`, `gg`/`G`,
+  // `0`/`$`, `<CR>` and `<Esc>` are the rows above, acting on the view. zathura's and nsxiv's keys: `+`/`-` zoom, `=` 100% (`150=`:
   // 150%), zathura's `a` best fit and `s` width.
   { action: "viewer.close", keys: ["q"], context: VIEWER_CONTEXT, desc: "close the viewer" },
-  { action: "viewer.left", keys: ["h"], context: VIEWER_CONTEXT, desc: "move left" },
-  { action: "viewer.right", keys: ["l"], context: VIEWER_CONTEXT, desc: "move right" },
-  { action: "viewer.left_edge", keys: ["0"], context: VIEWER_CONTEXT, desc: "left edge" },
-  { action: "viewer.right_edge", keys: ["$"], context: VIEWER_CONTEXT, desc: "right edge" },
   { action: "viewer.zoom_in", keys: ["+"], context: VIEWER_CONTEXT, desc: "zoom in" },
   { action: "viewer.zoom_out", keys: ["-"], context: VIEWER_CONTEXT, desc: "zoom out" },
   { action: "viewer.actual", keys: ["="], context: VIEWER_CONTEXT, desc: "100%, or the count in percent" },
@@ -307,6 +311,13 @@ export async function installKeys(
       // `}`/`{` are jumps, as vim's paragraph motions are.
       case "block.next": jumping(p, () => p.blockJump(1)); return true;
       case "block.prev": jumping(p, () => p.blockJump(-1)); return true;
+      case "cursor.left": p.blockMove("h"); return true;
+      case "cursor.right": p.blockMove("l"); return true;
+      case "cursor.word_next": p.blockMove("w"); return true;
+      case "cursor.word_prev": p.blockMove("b"); return true;
+      case "cursor.word_end": p.blockMove("e"); return true;
+      case "cursor.line_start": p.blockMove("0"); return true;
+      case "cursor.line_end": p.blockMove("$"); return true;
       case "heading.next": heading(p, 1); return true;
       case "heading.prev": heading(p, -1); return true;
       case "scroll.left": sideways(p, -SIDEWAYS_PX); return true;
@@ -323,7 +334,7 @@ export async function installKeys(
   const onClick = (ev: MouseEvent) => {
     if ((ev.target as Element).closest?.("a, summary, input")) return;
     noteClick();
-    p.cursorToPoint(ev.pageY);
+    p.cursorToPoint(ev.clientX, ev.pageY);
     refresh();
   };
   const onDouble = (ev: MouseEvent) => { void editHere(p, ev.pageY); };
@@ -365,8 +376,14 @@ export async function installKeys(
     }
     const from = jumpFrom;
     jumpFrom = null;
-    const rect = findMatch()?.getBoundingClientRect();
-    if (!from || !rect || !p.jumpCursorTo(rect.top + window.scrollY + rect.height / 2, from.y)) return;
+    const match = findMatch();
+    // The match's first row when it wraps: that is where the block goes.
+    const rect = match ? (typeof match.getClientRects === "function" ? match.getClientRects()[0] : undefined) ??
+      match.getBoundingClientRect() : null;
+    if (!from || !match || !rect) return;
+    // The block goes to the match's first character, the band to its row.
+    p.blockToMatch(match);
+    if (!p.jumpCursorTo(rect.top + window.scrollY + rect.height / 2, from.y, true)) return;
     const to = p.cursorBand()?.top ?? null;
     if (from.band === null || to === null || Math.abs(to - from.band) < 1) return;
     leaving(p, from.y, from.cursor);
@@ -385,7 +402,7 @@ export async function installKeys(
       // act on the source it spans.
       visual: {
         start: () => p.visualStart(),
-        follow: (rect) => { p.followSelection(rect); refresh(); },
+        follow: (rect, cursor) => { p.followSelection(rect, cursor); refresh(); },
         keys: {
           "<CR>": (kind) => { editSelection(p, kind); return true; },
           Y: (kind) => { yankSelection(p, kind); return true; },

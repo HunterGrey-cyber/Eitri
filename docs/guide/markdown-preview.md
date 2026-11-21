@@ -115,6 +115,9 @@ Give the preview the keys with your key, with `Ctrl+l` from the editor, or by cl
 | keys | what it does |
 |---|---|
 | `j` / `k` | the cursor down / up a line as shown (a long paragraph is several lines, as with Vim's `gj`) |
+| `h` / `l` | the cursor one character left / right, inside the block of text it is in (a wrapped paragraph's lines are one block; a code block's lines are separate) |
+| `w` / `b` / `e` | to the next word / the start of this or the previous word / the end of this or the next word, as in Vim, on into the next block when the word is there |
+| `0` / `$` | the first / last character of the line as shown |
 | `Ctrl+e` / `Ctrl+y` | scroll down / up a step; the cursor stays unless a margin pushes it |
 | `d` or `Ctrl+d` / `u` or `Ctrl+u` | half a page down / up, the cursor with it |
 | `Ctrl+f` / `Ctrl+b` | a page down / up |
@@ -133,6 +136,16 @@ Give the preview the keys with your key, with `Ctrl+l` from the editor, or by cl
 | `?` | the list of these keys |
 | `Esc` | leave a mode; also clears the search highlights |
 
+- The cursor sits on one character of its line, drawn as a block. `j`, `k` and the page moves keep its column (a
+  shorter line gets its last character, and the column comes back on a longer one); every other jump (`gg`, `G`, `}`,
+  `{`, `]]`, `[[`, a link inside the document, `H` and `L`) puts it on the line's first character that is not a space,
+  a search on the match, and a click on the character you clicked. `w`, `b` and `e` find the same words as they do
+  when selecting. Moving along a line does not move Neovim's cursor; moving to another line does, as `j` does.
+- The block wears the colours Neovim gives its Normal-mode cursor: the highlight group your `guicursor` names for
+  Normal mode, or, as with Neovim's default `guicursor`, which names none, your text's colours reversed. It does not blink unless that `guicursor` entry sets `blinkwait`, `blinkon` and
+  `blinkoff` to times above zero, as in `n-v-c:block-Cursor/lCursor-blinkwait700-blinkon400-blinkoff250`; then it blinks
+  as Neovim's does, and every move starts the wait again. It stays steady when your desktop asks for reduced motion.
+  The times follow `:set guicursor` and `:colorscheme` while the preview is open.
 - The current block is the one the cursor is in; a second bar in the margin marks it. A click puts the cursor on the
   line you clicked. Double-clicking a block does what `Enter` does there.
 - `Enter` leaves Neovim's cursor on its line when it is already on the cursor's line (put there as you moved, or the
@@ -155,8 +168,8 @@ Give the preview the keys with your key, with `Ctrl+l` from the editor, or by cl
 
 ### Selecting text
 
-`v` starts a selection at the cursor, as in Vim, and `V` selects whole lines; the status line says `VISUAL` or
-`VISUAL LINE`. Then:
+`v` starts a selection on the character the block is on, as in Vim, and `V` selects whole lines; the status line says
+`VISUAL` or `VISUAL LINE`. Then:
 
 | keys | what it does |
 |---|---|
@@ -172,8 +185,11 @@ Give the preview the keys with your key, with `Ctrl+l` from the editor, or by cl
 | `v` / `V` | switch between characters and whole lines; the same key again stops selecting |
 | `Esc` | stop selecting |
 
-- The preview's cursor follows the end you move, so the selection stays inside the margins and Neovim follows as it
-  does for `j`.
+- The preview's cursor follows the end you move: each move brings it inside the margins, and Neovim follows as it does
+  for `j`. `Ctrl+e` and `Ctrl+y` scroll without moving the selection, so it can leave the screen until your next move,
+  even one along the same line. The block sits on the character the selection's cursor is on, with `V` too (there `h`
+  and `l` move it along the line while whole lines stay selected), and stays there when the selection ends. A line
+  with no text (an image, an empty line in a code block) has no block.
 - The preview never changes your text. To change what you selected, press `Enter` and change it in Neovim (`c`, `d`,
   `gq`, ...).
 - `Enter` selects the same characters in Neovim when your selection lies inside one source line and its text appears
@@ -191,11 +207,13 @@ eitri.keymap.set("plugin:markdown", "e", "edit.here")
 
 `<prefix> ?` with the preview focused lists its keys first in Eitri's own key list. The actions are `cursor.down`,
 `cursor.up`, `cursor.half_down`, `cursor.half_up`, `cursor.page_down`, `cursor.page_up`, `cursor.first`,
-`cursor.last`, `block.next`, `block.prev`, `scroll.down`, `scroll.up`, `heading.next`, `heading.prev`, `scroll.left`, `scroll.right`, `find.start`,
+`cursor.last`, `cursor.left`, `cursor.right`, `cursor.word_next`, `cursor.word_prev`, `cursor.word_end`, `cursor.line_start`,
+`cursor.line_end`, `block.next`, `block.prev`, `scroll.down`, `scroll.up`, `heading.next`, `heading.prev`, `scroll.left`, `scroll.right`, `find.start`,
 `find.next`, `find.prev`, `hint.start`, `block.yank`, `edit.here`, `history.back`, `history.forward`, `sheet.open`,
-`mode.escape`, `visual.char`, `visual.line`, and the viewer's `viewer.open`, `viewer.close`, `viewer.left`,
-`viewer.right`, `viewer.left_edge`, `viewer.right_edge`, `viewer.zoom_in`, `viewer.zoom_out`, `viewer.actual`,
-`viewer.fit`, `viewer.fit_width` and `count` (the digits `1` to `9`). If you changed these keys for a release candidate, rename an override
+`mode.escape`, `visual.char`, `visual.line`, and the viewer's `viewer.open`, `viewer.close`, `viewer.zoom_in`,
+`viewer.zoom_out`, `viewer.actual`, `viewer.fit`, `viewer.fit_width` and `count` (the digits `1` to `9`). While the
+viewer is open it answers `cursor.down`, `cursor.up`, `cursor.left`, `cursor.right`, `cursor.line_start`,
+`cursor.line_end` and the page moves itself. If you changed these keys for a release candidate, rename an override
 of `scroll.half_down`, `scroll.half_up`, `scroll.page_down`, `scroll.page_up`, `scroll.top` or `scroll.bottom` to the
 matching `cursor.` action (`cursor.half_down`, ..., `cursor.first`, `cursor.last`): the preview no longer has those `scroll.` actions.
 

@@ -163,15 +163,18 @@ export class Viewer {
 
   /** The page's key actions while the viewer is open; every one is the viewer's (what does not apply does nothing),
    *  so no key acts on the page hidden under it. Counts multiply the moves and zoom steps; `=` takes the count as a
-   *  percentage, as nsxiv and zathura do. */
+   *  percentage, as nsxiv and zathura do. `h` `l` `0` `$` reach it as the page's own `cursor.left`, `cursor.right`,
+   *  `cursor.line_start` and `cursor.line_end` (a key has one action), as `j` `k` and `gg` `G` do. */
   run(action: string, ev: KeyboardEvent): boolean {
     if (!this.isOpen()) return false;
-    if (action === "count" || (action === "viewer.left_edge" && this.count !== "")) {
+    if (action === "count" || (action === "cursor.line_start" && this.count !== "")) {
       const digit = action === "count" ? ev.key : "0";
       if (/^[0-9]$/.test(digit) && this.count.length < 6) this.count += digit;
       this.showCount();
       return true;
     }
+    // The page's word keys mean nothing here: they take no count with them.
+    if (action === "cursor.word_next" || action === "cursor.word_prev" || action === "cursor.word_end") return true;
     const counted = this.count === "" ? null : Number(this.count);
     const n = counted ?? 1;
     this.count = "";
@@ -188,16 +191,16 @@ export class Viewer {
       case "viewer.close": this.close(); return true;
       case "cursor.down": next = panSteps(this.view, 0, n, pic, box); break;
       case "cursor.up": next = panSteps(this.view, 0, -n, pic, box); break;
-      case "viewer.left": next = panSteps(this.view, -n, 0, pic, box); break;
-      case "viewer.right": next = panSteps(this.view, n, 0, pic, box); break;
+      case "cursor.left": next = panSteps(this.view, -n, 0, pic, box); break;
+      case "cursor.right": next = panSteps(this.view, n, 0, pic, box); break;
       case "cursor.half_down": next = panBy(this.view, 0, (n * box.h) / 2, pic, box); break;
       case "cursor.half_up": next = panBy(this.view, 0, (-n * box.h) / 2, pic, box); break;
       case "cursor.page_down": next = panBy(this.view, 0, n * box.h, pic, box); break;
       case "cursor.page_up": next = panBy(this.view, 0, -n * box.h, pic, box); break;
       case "cursor.first": next = toEdge(this.view, "top", pic, box); break;
       case "cursor.last": next = toEdge(this.view, "bottom", pic, box); break;
-      case "viewer.left_edge": next = toEdge(this.view, "left", pic, box); break;
-      case "viewer.right_edge": next = toEdge(this.view, "right", pic, box); break;
+      case "cursor.line_start": next = toEdge(this.view, "left", pic, box); break;
+      case "cursor.line_end": next = toEdge(this.view, "right", pic, box); break;
       case "viewer.zoom_in": next = zoomSteps(this.view, n, pic, box); break;
       case "viewer.zoom_out": next = zoomSteps(this.view, -n, pic, box); break;
       case "viewer.actual":

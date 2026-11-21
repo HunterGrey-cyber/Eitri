@@ -76,7 +76,7 @@ it.each([
     expect(lineAt(index, 65)).toBe(1);
     expect(p.sourceLineAt(65)).toBe(1);
     p.onFocus(true);
-    p.cursorToPoint(65);
+    p.cursorToPoint(0, 65);
     expect(currentBlock(p)).toBe(box);
     await yankCurrentBlock(p);
     expect(copy).toHaveBeenLastCalledWith(html);

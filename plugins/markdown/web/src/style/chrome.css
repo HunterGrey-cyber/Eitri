@@ -83,14 +83,20 @@ div.mdp-box {
   pointer-events: none;
 }
 
-/* The cursor's row band, nvim's CursorLine colour across the text. It lies over the text, so it blends: on a dark
-   scheme only what is darker than the band (the background) takes its colour, on a light one only what is lighter,
-   and the text keeps its own colour either way. The page sets data-scheme from --nv-color-scheme. */
+/* The cursor's row band and visual mode's paint lie over the text, so they blend: on a dark scheme only what is
+   darker than the paint (the background) takes its colour, on a light one only what is lighter, and the text keeps
+   its own colour either way. The page sets data-scheme from --nv-color-scheme. Visual mode paints in the selection
+   colour (--nv-cursorline, from the editor's Visual); the band is the editor's own CursorLine colour, so the two do
+   not read alike. */
 .mdp-cursor-line, .mdp-visual-band, .mdp-visual-box {
   position: absolute;
   pointer-events: none;
   background-color: var(--nv-cursorline);
   mix-blend-mode: lighten;
+}
+
+.mdp-cursor-line {
+  background-color: var(--nv-editor-cursorline, var(--nv-cursorline));
 }
 
 .mdp-cursor-line[data-scheme="light"], .mdp-visual-band[data-scheme="light"], .mdp-visual-box[data-scheme="light"] {
@@ -131,6 +137,34 @@ html[data-eitri-visual] .mdp-cursor-line {
 
 .mdp-cursor-bar[hidden], .mdp-current-bar[hidden] {
   display: none;
+}
+
+/* The block cursor on one character of the band (view/block.ts), in the editor cursor's colours: its fill, and the
+   character drawn again inside in its text colour. It comes after the band in the page, so it is painted above it
+   and is not blended: the glyph keeps the cursor's text colour. Placed by the page in document coordinates; clicks
+   and selections go through it to the text. */
+.mdp-cursor-block {
+  position: absolute;
+  pointer-events: none;
+  -webkit-user-select: none;
+  user-select: none;
+  background-color: var(--nv-cursor-bg, var(--nv-fg));
+  color: var(--nv-cursor-fg, var(--nv-bg));
+}
+
+.mdp-cursor-block[hidden] {
+  display: none;
+}
+
+/* The blink's off phase (view/block.ts toggles it from the theme's blink times; steady by default): the block keeps
+   its place and size, so it comes back where it was. */
+.mdp-cursor-block.mdp-blink-hidden {
+  visibility: hidden;
+}
+
+.mdp-cursor-glyph {
+  position: absolute;
+  white-space: pre;
 }
 
 /* The end sentinel closes the last gap of the line index, which leaves out zero-height elements: it keeps one pixel. */

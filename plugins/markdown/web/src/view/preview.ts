@@ -5,8 +5,10 @@ import { renderDocument } from "../render/pipeline";
 import { kit } from "../kit";
 import { trace } from "../trace";
 import { ScrollGuard } from "./anchor";
+import { BlockCursor, type BlockMotion } from "./block";
 import { boxAt, clickedRecently, lineAt, pickBlock, pickedLine } from "./current";
 import { RowCache, rowsIn, type Row } from "./rows";
+import { textFrom } from "./text-from";
 import { selectionBoxes, selectionSpan } from "./selection";
 import { buildIndex, lastLineAtOrBefore, lastTopAtOrBefore, measure, type Box } from "./lineindex";
 import { blockedText, BUFFER_CLOSED_TEXT, EDITOR_CLOSED_TEXT, EMPTY_TEXT, tooLargeText } from "./notices";
@@ -46,45 +48,6 @@ const ROW_PROBE_PX = 0.5;
 export interface Band { top: number; bottom: number; row: Row }
 
 function clamp(n: number, lo: number, hi: number): number { return Math.min(Math.max(n, lo), hi); }
-
-/** What has no text of the source's: KaTeX's MathML copy, and what is hidden. */
-const NOT_TEXT = ".katex-mathml, [hidden], [aria-hidden='true'], script, style, template";
-
-/** The first character, white space passed over, at or below band `b` (document coordinates) in `scope`'s text, as
- *  a collapsed range; null when there is none. Characters keep their order down the page, so the first one of a
- *  text node that reaches the band is found by halving. */
-function textFrom(scope: Element, b: { top: number; bottom: number }): Range | null {
-  const doc = scope.ownerDocument;
-  const range = doc.createRange();
-  const y = window.scrollY;
-  const mid = (node: Text, i: number) => {
-    range.setStart(node, i);
-    range.setEnd(node, i + 1);
-    const r = range.getBoundingClientRect();
-    return (r.top + r.bottom) / 2 + y;
-  };
-  const walker = doc.createTreeWalker(scope, NodeFilter.SHOW_TEXT);
-  for (let n = walker.nextNode(); n; n = walker.nextNode()) {
-    const text = n as Text;
-    if (!/\S/.test(text.data) || text.parentElement?.closest(NOT_TEXT)) continue;
-    range.selectNodeContents(text);
-    const rects = [...(range.getClientRects?.() ?? [])];
-    if (!rects.some((r) => r.bottom + y > b.top + 0.5)) continue;
-    let lo = 0;
-    let hi = text.data.length - 1;
-    while (lo < hi) {
-      const m = (lo + hi) >> 1;
-      if (mid(text, m) >= b.top - 0.5) hi = m;
-      else lo = m + 1;
-    }
-    while (lo < text.data.length && /\s/.test(text.data[lo])) lo++;
-    if (lo >= text.data.length) continue;
-    const at = doc.createRange();
-    at.setStart(text, lo);
-    return at;
-  }
-  return null;
-}
 
 /* The box an image that was not shown leaves, in the shape the sanitiser gives one, so a later render's box for the
    same image compares equal and is kept. Built with DOM calls: the alt text is the document's. */
@@ -186,6 +149,8 @@ export class Preview {
   /** The bottom of the document's last row, for the line index (the layout) it was read on. */
   private lastRowMemo: { index: Box[]; bottom: number | null } | null = null;
   private readonly cursorLine: HTMLElement;
+  /** The block on one character of the cursor's band, drawn above it while the preview has the keys. */
+  readonly block: BlockCursor;
   /** Visual line mode's band over the rows the selection spans. */
   private readonly visualBand: HTMLElement;
   /** Charwise visual mode's boxes over the selected characters. */
@@ -234,14 +199,18 @@ export class Preview {
     this.visualBoxes = document.createElement("div");
     this.visualBoxes.className = "mdp-visual-boxes";
     this.visualBand.before(this.visualBoxes);
+    // After the band and the bar, so it is painted above the band, whose blending would wash out its glyph.
+    this.block = new BlockCursor(root, () => this.cached);
     this.setNotice(EMPTY_TEXT);
     const scroll = () => this.onScroll();
     const wheel = () => this.onPointer();
     const resize = () => this.applyReserve();
-    // A block scrolled sideways (a wide table or code block) moves the text under visual mode's boxes; its scroll
-    // does not reach the window, so it is caught on the way down.
+    // A block scrolled sideways (a wide table or code block) moves the text under the block cursor and visual mode's
+    // boxes; its scroll does not reach the window, so it is caught on the way down.
     const nestedScroll = (ev: Event) => {
-      if (ev.target === this.root || !document.documentElement.hasAttribute("data-eitri-visual")) return;
+      if (ev.target === this.root) return;
+      this.drawBlock();
+      if (!document.documentElement.hasAttribute("data-eitri-visual")) return;
       this.visualMemo = null;
       this.placeVisual();
     };
@@ -277,6 +246,7 @@ export class Preview {
       this.cursorLine.remove();
       this.visualBand.remove();
       this.visualBoxes.remove();
+      this.block.remove();
     });
   }
 
@@ -367,7 +337,7 @@ export class Preview {
     // The cursor starts on nvim's cursor line, unless a click that brought the keys has just put it: nvim hears of
     // that place now, since the click moved the cursor while nvim still led.
     if (hasKeys && !hadKeys) {
-      if (!clickedRecently()) this.startCursor();
+      if (!clickedRecently()) { this.block.reset(); this.startCursor(); }
       else if (this.cursorAt !== null && !this.editJumping()) { this.unsent = true; this.revealer.request(); }
     }
     this.placeBars();
@@ -616,7 +586,7 @@ export class Preview {
   moveRows(dir: 1 | -1, held = false): void {
     const b = this.cursorBand();
     const next = b ? this.stepBand(b, dir) : null;
-    if (next) this.moveCursor(next, this.scrollFor(next, this.destination()), held);
+    if (next) { this.carryColumn(next); this.moveCursor(next, this.scrollFor(next, this.destination()), held); }
   }
 
   /** `<C-d>` / `<C-u>`: the page half a view down or up and the cursor the same distance, so it keeps its height on
@@ -630,7 +600,7 @@ export class Preview {
     const t = dir > 0 ? Math.min(s + d, Math.max(s, this.endY())) : Math.max(s - d, 0);
     const moved = this.bandAt((b.top + b.bottom) / 2 + dir * d);
     const next = moved ? this.insideMargins(moved, t) : null;
-    if (next) this.moveCursor(next, this.scrollFor(next, t), held);
+    if (next) { this.carryColumn(next); this.moveCursor(next, this.scrollFor(next, t), held); }
   }
 
   /** `<C-f>` / `<C-b>`: the page a view less two lines down or up, and the cursor to the margin the text came in
@@ -644,7 +614,7 @@ export class Preview {
     const t = dir > 0 ? Math.min(s + p, Math.max(s, this.scrollMax())) : Math.max(s - p, 0);
     const next = Math.abs(t - s) < 0.5 ? (dir > 0 ? this.lastBand() : this.firstBand())
       : dir > 0 ? this.firstBandFrom(this.topLimit(t)) : this.lastBandTo(this.bottomLimit(t));
-    if (next) this.moveCursor(next, this.scrollFor(next, t), held);
+    if (next) { this.carryColumn(next); this.moveCursor(next, this.scrollFor(next, t), held); }
   }
 
   /** `gg` / `G`: the cursor to the document's first or last row, placed as a jump. False when there is none. */
@@ -653,9 +623,10 @@ export class Preview {
 
   /** Puts the cursor on the row at document y `y` and scrolls only if that row is outside the margins: as little
    *  as needed when it is near, centred when it is further than half a view away, as nvim places a jump. `from` is
-   *  the window position the jump is judged from (where the window was heading before it). False with no row. */
-  jumpCursorTo(y: number, from = this.destination()): boolean {
-    return this.cursorBand() !== null && this.jumpBand(this.bandAt(y), from);
+   *  the window position the jump is judged from (where the window was heading before it). The block lands on the
+   *  row's first character that is not blank, unless `keepBlock` says the caller has put it. False with no row. */
+  jumpCursorTo(y: number, from = this.destination(), keepBlock = false): boolean {
+    return this.cursorBand() !== null && this.jumpBand(this.bandAt(y), from, keepBlock);
   }
 
   /** The cursor to the row holding source line `L` (a history entry's place), placed as a jump. */
@@ -719,23 +690,45 @@ export class Preview {
     return up && up.top < b.top - 0.5 ? start(up) : null;
   }
 
-  /** Where visual mode starts (`v`, `V`): the first character of the cursor's row, or the first text after it when
-   *  the row has none (an image); null without a cursor. */
+  /** Where visual mode starts (`v`, `V`): the block's character while it shows, else the first character of the
+   *  cursor's row, or the first text after it when the row has none (an image); null without a cursor. */
   visualStart(): Range | null {
-    const b = this.cursorBand();
+    if (this.blockOn()) {
+      this.drawBlock();
+      const at = this.block.caretRange();
+      if (at) return at;
+    }
+    return this.rowStart();
+  }
+  /** The first character of the cursor's row that is not blank, or the first text after it when the row has none;
+   *  null without a cursor. */
+  private rowStart(b = this.cursorBand()): Range | null {
     if (!b) return null;
     const box = boxAt(this.index(), (b.top + b.bottom) / 2);
     const inBox = box !== null && b.top < box.top + box.height && b.bottom > box.top;
     return (inBox ? textFrom(box.el, b) : null) ?? textFrom(this.root, b);
   }
-  /** Visual mode's cursor moved to the character at `rect` (window coordinates): the page's cursor goes to its row,
-   *  and the page scrolls as for a jump, only when that row is outside the margins. */
-  followSelection(rect: DOMRect): void {
+  /** Visual mode's cursor moved to the character at `rect` (window coordinates), `cursor` when the kit gives it: the
+   *  block goes to the cursor's character (it stays there when the mode ends), the page's cursor goes to its row, and
+   *  the page scrolls as for a jump, only when that row is outside the margins (a move along the row the kit's
+   *  `<C-e>` scrolled away brings it back too). `cursor` is the kit's own, the same in `v` and `V` (where the
+   *  selection's focus is at a line's end: a table row's is its last cell's); a line's end with no drawn character on
+   *  its line leaves no block, and the cursor goes to `rect`'s row. A kit without it leaves the block to be read from
+   *  the selection: charwise its focus, linewise the row of `rect`. */
+  followSelection(rect: DOMRect, cursor?: { node: Node; offset: number }): void {
+    const sel = document.getSelection();
+    const linewise = document.documentElement.getAttribute("data-eitri-visual") === "line";
+    const fromSelection = () => sel !== null && (linewise ? this.blockToLine(rect) : this.block.placeAtFocus(sel));
+    const placed = this.blockOn() && (cursor ? this.block.placeAtCursor(cursor) : fromSelection());
+    const at = (placed ? this.block.caretBox() : null) ?? rect;
     const b = this.cursorBand();
-    if (b) {
-      const next = this.bandAt((rect.top + rect.bottom) / 2 + window.scrollY);
-      if (next && Math.abs(next.top - b.top) >= 0.5) this.jumpBand(next);
+    const next = b ? this.bandAt((at.top + at.bottom) / 2 + window.scrollY) : null;
+    if (b && next) {
+      const from = this.destination();
+      const outside = Math.abs(this.scrollFor(next, from) - from) >= 0.5;
+      if (outside || Math.abs(next.top - b.top) >= 0.5) this.jumpBand(next, from, true);
     }
+    if (placed) this.drawBlock();
     this.placeVisual();
   }
 
@@ -816,13 +809,59 @@ export class Preview {
     this.visualBand.hidden = false;
   }
 
-  /** A click: the cursor to the clicked row, without scrolling. It may come before the keys do; the cursor is then
-   *  where they find it. */
-  cursorToPoint(y: number): void {
+  /** A click at window x `x`, document y `y`: the cursor to the clicked row, without scrolling, and the block to the
+   *  clicked character. It may come before the keys do; the cursor is then where they find it. */
+  cursorToPoint(x: number, y: number): void {
     if (!this.rendered || this.root.hidden) return;
     const b = this.bandAt(y);
-    if (b) this.moveCursor(b, null);
+    if (!b) return;
+    if (typeof kit()?.motion === "function" && this.block.placeNear(b, x, this.rowStart(b))) this.block.clearColumn();
+    else this.block.reset();
+    this.moveCursor(b, null);
   }
+
+  /** Linewise visual mode's cursor is on the row of `rect`, from a kit that does not give its cursor: the kit draws
+   *  whole lines, so the selection's focus is at that row's end (going forward) or start. The block stays where it is
+   *  while it is on that row, else it goes to that row at its column, as `j` and `k` take it. False with no block to
+   *  place. */
+  private blockToLine(rect: DOMRect): boolean {
+    const band = this.bandAt((rect.top + rect.bottom) / 2 + window.scrollY);
+    const box = this.block.caretBox();
+    if (!band || !box) return false;
+    const mid = (box.top + box.bottom) / 2 + window.scrollY;
+    if (mid >= band.top && mid <= band.bottom) return true;
+    const x = this.block.column();
+    return x !== null && this.block.placeNear(band, x, this.rowStart(band));
+  }
+
+  /** Whether the block cursor is in use: the preview has the keys and the kit has the motions that move it. */
+  private blockOn(): boolean { return this.keys && typeof kit()?.motion === "function"; }
+
+  /** The block's column onto the row of band `next`, before the cursor moves there (`j` `k` and the pages keep
+   *  the x, as vim's curswant). A row with no character leaves the block hidden on it. */
+  private carryColumn(next: Band): void {
+    const x = this.blockOn() ? this.block.column() : null;
+    if (x !== null) this.block.placeNear(next, x, this.rowStart(next));
+  }
+
+  /** One move of the block's character (`h` `l` `w` `b` `e` `0` `$`); true when it moved. Inside the row the band
+   *  stays and nothing is sent to nvim; onto another row the cursor moves there as a jump does (the page scrolls only
+   *  when the row is outside the margins, nvim hears of it as of any move). */
+  blockMove(motion: BlockMotion): boolean {
+    if (!this.blockOn() || !this.cursorBand()) return false;
+    this.drawBlock();
+    if (!this.block.move(motion)) return false;
+    const box = this.block.caretBox();
+    const b = this.cursorBand();
+    const mid = box ? (box.top + box.bottom) / 2 + window.scrollY : null;
+    if (b && mid !== null && (mid < b.top || mid > b.bottom)) this.jumpCursorTo(mid, undefined, true);
+    this.drawBlock();
+    return true;
+  }
+
+  /** A find moved to `match`: the block to its first character (the jump to its row follows, `jumpCursorTo` with
+   *  `keepBlock`). */
+  blockToMatch(match: Range): void { this.block.placeAt(match); }
 
   afterUpdate(fn: (why: UpdateReason) => void): () => void { this.listeners.add(fn); return () => { this.listeners.delete(fn); }; }
 
@@ -889,8 +928,9 @@ export class Preview {
     if (b.bottom > bottom + 0.5) return this.lastBandTo(bottom) ?? b;
     return b;
   }
-  private jumpBand(b: Band | null, from = this.destination()): boolean {
+  private jumpBand(b: Band | null, from = this.destination(), keepBlock = false): boolean {
     if (!b) return false;
+    if (!keepBlock) this.block.reset();
     this.moveCursor(b, this.scrollForJump(b, from));
     return true;
   }
@@ -1128,7 +1168,8 @@ export class Preview {
      its row unless a margin pushes it onto the first or last row inside, as nvim's mouse scroll and <C-e> do. It is
      judged where the window is heading, so a glide the cursor asked for never pushes the cursor back. */
   private pushCursor(): void {
-    if (!this.keys || this.cursorAt === null) return;
+    // In visual mode the cursor is the selection's, which only the kit moves (`followSelection`).
+    if (!this.keys || this.cursorAt === null || document.documentElement.hasAttribute("data-eitri-visual")) return;
     const b = this.cursorBand();
     if (!b) return;
     const next = this.insideMargins(b, this.destination());
@@ -1148,6 +1189,8 @@ export class Preview {
   /** The page's text size moved (the host's `--nv-text-size` arrives in a theme event): the reserve is lines of that
    *  text, and nothing else about the page need have changed, so nothing else would refresh it. */
   onTextSize(): void { this.applyReserve(); }
+  /** A theme event: the text size moved the reserve, and the block reads its blink times again. */
+  onTheme(): void { this.onTextSize(); this.drawBlock(); }
   private notify(why: UpdateReason): void { for (const fn of [...this.listeners]) fn(why); }
   private setNotice(text: string): void { this.notice.textContent = text; if (text) trace("notice", { text }); }
 
@@ -1177,7 +1220,7 @@ export class Preview {
     }
     const switched = this.rendered?.buf !== t.buf;
     // Another buffer's text: the cursor starts again in it (it stays on the old blocks until they go).
-    if (switched) this.cursorAt = null;
+    if (switched) { this.cursorAt = null; this.block.reset(); }
     // The reader's line, read before the update moves anything.
     const before = !switched && this.lead() !== "editor" ? (this.anchor ?? yToLine(this.index(), window.scrollY)) : null;
     const doc = this.view?.buf === t.buf ? this.view.doc : null;
@@ -1423,18 +1466,25 @@ export class Preview {
     if (this.unsent || gliding) this.sendReveal(true);
   }
 
-  /* With the keys in the preview, its cursor: the bar in the margin at the cursor's band and a faint band across
-     the text, as nvim's 'cursorline'. While nvim leads, nvim's cursor line, marked in the margin beside the block
-     that holds it. */
+  /** Draws the block on its character of the cursor's band (after `block.placeAt`, a sideways scroll), while the
+   *  preview has the keys and the kit has the motions that move it (kit 6); else hides it. */
+  drawBlock(): void {
+    const band = this.keys && typeof kit()?.motion === "function" ? this.cursorBand() : null;
+    this.block.draw(band, () => this.rowStart());
+  }
+  /* With the keys in the preview, its cursor: the bar in the margin at the cursor's band, a faint band across the
+     text, as nvim's 'cursorline', and the block on one character of it. While nvim leads, nvim's cursor line, marked
+     in the margin beside the block that holds it. */
   private placeBars(): void {
     this.placeVisual();
     this.cursorBar.hidden = true;
     this.cursorLine.hidden = true;
     const rootBox = this.root.getBoundingClientRect();
     const left = rootBox.left + window.scrollX - 12;
+    // A block drawn again keeps its blink running; one that goes away stops it.
     if (this.keys) {
       const b = this.cursorBand();
-      if (!b) return;
+      if (!b) { this.block.hide(); return; }
       const height = `${b.bottom - b.top}px`;
       Object.assign(this.cursorBar.style, { top: `${b.top}px`, height, left: `${left}px` });
       Object.assign(this.cursorLine.style, { top: `${b.top}px`, height, left: `${left}px`,
@@ -1443,8 +1493,10 @@ export class Preview {
       this.cursorLine.dataset.scheme = scheme === "light" ? "light" : "dark";
       this.cursorBar.hidden = false;
       this.cursorLine.hidden = false;
+      this.drawBlock();
       return;
     }
+    this.block.hide();
     const v = this.view;
     if (v === null || this.rendered?.buf !== v.buf || this.lead() !== "editor") return;
     const index = this.index();

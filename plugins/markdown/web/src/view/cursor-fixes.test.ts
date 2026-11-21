@@ -170,7 +170,7 @@ describe("a click that brings the keys (4)", () => {
   it("tells nvim where it put the cursor", () => {
     show(paragraphs(30));
     noteClick();
-    p.cursorToPoint(155);
+    p.cursorToPoint(0, 155);
     expect(reveals()).toEqual([]);
     p.onFocus(true);
     expect(reveals().at(-1)).toMatchObject({ cursor: 11 });

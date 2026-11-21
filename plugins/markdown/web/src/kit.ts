@@ -32,10 +32,12 @@ export type InstallOptions = {
   bottom?: () => number | null;
   /** Version 4 and later: called around the kit's own jumps (`gg`, `G`, a find move). */
   onJump?: (when: "before" | "after") => void;
-  /** Version 5 and later: visual mode's start at the page's cursor, its cursor followed, and the page's own keys in it. */
+  /** Version 5 and later: visual mode's start at the page's cursor, its cursor followed, and the page's own keys in it.
+   *  `follow` gets the cursor character's box and, from a kit 6 build that has it, the cursor itself as a place with
+   *  `motion`'s contract (just before the cursor's character, or a line's end), for `v` and `V` and at the start. */
   visual?: {
     start?: () => Range | null;
-    follow?: (focus: DOMRect) => void;
+    follow?: (focus: DOMRect, cursor?: { node: Node; offset: number }) => void;
     keys?: Record<string, (kind: VisualKind) => boolean>;
   };
 };
@@ -56,6 +58,10 @@ export interface EitriKeys {
   /** Version 5 and later: visual mode's kind while it runs, and ending it. */
   visualMode?(): VisualKind | null;
   endVisual?(): void;
+  /** Version 6 and later: where a Normal-mode motion from `at` lands, by visual mode's own walker, the document's
+   *  selection left as it was; null for a place or a result outside the page. */
+  motion?(at: { node: Node; offset: number }, motion: "h" | "l" | "w" | "b" | "e" | "0" | "$"):
+    { node: Node; offset: number } | null;
 }
 /** The kit the host serves at /.eitri/keys.js, or null when the page runs without it (a test, a browser). */
 export function kit(): EitriKeys | null {

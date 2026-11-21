@@ -484,7 +484,7 @@ describe("the reading line shared with nvim", () => {
     show(p, 1, paragraphs(30));
     const box = p.index().find((b) => b.line === 4)!;
     noteClick();
-    p.cursorToPoint(box.top + 5);
+    p.cursorToPoint(0, box.top + 5);
     p.onFocus(true);
     expect(currentBlock(p)?.line).toBe(4);
   });

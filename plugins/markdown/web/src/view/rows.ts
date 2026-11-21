@@ -8,9 +8,10 @@ export interface Row { top: number; bottom: number }
 /** What is read as one box, never as the text inside it: a formula's spans sit at several heights (a fraction's
  *  numerator and denominator are not two rows), a diagram's labels are drawn, not read, and an image or a rule has
  *  no text at all. */
-const ATOM = "img, svg, hr, video, canvas, .katex, .katex-display, .mdp-diagram";
-/** What has no box of its own to read: KaTeX's MathML copy is clipped to a pixel, and the rest is never drawn. */
-const SKIP = ".katex-mathml, [hidden], [aria-hidden='true'], script, style, template";
+export const ATOM = "img, svg, hr, video, canvas, .katex, .katex-display, .mdp-diagram";
+/** What has no box of its own to read, and no text of the source's that the page shows: KaTeX's MathML copy is
+ *  clipped to a pixel, and the rest is never drawn. */
+export const SKIP = ".katex-mathml, [hidden], [aria-hidden='true'], script, style, template";
 
 /** How much of the shorter of two boxes must overlap the other, vertically, for both to sit on one row: a
  *  superscript, an inline formula or an inline image taller than the text shares the line it rides on. */

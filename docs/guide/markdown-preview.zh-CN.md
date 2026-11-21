@@ -1,5 +1,5 @@
 [English](markdown-preview.md) | 简体中文
-<!-- translated-from: markdown-preview.md sha256=462e8e4afcd63d81c8f1d7877fb3890a4afc015187d67e46f24c2dc4ea37d411 -->
+<!-- translated-from: markdown-preview.md sha256=30d1c936b6ac140e2f723099fee7a136f16a3ab7834536d7fdfcb71edbdc20c4 -->
 
 # Markdown 预览
 
@@ -78,6 +78,9 @@ eitri.plugin.load("markdown", { auto = true })
 | 按键 | 作用 |
 |---|---|
 | `j` / `k` | 光标向下 / 向上移动一个显示行（一个长段落占好几行，和 Vim 的 `gj` 一样） |
+| `h` / `l` | 光标向左 / 向右移动一个字符，只在它所在的文字块里走（一个换行的段落是一块；代码块的每一行各自独立） |
+| `w` / `b` / `e` | 到下一个词 / 这个词或上一个词的开头 / 这个词或下一个词的结尾，和 Vim 一样；词在下一块里时接着走到下一块 |
+| `0` / `$` | 这个显示行的第一个 / 最后一个字符 |
 | `Ctrl+e` / `Ctrl+y` | 向下 / 向上滚动一步；光标不动，除非边距把它推开 |
 | `d` 或 `Ctrl+d` / `u` 或 `Ctrl+u` | 向下 / 向上半页，光标跟着走 |
 | `Ctrl+f` / `Ctrl+b` | 向下 / 向上一页 |
@@ -96,6 +99,8 @@ eitri.plugin.load("markdown", { auto = true })
 | `?` | 列出这些按键 |
 | `Esc` | 退出当前模式；同时清除搜索高亮 |
 
+- 光标落在它那一行的某一个字符上，画成一个方块。`j`、`k` 和翻页会保持它的列（遇到更短的行就落在最后一个字符上，到了更长的行又回到原来的列）；其他跳转（`gg`、`G`、`}`、`{`、`]]`、`[[`、文档内的链接、`H` 和 `L`）把它放在那一行第一个不是空格的字符上，搜索把它放在匹配处，点击把它放在你点的字符上。`w`、`b`、`e` 找到的词和选中文字时一样。沿着一行移动不会移动 Neovim 的光标；移到另一行时会，和 `j` 一样。
+- 方块用的是 Neovim 给 Normal 模式光标的颜色：你的 `guicursor` 里 Normal 模式那一项指定的高亮组；Neovim 默认的 `guicursor` 那一项没有指定高亮组，这时就是正文颜色反过来。它默认不闪烁，只有那一项把 `blinkwait`、`blinkon`、`blinkoff` 都设成大于零的时间才会闪，例如 `n-v-c:block-Cursor/lCursor-blinkwait700-blinkon400-blinkoff250`；这时它像 Neovim 里的光标一样闪，每次移动都会重新开始等待。桌面要求减少动态效果时，它保持不闪。预览开着的时候，`:set guicursor` 和 `:colorscheme` 改了，时间和颜色也跟着变。
 - 当前块是光标所在的那一块；边栏里另有一条竖线标出它。点击会把光标放到你点的那一行。双击一个块，等于在那里按 `Enter`。
 - 如果 Neovim 的光标已经在预览光标所在的那一行上（移动时放到那里的，或者进入预览时带进来的那一行，这时连所在的列也不变），`Enter` 让它留在那一行，所以 Neovim 的窗口不会滚动。
 - `}` 和 `{` 一块一块走过的，就是边栏竖线标出的那些块。
@@ -108,7 +113,7 @@ eitri.plugin.load("markdown", { auto = true })
 
 ### 选中文字
 
-`v` 从光标处开始选中，和 Vim 一样；`V` 按整行选中。状态行显示 `VISUAL` 或 `VISUAL LINE`。然后：
+`v` 从方块所在的字符开始选中，和 Vim 一样；`V` 按整行选中。状态行显示 `VISUAL` 或 `VISUAL LINE`。然后：
 
 | 按键 | 作用 |
 |---|---|
@@ -124,7 +129,7 @@ eitri.plugin.load("markdown", { auto = true })
 | `v` / `V` | 在按字符和按整行之间切换；再按一次同一个键就结束选中 |
 | `Esc` | 结束选中 |
 
-- 预览的光标跟着你移动的那一端走，所以选区始终在边距以内，Neovim 也像按 `j` 时那样跟着走。
+- 预览的光标跟着你移动的那一端走：每次移动都把它带回边距以内，Neovim 也像按 `j` 时那样跟着走。`Ctrl+e` 和 `Ctrl+y` 只滚动页面、不移动选区，所以选区可能移出屏幕，直到你下一次移动，哪怕只是在同一行里移动。方块落在选区光标所在的字符上，`V` 也一样（这时 `h` 和 `l` 沿着这一行移动方块，选中的仍是整行），选中结束后也留在那里。没有文字的行（图片、代码块里的空行）没有方块。
 - 预览从不修改你的文字。要修改选中的内容，按 `Enter`，在 Neovim 里改（`c`、`d`、`gq` 等等）。
 - 选区在一行源码之内，而且它的文字在那一行里只出现一次时，`Enter` 在 Neovim 里选中同样的字符；否则 Neovim 选中它覆盖的整行源码：渲染后的 Markdown 对不回源码的列（`**bold**` 显示为 **bold**，链接只显示文字）。如果 Neovim 正停在提示或命令行上，就什么也不选中，状态行会说明。
 - 点击鼠标会结束选中，把按键交给别的窗格也会。选中时用的按键不能在 `init.lua` 里修改；`v` 和 `V` 本身可以（`visual.char`、`visual.line`）。
@@ -135,7 +140,7 @@ eitri.plugin.load("markdown", { auto = true })
 eitri.keymap.set("plugin:markdown", "e", "edit.here")
 ```
 
-焦点在预览上时，`<prefix> ?` 会在 Eitri 自己的按键列表里先列出它的按键。动作名是 `cursor.down`、`cursor.up`、`cursor.half_down`、`cursor.half_up`、`cursor.page_down`、`cursor.page_up`、`cursor.first`、`cursor.last`、`block.next`、`block.prev`、`scroll.down`、`scroll.up`、`heading.next`、`heading.prev`、`scroll.left`、`scroll.right`、`find.start`、`find.next`、`find.prev`、`hint.start`、`block.yank`、`edit.here`、`history.back`、`history.forward`、`sheet.open`、`mode.escape`、`visual.char`、`visual.line`，以及查看器的 `viewer.open`、`viewer.close`、`viewer.left`、`viewer.right`、`viewer.left_edge`、`viewer.right_edge`、`viewer.zoom_in`、`viewer.zoom_out`、`viewer.actual`、`viewer.fit`、`viewer.fit_width` 和 `count`（数字 `1` 到 `9`）。如果你在候选版本里改过这些按键，把对 `scroll.half_down`、`scroll.half_up`、`scroll.page_down`、`scroll.page_up`、`scroll.top` 或 `scroll.bottom` 的修改改成对应的 `cursor.` 动作（`cursor.half_down`……`cursor.first`、`cursor.last`）：预览里已经没有这几个 `scroll.` 动作了。
+焦点在预览上时，`<prefix> ?` 会在 Eitri 自己的按键列表里先列出它的按键。动作名是 `cursor.down`、`cursor.up`、`cursor.half_down`、`cursor.half_up`、`cursor.page_down`、`cursor.page_up`、`cursor.first`、`cursor.last`、`cursor.left`、`cursor.right`、`cursor.word_next`、`cursor.word_prev`、`cursor.word_end`、`cursor.line_start`、`cursor.line_end`、`block.next`、`block.prev`、`scroll.down`、`scroll.up`、`heading.next`、`heading.prev`、`scroll.left`、`scroll.right`、`find.start`、`find.next`、`find.prev`、`hint.start`、`block.yank`、`edit.here`、`history.back`、`history.forward`、`sheet.open`、`mode.escape`、`visual.char`、`visual.line`，以及查看器的 `viewer.open`、`viewer.close`、`viewer.zoom_in`、`viewer.zoom_out`、`viewer.actual`、`viewer.fit`、`viewer.fit_width` 和 `count`（数字 `1` 到 `9`）。查看器打开时，`cursor.down`、`cursor.up`、`cursor.left`、`cursor.right`、`cursor.line_start`、`cursor.line_end` 和翻页动作由它自己响应。如果你在候选版本里改过这些按键，把对 `scroll.half_down`、`scroll.half_up`、`scroll.page_down`、`scroll.page_up`、`scroll.top` 或 `scroll.bottom` 的修改改成对应的 `cursor.` 动作（`cursor.half_down`……`cursor.first`、`cursor.last`）：预览里已经没有这几个 `scroll.` 动作了。
 
 一步滚动多远、滚动是否带动画、`g` 这样的键等多久、什么时候列出接下来的键、提示标签用哪些字母、搜索怎样处理大小写，这些是所有插件页面共用的设置：见[插件页面里的按键](configuration.zh-CN.md#keys-in-a-plugin-page)。
 

@@ -34,7 +34,7 @@ const kit = { version: 5, install: vi.fn(async (o: InstallOptions) => { installe
   message: vi.fn(), status: vi.fn(), keys: vi.fn((a: string) => kitKeys[a] ?? []), findRefresh: vi.fn(), findSeed: vi.fn() };
 const press = (action: string, key = "") => installed!.run(action, new KeyboardEvent("keydown", { key }));
 const typeCount = (digits: string) => {
-  for (const d of digits) press(d === "0" ? "viewer.left_edge" : "count", d);
+  for (const d of digits) press(d === "0" ? "cursor.line_start" : "count", d);
 };
 
 const runner: MermaidRunner = {
@@ -145,8 +145,7 @@ describe("the viewer's keys", () => {
     expect(rows.get("viewer.open")).toMatchObject({ keys: ["o"], context: PAGE_CONTEXT });
     const own = PAGE_ROWS.filter((r) => r.context === VIEWER_CONTEXT).map((r) => [r.action, r.keys]);
     expect(own).toEqual([
-      ["viewer.close", ["q"]], ["viewer.left", ["h"]], ["viewer.right", ["l"]], ["viewer.left_edge", ["0"]],
-      ["viewer.right_edge", ["$"]], ["viewer.zoom_in", ["+"]], ["viewer.zoom_out", ["-"]], ["viewer.actual", ["="]],
+      ["viewer.close", ["q"]], ["viewer.zoom_in", ["+"]], ["viewer.zoom_out", ["-"]], ["viewer.actual", ["="]],
       ["viewer.fit", ["a"]], ["viewer.fit_width", ["s"]], ["count", ["1", "2", "3", "4", "5", "6", "7", "8", "9"]],
     ]);
     expect(VIEWER_HINT).toContain("q close");
@@ -156,7 +155,10 @@ describe("the viewer's keys", () => {
     const all = PAGE_ROWS.flatMap((r) => r.keys);
     expect(new Set(all).size).toBe(all.length);
     const kitKeysAll = new Set(GENERIC_ROWS.flatMap((r) => r.keys));
-    const viewerKeys = PAGE_ROWS.filter((r) => r.context === VIEWER_CONTEXT || r.action === "viewer.open").flatMap((r) => r.keys);
+    // `h` `l` `0` `$` are the page's cursor rows, which the open viewer answers.
+    const answered = ["viewer.open", "cursor.left", "cursor.right", "cursor.line_start", "cursor.line_end"];
+    const viewerKeys = PAGE_ROWS.filter((r) => r.context === VIEWER_CONTEXT || answered.includes(r.action))
+      .flatMap((r) => r.keys);
     expect(viewerKeys.filter((k) => kitKeysAll.has(k))).toEqual([]);
     // No Ctrl key among them, so no prefix (or none named) costs the viewer a key.
     for (const prefix of [undefined, "Ctrl+b", "Ctrl+a"]) {
@@ -167,7 +169,7 @@ describe("the viewer's keys", () => {
 
   it("do nothing while the viewer is closed, except `o`", () => {
     show(doc());
-    for (const a of ["viewer.close", "viewer.left", "viewer.zoom_in", "viewer.actual", "viewer.fit", "count"]) {
+    for (const a of ["viewer.close", "viewer.zoom_in", "viewer.actual", "viewer.fit", "count"]) {
       expect(press(a, "5")).toBe(false);
     }
     expect(overlay()).toBeNull();
@@ -306,20 +308,51 @@ describe("moving and zooming by keys", () => {
     expect(document.querySelector(".mdp-viewer-zoom")!.textContent).toBe("200%");
   });
 
+  it("answers the cursor's h l 0 $ with the same counts, and leaves w b e alone", () => {
+    openDiagram();
+    press("viewer.actual");
+    const x0 = viewBox()[0];
+    typeCount("3");
+    press("cursor.right", "l");
+    expect(viewBox()[0]).toBeCloseTo(x0 + 3 * 160);
+    typeCount("10");
+    expect(document.querySelector(".mdp-viewer-count")!.textContent).toBe("10");
+    press("cursor.left", "h");
+    expect(viewBox()[0]).toBe(0);
+    press("cursor.line_end", "$");
+    expect(viewBox()[0]).toBe(1200);
+    for (const a of ["cursor.word_next", "cursor.word_prev", "cursor.word_end"]) {
+      expect(press(a, "w")).toBe(true);
+      expect(viewBox()[0]).toBe(1200);
+    }
+    expect(overlay()).not.toBeNull();
+  });
+
+  it("keeps a pending count through w b e, which mean nothing here", () => {
+    openDiagram();
+    press("viewer.actual");
+    const x0 = viewBox()[0];
+    typeCount("3");
+    for (const a of ["cursor.word_next", "cursor.word_prev", "cursor.word_end"]) expect(press(a, "w")).toBe(true);
+    expect(document.querySelector(".mdp-viewer-count")!.textContent).toBe("3");
+    press("cursor.right", "l");
+    expect(viewBox()[0]).toBeCloseTo(x0 + 3 * 160);
+  });
+
   it("pans a fifth of the view per `hjkl`, `5l` five of them, and stops at the edges", () => {
     openDiagram();
     press("viewer.actual"); // 100%: 800 x 600 of 2000 x 500, centred at x 600
     const x0 = viewBox()[0];
     expect(x0).toBeCloseTo(600);
-    press("viewer.right", "l");
+    press("cursor.right", "l");
     expect(viewBox()[0]).toBeCloseTo(x0 + 160);
-    press("viewer.left", "h");
+    press("cursor.left", "h");
     typeCount("5");
-    press("viewer.right", "l");
+    press("cursor.right", "l");
     expect(viewBox()[0]).toBeCloseTo(1200);
-    press("viewer.left_edge");
+    press("cursor.line_start", "0");
     expect(viewBox()[0]).toBe(0);
-    press("viewer.right_edge");
+    press("cursor.line_end", "$");
     expect(viewBox()[0]).toBe(1200);
     // Taller than wide at 2x: j/k, d/u, gg/G move down the picture.
     typeCount("400");
@@ -442,7 +475,7 @@ describe("the document updating under the viewer", () => {
   it("an edit of the diagram redraws it, keeping the zoom and the centre's share of the picture", () => {
     openDiagram();
     press("viewer.actual");
-    press("viewer.right", "l");
+    press("cursor.right", "l");
     const [x, , w] = viewBox();
     const share = (x + w / 2) / 2000;
     show(doc({ source: "graph LR W3000\nA-->B" }));

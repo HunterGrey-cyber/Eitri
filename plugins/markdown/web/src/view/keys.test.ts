@@ -2,6 +2,7 @@ import { afterEach, assert, beforeEach, describe, expect, it, vi } from "vitest"
 import type { InstallOptions } from "../kit";
 import type { Bridge, EditorView } from "../protocol";
 import type { MermaidRunner } from "../render/mermaid";
+import { mergeRows } from "../../../../../plugin-kit/keys/src/install";
 import { installFakeLayout, type FakeLayout } from "./fakelayout";
 import { editHere, installKeys, jumpTo, PAGE_CONTEXT, PAGE_ROWS, pageRows } from "./keys";
 import { Preview } from "./preview";
@@ -66,7 +67,10 @@ describe("the page's rows", () => {
       ["cursor.half_up", ["u", "<C-u>"]], ["cursor.page_down", ["<C-f>"]], ["cursor.page_up", ["<C-b>"]],
       ["cursor.first", ["gg"]], ["cursor.last", ["G"]],
       ["block.next", ["}"]], ["block.prev", ["{"]],
-      ["heading.next", ["]]"]], ["heading.prev", ["[["]], ["scroll.left", ["zh"]], ["scroll.right", ["zl"]],
+      ["heading.next", ["]]"]], ["heading.prev", ["[["]],
+      ["cursor.left", ["h"]], ["cursor.right", ["l"]], ["cursor.word_next", ["w"]], ["cursor.word_prev", ["b"]],
+      ["cursor.word_end", ["e"]], ["cursor.line_start", ["0"]], ["cursor.line_end", ["$"]],
+      ["scroll.left", ["zh"]], ["scroll.right", ["zl"]],
       ["block.yank", ["yy"]], ["edit.here", ["<CR>"]], ["viewer.open", ["o"]],
       // The diagram viewer's own rows (viewer.test.ts).
       ...PAGE_ROWS.filter((r) => r.context === VIEWER_CONTEXT).map((r) => [r.action, r.keys]),
@@ -98,6 +102,39 @@ describe("the page's rows", () => {
     expect([none["cursor.half_down"], none["cursor.half_up"]]).toEqual([["d"], ["u"]]);
     expect([none["cursor.page_down"], none["cursor.page_up"]]).toEqual([undefined, undefined]);
     expect(keysOf(pageRows("Ctrl+Space"))).toEqual(keysOf(PAGE_ROWS));
+  });
+
+  it("declare the block cursor's seven moves in the page's context, one key each", () => {
+    const moves = PAGE_ROWS.filter((r) => r.action.match(/^cursor\.(left|right|word_next|word_prev|word_end|line_start|line_end)$/));
+    expect(moves.map((r) => [r.action, r.keys, r.context])).toEqual([
+      ["cursor.left", ["h"], PAGE_CONTEXT], ["cursor.right", ["l"], PAGE_CONTEXT],
+      ["cursor.word_next", ["w"], PAGE_CONTEXT], ["cursor.word_prev", ["b"], PAGE_CONTEXT],
+      ["cursor.word_end", ["e"], PAGE_CONTEXT], ["cursor.line_start", ["0"], PAGE_CONTEXT],
+      ["cursor.line_end", ["$"], PAGE_CONTEXT],
+    ]);
+    // The diagram viewer has no rows of its own for these four: it answers the page's.
+    expect(PAGE_ROWS.filter((r) => /^viewer\.(left|right|left_edge|right_edge)$/.test(r.action))).toEqual([]);
+    // Every one of the page's rows reaches the kit for any prefix, so a rebinding in `plugin:markdown` has a row to move.
+    for (const prefix of [null, "Ctrl+b"]) {
+      const kept = new Set(pageRows(prefix).map((r) => r.action));
+      for (const r of moves) expect(kept.has(r.action)).toBe(true);
+    }
+  });
+
+  it("hold no key under two actions, as the host's declaration check refuses", () => {
+    // The host's rule (`core/src/plugin/keys.rs` `validate`): a key, spelled as its strokes, names one action.
+    const strokes = (key: string) => (key.match(/<[^>]*>|[\s\S]/gu) ?? []).map((t) => (t.length > 1 ? t.toLowerCase() : t)).join(" ");
+    for (const prefix of [null, "Ctrl+b", "Ctrl+Space"]) {
+      const held = new Map<string, string>();
+      for (const row of mergeRows(pageRows(prefix), undefined, prefix)) {
+        for (const key of row.keys) {
+          const other = held.get(strokes(key));
+          expect(other === undefined || other === row.action, `${key} is held by ${other} and ${row.action}`).toBe(true);
+        }
+        for (const key of row.keys) held.set(strokes(key), row.action);
+      }
+      for (const key of ["h", "l", "w", "b", "e", "0", "$"]) expect(held.has(key), key).toBe(true);
+    }
   });
 
   it("answer mode.escape with false, so the kit moves focus off a focused control", async () => {

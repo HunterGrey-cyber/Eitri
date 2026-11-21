@@ -76,7 +76,7 @@ async function start(): Promise<void> {
     const vars = themeVarsOf(data);
     if (!vars) return;
     mermaid.setTheme(vars);
-    p.onTextSize();
+    p.onTheme();
     p.rerender();
   });
   installLinks(p, root);
