@@ -111,7 +111,8 @@ impl PageTheme {
 /// The name is `--nv-` and dash-separated groups of lowercase ASCII letters and digits, at most 64
 /// characters. Its shape decides the value's kind, so nothing has to list the set: `--nv-color-scheme` is
 /// `light` or `dark`, a name starting `--nv-font-` is a font list, a name ending `-size` is a length in whole or
-/// hundredths of CSS px (`14px`, `18.67px`), and every other name is a `#rrggbb` colour in lowercase hex.
+/// hundredths of CSS px (`14px`, `18.67px`), a name ending `-ms` is a time in whole milliseconds (`0ms`, `400ms`, up to
+/// `99999ms`), and every other name is a `#rrggbb` colour in lowercase hex.
 /// Lengths count Unicode scalar values.
 pub fn page_var_ok(name: &str, value: &str) -> bool {
     if !name_ok(name) {
@@ -123,6 +124,8 @@ pub fn page_var_ok(name: &str, value: &str) -> bool {
         font_list_ok(value)
     } else if name.ends_with("-size") {
         size_ok(value)
+    } else if name.ends_with("-ms") {
+        ms_ok(value)
     } else {
         colour_ok(value)
     }
@@ -139,6 +142,15 @@ fn size_ok(value: &str) -> bool {
     };
     let digits = |text: &str, most: usize| (1..=most).contains(&text.len()) && text.bytes().all(|b| b.is_ascii_digit());
     digits(whole, 3) && !whole.starts_with('0') && fraction.is_none_or(|f| digits(f, 2))
+}
+
+/// `0ms`, or `<1 to 5 digits, no leading zero>ms`.
+fn ms_ok(value: &str) -> bool {
+    let Some(digits) = value.strip_suffix("ms") else {
+        return false;
+    };
+    digits == "0"
+        || ((1..=5).contains(&digits.len()) && !digits.starts_with('0') && digits.bytes().all(|b| b.is_ascii_digit()))
 }
 
 fn name_ok(name: &str) -> bool {
@@ -247,6 +259,7 @@ mod tests {
                 .iter()
                 .map(|(n, a)| (n.to_string(), a.clone()))
                 .collect::<HashMap<_, _>>(),
+            cursor: None,
             options: NvimOptions {
                 background: background.into(),
                 guifont: guifont.into(),
@@ -299,6 +312,20 @@ mod tests {
     }
 
     #[test]
+    fn ms_vars() {
+        for ok in ["0ms", "250ms", "99999ms", "10ms"] {
+            assert!(page_var_ok("--nv-cursor-blinkon-ms", ok), "{ok}");
+        }
+        for bad in [
+            "01ms", "100000ms", "1.5ms", "ms", "-1ms", "250", "250px", "250 ms", "250MS", "#222436", "+5ms",
+        ] {
+            assert!(!page_var_ok("--nv-cursor-blinkon-ms", bad), "{bad}");
+        }
+        // The shape belongs to the name: a colour name takes no time, and a time name takes no colour.
+        assert!(!page_var_ok("--nv-bg", "250ms"));
+    }
+
+    #[test]
     fn the_fallback_page_theme_is_the_appearance_set() {
         let theme = PageTheme::fallback();
         let names: Vec<&str> = theme.vars().iter().map(|(n, _)| n.as_str()).collect();
@@ -319,7 +346,7 @@ mod tests {
         let guifont = vec![family; 40].join(",");
         let tokens = ThemeTokens::derive(&payload("dark", &guifont, &[]));
         let theme = PageTheme::from_tokens(&tokens);
-        assert_eq!(theme.vars().len(), 55);
+        assert_eq!(theme.vars().len(), 61);
         assert!(theme.vars().iter().any(|(n, _)| n == "--nv-font-mono"));
         assert_one_root_rule(&theme.user_style_sheet());
     }

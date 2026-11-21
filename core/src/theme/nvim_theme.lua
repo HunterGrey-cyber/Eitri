@@ -22,7 +22,7 @@ if not socket or socket == "" then
 end
 
 local GROUPS = {
-  "Normal", "NormalFloat", "Pmenu", "StatusLine", "WinSeparator", "VertSplit", "Comment", "Visual",
+  "Normal", "NormalFloat", "Pmenu", "StatusLine", "WinSeparator", "VertSplit", "Comment", "Visual", "CursorLine",
   "IncSearch", "Search", "DiagnosticWarn", "WarningMsg", "DiagnosticError", "ErrorMsg", "DiagnosticOk",
   "DiagnosticInfo", "Function", "String", "@keyword", "Statement", "@function", "@string", "@type", "Type",
   "@comment", "@number", "Number", "@constant", "Constant", "@variable", "Identifier", "@operator",
@@ -48,6 +48,50 @@ local function read_start_scale()
   end
 end
 
+-- What the editor draws for a Normal-mode cursor, read from `'guicursor'` here because the editor's own cursor
+-- table belongs to Neovide and this feed never reads that. The entries that name mode `n` or `a` apply in order
+-- and a later one overrides only the fields it sets. An entry's arguments are `block`, `ver<n>`, `hor<n>`,
+-- `blinkwait<n>`, `blinkon<n>`, `blinkoff<n>`, or a highlight group (the part before `/`, which names the
+-- `lCursor` group). nvim reads the modes and those keywords without regard to case (`N:BLOCK-Cursor` is the same
+-- entry as `n:block-Cursor`), so they are compared lowercased; the group keeps its own spelling. Blink times unset
+-- stay 0, which the host reads as steady. They are capped well below the largest u32 so a silly number cannot make
+-- the whole payload unparsable. A group name nvim would refuse (anything outside ASCII letters, digits, `_`, `.` and
+-- `@`) leaves the option set but gives the cursor no group, so nvim draws Normal reversed; the name is not sent,
+-- because `:set` accepts a name that is not valid UTF-8 and the host rejects a whole frame that is.
+local MAX_BLINK = 0x7fffffff
+local function normal_cursor()
+  local group, blink = nil, { wait = 0, on = 0, off = 0 }
+  for entry in vim.gsplit(vim.o.guicursor, ",", { plain = true }) do
+    local modes, args = entry:match("^([^:]*):(.*)$")
+    local applies = false
+    for mode in vim.gsplit((modes or ""):lower(), "-", { plain = true }) do
+      applies = applies or mode == "n" or mode == "a"
+    end
+    if applies then
+      for arg in vim.gsplit(args, "-", { plain = true }) do
+        local lowered = arg:lower()
+        local kind, digits = lowered:match("^blink(%a+)(%d+)$")
+        if kind and blink[kind] then
+          blink[kind] = math.min(tonumber(digits), MAX_BLINK)
+        elseif lowered ~= "block" and not lowered:match("^ver%d+$") and not lowered:match("^hor%d+$") then
+          local name = arg:match("^([^/]*)")
+          if name ~= "" then
+            group = name:find("^[A-Za-z0-9_.@]+$") and name or nil
+          end
+        end
+      end
+    end
+  end
+  local cursor = { group = group, blinkwait = blink.wait, blinkon = blink.on, blinkoff = blink.off }
+  if group then
+    local ok, attrs = pcall(vim.api.nvim_get_hl, 0, { name = group, link = false })
+    if ok then
+      cursor.fg, cursor.bg = attrs.fg, attrs.bg
+    end
+  end
+  return cursor
+end
+
 -- Runs on the main loop (autocmd callback): `nvim_get_hl` is not allowed in a fast event.
 local function snapshot()
   local groups = vim.empty_dict()
@@ -60,6 +104,7 @@ local function snapshot()
   return vim.json.encode({
     v = 1,
     groups = groups,
+    cursor = normal_cursor(),
     options = {
       background = vim.o.background,
       guifont = vim.o.guifont,
@@ -121,7 +166,7 @@ vim.api.nvim_create_autocmd("VimEnter", { group = augroup, once = true, callback
   read_start_scale()
 end })
 vim.api.nvim_create_autocmd({ "VimEnter", "ColorScheme" }, { group = augroup, callback = send_now })
-vim.api.nvim_create_autocmd("OptionSet", { group = augroup, pattern = { "background", "guifont", "cmdheight" }, callback = send_now })
+vim.api.nvim_create_autocmd("OptionSet", { group = augroup, pattern = { "background", "guifont", "cmdheight", "guicursor" }, callback = send_now })
 
 -- nvim has no "a highlight group changed" event at all, so a bare
 -- `nvim_set_hl` call -- or an autocmd registered AFTER this file's own, which therefore fires

@@ -4,7 +4,7 @@
 //! receive a complete set, so neither ever needs a default of its own.
 
 use super::color::{ensure_contrast, ensure_contrast_against_both, ensure_contrast_with_pole, Rgb};
-use super::payload::{HlAttrs, NvimThemePayload};
+use super::payload::{CursorInfo, HlAttrs, NvimThemePayload};
 
 /// nvim's own built-in default colorscheme (`NvimDarkGrey2` / `NvimLightGrey2`). Used only when
 /// nvim has sent no `Normal` at all. Not the UI protocol's `default_colors_set`: that event is
@@ -98,6 +98,7 @@ pub(crate) const GROUPS_READ: &[&str] = &[
     "VertSplit",
     "Comment",
     "Visual",
+    "CursorLine",
     "IncSearch",
     "Search",
     "DiagnosticWarn",
@@ -135,6 +136,9 @@ pub(crate) const GROUPS_READ: &[&str] = &[
     "lualine_a_insert",
     "lualine_a_visual",
 ];
+
+/// The largest blink time a page is given (`page_var_ok`'s `-ms` shape allows five digits).
+const MAX_BLINK_MS: u32 = 99_999;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct ThemeTokens {
@@ -176,6 +180,19 @@ pub struct ThemeTokens {
     pub border: Rgb,
     pub muted: Rgb,
     pub cursorline: Rgb,
+    /// What the editor draws its current line with: `CursorLine`'s own background, guarded only so `fg` text still
+    /// reads on it, and `cursorline` (the `Visual`-based band) when the group has no background or is reversed.
+    /// A separate token from `cursorline` because the agent panel's chooser and popovers take `cursorline` as a
+    /// selection colour; a page that draws the editor's current line asks for this one.
+    pub editor_cursorline: Rgb,
+    /// A Normal-mode cursor's fill and text as the editor draws them: the group the `guicursor` entry names, each
+    /// colour falling back to the other of Normal's two (reversed), the group's own `reverse` ignored. With no group
+    /// the cursor is Normal reversed. Unguarded: it is the editor's own colour.
+    pub cursor_bg: Rgb,
+    pub cursor_fg: Rgb,
+    /// The Normal-mode cursor's `(blinkwait, blinkon, blinkoff)` in milliseconds as nvim has them; 0 in any place, or
+    /// no cursor info, means steady. `appearance_vars` clamps each to `MAX_BLINK_MS` so it always passes the page rule.
+    pub cursor_blink: (u32, u32, u32),
     pub hint_bg: Rgb,
     pub hint_fg: Rgb,
     pub search: Rgb,
@@ -409,6 +426,18 @@ impl ThemeTokens {
             TEXT_CONTRAST,
         );
 
+        // The editor's own current line: guarded only so `fg` text reads on it, never made a visible band against
+        // `bg` (the editor does not), and `cursorline` when the group paints no background of its own.
+        let editor_cursorline = payload
+            .groups
+            .get("CursorLine")
+            .filter(|a| !a.reverse)
+            .and_then(|a| a.bg)
+            .map_or(cursorline, |raw| {
+                ensure_contrast(Rgb::from_u32(raw), fg, bg, TEXT_CONTRAST)
+            });
+        let (cursor_bg, cursor_fg, cursor_blink) = normal_cursor(payload.cursor.as_ref(), bg, fg);
+
         // `muted` used to be guarded only against `bg`, though `index.css` also paints
         // it directly on a `cursorline` fill (the detail popover's and chooser's current row). It is
         // guarded against both at once: a second guard run after the first, toward `fg`, walked a
@@ -501,6 +530,10 @@ impl ThemeTokens {
                 .unwrap_or_else(|| bg.mix(fg, 0.15)),
             muted,
             cursorline,
+            editor_cursorline,
+            cursor_bg,
+            cursor_fg,
+            cursor_blink,
             hint_bg,
             hint_fg,
             search: g.bg_of(&["Search"]).unwrap_or(hint_bg),
@@ -550,6 +583,9 @@ impl ThemeTokens {
             ("border", self.border),
             ("muted", self.muted),
             ("cursorline", self.cursorline),
+            ("editor-cursorline", self.editor_cursorline),
+            ("cursor-bg", self.cursor_bg),
+            ("cursor-fg", self.cursor_fg),
             ("hint-bg", self.hint_bg),
             ("hint-fg", self.hint_fg),
             ("search", self.search),
@@ -588,6 +624,13 @@ impl ThemeTokens {
                 .iter()
                 .map(|(name, colour)| (format!("--nv-syn-{name}"), colour.hex())),
         );
+        let (wait, on, off) = self.cursor_blink;
+        for (name, ms) in [("wait", wait), ("on", on), ("off", off)] {
+            vars.push((
+                format!("--nv-cursor-blink{name}-ms"),
+                format!("{}ms", ms.min(MAX_BLINK_MS)),
+            ));
+        }
         vars.push(("--nv-font-prose".to_string(), PROSE_FONT_STACK.to_string()));
         vars.push(("--nv-font-mono".to_string(), self.font_mono.clone()));
         vars.push(("--nv-color-scheme".to_string(), self.color_scheme.to_string()));
@@ -690,6 +733,21 @@ pub(crate) fn mono_font_stack(guifont: &str) -> String {
     stack.join(", ")
 }
 
+/// The Normal-mode cursor's `(fill, text, blink times)` as the fork's `Cursor::resolve_colors` gives them with its cell
+/// colour fallback off: the named group's `bg` is the fill and its `fg` the text, each falling back to the other
+/// of Normal's colours, `reverse` ignored; with no cursor info or no group, Normal reversed.
+fn normal_cursor(cursor: Option<&CursorInfo>, bg: Rgb, fg: Rgb) -> (Rgb, Rgb, (u32, u32, u32)) {
+    let Some(cursor) = cursor else {
+        return (fg, bg, (0, 0, 0));
+    };
+    let (fill, text) = if cursor.group.is_some() {
+        (cursor.bg.map_or(fg, Rgb::from_u32), cursor.fg.map_or(bg, Rgb::from_u32))
+    } else {
+        (fg, bg)
+    };
+    (fill, text, (cursor.blinkwait, cursor.blinkon, cursor.blinkoff))
+}
+
 /// A statusline mode section's `(bg, fg)` as the group draws it, or `fallback` when the group is missing
 /// or leaves either colour to Normal (`ThemeTokens::status_normal`).
 fn status_block(g: &Groups<'_>, group: &str, fallback_bg: Rgb, fallback_fg: Rgb) -> (Rgb, Rgb) {
@@ -749,7 +807,7 @@ pub fn guifont_size_px(guifont: &str) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::theme::payload::{HlAttrs, NvimOptions, NvimThemePayload, PAYLOAD_VERSION};
+    use crate::theme::payload::{CursorInfo, HlAttrs, NvimOptions, NvimThemePayload, PAYLOAD_VERSION};
     use std::collections::HashMap;
 
     fn hl(fg: Option<u32>, bg: Option<u32>) -> HlAttrs {
@@ -763,6 +821,7 @@ mod tests {
                 .iter()
                 .map(|(n, a)| (n.to_string(), a.clone()))
                 .collect::<HashMap<_, _>>(),
+            cursor: None,
             options: NvimOptions {
                 background: background.into(),
                 guifont: String::new(),
@@ -781,13 +840,14 @@ mod tests {
         assert_eq!(t.color_scheme, "dark");
         let vars = t.css_vars();
         // 45, the status band's three mode blocks as a bg and fg each (2026-10-15), the cursor band's two
-        // fills with the composer's focus ring, its inactive mark, and the colour of a Markdown link.
-        assert_eq!(vars.len(), 56);
+        // fills with the composer's focus ring, its inactive mark, and the colour of a Markdown link, then the
+        // editor's current line, the cursor's two colours and its three blink times.
+        assert_eq!(vars.len(), 62);
         assert!(vars
             .iter()
             .all(|(name, value)| name.starts_with("--nv-") && !value.is_empty()));
         let names: std::collections::HashSet<_> = vars.iter().map(|(n, _)| n.as_str()).collect();
-        assert_eq!(names.len(), 56, "no duplicate variable names");
+        assert_eq!(names.len(), 62, "no duplicate variable names");
         // The count alone would be satisfied by any variable at all, and this one carries a UNIT --
         // a bare `14` reaches the panel as an invalid `font-size` and every ratio built on it
         // silently falls back to the browser default.
@@ -1819,15 +1879,21 @@ mod tests {
     }
 
     #[test]
-    fn the_appearance_vars_number_55_and_carry_no_size() {
+    fn the_appearance_vars_number_61_and_carry_no_size() {
         let vars = ThemeTokens::fallback().appearance_vars();
-        assert_eq!(vars.len(), 55);
+        assert_eq!(vars.len(), 61);
         let names: std::collections::HashSet<&str> = vars.iter().map(|(n, _)| n.as_str()).collect();
-        assert_eq!(names.len(), 55, "no duplicate names");
+        assert_eq!(names.len(), 61, "no duplicate names");
         for name in [
             "--nv-bg",
             "--nv-focus-ring",
             "--nv-focus-ring-inactive",
+            "--nv-editor-cursorline",
+            "--nv-cursor-bg",
+            "--nv-cursor-fg",
+            "--nv-cursor-blinkwait-ms",
+            "--nv-cursor-blinkon-ms",
+            "--nv-cursor-blinkoff-ms",
             "--nv-syn-tag",
             "--nv-font-prose",
             "--nv-font-mono",
@@ -1838,6 +1904,173 @@ mod tests {
         for name in ["--nv-font-size", "--nv-editor-row", "--nv-editor-cmd-rows"] {
             assert!(!names.contains(name), "{name}");
         }
+    }
+
+    /// tokyonight-moon's numbers: Normal `#c8d3f5` on `#222436`, `CursorLine` `#2f334d`, `Visual` `#2d3f76`.
+    fn moon(extra: &[(&str, HlAttrs)]) -> NvimThemePayload {
+        let mut groups = vec![
+            ("Normal", hl(Some(0xc8d3f5), Some(0x222436))),
+            ("CursorLine", hl(None, Some(0x2f334d))),
+            ("Visual", hl(None, Some(0x2d3f76))),
+        ];
+        groups.extend(extra.iter().map(|(n, a)| (*n, a.clone())));
+        // A later entry replaces an earlier one of the same name in the map `payload` builds.
+        payload("dark", &groups)
+    }
+
+    fn cursor(group: Option<&str>, fg: Option<u32>, bg: Option<u32>, blink: (u32, u32, u32)) -> Option<CursorInfo> {
+        Some(CursorInfo {
+            group: group.map(str::to_string),
+            fg,
+            bg,
+            blinkwait: blink.0,
+            blinkon: blink.1,
+            blinkoff: blink.2,
+        })
+    }
+
+    fn var(tokens: &ThemeTokens, name: &str) -> String {
+        tokens
+            .appearance_vars()
+            .into_iter()
+            .find(|(n, _)| n == name)
+            .unwrap_or_else(|| panic!("{name} is not sent"))
+            .1
+    }
+
+    fn assert_cursor(tokens: &ThemeTokens, fill: &str, text: &str) {
+        assert_eq!(
+            (tokens.cursor_bg.hex(), tokens.cursor_fg.hex()),
+            (fill.into(), text.into())
+        );
+    }
+
+    #[test]
+    fn editor_cursorline_is_cursorline_bg() {
+        let tokens = ThemeTokens::derive(&moon(&[]));
+        assert_eq!(tokens.editor_cursorline.hex(), "#2f334d");
+        // `cursorline` is still the Visual-based band the panel's chooser and popovers use.
+        let without = payload(
+            "dark",
+            &[
+                ("Normal", hl(Some(0xc8d3f5), Some(0x222436))),
+                ("Visual", hl(None, Some(0x2d3f76))),
+            ],
+        );
+        assert_eq!(tokens.cursorline, ThemeTokens::derive(&without).cursorline);
+        assert_ne!(tokens.cursorline, tokens.editor_cursorline);
+        assert_eq!(var(&tokens, "--nv-editor-cursorline"), "#2f334d");
+    }
+
+    #[test]
+    fn editor_cursorline_falls_back_without_bg_or_when_reversed() {
+        let plain = ThemeTokens::derive(&moon(&[]));
+        let missing = payload(
+            "dark",
+            &[
+                ("Normal", hl(Some(0xc8d3f5), Some(0x222436))),
+                ("Visual", hl(None, Some(0x2d3f76))),
+            ],
+        );
+        let missing = ThemeTokens::derive(&missing);
+        assert_eq!(missing.editor_cursorline, missing.cursorline, "no CursorLine at all");
+        let no_bg = ThemeTokens::derive(&moon(&[("CursorLine", hl(Some(0xffffff), None))]));
+        assert_eq!(no_bg.editor_cursorline, no_bg.cursorline, "no background");
+        let reversed = ThemeTokens::derive(&moon(&[(
+            "CursorLine",
+            HlAttrs {
+                fg: None,
+                bg: Some(0x2f334d),
+                reverse: true,
+            },
+        )]));
+        assert_eq!(reversed.editor_cursorline, reversed.cursorline, "reversed");
+        assert_ne!(plain.editor_cursorline, plain.cursorline);
+    }
+
+    #[test]
+    fn editor_cursorline_keeps_fg_readable() {
+        // Almost the text colour itself: unguarded, fg text on it would be unreadable.
+        let tokens = ThemeTokens::derive(&moon(&[("CursorLine", hl(None, Some(0xc8d3f4)))]));
+        assert!(
+            tokens.editor_cursorline.contrast(tokens.fg) >= TEXT_CONTRAST,
+            "{}",
+            tokens.editor_cursorline.hex()
+        );
+    }
+
+    #[test]
+    fn cursor_colours_follow_the_named_group() {
+        let mut p = moon(&[]);
+        p.cursor = cursor(Some("Cursor"), Some(0x112233), Some(0xaabbcc), (0, 0, 0));
+        let tokens = ThemeTokens::derive(&p);
+        // Unguarded: a fill one step from the page's own stays as it is (checked below).
+        assert_cursor(&tokens, "#aabbcc", "#112233");
+        assert_eq!(var(&tokens, "--nv-cursor-bg"), "#aabbcc");
+        assert_eq!(var(&tokens, "--nv-cursor-fg"), "#112233");
+        p.cursor = cursor(Some("Cursor"), Some(0x222437), Some(0x222436), (0, 0, 0));
+        let same = ThemeTokens::derive(&p);
+        assert_cursor(&same, "#222436", "#222437");
+    }
+
+    #[test]
+    fn cursor_without_group_is_normal_reversed() {
+        let mut p = moon(&[]);
+        for info in [
+            None,
+            cursor(None, None, None, (0, 0, 0)),
+            cursor(Some("NoSuchGroup"), None, None, (0, 0, 0)),
+        ] {
+            p.cursor = info;
+            let tokens = ThemeTokens::derive(&p);
+            assert_cursor(&tokens, "#c8d3f5", "#222436");
+        }
+        // A group with only a background: the text falls back to Normal's background.
+        p.cursor = cursor(Some("Cursor"), None, Some(0xaabbcc), (0, 0, 0));
+        let tokens = ThemeTokens::derive(&p);
+        assert_cursor(&tokens, "#aabbcc", "#222436");
+        // And one with only a foreground: the fill falls back to Normal's foreground.
+        p.cursor = cursor(Some("Cursor"), Some(0x112233), None, (0, 0, 0));
+        let tokens = ThemeTokens::derive(&p);
+        assert_cursor(&tokens, "#c8d3f5", "#112233");
+    }
+
+    #[test]
+    fn cursor_reverse_is_ignored() {
+        let reversed_cursor = HlAttrs {
+            fg: Some(0x112233),
+            bg: Some(0xaabbcc),
+            reverse: true,
+        };
+        let mut p = moon(&[("Cursor", reversed_cursor)]);
+        p.cursor = cursor(Some("Cursor"), Some(0x112233), Some(0xaabbcc), (0, 0, 0));
+        let tokens = ThemeTokens::derive(&p);
+        assert_cursor(&tokens, "#aabbcc", "#112233");
+    }
+
+    #[test]
+    fn blink_vars_are_ms() {
+        let mut p = moon(&[]);
+        p.cursor = cursor(None, None, None, (700, 400, 250));
+        let tokens = ThemeTokens::derive(&p);
+        assert_eq!(var(&tokens, "--nv-cursor-blinkwait-ms"), "700ms");
+        assert_eq!(var(&tokens, "--nv-cursor-blinkon-ms"), "400ms");
+        assert_eq!(var(&tokens, "--nv-cursor-blinkoff-ms"), "250ms");
+        p.cursor = None;
+        let steady = ThemeTokens::derive(&p);
+        for name in ["wait", "on", "off"] {
+            assert_eq!(var(&steady, &format!("--nv-cursor-blink{name}-ms")), "0ms");
+        }
+    }
+
+    #[test]
+    fn blink_times_are_clamped_to_what_a_page_accepts() {
+        let mut p = moon(&[]);
+        p.cursor = cursor(None, None, None, (100_000, u32::MAX, 99_999));
+        let tokens = ThemeTokens::derive(&p);
+        assert_eq!(var(&tokens, "--nv-cursor-blinkwait-ms"), "99999ms");
+        assert_eq!(var(&tokens, "--nv-cursor-blinkon-ms"), "99999ms");
+        assert_eq!(var(&tokens, "--nv-cursor-blinkoff-ms"), "99999ms");
     }
 
     #[test]

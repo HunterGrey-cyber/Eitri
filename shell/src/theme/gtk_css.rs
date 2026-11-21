@@ -706,6 +706,7 @@ mod tests {
                 },
             )]
             .into(),
+            cursor: None,
             options: NvimOptions {
                 background: "light".into(),
                 guifont: String::new(),
@@ -792,6 +793,7 @@ mod tests {
                 ),
             ]
             .into(),
+            cursor: None,
             options: NvimOptions {
                 background: "dark".into(),
                 guifont: String::new(),
@@ -992,6 +994,7 @@ mod tests {
                 ("StatusLine".to_string(), status),
             ]
             .into(),
+            cursor: None,
             options: NvimOptions {
                 background: "dark".into(),
                 guifont: String::new(),
@@ -1186,6 +1189,7 @@ mod tests {
                 ),
             ]
             .into(),
+            cursor: None,
             options: NvimOptions {
                 background: "dark".into(),
                 guifont: String::new(),
@@ -1226,6 +1230,7 @@ mod tests {
                 ),
             ]
             .into(),
+            cursor: None,
             options: NvimOptions {
                 background: "dark".into(),
                 guifont: String::new(),
@@ -1262,6 +1267,7 @@ mod tests {
                 ),
             ]
             .into(),
+            cursor: None,
             options: NvimOptions {
                 background: "light".into(),
                 guifont: String::new(),

@@ -18,6 +18,25 @@ pub struct HlAttrs {
     pub reverse: bool,
 }
 
+/// The Normal-mode cursor as `nvim_theme.lua` resolves it from `'guicursor'`. Colours are those of the highlight
+/// group the entry names (absent when it names none, or the group does not exist); the blink times are
+/// milliseconds, with 0 meaning steady.
+#[derive(Clone, Debug, Default, PartialEq, Deserialize, Serialize)]
+pub struct CursorInfo {
+    #[serde(default)]
+    pub group: Option<String>,
+    #[serde(default)]
+    pub fg: Option<u32>,
+    #[serde(default)]
+    pub bg: Option<u32>,
+    #[serde(default)]
+    pub blinkwait: u32,
+    #[serde(default)]
+    pub blinkon: u32,
+    #[serde(default)]
+    pub blinkoff: u32,
+}
+
 #[derive(Clone, Debug, PartialEq, Deserialize, Serialize)]
 pub struct NvimOptions {
     /// `"light"` or `"dark"`: nvim's `'background'`.
@@ -41,6 +60,10 @@ pub struct NvimThemePayload {
     pub v: u32,
     /// Only groups nvim reported as non-empty are present.
     pub groups: HashMap<String, HlAttrs>,
+    /// Absent from a snippet older than this field (the snippet ships in the same binary, so only a feed
+    /// injected into a long-running nvim can lack it).
+    #[serde(default)]
+    pub cursor: Option<CursorInfo>,
     pub options: NvimOptions,
 }
 
@@ -50,6 +73,7 @@ impl NvimThemePayload {
         NvimThemePayload {
             v: PAYLOAD_VERSION,
             groups: HashMap::new(),
+            cursor: None,
             options: NvimOptions {
                 background: "dark".to_string(),
                 guifont: String::new(),
@@ -100,6 +124,32 @@ mod tests {
                 reverse: true
             }
         );
+    }
+
+    #[test]
+    fn parses_a_payload_with_a_cursor() {
+        let with = DAWN.replace(
+            r#""options""#,
+            r#""cursor":{"group":"Cursor","fg":2237494,"bg":13161461,"blinkwait":700,"blinkon":400,"blinkoff":250},"options""#,
+        );
+        assert_eq!(
+            parse_payload(&with).expect("valid").cursor,
+            Some(CursorInfo {
+                group: Some("Cursor".to_string()),
+                fg: Some(2237494),
+                bg: Some(13161461),
+                blinkwait: 700,
+                blinkon: 400,
+                blinkoff: 250,
+            })
+        );
+    }
+
+    #[test]
+    fn a_payload_without_a_cursor_reads_none() {
+        assert_eq!(parse_payload(DAWN).expect("valid").cursor, None);
+        let bare = DAWN.replace(r#""options""#, r#""cursor":{},"options""#);
+        assert_eq!(parse_payload(&bare).expect("valid").cursor, Some(CursorInfo::default()));
     }
 
     #[test]

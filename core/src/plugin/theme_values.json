@@ -99,6 +99,21 @@
       "id": "size-hundredths",
       "name": "--nv-text-size",
       "value": "18.67px"
+    },
+    {
+      "id": "ms-zero",
+      "name": "--nv-cursor-blinkon-ms",
+      "value": "0ms"
+    },
+    {
+      "id": "ms-whole",
+      "name": "--nv-cursor-blinkwait-ms",
+      "value": "250ms"
+    },
+    {
+      "id": "ms-five-digits",
+      "name": "--nv-cursor-blinkoff-ms",
+      "value": "99999ms"
     }
   ],
   "refused": [
@@ -483,6 +498,42 @@
     {
       "id": "size-name-takes-no-colour",
       "name": "--nv-text-size",
+      "value": "#14161b",
+      "why": "value"
+    },
+    {
+      "id": "ms-leading-zero",
+      "name": "--nv-cursor-blinkon-ms",
+      "value": "01ms",
+      "why": "value"
+    },
+    {
+      "id": "ms-six-digits",
+      "name": "--nv-cursor-blinkon-ms",
+      "value": "100000ms",
+      "why": "value"
+    },
+    {
+      "id": "ms-fraction",
+      "name": "--nv-cursor-blinkon-ms",
+      "value": "1.5ms",
+      "why": "value"
+    },
+    {
+      "id": "ms-no-number",
+      "name": "--nv-cursor-blinkon-ms",
+      "value": "ms",
+      "why": "value"
+    },
+    {
+      "id": "ms-negative",
+      "name": "--nv-cursor-blinkon-ms",
+      "value": "-1ms",
+      "why": "value"
+    },
+    {
+      "id": "ms-name-takes-no-colour",
+      "name": "--nv-cursor-blinkon-ms",
       "value": "#14161b",
       "why": "value"
     }

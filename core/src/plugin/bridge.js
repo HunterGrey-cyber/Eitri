@@ -23,12 +23,13 @@
     return e;
   }
 
-  // The theme the host hands every page: the user's colours and font lists, and, from every Eitri window except one
-  // beside a person's own Neovim, the editor's text size, set as custom properties on the root so a page reads them with var(). Each value is
-  // checked again here with the host's own rule.
+  // The theme the host hands every page: the user's colours, font lists and cursor blink times in milliseconds, and,
+  // from every Eitri window except one beside a person's own Neovim, the editor's text size, set as custom properties
+  // on the root so a page reads them with var(). Each value is checked again here with the host's own rule.
   var THEME_NAME = /^--nv-[a-z0-9]+(?:-[a-z0-9]+)*$/u;
   var THEME_COLOUR = /^#[0-9a-f]{6}$/u;
   var THEME_SIZE = /^[1-9][0-9]{0,2}(?:\.[0-9]{1,2})?px$/u;
+  var THEME_MS = /^(?:0|[1-9][0-9]{0,4})ms$/u;
   var THEME_FONTS = /^(?:"[^"\x5C;{}<>()[\]/*\u{0}-\u{1F}\u{7F}-\u{9F}]{1,100}"|[A-Za-z][A-Za-z0-9-]{0,39})(?:, ?(?:"[^"\x5C;{}<>()[\]/*\u{0}-\u{1F}\u{7F}-\u{9F}]{1,100}"|[A-Za-z][A-Za-z0-9-]{0,39})){0,15}$/u;
   var themeNames = new Set();
 
@@ -38,6 +39,7 @@
     if (name === "--nv-color-scheme") return value === "light" || value === "dark";
     if (name.indexOf("--nv-font-") === 0) return Array.from(value).length <= 1024 && THEME_FONTS.test(value);
     if (name.slice(-5) === "-size") return THEME_SIZE.test(value);
+    if (name.slice(-3) === "-ms") return THEME_MS.test(value);
     return THEME_COLOUR.test(value);
   }
 

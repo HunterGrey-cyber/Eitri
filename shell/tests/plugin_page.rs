@@ -508,6 +508,7 @@ fn light_theme() -> PageTheme {
         )]
         .into_iter()
         .collect(),
+        cursor: None,
         options: NvimOptions {
             background: "light".to_owned(),
             guifont: String::new(),

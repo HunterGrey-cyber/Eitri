@@ -274,6 +274,7 @@ mod tests {
                 ),
             ]
             .into(),
+            cursor: None,
             options: NvimOptions {
                 background: "light".into(),
                 guifont: "Mono:h14".into(),

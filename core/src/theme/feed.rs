@@ -225,7 +225,7 @@ fn parse_bytes(line: &[u8]) -> Result<NvimThemePayload, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::theme::payload::PAYLOAD_VERSION;
+    use crate::theme::payload::{CursorInfo, PAYLOAD_VERSION};
     use crate::theme::tokens::GROUPS_READ;
     use crate::theme::ThemeTokens;
     use std::io::Write;
@@ -556,6 +556,149 @@ mod tests {
                 want => assert_eq!(payload.options.start_scale, Some(want), "{config:?}"),
             }
         }
+    }
+
+    /// Starts a headless nvim with the feed loaded and `commands` run (`-c`, before VimEnter), and returns the first
+    /// payload `accept` takes, or panics after ten seconds.
+    fn payload_from_nvim(commands: &[&str], accept: impl Fn(&NvimThemePayload) -> bool) -> NvimThemePayload {
+        let mut feed = ThemeFeed::new().expect("feed");
+        let mut reader = reader_for(&mut feed);
+        let mut command = std::process::Command::new("nvim");
+        command.args(["--headless", "--clean"]).args(feed.nvim_args());
+        for cmd in commands {
+            command.args(["-c", cmd]);
+        }
+        let mut child = command
+            .envs(feed.child_env())
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("nvim on PATH");
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut seen = None;
+        while Instant::now() < deadline && seen.is_none() {
+            seen = reader.poll().filter(&accept);
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        let _ = child.kill();
+        let _ = child.wait();
+        feed.cleanup();
+        seen.expect("nvim never pushed the awaited payload")
+    }
+
+    /// The Normal-mode cursor nvim reports once `guicursor` is `set` and the colorscheme has loaded.
+    fn cursor_for(guicursor: &str) -> CursorInfo {
+        let set = format!("set guicursor={guicursor}");
+        let payload = payload_from_nvim(&[&set, "colorscheme retrobox"], |p| p.options.colors_name == "retrobox");
+        payload.cursor.expect("the snippet always sends a cursor")
+    }
+
+    /// Like `cursor_for`, but `guicursor` is assigned from Lua, so it may hold bytes `:set` would not carry: `tail` is
+    /// a Lua expression appended to `"n:block-"`.
+    fn cursor_for_lua_tail(tail: &str) -> CursorInfo {
+        let set = format!("lua vim.o.guicursor = 'n:block-' .. {tail}");
+        let payload = payload_from_nvim(&[&set, "colorscheme retrobox"], |p| p.options.colors_name == "retrobox");
+        payload.cursor.expect("the snippet always sends a cursor")
+    }
+
+    fn steady() -> (u32, u32, u32) {
+        (0, 0, 0)
+    }
+
+    fn blink(cursor: &CursorInfo) -> (u32, u32, u32) {
+        (cursor.blinkwait, cursor.blinkon, cursor.blinkoff)
+    }
+
+    #[test]
+    #[ignore = "spawns a real nvim; run with: cargo test -p eitri-core theme::feed -- --ignored"]
+    fn guicursor_default_is_steady_with_no_group() {
+        let payload = payload_from_nvim(&["colorscheme retrobox"], |p| p.options.colors_name == "retrobox");
+        let cursor = payload.cursor.expect("the snippet always sends a cursor");
+        assert_eq!((cursor.group.as_deref(), blink(&cursor)), (None, steady()));
+        assert_eq!((cursor.fg, cursor.bg), (None, None));
+    }
+
+    #[test]
+    #[ignore = "spawns a real nvim; run with: cargo test -p eitri-core theme::feed -- --ignored"]
+    fn guicursor_vim_classic() {
+        let cursor = cursor_for("n-v-c:block-Cursor/lCursor");
+        assert_eq!((cursor.group.as_deref(), blink(&cursor)), (Some("Cursor"), steady()));
+        assert!(
+            cursor.fg.is_some() || cursor.bg.is_some(),
+            "the Cursor group's colours: {cursor:?}"
+        );
+    }
+
+    #[test]
+    #[ignore = "spawns a real nvim; run with: cargo test -p eitri-core theme::feed -- --ignored"]
+    fn guicursor_blink_numbers() {
+        let cursor = cursor_for("n:block-blinkwait700-blinkon400-blinkoff250");
+        assert_eq!((cursor.group.as_deref(), blink(&cursor)), (None, (700, 400, 250)));
+    }
+
+    #[test]
+    #[ignore = "spawns a real nvim; run with: cargo test -p eitri-core theme::feed -- --ignored"]
+    fn guicursor_a_blinkon0_wins() {
+        let cursor = cursor_for("n:blinkwait700-blinkon400-blinkoff250,a:blinkon0");
+        assert_eq!(blink(&cursor), (700, 0, 250));
+    }
+
+    #[test]
+    #[ignore = "spawns a real nvim; run with: cargo test -p eitri-core theme::feed -- --ignored"]
+    fn guicursor_naming_a_missing_group() {
+        let cursor = cursor_for("n:block-NoSuchGroup");
+        assert_eq!(cursor.group.as_deref(), Some("NoSuchGroup"));
+        assert_eq!((cursor.fg, cursor.bg), (None, None));
+    }
+
+    #[test]
+    #[ignore = "spawns a real nvim; run with: cargo test -p eitri-core theme::feed -- --ignored"]
+    fn guicursor_modes_and_keywords_are_case_insensitive() {
+        // nvim reads `N`, `BLOCK` and `BLINKWAIT` like their lowercase forms; the group keeps its own spelling.
+        let cursor = cursor_for("N:BLOCK-Cursor");
+        assert_eq!(cursor.group.as_deref(), Some("Cursor"));
+        let cursor = cursor_for("n:BLINKWAIT700-BLINKON400-BLINKOFF250");
+        assert_eq!((cursor.group.as_deref(), blink(&cursor)), (None, (700, 400, 250)));
+        let cursor = cursor_for("A:Block-VER25-cursor,N:blinkWait100");
+        assert_eq!((cursor.group.as_deref(), blink(&cursor)), (Some("cursor"), (100, 0, 0)));
+    }
+
+    #[test]
+    #[ignore = "spawns a real nvim; run with: cargo test -p eitri-core theme::feed -- --ignored"]
+    fn guicursor_a_group_name_nvim_refuses_is_not_sent() {
+        // `:set` accepts a name with a stray byte (nvim only complains), so it stays in the option; sending it would make
+        // the host reject the whole frame as invalid UTF-8 and lose every later theme update. The payload arrives, with
+        // no group, and a refused name also clears a valid group an earlier entry set, as it does in nvim.
+        for tail in ["string.char(255)", "'Cu$r'", "'caf\\xc3\\xa9'"] {
+            let cursor = cursor_for_lua_tail(tail);
+            assert_eq!(cursor.group, None, "{tail}");
+        }
+        let set = "lua vim.o.guicursor = 'n:block-Cursor,n:block-' .. string.char(255)";
+        let payload = payload_from_nvim(&[set, "colorscheme retrobox"], |p| p.options.colors_name == "retrobox");
+        assert_eq!(payload.cursor.and_then(|c| c.group), None);
+    }
+
+    #[test]
+    #[ignore = "spawns a real nvim; run with: cargo test -p eitri-core theme::feed -- --ignored"]
+    fn guicursor_a_group_name_with_dots_and_at_signs_is_sent() {
+        let cursor = cursor_for_lua_tail("'My.Group@x'");
+        assert_eq!(cursor.group.as_deref(), Some("My.Group@x"));
+    }
+
+    /// Only the `OptionSet guicursor` handler can deliver this: the option holds the group for 1.5 seconds and is then
+    /// back at its default, and the periodic resnapshot (which sends what it sees at each tick, three seconds apart)
+    /// never sees the group at all.
+    #[test]
+    #[ignore = "spawns a real nvim; run with: cargo test -p eitri-core theme::feed -- --ignored"]
+    fn guicursor_change_resends() {
+        // Nested, so the `:set` inside the handler fires OptionSet; the payload at VimEnter still has no group.
+        let handler = "autocmd VimEnter * ++nested set guicursor=n:block-Cursor | \
+                       lua vim.defer_fn(function() vim.cmd('set guicursor&') end, 1500)";
+        let payload = payload_from_nvim(&[handler], |p| {
+            p.cursor.as_ref().is_some_and(|c| c.group.as_deref() == Some("Cursor"))
+        });
+        assert_eq!(payload.cursor.and_then(|c| c.group).as_deref(), Some("Cursor"));
     }
 
     /// Nvim has no general highlight-change event. A plugin autocmd registered after the loader

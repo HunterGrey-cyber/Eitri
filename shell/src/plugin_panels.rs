@@ -2704,6 +2704,7 @@ mod tests {
             )]
             .into_iter()
             .collect(),
+            cursor: None,
             options: NvimOptions {
                 background: background.to_owned(),
                 guifont: String::new(),
