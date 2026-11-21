@@ -143,6 +143,16 @@ impl AnswerBound {
         )
     }
 
+    /// A ReadPath answer for a request with this `limit` (0 meaning the server's maximum): the data at most the
+    /// effective cap, framed as [`Self::read_file`] is.
+    pub fn read_path(limit: u64) -> Self {
+        let most = eitri_server_proto::READ_PATH_MAX as u64;
+        let cap = if limit == 0 { most } else { limit.min(most) };
+        let mut bound = Self::read_file(cap);
+        bound.what = "the server's path read";
+        bound
+    }
+
     pub fn entries(&self) -> usize {
         self.entries
     }

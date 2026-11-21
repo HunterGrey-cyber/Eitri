@@ -317,7 +317,7 @@ assert(jobs == 0 and #argv() == 0)
 
 #[test]
 #[ignore = "needs a real nvim with serverstart() socket access"]
-fn the_plugin_file_defines_four_commands_and_one_global() {
+fn the_plugin_file_defines_five_commands_and_one_global() {
     check(
         "load",
         r#"
@@ -328,7 +328,7 @@ for name in pairs(commands_after) do
   if commands_before[name] == nil then table.insert(added, name) end
 end
 table.sort(added)
-assert(vim.deep_equal(added, {'EitriOpen', 'EitriPage', 'EitriPanel', 'EitriSync'}), vim.inspect(added))
+assert(vim.deep_equal(added, {'EitriOpen', 'EitriPage', 'EitriPanel', 'EitriRemote', 'EitriSync'}), vim.inspect(added))
 for name in pairs(commands_before) do assert(commands_after[name] ~= nil, name) end
 assert(vim.g.loaded_eitri == 1)
 local globals_after = vim.fn.eval('copy(g:)')
@@ -336,8 +336,16 @@ globals_after.loaded_eitri = nil
 assert(vim.deep_equal(globals_before, globals_after), vim.inspect(globals_after))
 assert(vim.deep_equal(maps_before, all_maps()))
 assert(#vim.fn.timer_info() == 0)
-local other = vim.tbl_filter(function(a) return a.group_name ~= "EitriRemote" end, vim.api.nvim_get_autocmds({}))
-assert(vim.deep_equal(autocmds_before, other))
+-- The only new ones are the remote setup's own groups (the sync, the eitri-remote:// buffers, the language-server
+-- guard) and Neovim's exit handler, which `vim.lsp` adds when the language-server wrap first loads it.
+local function expected(a)
+  return tostring(a.group_name or ""):find("^EitriRemote") ~= nil or a.desc == "vim.lsp: exit handler"
+end
+local other = vim.tbl_filter(function(a) return not expected(a) end, vim.api.nvim_get_autocmds({}))
+local function named(list)
+  return vim.tbl_map(function(a) return (a.group_name or "-") .. " " .. a.event .. " " .. tostring(a.pattern) end, list)
+end
+assert(vim.deep_equal(autocmds_before, other), vim.inspect({ before = named(autocmds_before), after = named(other) }))
 vim.cmd('runtime plugin/eitri.lua')
 assert(jobs == 0 and #argv() == 0)
 "#,

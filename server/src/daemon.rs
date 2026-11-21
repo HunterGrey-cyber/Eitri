@@ -4,6 +4,8 @@ pub mod exec;
 pub mod gate;
 #[path = "login_env.rs"]
 pub mod login_env;
+#[path = "lsp/mod.rs"]
+pub mod lsp;
 #[path = "serve/mod.rs"]
 pub mod serve;
 #[path = "sidecars.rs"]
@@ -140,6 +142,9 @@ fn capabilities(boot_id: &str) -> Vec<String> {
         CAP_EXEC.to_owned(),
         CAP_TRANSCRIPTS.to_owned(),
         CAP_GATE_FACTS.to_owned(),
+        CAP_EXEC_COMMAND.to_owned(),
+        CAP_LSP.to_owned(),
+        CAP_READ_PATH.to_owned(),
     ];
     if !boot_id.is_empty() {
         caps.push(CAP_TERMINAL.to_owned());
@@ -582,7 +587,7 @@ impl Helper for Service {
                 )))))
             }
         };
-        let prepared = match off_runtime(move || exec::git::prepare(&start, &captured.env)).await? {
+        let prepared = match off_runtime(move || exec::prepare(&start, &captured.env)).await? {
             Ok(prepared) => prepared,
             Err(refusal) => return Ok(Response::new(streamed(exec::refused(refusal)))),
         };
@@ -639,6 +644,7 @@ pub async fn run_with_terminals(
         managed.clone(),
     ));
     let serving = serve::Serving::new(paths.clone(), managed.clone());
+    let servers = Arc::new(lsp::Servers::new(paths.clone(), managed.clone()));
     let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
     let listener = UnixListener::bind(paths.bind_socket()?)?;
     let _cleanup = Cleanup(paths.clone());
@@ -752,6 +758,7 @@ pub async fn run_with_terminals(
             )))
             .add_service(serve::TerminalRoutes::new(hosts.clone(), daemon_instance.clone()))
             .add_service(serve::transcripts_server(managed.clone()))
+            .add_service(serve::lsp_server(servers.clone()))
             .serve_with_incoming(incoming);
         tokio::pin!(server);
         let idle_exit = async {
@@ -765,7 +772,8 @@ pub async fn run_with_terminals(
                     && !managed.any_alive()
                     && !hosts.any_live()
                     && runs.running() == 0
-                    && !modes.holds();
+                    && !modes.holds()
+                    && !servers.any_live();
                 let state = connections.lock().expect("connection state");
                 if empty && state.active == 0 && state.last_closed.elapsed() >= idle {
                     break;
@@ -779,6 +787,8 @@ pub async fn run_with_terminals(
                 tick.tick().await;
                 let manager = managed.clone();
                 let _ = tokio::task::spawn_blocking(move || manager.trim_logs()).await;
+                let language_servers = servers.clone();
+                let _ = tokio::task::spawn_blocking(move || language_servers.trim_logs()).await;
                 managed.refresh_handshakes().await;
                 hosts.maintain().await;
                 if let Err(error) = serving.maintain().await {
@@ -799,18 +809,19 @@ pub async fn run_with_terminals(
             _ = idle_exit => (Ok(()), false),
             _ = &mut maintenance => unreachable!(),
         };
-        // Terminal hosts, sidecars and Exec runs stop together, so the stop takes the longest of their bounds, not
-        // their sum, while the server still carries the hosts' final frames.
+        // Terminal hosts, sidecars, Exec runs and language servers stop together, so the stop takes the longest of
+        // their bounds, not their sum, while the server still carries the hosts' final frames.
         let stops = if terminate {
             stopping.store(true, Ordering::SeqCst);
             let all = async {
                 let mut sidecars = owned.lock().await;
                 let pids: Vec<_> = sidecars.children.iter().filter_map(tokio::process::Child::id).collect();
-                let (hosts_stopped, managed_stopped, stopped, ()) = tokio::join!(
+                let (hosts_stopped, managed_stopped, stopped, (), ()) = tokio::join!(
                     hosts.stop_all(),
                     managed.stop_all(),
                     sidecars.stop_all(),
-                    stop_runs_and_keepers(&runs, &modes, &paths.state)
+                    stop_runs_and_keepers(&runs, &modes, &paths.state),
+                    servers.stop_all()
                 );
                 (hosts_stopped, managed_stopped, stopped, pids)
             };
@@ -1136,8 +1147,15 @@ mod tests {
             CAP_SYNC_MODES,
             CAP_EXEC,
             CAP_TRANSCRIPTS,
+            CAP_EXEC_COMMAND,
+            CAP_LSP,
+            CAP_READ_PATH,
         ] {
-            assert!(hello.capabilities.iter().any(|cap| cap == capability), "{capability}");
+            assert_eq!(
+                hello.capabilities.iter().filter(|cap| *cap == capability).count(),
+                1,
+                "{capability}"
+            );
         }
         assert_eq!(hello.protocol_minor, 3);
     }

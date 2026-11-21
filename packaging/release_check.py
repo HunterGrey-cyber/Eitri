@@ -845,6 +845,10 @@ _PLUGIN_FILES = {
     "plugin-module": "lua/eitri/init.lua",
     "plugin-remote-init": "lua/eitri/remote/init.lua",
     "plugin-remote-sync": "lua/eitri/remote/sync.lua",
+    "plugin-remote-exec": "lua/eitri/remote/exec.lua",
+    "plugin-remote-buffers": "lua/eitri/remote/buffers.lua",
+    "plugin-remote-lsp": "lua/eitri/remote/lsp.lua",
+    "plugin-remote-text": "lua/eitri/remote/text.lua",
     "plugin-health": "lua/eitri/health.lua",
     "plugin-doc": "doc/eitri.txt",
 }

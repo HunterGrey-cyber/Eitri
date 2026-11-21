@@ -83,10 +83,58 @@ pub fn parse_hash(text: &str) -> Result<[u8; 32], String> {
 
 /// A value for an audit line: as it is when it is one plain word, quoted otherwise, so a field cannot pass for two.
 pub fn audit_word(text: &str) -> String {
-    let plain = |c: char| c.is_ascii_graphic() || (!c.is_ascii() && !c.is_control() && !c.is_whitespace());
+    let plain = |c: char| {
+        c.is_ascii_graphic() || (!c.is_ascii() && !c.is_control() && !c.is_whitespace() && !is_format_char(c))
+    };
     if !text.is_empty() && !text.contains('"') && text.chars().all(plain) {
         text.to_owned()
     } else {
         format!("{text:?}")
+    }
+}
+
+/// Whether `c` is an invisible format character (Unicode category Cf: soft hyphen, zero-width and bidirectional
+/// controls, the byte-order mark, the tag characters). The common invisible ones, listed by hand: `char` has no category test, and a value that carries
+/// one must not look like a plain word in a line a person reads.
+fn is_format_char(c: char) -> bool {
+    matches!(
+        c,
+        '\u{AD}'
+            | '\u{61C}'
+            | '\u{180E}'
+            | '\u{200B}'..='\u{200F}'
+            | '\u{202A}'..='\u{202E}'
+            | '\u{2060}'..='\u{2064}'
+            | '\u{2066}'..='\u{206F}'
+            | '\u{FEFF}'
+            | '\u{FFF9}'..='\u{FFFB}'
+            | '\u{E0001}'
+            | '\u{E0020}'..='\u{E007F}'
+    )
+}
+
+#[cfg(test)]
+mod audit_word_tests {
+    use super::audit_word;
+
+    #[test]
+    fn a_value_with_an_invisible_format_character_is_quoted() {
+        assert_eq!(audit_word("fmt"), "fmt");
+        assert_eq!(audit_word("é-名前"), "é-名前");
+        for hidden in [
+            "\u{202E}",
+            "\u{200B}",
+            "\u{2066}",
+            "\u{FEFF}",
+            "\u{AD}",
+            "\u{61C}",
+            "\u{180E}",
+            "\u{E0041}",
+        ] {
+            let text = format!("txt{hidden}fdp");
+            let word = audit_word(&text);
+            assert!(word.starts_with('"') && word.ends_with('"'), "{text:?} -> {word}");
+            assert!(!word.contains(hidden), "{text:?} -> {word}");
+        }
     }
 }

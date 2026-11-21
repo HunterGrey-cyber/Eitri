@@ -1,9 +1,9 @@
 [English](remote-development.md) | 简体中文
-<!-- translated-from: remote-development.md sha256=69d9c18a57606f225b816bea37bdf990ec0042bcf99bd21e001fb5854ef9702d -->
+<!-- translated-from: remote-development.md sha256=942e2adf30b5279a4e8698a3b08c796babb52889a309aed8474a588e8e21e5b5 -->
 
 # 远程开发
 
-远程开发让你电脑上的一个 Eitri 窗口，去处理放在另一台机器上的项目。代码、agent 和它的工具留在服务器上，工具链和凭据本来就在那里；你的 Neovim、它的插件、面板和你的按键都留在本地。这一页讲的是同步这一侧：项目怎样到达你的电脑、哪些东西不会到，以及两份副本对不上时 Eitri 怎么办。
+远程开发让你电脑上的一个 Eitri 窗口，去处理放在另一台机器上的项目。代码、agent 和它的工具留在服务器上，工具链和凭据本来就在那里；你的 Neovim、它的插件、面板和你的按键都留在本地。这一页讲的是同步这一侧：项目怎样到达你的电脑、哪些东西不会到，以及两份副本对不上时 Eitri 怎么办。之后讲语言服务器，和 Neovim 替你运行的命令（格式化工具、lint 工具、`make`），它们都在服务器上运行。
 
 它是**实验性**的，默认关闭。`init.lua` 里要有下面这一行，这里讲的一切才会运行：
 
@@ -47,6 +47,8 @@ eitri.config.set("remote_dev.enabled", true)
 | `remote_dev.tripwire_mib` | `64` | 体积[绊线](#the-size-tripwire)，8 到 4096 MiB |
 | `remote_dev.flush_cap` | `3` | 发送时最多等多少秒，让你的保存先到达服务器，0.5 到 30 |
 | `remote_dev.send_waits_for_flush` | `true` | 设成 `false` 则发送完全不等 |
+| `remote_dev.lsp_grace` | `1800` | Neovim 的连接断开后，服务器还把语言服务器留多少秒，60 到 86400（[宽限期](#the-grace)） |
+| `remote_dev.lsp_local` | 无 | 留在笔记本上的语言服务器名字，用逗号或空白分隔（[哪些留在笔记本上](#what-stays-on-the-laptop)） |
 
 其余设置见[配置](configuration.zh-CN.md)。
 
@@ -74,7 +76,7 @@ eitri /srv/project
 
 Eitri 记得这个文件夹是远程项目，所以窗口会以远程项目的方式打开：面板的状态栏显示主机、同步状态和冲突，agent 标签页跑在服务器上。`eitri --local /srv/project` 把同一个文件夹当作普通的本地副本打开，不建立连接（那里拒绝 agent 标签页，因为 agent 跑在服务器上）。
 
-`eitri host list` 列出你打开过的每台主机上辅助程序正在运行的 agent；`eitri host stop example-host` 停掉它们（并暂停那台主机上各项目的同步）；`eitri host uninstall example-host` 删除辅助程序。这几个命令在 `remote_dev.enabled` 关闭时也能用。
+`eitri host list` 列出你打开过的每台主机上辅助程序在运行的东西：agent、服务器终端和语言服务器；`eitri host stop example-host` 停掉它们（并暂停那台主机上各项目的同步）；`eitri host uninstall example-host` 删除辅助程序。这几个命令在 `remote_dev.enabled` 关闭时也能用。
 
 <a id="from-the-window"></a>
 ### 从窗口打开
@@ -254,6 +256,144 @@ Eitri 自己作答之前，会再问服务器一次（一次新的检查，最�
 ```
 
 只有当 Eitri 能证明 `.stignore` 里、以及它 `#include` 的文件里，没有任何内容把项目的任何部分重新纳入时，才会接受这条排除。它读不懂、或没法确定是否匹配的例外，都算作不利。Dropbox 的标记总是需要换个位置，或者去掉重叠。这项检查在你用 `eitri host open` 打开项目时运行。
+
+<a id="language-servers-and-neovim"></a>
+## 语言服务器和 Neovim
+
+前面几节都让你的编辑留在笔记本上。语言服务器、格式化工具、测试运行器就不一样：它们需要项目的工具链，而笔记本上未必有。所以在远程项目里，Eitri 让它们在服务器上运行，你的 Neovim 从笔记本上去和它们通信。语言服务器这部分不用改你的 Neovim 配置：lspconfig、`vim.lsp.enable` 和 `vim.lsp.start` 走的是同一条路。
+
+<a id="language-servers-on-the-server"></a>
+### 服务器上的语言服务器
+
+在远程项目里打开一个文件，你的配置本来会在笔记本上启动的语言服务器，改成在服务器上启动：工作目录是项目目录，环境是那个账户的登录环境。诊断、补全、悬停提示等在 Neovim 里的样子和以前一样。你的缓冲区会随着你输入送到服务器，所以补全看得到你还没保存的文字。
+
+- **语言服务器要装在服务器上**，笔记本上不用装。Eitri 在那个账户的登录 `PATH` 里找这个命令，再到那里 Mason 的目录（`~/.local/share/nvim/mason/bin`）里找。找不到时，Neovim 里的这个服务器会启动失败，并给出一条消息，例如 `rust-analyzer is not installed on example-host (looked on the login PATH and in mason)`。Eitri 这一端会马上放掉连接；Neovim 不去停它的话，大约十秒后它自己退出。
+- **每个 Neovim 一个服务器。** 同一个项目开两个 Neovim，服务器上就启动两个语言服务器。
+- 服务器配置里的 `cmd_env` 和 `cmd_cwd` 说的是笔记本，所以不会在服务器上生效。
+- **服务器进程退出了**，Eitri 会启动一个新的，并把你打开的缓冲区重新发给它。五分钟内第二次退出，Eitri 就不再重试，并告诉你：`the language server rust-analyzer on example-host stopped twice`，后面跟着它错误输出的末尾。
+- 如果服务器上还在运行的辅助程序是不认识语言服务器的旧版本，语言服务器会改在笔记本上运行。说明这一点的那一行写进 Neovim 的语言服务器日志（`vim.lsp.log.get_filename()` 给出的文件），不显示在屏幕上。它运行时不带配置里的 `cmd_env` 和 `cmd_cwd`，工作目录是 Neovim 的工作目录。重新打开这个项目的窗口，辅助程序就会更新。
+
+<a id="what-stays-on-the-laptop"></a>
+### 哪些留在笔记本上
+
+下面这些情况，语言服务器留在笔记本上：
+
+- 它的根目录不在任何远程项目里；
+- 它的名字在 `remote_dev.lsp_local` 里。名字指它配置里的 `name`，没有 `name` 的配置没法列进去。`init.lua` 不存表，所以写成一个字符串：
+
+  ```lua
+  eitri.config.set("remote_dev.lsp_local", "lua_ls, stylua")
+  ```
+
+- 它的 `cmd` 是一个 Lua 函数。函数自己建立连接，Eitri 没法把服务器放到连接的另一头。`:checkhealth eitri` 会就此给出警告（见[普通 Neovim](#plain-neovim)）；
+- 你设了 `vim.g.eitri_remote_lsp = false`（整个会话）或 `vim.b.eitri_remote_lsp = false`（单个缓冲区）。这两个是 Neovim 变量，不是 `eitri.config` 的设置项，要写在你的 Neovim 配置里。
+
+选择是在服务器启动的那一刻做出的，所以改了设置不会把已经在运行的服务器搬走。在 Eitri 的 setup 运行之前就保存了自己那份 `vim.lsp.start` 引用的插件，以及 `vim.lsp.start_client`，都不在覆盖范围内。
+
+<a id="the-grace"></a>
+### 宽限期
+
+合上盖子、换了网络、ssh 连接断了，都不会让语言服务器停下。服务器会把它留 `remote_dev.lsp_grace` 秒（60 到 86,400，默认 1,800，也就是 30 分钟），Neovim 自己会重新连接。宽限期内连接恢复时，Neovim 接上的是同一个服务器：你打开的缓冲区和你这段时间里做的保存会重新发过去，你不在时服务器发出的内容（诊断、进度）也会送到。**不会重新建索引。** 连接断着的时候，补全、悬停这类请求会立刻失败，不会一直等。
+
+宽限期用完，服务器就停掉它；下一次连接会启动一个新的，重新建索引。连接还在时，关闭 Neovim 会让服务器立刻把它的语言服务器停掉；连接断着时，语言服务器到宽限期用完才停。`eitri host stop` 也会停掉语言服务器。Neovim 里对应的客户端随之退出，不会自己启动新的，直到 Neovim 再次启动它们，比如你打开项目里的一个文件。宽限期里保留的服务器会一直占用服务器的内存，直到它结束，所以内存小的机器适合设短一点：
+
+```lua
+eitri.config.set("remote_dev.lsp_grace", 600)
+```
+
+<a id="saves-reach-the-server-first"></a>
+### 保存先到服务器
+
+你保存时，Eitri 会让同步马上把这个文件送到服务器，语言服务器要等文件到了之后才会得到通知，所以在保存时运行的检查（比如 rust-analyzer 的 `cargo check`）读到的是你保存的内容。通常这大约是到服务器一个来回的时间。如果文件在大约五秒内还没到，这次保存会照样送给语言服务器，检查就可能读到旧文件；辅助程序会在服务器上那个语言服务器的日志里记一行。一次保存最多被扣住大约六秒。`eitri host sync status` 能看到同步在做什么。
+
+<a id="gd-into-dependencies"></a>
+### `gd` 跳进依赖
+
+语言服务器还会提到同步不携带的文件：标准库、`~/.cargo` 下的某个 crate、排除目录下生成的文件。笔记本上同一路径的文件，是别的文件，或者根本没有。所以 Eitri 把这些文件打开成 `eitri-remote://example-host/<路径>` 缓冲区，内容从服务器读取：
+
+- 缓冲区先显示 `reading from example-host…`，然后是文本。它是**只读**的：`:w` 会回答 `this file is on example-host and read-only here`。
+- 文件类型由路径判断，你跳过来时用的语言服务器会接上去，所以在里面悬停、`gd` 还能继续用。`gd` 是这样，你自己打开或从面板打开的文件也是这样：你原先所在缓冲区的语言服务器如果处理这种语言，就会接上去；那个缓冲区没有的话，同一台主机上已经在为这种语言运行的服务器会接上去。只有同一台主机的语言服务器才会接到这样的缓冲区上；你的配置在笔记本上按文件类型启动的服务器不会。
+- 项目里被某条忽略规则排除的文件，也这样打开，哪怕笔记本上还留着一份旧的。
+- 超过 16 MiB 的文件会被拒绝，不会只显示一部分。同时最多读四个，其余的排队等。
+- 想自己打开一个：`:EitriRemote open /home/user/.cargo/registry/src/example/lib.rs`（当前缓冲区所属项目的服务器上的绝对路径；在 `eitri-remote://` 缓冲区里输入时，是那个缓冲区所在主机上的路径）。在远程窗口里，面板的打开路径对项目之外的绝对路径也是这样处理。`gf` 仍是 Neovim 自己的。
+- 这样的缓冲区里 `vim.b.eitri_remote` 是 `{ host, path }`，给不该把它当本地文件的插件用。
+
+在终端里，`eitri host read example-host:/absolute/path` 会把服务器上的一个文件打印出来。
+
+<a id="commands-on-the-server"></a>
+### 服务器上的命令
+
+格式化工具、lint 工具、测试运行器和 `make` 本来是 Neovim 在笔记本上启动的。`eitri host exec` 改成在项目的服务器上运行一条命令：
+
+```sh
+eitri host exec --cwd /srv/project -- cargo fmt
+```
+
+项目是记录里包含 `--cwd`（默认是当前目录）的那一个，命令在它的服务器上的同一个路径里运行。Eitri 在启动前把你的保存刷到服务器，结束时把命令改动的内容取回来，所以原地改写文件的格式化工具，命令返回时结果已经在笔记本上了（缓冲区的 `:checktime` 看得到）。`--no-flush` 两头都不做。如果刷新失败，命令照样运行，并在 stderr 上给出一行，说明你最近的保存可能还没到主机（或命令的改动可能还没回到笔记本）。标准输入会交给命令，除非你给了 `--no-stdin`，或者它是个终端，所以从 stdin 读、往 stdout 写的格式化工具能用。
+
+命令得到的是服务器账户的登录环境，加上 `TERM=dumb`，笔记本上的东西一概没有。没有谁能向它提问：要开编辑器或者要输入密码时，它会直接失败。程序要么是登录 `PATH` 里找得到的裸名字，要么是绝对路径；否则你会看到这一行：“`<name>` is not on the login PATH of this account”。
+
+你会遇到的：
+
+- **退出码。** 命令自己的退出码；信号 `n` 结束它时是 `128 + n`。**125** 表示什么都没运行：目录不在任何远程项目里、服务器拒绝了，或者它的辅助程序比这个 Eitri 旧（打开项目的窗口来更新它）。**255** 表示连不上服务器，或者结果未知，因为命令启动后连接丢了；再运行之前先到服务器上看看。Eitri 自己的行写到 stderr，以 `eitri host exec:` 开头。它用 125 而不是 1，这样 lint 工具“发现问题”的退出码不会被当成 Eitri 出了错。
+- **命令运行 1 小时后会被杀掉。** 在笔记本上中断 `eitri host exec`，停不了一条输入已经关闭的命令（Neovim 的包装会立刻关闭输入）；只有这个时限能停它。
+- 不管 `remote_dev.enabled` 开没开，只要是你打开过的项目，它都能用。
+
+<a id="exec-wrappers-for-plugins"></a>
+### 给插件用的 exec 包装
+
+`require("eitri.remote").cmd(argv, opts)` 接收一个参数列表；目录在远程项目里时，返回包在 `eitri host exec` 里的版本，否则原样返回，所以同一份配置本地项目和远程项目都能用。`opts` 里有 `cwd`（默认是当前缓冲区的目录）、`flush = false`（相当于 `--no-flush`）和 `stdin = true`（给要读标准输入的命令）。设了 `stdin = true` 的命令读的是缓冲区、答案写到标准输出，所以两次 flush 也一并跳过（每次都要到服务器走一个来回）；如果它还要读写项目里的文件，再加上 `flush = true`。各插件的一行写法：
+
+- **conform.nvim。** 把 `command` 和 `args` 写成包装后列表的函数。格式化工具如果从标准输入读缓冲区，就给 `cmd` 传 `stdin = true`，格式化工具上也设 `stdin = true`：
+
+  ```lua
+  local function on_server(argv)
+    return require("eitri.remote").cmd(argv, { stdin = true })
+  end
+  local rustfmt = { "rustfmt", "--edition", "2021" }
+  require("conform").formatters.rustfmt = {
+    inherit = false,
+    command = function() return on_server(rustfmt)[1] end,
+    args = function() return vim.list_slice(on_server(rustfmt), 2) end,
+    stdin = true,
+  }
+  ```
+
+- **nvim-lint。** `linters.<name>.cmd` 是一个函数，返回 `cmd{ ... }` 的第一个词，`args` 是其余的部分。设了 `stdin = true` 的 linter 从标准输入读缓冲区，所以要用 `cmd(argv, { stdin = true })` 生成列表：默认包装出来的命令带 `--no-stdin`，读到的是空输入。
+- **neotest。** 适配器里接收命令的选项，传 `cmd{ ... }`。
+- **`:make`。** `:EitriRemote makeprg cargo build` 把这个缓冲区的 `makeprg` 设成在服务器上、在缓冲区所在目录里运行这条命令（不给命令就是 `make`）；之后 `:make` 照常填充 quickfix 列表。`errorformat` 不动：输出里的路径是服务器上的路径，和镜像的路径一致。在远程项目之外，`:EitriRemote makeprg` 会说明这一点，什么都不改。
+
+如果列表是在没有当前缓冲区的时候建好的（nvim-lint 的 `args`、neotest 的某个选项），请自己传 `cwd`。
+
+<a id="plain-neovim"></a>
+### 普通 Neovim
+
+这一切都不需要 Eitri 窗口。在普通终端里的 Neovim，需要三样东西：
+
+1. `eitri.nvim` 插件在它的 `runtimepath` 上（`vim.opt.runtimepath:append("/usr/share/eitri/nvim/eitri.nvim")`；其他安装路径见 `:help eitri-install`）。
+2. 可选，用于上面那两个窗口会从 `init.lua` 里读的设置：
+
+   ```lua
+   require("eitri.remote").setup({
+     lsp = { grace = 1800, local_servers = { "lua_ls" } },
+   })
+   ```
+
+   不写就用默认值：宽限期 1,800 秒，没有任何服务器留在本地。超出 60 到 86,400 的宽限期会被收到这个范围内。
+3. 在 shell 里把项目打开一次：`eitri host open example-host:/srv/project`（要求 Eitri 的 `init.lua` 里 `remote_dev.enabled` 是开的）。
+
+之后，项目本地副本下的文件，和在窗口里一样：语言服务器在服务器上，可以 `gd` 进依赖，也有 exec 包装和同步监视。同步监视每次启动都会从 Eitri 的 `init.lua` 读 `remote_dev.enabled`：如果这个 Neovim 看到的 `init.lua` 里没开（或者根本没有 `init.lua`），监视会说 "remote development is off"，这时只有语言服务器和 exec 包装能用。`:help eitri-plain-remote` 说的是同样的内容。
+
+`:checkhealth eitri` 里有一节针对你输入它时所在的缓冲区。在远程项目之外，它只有一行。在项目里，它会显示项目（主机和根目录）、`eitri` 程序及其版本、`remote_dev.enabled` 开没开、附在这个缓冲区上的每个语言服务器是**远程**、**本地且已固定**、**因为 `cmd` 是函数而在本地**（警告）还是普通的本地服务器，以及 Mutagen 及其版本（低于 0.18.0 或找不到时给出警告）。
+
+<a id="a-server-shell-in-neovim"></a>
+### Neovim 里的服务器 shell
+
+`:EitriRemote term` 在新标签页的终端缓冲区里，打开项目服务器上的一个 shell，目录是当前缓冲区的目录（服务器上的同一路径）。它的样子和用 ssh 时一样：`vim`、作业控制、调整大小都能用。在远程项目之外不会打开任何东西。它运行的是 `eitri host term`，你也可以在任何终端里运行它。
+
+- 清除这个缓冲区时，会请服务器关掉 shell，但**只是尽力而为**：如果服务器在大约一秒半内没有回应，shell 会继续运行，`eitri host list` 能看到它。
+- 连接丢了，shell 会继续在服务器上运行，终端会自己重新连接，最长两分钟；之后它放弃，并说明 shell 仍在运行。
+- 它和窗口里的那些终端一样，是一个服务器终端；关闭一个会结束什么，见[服务器终端](#server-terminals)。
 
 <a id="what-is-not-in-this-version"></a>
 ## 这个版本里没有的

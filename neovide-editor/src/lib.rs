@@ -3162,6 +3162,30 @@ impl NeovideEditorPane {
         }
     }
 
+    /// Replaces the argument `old` that the pane's nvim will be started with by `new`, while nvim has not been
+    /// started (a restart takes its arguments from the host's [`NeovideEditorPaneOptions`] again). The host uses it for
+    /// a `--cmd` it can only finish once `init.lua` has run. Whether it was replaced: false when `old` is not there,
+    /// and false (with a line on stderr) once nvim has started or is starting, since the change could no longer reach it.
+    pub fn replace_nvim_arg(&self, old: &str, new: String) -> bool {
+        let state = self.live_state.borrow();
+        if !matches!(&*state, LiveState::NotStarted) {
+            eprintln!(
+                "[editor] an nvim argument was changed after nvim was started ({}); the change is not applied",
+                state.name()
+            );
+            return false;
+        }
+        drop(state);
+        let mut options = self.spawn_options.borrow_mut();
+        match options.extra_nvim_args.iter_mut().find(|arg| arg.as_str() == old) {
+            Some(arg) => {
+                *arg = new;
+                true
+            }
+            None => false,
+        }
+    }
+
     /// The `GtkGLArea` this pane renders into. The host places this into its own window (e.g. as
     /// an `ApplicationWindow`'s child) -- this pane never does so itself.
     pub fn widget(&self) -> &gtk4::GLArea {

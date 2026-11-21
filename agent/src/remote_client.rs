@@ -12,11 +12,13 @@ use crate::runtime_thread::RuntimeThread;
 use crate::ssh::{ChannelLauncher, LinkCheck};
 use eitri_server_proto::gate_client::GateClient as GateService;
 use eitri_server_proto::helper_client::HelperClient as HelperService;
+use eitri_server_proto::lsp_client::LspClient as LspService;
 use eitri_server_proto::transcripts_client::TranscriptsClient as TranscriptsService;
 use eitri_server_proto::{
-    CheckFactRequest, CheckFactResponse, GateFactEvent, HelloRequest, HelloResponse, ListSidecarsRequest,
-    PendingPermission, PendingRequest, SidecarInfo, StartSidecarRequest, StopSidecarRequest, TrustScanRequest,
-    TrustScanResponse, WatchFactsRequest, PROTOCOL_MAJOR, PROTOCOL_MINOR,
+    CheckFactRequest, CheckFactResponse, GateFactEvent, HelloRequest, HelloResponse, ListServersRequest,
+    ListServersResponse, ListSidecarsRequest, PendingPermission, PendingRequest, ReadPathChunk, ReadPathRequest,
+    SidecarInfo, StartSidecarRequest, StopServerRequest, StopSidecarRequest, TrustScanRequest, TrustScanResponse,
+    WatchFactsRequest, PROTOCOL_MAJOR, PROTOCOL_MINOR,
 };
 use std::ffi::OsString;
 use std::io;
@@ -106,6 +108,7 @@ pub struct SidecarStart {
     pub sidecar_sha256: String,
 }
 
+pub use eitri_server_proto::CAP_EXEC_COMMAND;
 pub use eitri_server_proto::{
     exec_input, exec_output, ExecExit, ExecInput, ExecOutput, ExecPurpose, ExecStart, GitConfigEntry, GitConfigRequest,
     GitConfigResponse, ListTreeEntry, ListTreeRequest, PathSize, PathSizesRequest, PathSizesResponse,
@@ -477,6 +480,13 @@ impl HelperClient {
     pub fn terminal_channel(&self) -> Result<(Channel, tokio::runtime::Handle), Status> {
         self.require_pin()?;
         Ok((self.channel(), self.inner.runtime.handle().clone()))
+    }
+
+    /// The `Lsp` service's channel and the runtime it runs on, as [`Self::terminal_channel`]: a language server's
+    /// traffic goes through a connection of its own ([`Self::terminal_connection_through`]), never the agents'. The
+    /// caller keeps this client alive outside tasks on that runtime.
+    pub fn lsp_channel(&self) -> Result<(Channel, tokio::runtime::Handle), Status> {
+        self.terminal_channel()
     }
 
     /// Opens an independent connection through this connection's launcher and installation routing.
@@ -923,6 +933,42 @@ impl HelperClient {
             .map_err(|error| refusal_text(&bound, error))
     }
 
+    /// The bytes of an absolute path on the server (`Lsp.ReadPath`): the stream of chunks as it comes. The caller
+    /// holds it to [`AnswerBound::read_path`]; [`Self::collect_read_path`] does.
+    pub fn read_path(&self, request: ReadPathRequest) -> Result<tonic::Streaming<ReadPathChunk>, Status> {
+        self.require_pin()?;
+        let mut service = LspService::new(self.channel());
+        self.call(HELPER_RPC_TIMEOUT, async move { service.read_path(request).await })
+    }
+
+    /// The language servers this installation's daemon keeps (`ListServers`). Pinned like every other call; the answer
+    /// is the server's claim, bounded by whoever keeps it.
+    pub fn list_servers(&self) -> Result<ListServersResponse, Status> {
+        self.require_pin()?;
+        let mut service = LspService::new(self.channel());
+        self.call(HELPER_RPC_TIMEOUT, async move {
+            service.list_servers(ListServersRequest {}).await
+        })
+    }
+
+    /// Stops one language server of this installation's daemon (`StopServer`): it ends as stopped, so a bridge attached
+    /// to it ends rather than starting another. The helper answers once the server has ended.
+    pub fn stop_server(&self, request: StopServerRequest) -> Result<(), Status> {
+        self.require_pin()?;
+        let mut service = LspService::new(self.channel());
+        self.call(HELPER_RPC_TIMEOUT, async move { service.stop_server(request).await })
+            .map(|_| ())
+    }
+
+    /// The whole answer of a `ReadPath` for the request's limit, refused past [`AnswerBound::read_path`]: the bound's
+    /// own line, or the call's failure in words. The chunks are not judged here (a refusal chunk may follow data).
+    pub fn collect_read_path(&self, request: ReadPathRequest) -> Result<Vec<ReadPathChunk>, String> {
+        let bound = AnswerBound::read_path(request.limit);
+        let stream = self.read_path(request).map_err(|error| error.to_string())?;
+        self.collect_sync_stream(stream, bound)
+            .map_err(|error| refusal_text(&bound, error))
+    }
+
     pub fn replace_file_if(&self, request: ReplaceFileIfRequest) -> Result<ReplaceFileIfResponse, Status> {
         self.require_pin()?;
         let mut service = self.service();
@@ -1213,6 +1259,7 @@ impl HelperExec {
                 }
             }
         });
+        let written = |error: io::Error| format!("this side could not write the output: {error}");
         loop {
             match self
                 .next_output()?
@@ -1220,12 +1267,12 @@ impl HelperExec {
                 .output
             {
                 Some(exec_output::Output::Stdout(bytes)) => {
-                    stdout.write_all(&bytes).map_err(|e| e.to_string())?;
-                    stdout.flush().map_err(|e| e.to_string())?;
+                    stdout.write_all(&bytes).map_err(written)?;
+                    stdout.flush().map_err(written)?;
                 }
                 Some(exec_output::Output::Stderr(bytes)) => {
-                    stderr.write_all(&bytes).map_err(|e| e.to_string())?;
-                    stderr.flush().map_err(|e| e.to_string())?;
+                    stderr.write_all(&bytes).map_err(written)?;
+                    stderr.flush().map_err(written)?;
                 }
                 Some(exec_output::Output::Exit(exit)) => return Ok(exit),
                 None => return Err("execution output is empty".into()),
@@ -1778,6 +1825,102 @@ impl<R: io::Read> StderrReader<R> {
         }
         self.line.clear();
         self.cut = 0;
+    }
+}
+
+/// A tonic service served in this process over an in-memory connection, for tests of code that reaches one service
+/// through a [`Channel`] (the bridge's fake `Lsp` service). The channel reconnects as a real one does: each connection
+/// it makes gets a new server over the same service.
+#[cfg(feature = "test-support")]
+pub mod in_process {
+    use super::*;
+    use tonic::codegen::http;
+
+    pub struct InProcess {
+        runtime: Arc<RuntimeThread>,
+        pub channel: Channel,
+    }
+
+    impl InProcess {
+        /// The runtime the channel runs on.
+        pub fn handle(&self) -> tokio::runtime::Handle {
+            self.runtime.handle().clone()
+        }
+
+        /// A [`HelperClient`] over this channel for `host`, pinned to `host_key`, for code that takes a client (the
+        /// terminal link). Its launcher starts no channel: a link check finds no master and passes, and a connection
+        /// of its own cannot be opened from it.
+        pub fn helper_client(&self, host: &str, host_key: &str) -> HelperClient {
+            struct NoChannels;
+            impl ChannelLauncher for NoChannels {
+                fn spawn(&self, _: &[OsString]) -> io::Result<std::process::Child> {
+                    Err(io::Error::other("an in-process connection starts no channels"))
+                }
+            }
+            HelperClient {
+                inner: Arc::new(Inner {
+                    hello: Mutex::new(None),
+                    host: host.to_string(),
+                    daemon: String::new(),
+                    routes: Default::default(),
+                    installations: Default::default(),
+                    state: Default::default(),
+                    runtime: Arc::clone(&self.runtime),
+                    channel: self.channel.clone(),
+                    launcher: Arc::new(NoChannels),
+                    stderr: Default::default(),
+                    refused: Default::default(),
+                    pinned: Some(host_key.to_string()),
+                }),
+            }
+        }
+    }
+
+    pub fn serve<S>(service: S) -> InProcess
+    where
+        S: tower::Service<
+                http::Request<tonic::body::Body>,
+                Response = http::Response<tonic::body::Body>,
+                Error = std::convert::Infallible,
+            > + tonic::server::NamedService
+            + Clone
+            + Send
+            + Sync
+            + 'static,
+        S::Future: Send + 'static,
+    {
+        serve_routes(tonic::service::Routes::new(service))
+    }
+
+    /// [`serve`] for several services behind one connection (the helper's own services share its channel).
+    pub fn serve_routes(routes: tonic::service::Routes) -> InProcess {
+        let runtime = Arc::new(RuntimeThread::spawn());
+        let channel = runtime
+            .block_on(
+                async move {
+                    Endpoint::from_static("http://localhost")
+                        .connect_with_connector(tower::service_fn(move |_: Uri| {
+                            let routes = routes.clone();
+                            async move {
+                                let (client, server) = tokio::io::duplex(1 << 20);
+                                tokio::spawn(async move {
+                                    let _ = tonic::transport::Server::builder()
+                                        .add_routes(routes)
+                                        .serve_with_incoming(tonic::codegen::tokio_stream::iter([Ok::<_, io::Error>(
+                                            server,
+                                        )]))
+                                        .await;
+                                });
+                                Ok::<_, io::Error>(hyper_util::rt::TokioIo::new(client))
+                            }
+                        }))
+                        .await
+                        .expect("the in-process channel connects")
+                },
+                Duration::from_secs(60),
+            )
+            .expect("the in-process channel connects in time");
+        InProcess { runtime, channel }
     }
 }
 
@@ -2600,6 +2743,32 @@ mod tests {
             .copy_stdio(Box::new(Broken), &mut vec![], &mut vec![])
             .unwrap_err()
             .contains("input dropped before close"));
+    }
+
+    #[test]
+    fn helper_exec_stream_names_a_failed_local_write_as_this_sides() {
+        struct Closed;
+        impl io::Write for Closed {
+            fn write(&mut self, _: &[u8]) -> io::Result<usize> {
+                Err(io::Error::from(io::ErrorKind::BrokenPipe))
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        let mut stream = fake_exec(|_input, output| {
+            Box::pin(async move {
+                let _ = output
+                    .send(Ok(Some(ExecOutput {
+                        output: Some(exec_output::Output::Stdout(b"text".to_vec())),
+                    })))
+                    .await;
+            })
+        });
+        let error = stream
+            .copy_stdio(Box::new(io::empty()), &mut Closed, &mut vec![])
+            .unwrap_err();
+        assert!(error.starts_with("this side could not write the output"), "{error}");
     }
 
     #[test]

@@ -247,6 +247,14 @@ impl RemoteConnection {
         }
     }
 
+    /// A helper connection of its own for one language server's traffic, over the terminals' route (the window's second
+    /// ssh master), so a server's stream never shares the agents' connection. The project's key is checked before any
+    /// channel opens. Blocking: a worker's.
+    pub fn lsp_client(&self) -> std::io::Result<HelperClient> {
+        self.client.link_checker(Some(&self.project.host_key_sha256))?;
+        self.terminal_client("")
+    }
+
     /// Opens the terminal's own helper connection over the terminals' route, through the installation that owns it.
     /// A transient connection failure starts a link that backs off and retries that route. Construction belongs on
     /// the window's worker, and every later link call is nonblocking.
@@ -477,6 +485,46 @@ impl RemoteConnection {
         )
     }
 
+    /// Whether the helper runs commands (`exec-command`). A refusal says what to do; a helper that could not be asked
+    /// is [`ExecFailure::Unreached`]. Blocking.
+    pub fn offers_exec_command(&self) -> Result<(), ExecFailure> {
+        let capabilities = self
+            .client
+            .hello_capabilities()
+            .map_err(|error| ExecFailure::Unreached(error.to_string()))?;
+        check_capability(self.host(), &capabilities, wire::CAP_EXEC_COMMAND).map_err(|_| {
+            ExecFailure::NotRun(format!(
+                "the Eitri server on {} is older than this Eitri and runs no commands (it does not offer {}); open \
+                 the project's window to update it; nothing was run",
+                self.host(),
+                wire::CAP_EXEC_COMMAND
+            ))
+        })
+    }
+
+    /// Runs `argv` (its program first) in `cwd` on the server with streaming stdio, as purpose `COMMAND`. stdin is
+    /// passed on until its end, then the run is closed; a caller whose stdin may never end (a terminal) passes an
+    /// empty one. Callers ask [`Self::offers_exec_command`] first. Blocking.
+    pub fn exec_command(
+        &self,
+        cwd: &std::path::Path,
+        argv: &[std::ffi::OsString],
+        stdin: Box<dyn std::io::Read + Send>,
+        stdout: &mut dyn std::io::Write,
+        stderr: &mut dyn std::io::Write,
+    ) -> Result<wire::ExecExit, ExecFailure> {
+        exec_stream_with(
+            "remote command",
+            wire::ExecPurpose::Command,
+            cwd,
+            argv,
+            stdin,
+            stdout,
+            stderr,
+            |start| self.client.exec_stream(start).map_err(|error| error.to_string()),
+        )
+    }
+
     pub fn sync_ignores(&self, request: wire::SyncIgnoresRequest) -> Result<wire::SyncIgnoresResponse, String> {
         self.require_capability(wire::CAP_SYNC_IGNORES)?;
         self.client.sync_ignores(request).map_err(|error| error.to_string())
@@ -564,6 +612,18 @@ impl RemoteConnection {
     }
 }
 
+/// Why a run on the server gave no exit status.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ExecFailure {
+    /// Nothing was sent past the start: arguments that cannot travel, or a helper that does not run the purpose. The
+    /// text says nothing was run.
+    NotRun(String),
+    /// The helper could not be reached before anything was sent past the start, so nothing was run.
+    Unreached(String),
+    /// The link was lost once the command may have started: its outcome is unknown.
+    Lost(String),
+}
+
 fn exec_git_with(
     host: &str,
     cwd: &std::path::Path,
@@ -574,36 +634,66 @@ fn exec_git_with(
     stderr: &mut dyn std::io::Write,
     open: impl FnOnce(wire::ExecStart) -> Result<agent::remote_client::HelperExec, String>,
 ) -> Result<i32, String> {
-    let cwd = cwd
-        .to_str()
-        .ok_or("remote git cwd is not UTF-8; nothing was run")?
-        .to_owned();
-    let argv = std::iter::once(Ok("git".to_owned()))
-        .chain(args.iter().map(|arg| {
-            arg.to_str()
-                .map(str::to_owned)
-                .ok_or("remote git argument is not UTF-8; nothing was run")
-        }))
-        .collect::<Result<Vec<_>, _>>()?;
-    let unknown = || {
-        format!(
-            "the outcome on {} is unknown; check with `git status` in the terminal",
-            host
-        )
-    };
-    let mut stream = open(wire::ExecStart {
-        cwd,
-        argv,
-        purpose: wire::ExecPurpose::Git as i32,
-    })
-    .map_err(|_| unknown())?;
+    let argv: Vec<std::ffi::OsString> = std::iter::once("git".into()).chain(args.iter().cloned()).collect();
     // A TTY must never hold the helper's start barrier open.
     let stdin = git_input(args, is_tty, stdin);
-    let exit = git_stream_result(host, stream.copy_stdio(stdin, stdout, stderr))?;
+    let exit = match exec_stream_with(
+        "remote git",
+        wire::ExecPurpose::Git,
+        cwd,
+        &argv,
+        stdin,
+        stdout,
+        stderr,
+        open,
+    ) {
+        Ok(exit) => exit,
+        Err(ExecFailure::NotRun(why)) => return Err(why),
+        Err(ExecFailure::Unreached(_) | ExecFailure::Lost(_)) => {
+            return Err(format!(
+                "the outcome on {host} is unknown; check with `git status` in the terminal"
+            ))
+        }
+    };
     if !exit.refusal.is_empty() {
         return Err(exit.refusal);
     }
     Ok(if exit.signal != 0 { 128 + exit.signal } else { exit.code })
+}
+
+/// Opens one run of `purpose` and copies its stdio: `stdin` until its end (then `close`), the outputs as they come.
+/// `what` names the run in the refusals of arguments that cannot travel (the wire carries UTF-8 only); those refuse
+/// before anything is opened.
+#[allow(clippy::too_many_arguments)]
+fn exec_stream_with(
+    what: &str,
+    purpose: wire::ExecPurpose,
+    cwd: &std::path::Path,
+    argv: &[std::ffi::OsString],
+    stdin: Box<dyn std::io::Read + Send>,
+    stdout: &mut dyn std::io::Write,
+    stderr: &mut dyn std::io::Write,
+    open: impl FnOnce(wire::ExecStart) -> Result<agent::remote_client::HelperExec, String>,
+) -> Result<wire::ExecExit, ExecFailure> {
+    let cwd = cwd
+        .to_str()
+        .ok_or_else(|| ExecFailure::NotRun(format!("{what} cwd is not UTF-8; nothing was run")))?
+        .to_owned();
+    let argv = argv
+        .iter()
+        .map(|arg| {
+            arg.to_str()
+                .map(str::to_owned)
+                .ok_or_else(|| ExecFailure::NotRun(format!("{what} argument is not UTF-8; nothing was run")))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut stream = open(wire::ExecStart {
+        cwd,
+        argv,
+        purpose: purpose as i32,
+    })
+    .map_err(ExecFailure::Unreached)?;
+    stream.copy_stdio(stdin, stdout, stderr).map_err(ExecFailure::Lost)
 }
 
 fn git_input(
@@ -616,10 +706,6 @@ fn git_input(
     } else {
         Box::new(std::io::empty())
     }
-}
-
-fn git_stream_result(host: &str, result: Result<wire::ExecExit, String>) -> Result<wire::ExecExit, String> {
-    result.map_err(|_| format!("the outcome on {host} is unknown; check with `git status` in the terminal"))
 }
 
 fn check_capability(host: &str, capabilities: &[String], capability: &str) -> Result<(), String> {
@@ -936,6 +1022,7 @@ mod tests {
             wire::CAP_GIT_CONFIG,
             wire::CAP_SYNC_MODES,
             wire::CAP_EXEC,
+            wire::CAP_EXEC_COMMAND,
         ] {
             assert_eq!(
                 check_capability("example-host", &capabilities, capability).unwrap_err(),

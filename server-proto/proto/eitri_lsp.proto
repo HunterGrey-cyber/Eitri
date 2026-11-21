@@ -1,0 +1,128 @@
+syntax = "proto3";
+package eitri.server.v1;
+
+// A language server runs on the server, one per OpenServer. One bridge is attached at a time; a new Attach replaces it.
+service Lsp {
+  rpc OpenServer(OpenServerRequest) returns (OpenServerResponse);
+  rpc Attach(stream LspClientFrame) returns (stream LspServerFrame);
+  rpc ListServers(ListServersRequest) returns (ListServersResponse);
+  rpc StopServer(StopServerRequest) returns (StopServerResponse);
+  // Read-only bytes of an absolute path anywhere the account can read (eitri-remote:// buffers).
+  rpc ReadPath(ReadPathRequest) returns (stream ReadPathChunk);
+}
+
+message OpenServerRequest {
+  string command_id = 1;
+  // At most LSP_PATH_MAX bytes.
+  string root = 2;
+  repeated string argv = 3;
+  // 0 means the default (1,800 s); other values are clamped to [LSP_GRACE_MIN_MS, LSP_GRACE_MAX_MS].
+  uint64 grace_ms = 4;
+  string client_id = 5;
+}
+message OpenServerResponse {
+  string server_id = 1;
+  // The resolved path of argv[0], not the argv; at most LSP_PATH_MAX bytes.
+  string resolved_command = 2;
+  string missing_command = 3;
+  string refusal = 4;
+}
+
+message LspClientFrame {
+  oneof frame {
+    LspAttachHello hello = 1;
+    LspChunk chunk = 2;
+  }
+}
+message LspAttachHello {
+  string server_id = 1;
+  string client_id = 2;
+}
+// One JSON-RPC message (no Content-Length header) travels in chunks of at most LSP_CHUNK_MAX; `last` ends it.
+// `saved_sha256` is set only on the last chunk of a textDocument/didSave from the bridge: 64 lowercase hex. A didSave
+// whose uri is longer than LSP_URI_MAX is not held while the bridge is away (it is forwarded at once, as a save outside
+// the root is), so it never needs a place in `LspAttached.dropped_saves`.
+message LspChunk {
+  bytes data = 1;
+  bool last = 2;
+  string saved_sha256 = 3;
+}
+
+message LspServerFrame {
+  oneof frame {
+    LspChunk chunk = 1;
+    LspAttached attached = 2;
+    LspEnded ended = 3;
+  }
+}
+message LspAttached {
+  // False on the first attach of this server.
+  bool reattached = 1;
+  // The register and unregister requests the helper accepted while detached, in order.
+  repeated LspRegistration registrations = 2;
+  // Server requests the helper answered while detached.
+  uint64 requests_answered = 3;
+  // Notifications collapsed or dropped while detached.
+  uint64 notifications_dropped = 4;
+  // URIs whose held didSave the detach dropped: the bridge saves them again. Each is at most LSP_URI_MAX bytes: a
+  // didSave with a longer uri is never held (see LspChunk), so it cannot appear here.
+  repeated string dropped_saves = 5;
+}
+// method is "client/registerCapability" or "client/unregisterCapability"; params are the server's, as sent.
+message LspRegistration {
+  string method = 1;
+  bytes params = 2;
+}
+message LspEnded {
+  optional int32 code = 1;
+  optional int32 signal = 2;
+  LspEndReason reason = 3;
+  bytes stderr_tail = 4;
+}
+enum LspEndReason {
+  LSP_END_REASON_UNSPECIFIED = 0;
+  LSP_END_REASON_EXITED = 1;
+  LSP_END_REASON_GRACE = 2;
+  LSP_END_REASON_QUEUE_FULL = 3;
+  LSP_END_REASON_STOPPED = 4;
+  LSP_END_REASON_REPLACED = 5;
+  LSP_END_REASON_DAEMON = 6;
+  // Attach named a server this daemon does not have (a daemon restart, or its grace ran out): take the fresh-server path.
+  LSP_END_REASON_GONE = 7;
+}
+
+message ListServersRequest {}
+message LspServerInfo {
+  string server_id = 1;
+  // At most LSP_PATH_MAX bytes.
+  string root = 2;
+  // The resolved path of argv[0], not the argv; at most LSP_PATH_MAX bytes.
+  string command = 3;
+  uint32 pid = 4;
+  bool attached = 5;
+  uint64 detached_since_unix_ms = 6;
+  uint64 queued_bytes = 7;
+}
+message ListServersResponse {
+  repeated LspServerInfo servers = 1;
+  bool truncated = 2;
+}
+message StopServerRequest {
+  string server_id = 1;
+  string command_id = 2;
+}
+message StopServerResponse {}
+
+message ReadPathRequest {
+  string path = 1;
+  // The effective cap is min(limit, READ_PATH_MAX); 0 means READ_PATH_MAX. A file larger than the cap is refused,
+  // never sent in part.
+  uint64 limit = 2;
+}
+// Data chunks of at most LSP_CHUNK_MAX bytes first; the last chunk carries the SHA-256 of everything sent, or a
+// refusal in place of data. A refusal may follow data chunks and voids everything received.
+message ReadPathChunk {
+  bytes data = 1;
+  string sha256 = 2;
+  string refusal = 3;
+}

@@ -1,0 +1,143 @@
+#!/usr/bin/env python3
+"""A scripted language server for Eitri's tests. It speaks LSP framing on stdio and does what a script says.
+
+Usage: scripted-server SCRIPT RECEIVED
+
+SCRIPT is a file of JSON lines, one step each, run in order:
+  {"send": MESSAGE}                 write MESSAGE (any JSON value) to stdout with a Content-Length header
+  {"send_big": {"id": ID, "bytes": N}}         a response to ID whose result is a string of N "x" characters
+  {"send_big": {"method": M, "bytes": N}}      a notification M whose params are {"pad": <N "x" characters>}
+  {"send_many": {"method": M, "first_id": ID, "count": N}}   N requests M with ids ID, ID+1, ... and params {}
+                                    (or the step's "params", when it has them)
+  {"recv": METHOD}                  read messages until one with this method arrives
+  {"recv_id": ID}                   read messages until a response with this id arrives
+  {"wait_file": PATH}               wait until PATH exists (messages are not read meanwhile)
+  {"touch": PATH}                   create PATH
+  {"stderr": TEXT}                  write TEXT to stderr
+  {"sleep": SECONDS}
+  {"exit": CODE}                    exit at once with CODE
+  {"ignore_sigterm": true}          ignore SIGTERM from now on
+  {"spawn_child": PATH}             fork a child that keeps stdin, stdout and stderr open and sleeps for an hour;
+                                    its pid is written to PATH (complete once PATH exists)
+When the steps run out it answers every request with {"result": {"method": M, "params": P}} (an echo) until stdin
+ends, then exits 0. Messages read while a step waits are not answered.
+
+RECEIVED gets one JSON line per message read, in order. Its first line, written before any step, is
+{"started": {"cwd": <working directory>, "path": <$PATH>, "argv": <sys.argv>, "pid": <pid>}}.
+"""
+
+import json
+import os
+import signal
+import sys
+import time
+
+stdin = sys.stdin.buffer
+stdout = sys.stdout.buffer
+
+
+def write(message):
+    body = json.dumps(message).encode()
+    stdout.write(b"Content-Length: %d\r\n\r\n" % len(body))
+    stdout.write(body)
+    stdout.flush()
+
+
+def write_raw(body):
+    stdout.write(b"Content-Length: %d\r\n\r\n" % len(body))
+    stdout.write(body)
+    stdout.flush()
+
+
+def read():
+    length = None
+    while True:
+        line = stdin.readline()
+        if not line:
+            return None
+        line = line.strip()
+        if not line:
+            break
+        name, _, value = line.partition(b":")
+        if name.strip().lower() == b"content-length":
+            length = int(value.strip())
+    body = stdin.read(length)
+    message = json.loads(body)
+    with open(received_path, "a") as received:
+        received.write(json.dumps(message) + "\n")
+    return message
+
+
+def big(spec):
+    pad = b"x" * spec["bytes"]
+    if "id" in spec:
+        head = b'{"jsonrpc":"2.0","id":%s,"result":"' % json.dumps(spec["id"]).encode()
+        return head + pad + b'"}'
+    head = b'{"jsonrpc":"2.0","method":%s,"params":{"pad":"' % json.dumps(spec["method"]).encode()
+    return head + pad + b'"}}'
+
+
+def main():
+    global received_path
+    script_path, received_path = sys.argv[1], sys.argv[2]
+    with open(received_path, "a") as received:
+        started = {"cwd": os.getcwd(), "path": os.environ.get("PATH", ""), "argv": sys.argv, "pid": os.getpid()}
+        received.write(json.dumps({"started": started}) + "\n")
+    with open(script_path) as script:
+        steps = [json.loads(line) for line in script if line.strip()]
+    for step in steps:
+        if "send" in step:
+            write(step["send"])
+        elif "send_big" in step:
+            write_raw(big(step["send_big"]))
+        elif "send_many" in step:
+            spec = step["send_many"]
+            for id in range(spec["first_id"], spec["first_id"] + spec["count"]):
+                write({"jsonrpc": "2.0", "id": id, "method": spec["method"], "params": spec.get("params", {})})
+        elif "recv" in step:
+            while True:
+                message = read()
+                if message is None:
+                    return 0
+                if isinstance(message, dict) and message.get("method") == step["recv"]:
+                    break
+        elif "recv_id" in step:
+            while True:
+                message = read()
+                if message is None:
+                    return 0
+                if isinstance(message, dict) and "method" not in message and message.get("id") == step["recv_id"]:
+                    break
+        elif "wait_file" in step:
+            while not os.path.exists(step["wait_file"]):
+                time.sleep(0.01)
+        elif "touch" in step:
+            open(step["touch"], "a").close()
+        elif "stderr" in step:
+            sys.stderr.write(step["stderr"])
+            sys.stderr.flush()
+        elif "sleep" in step:
+            time.sleep(step["sleep"])
+        elif "exit" in step:
+            return step["exit"]
+        elif "ignore_sigterm" in step:
+            signal.signal(signal.SIGTERM, signal.SIG_IGN)
+        elif "spawn_child" in step:
+            child = os.fork()
+            if child == 0:
+                time.sleep(3600)
+                os._exit(0)
+            with open(step["spawn_child"] + ".tmp", "w") as pid_file:
+                pid_file.write(str(child))
+            os.rename(step["spawn_child"] + ".tmp", step["spawn_child"])
+    while True:
+        message = read()
+        if message is None:
+            return 0
+        if isinstance(message, dict) and "id" in message and "method" in message:
+            write({"jsonrpc": "2.0", "id": message["id"],
+                   "result": {"method": message["method"], "params": message.get("params")}})
+
+
+if __name__ == "__main__":
+    sys.exit(main())

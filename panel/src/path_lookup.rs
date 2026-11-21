@@ -205,6 +205,28 @@ pub(super) fn start(
     check_path_length(&path)?;
     let root = state.project_dir.clone();
     let limits = state.path_lookup.limits;
+    // A remote project's host, and the sync directory that keeps the excludes its mirror was made with.
+    let remote = match state.tabs.project_origin() {
+        eitri_core::remote_project::TabOrigin::Remote {
+            host,
+            host_key_sha256,
+            root,
+        } => {
+            let sync_dir = eitri_core::remote_project::RemoteProjects::new(
+                state.review_roots.state_home.as_deref(),
+                state.review_roots.home.as_deref(),
+            )
+            .state_home()
+            .map(|home| {
+                eitri_core::remote_sync::status_file::sync_dir(
+                    &home,
+                    &eitri_core::remote_sync::SyncKey::new(host_key_sha256, root),
+                )
+            });
+            Some((host.clone(), sync_dir))
+        }
+        eitri_core::remote_project::TabOrigin::Local => None,
+    };
     let request = Request {
         line,
         col,
@@ -217,6 +239,16 @@ pub(super) fn start(
         interaction,
     };
     start_worker(state, request, move || {
+        if let Some((host, sync_dir)) = remote {
+            let patterns = sync_dir
+                .as_deref()
+                .and_then(eitri_core::remote_sync::recreate::read_created_patterns)
+                .unwrap_or_default();
+            let excludes = eitri_core::remote_sync::ignores::Matcher::new(&patterns);
+            if let Some(uri) = outside_the_mirror(&root, &path, &host, &excludes) {
+                return Ok(Answer::Ready(PathBuf::from(uri), None));
+            }
+        }
         match super::links::open_path_exact(&root, &path) {
             Ok(resolved) => {
                 let note = line_note(&resolved, &path, line, expect.as_deref());
@@ -230,6 +262,31 @@ pub(super) fn start(
             Err(why) => Err(why.message(&path)),
         }
     })
+}
+
+/// For a remote project: the `eitri-remote://` URI that opens `path` when it is an absolute path the project's mirror
+/// does not hold (outside the root, or matched by the excludes sync was made with), which is a file on the server that
+/// this machine does not have (a dependency, the standard library, build output). The laptop's file of the same path
+/// is some other file, or a stale one, so it is never looked at. A path holding a control character, a relative one
+/// and one not in normal form (`..` could lead back in) are left to the ordinary lookup, which refuses or resolves them
+/// against the mirror. It runs on the lookup's worker: the root is resolved on disk.
+fn outside_the_mirror(
+    root: &Path,
+    path: &str,
+    host: &str,
+    excludes: &eitri_core::remote_sync::ignores::Matcher,
+) -> Option<String> {
+    if eitri_core::agent_bridge::path_holds_control(path)
+        || !path.starts_with('/')
+        || path.len() > 1 && !path[1..].split('/').all(|part| !matches!(part, "" | "." | ".."))
+    {
+        return None;
+    }
+    let candidate = Path::new(path);
+    let held = std::iter::once(root.to_path_buf())
+        .chain(root.canonicalize().ok())
+        .any(|root| eitri_core::remote_lsp::uris::Mirror::new(root, excludes.clone()).holds(candidate));
+    (!held).then(|| eitri_core::remote_lsp::uris::remote_uri(host, path))
 }
 
 /// The one regular file inside the canonical project root that `path` names as `gf` resolves it: the path itself,
@@ -595,6 +652,51 @@ mod tests {
         assert!(check_path_length(&"é".repeat(2049)).is_err());
     }
 
+    #[test]
+    fn a_remote_tab_opens_an_excluded_path_inside_the_root_as_eitri_remote() {
+        let mirror = Project::new();
+        mirror.write("src/lib.rs");
+        // The laptop's stale build output at an excluded path: not the server's file.
+        mirror.write("target/debug/build/out.rs");
+        let state_home = Project::new();
+        let (handle, _page, _) = handle_with_recording_page();
+        {
+            let mut state = handle.state.borrow_mut();
+            state.project_dir = mirror.0.clone();
+            state.review_roots.state_home = Some(state_home.0.clone().into_os_string());
+            state
+                .tabs
+                .set_project_origin(eitri_core::remote_project::TabOrigin::Remote {
+                    host: "example-host".into(),
+                    host_key_sha256: "SHA256:example".into(),
+                    root: mirror.0.clone(),
+                })
+                .unwrap();
+        }
+        let sync_dir = eitri_core::remote_sync::status_file::sync_dir(
+            &state_home.0,
+            &eitri_core::remote_sync::SyncKey::new("SHA256:example", &mirror.0),
+        );
+        agent::private_fs::create_private_dir_all(&sync_dir, &state_home.0).unwrap();
+        eitri_core::remote_sync::recreate::write_created_patterns(&sync_dir, &["/target/".to_owned()]).unwrap();
+        let opened = record_opens(&handle);
+        let excluded = mirror.0.join("target/debug/build/out.rs");
+        ask(&handle, excluded.to_str().unwrap());
+        tick_handle_until(&handle, "an excluded path opens", || !opened.borrow().is_empty());
+        assert_eq!(
+            request_json(&opened.borrow()[0])["path"],
+            format!("eitri-remote://example-host{}", excluded.display()).as_str()
+        );
+        // A path the excludes do not match is the mirror's.
+        opened.borrow_mut().clear();
+        ask(&handle, mirror.0.join("src/lib.rs").to_str().unwrap());
+        tick_handle_until(&handle, "a mirror path opens", || !opened.borrow().is_empty());
+        assert_eq!(
+            request_json(&opened.borrow()[0])["path"],
+            mirror.0.join("src/lib.rs").to_str().unwrap()
+        );
+    }
+
     struct Project(PathBuf);
     impl Project {
         fn new() -> Self {
@@ -629,6 +731,93 @@ mod tests {
             .map(|p| json_of(p))
             .find(|v| v["requestId"] == "find")
     }
+    /// The JSON a scratch request carries: its hex is the request's text.
+    fn request_json(request: &eitri_core::scratch::ScratchRequest) -> serde_json::Value {
+        let hex = request.hex();
+        let bytes: Vec<u8> = (0..hex.len())
+            .step_by(2)
+            .map(|at| u8::from_str_radix(&hex[at..at + 2], 16).unwrap())
+            .collect();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    #[test]
+    fn a_remote_tab_opens_an_outside_path_as_eitri_remote() {
+        let mirror = Project::new();
+        mirror.write("src/lib.rs");
+        // A file of the laptop at a path outside the mirror: not the server's file of that path.
+        let elsewhere = Project::new();
+        elsewhere.write("lib.rs");
+        let outside = [
+            (
+                "/home/user/.cargo/registry/src/dep 1.0/src/lib.rs".to_owned(),
+                "eitri-remote://example-host/home/user/.cargo/registry/src/dep%201.0/src/lib.rs".to_owned(),
+            ),
+            (
+                elsewhere.0.join("lib.rs").to_str().unwrap().to_owned(),
+                format!("eitri-remote://example-host{}/lib.rs", elsewhere.0.display()),
+            ),
+        ];
+        let (handle, _page, _) = handle_with_recording_page();
+        {
+            let mut state = handle.state.borrow_mut();
+            state.project_dir = mirror.0.clone();
+            state
+                .tabs
+                .set_project_origin(eitri_core::remote_project::TabOrigin::Remote {
+                    host: "example-host".into(),
+                    host_key_sha256: "SHA256:example".into(),
+                    root: mirror.0.clone(),
+                })
+                .unwrap();
+        }
+        let opened = record_opens(&handle);
+        for (path, uri) in outside {
+            opened.borrow_mut().clear();
+            ask(&handle, &path);
+            tick_handle_until(&handle, "an outside path opens", || !opened.borrow().is_empty());
+            let request = request_json(&opened.borrow()[0]);
+            assert_eq!(request["op"], "open");
+            assert_eq!(request["path"], uri.as_str());
+            assert_eq!(request["line"], 12);
+        }
+        // A path in the mirror, and a name relative to it, are the mirror's own files as before.
+        for wanted in [
+            mirror.0.join("src/lib.rs").to_str().unwrap().to_owned(),
+            "src/lib.rs".to_owned(),
+        ] {
+            opened.borrow_mut().clear();
+            ask(&handle, &wanted);
+            tick_handle_until(&handle, "a mirror path opens", || !opened.borrow().is_empty());
+            assert_eq!(
+                request_json(&opened.borrow()[0])["path"],
+                mirror.0.join("src/lib.rs").to_str().unwrap()
+            );
+        }
+        // A path that is not in normal form, or holds a control character, is never read from the server.
+        let none = eitri_core::remote_sync::ignores::Matcher::new(&[]);
+        assert_eq!(
+            outside_the_mirror(&mirror.0, "/srv/../etc/passwd", "example-host", &none),
+            None
+        );
+        assert_eq!(outside_the_mirror(&mirror.0, "/srv//etc", "example-host", &none), None);
+        assert_eq!(outside_the_mirror(&mirror.0, "/srv/a\nb", "example-host", &none), None);
+        assert_eq!(
+            outside_the_mirror(&mirror.0, "relative/a.rs", "example-host", &none),
+            None
+        );
+        // A window of this machine's own project opens the path it names, as it always did.
+        let (local, _page, _) = handle_with_recording_page();
+        local.state.borrow_mut().project_dir = mirror.0.clone();
+        let opened = record_opens(&local);
+        ask(&local, elsewhere.0.join("lib.rs").to_str().unwrap());
+        tick_handle_until(&local, "a local open", || !opened.borrow().is_empty());
+        assert_eq!(
+            request_json(&opened.borrow()[0])["path"],
+            elsewhere.0.join("lib.rs").to_str().unwrap()
+        );
+    }
+
     #[test]
     fn path_lookup_exact_open_uses_worker_and_missing_falls_back() {
         let root = Project::new();

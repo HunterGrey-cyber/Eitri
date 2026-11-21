@@ -95,6 +95,8 @@ fn checks<'a>(agents: &'a [&'a str]) -> Vec<(&'static str, Check<'a>)> {
             cfg::REMOTE_DEV_TRIPWIRE_MIB_KEY,
             check(cfg::parse_remote_dev_tripwire_mib),
         ),
+        (cfg::REMOTE_DEV_LSP_GRACE_KEY, check(cfg::parse_remote_dev_lsp_grace)),
+        (cfg::REMOTE_DEV_LSP_LOCAL_KEY, check(cfg::parse_remote_dev_lsp_local)),
         (cfg::WINDOW_RESTORE_KEY, check(cfg::parse_window_restore)),
         (cfg::EDITOR_RESTORE_KEY, check(cfg::parse_editor_restore)),
         (cfg::EDITOR_TAKEOVER_KEY, check(cfg::parse_editor_takeover)),
@@ -379,6 +381,28 @@ mod tests {
         let (_, problems) = settled("eitri.config.set('remote_dev.flushcap', 2)");
         assert_eq!(problems.len(), 1, "{problems:?}");
         assert!(problems[0].contains("remote_dev.flush_cap"), "{problems:?}");
+    }
+
+    #[test]
+    fn remote_language_server_values_and_typos_are_checked_at_startup() {
+        let (_, problems) = settled(
+            "eitri.config.set('remote_dev.lsp_grace', 3600)\n\
+             eitri.config.set('remote_dev.lsp_local', 'lua_ls, taplo')\n",
+        );
+        assert!(problems.is_empty(), "{problems:?}");
+        for (key, value) in [
+            ("remote_dev.lsp_grace", "59"),
+            ("remote_dev.lsp_grace", "'a while'"),
+            ("remote_dev.lsp_local", "'caf\\u{e9}'"),
+        ] {
+            let (kernel, problems) = settled(&format!("eitri.config.set('{key}', {value})"));
+            assert_eq!(problems.len(), 1, "{key}: {problems:?}");
+            assert!(problems[0].contains(key), "{key}: {problems:?}");
+            assert_eq!(kernel.config.borrow().get(key), None, "{key}");
+        }
+        let (_, problems) = settled("eitri.config.set('remote_dev.lsp_graze', 600)");
+        assert_eq!(problems.len(), 1, "{problems:?}");
+        assert!(problems[0].contains("remote_dev.lsp_grace"), "{problems:?}");
     }
 
     #[test]

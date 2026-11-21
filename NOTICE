@@ -4,3 +4,9 @@ dependency — it is not vendored or copied into this repository. Neovide's own
 architecture and code directly shaped a large fraction of this project's
 editor component (`neovide-editor/`), so it is acknowledged here even though
 no Neovide source is redistributed by this repository.
+
+The language-server bridge of remote development (`core/src/remote_lsp/` and the code that hands a language server
+to it) follows the shape of remote-ssh.nvim (https://github.com/inhesrom/remote-ssh.nvim, commit b0fc5c8), also
+MIT-licensed (Copyright (c) 2024 ihersom): a stdio proxy that keeps what it needs to bring a language client back to
+the same place on a new connection, and registrations replayed to the editor when it comes back. No remote-ssh.nvim
+source is copied or redistributed by this repository.

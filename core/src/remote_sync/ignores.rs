@@ -287,7 +287,7 @@ fn parents(path: &str) -> impl Iterator<Item = &str> {
     path.match_indices('/').map(|(i, _)| &path[..i])
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 struct Rule {
     negative: bool,
     directory: bool,
@@ -321,7 +321,7 @@ impl Rule {
     }
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct Matcher {
     rules: Vec<Rule>,
 }

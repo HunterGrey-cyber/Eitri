@@ -760,6 +760,26 @@ impl Controller {
         }
     }
 
+    /// Replaces the argument `old` of the spawn `win`'s editor restarts from (and a new editor module starts from) by
+    /// `new`; whether it was there. For a `--cmd` the shell can only finish once `init.lua` has run, after the spawn was
+    /// first supplied.
+    pub fn replace_editor_arg(&mut self, win: WinId, old: &str, new: String) -> bool {
+        let Some(spawn) = self
+            .windows
+            .get_mut(&win)
+            .and_then(|window| window.editor_spawn.as_mut())
+        else {
+            return false;
+        };
+        match spawn.args.iter_mut().find(|arg| arg.as_str() == old) {
+            Some(arg) => {
+                *arg = new;
+                true
+            }
+            None => false,
+        }
+    }
+
     pub(super) fn keep_editor_spawn(&mut self, win: WinId, spawn: EditorSpawn) {
         if let Some(window) = self.windows.get_mut(&win) {
             window.keep_spawn(spawn);
@@ -816,6 +836,16 @@ impl Controller {
         self.windows
             .get(&win)
             .map(|w| (w.pending_open.clone(), w.editor_ready, w.save_timer.is_some()))
+    }
+
+    /// The arguments of the spawn a restart of `win`'s editor starts from, for tests.
+    #[cfg(test)]
+    pub(super) fn editor_spawn_args(&self, win: WinId) -> Option<Vec<String>> {
+        self.windows
+            .get(&win)?
+            .editor_spawn
+            .as_ref()
+            .map(|spawn| spawn.args.clone())
     }
 
     /// The `open` of the spawn a restart of `win`'s editor starts from, for tests.

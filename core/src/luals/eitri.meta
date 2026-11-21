@@ -53,6 +53,8 @@
 ---| "remote.port"
 ---| "remote_dev.enabled"
 ---| "remote_dev.flush_cap"
+---| "remote_dev.lsp_grace"
+---| "remote_dev.lsp_local"
 ---| "remote_dev.mutagen"
 ---| "remote_dev.send_waits_for_flush"
 ---| "remote_dev.tripwire_mib"

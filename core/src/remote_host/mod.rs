@@ -1,7 +1,11 @@
 //! Worker-side remote host connection and resume operations.
 
 pub mod cli;
+pub mod cli_exec;
+pub mod cli_lsp;
+pub mod cli_read;
 pub mod cli_sync;
+pub mod cli_term;
 pub mod first_connect;
 pub mod first_contact;
 pub mod folders;

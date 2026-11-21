@@ -84,6 +84,36 @@ pub fn check_sync_rel(rel: &str) -> Result<(), String> {
     Ok(())
 }
 
+// Language-server service, path reads and the exec command purpose: capabilities and message bounds.
+// Hello lists a capability only once its handler exists.
+pub const CAP_LSP: &str = "lsp";
+pub const CAP_READ_PATH: &str = "read-path";
+pub const CAP_EXEC_COMMAND: &str = "exec-command";
+/// One chunk of a JSON-RPC message; a frame with its other fields at their bounds stays under tonic's 4 MiB limit.
+pub const LSP_CHUNK_MAX: usize = 1024 * 1024;
+/// A reassembled JSON-RPC message, in either direction.
+pub const LSP_MESSAGE_MAX: usize = 64 * 1024 * 1024;
+/// What the helper holds for a detached bridge; past it the server is stopped with `QUEUE_FULL`.
+pub const LSP_DETACHED_QUEUE_MAX: usize = 16 * 1024 * 1024;
+pub const LSP_GRACE_MIN_MS: u64 = 60_000;
+pub const LSP_GRACE_MAX_MS: u64 = 86_400_000;
+/// A server root, a resolved command path (argv[0] resolved, not the argv) and the same two in `ListServers`.
+pub const LSP_PATH_MAX: usize = 4096;
+pub const LSP_ARGV_MAX: usize = 64;
+pub const LSP_ARGV_ENTRY_MAX: usize = 4096;
+pub const LSP_LIST_MAX: usize = 64;
+/// Registrations kept for a detached bridge: a count and a total of params bytes; past either the server is stopped
+/// with `QUEUE_FULL`.
+pub const LSP_REGISTRATIONS_MAX: usize = 256;
+pub const LSP_REGISTRATIONS_PARAMS_MAX: usize = 1024 * 1024;
+pub const LSP_DROPPED_SAVES_MAX: usize = 1024;
+/// A document URI in `LspAttached.dropped_saves`; 1024 of them plus the registrations stay under 4 MiB.
+pub const LSP_URI_MAX: usize = 2048;
+/// The most bytes one `ReadPath` returns.
+pub const READ_PATH_MAX: usize = 16 * 1024 * 1024;
+/// The tail of a language server's stderr carried in `LspEnded`.
+pub const LSP_STDERR_TAIL: usize = 4096;
+
 #[cfg(test)]
 mod tests {
     #[test]

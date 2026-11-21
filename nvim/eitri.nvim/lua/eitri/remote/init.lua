@@ -42,7 +42,9 @@ local function project_roots(hosts)
           and type(project.root) == "string"
           and project.root:sub(1, 1) == "/"
         then
-          table.insert(roots, root_paths(project.root))
+          local root = root_paths(project.root)
+          root.host = project.host
+          table.insert(roots, root)
         end
       end
     end
@@ -56,20 +58,41 @@ local function matched_length(root, path)
   if root.real and under(root.real, path) then return #root.real end
 end
 
+local function hosts_dir()
+  local state = options.state_home or vim.env.XDG_STATE_HOME or ((vim.env.HOME or "") .. "/.local/state")
+  return state .. "/eitri/hosts"
+end
+
 local configured_root
 local function recorded(path)
   if configured_root then
     return matched_length(configured_root, path) and configured_root.path
   end
-  local state = options.state_home or vim.env.XDG_STATE_HOME or ((vim.env.HOME or "") .. "/.local/state")
   local best, length = nil, -1
-  for _, root in ipairs(project_roots(state .. "/eitri/hosts")) do
+  for _, root in ipairs(project_roots(hosts_dir())) do
     local n = matched_length(root, path)
     if n and n > length then
       best, length = root.path, n
     end
   end
   return best
+end
+
+--- The recorded remote project `path` belongs to: `{ root = <its root>, host = <the host as typed> }`, or nil.
+function M.project_of(path)
+  local root = recorded(path)
+  if not root then
+    return nil
+  end
+  -- A recorded project's own host wins; `options.host` names the host of a configured root no record holds.
+  local host
+  for _, recorded_root in ipairs(project_roots(hosts_dir())) do
+    if recorded_root.path == root then
+      host = recorded_root.host
+      break
+    end
+  end
+  return { root = root, host = host or options.host }
 end
 
 local keys =
@@ -169,9 +192,109 @@ function M.open()
   end
 end
 
+--- The recorded remote root `path` belongs to, or nil: the lookup the sync, the exec wrappers and the language-server
+--- wrap all use.
+function M.root_of(path)
+  if not options then
+    M.setup()
+  end
+  return recorded(path)
+end
+
+--- The `eitri` program the remote modules run: setup's `cmd`, else the launcher's.
+function M.program()
+  if not options then
+    M.setup()
+  end
+  return options.cmd or require("eitri").program()
+end
+
+-- The wrappers need only the recorded-root lookup, the program and the project's host; passing them keeps their modules
+-- free of state.
+local function lookup_host()
+  if not options then
+    M.setup()
+  end
+  return {
+    recorded = recorded,
+    project_of = M.project_of,
+    program = M.program,
+  }
+end
+
+function M.cmd(argv, opts)
+  return require("eitri.remote.exec").cmd(lookup_host(), argv, opts)
+end
+
+-- `:EitriRemote {name} ...`: each module adds its own entry, so the command exists once however many modules have
+-- something to offer it. An entry is { run = function(words, rest), complete = function(arglead) -> list|nil }: `words`
+-- are the words after the name, `rest` the rest of the line as typed (for an argument that may hold blanks).
+M.subcommands = {}
+M.subcommands.makeprg = {
+  run = function(args)
+    require("eitri.remote.exec").makeprg(lookup_host(), args)
+  end,
+}
+
+M.subcommands.term = {
+  run = function()
+    require("eitri.remote.exec").term(lookup_host())
+  end,
+}
+
+local command_defined = false
+local function define_command()
+  if command_defined then
+    return
+  end
+  command_defined = true
+  local function names(lead)
+    local out = {}
+    for name in pairs(M.subcommands) do
+      if vim.startswith(name, lead) then
+        table.insert(out, name)
+      end
+    end
+    table.sort(out)
+    return out
+  end
+  api.nvim_create_user_command("EitriRemote", function(o)
+    local name, rest = o.args:match("^%s*(%S+)%s*(.-)%s*$")
+    local sub = name and M.subcommands[name]
+    if not sub then
+      error(
+        ("EitriRemote: unknown subcommand %s; expected one of: %s"):format(
+          name or "(none)",
+          table.concat(names(""), ", ")
+        ),
+        0
+      )
+    end
+    -- `vim.cmd.EitriRemote("open /a b")` passes the whole line as one argument: then the words come from the line.
+    local words = o.fargs[1] == name and vim.list_slice(o.fargs, 2) or vim.split(rest, "%s+", { trimempty = true })
+    sub.run(words, rest)
+  end, {
+    nargs = "*",
+    desc = "Eitri remote project commands",
+    complete = function(lead, line)
+      local words = vim.split(vim.trim(line), "%s+")
+      if #words <= 1 or (#words == 2 and line:sub(-1) ~= " ") then
+        return names(lead)
+      end
+      local sub = M.subcommands[words[2]]
+      return sub and sub.complete and sub.complete(lead) or {}
+    end,
+  })
+end
+
 function M.setup(opts)
   if options and not opts then
     return
+  end
+  if options and options.embedded then
+    -- In Eitri's window the window's own call came first: a shared configuration's call keeps everything it set (the
+    -- project root, the program, `embedded`, the language-server options from Eitri's init.lua) and adds the rest.
+    opts = vim.tbl_extend("keep", options, type(opts) == "table" and opts or {})
   end
   supplied = opts ~= nil
   options = opts or {}
@@ -179,6 +302,24 @@ function M.setup(opts)
   if vim.fn.exists(":EitriSync") ~= 2 then
     api.nvim_create_user_command("EitriSync", M.open, { desc = "Show project sync and resolve conflicts" })
   end
+  local loaded, buffers = pcall(require, "eitri.remote.buffers")
+  if loaded then
+    buffers.setup({ cmd = options.cmd })
+    M.subcommands.open = {
+      run = function(_, rest)
+        buffers.open(rest)
+      end,
+    }
+  else
+    vim.notify("eitri.remote.buffers could not be loaded: " .. tostring(buffers), vim.log.levels.WARN)
+  end
+  local lsp_loaded, lsp = pcall(require, "eitri.remote.lsp")
+  if lsp_loaded then
+    lsp.setup(options.lsp, lookup_host())
+  else
+    vim.notify("eitri.remote.lsp could not be loaded: " .. tostring(lsp), vim.log.levels.WARN)
+  end
+  define_command()
   local function enter()
     local b = api.nvim_get_current_buf()
     local path = api.nvim_buf_get_name(b)

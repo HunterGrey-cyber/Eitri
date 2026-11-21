@@ -15,9 +15,9 @@ use agent::ssh::{ChannelLauncher, ConnectError, ControlMaster, DaemonInfo, SshLa
 use super::install::{self, InstallPlan};
 use crate::remote_project::terminals::{service_call, terminal_lines, TerminalState};
 use crate::remote_project::{host_key_changed, remote_dev_off, RemoteProject, RemoteProjects};
-use crate::remote_sync::SyncError;
 #[cfg(test)]
 use crate::remote_sync::{actor, status_file};
+use crate::remote_sync::{terminal_text, SyncError};
 use agent::remote_client::terminal_transport::wire;
 
 /// The hidden subcommand ssh runs to record the host key it is checking.
@@ -25,7 +25,9 @@ pub const KNOWN_HOSTS_PROBE: &str = "known-hosts-probe";
 
 /// What `eitri host` with no or a wrong command says.
 pub const USAGE: &str = "usage: eitri host open <host>:<path> | status [<host>] | list [<host>] | stop <host> | \
-                         uninstall <host>";
+                         uninstall <host> | exec [--cwd <dir>] [--no-flush] [--no-stdin] -- <cmd> [args...] | \
+                         lsp --root <root> [--grace <seconds>] -- <cmd> [args...] | \
+                         read <host>:<absolute path> | term [--cwd <dir>]";
 
 /// ssh's `KnownHostsCommand`: records the key it checks and prints nothing, so ssh's own known-hosts files still
 /// decide. Its exit code.
@@ -195,6 +197,25 @@ pub trait Reach {
     fn terminals(&mut self, _host: &str, _key: &str, _helper: &Path) -> Result<wire::ListTerminalsResponse, String> {
         Ok(wire::ListTerminalsResponse::default())
     }
+    /// The language servers the helper at `helper` keeps on the connected host, through a connection pinned to `key`.
+    /// Reaches without a language-server service have none.
+    fn language_servers(
+        &mut self,
+        _host: &str,
+        _key: &str,
+        _helper: &Path,
+    ) -> Result<wire::ListServersResponse, String> {
+        Ok(wire::ListServersResponse::default())
+    }
+    /// Stops every language server the helper at `helper` keeps on the connected host, through a connection pinned to
+    /// `key`, each as `StopServer` stops one. Reaches without a language-server service have none to stop.
+    fn stop_language_servers(&mut self, _host: &str, _key: &str, _helper: &Path) -> Result<(), String> {
+        Ok(())
+    }
+    /// A connection to `project`'s helper, for `eitri host exec`.
+    fn exec_connection(&mut self, _project: &RemoteProject) -> Result<crate::remote_project::RemoteConnection, String> {
+        Err("running commands on the server is not available here".into())
+    }
 }
 
 /// What a command reads and writes besides its arguments.
@@ -226,6 +247,10 @@ fn run_command(args: &[String], cx: &mut Context<'_>) -> i32 {
     match args.first().map(String::as_str) {
         Some("sync") => return super::cli_sync::run_sync(&args[1..], cx),
         Some("git") => return super::cli_sync::run_git(&args[1..], cx),
+        Some("exec") => return super::cli_exec::run_exec(&args[1..], cx),
+        Some("lsp") => return super::cli_lsp::run_lsp(&args[1..], cx),
+        Some("read") => return super::cli_read::run_read(&args[1..], cx),
+        Some("term") => return super::cli_term::run_term(&args[1..], cx),
         _ => {}
     }
     let args: Vec<&str> = args.iter().map(String::as_str).collect();
@@ -258,6 +283,14 @@ fn run_command(args: &[String], cx: &mut Context<'_>) -> i32 {
 /// `ssh://user@host:2222:/srv/project` both work. The path must be absolute and in normal form, as the server and the
 /// record keep it.
 pub fn parse_spec(spec: &str) -> Result<(String, PathBuf), String> {
+    let (host, path) = split_spec(spec)?;
+    let root = PathBuf::from(path);
+    super::first_connect::validate_root(&root)?;
+    Ok((host, root))
+}
+
+/// `<host>:<path>` as [`parse_spec`] splits it, with the host checked and the path as typed.
+pub(super) fn split_spec(spec: &str) -> Result<(String, String), String> {
     let split = spec
         .match_indices(":/")
         .map(|(at, _)| at)
@@ -265,9 +298,7 @@ pub fn parse_spec(spec: &str) -> Result<(String, PathBuf), String> {
         .ok_or_else(|| format!("{spec:?}: expected <host>:<absolute path>"))?;
     let (host, path) = (&spec[..split], &spec[split + 1..]);
     agent::ssh::validate_host(host).map_err(|why| format!("{host:?}: {why}"))?;
-    let root = PathBuf::from(path);
-    super::first_connect::validate_root(&root)?;
-    Ok((host.to_owned(), root))
+    Ok((host.to_owned(), path.to_owned()))
 }
 
 fn open(cx: &mut Context<'_>, spec: &str) -> Result<(), String> {
@@ -292,8 +323,16 @@ fn projects(cx: &mut Context<'_>, host: Option<&str>) -> Result<Vec<RemoteProjec
         .collect())
 }
 
-/// `status [<host>]`: what this machine recorded, with no connection.
+/// `status [<host>]`: what this machine recorded, with no connection, and last whether `remote_dev.enabled` lets
+/// `open` run (`remote development: on` or `off`, the line `:checkhealth eitri` reads).
 fn status(cx: &mut Context<'_>, host: Option<&str>) -> Result<(), String> {
+    let recorded = status_records(cx, host);
+    let switch = if (cx.remote_dev_enabled)() { "on" } else { "off" };
+    cx.term.say(&format!("remote development: {switch}"));
+    recorded
+}
+
+fn status_records(cx: &mut Context<'_>, host: Option<&str>) -> Result<(), String> {
     let projects = projects(cx, host)?;
     if projects.is_empty() {
         cx.term.say(&match host {
@@ -385,6 +424,83 @@ pub fn agent_lines(host: &str, agents: &[Agent]) -> Vec<String> {
 
 /// How long `uninstall` waits for stopped daemons to let go of their lifetime locks before it gives up.
 const UNINSTALL_WAIT: Duration = Duration::from_secs(30);
+/// How many times `stop` lists a helper's language servers to stop them: a list holds at most `LSP_LIST_MAX`.
+const STOP_LIST_ROUNDS: usize = 4;
+
+/// How many language servers `stop` asks to stop at once: a server that does not answer costs its stop's timeout, which
+/// the others need not wait out.
+const STOPS_AT_ONCE: usize = 16;
+
+/// Stops every language server `list` names, [`STOPS_AT_ONCE`] at a time. A list holds at most `LSP_LIST_MAX`, so a
+/// truncated one is listed again (up to [`STOP_LIST_ROUNDS`] times) for the rest; a server whose stop failed is not
+/// asked again. One failure does not keep the others from being stopped: every failure is said, in one line.
+fn stop_listed_servers(
+    list: &dyn Fn() -> Result<wire::ListServersResponse, String>,
+    stop: &(dyn Fn(String) -> Result<(), String> + Sync),
+) -> Result<(), String> {
+    let mut failed: Vec<(String, String)> = Vec::new();
+    let mut unlisted = None;
+    for round in 0..STOP_LIST_ROUNDS {
+        let answer = match list() {
+            Ok(answer) => answer,
+            Err(why) if round == 0 => return Err(why),
+            Err(why) => {
+                unlisted = Some(why);
+                break;
+            }
+        };
+        let ids: Vec<String> = super::cli_lsp::server_ids(&answer)?
+            .into_iter()
+            .filter(|id| !failed.iter().any(|(gone, _)| gone == id))
+            .collect();
+        for batch in ids.chunks(STOPS_AT_ONCE) {
+            let results: Vec<(String, Result<(), String>)> = std::thread::scope(|scope| {
+                let running: Vec<_> = batch
+                    .iter()
+                    .map(|id| (id.clone(), scope.spawn(move || stop(id.clone()))))
+                    .collect();
+                running
+                    .into_iter()
+                    .map(|(id, stopping)| {
+                        let result = stopping
+                            .join()
+                            .unwrap_or_else(|_| Err("the stop ended without an answer".into()));
+                        (id, result)
+                    })
+                    .collect()
+            });
+            failed.extend(
+                results
+                    .into_iter()
+                    .filter_map(|(id, result)| result.err().map(|why| (id, why))),
+            );
+        }
+        if !answer.truncated || ids.is_empty() {
+            break;
+        }
+    }
+    let mut said = Vec::new();
+    if !failed.is_empty() {
+        let each: Vec<String> = failed.iter().map(|(id, why)| format!("{id}: {why}")).collect();
+        said.push(format!(
+            "{} could not be stopped ({})",
+            if failed.len() == 1 {
+                "one language server".to_owned()
+            } else {
+                format!("{} language servers", failed.len())
+            },
+            each.join("; ")
+        ));
+    }
+    if let Some(why) = unlisted {
+        said.push(format!("the rest could not be listed ({why})"));
+    }
+    if said.is_empty() {
+        Ok(())
+    } else {
+        Err(said.join("; "))
+    }
+}
 
 /// What the `UNINSTALL` step says when a daemon still holds its lifetime lock, and so removes nothing.
 #[cfg(all(test, target_os = "linux"))]
@@ -549,33 +665,13 @@ fn list_one(cx: &mut Context<'_>, host: &str) -> Result<(), String> {
         return Ok(());
     }
     let mut failures = Vec::new();
-    for Running {
-        daemon,
-        incompatible,
-        run,
-    } in &running
-    {
+    for listed in &running {
+        let Running { daemon, run, .. } = listed;
         cx.term.say(&format!(
             "Eitri server {} ({}) runs on {host} as pid {}",
             daemon.version, daemon.rev, daemon.pid
         ));
-        let exact = reached
-            .record
-            .helpers
-            .keys()
-            .find(|name| installation_run_key(name) == *run || *name == run);
-        let legacy_prefix = format!("{}-{}", daemon.version, daemon.rev.get(..7).unwrap_or(&daemon.rev));
-        let mut legacy = reached.record.helpers.keys().filter(|name| {
-            *run == daemon.version
-                && name
-                    .strip_prefix(&legacy_prefix)
-                    .is_some_and(|tail| tail.is_empty() || tail.starts_with('-'))
-        });
-        let first = legacy.next();
-        let installation = exact.or_else(|| first.filter(|_| legacy.next().is_none()));
-        let Some(installation) =
-            installation.filter(|_| !incompatible && daemon.protocol_major == agent::ssh::PROTOCOL_MAJOR)
-        else {
+        let Some(installation) = listed_installation(&reached, listed) else {
             cx.term.say(&format!(
                 "agents of Eitri server {} ({run}) not listed: another protocol or no recorded installation",
                 daemon.version
@@ -594,7 +690,25 @@ fn list_one(cx: &mut Context<'_>, host: &str) -> Result<(), String> {
                     "terminals of Eitri server {} ({installation}) not listed: {why}",
                     daemon.version
                 ));
-                failures.push(installation.clone());
+                failures.push(format!("terminals of {installation}"));
+            }
+        }
+        let servers = cx
+            .reach
+            .language_servers(host, &reached.key, &helper)
+            .and_then(|answer| super::cli_lsp::language_server_lines(&answer));
+        match servers {
+            Ok(lines) => {
+                for line in lines {
+                    cx.term.say(&format!("[{installation}] {line}"));
+                }
+            }
+            Err(why) => {
+                cx.term.say(&format!(
+                    "language servers of Eitri server {} ({installation}) not listed: {why}",
+                    daemon.version
+                ));
+                failures.push(format!("language servers of {installation}"));
             }
         }
         match cx.reach.agents(host, &reached.key, &helper) {
@@ -612,14 +726,54 @@ fn list_one(cx: &mut Context<'_>, host: &str) -> Result<(), String> {
                     "agents of Eitri server {} ({installation}) not listed: {why}",
                     daemon.version
                 ));
-                failures.push(installation.clone());
+                failures.push(format!("agents of {installation}"));
             }
         }
     }
     if !failures.is_empty() {
-        return Err(format!("could not list agents of {}", failures.join(", ")));
+        return Err(format!("could not list {}", failures.join(", ")));
     }
     Ok(())
+}
+
+/// The recorded installation a listed daemon belongs to, when it speaks this build's protocol: the one whose run key
+/// it names, else the one installation named for its version and revision. `None` for an incompatible daemon, or one
+/// no record holds (or two could).
+fn listed_installation<'a>(reached: &'a Reached, listed: &Running) -> Option<&'a String> {
+    let Running {
+        daemon,
+        incompatible,
+        run,
+    } = listed;
+    let exact = reached
+        .record
+        .helpers
+        .keys()
+        .find(|name| installation_run_key(name) == *run || *name == run);
+    let legacy_prefix = format!("{}-{}", daemon.version, daemon.rev.get(..7).unwrap_or(&daemon.rev));
+    let mut legacy = reached.record.helpers.keys().filter(|name| {
+        *run == daemon.version
+            && name
+                .strip_prefix(&legacy_prefix)
+                .is_some_and(|tail| tail.is_empty() || tail.starts_with('-'))
+    });
+    let first = legacy.next();
+    let installation = exact.or_else(|| first.filter(|_| legacy.next().is_none()));
+    installation.filter(|_| !incompatible && daemon.protocol_major == agent::ssh::PROTOCOL_MAJOR)
+}
+
+/// A `ListServers` answer as `list` reads it: a helper from before language servers ran on the server has no such
+/// service, and so none; any other failure is its message.
+fn servers_or_none(
+    answer: Result<wire::ListServersResponse, agent::remote_client::terminal_transport::tonic::Status>,
+) -> Result<wire::ListServersResponse, String> {
+    match answer {
+        Ok(answer) => Ok(answer),
+        Err(status) if status.code() == agent::remote_client::terminal_transport::tonic::Code::Unimplemented => {
+            Ok(wire::ListServersResponse::default())
+        }
+        Err(status) => Err(status.message().to_owned()),
+    }
 }
 
 pub(super) fn installation_run_key(installation: &str) -> String {
@@ -853,15 +1007,17 @@ fn stop_running(
     let mut count = 0;
     let mut left = false;
     let mut first_error = None;
-    for Running { daemon, run, .. } in running {
-        if super::skew::is_newer_than_this_build(&daemon) {
+    for listed in running {
+        if super::skew::is_newer_than_this_build(&listed.daemon) {
             cx.term.say(&format!(
                 "{host} runs a newer Eitri server {}; stop it with that Eitri",
-                daemon.version
+                listed.daemon.version
             ));
             left = true;
             continue;
         }
+        stop_language_servers(cx, host, reached, &listed);
+        let Running { daemon, run, .. } = listed;
         if let Err(e) =
             super::skew::stop_daemon_with(launcher, &reached.record, Some(&reached.installation), &daemon, &run)
         {
@@ -882,6 +1038,24 @@ fn stop_running(
     first_error.map_or(Ok(Stopped { left, count }), |why| {
         Err(format!("{why}; stopped {count} daemon(s) and their agents"))
     })
+}
+
+/// Before a daemon is stopped, its language servers are stopped one by one: each ends as stopped, so the bridge of a
+/// Neovim still open on the project ends instead of starting another, as it would after the daemon's own end (the
+/// daemon cannot tell this stop from any other SIGTERM). A failure is said and the daemon is stopped all the same.
+fn stop_language_servers(cx: &mut Context<'_>, host: &str, reached: &Reached, listed: &Running) {
+    let Some(installation) = listed_installation(reached, listed) else {
+        return;
+    };
+    let helper = reached.record.data_dir.join(installation).join("bin/eitri-server");
+    if let Err(why) = cx.reach.stop_language_servers(host, &reached.key, &helper) {
+        cx.term.say(&format!(
+            "language servers of Eitri server {} ({installation}) were not stopped first: {}; a Neovim still open on \
+             the project may start them again",
+            listed.daemon.version,
+            terminal_text(&why)
+        ));
+    }
 }
 
 /// `uninstall <host>`: stops every helper daemon, removes the helper's data and state directories on the server and
@@ -1022,6 +1196,21 @@ impl SshReach {
         self
     }
 
+    /// A connection to `project`'s helper over the host's master, as a window opens it. Blocking.
+    fn project_connection(&self, project: &RemoteProject) -> Result<crate::remote_project::RemoteConnection, String> {
+        let state_home = self.state_home()?;
+        let store = RemoteProjects::new(Some(state_home.as_os_str()), None);
+        let master = ControlMaster::ensure(&project.host, &self.ssh_dir, &self.exe)
+            .map_err(|error| format!("connecting to {}: {error}", project.host))?;
+        crate::remote_project::RemoteConnection::open_over_ssh(
+            &master,
+            &store,
+            project,
+            &project.helper_version,
+            agent::BUNDLED_SIDECAR_REVISION,
+        )
+    }
+
     /// The state home the masters' directory (`<state home>/eitri/ssh`) is under.
     fn state_home(&self) -> Result<PathBuf, String> {
         self.ssh_dir
@@ -1052,6 +1241,25 @@ impl Reach for SshReach {
             }
         })
         .map_err(|e| e.to_string())
+    }
+
+    fn language_servers(&mut self, host: &str, key: &str, helper: &Path) -> Result<wire::ListServersResponse, String> {
+        let client = agent::remote_client::HelperClient::connect(self.launcher(helper), host, Some(key))
+            .map_err(|e| e.to_string())?;
+        servers_or_none(client.list_servers())
+    }
+
+    fn stop_language_servers(&mut self, host: &str, key: &str, helper: &Path) -> Result<(), String> {
+        let client = agent::remote_client::HelperClient::connect(self.launcher(helper), host, Some(key))
+            .map_err(|e| e.to_string())?;
+        stop_listed_servers(&|| servers_or_none(client.list_servers()), &|server_id| {
+            client
+                .stop_server(wire::StopServerRequest {
+                    server_id,
+                    command_id: crate::remote_lsp::link::random_id(),
+                })
+                .map_err(|status| status.message().to_owned())
+        })
     }
 
     fn connect(&mut self, host: &str) -> Result<String, ConnectError> {
@@ -1111,18 +1319,11 @@ impl Reach for SshReach {
         &mut self,
         project: &RemoteProject,
     ) -> Result<Arc<dyn crate::remote_sync::sessions::SyncHelper>, String> {
-        let state_home = self.state_home()?;
-        let store = RemoteProjects::new(Some(state_home.as_os_str()), None);
-        let master = ControlMaster::ensure(&project.host, &self.ssh_dir, &self.exe)
-            .map_err(|error| format!("connecting to {}: {error}", project.host))?;
-        let connection = crate::remote_project::RemoteConnection::open_over_ssh(
-            &master,
-            &store,
-            project,
-            &project.helper_version,
-            agent::BUNDLED_SIDECAR_REVISION,
-        )?;
-        Ok(Arc::new(connection))
+        Ok(Arc::new(self.project_connection(project)?))
+    }
+
+    fn exec_connection(&mut self, project: &RemoteProject) -> Result<crate::remote_project::RemoteConnection, String> {
+        self.project_connection(project)
     }
 
     fn sync_settings(&self) -> super::cli_sync::SyncSettings {
@@ -2866,7 +3067,30 @@ mod tests {
         let store = RemoteProjects::new(Some(root.as_os_str()), None);
         let mut term = Scripted::default();
         assert_eq!(run_with(&store, &mut fixture(&root, true), &mut term, &["status"]), 0);
-        assert_eq!(term.said, ["no remote project is recorded on this machine"]);
+        assert_eq!(
+            term.said,
+            [
+                "no remote project is recorded on this machine",
+                "remote development: on"
+            ]
+        );
+        // The switch is said whatever it is, and saying it connects to nothing.
+        let off = || false;
+        let mut term = Scripted::default();
+        let mut offline = fixture(&root, true);
+        let args = vec!["status".to_string()];
+        let code = run_command(
+            &args,
+            &mut Context {
+                store: &store,
+                reach: &mut offline,
+                term: &mut term,
+                remote_dev_enabled: &off,
+                now: 0,
+            },
+        );
+        assert_eq!((code, offline.connects), (0, 0));
+        assert_eq!(term.said.last().map(String::as_str), Some("remote development: off"));
         let (plan, _) = install::test_plan(&root, "open");
         let mut host = install::test_host_record(&plan);
         host.data_dir = root.join("share/eitri-server");
@@ -2925,6 +3149,110 @@ mod tests {
             created_at: 1,
             queued_stops: Vec::new(),
         }
+    }
+
+    /// `stop` stops a daemon's language servers before the daemon itself, through that daemon's own installation:
+    /// each ends as stopped, so the bridge of a Neovim still open on the project ends instead of starting another. A
+    /// failure is said, escaped, and the daemon is stopped all the same.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn stop_ends_the_language_servers_before_the_daemon() {
+        struct Stopping {
+            fixture: Fixture,
+            stopped: PathBuf,
+            calls: Vec<(String, String, PathBuf, bool)>,
+            fail: bool,
+        }
+        impl Reach for Stopping {
+            fn connect(&mut self, host: &str) -> Result<String, ConnectError> {
+                self.fixture.connect(host)
+            }
+            fn first_contact(&mut self, _: &str) -> Result<Contact, String> {
+                unreachable!()
+            }
+            fn launcher(&self, helper: &Path) -> Arc<dyn ChannelLauncher> {
+                self.fixture.launcher(helper)
+            }
+            fn plan(&mut self) -> Result<InstallPlan, String> {
+                unreachable!()
+            }
+            fn agents(&mut self, _: &str, _: &str, _: &Path) -> Result<Vec<Agent>, String> {
+                Ok(Vec::new())
+            }
+            fn stop_language_servers(&mut self, host: &str, key: &str, helper: &Path) -> Result<(), String> {
+                let daemon_stopped = self.stopped.exists();
+                self.calls
+                    .push((host.to_owned(), key.to_owned(), helper.to_owned(), daemon_stopped));
+                if self.fail {
+                    Err("no answer\u{1b}[31m".into())
+                } else {
+                    Ok(())
+                }
+            }
+        }
+        let root = ScratchDir::new("remote", "host-stop-lsp");
+        let store = RemoteProjects::new(Some(root.as_os_str()), None);
+        let (data, _) = installed_host(&root, &store);
+        let stopped = root.join("stopped");
+        let listing = root.join("listing");
+        let info = serde_json::json!({"version":"0.3.0", "rev":"123abcd", "pid":42,
+            "protocol_major":agent::ssh::PROTOCOL_MAJOR, "protocol_minor":0, "started_unix_ms":0,
+            "incompatible_protocol":false, "run":installation_run_key("0.3.0-current")});
+        std::fs::write(
+            &listing,
+            format!(
+                "#!/bin/sh\ntest \"$1\" = list-daemons || exit 1\ntest -e '{}' && exit 0\nprintf '%s\\n' '{info}'\n",
+                stopped.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&listing, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let mut fixture = fixture(&root, true);
+        fixture.launcher = Arc::new(agent::ssh::LocalExec { helper: listing });
+        let mut reach = Stopping {
+            fixture,
+            stopped: stopped.clone(),
+            calls: Vec::new(),
+            fail: false,
+        };
+        let helper = data.join("0.3.0-current/bin/eitri-server");
+        let mut term = Scripted::default();
+        assert_eq!(
+            run_with(&store, &mut reach, &mut term, &["stop", "example-host"]),
+            0,
+            "{:?}",
+            term.said
+        );
+        assert_eq!(
+            reach.calls,
+            [(
+                "example-host".to_owned(),
+                "SHA256:example".to_owned(),
+                helper.clone(),
+                false
+            )]
+        );
+        assert!(stopped.exists(), "{:?}", term.said);
+
+        std::fs::remove_file(&stopped).unwrap();
+        reach.fail = true;
+        reach.calls.clear();
+        let mut term = Scripted::default();
+        assert_eq!(
+            run_with(&store, &mut reach, &mut term, &["stop", "example-host"]),
+            0,
+            "{:?}",
+            term.said
+        );
+        assert_eq!(reach.calls.len(), 1);
+        assert!(stopped.exists(), "{:?}", term.said);
+        assert!(
+            term.said.iter().any(|line| line
+                == "language servers of Eitri server 0.3.0 (0.3.0-current) were not stopped first: no answer\\u{1b}[31m; \
+                    a Neovim still open on the project may start them again"),
+            "{:?}",
+            term.said
+        );
     }
 
     /// A helper whose `list-daemons` reports one daemon of `version` until `<root>/stopped` exists.
@@ -3743,6 +4071,8 @@ mod tests {
             fixture: Fixture,
             helper: PathBuf,
             calls: usize,
+            server_calls: usize,
+            servers_fail: bool,
         }
         impl Reach for Inventory {
             fn connect(&mut self, host: &str) -> Result<String, ConnectError> {
@@ -3783,6 +4113,32 @@ mod tests {
                     truncated: true,
                 })
             }
+            fn language_servers(
+                &mut self,
+                host: &str,
+                key: &str,
+                helper: &Path,
+            ) -> Result<wire::ListServersResponse, String> {
+                assert_eq!(
+                    (host, key, helper),
+                    ("example-host", "SHA256:example", self.helper.as_path())
+                );
+                self.server_calls += 1;
+                if self.servers_fail {
+                    return Err("no answer from the language servers".into());
+                }
+                Ok(wire::ListServersResponse {
+                    servers: vec![wire::LspServerInfo {
+                        server_id: "5e7e7e7e".into(),
+                        root: "/srv/project\u{1b}[31m".into(),
+                        command: "/usr/bin/rust-analyzer".into(),
+                        pid: 777,
+                        attached: true,
+                        ..Default::default()
+                    }],
+                    truncated: false,
+                })
+            }
         }
         let root = ScratchDir::new("remote", "terminal-list");
         let store = RemoteProjects::new(Some(root.as_os_str()), None);
@@ -3813,6 +4169,8 @@ mod tests {
             fixture,
             helper: data.join("0.3.0-current/bin/eitri-server"),
             calls: 0,
+            server_calls: 0,
+            servers_fail: false,
         };
         let mut term = Scripted::default();
         assert_eq!(run_with(&store, &mut reach, &mut term, &["status", "example-host"]), 0);
@@ -3827,16 +4185,65 @@ mod tests {
             "{:?}",
             term.said
         );
-        assert_eq!(reach.calls, 1);
+        assert_eq!((reach.calls, reach.server_calls), (1, 1));
         assert!(term
             .said
             .iter()
             .any(|line| line.contains("0123456789ab") && line.contains("attached") && line.contains("running job")));
+        assert!(
+            term.said
+                .iter()
+                .any(|line| line.starts_with("[0.3.0-current]   language server 5e7e7e7e")
+                    && line.ends_with("rust-analyzer  pid 777  attached")),
+            "{:?}",
+            term.said
+        );
         assert!(term.said.iter().any(|line| line.ends_with("terminal list truncated")));
         assert!(term
             .said
             .iter()
             .all(|line| !line.contains('\u{1b}') && !line.contains('\u{202e}')));
+
+        // Language servers that cannot be listed fail the listing, and the terminals and agents are still shown.
+        reach.servers_fail = true;
+        let before = term.said.len();
+        assert_eq!(run_with(&store, &mut reach, &mut term, &["list", "example-host"]), 1);
+        let said = &term.said[before..];
+        assert!(
+            said.iter().any(|line| line
+                == "language servers of Eitri server 0.3.0 (0.3.0-current) not listed: no answer from the language servers"),
+            "{said:?}"
+        );
+        assert!(
+            said.iter()
+                .any(|line| line == "[0.3.0-current] no running agents in this installation"),
+            "{said:?}"
+        );
+        assert!(said.iter().any(|line| line.contains("0123456789ab")), "{said:?}");
+        assert!(
+            said.iter()
+                .any(|line| line == "example-host: could not list language servers of 0.3.0-current"),
+            "{said:?}"
+        );
+    }
+
+    #[test]
+    fn a_helper_without_the_language_server_service_has_none() {
+        use agent::remote_client::terminal_transport::tonic::Status;
+        let none = servers_or_none(Err(Status::unimplemented("unknown service"))).unwrap();
+        assert!(none.servers.is_empty() && !none.truncated);
+        assert_eq!(
+            servers_or_none(Err(Status::unavailable("connection reset"))).unwrap_err(),
+            "connection reset"
+        );
+        let one = wire::ListServersResponse {
+            servers: vec![wire::LspServerInfo {
+                server_id: "5e7e7e7e".into(),
+                ..Default::default()
+            }],
+            truncated: false,
+        };
+        assert_eq!(servers_or_none(Ok(one.clone())).unwrap(), one);
     }
 
     #[cfg(target_os = "linux")]
@@ -3877,5 +4284,79 @@ mod tests {
             .any(|line| line.contains("terminal ") && line.ends_with("opening")));
         assert!(term.said.iter().any(|line| line == "example-host:/srv/other"));
         assert!(term.said.iter().any(|line| line == "example-host:/srv/project"));
+    }
+
+    #[test]
+    fn every_listed_language_server_is_asked_to_stop_at_once_and_every_failure_is_said() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Mutex;
+        let server = |id: &str| wire::LspServerInfo {
+            server_id: id.into(),
+            root: "/srv/project".into(),
+            command: "/usr/bin/rust-analyzer".into(),
+            pid: 1,
+            attached: true,
+            detached_since_unix_ms: 0,
+            queued_bytes: 0,
+        };
+        let ids = ["0000000a", "0000000b", "0000000c", "0000000d"];
+        let list = || -> Result<wire::ListServersResponse, String> {
+            Ok(wire::ListServersResponse {
+                servers: ids.iter().map(|id| server(*id)).collect(),
+                truncated: false,
+            })
+        };
+        let (asked, active, most) = (Mutex::new(Vec::new()), AtomicUsize::new(0), AtomicUsize::new(0));
+        let stop = |id: String| {
+            let now = active.fetch_add(1, Ordering::SeqCst) + 1;
+            most.fetch_max(now, Ordering::SeqCst);
+            // Each stop waits (up to a bound) for the others to be running: stops made one after another never
+            // see more than one at a time.
+            let until = std::time::Instant::now() + Duration::from_secs(2);
+            while active.load(Ordering::SeqCst) < ids.len() && std::time::Instant::now() < until {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            asked.lock().unwrap().push(id.clone());
+            let result = match id.as_str() {
+                "0000000b" => Err("no answer".to_owned()),
+                "0000000c" => Err("refused".to_owned()),
+                _ => Ok(()),
+            };
+            active.fetch_sub(1, Ordering::SeqCst);
+            result
+        };
+        let why = stop_listed_servers(&list, &stop).unwrap_err();
+        let mut asked = asked.into_inner().unwrap();
+        asked.sort();
+        assert_eq!(asked, ids, "a failure stops none of the others from being asked");
+        assert_eq!(most.load(Ordering::SeqCst), ids.len(), "the stops ran at once");
+        assert!(why.contains("2 language servers could not be stopped"), "{why}");
+        assert!(
+            why.contains("0000000b: no answer") && why.contains("0000000c: refused"),
+            "{why}"
+        );
+        assert_eq!(
+            stop_listed_servers(&list, &|_: String| -> Result<(), String> { Ok(()) }),
+            Ok(())
+        );
+
+        // A truncated list is listed again; a server whose stop failed is not asked twice.
+        let rounds = AtomicUsize::new(0);
+        let truncated = || -> Result<wire::ListServersResponse, String> {
+            rounds.fetch_add(1, Ordering::SeqCst);
+            Ok(wire::ListServersResponse {
+                servers: vec![server("0000000e")],
+                truncated: true,
+            })
+        };
+        let tries = AtomicUsize::new(0);
+        let why = stop_listed_servers(&truncated, &|_: String| -> Result<(), String> {
+            tries.fetch_add(1, Ordering::SeqCst);
+            Err("no answer".to_owned())
+        })
+        .unwrap_err();
+        assert_eq!(tries.load(Ordering::SeqCst), 1, "{why}");
+        assert_eq!(rounds.load(Ordering::SeqCst), 2);
+        assert!(why.contains("one language server could not be stopped"), "{why}");
     }
 }

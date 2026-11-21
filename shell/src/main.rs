@@ -869,6 +869,9 @@ fn build_ui(
     nvim_child_env.extend(nvim_keys_feed.as_ref().map(|feed| feed.child_env()).unwrap_or_default());
     let mut nvim_extra_args = theme_feed.as_ref().map(|feed| feed.nvim_args()).unwrap_or_default();
     nvim_extra_args.extend(context_feed.as_ref().map(|feed| feed.nvim_args()).unwrap_or_default());
+    // The remote loader as first built, and the program it names: `init.lua` has not run yet, so the language-server
+    // options in it are the defaults, and the kernel phase below finishes it (`remote_dev.lsp_grace`, `.lsp_local`).
+    let mut remote_loader: Option<(String, String)> = None;
     if owns_editor && !matches!(origin, eitri_core::remote_project::WindowOrigin::Local) {
         let program = nvim_child_env
             .iter()
@@ -877,6 +880,7 @@ fn build_ui(
             .unwrap_or("eitri");
         // The embedded editor can start without the optional plugin on its runtimepath.
         let loader = eitri_core::remote_sync::nvim_loader(project_root, program);
+        remote_loader = Some((loader.clone(), program.to_owned()));
         nvim_extra_args.extend(["--cmd".into(), loader]);
     }
     nvim_extra_args.extend(nvim_keys_feed.as_ref().map(|feed| feed.nvim_args()).unwrap_or_default());
@@ -906,7 +910,7 @@ fn build_ui(
     // child's inherited process cwd: the two panes silently disagreeing about which project is
     // open is a worse failure than either one pointing somewhere unexpected.
     let opens_files = !open.is_empty();
-    let editor_spawn = eitri_core::wm::EditorSpawn {
+    let mut editor_spawn = eitri_core::wm::EditorSpawn {
         env: nvim_child_env,
         args: nvim_extra_args,
         cwd: Some(project_root.to_path_buf()),
@@ -1205,6 +1209,35 @@ fn build_ui(
             lua_engine.report_problem(problem);
         }
         remote_window::set_sync_settings(settings);
+    }
+    // The editor's nvim starts when the window is first drawn, after this: the `--cmd` that loads the remote modules is
+    // finished with the language-server settings `init.lua` gave, in the pane, in what a restart starts from and in the
+    // surface declaration below.
+    if let Some((first, program)) = remote_loader.take() {
+        let (lsp, problems) = host_command::lsp_options(&lua_engine.config.borrow());
+        for problem in problems {
+            lua_engine.report_problem(problem);
+        }
+        let finished = eitri_core::remote_sync::nvim_loader_with(project_root, &program, &lsp);
+        if finished != first {
+            let in_pane = pane
+                .as_ref()
+                .is_none_or(|pane| pane.replace_nvim_arg(&first, finished.clone()));
+            let in_restart = driver.replace_editor_arg(WinId::MAIN, &first, finished.clone());
+            let in_surface = match editor_spawn.args.iter_mut().find(|arg| **arg == first) {
+                Some(arg) => {
+                    *arg = finished;
+                    true
+                }
+                None => false,
+            };
+            if !(in_pane && in_restart && in_surface) {
+                eprintln!(
+                    "eitri: the remote project's language-server settings did not reach every start of the editor \
+                     (pane {in_pane}, restart {in_restart}, surface {in_surface}); the defaults apply where they did not"
+                );
+            }
+        }
     }
     let git_shim_settings = GIT_SHIM.with(|slot| {
         slot.borrow().as_ref().map(|shim| {

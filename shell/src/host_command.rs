@@ -44,26 +44,28 @@ pub(crate) fn run(args: impl IntoIterator<Item = OsString>) -> Option<glib::Exit
     if rest.first().is_some_and(|first| first == cli::KNOWN_HOSTS_PROBE) {
         return Some(code(cli::known_hosts_probe(&rest[1..])));
     }
+    let is_exec = rest.first().is_some_and(|first| first == "exec");
+    let is_lsp = rest.first().is_some_and(|first| first == "lsp");
     let Some(rest) = rest
         .iter()
         .map(|arg| arg.to_str().map(str::to_owned))
         .collect::<Option<Vec<String>>>()
     else {
         eprintln!("eitri host: arguments must be valid UTF-8");
-        return Some(glib::ExitCode::from(64));
+        return Some(early_exit(is_exec, 64));
     };
     let state_home = std::env::var_os("XDG_STATE_HOME");
     let home = std::env::var_os("HOME");
     let store = eitri_core::remote_project::RemoteProjects::new(state_home.as_deref(), home.as_deref());
     let Some(ssh_dir) = cli::ssh_dir(state_home.as_deref(), home.as_deref()) else {
         eprintln!("eitri host: no state directory (set HOME or XDG_STATE_HOME)");
-        return Some(glib::ExitCode::FAILURE);
+        return Some(early_exit(is_exec, 1));
     };
     let exe = match std::env::current_exe() {
         Ok(exe) => exe,
         Err(e) => {
             eprintln!("eitri host: cannot find this Eitri's own executable ({e})");
-            return Some(glib::ExitCode::FAILURE);
+            return Some(early_exit(is_exec, 1));
         }
     };
     let known_hosts = home
@@ -78,7 +80,15 @@ pub(crate) fn run(args: impl IntoIterator<Item = OsString>) -> Option<glib::Exit
         [command, ..] => matches!(command.as_str(), "open" | "stop" | "uninstall"),
         [] => false,
     };
-    if needs_settings {
+    if is_exec || is_lsp {
+        // A command's stdout is its output (a formatter's is the file's text), and a language server's stdout is the
+        // protocol's: init.lua's prints go to stderr, and a missing init.lua is not worth a line there (a formatter's
+        // stderr lands in the editor's messages). `lsp` takes the flush cap and the Mutagen path for the flush a save
+        // asks for.
+        reach = reach.with_sync_settings(eitri_core::remote_host::cli_exec::with_stdout_on_stderr(
+            init_sync_settings_for_a_command,
+        ));
+    } else if needs_settings {
         reach = reach.with_sync_settings(init_sync_settings());
     }
     let mut term = Stdio;
@@ -97,6 +107,16 @@ pub(crate) fn run(args: impl IntoIterator<Item = OsString>) -> Option<glib::Exit
         },
     );
     Some(code(status))
+}
+
+/// The exit code of a failure before a verb ran. `exec`'s exits belong to the command it wraps (a linter reads 1 as
+/// "issues found", 64 as its own usage error), so there 125 says nothing was tried; every other verb keeps `usual`.
+fn early_exit(is_exec: bool, usual: u8) -> glib::ExitCode {
+    if is_exec {
+        glib::ExitCode::from(125)
+    } else {
+        glib::ExitCode::from(usual)
+    }
 }
 
 fn code(status: i32) -> glib::ExitCode {
@@ -134,6 +154,21 @@ pub(crate) fn init_sync_settings() -> eitri_core::remote_host::cli_sync::SyncSet
         eprintln!("eitri: {problem}");
     }
     settings
+}
+
+/// [`init_sync_settings`] for `exec` and `lsp`, whose stderr belongs to the command and the editor: without an
+/// `init.lua` the defaults are taken without the notice the other verbs print.
+pub(crate) fn init_sync_settings_for_a_command() -> eitri_core::remote_host::cli_sync::SyncSettings {
+    let Ok(config_dir) = eitri_core::config_dir::resolve(&|key| std::env::var_os(key)) else {
+        return Default::default();
+    };
+    if !config_dir.join("init.lua").exists() {
+        let Ok(kernel) = Kernel::new(config_dir, refuse_panels) else {
+            return Default::default();
+        };
+        return sync_settings(&kernel.config.borrow()).0;
+    }
+    init_sync_settings()
 }
 
 /// The terminal `eitri host` runs in: lines to stdout, questions answered on stdin.
@@ -213,6 +248,25 @@ pub(crate) fn git_shim_options(
     )
 }
 
+/// `remote_dev.lsp_grace` and `remote_dev.lsp_local` for the language-server wrap in the embedded editor; a value that
+/// does not parse leaves the default, with the problem said.
+pub(crate) fn lsp_options(
+    config: &eitri_core::lua::config::ConfigStore,
+) -> (eitri_core::remote_sync::LspOptions, Vec<String>) {
+    use eitri_core::lua::config::*;
+    let mut problems = vec![];
+    let defaults = eitri_core::remote_sync::LspOptions::default();
+    let grace = parse_remote_dev_lsp_grace(config.get(REMOTE_DEV_LSP_GRACE_KEY)).unwrap_or_else(|e| {
+        problems.push(format!("{e}; the default is used"));
+        defaults.grace
+    });
+    let local_servers = parse_remote_dev_lsp_local(config.get(REMOTE_DEV_LSP_LOCAL_KEY)).unwrap_or_else(|e| {
+        problems.push(format!("{e}; every server runs on the server"));
+        defaults.local_servers.clone()
+    });
+    (eitri_core::remote_sync::LspOptions { grace, local_servers }, problems)
+}
+
 /// `remote_dev.mutagen`, `remote_dev.tripwire_mib` and `remote_dev.flush_cap` for the sync actor and the sync verbs;
 /// a value that does not parse leaves the default, with the problem said.
 pub(crate) fn sync_settings(
@@ -260,6 +314,52 @@ mod tests {
     use std::path::Path;
     use std::process::{Command, Stdio};
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn exec_fails_before_a_verb_with_125_and_other_verbs_keep_their_codes() {
+        use std::os::unix::ffi::OsStringExt;
+        for usual in [1, 64] {
+            assert_eq!(early_exit(true, usual), glib::ExitCode::from(125));
+            assert_eq!(early_exit(false, usual), glib::ExitCode::from(usual));
+        }
+        let args = |verb: &str| {
+            [
+                OsString::from("host"),
+                OsString::from(verb),
+                OsString::from("--"),
+                OsString::from_vec(vec![0xff, b'x']),
+            ]
+        };
+        assert_eq!(run(args("exec")), Some(glib::ExitCode::from(125)));
+        assert_eq!(run(args("sync")), Some(glib::ExitCode::from(64)));
+    }
+
+    #[test]
+    fn the_language_server_options_come_from_the_two_keys_and_fall_back_with_a_line() {
+        use eitri_core::lua::config::ConfigStore;
+        use eitri_core::remote_sync::LspOptions;
+        let mut config = ConfigStore::default();
+        let (options, problems) = lsp_options(&config);
+        assert_eq!(options, LspOptions::default());
+        assert!(problems.is_empty(), "{problems:?}");
+        config.set_text("remote_dev.lsp_grace", "600");
+        config.set_text("remote_dev.lsp_local", "lua_ls, taplo");
+        let (options, problems) = lsp_options(&config);
+        assert_eq!(
+            options,
+            LspOptions {
+                grace: 600,
+                local_servers: vec!["lua_ls".into(), "taplo".into()]
+            }
+        );
+        assert!(problems.is_empty(), "{problems:?}");
+        config.set_text("remote_dev.lsp_grace", "5");
+        config.set_text("remote_dev.lsp_local", "caf\u{e9}");
+        let (options, problems) = lsp_options(&config);
+        assert_eq!(options, LspOptions::default());
+        assert_eq!(problems.len(), 2, "{problems:?}");
+        assert!(problems[0].contains("remote_dev.lsp_grace") && problems[1].contains("remote_dev.lsp_local"));
+    }
 
     #[test]
     fn host_lines_and_questions_carry_no_escape_byte() {
@@ -365,6 +465,52 @@ mod tests {
         assert_eq!(output.status.code(), Some(255), "{stderr}");
         assert!(stderr.contains("no remote project records a session"), "{stderr}");
         assert!(!stderr.contains("INIT_LUA_TRIPWIRE"), "{stderr}");
+    }
+
+    #[test]
+    fn exec_and_lsp_say_nothing_of_a_missing_init_lua() {
+        let root = agent::state_dirs::test_workspace_dir("command-no-init");
+        let outside = root.join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        let run = |args: &[&str]| {
+            Command::new(shell_binary())
+                .args(args)
+                .current_dir(&outside)
+                .env("EITRI_CONFIG_DIR", root.join("config"))
+                .env("XDG_STATE_HOME", root.join("state"))
+                .env("HOME", &root)
+                .env_remove("DISPLAY")
+                .env_remove("WAYLAND_DISPLAY")
+                .env_remove("DBUS_SESSION_BUS_ADDRESS")
+                .env_remove("DBUS_SYSTEM_BUS_ADDRESS")
+                .stdin(Stdio::null())
+                .output()
+                .unwrap()
+        };
+        let outside_text = outside.display().to_string();
+        let exec = run(&["host", "exec", "--cwd", &outside_text, "--", "true"]);
+        let stderr = String::from_utf8_lossy(&exec.stderr);
+        assert_eq!(exec.status.code(), Some(125), "{stderr}");
+        assert!(stderr.contains("is not inside a remote project"), "{stderr}");
+        let lsp = run(&["host", "lsp", "--root", &outside_text, "--", "rust-analyzer"]);
+        let lsp_stderr = String::from_utf8_lossy(&lsp.stderr);
+        assert_eq!(lsp.status.code(), Some(1), "{lsp_stderr}");
+        for (verb, output) in [("exec", &exec), ("lsp", &lsp)] {
+            let all = format!(
+                "{}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(!all.contains("init.lua"), "{verb}: {all}");
+        }
+        // The verbs that said it before still do.
+        let status = run(&["host", "sync", "flush"]);
+        let all = format!(
+            "{}{}",
+            String::from_utf8_lossy(&status.stdout),
+            String::from_utf8_lossy(&status.stderr)
+        );
+        assert!(all.contains("no init.lua"), "{all}");
     }
 
     fn shell_binary() -> PathBuf {

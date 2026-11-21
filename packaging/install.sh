@@ -81,7 +81,7 @@ NV_OLD_DESKTOP=eitri.desktop
 # installed to $XDG_DATA_HOME/eitri/eitri.nvim/<this path>. Not under eitri/nvim/: that directory holds
 # the private nvim versions this installer scans and removes. A test holds this list to the committed
 # files.
-NV_PLUGIN_FILES='plugin/eitri.lua lua/eitri/init.lua lua/eitri/health.lua lua/eitri/remote/init.lua lua/eitri/remote/sync.lua doc/eitri.txt'
+NV_PLUGIN_FILES='plugin/eitri.lua lua/eitri/init.lua lua/eitri/health.lua lua/eitri/remote/init.lua lua/eitri/remote/sync.lua lua/eitri/remote/exec.lua lua/eitri/remote/buffers.lua lua/eitri/remote/lsp.lua lua/eitri/remote/text.lua doc/eitri.txt'
 # The GNOME Shell extension a companion panel on GNOME uses to move focus to and from its editor: in the release
 # tarball at share/gnome-shell/extensions/<NV_EXT_ID>/<file>, and installed to
 # $XDG_DATA_HOME/gnome-shell/extensions/<NV_EXT_ID>/<file>, where the shell looks for a user's extensions.

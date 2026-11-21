@@ -8,6 +8,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         proto.join("eitri_terminal.proto"),
         proto.join("eitri_transcripts.proto"),
         proto.join("eitri_gate.proto"),
+        proto.join("eitri_lsp.proto"),
     ];
     for file in &files {
         println!("cargo:rerun-if-changed={}", file.display());

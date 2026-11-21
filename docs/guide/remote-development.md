@@ -5,7 +5,8 @@ English | [简体中文](remote-development.zh-CN.md)
 Remote development lets one Eitri window on your computer work on a project that lives on another machine. The code,
 the agent and its tools stay on the server, where the toolchains and credentials are. Your Neovim, its plugins, the panel and your
 keys stay local. This page covers the sync side: how the project reaches your computer, what does not, and what
-Eitri does when the two copies disagree.
+Eitri does when the two copies disagree. It then covers language servers and the commands Neovim runs for you
+(formatters, linters, `make`), which run on the server.
 
 It is **experimental** and off by default. Nothing here runs until `init.lua` has
 
@@ -60,6 +61,8 @@ and the default is used.
 | `remote_dev.tripwire_mib` | `64` | the size [tripwire](#the-size-tripwire), 8 to 4096 MiB |
 | `remote_dev.flush_cap` | `3` | seconds a send waits for your saves to reach the server, 0.5 to 30 |
 | `remote_dev.send_waits_for_flush` | `true` | `false` makes a send not wait at all |
+| `remote_dev.lsp_grace` | `1800` | seconds the server keeps a language server after Neovim's connection is lost, 60 to 86400 ([the grace](#the-grace)) |
+| `remote_dev.lsp_local` | none | names of language servers that stay on the laptop, separated by commas or blanks ([what stays local](#what-stays-on-the-laptop)) |
 
 The other settings are in [Configuration](configuration.md).
 
@@ -97,8 +100,8 @@ Eitri remembers that this folder is a remote project, so the window opens as one
 host, the sync state and any conflicts, and agent tabs run on the server. `eitri --local /srv/project` opens the same
 folder as a plain local copy, with no connection (agent tabs are refused there, since they run on the server).
 
-`eitri host list` shows the helper's running agents on every host you opened; `eitri host stop example-host` stops
-them (and pauses sync for that host's projects); `eitri host uninstall example-host` removes the helper. They work
+`eitri host list` shows what the helper runs on every host you opened: agents, server terminals and language servers.
+`eitri host stop example-host` stops them (and pauses sync for that host's projects); `eitri host uninstall example-host` removes the helper. They work
 with `remote_dev.enabled` off.
 
 ### From the window
@@ -419,6 +422,216 @@ Eitri accepts the exclusion only when it can prove that nothing in `.stignore`, 
 re-includes anything of the project. An exception it cannot read or match with certainty counts against it. Dropbox
 markers always need a different location or removal of the overlap. The check runs when you open a project with
 `eitri host open`.
+
+## Language servers and Neovim
+
+The sections above keep your editing on the laptop. A language server, a formatter or a test runner is different: it
+needs the project's toolchain, and the laptop may not have one. So in a remote project Eitri runs them on the server
+and lets your Neovim talk to them from the laptop. You do not change your Neovim configuration for the language
+servers: lspconfig, `vim.lsp.enable` and `vim.lsp.start` all go through the same path.
+
+### Language servers on the server
+
+Open a file in a remote project, and the language server your configuration would have started on the laptop starts
+on the server instead, in the project's directory, with that account's login environment. Diagnostics, completion,
+hover and the rest show up in Neovim as before. Your buffers go to the server as you type, so completion sees text
+you have not saved.
+
+- **The server needs the language server installed**, not the laptop. Eitri looks for the command on the account's
+  login `PATH`, then in Mason's directory there (`~/.local/share/nvim/mason/bin`). If it is not found, Neovim's server
+  fails to start with one message, for example `rust-analyzer is not installed on example-host (looked on the login
+  PATH and in mason)`. Eitri's side of that server lets go of its connection at once and ends by itself about ten
+  seconds later if Neovim does not stop it.
+- **One server per Neovim.** Two Neovims on one project start two servers on the server.
+- `cmd_env` and `cmd_cwd` in a server's configuration describe the laptop, so they are not applied on the server.
+- **If the server dies**, Eitri starts a fresh one and sends it your open buffers. If it dies a second time within
+  five minutes, Eitri stops trying and says so: `the language server rust-analyzer on example-host stopped twice`,
+  followed by the end of its error output.
+- If the helper on the server is an older one that is still running and does not know language servers, the language
+  server runs on the laptop instead. The line saying so goes to Neovim's language-server log (the file
+  `vim.lsp.log.get_filename()` names), not to the screen. It runs without the configuration's `cmd_env` and
+  `cmd_cwd`, in Neovim's working directory. Opening the project's window again updates the helper.
+
+### What stays on the laptop
+
+A language server stays on the laptop when
+
+- its root is not inside a remote project;
+- its name is in `remote_dev.lsp_local`. The name is the `name` of its configuration, and a configuration with no
+  name cannot be listed. `init.lua` stores no tables, so it is one string:
+
+  ```lua
+  eitri.config.set("remote_dev.lsp_local", "lua_ls, stylua")
+  ```
+
+- its `cmd` is a Lua function. A function builds its own connection, so Eitri cannot put the server on the other
+  side of one. `:checkhealth eitri` warns about it (see [Plain Neovim](#plain-neovim));
+- you set `vim.g.eitri_remote_lsp = false` (for the whole session) or `vim.b.eitri_remote_lsp = false` (for one
+  buffer). These are Neovim variables, not `eitri.config` keys, so they go in your Neovim configuration.
+
+The choice is made when a server starts, so changing it does not move a server that is already running. A plugin that
+saved its own reference to `vim.lsp.start` before Eitri's setup ran, and `vim.lsp.start_client`, are not covered.
+
+### The grace
+
+A closed lid, a change of network or a dropped ssh connection does not stop the language server. The server keeps it
+for `remote_dev.lsp_grace` seconds (60 to 86,400, default 1,800, so 30 minutes), and Neovim reconnects by itself.
+When the connection is back within the grace, Neovim is talking to the same server: your open buffers and the saves
+you made meanwhile are sent again, and what the server said while you were away (diagnostics, progress) arrives.
+**Nothing is indexed again.** While the connection is down, requests such as completion and hover fail at once
+instead of waiting.
+
+If the grace runs out, the server stops; the next connection starts a fresh one, which indexes again. Closing Neovim
+asks the server to stop its language server straight away when the connection is up; with the connection down, the
+language server ends when the grace runs out. `eitri host stop` stops the language servers too. Neovim's clients for
+them quit and do not start new ones until Neovim starts them again, for example when you open a file of the project.
+A server kept by the grace keeps using the server's memory until it ends, so a
+shorter grace suits a small machine:
+
+```lua
+eitri.config.set("remote_dev.lsp_grace", 600)
+```
+
+### Saves reach the server first
+
+When you save, Eitri asks sync to carry the file to the server at once, and the language server is told once the saved
+file has arrived, so a check that runs on save (rust-analyzer's `cargo check`, for one) reads what you saved. Usually
+that takes about as long as one round trip to the server.
+If the file has not arrived within about five seconds, the save goes to the language server anyway, and the check can
+read the older file; the helper notes it in that language server's log on the server. A save is held for at most about
+six seconds. `eitri host sync status` shows what sync is doing.
+
+### `gd` into dependencies
+
+A language server also names files that sync does not carry: the standard library, a crate under `~/.cargo`, a file
+generated under an excluded directory. The laptop's file at such a path is some other file, or none. So Eitri opens
+these as `eitri-remote://example-host/<path>` buffers, read from the server:
+
+- The buffer says `reading from example-host…` and then shows the text. It is **read-only**: `:w` answers `this file
+  is on example-host and read-only here`.
+- The file type is detected from the path, and the language server you came from attaches, so hover and `gd` keep
+  working inside it. That holds for `gd` and for a file you open yourself or from the panel: the servers of the buffer
+  you were in attach if they handle the file's language, and if that buffer has none, a server of the same host that
+  already runs for that language does. Only a language server of that same host attaches to such a buffer; one your
+  configuration would start on the laptop for the file type does not.
+- A file inside the project that an ignore rule excludes opens this way too, even if the laptop holds an old copy.
+- A file larger than 16 MiB is refused, not shown in part. At most four are read at once; the rest wait their turn.
+- To open one yourself, `:EitriRemote open /home/user/.cargo/registry/src/example/lib.rs` (an absolute path on the
+  server of the current buffer's project; typed inside an `eitri-remote://` buffer, on that buffer's host). In a remote window, the panel's open-path does the same for an absolute
+  path outside the project. `gf` stays Neovim's own.
+- `vim.b.eitri_remote` is `{ host, path }` in these buffers, for a plugin that must not treat one as a local file.
+
+From a terminal, `eitri host read example-host:/absolute/path` prints a file from the server.
+
+### Commands on the server
+
+Formatters, linters, test runners and `make` are started by Neovim on the laptop. `eitri host exec` runs one command
+on the project's server instead:
+
+```sh
+eitri host exec --cwd /srv/project -- cargo fmt
+```
+
+The project is the recorded one that holds `--cwd` (default: the current directory), and the command runs in the same
+path on its server. Eitri flushes your saves to the server before it starts and brings back what the command changed
+when it ends, so a formatter that rewrote a file in place has its result on the laptop when the command returns (a
+buffer's `:checktime` sees it). `--no-flush` skips both. If a flush fails the command still runs, with a line on
+stderr saying your last save may not have reached the host (or that the command's changes may not have reached the
+laptop). Standard input goes to the command unless you give `--no-stdin` or it is a terminal, so a formatter that
+reads stdin and writes stdout works.
+
+The command gets the login environment of the server account with `TERM=dumb`, and nothing from your laptop. Nothing
+can ask it a question: an editor or a password prompt fails instead of opening. The program is a bare name found on
+the login `PATH`, or an absolute path; otherwise you get the line "`<name>` is not on the login PATH of this account".
+
+What you meet:
+
+- **Exit code.** The command's own; `128 + n` when a signal `n` ended it. **125** means nothing was run: the
+  directory is in no remote project, the server refused, or its helper is older than this Eitri (open the project's
+  window to update it). **255** means the server could not be reached, or the outcome is unknown because the
+  connection was lost after the start; look on the server before you run it again. Eitri's own lines go to stderr
+  starting `eitri host exec:`. It uses 125 rather than 1 so that a linter's "issues found" exit never reads as Eitri
+  failing.
+- **A command is killed after 1 hour.** Interrupting `eitri host exec` on the laptop does not stop a command whose
+  input was already closed (the Neovim wrappers close it at once); only that limit does.
+- It works whether or not `remote_dev.enabled` is on, for a project you have opened.
+
+### Exec wrappers for plugins
+
+`require("eitri.remote").cmd(argv, opts)` takes an argument list and returns it wrapped in `eitri host exec` when the
+directory is inside a remote project, and unchanged otherwise, so one configuration serves local and remote projects.
+`opts` takes `cwd` (default: the current buffer's directory), `flush = false` for `--no-flush`, and `stdin = true`
+for a command that reads standard input. A command with `stdin = true` reads the buffer and answers on standard
+output, so it skips both flushes too (a round trip each); add `flush = true` if it also reads or writes files of the
+project. The one-line recipes:
+
+- **conform.nvim.** Make `command` and `args` functions of the wrapped list. For a formatter that reads the buffer
+  from standard input, pass `stdin = true` to `cmd` and set it on the formatter too:
+
+  ```lua
+  local function on_server(argv)
+    return require("eitri.remote").cmd(argv, { stdin = true })
+  end
+  local rustfmt = { "rustfmt", "--edition", "2021" }
+  require("conform").formatters.rustfmt = {
+    inherit = false,
+    command = function() return on_server(rustfmt)[1] end,
+    args = function() return vim.list_slice(on_server(rustfmt), 2) end,
+    stdin = true,
+  }
+  ```
+
+- **nvim-lint.** `linters.<name>.cmd` is a function that returns the first word of `cmd{ ... }`, and `args` is the
+  rest. A linter with `stdin = true` reads the buffer from standard input, so build its list with
+  `cmd(argv, { stdin = true })`: by default the wrapped command runs with `--no-stdin` and reads empty input.
+- **neotest.** For an adapter option that takes a command, pass `cmd{ ... }`.
+- **`:make`.** `:EitriRemote makeprg cargo build` sets this buffer's `makeprg` to run the command on the server in
+  the buffer's directory (`make` if you give none); then `:make` fills the quickfix list as usual. `errorformat` is
+  left alone: the paths in the output are the server's, and they equal the mirror's. Outside a remote project
+  `:EitriRemote makeprg` says so and changes nothing.
+
+Where a list is built before any buffer is current (nvim-lint's `args`, a neotest option), pass `cwd` yourself.
+
+### Plain Neovim
+
+None of this needs an Eitri window. A Neovim in an ordinary terminal needs three things:
+
+1. The `eitri.nvim` plugin on its `runtimepath` (`vim.opt.runtimepath:append("/usr/share/eitri/nvim/eitri.nvim")`;
+   `:help eitri-install` lists the other install paths).
+2. Optional, for the two settings above that a window reads from `init.lua`:
+
+   ```lua
+   require("eitri.remote").setup({
+     lsp = { grace = 1800, local_servers = { "lua_ls" } },
+   })
+   ```
+
+   Without it the defaults apply: grace 1,800 seconds, nothing kept local. A grace outside 60 to 86,400 is clamped.
+3. The project opened once, in a shell: `eitri host open example-host:/srv/project` (with `remote_dev.enabled` on in
+   Eitri's `init.lua`).
+
+After that, a file under the project's local copy gets its language servers on the server, `gd` into dependencies,
+the exec wrappers and the sync watch, as in a window. The sync watch reads `remote_dev.enabled` from Eitri's `init.lua`
+each time it starts: if this Neovim sees an `init.lua` without it (or none), the watch says "remote development is
+off" and only the language servers and the exec wrappers work. `:help eitri-plain-remote` says the same.
+
+`:checkhealth eitri` has a section for the buffer it was typed in. Outside a remote project it is one line. Inside one
+it shows the project (host and root), the `eitri` program and its version, whether `remote_dev.enabled` is on, each
+language server attached to the buffer as **remote**, **local and pinned**, **local because its `cmd` is a function**
+(a warning) or plain local, and Mutagen with its version (a warning below 0.18.0 or when it is not found).
+
+### A server shell in Neovim
+
+`:EitriRemote term` opens a shell on the project's server in a terminal buffer of a new tab, in the current buffer's
+directory (the same path there). It looks as it would over ssh: `vim`, job control and resizing work. Outside a remote
+project nothing opens. It runs `eitri host term`, which you can also run in any terminal.
+
+- Wiping the buffer asks the server to close the shell, **on a best-effort basis**: if the server does not answer
+  within about a second and a half, the shell keeps running, and `eitri host list` shows it.
+- If the connection is lost, the shell keeps running on the server and the terminal reattaches by itself for up to two
+  minutes; after that it gives up and says the shell is still running.
+- It is a server terminal like those in the window; [Server terminals](#server-terminals) says what closing one
+  ends.
 
 ## What is not in this version
 

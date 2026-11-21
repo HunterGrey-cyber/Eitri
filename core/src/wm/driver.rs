@@ -439,6 +439,11 @@ impl Driver<Controller> {
         self.decide.borrow_mut().set_hint_delay(win, delay);
     }
 
+    /// Replaces an argument of the spawn `win`'s editor restarts from ([`Controller::replace_editor_arg`]).
+    pub fn replace_editor_arg(&self, win: WinId, old: &str, new: String) -> bool {
+        self.decide.borrow_mut().replace_editor_arg(win, old, new)
+    }
+
     /// Holds compositor mode's first-start toast for `win`: the first-start screen goes first, and what it writes can
     /// drop the toast ([`Controller::hold_first_toast`]).
     pub fn hold_first_toast(&self, win: WinId, text: String) {

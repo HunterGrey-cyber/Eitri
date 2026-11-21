@@ -151,10 +151,12 @@ end
 
 local draw, refresh
 function M.start(s, on_shim, on_exit)
-  local partial, errors = "", {}
+  -- `said`: the last line of the watch's output that is not JSON, already shown. The watch writes why it cannot run
+  -- there (remote development off, no such project) and exits with nothing on stderr; that line is the failure.
+  local partial, errors, said = "", {}, nil
   local function failed(reason)
     s.job, s.status = nil, nil
-    if not s.failure and vim.v.exiting == vim.NIL then notify(reason) end
+    if not s.failure and vim.v.exiting == vim.NIL and reason ~= said then notify(reason) end
     s.failure = reason
     on_exit()
     M.mark(s)
@@ -163,6 +165,7 @@ function M.start(s, on_shim, on_exit)
   local function message(line)
     local ok, msg = pcall(vim.json.decode, line)
     if not ok or type(msg) ~= "table" then
+      said = line
       notify(line)
       return
     end
@@ -225,7 +228,7 @@ function M.start(s, on_shim, on_exit)
         s.timer:stop()
         s.timer:close()
       end
-      failed(errors[1] or ("sync watch exited " .. code))
+      failed(errors[1] or said or ("sync watch exited " .. code))
     end,
   })
   if not started or job <= 0 then

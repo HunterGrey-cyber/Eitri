@@ -47,6 +47,13 @@ local function absolute(path)
   return path
 end
 
+-- A path that is not on this machine: `eitri-remote://<host>/<path>`, which `eitri.nvim` reads from the server into a
+-- read-only buffer. Only `open` takes one, and only as the scheme and nothing before it (so never `+cmd` or `++opt`).
+local REMOTE = 'eitri-remote://'
+local function remote(path)
+  return type(path) == 'string' and path:sub(1, #REMOTE) == REMOTE
+end
+
 local function run(cmd, path, mods)
   path = absolute(path)
   vim.api.nvim_cmd({ cmd = cmd, args = { path }, mods = mods or {}, magic = { file = false } }, {})
@@ -271,7 +278,24 @@ function M.call(hex)
   if not ok or type(req) ~= 'table' then return end
   local previous_syntax = vim.go.syntax
   local ran, err = pcall(function()
-    if req.op == 'open' then
+    if req.op == 'open' and remote(req.path) then
+      local buffers = package.loaded['eitri.remote.buffers']
+      -- The language servers the buffer gets are chosen from the buffer the open leaves, so before it leaves it.
+      if buffers and type(buffers.opening) == 'function' then pcall(buffers.opening, req.path) end
+      vim.api.nvim_cmd({ cmd = 'edit', args = { req.path }, magic = { file = false } }, {})
+      -- The buffer is still being read: the line and column are kept for when its text arrives. The column is
+      -- judged as for a file (a whole number from 1 below 2^31, a unit of the three); the buffers count from 0.
+      if buffers and type(req.line) == 'number' and req.line > 0 then
+        local col = req.col
+        local column = type(col) == 'number' and col >= 1 and col < 2 ^ 31 and col == math.floor(col)
+          and type(req.unit) == 'string' and units[req.unit]
+        if column then
+          pcall(buffers.want, vim.api.nvim_get_current_buf(), req.line, col - 1, req.unit)
+        else
+          pcall(buffers.want, vim.api.nvim_get_current_buf(), req.line)
+        end
+      end
+    elseif req.op == 'open' then
       run('edit', req.path)
       if type(req.line) == 'number' and req.line > 0 then
         -- A line past the buffer's end moves nothing, and then no column is placed either.

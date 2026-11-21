@@ -135,6 +135,11 @@ struct State {
     terminal_id: Option<String>,
     opened: OpenAnswer,
     bell: PipeWriter,
+    /// The helper connection the attachment runs on, once the link has one (not while it retries its first).
+    connection: Weak<TerminalConnection>,
+    /// The link's own lines (`[remote terminal …] …`): `None` writes them to stderr; `Some` keeps them for
+    /// [`TerminalLink::take_notes`].
+    notes: Option<Vec<String>>,
 }
 
 impl State {
@@ -478,6 +483,8 @@ impl TerminalLink {
             terminal_id: None,
             opened: OpenAnswer::default(),
             bell: writer,
+            connection: Weak::new(),
+            notes: None,
         }));
         state.lock().unwrap().link(LinkState::Connecting, 0);
         let changed = Arc::new(Notify::new());
@@ -488,6 +495,7 @@ impl TerminalLink {
         let (host, runtime, start) = match &connection {
             LinkConnection::Ready(connection) => {
                 connection.owners.lock().unwrap().push(Arc::downgrade(&owner));
+                state.lock().unwrap().connection = Arc::downgrade(connection);
                 (
                     connection.client.host(),
                     connection.runtime.clone(),
@@ -537,6 +545,41 @@ impl TerminalLink {
 
     pub fn terminal_id(&self) -> Option<String> {
         self.state.lock().unwrap().terminal_id.clone()
+    }
+
+    /// Input bytes put on the stream that the server has not said it wrote yet: what a close sent now could overtake.
+    pub fn input_unwritten(&self) -> u64 {
+        let state = self.state.lock().unwrap();
+        state.sent.saturating_sub(state.written)
+    }
+
+    /// Closes the terminal `terminal_id` over this link's own helper connection, giving up at `deadline`: no new
+    /// connection (no new ssh child) is opened for it. `None` when the link has no connection yet (its first is still
+    /// being retried). Blocking: not for the GTK thread.
+    pub fn close_terminal(&self, terminal_id: &str, deadline: Instant) -> Option<io::Result<Option<String>>> {
+        let connection = self.state.lock().unwrap().connection.upgrade()?;
+        Some(super::terminals::close_before(
+            &connection.client,
+            terminal_id,
+            deadline,
+        ))
+    }
+
+    /// From now on the link's own lines are kept for [`Self::take_notes`] instead of going to stderr: for a caller
+    /// whose stderr is the terminal it draws on in raw mode, where a bare newline would not return the carriage.
+    pub fn keep_notes(&self) {
+        self.state.lock().unwrap().notes.get_or_insert_with(Vec::new);
+    }
+
+    /// The lines kept since the last call (each already escaped for display).
+    pub fn take_notes(&self) -> Vec<String> {
+        self.state
+            .lock()
+            .unwrap()
+            .notes
+            .as_mut()
+            .map(std::mem::take)
+            .unwrap_or_default()
     }
 }
 
@@ -647,6 +690,7 @@ impl Worker {
                     return;
                 };
                 connection.owners.lock().unwrap().push(Arc::downgrade(&self.owner));
+                self.state.lock().unwrap().connection = Arc::downgrade(&connection);
                 // Keep the recovered connection alive outside its runtime. Dropping the link aborts this
                 // task, and dropping the set in turn aborts the attachment on the terminal runtime.
                 let mut attachment = tokio::task::JoinSet::new();
@@ -682,11 +726,11 @@ impl Worker {
                 Err(Failure::Retry(status)) => {
                     let kind = FailureKind::Rpc(status.code());
                     if self.note_failure(kind) {
-                        eprintln!(
+                        self.note(format!(
                             "[remote terminal {}] {}",
                             crate::onboarding::display::display_name(&self.host),
                             crate::onboarding::display::display_text_cut(&status.to_string(), 1024)
-                        );
+                        ));
                     }
                 }
             }
@@ -695,11 +739,11 @@ impl Worker {
                 self.wait_to_retry(&mut attempt).await;
                 if let agent::ssh::LinkCheck::Failed(error) = checker.check().await {
                     if self.note_failure(FailureKind::Link) {
-                        eprintln!(
+                        self.note(format!(
                             "[remote terminal {}] link check: {}",
                             crate::onboarding::display::display_name(&self.host),
                             crate::onboarding::display::display_text_cut(&error.to_string(), 1024)
-                        );
+                        ));
                     }
                 } else {
                     break;
@@ -716,11 +760,11 @@ impl Worker {
     ) -> Option<Arc<TerminalConnection>> {
         loop {
             if self.note_failure(FailureKind::Connect) {
-                eprintln!(
+                self.note(format!(
                     "[remote terminal {}] connecting: {}",
                     crate::onboarding::display::display_name(&self.host),
                     crate::onboarding::display::display_text_cut(&error, 1024)
-                );
+                ));
             }
             self.disconnected();
             self.wait_to_retry(attempt).await;
@@ -773,6 +817,21 @@ impl Worker {
 
     fn note_failure(&mut self, kind: FailureKind) -> bool {
         self.failures.len() < 64 && self.failures.insert(kind)
+    }
+
+    /// One of the link's own lines: to stderr, or kept for the owner that asked ([`TerminalLink::keep_notes`]).
+    fn note(&self, line: String) {
+        let mut state = self.state.lock().unwrap();
+        let Some(notes) = state.notes.as_mut() else {
+            drop(state);
+            eprintln!("{line}");
+            return;
+        };
+        // `note_failure` already lets each kind through once; the bound is for an owner that never takes them.
+        if notes.len() < 64 {
+            notes.push(line);
+            state.ring();
+        }
     }
 
     fn offline(&self) {
@@ -1198,6 +1257,8 @@ mod tests {
                 terminal_id: None,
                 opened: OpenAnswer::default(),
                 bell,
+                connection: Weak::new(),
+                notes: None,
             },
             reader,
             receiver,

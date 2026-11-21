@@ -8,7 +8,7 @@ pub mod terminal_link;
 pub mod terminals;
 pub mod transcripts;
 
-pub use connection::{verified_host_key, RemoteConnection, TerminalMaster, TerminalRoute};
+pub use connection::{verified_host_key, ExecFailure, RemoteConnection, TerminalMaster, TerminalRoute};
 pub use origin::{
     carried_text, carry_tabs_to_key, check_remote_dev, control_dir, decide_origin, host_key_changed, host_open_hint,
     missing_mirror_hint, origin_key, reconcile_host_key, remote_dev_off, tab_origin_key, WindowOrigin,
@@ -229,6 +229,7 @@ pub enum TabOrigin {
     },
 }
 
+#[derive(Clone)]
 pub struct RemoteProjects {
     dir: Option<PathBuf>,
 }

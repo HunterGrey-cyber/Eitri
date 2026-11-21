@@ -1,7 +1,5 @@
-//! The one purpose `Exec` serves: `git`, run as the account would run it at a login prompt, with nothing that waits for
-//! a person.
+//! Purpose `GIT`: `git`, run as the account would run it at a login prompt, with nothing that waits for a person.
 use std::ffi::{OsStr, OsString};
-use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 
 use eitri_server_proto::{ExecPurpose, ExecStart};
@@ -37,28 +35,15 @@ pub fn prepare(start: &ExecStart, login: &Environment) -> Result<Prepared, Strin
         return Err("an argument holds a NUL".to_owned());
     }
     let program = find_git(login)?;
-    let mut env: Vec<(OsString, OsString)> = login
-        .iter()
-        .filter(|(key, _)| {
-            !key.to_str().is_some_and(|key| {
-                ASKING.contains(&key)
-                    || matches!(
-                        key,
-                        "SSH_ASKPASS"
-                            | "GIT_ICASE_PATHSPECS"
-                            | "GIT_LITERAL_PATHSPECS"
-                            | "GIT_GLOB_PATHSPECS"
-                            | "GIT_NOGLOB_PATHSPECS"
-                    )
-            })
-        })
-        .map(|(key, value)| (key.clone(), value.clone()))
-        .collect();
-    env.extend(
-        ASKING
-            .iter()
-            .zip(ANSWERS)
-            .map(|(key, value)| (OsString::from(key), OsString::from(value))),
+    // The shim puts its pathspec settings in argv; the login's switches would change what they mean.
+    let env = without_prompts(
+        login,
+        &[
+            "GIT_ICASE_PATHSPECS",
+            "GIT_LITERAL_PATHSPECS",
+            "GIT_GLOB_PATHSPECS",
+            "GIT_NOGLOB_PATHSPECS",
+        ],
     );
     let audit = match subcommand(&start.argv[1..]) {
         Some(subcommand) => format!("git {}", audit_word(subcommand)),
@@ -86,6 +71,26 @@ const ASKING: [&str; 6] = [
     "GCM_INTERACTIVE",
 ];
 const ANSWERS: [&str; 6] = ["false", "false", "0", "", "never", "never"];
+
+/// `login` with everything in [`ASKING`] answered, `SSH_ASKPASS` and the keys in `removed` taken out: the environment
+/// of a run that must fail instead of waiting for a person.
+pub(super) fn without_prompts(login: &Environment, removed: &[&str]) -> Vec<(OsString, OsString)> {
+    let mut env: Vec<(OsString, OsString)> = login
+        .iter()
+        .filter(|(key, _)| {
+            !key.to_str()
+                .is_some_and(|key| ASKING.contains(&key) || key == "SSH_ASKPASS" || removed.contains(&key))
+        })
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect();
+    env.extend(
+        ASKING
+            .iter()
+            .zip(ANSWERS)
+            .map(|(key, value)| (OsString::from(key), OsString::from(value))),
+    );
+    env
+}
 
 /// Git's options before the subcommand that take the next argument as their value.
 const GLOBAL_WITH_VALUE: &[&str] = &[
@@ -117,17 +122,10 @@ pub fn subcommand(args: &[String]) -> Option<&str> {
     None
 }
 
-/// The first `git` on the login `PATH` that is an executable regular file. Only absolute entries are searched: a
-/// relative one would depend on the daemon's own working directory.
+/// The first `git` on the login `PATH` that is an executable regular file.
 fn find_git(login: &Environment) -> Result<PathBuf, String> {
-    let path = login.get(OsStr::new("PATH")).cloned().unwrap_or_default();
-    for dir in std::env::split_paths(&path).filter(|dir| dir.is_absolute()) {
-        let candidate = dir.join("git");
-        if std::fs::metadata(&candidate)
-            .is_ok_and(|metadata| metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
-        {
-            return Ok(candidate);
-        }
-    }
-    Err(format!("git is not on the login PATH ({})", path.to_string_lossy()))
+    super::on_login_path(login, "git").ok_or_else(|| {
+        let path = login.get(OsStr::new("PATH")).cloned().unwrap_or_default();
+        format!("git is not on the login PATH ({})", path.to_string_lossy())
+    })
 }

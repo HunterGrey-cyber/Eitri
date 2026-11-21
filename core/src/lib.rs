@@ -70,6 +70,7 @@ pub mod remote_audit;
 pub mod remote_devices;
 pub mod remote_greeting;
 pub mod remote_host;
+pub mod remote_lsp;
 pub mod remote_pairing;
 pub mod remote_project;
 pub mod remote_runtime;

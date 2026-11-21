@@ -4,12 +4,13 @@
 CONTENTS                                                        *eitri-contents*
 
   1. Install ............................ |eitri-install|
-  2. Commands ............. |:EitriPanel|, |:EitriOpen|, |:EitriPage|, |:EitriSync|
+  2. Commands ............. |:EitriPanel|, |:EitriOpen|, |:EitriPage|, |:EitriSync|, |:EitriRemote|
   3. Setup .............................. |eitri-setup|
   4. Navigators ......................... |eitri.edge()|
   5. Inside tmux ........................ |eitri-tmux|
   6. Window manager ..................... |eitri-wm|
-  7. Health check ....................... |eitri-health|
+  7. Remote projects in plain nvim ...... |eitri-plain-remote|
+  8. Health check ....................... |eitri-health|
 
 ==============================================================================
 1. INSTALL                                                      *eitri-install*
@@ -85,6 +86,56 @@ The Lua form of :EitriOpen; {dir} is optional.
 
 require("eitri.remote").status() returns the current buffer's project sync
 status for a statusline, or an empty string outside an attached project.
+
+                                                                *:EitriRemote*
+:EitriRemote makeprg [{cmd}]
+                        Set this buffer's 'makeprg' to run {cmd} (default
+                        `make`) on the server, in this buffer's directory.
+                        Words split on blanks; 'errorformat' is untouched,
+                        and the paths in the output are the server's, which
+                        equal this laptop's mirror. Outside a remote project
+                        nothing changes.
+:EitriRemote open {path}
+                        Open the file at the absolute {path} on the server
+                        of this buffer's project as a read-only
+                        `eitri-remote://` buffer (a file the mirror does not
+                        hold: a dependency, a generated file).
+
+:EitriRemote term       Open a shell on the server in a terminal buffer of a new
+                        tab, in this buffer's directory (the same path on the
+                        server). It runs `eitri host term`, which shows the
+                        server's terminal as ssh would: `vim`, job control and
+                        resizing work. Wiping the buffer asks the server to
+                        close the shell; when the server does not answer
+                        within a second and a half the shell keeps running
+                        (`eitri host list` shows it). If the link is lost, the
+                        shell keeps running and the terminal reattaches for up
+                        to two minutes. Outside a remote project nothing
+                        opens.
+
+                                                                *eitri.remote.cmd()*
+require("eitri.remote").cmd({argv}, {opts})
+                        Returns {argv} wrapped in `eitri host exec` when
+                        {opts}.cwd (default: this buffer's directory) is
+                        inside a recorded remote project, else {argv}
+                        unchanged, so one config serves local projects too.
+                        {opts}: cwd, flush (false: `--no-flush`), stdin (true
+                        lets the command read stdin; default `--no-stdin`).
+                        With stdin = true the flushes are skipped too (the
+                        input is the buffer, the answer stdout) unless flush
+                        = true.
+                        Plugins that run a command on the laptop's behalf:
+                          conform.nvim   formatters.<name> = { command =
+                                         c[1], args = vim.list_slice(c, 2) }
+                                         with c = cmd{ "prettier", ... };
+                                         set stdin = true for a formatter
+                                         that reads the buffer on stdin
+                          nvim-lint      linters.<name>.cmd = a function
+                                         returning the first word of cmd{...}
+                                         and args the rest
+                          neotest        an adapter option that takes a
+                                         command: pass cmd{ ... }
+                          :make          :EitriRemote makeprg
 
                                                                   *:EitriPage*
 :EitriPage {id} [dir]   Open a plugin page beside this nvim, following its
@@ -230,7 +281,49 @@ it starts Neovide with nvim on a private socket and attaches the panel to it.
 The panel closes when that Neovide exits; closing the panel leaves Neovide.
 
 ==============================================================================
-7. HEALTH CHECK                                                *eitri-health*
+7. REMOTE PROJECTS IN PLAIN NVIM                            *eitri-plain-remote*
+
+A plain nvim, in a terminal with no Eitri window, needs nothing but this
+plugin to work on a remote project: open the project once, and a file under
+its local copy gets its language servers on the server, `gd` into a
+dependency, and the sync watch. Three lines:
+
+1. The plugin on the 'runtimepath' (|eitri-install|):
+>lua
+  vim.opt.runtimepath:append("/usr/share/eitri/nvim/eitri.nvim")
+<
+2. Optional: the options that Eitri's window takes from `init.lua`.
+   {grace} is how many seconds an idle language server is kept on the server
+   (60 to 86400, default 1800); {local_servers} are the names of servers that
+   keep running on this machine:
+>lua
+  require("eitri.remote").setup({
+    lsp = { grace = 1800, local_servers = { "lua_ls" } },
+  })
+<
+3. Open the project once, in a shell (needs `remote_dev.enabled` on in
+   Eitri's `init.lua`; the host and the path are yours):
+>
+  eitri host open example-host:/srv/project
+<
+Without line 2 the defaults apply. A configuration shared with Eitri's
+window may keep line 2: inside the window it changes nothing the window set
+(the project, the program, and the language-server options, which come from
+`remote_dev.lsp_grace` and `remote_dev.lsp_local` in Eitri's `init.lua`;
+there the names are separated by commas, spaces or tabs). `vim.lsp.start`,
+lspconfig and `vim.lsp.enable` all go through the same wrap; a server whose
+root is outside every recorded project, a server named in {local_servers},
+and a `cmd` that is a function stay on this machine. `vim.g.eitri_remote_lsp = false` (or the
+buffer's `vim.b.eitri_remote_lsp`) keeps everything local. `:checkhealth
+eitri` says which of these a buffer's servers are (|eitri-health|).
+
+The sync watch reads `remote_dev.enabled` from Eitri's `init.lua` each time
+it starts; with it off (or no `init.lua` where this nvim looks) the watch
+says "remote development is off", and the language servers and the exec
+wrappers still work.
+
+==============================================================================
+8. HEALTH CHECK                                                *eitri-health*
 
 :checkhealth eitri
 
@@ -239,5 +332,14 @@ page ids returned by `eitri page --list`. It reports an older Eitri without
 page support. The health module loads only when called. Opening a buffer
 under a recorded remote root starts one sync watch for that project and
 reports the editor's modified buffers to it.
+
+The "Eitri remote project" section is about the buffer the check was typed in.
+Outside a recorded remote project it says so in one line. Inside one it shows
+the project (host and root), the `eitri` program and its version, whether
+`remote_dev.enabled` is on (as `eitri host status` says), each language server
+attached to the buffer (remote through the bridge, local and pinned, or local
+because its `cmd` is a function, which Eitri cannot send to the server), and
+whether `mutagen` is found. Every program it runs is stopped after four
+seconds.
 
 vim:tw=78:ts=8:ft=help:norl:

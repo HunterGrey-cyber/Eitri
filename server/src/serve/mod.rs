@@ -2,6 +2,7 @@
 #[cfg(test)]
 pub mod fake_sidecar;
 mod gate;
+pub mod lsp;
 mod proxy;
 mod replay;
 mod terminal;
@@ -26,6 +27,7 @@ use super::sync::activity::{Facts, SessionFacts, Tasks, Turn};
 use crate::run_dir::Paths;
 
 pub use gate::GateFacts;
+pub use lsp::lsp_server;
 pub use proxy::Proxy;
 pub use terminal::TerminalRoutes;
 pub use transcripts::server as transcripts_server;

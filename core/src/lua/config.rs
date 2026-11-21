@@ -188,6 +188,17 @@ pub const REMOTE_DEV_FLUSH_CAP_KEY: &str = "remote_dev.flush_cap";
 pub const REMOTE_DEV_SEND_WAITS_FOR_FLUSH_KEY: &str = "remote_dev.send_waits_for_flush";
 pub const REMOTE_DEV_MUTAGEN_KEY: &str = "remote_dev.mutagen";
 pub const REMOTE_DEV_TRIPWIRE_MIB_KEY: &str = "remote_dev.tripwire_mib";
+/// How long a language server of a remote project is kept on the server after its bridge is lost, in seconds.
+pub const REMOTE_DEV_LSP_GRACE_KEY: &str = "remote_dev.lsp_grace";
+/// Names of language servers kept on this machine even in a remote project, separated by commas, spaces or tabs.
+pub const REMOTE_DEV_LSP_LOCAL_KEY: &str = "remote_dev.lsp_local";
+/// The grace's default and bounds, in seconds.
+pub const REMOTE_DEV_LSP_GRACE_DEFAULT: u32 = 1800;
+pub const REMOTE_DEV_LSP_GRACE_MIN: u32 = 60;
+pub const REMOTE_DEV_LSP_GRACE_MAX: u32 = 86_400;
+/// How many names `remote_dev.lsp_local` takes, and the longest one.
+const REMOTE_DEV_LSP_LOCAL_MAX: usize = 64;
+const REMOTE_DEV_LSP_LOCAL_NAME_MAX_BYTES: usize = 128;
 
 pub fn parse_remote_dev_flush_cap(value: Option<&str>) -> Result<f64, String> {
     let Some(value) = value else {
@@ -225,6 +236,52 @@ pub fn parse_remote_dev_tripwire_mib(value: Option<&str>) -> Result<u32, String>
         .ok()
         .filter(|n| (8..=4096).contains(n))
         .ok_or_else(|| format!("{REMOTE_DEV_TRIPWIRE_MIB_KEY:?} must be an integer from 8 to 4096 (got {value:?})"))
+}
+
+/// [`REMOTE_DEV_LSP_GRACE_KEY`] as stored: whole seconds from 60 to 86,400, or unset for 1,800.
+pub fn parse_remote_dev_lsp_grace(value: Option<&str>) -> Result<u32, String> {
+    let Some(value) = value else {
+        return Ok(REMOTE_DEV_LSP_GRACE_DEFAULT);
+    };
+    let text = value.trim();
+    match text.parse::<u32>() {
+        Ok(seconds)
+            if text.bytes().all(|b| b.is_ascii_digit())
+                && (REMOTE_DEV_LSP_GRACE_MIN..=REMOTE_DEV_LSP_GRACE_MAX).contains(&seconds) =>
+        {
+            Ok(seconds)
+        }
+        _ => Err(format!(
+            "{REMOTE_DEV_LSP_GRACE_KEY:?} must be a whole number of seconds from {REMOTE_DEV_LSP_GRACE_MIN} to \
+             {REMOTE_DEV_LSP_GRACE_MAX} (got {value:?})"
+        )),
+    }
+}
+
+/// [`REMOTE_DEV_LSP_LOCAL_KEY`] as stored: server names (the `name` a client config carries) separated by commas,
+/// spaces or tabs; none is empty, longer than 128 bytes or holds anything but printable ASCII. Unset is no name. A
+/// repeated name counts once.
+pub fn parse_remote_dev_lsp_local(value: Option<&str>) -> Result<Vec<String>, String> {
+    let Some(value) = value else {
+        return Ok(Vec::new());
+    };
+    let mut names: Vec<String> = Vec::new();
+    for name in value.split([',', ' ', '\t']).filter(|name| !name.is_empty()) {
+        if name.len() > REMOTE_DEV_LSP_LOCAL_NAME_MAX_BYTES || !name.bytes().all(|b| b.is_ascii_graphic()) {
+            return Err(format!(
+                "{REMOTE_DEV_LSP_LOCAL_KEY:?} takes language server names, not {name:?}"
+            ));
+        }
+        if !names.iter().any(|known| known == name) {
+            names.push(name.to_owned());
+        }
+    }
+    if names.len() > REMOTE_DEV_LSP_LOCAL_MAX {
+        return Err(format!(
+            "{REMOTE_DEV_LSP_LOCAL_KEY:?} names more than {REMOTE_DEV_LSP_LOCAL_MAX} servers"
+        ));
+    }
+    Ok(names)
 }
 
 /// The `init.lua` key: `eitri.config.set("remote.enabled", true | false)`. Whether this window starts remote control
@@ -576,6 +633,38 @@ mod tests {
                 .unwrap_err()
                 .contains(REMOTE_DEV_MUTAGEN_KEY));
         }
+        assert_eq!(parse_remote_dev_lsp_grace(None), Ok(1800));
+        assert_eq!(parse_remote_dev_lsp_local(None), Ok(Vec::new()));
+        for (value, expected) in [("60", 60), ("86400", 86_400), ("1800", 1800), (" 300 ", 300)] {
+            assert_eq!(parse_remote_dev_lsp_grace(Some(value)), Ok(expected));
+        }
+        for bad in ["59", "86401", "60.5", "-1", "true", "", "1e3", "+60", "99999999999999"] {
+            assert!(parse_remote_dev_lsp_grace(Some(bad))
+                .unwrap_err()
+                .contains(REMOTE_DEV_LSP_GRACE_KEY));
+        }
+        assert_eq!(
+            parse_remote_dev_lsp_local(Some("lua_ls, rust-analyzer lua_ls,,")),
+            Ok(vec!["lua_ls".to_owned(), "rust-analyzer".to_owned()])
+        );
+        assert_eq!(parse_remote_dev_lsp_local(Some("")), Ok(Vec::new()));
+        let too_many = (0..65).map(|n| format!("s{n}")).collect::<Vec<_>>().join(",");
+        for bad in ["ok,caf\u{e9}", "a\u{0}b", &"x".repeat(129), &too_many] {
+            assert!(parse_remote_dev_lsp_local(Some(bad))
+                .unwrap_err()
+                .contains(REMOTE_DEV_LSP_LOCAL_KEY));
+        }
+        let store = store_with(
+            "eitri.config.set('remote_dev.lsp_grace', 600)\neitri.config.set('remote_dev.lsp_local', 'lua_ls,taplo')",
+        );
+        assert_eq!(
+            parse_remote_dev_lsp_grace(store.borrow().get(REMOTE_DEV_LSP_GRACE_KEY)),
+            Ok(600)
+        );
+        assert_eq!(
+            parse_remote_dev_lsp_local(store.borrow().get(REMOTE_DEV_LSP_LOCAL_KEY)),
+            Ok(vec!["lua_ls".to_owned(), "taplo".to_owned()])
+        );
         let store = store_with("eitri.config.set('remote_dev.flush_cap', 0.5)\neitri.config.set('remote_dev.send_waits_for_flush', false)\neitri.config.set('remote_dev.mutagen', '/usr/bin/mutagen')\neitri.config.set('remote_dev.tripwire_mib', 4096)");
         let store = store.borrow();
         assert_eq!(parse_remote_dev_flush_cap(store.get(REMOTE_DEV_FLUSH_CAP_KEY)), Ok(0.5));

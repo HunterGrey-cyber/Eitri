@@ -688,6 +688,35 @@ fn stop_on(client: &HelperClient, entry: TerminalEntry, deadline: Instant) -> io
     })
 }
 
+/// Closes the terminal `terminal_id` on the server `client` reaches, as a call of its own: `Some` is the warning to show
+/// when the server could not confirm the shell and its session gone. A terminal the server no longer knows is closed.
+pub fn close_on(client: &HelperClient, terminal_id: &str) -> io::Result<Option<String>> {
+    close_before(client, terminal_id, Instant::now() + STOP_BUDGET)
+}
+
+/// [`close_on`], given up at `deadline`.
+pub fn close_before(client: &HelperClient, terminal_id: &str, deadline: Instant) -> io::Result<Option<String>> {
+    let request = wire::CloseTerminalRequest {
+        terminal_id: terminal_id.to_owned(),
+        command_id: format!("{:x}", Sha256::digest(format!("close:{terminal_id}").as_bytes())),
+    };
+    service_call_before(client, deadline, move |mut service| async move {
+        match service.close_terminal(request).await {
+            Ok(answer) => Ok(close_warning(answer.metadata())),
+            Err(status) if status.code() == tonic::Code::NotFound => Ok(None),
+            Err(status) => Err(status),
+        }
+    })
+}
+
+impl RemoteConnection {
+    /// Closes the terminal `terminal_id` of this project's current installation, through a terminal connection of its
+    /// own ([`close_on`]). Blocking: a worker's.
+    pub fn close_terminal(&self, terminal_id: &str) -> io::Result<Option<String>> {
+        close_on(&self.terminal_control("")?, terminal_id)
+    }
+}
+
 fn unix_seconds() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -896,7 +925,7 @@ pub fn queued_notice(host: &str) -> String {
     format!("the terminal on {host} will be stopped when a window of this project next connects")
 }
 
-fn local_time(unix_ms: u64) -> String {
+pub(crate) fn local_time(unix_ms: u64) -> String {
     let Ok(seconds) = libc::time_t::try_from(unix_ms / 1000) else {
         return "unknown time".into();
     };

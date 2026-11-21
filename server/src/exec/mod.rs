@@ -16,10 +16,11 @@
 //! over a command that must not be cut short half-way (a commit), so the child runs to its end, its output is read and
 //! dropped, and its status goes to the audit log while the daemon is running. At daemon exit the readers go away,
 //! and a child still writing to a pipe can get SIGPIPE.
+pub mod command;
 pub mod git;
 
 use std::collections::{HashMap, VecDeque};
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::future::Future;
 use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
@@ -29,7 +30,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use eitri_server_proto::{exec_input, exec_output, ExecExit, ExecInput, ExecOutput};
+use eitri_server_proto::{exec_input, exec_output, ExecExit, ExecInput, ExecOutput, ExecPurpose, ExecStart};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::process::ChildStdin;
 use tokio::sync::mpsc;
@@ -52,6 +53,33 @@ pub const STOP_GRACE: Duration = Duration::from_secs(10);
 
 pub type Output = mpsc::Receiver<Result<ExecOutput, Status>>;
 
+/// Checks a start by its purpose and prepares it to run in `login`, the login environment the daemon captured:
+/// [`git::prepare`] for `GIT`, [`command::prepare`] for `COMMAND`; any other purpose is refused. A refusal says what
+/// is wrong. Looks at the disk, so callers run it off the async runtime.
+pub fn prepare(start: &ExecStart, login: &crate::daemon::login_env::Environment) -> Result<Prepared, String> {
+    match ExecPurpose::try_from(start.purpose) {
+        Ok(ExecPurpose::Git) => git::prepare(start, login),
+        Ok(ExecPurpose::Command) => command::prepare(start, login),
+        _ => Err(format!("the helper runs no exec purpose {}", start.purpose)),
+    }
+}
+
+/// The first executable regular file called `name` in the absolute entries of the login `PATH`. A relative entry would
+/// depend on the daemon's own working directory, so it is never searched.
+fn on_login_path(login: &crate::daemon::login_env::Environment, name: &str) -> Option<PathBuf> {
+    let path = login.get(OsStr::new("PATH"))?;
+    std::env::split_paths(path)
+        .filter(|dir| dir.is_absolute())
+        .map(|dir| dir.join(name))
+        .find(|candidate| is_executable_file(candidate))
+}
+
+/// Whether `path` is a regular file (links followed) with an execute bit set.
+fn is_executable_file(path: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::metadata(path).is_ok_and(|metadata| metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
+}
+
 /// A command ready to run: what to execute, its arguments after the program name, where, with what environment, and
 /// how long it may take.
 #[derive(Clone, Debug)]
@@ -60,7 +88,7 @@ pub struct Prepared {
     pub args: Vec<String>,
     pub cwd: String,
     pub env: Vec<(OsString, OsString)>,
-    /// The audit line's name for the command (`git <subcommand>`).
+    /// The audit line's name for the command (`git <subcommand>`, `command <program's file name>`).
     pub audit: String,
     pub deadline: Duration,
 }
@@ -593,17 +621,29 @@ where
         out.abort();
         err.abort();
     }
-    let exit = match status {
-        Ok(status) => exit_of(status),
-        Err(error) => ExecExit {
-            code: -1,
-            signal: 0,
-            refusal: format!("waiting for {} failed: {error}", prepared.audit),
-        },
-    };
+    let (exit, reported) = waited(status, &prepared.audit);
     // Nobody may be reading any more; the status still goes to the audit log.
-    let _ = tokio::time::timeout_at(deadline, sender.send(Ok(exit_message(exit.clone())))).await;
+    if reported {
+        let _ = tokio::time::timeout_at(deadline, sender.send(Ok(exit_message(exit.clone())))).await;
+    }
     finish(Ended::Exited(exit)).await
+}
+
+/// The exit of a child once it was waited for, and whether the laptop is told it. A wait that failed leaves the status
+/// unknown, and the child did start: the laptop gets no exit message then (a refusal means "nothing ran" to it) and
+/// reads the stream's end as an outcome it does not know; the audit line keeps the reason.
+fn waited(status: std::io::Result<ExitStatus>, audit: &str) -> (ExecExit, bool) {
+    match status {
+        Ok(status) => (exit_of(status), true),
+        Err(error) => (
+            ExecExit {
+                code: -1,
+                signal: 0,
+                refusal: format!("waiting for {audit} failed: {error}"),
+            },
+            false,
+        ),
+    }
 }
 
 /// Waits, for at most two seconds, until the transport has taken every message queued on `sender` or the laptop is
@@ -830,6 +870,28 @@ fn outcome(ended: &Ended) -> String {
         Ended::KilledByDaemonStop => "killed=daemon-stop".to_owned(),
         Ended::NotStarted => "not-started".to_owned(),
         Ended::Refused(refusal) => format!("refused {}", audit_word(refusal)),
+    }
+}
+
+#[cfg(test)]
+mod waited_tests {
+    use super::*;
+
+    #[test]
+    fn a_child_that_could_not_be_waited_for_is_audited_but_not_reported_as_a_refusal() {
+        use std::os::unix::process::ExitStatusExt;
+        let (exit, reported) = waited(Ok(ExitStatus::from_raw(3 << 8)), "command fmt");
+        assert_eq!((exit.code, reported), (3, true));
+        let (exit, reported) = waited(Err(std::io::Error::other("no child")), "command fmt");
+        assert!(
+            !reported,
+            "the laptop learns of no exit: it ran, and `refusal` would say it did not"
+        );
+        assert!(exit.refusal.contains("waiting for command fmt failed"), "{exit:?}");
+        assert_eq!(
+            outcome(&Ended::Exited(exit)),
+            "failed \"waiting for command fmt failed: no child\""
+        );
     }
 }
 

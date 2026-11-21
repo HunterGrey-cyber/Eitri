@@ -1008,6 +1008,24 @@ mod tests {
     }
 
     #[test]
+    fn an_argument_finished_after_the_start_is_what_a_restart_starts_from() {
+        let (driver, host) = setup();
+        walk_over(&driver, &host, spawn(), EditorPresence::Owned, editor_hidden());
+        let args = |driver: &Driver<Controller>| driver.query(|c| c.editor_spawn_args(WinId::MAIN));
+        assert!(driver.replace_editor_arg(WinId::MAIN, "--embed", "--cmd=late".into()));
+        assert_eq!(args(&driver), Some(vec!["--cmd=late".to_owned()]));
+        assert!(
+            !driver.replace_editor_arg(WinId::MAIN, "--embed", "x".into()),
+            "it was replaced already"
+        );
+        assert!(
+            !driver.replace_editor_arg(WinId(2), "--cmd=late", "x".into()),
+            "no such window"
+        );
+        assert_eq!(args(&driver), Some(vec!["--cmd=late".to_owned()]));
+    }
+
+    #[test]
     fn a_start_with_targets_ends_a_zoom_on_another_module() {
         let (driver, host) = setup();
         let mut layout = editor_hidden();

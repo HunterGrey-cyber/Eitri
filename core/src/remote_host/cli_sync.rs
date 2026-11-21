@@ -276,7 +276,7 @@ fn absolute(cwd: &Path, path: Option<&str>) -> PathBuf {
 }
 
 /// The recorded project whose root holds `path` (the longest such root), and `path` relative to it.
-fn project_for(cx: &Context<'_>, cwd: &Path, path: Option<&str>) -> Result<(RemoteProject, String), String> {
+pub(crate) fn project_for(cx: &Context<'_>, cwd: &Path, path: Option<&str>) -> Result<(RemoteProject, String), String> {
     let wanted = absolute(cwd, path);
     let canonical = wanted.canonicalize().ok();
     let found = locate(cx, &wanted, canonical.as_deref())?;
@@ -699,21 +699,36 @@ fn details(cx: &mut Context<'_>, cwd: &Path, path: &str, output: &mut dyn Write)
 
 fn flush(cx: &mut Context<'_>, cwd: &Path, path: Option<&str>) -> Result<(), String> {
     let (project, _) = project_for(cx, cwd, path)?;
-    let record = record_of(&project)?;
+    let cap = cx.reach.sync_settings().flush_cap;
+    flush_project(cx, &project, cap)?;
+    // A completed cycle; a conflicted or unsyncable file is still only on this laptop.
+    cx.term.say(&format!(
+        "sync with {} finished a cycle; eitri host sync status lists anything it could not carry",
+        project.host
+    ));
+    Ok(())
+}
+
+/// Flushes `project`'s tree session within `cap` and returns the session's name once a cycle completed.
+pub(crate) fn flush_project(cx: &mut Context<'_>, project: &RemoteProject, cap: Duration) -> Result<String, String> {
+    record_of(project)?;
+    let engine = cx.reach.sync_engine().map_err(|e| e.to_string())?;
+    flush_tree(engine.as_ref(), project, cap)
+}
+
+/// [`flush_project`] through an engine already opened: the session's name is read from the record each time, since
+/// the session is re-created under another name when the project's excludes change.
+pub(crate) fn flush_tree(
+    engine: &dyn crate::remote_sync::engine::SyncEngine,
+    project: &RemoteProject,
+    cap: Duration,
+) -> Result<String, String> {
+    let record = record_of(project)?;
     let tree = record
         .tree_session
         .ok_or_else(|| format!("{} has no sync session", project.root.display()))?;
-    let cap = cx.reach.sync_settings().flush_cap;
-    let engine = cx.reach.sync_engine().map_err(|e| e.to_string())?;
     match engine.flush(&tree, cap) {
-        FlushOutcome::Flushed => {
-            // A completed cycle; a conflicted or unsyncable file is still only on this laptop.
-            cx.term.say(&format!(
-                "sync with {} finished a cycle; eitri host sync status lists anything it could not carry",
-                project.host
-            ));
-            Ok(())
-        }
+        FlushOutcome::Flushed => Ok(tree),
         FlushOutcome::TimedOut => Err(format!(
             "{} did not confirm within {} s",
             project.host,

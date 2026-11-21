@@ -350,6 +350,52 @@ fn a_relative_path_is_refused_and_runs_nothing() {
     dir.cleanup();
 }
 
+/// A server file the mirror does not hold is named `eitri-remote://<host>/<path>`: `open` takes that scheme (only when
+/// the string begins with it) and hands the line to `eitri.remote.buffers`, which keeps it until the text is there.
+#[test]
+#[ignore = "needs a real nvim on PATH; spends no tokens and needs no display"]
+fn an_eitri_remote_name_opens_as_that_buffer_and_hands_its_line_to_the_buffers_module() {
+    agent::state_dirs::redirect_state_to_a_test_root();
+    let dir = ScratchDir::new().expect("a scratch directory");
+    let name = eitri_core::remote_lsp::uris::remote_uri("example-host", "/opt/dep/src/lib.rs");
+    let probe = dir.path().join("wanted");
+    let opening = dir.path().join("opening");
+    let stub = format!(
+        "lua package.loaded['eitri.remote.buffers'] = {{ want = function(buf, line, character, encoding) \
+         local f = io.open('{}', 'w') f:write(vim.api.nvim_buf_get_name(buf) .. ' ' .. line .. ' ' .. \
+         tostring(character) .. ' ' .. tostring(encoding)) f:close() end, opening = function(name) \
+         local f = io.open('{}', 'w') f:write(name .. (vim.api.nvim_buf_get_name(0) == name and ' after' or ' before')) \
+         f:close() end }}",
+        probe.display(),
+        opening.display()
+    );
+    let hex = hex_of(&serde_json::json!({ "op": "open", "path": name, "line": 7 }));
+    nvim(&dir, &[stub.clone(), call(&hex)]);
+    assert_eq!(std::fs::read_to_string(&probe).unwrap(), format!("{name} 7 nil nil"));
+    // The module is told of the open before the `:edit`, while the buffer the open leaves is still the current one: the
+    // language servers the new buffer gets are chosen from it.
+    assert_eq!(std::fs::read_to_string(&opening).unwrap(), format!("{name} before"));
+    // The column goes along, counted from 0 in its unit; one that is not a whole number from 1 does not.
+    let hex = hex_of(&serde_json::json!({ "op": "open", "path": name, "line": 7, "col": 5, "unit": "utf-16" }));
+    nvim(&dir, &[stub.clone(), call(&hex)]);
+    assert_eq!(std::fs::read_to_string(&probe).unwrap(), format!("{name} 7 4 utf-16"));
+    let hex = hex_of(&serde_json::json!({ "op": "open", "path": name, "line": 7, "col": 0, "unit": "utf-16" }));
+    nvim(&dir, &[stub, call(&hex)]);
+    assert_eq!(std::fs::read_to_string(&probe).unwrap(), format!("{name} 7 nil nil"));
+    // Anything before the scheme is not one: a leading `+` is still a relative path and runs nothing.
+    let pwned = dir.path().join("pwned");
+    let lua = format!(
+        "lua if vim.g.eitri_pwned then io.open({},{}):close() end",
+        lua_bytes(&pwned.to_string_lossy()),
+        lua_bytes("w")
+    );
+    let hex =
+        hex_of(&serde_json::json!({ "op": "open", "path": format!("+let\\ g:eitri_pwned=1 {name}"), "line": null }));
+    nvim(&dir, &[call(&hex), lua]);
+    assert!(!pwned.exists(), "a +command before the scheme ran");
+    dir.cleanup();
+}
+
 /// The `edit` op opens its draft with `:split`, which reads a leading `+` as a command just as `:edit` does, so it
 /// goes through the same absolute-path check. Unlike `open` and `view` it carries a `done` marker, so the refusal
 /// also has to come back through it as a failure the panel can show.

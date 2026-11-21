@@ -29,16 +29,60 @@ use std::fmt;
 use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
 
-/// The embedded editor's early startup command, including both modules for a plugin-free runtimepath.
+/// What the window tells the language-server wrap of `eitri.nvim` (`remote_dev.lsp_grace`, `remote_dev.lsp_local`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LspOptions {
+    /// Seconds the helper keeps a server whose bridge is lost.
+    pub grace: u32,
+    /// Names of the servers kept on this machine.
+    pub local_servers: Vec<String>,
+}
+
+impl Default for LspOptions {
+    fn default() -> Self {
+        Self {
+            grace: crate::lua::config::REMOTE_DEV_LSP_GRACE_DEFAULT,
+            local_servers: Vec::new(),
+        }
+    }
+}
+
+impl LspOptions {
+    /// The Lua table `setup` takes as `lsp`.
+    fn lua_table(&self) -> String {
+        use crate::onboarding::lua_text::quote_bytes;
+        let names: Vec<String> = self
+            .local_servers
+            .iter()
+            .map(|name| quote_bytes(name.as_bytes()))
+            .collect();
+        format!("{{grace={},local_servers={{{}}}}}", self.grace, names.join(","))
+    }
+}
+
+/// The embedded editor's early startup command, including every module for a plugin-free runtimepath, with the
+/// language-server options at their defaults.
 pub fn nvim_loader(root: &Path, program: &str) -> String {
+    nvim_loader_with(root, program, &LspOptions::default())
+}
+
+/// [`nvim_loader`] passing the language-server wrap `lsp` as setup's `lsp` option.
+pub fn nvim_loader_with(root: &Path, program: &str, lsp: &LspOptions) -> String {
     use crate::onboarding::lua_text::quote_bytes;
     format!(
         "lua package.preload['eitri.remote']=function()\n{}\nend; package.preload['eitri.remote.sync']=function()\n{}\nend; \
-         require('eitri.remote').setup({{embedded=true,root={},cmd={}}})",
+         package.preload['eitri.remote.exec']=function()\n{}\nend; package.preload['eitri.remote.buffers']=function()\n{}\nend; \
+         package.preload['eitri.remote.lsp']=function()\n{}\nend; package.preload['eitri.remote.text']=function()\n{}\nend; \
+         require('eitri.remote').setup({{embedded=true,root={},cmd={},lsp={}}})",
         include_str!("../../../nvim/eitri.nvim/lua/eitri/remote/init.lua"),
         include_str!("../../../nvim/eitri.nvim/lua/eitri/remote/sync.lua"),
+        include_str!("../../../nvim/eitri.nvim/lua/eitri/remote/exec.lua"),
+        include_str!("../../../nvim/eitri.nvim/lua/eitri/remote/buffers.lua"),
+        include_str!("../../../nvim/eitri.nvim/lua/eitri/remote/lsp.lua"),
+        include_str!("../../../nvim/eitri.nvim/lua/eitri/remote/text.lua"),
         quote_bytes(root.as_os_str().as_bytes()),
         quote_bytes(program.as_bytes()),
+        lsp.lua_table(),
     )
 }
 
@@ -109,6 +153,40 @@ mod tests {
         assert_eq!(
             SyncKey::new("SHA256:example", raw).as_str(),
             &format!("{expected:x}")[..16]
+        );
+    }
+
+    #[test]
+    fn the_loader_preloads_every_module_of_the_remote_directory_and_passes_the_language_server_options() {
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../nvim/eitri.nvim/lua/eitri/remote");
+        let loader = nvim_loader(Path::new("/srv/project"), "eitri");
+        for entry in std::fs::read_dir(&dir).unwrap() {
+            let file = entry.unwrap().file_name().into_string().unwrap();
+            let module = match file.strip_suffix(".lua").unwrap() {
+                "init" => "eitri.remote".to_owned(),
+                name => format!("eitri.remote.{name}"),
+            };
+            assert!(
+                loader.contains(&format!("package.preload['{module}']=function()")),
+                "{module} is not preloaded: a window without the plugin on its runtimepath could not load it"
+            );
+        }
+        // One argument of nvim's command line: Linux takes at most 128 KiB.
+        assert!(loader.len() < 100 * 1024, "{} bytes", loader.len());
+        assert!(
+            loader.ends_with("lsp={grace=1800,local_servers={}}})"),
+            "{}",
+            &loader[loader.len() - 120..]
+        );
+        let options = LspOptions {
+            grace: 90,
+            local_servers: vec!["lua_ls".into(), "we\"ird".into()],
+        };
+        let loader = nvim_loader_with(Path::new("/srv/project"), "eitri", &options);
+        assert!(
+            loader.ends_with("lsp={grace=90,local_servers={\"lua_ls\",\"we\\\"ird\"}}})"),
+            "{}",
+            &loader[loader.len() - 120..]
         );
     }
 }

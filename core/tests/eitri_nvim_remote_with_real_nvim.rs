@@ -69,6 +69,9 @@ with (base / "calls").open("a") as log:
     print(json.dumps(args),file=log)
 if args == ["watch", "--json"]:
     if flag("fail-watch"): sys.exit("watch fixture exited")
+    if flag("off-watch"):
+        print("eitri host sync: eitri host sync watch: remote development is off; turn it on with eitri.config.set(\"remote_dev.enabled\", true) in init.lua", flush=True)
+        sys.exit(1)
     st = {"host":"example-host", "phase":"watching", "git_pct":100, "conflicts":[{"path":"file","server_kind":"file","laptop_kind":"file"}],
           "problems":[{"path":"broken","side":"laptop","text":"absolute link"}], "copied_back":["restored"],"kept_here":["cache"],"paused":None}
     print(json.dumps({"type":"status","status":st,"shim":[["PATH",str(base/"shim")],["EITRI_GIT_SHIM_EXE",str(base/"eitri")],["EITRI_REAL_GIT","/usr/bin/git"]]}),flush=True)
@@ -345,6 +348,30 @@ assert(watches()==1 and not remote.current().job)
 assert(vim.fn.execute("messages"):find("watch fixture exited",1,true))
 vim.cmd.EitriSync()
 wait(function() return watches()==2 and remote.status() ~= "" end)"#,
+    )
+}
+
+#[test]
+#[ignore = "requires headless nvim"]
+fn a_watch_that_refuses_on_stdout_says_why_once() {
+    check(
+        r#"
+local remote = require("eitri.remote")
+wait(function() return remote.status() ~= "" end)
+vim.fn.writefile({}, base .. "/off-watch")
+vim.fn.chansend(remote.current().job, '{"exit":true}\n')
+wait(function() return remote.current().failed_at end)
+-- As on a first start, where the failure is said.
+remote.current().failure = nil
+vim.cmd("messages clear")
+vim.cmd.EitriSync()
+wait(function() return remote.current().failure ~= nil end)
+local failure = remote.current().failure
+assert(failure:find("remote development is off",1,true), failure)
+local messages = vim.fn.execute("messages")
+assert(not messages:find("exited 1",1,true), messages)
+local _, said = messages:gsub("remote development is off", "")
+assert(said == 1, messages)"#,
     )
 }
 
