@@ -66,20 +66,21 @@ impl Drop for Prepared {
         };
         let _ = std::thread::Builder::new()
             .name("takeover-room-cleanup".into())
-            .spawn(move || {
-                let record =
-                    agent::private_fs::read_private_nofollow_capped(&path.join("room.pid"), 128).unwrap_or_default();
-                let mut words = record.split_whitespace();
-                let pid = words.next().and_then(|s| s.parse::<u32>().ok());
-                let start = words.next().and_then(|s| s.parse::<u64>().ok());
-                if let Some((pid, start)) = pid.zip(start).filter(|(_, start)| *start != 0) {
-                    while crate::split::proc_start_time(pid) == Some(start) {
-                        std::thread::sleep(Duration::from_millis(250));
-                    }
-                    let _ = std::fs::remove_dir_all(path);
-                }
-            });
+            .spawn(move || remove_when_room_exits(path));
     }
+}
+
+/// Removes the room directory `path` once the process recorded in its `room.pid` is gone. A record with
+/// no start time (0) cannot tell that process from a reused pid, so the directory is left for
+/// `sweep_stale`, as is a record that is not understood.
+fn remove_when_room_exits(path: PathBuf) {
+    let Some((pid, start)) = super::room::read_pid(&path).filter(|(_, start)| *start != 0) else {
+        return;
+    };
+    while crate::split::proc_start_time(pid) == Some(start) {
+        std::thread::sleep(Duration::from_millis(250));
+    }
+    let _ = std::fs::remove_dir_all(path);
 }
 
 fn field<'a>(value: &'a Value, name: &str) -> Option<&'a Value> {
@@ -515,6 +516,61 @@ impl StepError {
 #[cfg(test)]
 mod tests {
     use super::{Refusal, StepError};
+    use crate::takeover::room::RoomDir;
+
+    /// A room directory under a private runtime directory, with `room.pid` holding `record` (none: no file).
+    fn room_with_record(record: Option<&str>) -> (std::path::PathBuf, std::path::PathBuf) {
+        let runtime = std::env::temp_dir().join(format!(
+            "takeover-seq-{}",
+            &uuid::Uuid::new_v4().simple().to_string()[..8]
+        ));
+        agent::private_fs::create_private_dir_all(&runtime, &runtime).unwrap();
+        let dir = RoomDir::create(&runtime).unwrap();
+        let path = dir.socket().parent().unwrap().to_path_buf();
+        if let Some(record) = record {
+            agent::private_fs::write_private(&path.join(crate::takeover::room::PID_FILE), record.as_bytes()).unwrap();
+        }
+        (runtime, path)
+    }
+
+    /// A pid no process has, so the room counts as gone at once.
+    const NO_SUCH_PID: u32 = u32::MAX;
+
+    #[test]
+    fn the_cleanup_removes_a_room_whose_recorded_process_is_gone() {
+        let (runtime, path) = room_with_record(Some(&format!("{NO_SUCH_PID} 7\n")));
+        super::remove_when_room_exits(path.clone());
+        assert!(!path.exists());
+        std::fs::remove_dir_all(runtime).unwrap();
+    }
+
+    #[test]
+    fn the_cleanup_leaves_a_room_whose_record_has_no_start_time() {
+        let (runtime, path) = room_with_record(Some(&format!("{NO_SUCH_PID} 0\n")));
+        super::remove_when_room_exits(path.clone());
+        assert!(
+            path.exists(),
+            "a pid without a start time cannot be told from a reused one"
+        );
+        std::fs::remove_dir_all(runtime).unwrap();
+    }
+
+    /// `sweep_stale` refuses a record with a third field, so the cleanup must too.
+    #[test]
+    fn the_cleanup_leaves_a_room_whose_record_has_a_third_field() {
+        let (runtime, path) = room_with_record(Some(&format!("{NO_SUCH_PID} 7 extra\n")));
+        super::remove_when_room_exits(path.clone());
+        assert!(path.exists());
+        std::fs::remove_dir_all(runtime).unwrap();
+    }
+
+    #[test]
+    fn the_cleanup_leaves_a_room_with_no_readable_record() {
+        let (runtime, path) = room_with_record(None);
+        super::remove_when_room_exits(path.clone());
+        assert!(path.exists());
+        std::fs::remove_dir_all(runtime).unwrap();
+    }
 
     #[test]
     fn takeover_socket_checks_refuse_foreign_owners_before_requests() {

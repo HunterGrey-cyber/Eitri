@@ -117,12 +117,31 @@ impl RoomDir {
     }
 
     pub fn write_pid(&self, pid: u32, start_time: u64) -> io::Result<()> {
-        agent::private_fs::write_private(&self.path.join("room.pid"), format!("{pid} {start_time}\n").as_bytes())
+        agent::private_fs::write_private(&self.path.join(PID_FILE), format!("{pid} {start_time}\n").as_bytes())
     }
 
     pub fn remove(self) -> io::Result<()> {
         std::fs::remove_dir_all(self.path)
     }
+}
+
+pub(super) const PID_FILE: &str = "room.pid";
+
+/// The room process recorded in `dir`'s `room.pid`, as `(pid, start time)`: the one reader of that file, which
+/// gates removing a directory. `None` when the file is missing, unreadable or not exactly two fields that
+/// parse as unsigned integers (`write_pid`'s `<pid> <start time>`): a record that is not understood is never
+/// acted on. A start time of 0 is a valid record (the room's start time could not be read when it was
+/// written); what it permits is each caller's to decide.
+pub(super) fn read_pid(dir: &Path) -> Option<(u32, u64)> {
+    let record = agent::private_fs::read_private_nofollow_capped(&dir.join(PID_FILE), 128).ok()?;
+    parse_pid(&record)
+}
+
+fn parse_pid(record: &str) -> Option<(u32, u64)> {
+    let mut words = record.split_whitespace();
+    let pid = words.next()?.parse().ok()?;
+    let start = words.next()?.parse().ok()?;
+    words.next().is_none().then_some((pid, start))
 }
 
 /// Remove only private room directories whose recorded process is provably gone or replaced.
@@ -146,19 +165,9 @@ pub fn sweep_stale(runtime: &Path) {
         if !meta.is_dir() || meta.uid() != crate::panel_control::euid() || meta.mode() & 0o777 != 0o700 {
             continue;
         }
-        let Ok(record) = agent::private_fs::read_private_nofollow_capped(&path.join("room.pid"), 128) else {
+        let Some((pid, start)) = read_pid(&path) else {
             continue;
         };
-        let mut words = record.split_whitespace();
-        let Some(pid) = words.next().and_then(|p| p.parse::<u32>().ok()) else {
-            continue;
-        };
-        let Some(start) = words.next().and_then(|p| p.parse::<u64>().ok()) else {
-            continue;
-        };
-        if words.next().is_some() {
-            continue;
-        }
         let gone = !agent::process_probe::pid_is_alive(pid);
         let replaced = crate::split::proc_start_time(pid).is_some_and(|now| start != 0 && now != start);
         if gone || replaced {
@@ -726,6 +735,81 @@ mod tests {
         assert!(!dead_path.exists());
         live.remove().unwrap();
         unknown.remove().unwrap();
+        std::fs::remove_dir(runtime).unwrap();
+    }
+
+    /// A private runtime directory of its own for rooms to be made in; the caller removes it.
+    fn scratch_runtime() -> PathBuf {
+        let runtime =
+            std::env::temp_dir().join(format!("takeover-{}", &uuid::Uuid::new_v4().simple().to_string()[..6]));
+        agent::private_fs::create_private_dir_all(&runtime, &runtime).unwrap();
+        runtime
+    }
+
+    #[test]
+    fn room_pid_is_exactly_two_unsigned_integer_fields() {
+        assert_eq!(parse_pid("12 345\n"), Some((12, 345)));
+        assert_eq!(
+            parse_pid("12 0\n"),
+            Some((12, 0)),
+            "a zero start time is a record; callers decide what it permits"
+        );
+        assert_eq!(parse_pid("4294967295 18446744073709551615"), Some((u32::MAX, u64::MAX)));
+        for refused in [
+            "",
+            "\n",
+            "12",
+            "12 ",
+            "12 345 6",
+            "12 345 x\n",
+            "x 345",
+            "12 y",
+            "-1 5",
+            "12 -5",
+            "12 5.0",
+            "4294967296 5",
+            "12 18446744073709551616",
+        ] {
+            assert_eq!(parse_pid(refused), None, "{refused:?}");
+        }
+    }
+
+    #[test]
+    fn room_pid_reads_back_what_write_pid_wrote_and_nothing_else() {
+        let runtime = scratch_runtime();
+        let dir = RoomDir::create(&runtime).unwrap();
+        let path = dir.socket().parent().unwrap().to_path_buf();
+        assert_eq!(read_pid(&path), None, "no file");
+        dir.write_pid(77, 123456).unwrap();
+        assert_eq!(read_pid(&path), Some((77, 123456)));
+        agent::private_fs::write_private(&path.join(PID_FILE), b"77 123456 extra\n").unwrap();
+        assert_eq!(read_pid(&path), None, "a third field");
+        let padded = format!("{:<129}", "77 123456");
+        agent::private_fs::write_private(&path.join(PID_FILE), padded.as_bytes()).unwrap();
+        assert_eq!(read_pid(&path), None, "a record over the read cap is not read");
+        dir.remove().unwrap();
+        std::fs::remove_dir(runtime).unwrap();
+    }
+
+    /// A record with a stray third field, or not a record at all, is left alone even when its pid is gone; a
+    /// well-formed record of a gone process in the same runtime is the control that the sweep ran.
+    #[test]
+    fn the_sweep_leaves_a_room_whose_record_has_a_third_field_or_is_garbled() {
+        let runtime = scratch_runtime();
+        let extra = RoomDir::create(&runtime).unwrap();
+        agent::private_fs::write_private(&extra.path.join(PID_FILE), format!("{} 7 extra\n", u32::MAX).as_bytes())
+            .unwrap();
+        let garbled = RoomDir::create(&runtime).unwrap();
+        agent::private_fs::write_private(&garbled.path.join(PID_FILE), b"not a record\n").unwrap();
+        let gone = RoomDir::create(&runtime).unwrap();
+        gone.write_pid(u32::MAX, 7).unwrap();
+        let gone_path = gone.path.clone();
+        sweep_stale(&runtime);
+        assert!(!gone_path.exists(), "the sweep reached this runtime");
+        assert!(extra.path.exists());
+        assert!(garbled.path.exists());
+        extra.remove().unwrap();
+        garbled.remove().unwrap();
         std::fs::remove_dir(runtime).unwrap();
     }
 
