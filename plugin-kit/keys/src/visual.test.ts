@@ -17,6 +17,9 @@ const ATOM = "img, input";
 /** With `breaks` on, a `<br>` is a step of its own too (the engines step over a line break as over a character); a
  *  test that turns it on makes the selection's text gain the line break. */
 let breaks = false;
+/** With `graphemes` on, a character step passes a letter with the combining marks after it as one, as both engines
+ *  step by grapheme cluster (a decomposed `é` is two code points and one step). */
+let graphemes = false;
 function chars(): Place[] {
   const out: Place[] = [];
   const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT | NodeFilter.SHOW_ELEMENT);
@@ -31,7 +34,8 @@ function chars(): Place[] {
     }
     const text = n as Text;
     for (let i = 0; i < text.data.length;) {
-      const length = text.data.codePointAt(i)! > 0xffff ? 2 : 1;
+      let length = text.data.codePointAt(i)! > 0xffff ? 2 : 1;
+      while (graphemes && i + length < text.data.length && /\p{M}/u.test(text.data[i + length])) length++;
       out.push({ node: text, offset: i, length });
       i += length;
     }
@@ -186,6 +190,7 @@ beforeEach(() => {
   upstream = "off";
   cjkSplit = false;
   breaks = false;
+  graphemes = false;
   stuck = null;
   walls = null;
   Object.defineProperty(window, "scrollY", { configurable: true, get: () => y });
@@ -501,20 +506,37 @@ describe("in a table", () => {
     expect(sel().toString()).toBe("ecratelinestestscore146");
   });
 
-  it("k and j count characters in code points: never into the middle of a letter outside the BMP", async () => {
-    document.body.innerHTML = '<main id="root"><table><tbody><tr><td>\u{1F600}x</td></tr><tr><td>abcd</td></tr>' +
-      "<tr><td>\u{1F600}</td></tr></tbody></table></main>";
-    await start({ start: () => at("td", 1, 1) });
-    key("v");
-    key("k");
-    expect(sel().toString()).toBe("xab");
-    key("Escape");
-    cleanup?.();
-    await start({ start: () => at("td", 1, 3) });
-    key("v");
-    key("j");
-    expect(sel().toString()).toBe("d\u{1F600}");
-  });
+  it("k and j count characters in grapheme clusters: never into a letter outside the BMP or under its accent",
+    async () => {
+      graphemes = true;
+      document.body.innerHTML = '<main id="root"><table><tbody><tr><td>e\u0301x</td></tr><tr><td>abcd</td></tr>' +
+        "</tbody></table></main>";
+      await start({ start: () => at("td", 1, 1) });
+      key("v");
+      key("k");
+      expect(sel().toString()).toBe("xab");
+      key("Escape");
+      cleanup?.();
+      await start({ start: () => at("td", 0, 2) });
+      key("v");
+      key("j");
+      expect(sel().toString()).toBe("xab");
+      key("Escape");
+      cleanup?.();
+      graphemes = false;
+      document.body.innerHTML = '<main id="root"><table><tbody><tr><td>\u{1F600}x</td></tr><tr><td>abcd</td></tr>' +
+        "<tr><td>\u{1F600}</td></tr></tbody></table></main>";
+      await start({ start: () => at("td", 1, 1) });
+      key("v");
+      key("k");
+      expect(sel().toString()).toBe("xab");
+      key("Escape");
+      cleanup?.();
+      await start({ start: () => at("td", 1, 3) });
+      key("v");
+      key("j");
+      expect(sel().toString()).toBe("d\u{1F600}");
+    });
 
   it("v selects exactly the characters, across cells too", async () => {
     table();
@@ -802,6 +824,27 @@ describe("motion (kit 6): the walker as a Normal-mode motion", () => {
     expect(motion({ node: text, offset: 2 }, "l")).toBeNull();
   });
 
+  it("root_once_at_boundaries: calls the page's root once per motion, at block boundaries and element places too",
+    async () => {
+      walls = "hr, table";
+      document.getElementById("root")!.innerHTML = "<p>before rule</p><hr><p>after rule.</p>" +
+        "<table><tbody><tr><td>cell</td></tr></tbody></table><h2>heading</h2><p>tail <img></p><p>next</p>";
+      let calls = 0;
+      const root = () => { calls++; return document.getElementById("root"); };
+      cleanup = await install({ rows: pageRows, run: () => true, initial: { timeoutlen: 1000, hasKeys: true, prefix: "Ctrl+b" },
+        find: { root } });
+      const all = [...document.querySelectorAll("#root p, #root td, #root h2")].map((el) => el.firstChild as Text);
+      for (const text of all) {
+        for (const offset of [0, text.data.length - 1]) {
+          for (const m of ["h", "l", "w", "b", "e", "0", "$"]) {
+            calls = 0;
+            motion({ node: text, offset }, m);
+            expect(calls, `${m} from ${JSON.stringify(text.data)},${offset}`).toBe(1);
+          }
+        }
+      }
+    });
+
   it("never throws or leaves the walker's selection when the borrowed one cannot be put back", async () => {
     await start();
     const p = document.querySelector("p")!.firstChild!;
@@ -883,6 +926,34 @@ describe("motion (kit 6): the walker as a Normal-mode motion", () => {
       const bar = document.querySelector("p")!.lastChild as Text;
       const foo = document.querySelector("code")!.firstChild as Text;
       expect(motion({ node: foo, offset: 2 }, "l")).toEqual({ node: bar, offset: 0 });
+    });
+
+    it("motion_cluster_boundary: a letter with a combining accent at an inline element's edge is one character, " +
+      "so w lands on it and goes on past its word", async () => {
+      graphemes = true;
+      upstream = "text";
+      document.getElementById("root")!.innerHTML = "<p>see <strong>e\u0301clair</strong> now</p>";
+      const walker = document.createTreeWalker(document.querySelector("p")!, NodeFilter.SHOW_TEXT);
+      const [see, eclair, now] = [walker.nextNode(), walker.nextNode(), walker.nextNode()] as Text[];
+      expect(motion({ node: see, offset: 0 }, "w")).toEqual({ node: eclair, offset: 0 });
+      expect(motion({ node: eclair, offset: 0 }, "w")).toEqual({ node: now, offset: 1 });
+      expect(motion({ node: now, offset: 1 }, "b")).toEqual({ node: eclair, offset: 0 });
+      await start({ start: () => { const r = document.createRange(); r.setStart(see, 0); return r; } });
+      key("v");
+      key("w");
+      expect(sel().toString()).toBe("see e\u0301");
+    });
+
+    it("motion_cluster_word: b takes a word with a combining accent whole, as w does", async () => {
+      graphemes = true;
+      document.getElementById("root")!.innerHTML = "<p>cafe\u0301s x</p>";
+      const text = document.querySelector("p")!.firstChild as Text;
+      expect(motion({ node: text, offset: 7 }, "b")).toEqual({ node: text, offset: 0 });
+      expect(motion({ node: text, offset: 0 }, "w")).toEqual({ node: text, offset: 7 });
+      await start({ start: () => { const r = document.createRange(); r.setStart(text, 7); return r; } });
+      key("v");
+      key("b");
+      expect(sel().toString()).toBe("cafe\u0301s x");
     });
 
     it("keeps the end of a line as it is: no character follows it on its line", () => {
@@ -973,6 +1044,35 @@ describe("motion (kit 6): the walker as a Normal-mode motion", () => {
       document.getElementById("root")!.innerHTML = '<p>foo<span aria-hidden="true">X</span>bar</p>';
       const [foo, , bar] = texts();
       expect(motion({ node: foo, offset: 2 }, "l")).toEqual({ node: bar, offset: 0 });
+    });
+
+    it("visual_atom_settles: visual l onto an image or an aria-hidden span takes the cursor and the selection to the " +
+      "character after it in one press, h back to the one before; follow gets that cursor", async () => {
+      for (const atom of ["<img>", '<span aria-hidden="true">X</span>']) {
+        for (const mode of ["off", "text", "element"] as const) {
+          upstream = mode;
+          document.getElementById("root")!.innerHTML = `<p>foo${atom}bar</p>`;
+          const [foo, bar] = texts().filter((t) => !t.parentElement!.closest("[aria-hidden]"));
+          let from: Spot = { node: foo, offset: 2 };
+          let cursor: Spot | undefined;
+          await start({ start: () => { const r = document.createRange(); r.setStart(from.node, from.offset); return r; },
+            follow: (_rect, c) => { cursor = c; } });
+          const label = `${atom} ${mode}`;
+          key("v");
+          key("l");
+          expect([visualCursor(), cursor], label).toEqual([{ node: bar, offset: 0 }, { node: bar, offset: 0 }]);
+          expect(sel().toString().replace("X", ""), label).toBe("ob");
+          key("Escape");
+          from = { node: bar, offset: 0 };
+          key("v");
+          key("h");
+          expect([sel().focusNode, sel().focusOffset, cursor], label).toEqual([foo, 2, { node: foo, offset: 2 }]);
+          expect(sel().toString().replace("X", ""), label).toBe("ob");
+          key("Escape");
+          cleanup?.();
+          cleanup = undefined;
+        }
+      }
     });
   });
 
@@ -1177,6 +1277,67 @@ describe("motion (kit 6): the walker as a Normal-mode motion", () => {
         expect(run({ node: a, offset: 0 }, ["$"]), mode).toEqual(["a", { node: a, offset: 0 }]);
         reset();
       }
+    });
+
+    it("visual_formula_settles: visual l on the last character before a formula takes the cursor and the selection " +
+      "past it in one press, in every boundary report", async () => {
+      const { from, visual } = startAt();
+      for (const mode of MODES) {
+        upstream = mode;
+        await page(`<p>ab${katex("x")}cd</p>`, EXCLUDE, visual);
+        const [ab, cd] = own();
+        from.at = { node: ab, offset: 1 };
+        key("v");
+        key("l");
+        expect(visualCursor(), mode).toEqual({ node: cd, offset: 0 });
+        expect(sel().toString().endsWith("c"), mode).toBe(true);
+        key("Escape");
+        reset();
+      }
+    });
+
+    it("visual_k_skips_folded: a line move past a left-out block never lands in a closed details' folded text, nor " +
+      "does G; an open one's text is the page's", async () => {
+      const { from, visual } = startAt();
+      for (const open of ["", " open"]) {
+        await page(`<details${open}><summary>sum</summary><p>folded</p></details>${diagram(2)}<p>below</p>`, ".dg",
+          visual);
+        const [sum, folded, below] = own().filter((t) => !t.parentElement!.closest(".dg"));
+        from.at = { node: below, offset: 2 };
+        key("v");
+        key("k");
+        expect(visualCursor(), open).toEqual(open ? { node: folded, offset: 5 } : { node: sum, offset: 2 });
+        key("Escape");
+        reset();
+      }
+      await page("<p>first</p><details><summary>sum</summary><p>folded</p></details>", ".dg", visual);
+      const [first, sum] = own();
+      from.at = { node: first, offset: 0 };
+      key("v");
+      key("G", { shiftKey: true });
+      expect(visualCursor()).toEqual({ node: sum, offset: 2 });
+      key("Escape");
+    });
+
+    it("cluster_last_character: the last character k past a block and } reach is a letter with its combining " +
+      "accent, never its accent alone", async () => {
+      graphemes = true;
+      const seen: Array<Spot | undefined> = [];
+      const { from, visual } = startAt();
+      await page(`<p>a cafe\u0301</p>${diagram(2)}<p>below</p>`, ".dg",
+        { ...visual, follow: (_rect, c) => { seen.push(c); } });
+      const [cafe, below] = own().filter((t) => !t.parentElement!.closest(".dg"));
+      from.at = { node: below, offset: 2 };
+      key("v");
+      key("k");
+      expect(seen.at(-1)).toEqual({ node: cafe, offset: 5 });
+      key("Escape");
+      from.at = { node: cafe, offset: 0 };
+      key("v");
+      key("}");
+      expect(seen.at(-1)).toEqual({ node: cafe, offset: 5 });
+      expect(sel().toString()).toBe("a cafe\u0301");
+      key("Escape");
     });
 
     it("G and gg stop at the page's last and first text, never in left-out text", async () => {

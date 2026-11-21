@@ -348,7 +348,9 @@ const remove = await window.eitriKeys.install({
   by the same walker visual mode uses, so a page that draws a cursor of its own moves it as visual mode does. The
   answer is the place just before the character the cursor is then on, a text node and an offset below its length:
   for `e` and `$` the last character of the word or the line, and across an inline element's edge the next text's
-  first character. An image or a checkbox is not a character: `h` goes back past it, the other keys go on past it.
+  first character. An image or a checkbox is not a character, and no key stops on one: `h` goes back past it to the
+  character before it, so do `e` and `$` where they would end on it (`$` on a line that ends in an image stops on the
+  last character before the image), and the other keys go on past it.
   Nor is text that `find.exclude` names or that is `aria-hidden` (KaTeX's hidden MathML copy and its glyphs): the keys
   pass it as they pass an image, and the answer is never inside it.
   Past a line's last character, where none follows, the answer is the line's end: the end of its text or a place in

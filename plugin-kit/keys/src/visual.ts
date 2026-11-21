@@ -17,6 +17,33 @@ type Place = { node: Node; offset: number };
 
 /** A word character for `w`, `b` and `e`, as vim's 'iskeyword' reads letters, digits and `_` in every script. */
 const WORD = /[\p{L}\p{N}_]/u;
+/* One character as the reader sees it, and as both engines' character steps pass it, is a grapheme cluster: a letter
+   with its combining marks (a decomposed `é` is two code points), an emoji with its joiners, a flag. Without
+   `Intl.Segmenter` (no engine Eitri ships lacks it) a cluster is a code point and the combining marks after it. The
+   kit's library target predates the segmenter's types. */
+type Cluster = { segment: string; index: number };
+interface Segmenter { segment(text: string): Iterable<Cluster> & { containing(index: number): Cluster | undefined } }
+const SegmenterCtor = typeof Intl === "undefined" ? undefined
+  : (Intl as unknown as { Segmenter?: new (locale: undefined, o: { granularity: "grapheme" }) => Segmenter }).Segmenter;
+const segmenter: Segmenter = SegmenterCtor ? new SegmenterCtor(undefined, { granularity: "grapheme" }) : {
+  segment: (text) => {
+    const all: Cluster[] = Array.from(text.matchAll(/\P{M}\p{M}*|\p{M}+/gu),
+      (m) => ({ segment: m[0], index: m.index ?? 0 }));
+    const containing = (i: number) => all.find((c) => i >= c.index && i < c.index + c.segment.length);
+    return Object.assign(all, { containing });
+  },
+};
+
+/** A string's characters, each a grapheme cluster. */
+function clusters(text: string): string[] {
+  return Array.from(segmenter.segment(text), (c) => c.segment);
+}
+
+/** The character (grapheme cluster) of a string that holds the code unit at `index`, read around it only. */
+function clusterAt(text: string, index: number): Cluster | undefined {
+  return segmenter.segment(text).containing(index);
+}
+
 /** The kit's own elements: a selection never reaches into them, and the page's text ends where they start. */
 const KIT = "#eitri-keys-hud, #eitri-keys-sheet, #eitri-keys-find, #eitri-keys-hints";
 /** Text nobody reads as the page's, besides what the page excludes from find: KaTeX draws its glyphs in it. */
@@ -260,7 +287,8 @@ function textBetween(a: Place, b: Place, root: Element): { page: string; hidden:
 }
 
 /** What a character step from `a` to `b` passed: the character the engine's selection text gained by it (a whole
- *  code point: a letter outside the BMP is two UTF-16 units), or "" where it passed nothing of the page's text: an
+ *  grapheme cluster, `clusters`: a letter with a combining accent is one, and is a word character as its letter is),
+ *  or "" where it passed nothing of the page's text: an
  *  inline atom (an image, a checkbox: the engine steps over it with no text), only text the page leaves out, or
  *  nothing of the page's from or into such text (around KaTeX's MathML copy, which the engine lays out as a block,
  *  the selection's text gains line breaks). The gain can carry line breaks and spaces the engine writes at block and
@@ -268,7 +296,7 @@ function textBetween(a: Place, b: Place, root: Element): { page: string; hidden:
  *  character is the one that is not white space, if there is one. A step between the page's places with no text in
  *  the DOM (a line break, a block's edge) keeps the engine's character. */
 function passed(a: Place, b: Place, text: string, direction: Direction, root: Element): string {
-  const points = [...text];
+  const points = clusters(text);
   const solid = points.filter((c) => !/\s/.test(c));
   const pick = solid.length ? solid : points;
   const ch = (direction === "forward" ? pick[0] : pick[pick.length - 1]) ?? "";
@@ -334,7 +362,7 @@ function jump(from: Place, inside: Node, direction: Direction, root: Element): S
  *  passes an atom. Null from a text, or beside an element that is not the page's. */
 function into(from: Place, el: Node, direction: Direction, root: Element): Step | null {
   if (from.node.nodeType === Node.TEXT_NODE || el.nodeType !== Node.ELEMENT_NODE || !onPage(el, root)) return null;
-  const inside = texts(el as Element);
+  const inside = texts(el as Element, root);
   const text = direction === "forward" ? inside[0] : inside[inside.length - 1];
   const to = text ? { node: text, offset: direction === "forward" ? 0 : text.data.length }
     : past(el as Element, direction);
@@ -392,8 +420,8 @@ function moveCursor(s: Alterable, at: Place, motion: string, root: Element): Pla
   switch (motion) {
     case "h": return step(s, at, "backward");
     case "l": return step(s, at, "forward");
-    case "j": return rowMove(at, "forward") ?? from(s, at, (sel) => sel.modify("extend", "forward", "line"));
-    case "k": return rowMove(at, "backward") ?? from(s, at, (sel) => sel.modify("extend", "backward", "line"));
+    case "j": return rowMove(at, "forward", root) ?? from(s, at, (sel) => sel.modify("extend", "forward", "line"));
+    case "k": return rowMove(at, "backward", root) ?? from(s, at, (sel) => sel.modify("extend", "backward", "line"));
     case "b":
       // Back over what is not a word, then over the word's characters to its first: a character at a time with the
       // same WORD as `w` and `e`, not the engine's word granularity (which splits a Chinese run in the middle).
@@ -421,10 +449,10 @@ function moveCursor(s: Alterable, at: Place, motion: string, root: Element): Pla
       const end = from(s, at, (sel) => sel.modify("extend", "forward", "lineboundary"));
       return order(end, at) > 0 ? step(s, end, "backward") : at;
     }
-    case "}": return blockMove(at, "forward");
-    case "{": return blockMove(at, "backward");
+    case "}": return blockMove(at, "forward", root);
+    case "{": return blockMove(at, "backward", root);
     case "gg": case "G": {
-      const all = texts(root);
+      const all = texts(root, root);
       const text = motion === "G" ? all[all.length - 1] : all[0];
       if (!text) return null;
       return motion === "G" ? step(s, { node: text, offset: text.data.length }, "backward") : { node: text, offset: 0 };
@@ -437,7 +465,8 @@ function moveCursor(s: Alterable, at: Place, motion: string, root: Element): Pla
   }
 }
 
-/** The motions `normalMotion` answers: the cursor moves of a line, as Normal mode keeps its cursor on one character. */
+/** The motions `normalMotion` answers, and visual mode places its cursor for the same way (`lineMotion`): the cursor
+ *  moves of a line, as Normal mode keeps its cursor on one character. */
 const NORMAL_MOTIONS = new Set(["h", "l", "w", "b", "e", "0", "$"]);
 
 /** What `normalMotion` borrows of the document's selection: its two ends, and the Range it held. */
@@ -484,11 +513,11 @@ function lineOf(node: Node, root: Element): Element | null {
   return el ? layoutBlock(el) : null;
 }
 
-/** The place before the one character a step passed, when it passed exactly one inside a text on `line`: not a line
- *  break (the engine's selection text has one where a line ends) and not into another block. */
+/** The place before the one character a step passed, when it passed exactly one (a grapheme cluster) inside a text on
+ *  `line`: not a line break (the engine's selection text has one where a line ends) and not into another block. */
 function characterOf(step: Step, line: Element | null): Place | null {
   const { to, text } = step;
-  if (to.node.nodeType !== Node.TEXT_NODE || [...text].length !== 1) return null;
+  if (to.node.nodeType !== Node.TEXT_NODE || clusters(text).length !== 1) return null;
   const start = to.offset - text.length;
   if (start < 0 || (to.node as Text).data.slice(start, to.offset) !== text) return null;
   return layoutBlock(to.node) === line ? { node: to.node, offset: start } : null;
@@ -505,7 +534,7 @@ function beforeCharacter(s: Alterable, at: Place, root: Element): Place | null {
   // An element place in a block with none of the page's text (before a diagram's SVG) is on no line of the page's,
   // as a place in left-out text is.
   const line = lineOf(at.node, root);
-  const end = onPage(at.node, root) && (text || (!!line && texts(line, 1).length > 0)) ? at : null;
+  const end = onPage(at.node, root) && (text || (!!line && texts(line, root, 1).length > 0)) ? at : null;
   // A step out of the root passes no atom (`passed`): the page's text has ended there.
   for (let step = cross(s, at, "forward", root); step && !step.last; step = cross(s, step.to, "forward", root)) {
     if (step.ch !== "") return (onPage(step.to.node, root) && characterOf(step, line)) || end;
@@ -601,10 +630,7 @@ export function normalMotion(from: Place, motion: string): Place | null {
   if (!from.node.isConnected || !onPage(from.node, root) || !exists(from)) return null;
   const held = hold(s);
   try {
-    const next = moveCursor(s, from, motion, root);
-    if (!next || !(onPage(next.node, root) || aside(next.node, root))) return null;
-    const placed = settle(s, next, root, ENDS_BACK.has(motion));
-    return placed && onPage(placed.node, root) ? placed : null;
+    return lineMotion(s, from, motion, root);
   } catch {
     return null;
   } finally {
@@ -612,10 +638,20 @@ export function normalMotion(from: Place, motion: string): Place | null {
   }
 }
 
-/** The offset of a text's last character (a whole code point: a letter outside the BMP is two UTF-16 units). */
-function lastCharOffset(t: Text): number {
-  const points = [...t.data];
-  return Math.max(0, t.data.length - (points[points.length - 1]?.length ?? 1));
+/** Where one of `h l w b e 0 $` takes a cursor standing just before a character at `at`, in `normalMotion`'s shape, for
+ *  visual mode's cursor and a page's Normal-mode one alike: the walker's place, settled (`settle`) onto the character
+ *  the cursor is then on, so the selection drawn, `follow`'s cursor and `motion`'s answer agree past an inline atom or
+ *  left-out text. Null where the walker leaves the page's text. */
+function lineMotion(s: Alterable, at: Place, motion: string, root: Element): Place | null {
+  const next = moveCursor(s, at, motion, root);
+  if (!next || !(onPage(next.node, root) || aside(next.node, root))) return null;
+  const placed = settle(s, next, root, ENDS_BACK.has(motion));
+  return placed && onPage(placed.node, root) ? placed : null;
+}
+
+/** The offset of the last character (a whole grapheme cluster) of a string; 0 for an empty one. */
+function lastCharOffset(data: string): number {
+  return data === "" ? 0 : clusterAt(data, data.length - 1)?.index ?? data.length - 1;
 }
 
 /** The nearest element laid out as a block (a paragraph, a list item's own text, a heading, a code block, a table
@@ -642,8 +678,8 @@ function blockOf(node: Node, known: Map<Node, Element | null>): Element | null {
  *  from there to the last of the next block; `{` to the first character of the cursor's block, or from there to the
  *  first of the block before. So a selection grows a whole block at a time, as `v}` and `V}` grow by paragraphs.
  *  White space at a block's edges is passed over. */
-function blockMove(at: Place, direction: Direction): Place | null {
-  const all = texts(rootOf());
+function blockMove(at: Place, direction: Direction, root: Element): Place | null {
+  const all = texts(root, root);
   if (all.length === 0) return null;
   const known = new Map<Node, Element | null>();
   let i = all.indexOf(at.node as Text);
@@ -663,11 +699,7 @@ function blockMove(at: Place, direction: Direction): Place | null {
     return [a, b];
   };
   const first = (t: Text): Place => ({ node: t, offset: t.data.length - t.data.replace(/^\s+/, "").length });
-  const last = (t: Text): Place => {
-    const trimmed = t.data.replace(/\s+$/, "");
-    const points = [...trimmed];
-    return { node: t, offset: Math.max(0, trimmed.length - (points[points.length - 1]?.length ?? 1)) };
-  };
+  const last = (t: Text): Place => ({ node: t, offset: lastCharOffset(t.data.replace(/\s+$/, "")) });
   const [a, b] = run(i);
   if (direction === "forward") {
     const end = last(all[b]);
@@ -688,35 +720,37 @@ function cellsOf(row: Element): Element[] {
  *  is a block of its own), so the cursor goes to the row below (above) instead: the cell in the same column, at the
  *  same character or the cell's last; past the table's last (first) row, to the first text after the table (the
  *  last character before it). Null outside a table. */
-function rowMove(at: Place, direction: Direction): Place | null {
-  const row = rowOf(at.node);
+function rowMove(at: Place, direction: Direction, root: Element): Place | null {
+  const row = rowOf(at.node, root);
   const table = row?.closest("table");
   if (!row || !table) return null;
-  const rows: Element[] = [...table.querySelectorAll("tr")].filter((r) => r.closest("table") === table && texts(r).length > 0);
+  const rows: Element[] = [...table.querySelectorAll("tr")]
+    .filter((r) => r.closest("table") === table && texts(r, root).length > 0);
   const el = at.node.nodeType === Node.ELEMENT_NODE ? (at.node as Element) : at.node.parentElement;
   const cell = el?.closest("td, th") ?? null;
   const column = cell && cell.parentElement === row ? cellsOf(row).indexOf(cell) : 0;
-  // Characters are counted in code points, so the cursor never lands inside a letter outside the BMP.
+  // Characters are counted in grapheme clusters, so the cursor never lands inside a letter outside the BMP or between
+  // a letter and its combining accent.
   let chars = 0;
-  for (const t of cell ? texts(cell) : []) {
-    if (t === at.node) { chars += [...t.data.slice(0, at.offset)].length; break; }
-    chars += [...t.data].length;
+  for (const t of cell ? texts(cell, root) : []) {
+    if (t === at.node) { chars += clusters(t.data.slice(0, at.offset)).length; break; }
+    chars += clusters(t.data).length;
   }
   const next = rows[rows.indexOf(row) + (direction === "forward" ? 1 : -1)];
   if (next) {
     const cells = cellsOf(next);
     const target = cells[Math.min(column, cells.length - 1)];
-    let inCell = target ? texts(target) : [];
-    if (inCell.length === 0) inCell = texts(next);
+    let inCell = target ? texts(target, root) : [];
+    if (inCell.length === 0) inCell = texts(next, root);
     for (const t of inCell) {
-      const points = [...t.data];
-      if (chars < points.length) return { node: t, offset: points.slice(0, chars).join("").length };
-      chars -= points.length;
+      const inText = clusters(t.data);
+      if (chars < inText.length) return { node: t, offset: inText.slice(0, chars).join("").length };
+      chars -= inText.length;
     }
     const last = inCell[inCell.length - 1];
-    return { node: last, offset: lastCharOffset(last) };
+    return { node: last, offset: lastCharOffset(last.data) };
   }
-  return beyond(table, direction, rootOf()) ?? at;
+  return beyond(table, direction, root) ?? at;
 }
 
 /** Past an element a line move went into or across: the start of the page's first text after it (forward), or the
@@ -729,7 +763,7 @@ function beyond(el: Element, direction: Direction, root: Element): Place | null 
   walker.currentNode = start;
   const next = () => (direction === "forward" ? walker.nextNode() : walker.previousNode()) as Text | null;
   for (let t = next(); t; t = next()) {
-    if (pageText(t, root)) return { node: t, offset: direction === "forward" ? 0 : lastCharOffset(t) };
+    if (pageText(t, root)) return { node: t, offset: direction === "forward" ? 0 : lastCharOffset(t.data) };
   }
   return null;
 }
@@ -750,23 +784,23 @@ function wholeLines(s: Alterable): void {
 }
 
 /** The table row holding a place, if it is in one on the page. */
-function rowOf(node: Node | null): Element | null {
+function rowOf(node: Node | null, root: Element): Element | null {
   const el = node && (node.nodeType === Node.ELEMENT_NODE ? (node as Element) : node.parentElement);
   const row = el?.closest("tr") ?? null;
-  return row && onPage(row) ? row : null;
+  return row && onPage(row, root) ? row : null;
 }
 
 /** Linewise in a table: a row is one line, as its source is. The engine's line boundary is a cell's (each cell is a
  *  block of its own), so an end in a row goes out to the row's first and last text. */
-function wholeRows(s: Alterable): void {
+function wholeRows(s: Alterable, root: Element): void {
   if (!s.anchorNode || !s.focusNode) return;
   const a: Place = { node: s.anchorNode, offset: s.anchorOffset };
   const f: Place = { node: s.focusNode, offset: s.focusOffset };
   const forward = order(f, a) >= 0;
   const [first, last] = forward ? [a, f] : [f, a];
   const out = (p: Place, start: boolean): Place => {
-    const row = rowOf(p.node);
-    const text = row ? texts(row) : [];
+    const row = rowOf(p.node, root);
+    const text = row ? texts(row, root) : [];
     if (text.length === 0) return p;
     const t = start ? text[0] : text[text.length - 1];
     return start ? { node: t, offset: 0 } : { node: t, offset: t.data.length };
@@ -788,7 +822,7 @@ function draw(s: Alterable): void {
   s.setBaseAndExtent(a.node, a.offset, c.node, c.offset);
   if (kind === "line") {
     wholeLines(s);
-    wholeRows(s);
+    wholeRows(s, root);
   }
   paint(s);
 }
@@ -800,15 +834,15 @@ function pastCharacter(s: Alterable, at: Place, root: Element): Place {
   const next = step(s, at, "forward");
   if (!aside(next.node, root)) return next;
   if (at.node.nodeType !== Node.TEXT_NODE) return at;
-  const point = (at.node as Text).data.codePointAt(at.offset);
-  return point === undefined ? at : { node: at.node, offset: at.offset + (point > 0xffff ? 2 : 1) };
+  const char = clusterAt((at.node as Text).data, at.offset);
+  return char ? { node: at.node, offset: char.index + char.segment.length } : at;
 }
 
-/* The page's texts under `scope` (only the first `most`): `gg` and `G` stop at the first and last, and the selection
-   never takes in what follows the page's text (the kit's HUD). */
-function texts(scope: Element, most = Infinity): Text[] {
+/* The page's texts under `scope` (only the first `most`), for the root the caller resolved (a walk borrowing the
+   selection never resolves it again: a page's root can follow the selection): `gg` and `G` stop at the first and last,
+   and the selection never takes in what follows the page's text (the kit's HUD). */
+function texts(scope: Element, root: Element, most = Infinity): Text[] {
   const out: Text[] = [];
-  const root = rootOf();
   const walker = document.createTreeWalker(scope, NodeFilter.SHOW_TEXT);
   for (let n = walker.nextNode(); n && out.length < most; n = walker.nextNode()) {
     if (pageText(n as Text, root)) out.push(n as Text);
@@ -816,16 +850,27 @@ function texts(scope: Element, most = Infinity): Text[] {
   return out;
 }
 
-/** Whether a text is one `texts` lists: not white space only, the page's, and not in hidden or non-content markup. */
+/** Whether a text is one `texts` lists: not white space only, the page's, and not in hidden or non-content markup or
+ *  a closed `details`' folded content (none of which is drawn, so a line move past a block never lands in it). */
 function pageText(text: Text, root: Element): boolean {
   return text.data.trim() !== "" && onPage(text, root) &&
-    !text.parentElement?.closest("[hidden], script, style, template");
+    !text.parentElement?.closest("[hidden], script, style, template") && !folded(text);
+}
+
+/** Whether a node is in a closed `details` and not in that details' own summary, which stays drawn. */
+function folded(node: Node): boolean {
+  const closed = (el: Element | null | undefined) => el?.closest("details:not([open])");
+  for (let d = closed(elementOf(node)); d; d = closed(d.parentElement)) {
+    const summary = [...d.children].find((c) => c.matches("summary"));
+    if (!summary?.contains(node)) return true;
+  }
+  return false;
 }
 
 /** Where `v` starts without a page cursor: the first text in the view, as Vimium's caret does. */
 function firstTextInView(root: Element): Place | null {
   const range = document.createRange();
-  for (const text of texts(root)) {
+  for (const text of texts(root, root)) {
     const offset = text.data.length - text.data.replace(/^\s+/, "").length;
     range.setStart(text, offset);
     range.setEnd(text, Math.min(offset + 1, text.data.length));
@@ -1026,8 +1071,8 @@ export function visualKey(stroke: KeyStroke, ev: KeyboardEvent, timeoutlen: () =
 /** The line and block motions: a move of theirs into left-out text goes on past it in the motion's direction. */
 const VERTICAL = new Map<string, Direction>([["j", "forward"], ["}", "forward"], ["k", "backward"], ["{", "backward"]]);
 
-/** Where a cursor move from `start` that landed in left-out text goes: out of it as the Normal-mode cursor does
- *  (`settle`), except a line or block move onto a line with none of the page's text (a diagram, a display formula),
+/** Where one of visual mode's other moves (not `lineMotion`'s) from `start` that landed in left-out text goes: out of
+ *  it onward as the Normal-mode cursor does (`settle`), except a line or block move onto a line with none of the page's text (a diagram, a display formula),
  *  which goes on past the left-out element to the page's text beyond it, as past a table's last row. A line move
  *  onto an inline formula stays on that formula's line unless settling there would not take the cursor on in the
  *  move's direction (Blink's line move from the text before a formula that ends its line lands in that formula's
@@ -1035,9 +1080,9 @@ const VERTICAL = new Map<string, Direction>([["j", "forward"], ["}", "forward"],
 function outOf(s: Alterable, start: Place, at: Place, action: string, root: Element): Place | null {
   const direction = VERTICAL.get(action);
   const el = direction ? leftOutElement(at.node, root) : null;
-  if (!direction || !el) return settle(s, at, root, ENDS_BACK.has(action));
+  if (!direction || !el) return settle(s, at, root, false);
   const block = blockHolding(el);
-  const placed = block && texts(block, 1).length > 0 ? settle(s, at, root, false) : null;
+  const placed = block && texts(block, root, 1).length > 0 ? settle(s, at, root, false) : null;
   const onward = placed && order(placed, start) * (direction === "forward" ? 1 : -1) > 0;
   return onward ? placed : beyond(el, direction, root);
 }
@@ -1070,9 +1115,13 @@ function act(s: Alterable, action: string, ev: KeyboardEvent,
     case "o": [anchor, cursor] = [cursor, anchor]; break;
     default: {
       const root = rootOf();
-      let next = moveCursor(s, cursor, action, root);
-      if (next && aside(next.node, root)) next = outOf(s, cursor, next, action, root);
-      else if (next && ENDS_BACK.has(action)) next = lineEndBefore(next, root);
+      let next: Place | null;
+      if (NORMAL_MOTIONS.has(action)) {
+        next = lineMotion(s, cursor, action, root);
+      } else {
+        next = moveCursor(s, cursor, action, root);
+        if (next && aside(next.node, root)) next = outOf(s, cursor, next, action, root);
+      }
       // The cursor stays on the page's text: a move that would leave it (or found nothing) moves nothing.
       if (next && onPage(next.node, root)) cursor = next;
     }
