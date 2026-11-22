@@ -147,7 +147,10 @@ impl Test {
             ("capabilities", map(&[("renameProvider", true.into())])),
         ]);
         nvim.lua(FAKE, vec![buf.clone(), config]);
+        // The fake server answers through `vim.defer_fn(_, 0)`: due at once on the manual clock, so firing what is due
+        // (without moving the clock) delivers it.
         nvim.wait_until("the client to attach", |nvim| {
+            nvim.advance_timers(0);
             nvim.lua(ATTACHED, vec![buf.clone()]).as_bool() == Some(true)
         });
         let edit = nvim.lua(RENAME, vec![path(&a), path(&b)]);
@@ -193,6 +196,7 @@ impl Test {
     fn answered(&mut self) -> ToolResult {
         let end = Instant::now() + LSP_BUDGET * 2;
         loop {
+            self.fire_due_timers();
             for out in self.broker.tick(&self.env, Instant::now()) {
                 if let BrokerOut::Answer { result, .. } = out {
                     return result;
@@ -206,6 +210,7 @@ impl Test {
     fn card(&mut self) -> EditorCardWire {
         let end = Instant::now() + LSP_BUDGET * 2;
         loop {
+            self.fire_due_timers();
             let out = self.broker.tick(&self.env, Instant::now());
             assert!(
                 !out.iter().any(|out| matches!(out, BrokerOut::Answer { .. })),
@@ -217,6 +222,12 @@ impl Test {
             assert!(Instant::now() < end, "no card was raised");
             std::thread::sleep(Duration::from_millis(10));
         }
+    }
+
+    /// Runs the timers due now (the fake server's replies) and leaves the clock where it is, so the reload timer
+    /// fires only when a test moves the clock.
+    fn fire_due_timers(&self) {
+        self.rpc.0.borrow_mut().advance_timers(0);
     }
 
     fn allow(&mut self, card: &EditorCardWire) {
@@ -283,11 +294,8 @@ fn a_rename_through_a_fake_server_reaches_the_disk_and_the_buffer_reloads() {
     assert_eq!(std::fs::read(&t.a).unwrap(), b"bar\n");
     assert_eq!(std::fs::read(&t.b).unwrap(), b"bar\n");
 
-    let end = Instant::now() + RELOADED_WITHIN;
-    while t.lines() != Value::Array(vec!["bar".into()]) {
-        assert!(Instant::now() < end, "the buffer did not reload: {:?}", t.lines());
-        std::thread::sleep(Duration::from_millis(20));
-    }
+    t.rpc.0.borrow_mut().advance_timers(RELOADED_WITHIN.as_millis() as u64);
+    assert_eq!(t.lines(), Value::Array(vec!["bar".into()]), "the buffer did not reload");
     assert_eq!(t.lua(MODIFIED, vec![t.buf.clone()]), false.into());
     let b = t.b.to_string_lossy().into_owned();
     assert_eq!(

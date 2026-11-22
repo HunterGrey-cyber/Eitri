@@ -907,7 +907,8 @@ fn a_request_still_out_when_its_entry_goes_is_cancelled_and_an_answered_one_is_n
     b.budget_ms = 100;
     t.ask(&b);
     assert_eq!(cancelled(&t), Some(1));
-    std::thread::sleep(Duration::from_millis(300));
+    // nvim's wall clock is the test's: "three" expires only when it is moved past its budget.
+    t.advance_wall(300);
     b.id = "four".into();
     b.budget_ms = 15000;
     t.ask(&b);

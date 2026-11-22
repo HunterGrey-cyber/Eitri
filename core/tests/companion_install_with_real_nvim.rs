@@ -395,6 +395,8 @@ fn install_reports_every_part_and_each_feed_answers() {
             .next(Duration::from_secs(2))
             .unwrap_or_else(|| panic!("no line on the {what} socket within 2 s"))
     };
+    // The editor context is sent from a debounce timer, which runs on the test's clock.
+    lua(&obs, "test_timers.advance(500)", vec![]);
     assert!(line(&editor_context, "editor context").contains('{'));
     assert!(line(&theme, "theme").contains("\"groups\""));
     assert!(line(&keys, "keys").contains("\"maps\""));
