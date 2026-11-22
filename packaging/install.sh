@@ -58,13 +58,17 @@ NV_BRIDGE_SINCE=0.3.1
 # The oldest release line whose layout this installer lays out, including that line's candidates. From
 # 0.3.1 on, a release carries the page window's desktop entry, the nvim plugin's health check
 # (lua/eitri/health.lua) and the agents-strips, agents-top and agents-pass plugins; 0.3.0 carries none of
-# them. An older version is refused before its tarball is fetched (refuse_older_layout), with the way to
-# install it with its own installer.
+# them. An older version is refused before its tarball is fetched (refuse_older_layout), with the plain
+# statement that releases before the first one offered are gone (older_layout_gone).
 NV_LAYOUT_SINCE=0.3.1
-# What a refusal tells the user. 0.3.1 and 0.3.2 were release candidates that were never published: the
-# published lines are 0.3.0 (refused) and 0.4.0 (the first this installer takes), so the messages name those,
-# as the install guide does, rather than the internal threshold above.
-NV_LAYOUT_SAYS='it installs 0.4.0 and later; it refuses 0.3.0 and older'
+# The first release the public repository still offers. 0.3.1 and 0.3.2 were release candidates that were
+# never published, and the releases before 0.4.0 were removed from the public repository, tags and files
+# alike, so there is nothing older to point a user at.
+NV_OLDEST_OFFERED=0.4.0
+# What a refusal tells the user. The published lines are 0.3.0 (refused) and 0.4.0 (the first this
+# installer takes), so the messages name those, as the install guide does, rather than the internal
+# threshold above.
+NV_LAYOUT_SAYS="it installs $NV_OLDEST_OFFERED and later; it refuses 0.3.0 and older"
 NV_LICENCE_FILES='LICENSE THIRD-PARTY-LICENSES SOURCE'
 # The desktop entry is named by the application id (the compositor matches a window to <id>.desktop;
 # the icon theme's icon name and the window's class, shell/src/main.rs's APP_ID, are the same string).
@@ -4519,8 +4523,8 @@ unpack_new() {
 	_un_why="it is not a valid Eitri release. Nothing was changed; report it at $NV_ISSUES"
 	older_layout "$NV_VERSION"
 	if [ "$OL_OLDER" = 1 ]; then
-		_un_how=$(older_layout_how "$NV_VERSION")
-		_un_why="Eitri $NV_VERSION is older than this installer installs ($NV_LAYOUT_SAYS). Nothing was changed; install $_un_how"
+		_un_gone=$(older_layout_gone "$NV_VERSION")
+		_un_why="Eitri $NV_VERSION is older than this installer installs ($NV_LAYOUT_SAYS). $_un_gone Nothing was changed."
 	fi
 	for _un_f in $NV_DESKTOP; do
 		if [ ! -f "$_un_top/share/applications/$_un_f" ]; then die "$NV_TARBALL_NAME has no share/applications/$_un_f: $_un_why"; fi
@@ -4598,30 +4602,21 @@ older_layout() {
 	if [ "$_ol_cmp" -lt 0 ]; then OL_OLDER=1; fi
 }
 
-# older_layout_how VERSION: how to install VERSION with its own installer: the release asset from the base
-# URL in use, and, for the public repository, the file at the tag.
-older_layout_how() {
-	# unpack_new reaches this through refuse_older_layout without set_paths having run (its own tests call
-	# it alone), so the default stands in for an unsettled release base.
-	_olh_base=${NV_RELEASE_BASE:-$NV_DEFAULT_BASE_URL}
-	_olh_how="$1 with its own install.sh: the release asset $_olh_base/releases/download/v$1/install.sh"
-	if [ "$_olh_base" = "$NV_DEFAULT_BASE_URL" ]; then
-		_olh_how="$_olh_how, or the file at the tag, https://raw.githubusercontent.com/HunterGrey-cyber/eitri/v$1/packaging/install.sh"
-	else
-		# That install.sh carries the release key it will trust, and nothing here checks a mirror's copy of it.
-		_olh_how="$_olh_how; a mirror's copy of install.sh is checked by nothing, so compare it with the official $NV_DEFAULT_BASE_URL/releases/download/v$1/install.sh first"
-	fi
-	if [ "$OPT_MODE" = from-source ]; then _olh_how="$_olh_how (with --from-source --version $1)"; fi
-	printf '%s\n' "$_olh_how"
+# older_layout_gone VERSION: the statement that VERSION cannot be installed. The releases before
+# NV_OLDEST_OFFERED are no longer offered (their release files and tags were removed from the public
+# repository), so it names no URL and no way back to one; the same holds for a mirror and for --from-source,
+# which would need the removed tag.
+older_layout_gone() {
+	printf '%s\n' "Eitri releases before $NV_OLDEST_OFFERED are no longer offered (their release files and tags were removed from the public repository), so this installer cannot install $1."
 }
 
 # refuse_older_layout VERSION: when VERSION is older than this installer lays out, stop before its
-# tarball is fetched and before anything is changed, saying how to install it instead.
+# tarball is fetched and before anything is changed, saying that the release is no longer offered.
 refuse_older_layout() {
 	older_layout "$1"
 	if [ "$OL_OLDER" != 1 ]; then return 0; fi
-	_rol_how=$(older_layout_how "$1")
-	die "Eitri $1 is older than this installer installs: $NV_LAYOUT_SAYS, which lack the page window's desktop entry, the nvim plugin's health check and the agents plugins. $(before_icon_advice "$_rol_how")"
+	_rol_gone=$(older_layout_gone "$1")
+	die "Eitri $1 is older than this installer installs: $NV_LAYOUT_SAYS, which lack the page window's desktop entry, the nvim plugin's health check and the agents plugins. $_rol_gone Nothing was changed."
 }
 
 # refuse_older_layout_early: what the command line alone says about the version (--version, or the version in

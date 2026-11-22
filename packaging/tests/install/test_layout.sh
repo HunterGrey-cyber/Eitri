@@ -343,9 +343,11 @@ t_release_older_than_the_layout_is_refused_before_download() {
 	expect_fail "--version 0.3.0"
 	expect_out "eitri: error: Eitri 0.3.0 is older than this installer installs: it installs 0.4.0 and later; it refuses 0.3.0 and older, which lack the page window's desktop entry"
 	expect_no_out '0.3.1'
-	expect_out "then install 0.3.0 with its own install.sh: the release asset http://127.0.0.1:$PORT/releases/download/v0.3.0/install.sh"
-	expect_out 'Nothing was changed.'
+	expect_out "Eitri releases before 0.4.0 are no longer offered (their release files and tags were removed from the public repository), so this installer cannot install 0.3.0. Nothing was changed."
 	expect_no_out 'raw.githubusercontent.com'
+	expect_no_out 'releases/download/v0.3.0'
+	expect_no_out 'its own install.sh'
+	expect_no_out 'eitri setup --uninstall'
 	expect_eq "$(srv_paths)" '' "requests for a --version older than the layout"
 	expect_eq "$(snap "$TH")" "$before" "the home after --version 0.3.0"
 	inst_net --version 0.3.0 --dry-run
@@ -356,7 +358,9 @@ t_release_older_than_the_layout_is_refused_before_download() {
 		--release-signers "$SIGNERS"
 	expect_fail "release files older than the layout"
 	expect_out 'Eitri 0.3.0 is older than this installer installs'
-	expect_out 'or the file at the tag, https://raw.githubusercontent.com/HunterGrey-cyber/eitri/v0.3.0/packaging/install.sh'
+	expect_out 'so this installer cannot install 0.3.0. Nothing was changed.'
+	expect_no_out 'raw.githubusercontent.com'
+	expect_no_out 'the file at the tag'
 	expect_eq "$(snap "$TH")" "$before" "the home after 0.3.0 from files"
 	# The latest version is known only from SHA256SUMS, after the lock: refused before the signature and
 	# the tarball, with the cleanup any failed locked run makes (the kept tree goes, as on any failure).

@@ -58,12 +58,6 @@ bug, and tell us if something here is wrong or has changed. The requirements are
   startup; the editor and the terminal still work, and the agent panel shows the one-time fix in its place. The
   fix needs `sudo` and has a cost, both spelled out in
   [INSTALL.md](../INSTALL.md#ubuntu-2310-and-later).
-- **`v0.2.0` cannot be built from git for much longer.** The Neovide fork's public history was rewritten after
-  0.2.0 (commit metadata only; the files are the same), so the `v0.2.0` tag and every earlier commit point at fork
-  commits no branch holds. Build 0.2.1 or later. For 0.2.0 itself, 0.2.0's own `install.sh` with `--from-source`
-  works only while GitHub still serves those old objects, and the `eitri-0.2.0-source.tar.gz` on its release page
-  rebuilds it for good; a later release's `install.sh` cannot build 0.2.0 from source. Packages, tarballs and
-  `install.sh` are not affected.
 - **If GitHub, Node.js or npm cannot be reached from your network**, each download the installer makes can come
   from a mirror you or your organisation run, and every file is still checked against the signed release
   ([Download addresses](../INSTALL.md#download-addresses)). Release files you got another way install with

@@ -1,5 +1,5 @@
 [English](known-issues.md) | 简体中文
-<!-- translated-from: known-issues.md sha256=f3a1437cf5f6e450841c087c68cb0bb3af42fa3b69886d207a0fe54744100e64 -->
+<!-- translated-from: known-issues.md sha256=eb0b8f804dee43de80ce1f4468f436940642680218fcf9fb9d633f053bf6802a -->
 
 # 已知问题与限制
 
@@ -23,7 +23,6 @@
 - **从 0.2.2 升级会重新构建一次 sidecar**，因为 0.3.0 固定了一个更新的版本：下载量和磁盘空间与第一次安装相同；`.deb` 或 `.rpm` 升级之后还要再运行一次 `eitri setup`。
 - **sidecar 更新可能在两个地方失败**（[INSTALL.zh-CN.md](../INSTALL.zh-CN.md#updating-the-sidecar)）。`eitri sidecar update` 会用一句直白的话停下，并且什么都不改：常见原因是连不上 nodejs.org、npm 或 grpc.io，可用磁盘空间太少，签名验证不过，发布需要更新的 Eitri，或者同时有另一个 `eitri sidecar` 命令在运行。更新已经构建好、但在某个标签页里启动不了，不会弄坏这个标签页：它改用 Eitri 自带的 sidecar，状态栏显示 `⚠`，详情里写明原因。`eitri sidecar use bundled` 让它不再尝试。更新只对它之后打开的标签页生效，Eitri 0.3.0 完全不能装更新。
 - **Ubuntu 23.10 及以后，包括 24.04：** AppArmor 默认会拦住 WebKit 的沙盒。Eitri 启动时会检查；编辑器和终端照常工作，agent 面板的位置会显示只需做一次的修复步骤。修复需要 `sudo`，也有代价，两者都写在 [INSTALL.zh-CN.md](../INSTALL.zh-CN.md#ubuntu-2310-及以后版本) 里。
-- **`v0.2.0` 很快将无法再从 git 构建。** 0.2.0 之后，Neovide fork 的公开历史被改写了（只改了提交的元数据，文件内容没有变），所以 `v0.2.0` 这个 tag 以及之前的每一个提交，指向的都是已经没有任何分支持有的 fork 提交；请构建 0.2.1 或更新的版本。至于 0.2.0 本身：用 0.2.0 自己的 `install.sh` 加 `--from-source`，只在 GitHub 还提供那些旧对象时才能成功；用 0.2.0 发布页上的 `eitri-0.2.0-source.tar.gz` 则可以一直重新构建它；之后版本的 `install.sh` 没法从源码构建 0.2.0。安装包、tar 包和 `install.sh` 不受影响。
 - **如果你的网络连不上 GitHub、Node.js 或 npm**，安装脚本的每一项下载都可以改从你自己或你所在机构运行的镜像获取，每个文件照样按签名的发布来校验（[下载地址](../INSTALL.zh-CN.md#download-addresses)）。用别的办法拿到的发布文件，可以用 `sh install.sh --tarball FILE --sums FILE --sig FILE` 安装（[INSTALL.zh-CN.md](../INSTALL.zh-CN.md#offline-from-release-files)）。
 
 ## 速度与绘制

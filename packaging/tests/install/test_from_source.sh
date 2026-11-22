@@ -297,7 +297,8 @@ t_from_source_030_refused_before_work() {
 		-- --from-source --version 0.3.0 --base-url "http://127.0.0.1:$PORT" --release-signers "$SIGNERS"
 	expect_fail "--from-source --version 0.3.0"
 	expect_out 'Eitri 0.3.0 is older than this installer installs'
-	expect_out '(with --from-source --version 0.3.0)'
+	expect_out 'Eitri releases before 0.4.0 are no longer offered'
+	expect_no_out '--from-source --version 0.3.0)'
 	expect_eq "$(srv_paths)" '' "requests for an older --from-source --version"
 	if grep -q '^cargo ' "$S/logs/cargo.log"; then fail "cargo ran for a release older than the layout"; fi
 	expect_absent "$TH/.local/lib/eitri"

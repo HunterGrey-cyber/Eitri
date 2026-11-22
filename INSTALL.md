@@ -21,8 +21,7 @@ This is the recommended way on every distribution; on Arch, the [AUR package](#a
 - It builds the agent sidecar on your machine ([why](#why-the-sidecar-is-built-on-your-machine)), which takes a few
   minutes, network access and about 1.4 GiB of free disk space while it builds.
 - Options go after `sh -s --`, for example `… | sh -s -- --version 0.4.0 --yes`; `sh install.sh --help` lists them all.
-- This installer installs 0.4.0 and later; it refuses 0.3.0 and older. To install an older release, use that release's
-  own `install.sh` (its release asset, for example `https://github.com/HunterGrey-cyber/eitri/releases/download/v0.3.0/install.sh`).
+- This installer installs 0.4.0 and later; it refuses 0.3.0 and older. Releases before 0.4.0 are no longer offered.
 
 To check the download's signature before running it, see [Verify before running](#verify-before-running).
 

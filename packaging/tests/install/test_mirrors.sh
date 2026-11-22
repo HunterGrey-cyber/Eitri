@@ -384,10 +384,11 @@ t_mirror_release_sidecar_only_used() {
 }
 t_mirror_release_older_layout_hint() {
 	inst --stubs "$S/stubs-net" --set EITRI_RELEASE_BASE_URL=https://mirror.example/project/// -- --version 0.3.0
-	expect_fail 'older release names user mirror'
-	expect_out 'https://mirror.example/project/releases/download/v0.3.0/install.sh'
-	expect_no_out 'project//'
-	expect_out "a mirror's copy of install.sh is checked by nothing, so compare it with the official https://github.com/HunterGrey-cyber/eitri/releases/download/v0.3.0/install.sh first"
+	expect_fail 'older release under a user mirror'
+	expect_out 'Eitri releases before 0.4.0 are no longer offered'
+	expect_no_out 'releases/download/v0.3.0'
+	expect_no_out 'mirror.example'
+	expect_no_out 'a mirror'"'"'s copy of install.sh'
 	mirror_no_curl
 }
 t_mirror_bad_variable_all_modes() {

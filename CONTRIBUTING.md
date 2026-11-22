@@ -203,22 +203,21 @@ added two days into development, is present from the first commit. In each snaps
 `neovide` submodule and the Verdandi dependency point at the nearest public commit, which for
 some early commits is a newer one.
 
-Releases 0.2.0 to 0.3.0 keep their original tags and commits, which are not on `main`. Each of
-their release pages names the commit on `main` that brings that release's changes in. The old
-history of `main` is still reachable through these tags: `git log v0.3.0`.
+Releases 0.2.0 to 0.3.0 were published from the old history. Their tags and release pages went
+with the rewrite, so their original commits are no longer in this repository. Their changes are on
+`main`:
 
-| tag | where its changes are on `main` |
+| release | where its changes are on `main` |
 |---|---|
-| `v0.2.0` | the commit named on the [0.2.0 release page](https://github.com/HunterGrey-cyber/eitri/releases/tag/v0.2.0) |
-| `v0.2.1` | the commit named on the [0.2.1 release page](https://github.com/HunterGrey-cyber/eitri/releases/tag/v0.2.1) |
-| `v0.2.2` | the commit named on the [0.2.2 release page](https://github.com/HunterGrey-cyber/eitri/releases/tag/v0.2.2) |
-| `v0.3.0` | the commit named on the [0.3.0 release page](https://github.com/HunterGrey-cyber/eitri/releases/tag/v0.3.0) |
+| 0.2.0 | [`e67f116d49ae`](https://github.com/HunterGrey-cyber/eitri/commit/e67f116d49ae9d505326b28a0cbd5bdeedfe0e92) |
+| 0.2.1 | [`89466698085c`](https://github.com/HunterGrey-cyber/eitri/commit/89466698085c4a4fe705224fbecc9f1f1292e3a5) |
+| 0.2.2 | [`2ee7d5ad0e4a`](https://github.com/HunterGrey-cyber/eitri/commit/2ee7d5ad0e4a224e1004dc56a0e17575c2fdfe29) |
+| 0.3.0 | [`131ea981e5e7`](https://github.com/HunterGrey-cyber/eitri/commit/131ea981e5e7e9408dfa4b6b6e68631f36ca46d7) |
 | `v0.4.0` and later | the tagged commit, which is on `main` |
 
-A tagged release commit builds with `cargo build --locked`: the four old tags, and `v0.4.0` and
-later on `main`. Every other commit on `main`, including the ones the old release pages name, is a
-snapshot: its `neovide` submodule points at the nearest commit of the public fork, and it may not
-build.
+A tagged release commit (`v0.4.0` and later) builds with `cargo build --locked`. Every other commit
+on `main`, including the four above, is a snapshot: its `neovide` submodule points at the nearest
+commit of the public fork, and it may not build.
 
 A clone made before the rewrite cannot `git pull` the new `main` (git refuses with "refusing to
 merge unrelated histories"); reset its `main` instead. The reset throws away commits on your local

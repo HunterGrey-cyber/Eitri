@@ -1,5 +1,5 @@
 [English](INSTALL.md) | 简体中文
-<!-- translated-from: INSTALL.md sha256=18f55df4fac2580edb050ef993dfa4042c1c57fc486d593ff80eaf42bdd2dff3 -->
+<!-- translated-from: INSTALL.md sha256=4211106c5e922be75e9315e8f73db1b4c9fbbb67ba03367780f8549bc19e0a7b -->
 
 # 安装 Eitri
 
@@ -21,7 +21,7 @@ curl --proto '=https' --proto-redir '=https' --tlsv1.2 -sSfL https://github.com/
 - 装到 `~/.local`，不需要 `sudo`。
 - 会在你机器上构建 agent sidecar（[为什么](#why-the-sidecar-is-built-on-your-machine)）：要几分钟，需要联网，构建时大约占 1.4 GiB 磁盘。
 - 选项写在 `sh -s --` 后面，例如 `… | sh -s -- --version 0.4.0 --yes`；全部选项见 `sh install.sh --help`。
-- 这个安装脚本安装 0.4.0 及以后的版本，0.3.0 及更早的会被拒绝。要安装更早的版本，请用那个版本自己的 `install.sh`（它的发布文件，例如 `https://github.com/HunterGrey-cyber/eitri/releases/download/v0.3.0/install.sh`）。
+- 这个安装脚本安装 0.4.0 及以后的版本，0.3.0 及更早的会被拒绝。0.4.0 之前的版本已不再提供。
 
 想在运行前先校验下载的签名，见[运行前先验证](#verify-before-running)。
 
