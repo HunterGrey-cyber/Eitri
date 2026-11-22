@@ -210,9 +210,9 @@ with the rewrite, so their original commits are no longer in this repository. Th
 | release | where its changes are on `main` |
 |---|---|
 | 0.2.0 | [`e67f116d49ae`](https://github.com/HunterGrey-cyber/eitri/commit/e67f116d49ae9d505326b28a0cbd5bdeedfe0e92) |
-| 0.2.1 | [`89466698085c`](https://github.com/HunterGrey-cyber/eitri/commit/89466698085c4a4fe705224fbecc9f1f1292e3a5) |
-| 0.2.2 | [`2ee7d5ad0e4a`](https://github.com/HunterGrey-cyber/eitri/commit/2ee7d5ad0e4a224e1004dc56a0e17575c2fdfe29) |
-| 0.3.0 | [`131ea981e5e7`](https://github.com/HunterGrey-cyber/eitri/commit/131ea981e5e7e9408dfa4b6b6e68631f36ca46d7) |
+| 0.2.1 | [`0af6a01b98c4`](https://github.com/HunterGrey-cyber/eitri/commit/0af6a01b98c47055a2c44ff7d4b47230496a451b) |
+| 0.2.2 | [`8228c9bee8a5`](https://github.com/HunterGrey-cyber/eitri/commit/8228c9bee8a5d719cbba66b76819f06cb9b08598) |
+| 0.3.0 | [`bbb86c3b7a3d`](https://github.com/HunterGrey-cyber/eitri/commit/bbb86c3b7a3db4984be39f83b269101d836f69ad) |
 | `v0.4.0` and later | the tagged commit, which is on `main` |
 
 A tagged release commit (`v0.4.0` and later) builds with `cargo build --locked`. Every other commit
