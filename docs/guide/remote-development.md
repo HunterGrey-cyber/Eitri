@@ -642,6 +642,7 @@ project nothing opens. It runs `eitri host term`, which you can also run in any 
   folder describes the outer repository; run git for a submodule in a terminal on the server.
 - **Git commands the shim lists as refused, and interactive editor flows** through git (see above).
 - **Agent tabs on the local copy.** A window opened with `--local` shows the copy; agents run on the server.
+- **Turn review on remote tabs.** A remote tab's turn review says it is not available yet.
 - **Sparse editing and a remote Neovim.** The whole non-ignored tree is mirrored, and Neovim runs on your laptop.
 
 For what else is unsupported or rough today, see [Known issues](../known-issues.md).

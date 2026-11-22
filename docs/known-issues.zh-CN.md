@@ -1,5 +1,5 @@
 [English](known-issues.md) | 简体中文
-<!-- translated-from: known-issues.md sha256=52df08a6cf33457eff21f5aa78a498e4d0d32054e75327ad2f9166aa36f912c5 -->
+<!-- translated-from: known-issues.md sha256=253d0836eef4b92da36de647961171574565d09d9a3b391016824c20857e8bd0 -->
 
 # 已知问题与限制
 
@@ -10,6 +10,7 @@
 - **x86_64 的 Linux，Wayland。** X11 只试过一种会话：Ubuntu 24.04 上的 GNOME on Xorg，没有 GPU 加速。窗口、编辑器、agent 面板、底部终端和平铺在那里都能用。X11 上编辑器始终用 GTK 方式绘制，GNOME Shell 扩展和 companion 模式的焦点移动对 X11 窗口不起作用。其他 X11 桌面和窗口管理器（包括 i3）没有测试过（欢迎反馈）。macOS：移植中。Windows：不支持，WSL2 配合 WSLg 也许能用，但没有测试过。目前还没有 ARM 版本。
 - **在 GNOME 和 sway 上测试过，companion 模式还在 Hyprland 上测试过。** 其他桌面和合成器，包括 KDE Plasma，没有测试过，欢迎反馈。Hyprland：companion 模式（焦点移动和置前）在真实运行的 0.57.0 和 0.56.2 上跑过（0.56.2 分别用 `hyprland.conf` 和 `hyprland.lua`）；第二个窗口的置前没有跑过。
 - **[合成器窗口](guide/compositor-windows.zh-CN.md)**是 Hyprland、sway 和 niri 上的默认行为，还很新，有一些地方不符合预期：见指南里的[已知缺口](guide/compositor-windows.zh-CN.md#known-gaps)。
+- **[远程开发](guide/remote-development.zh-CN.md)是实验性功能，默认关闭**（`remote_dev.enabled`）。笔记本需要是 Linux（macOS 默认不区分大小写的文件系统还没有处理），并且要自己装好 Mutagen。远程标签页还不能用回合审阅。其余限制见指南里的[这个版本里没有的](guide/remote-development.zh-CN.md#what-is-not-in-this-version)。
 - **需要 WebKitGTK 2.40 或更新**（`webkitgtk-6.0` API）。预构建二进制按 glibc 2.39 和 GTK 4.14 构建，更旧的版本没有测试过。Ubuntu 24.04、Debian 13、Fedora 40+、RHEL 10 和 Arch 满足要求；Ubuntu 22.04 和 Debian 12 不满足。
 - **Neovim 0.11 或更新**：用你自己 `PATH` 里的，或者让安装脚本在你的版本更旧时为 Eitri 单独下载一份私有副本（0.12.6）。`PATH` 里的 Neovim 0.11 会被接受，也不会被替换，但有三个常见配置在它上面仍有问题：当前的 kickstart.nvim 无法启动（它用了 0.12 才有的 `vim.pack`）；LazyVim 在第一次启动时，`Ctrl+j` 和 `Ctrl+k` 会被它的通知浮窗抢走，Eitri 收不到；AstroNvim 偶尔会保留它自己的 `Ctrl+j`（在 0.12.6 上也出现过一次，所以和版本无关）。LazyVim 和 kickstart 的这两项在 0.12.6 上都通过。如果你用其中之一，请让 `PATH` 里是 0.12，或者用 `EITRI_NVIM` 指向它。
 - **Claude Code**，已安装并配置好，2.1.252 或更新，低于 3.0。没有它时 Eitri 照样能打开，编辑器可以用；agent 面板没法运行对话。
@@ -23,6 +24,7 @@
 - **sidecar 更新可能在两个地方失败**（[INSTALL.zh-CN.md](../INSTALL.zh-CN.md#updating-the-sidecar)）。`eitri sidecar update` 会用一句直白的话停下，并且什么都不改：常见原因是连不上 nodejs.org、npm 或 grpc.io，可用磁盘空间太少，签名验证不过，发布需要更新的 Eitri，或者同时有另一个 `eitri sidecar` 命令在运行。更新已经构建好、但在某个标签页里启动不了，不会弄坏这个标签页：它改用 Eitri 自带的 sidecar，状态栏显示 `⚠`，详情里写明原因。`eitri sidecar use bundled` 让它不再尝试。更新只对它之后打开的标签页生效，Eitri 0.3.0 完全不能装更新。
 - **Ubuntu 23.10 及以后，包括 24.04：** AppArmor 默认会拦住 WebKit 的沙盒。Eitri 启动时会检查；编辑器和终端照常工作，agent 面板的位置会显示只需做一次的修复步骤。修复需要 `sudo`，也有代价，两者都写在 [INSTALL.zh-CN.md](../INSTALL.zh-CN.md#ubuntu-2310-及以后版本) 里。
 - **`v0.2.0` 很快将无法再从 git 构建。** 0.2.0 之后，Neovide fork 的公开历史被改写了（只改了提交的元数据，文件内容没有变），所以 `v0.2.0` 这个 tag 以及之前的每一个提交，指向的都是已经没有任何分支持有的 fork 提交；请构建 0.2.1 或更新的版本。至于 0.2.0 本身：用 0.2.0 自己的 `install.sh` 加 `--from-source`，只在 GitHub 还提供那些旧对象时才能成功；用 0.2.0 发布页上的 `eitri-0.2.0-source.tar.gz` 则可以一直重新构建它；之后版本的 `install.sh` 没法从源码构建 0.2.0。安装包、tar 包和 `install.sh` 不受影响。
+- **如果你的网络连不上 GitHub、Node.js 或 npm**，安装脚本的每一项下载都可以改从你自己或你所在机构运行的镜像获取，每个文件照样按签名的发布来校验（[下载地址](../INSTALL.zh-CN.md#download-addresses)）。用别的办法拿到的发布文件，可以用 `sh install.sh --tarball FILE --sums FILE --sig FILE` 安装（[INSTALL.zh-CN.md](../INSTALL.zh-CN.md#offline-from-release-files)）。
 
 ## 速度与绘制
 
@@ -57,10 +59,6 @@ Lua 面板和插件页面（[你自己做的页面](guide/pages.zh-CN.md)）是*
 - **Lua 面板是一个普通的网页视图。** 它加载你给它的地址，运行页面里的脚本，可以访问网络；它没有通往 Eitri 的桥接，拿不到配色，也没有按键工具包。只给它你信任的页面。
 - **自己处理按键的页面**如果把按键交回编辑器（`layout.focus`），这个按键也会传到编辑器，除非页面调用了 `preventDefault()`。通过按键工具包处理的按键不受影响。
 - 插件页面和 Lua 面板不会显示在 companion 窗口里。插件页面仍然可以作为单独的窗口开在你的 Neovim 旁边（`eitri page <id>`、`:EitriPage <id>`；[指南](guide/companion.zh-CN.md#pages-beside-your-nvim)），只要它只用到跟随缓冲区、Neovim 命令、打开文件、保存状态和网络：Markdown 预览可以，agent 页面不行。Lua 面板没有这样的窗口。
-
-## 在中国大陆访问 eitri.cc 和 GitHub
-
-一些中国运营商的用户反馈（目前收到的有：福建、江苏、河南的中国电信），到不在运营商白名单上的境外网站的连接会被重置，所以 eitri.cc 和 github.com 在那里可能根本打不开。安装脚本从 GitHub 下载，所以也可能同样失败。如果你能通过别的办法拿到发布文件，`sh install.sh --tarball FILE --sums FILE --sig FILE` 可以直接用它们安装（[INSTALL.zh-CN.md](../INSTALL.zh-CN.md#offline-from-release-files)）；构建 sidecar 时仍然需要一个能访问 Node.js 和 npm 的网络。
 
 <a id="companion-mode"></a>
 ## Companion 模式

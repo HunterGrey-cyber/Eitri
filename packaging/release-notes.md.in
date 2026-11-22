@@ -6,7 +6,8 @@ and WebKitGTK 2.40 (the webkitgtk-6.0 API) or newer.
 see which one waits for you and go to it with one key. Claude tabs get plan mode, pasted images, your open buffers as
 context and vim-style keys in the panel, and permission cards are answered in a mode of their own. On Hyprland, sway
 and niri, chats and pages become windows your compositor tiles. A Neovim already running in a terminal can be moved
-into an Eitri window, and Eitri reopens your files where you left them. Your Neovim stays the editor: a real
+into an Eitri window, and Eitri reopens your files where you left them. A window can also work on a project that
+lives on another Linux machine, over ssh (experimental, off by default). Your Neovim stays the editor: a real
 `nvim --embed` with your own `init.lua`, plugins, LSP and keymaps.
 
 ## What's new since 0.3.0
@@ -66,6 +67,9 @@ into an Eitri window, and Eitri reopens your files where you left them. Your Neo
   a crash costs about the last 30 seconds. It stands aside when a session plugin is installed (persistence.nvim,
   auto-session, resession.nvim and the others the guide lists), with `eitri FILE`, with `--clean`, in the second
   window and beside your own Neovim. `editor.restore = false` turns it off.
+- Quitting Neovim from a start screen (LazyVim's dashboard, alpha, mini.starter and the like) while the window holds
+  more than the editor now asks `close Eitri? (y/n)`: one `q` too many after closing Lazy's window no longer closes
+  all of Eitri. `:qa`, `:wqa` and `ZZ` from your files still close at once.
 - If Neovim itself is killed or crashes, the window stays and says so, and `<prefix> e` starts it again. A start that
   finds unsaved changes in swap files says so and recovers nothing until you ask.
 - A crash of Eitri leaves `crash-<time>-<pid>.log` under `~/.local/state/eitri/log/`, readable by you only, and the
@@ -104,6 +108,19 @@ into an Eitri window, and Eitri reopens your files where you left them. Your Neo
 - In the window's Neovim, git reads run on your copy and git writes (`commit`, `checkout`, `push` and the others) run
   on the server, after your saves have reached it. The bottom terminal of a remote window is a shell on the server; it
   keeps running when the link drops, and the window attaches to it again.
+- Permission cards on a remote tab follow the same rules as on a local project: Eitri's helper checks each path the
+  agent names on the server's disk (inside the project or not, a link that leads out, whether the folder is a
+  boundary at all) and checks again just before Eitri answers a request by itself. When the server cannot check paths
+  for a tab (a tab you just moved to another window, an agent started by an older helper), the tab says so and asks
+  about every file and command. Turn review is not available on remote tabs yet.
+- The session chooser (`<prefix> w`) of a remote window lists the sessions Claude Code recorded on the server for the
+  project, those you started with `claude` in a terminal there included, and continues one with its history read
+  from the server.
+- Language servers run on the server, next to the project's toolchain, with no change to your Neovim configuration,
+  and see your unsaved text as you type. A closed lid or a dropped connection does not stop them: the server keeps
+  one for `remote_dev.lsp_grace` seconds (30 minutes by default) and Neovim reconnects to it, so nothing is indexed
+  again. `gd` into a file that sync does not carry (the standard library, a dependency) opens it read-only from the
+  server, and `eitri host exec` runs a formatter, a linter or `make` on the server and brings back what it changed.
 - It is off by default: `eitri.config.set("remote_dev.enabled", true)` turns it on. You need key-based ssh, OpenSSH
   8.5 or later and Mutagen 0.18 or later on your computer (Eitri does not ship Mutagen), and `git` and `claude`,
   installed and set up, on the server. The guide's new "Remote development" page has the details.
@@ -147,8 +164,14 @@ into an Eitri window, and Eitri reopens your files where you left them. Your Neo
 - When `claude` is not found, the panel and the first-start screen say where to get Claude Code.
 - Agent replies draw closed `mermaid` fences as diagrams in the panel (up to 20,000 characters and 500 lines, each in
   a hidden renderer view with a four-second limit). Copying gives the fence's source, and a fence that fails to draw or
-  is too large stays as code.
+  is too large stays as code. Claude is told that the panel draws flowcharts, sequence and class diagrams.
 - A reply's separate text blocks keep their paragraph break instead of running together.
+- Tables in a reply stay readable in a narrow panel: code in a cell can break after `/` and `,`, a column of CJK
+  text is no longer squeezed to two characters, and a table that still does not fit is drawn as a list,
+  one `Header: value` line per cell.
+- Reopening a project whose chat you were in shows the conversation's earlier messages within about a second, while
+  the tab is still starting. A message you type meanwhile is sent once the session is back, and stays in the box if
+  it does not come back.
 - A tab keeps about 200 settled turns in the panel (`agent.history_turns`, 10 to 2000). Older turns are unloaded, a line
   says `N earlier turns not loaded.`, `Enter` on it (or `:history older`) loads an older page, and `:history latest`
   goes back. This changes only what the panel holds: Claude Code's own session file is never touched. Resuming an ACP
@@ -174,6 +197,7 @@ into an Eitri window, and Eitri reopens your files where you left them. Your Neo
 - The preview's text is the editor's size by default (`font_size` overrides it), `{` and `}` jump by block, and a
   selection can take whole table rows. `o` on a diagram or image opens it in a viewer with zathura-like keys (`h j k
   l`, `+` and `-`, `=`, `a` to fit, `Enter` to edit); a diagram stays sharp at any size and redraws while you edit it.
+- A held `j` or `k` in the preview scrolls at once and stops when you let go.
 
 **Keys you can find without the guide**
 
@@ -214,7 +238,11 @@ into an Eitri window, and Eitri reopens your files where you left them. Your Neo
   Eitri's editor: on Neovim 0.12, rows no longer stay blank after a `:split`, `:update` or `:close` under
   `'lazyredraw'`; a `guifont` that names a font you do not have no longer stops the editor from starting; a plugin that
   replays exit autocommands no longer freezes the quit; and wheel notches that arrive while Neovim is busy queue up,
-  each still reaching Neovim as its own scroll.
+  each still reaching Neovim as its own scroll. A popup that sits just above the last row (which-key's, for one) no
+  longer paints over the statusline.
+- Eitri starts the editor's Neovim with `vim.g.snacks_scroll = false`, which turns off the scroll animation of
+  snacks.nvim (LazyVim turns it on), since Neovide already animates scrolling and the two together could move the
+  cursor around in a Markdown buffer. `vim.g.snacks_scroll = true` in your own configuration brings it back.
 - Eitri now needs Neovim 0.11 or newer (it was 0.10). `install.sh` and `eitri setup` offer a private copy of 0.12.6
   when the Neovim on your `PATH` is older. `:NeovideHelp`, which Neovide adds to every Neovim it runs, opens Neovide's
   online documentation, not Eitri's.
@@ -338,9 +366,8 @@ into an Eitri window, and Eitri reopens your files where you left them. Your Neo
 - **A bare `/plan` no longer goes to Claude Code as a message.** It switches plan mode in Eitri.
 - **In companion mode on Hyprland, a key at a real edge now stops there.** Hyprland's own move picks a window even when
   nothing lies that way, so `Ctrl+k` and `Ctrl+j` could leave for the panel. Windows that overlap are still left to it.
-- **Remote tabs show a permission card for every call whose answer depends on a path,** in Manual and in Auto,
-  because Eitri cannot yet check paths on the server; Bypass and tools you allowed by name behave as they do
-  locally. Turn review is not available on remote tabs yet.
+- **snacks.nvim's smooth scrolling is off in Eitri's editor.** Set `vim.g.snacks_scroll = true` in your Neovim
+  configuration to keep it.
 
 ## What's new in 0.3.0
 
@@ -627,8 +654,8 @@ repository).
 
 ## Performance, against native Neovide
 
-Measured on development builds shortly before this release, on an AMD desktop, and on an Intel laptop where it
-says so:
+Measured on development builds shortly before 0.3.0, on an AMD desktop, and on an Intel laptop where it says so;
+not repeated for this release:
 
 - **On GTK 4.24, typing is one refresh slower than native Neovide.** With the compositor feeding GTK a real
   165 Hz period through presentation feedback, GTK 4.24.1 added 5.97 ms at the median; the same build with

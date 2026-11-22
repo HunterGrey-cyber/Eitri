@@ -20,6 +20,10 @@ bug, and tell us if something here is wrong or has changed. The requirements are
 - **[Compositor windows](guide/compositor-windows.md)**, the default on Hyprland, sway and niri, are new, and some
   things do not work as they should yet: the guide's
   [known gaps](guide/compositor-windows.md#known-gaps) list them.
+- **[Remote development](guide/remote-development.md) is experimental and off by default** (`remote_dev.enabled`).
+  It needs a Linux laptop (a macOS file system that ignores case is not handled yet) and Mutagen, which you install
+  yourself. Turn review is not available on remote tabs. The guide's
+  [list of what is not in this version](guide/remote-development.md#what-is-not-in-this-version) has the rest.
 - **WebKitGTK 2.40 or newer** (the `webkitgtk-6.0` API) is required. The prebuilt binaries are built against
   glibc 2.39 and GTK 4.14; older versions are untested. Ubuntu 24.04, Debian 13, Fedora 40+, RHEL 10 and Arch
   meet this; Ubuntu 22.04 and Debian 12 do not.
@@ -60,6 +64,10 @@ bug, and tell us if something here is wrong or has changed. The requirements are
   works only while GitHub still serves those old objects, and the `eitri-0.2.0-source.tar.gz` on its release page
   rebuilds it for good; a later release's `install.sh` cannot build 0.2.0 from source. Packages, tarballs and
   `install.sh` are not affected.
+- **If GitHub, Node.js or npm cannot be reached from your network**, each download the installer makes can come
+  from a mirror you or your organisation run, and every file is still checked against the signed release
+  ([Download addresses](../INSTALL.md#download-addresses)). Release files you got another way install with
+  `sh install.sh --tarball FILE --sums FILE --sig FILE` ([INSTALL.md](../INSTALL.md#offline-from-release-files)).
 
 ## Speed and drawing
 
@@ -152,14 +160,6 @@ page bridge may change during 0.x.
   own beside your Neovim (`eitri page <id>`, `:EitriPage <id>`; [the guide](guide/companion.md#pages-beside-your-nvim))
   when it uses only following the buffer, Neovim commands, opening files, keeping state and the network: the Markdown
   preview can, the agent pages cannot. Lua panels have no such window.
-
-## Reaching eitri.cc and GitHub from mainland China
-
-Users on some Chinese ISPs (reported so far: China Telecom in Fujian, Jiangsu and Henan) say their connections to
-foreign sites that are not on the ISP's whitelist are reset, so eitri.cc and github.com may not open at all
-there. The installer downloads from GitHub, so it can fail the same way. If you can get the release files another
-way, `sh install.sh --tarball FILE --sums FILE --sig FILE` installs from them
-([INSTALL.md](../INSTALL.md#offline-from-release-files)); the sidecar build still needs a network that reaches Node.js and npm.
 
 ## Companion mode
 

@@ -1,5 +1,5 @@
 [English](remote-development.md) | 简体中文
-<!-- translated-from: remote-development.md sha256=942e2adf30b5279a4e8698a3b08c796babb52889a309aed8474a588e8e21e5b5 -->
+<!-- translated-from: remote-development.md sha256=ec74ee9cb1903fdb568dd739aeb2423d34394291a1d8ef7429f6023b236604bb -->
 
 # 远程开发
 
@@ -403,6 +403,7 @@ eitri host exec --cwd /srv/project -- cargo fmt
 - **项目里某个子模块之内的 git。** 副本里没有子模块的历史，所以在子模块文件夹里运行的 git 读操作描述的是外层仓库；子模块的 git 请在服务器的终端里运行。
 - **垫片列为拒绝的 git 命令，以及经由 git 的交互式编辑器流程**（见上文）。
 - **本地副本上的 agent 标签页。** 用 `--local` 打开的窗口显示的是副本；agent 在服务器上运行。
+- **远程标签页上的回合审阅。** 远程标签页的回合审阅会说明它还不可用。
 - **稀疏编辑和远程 Neovim。** 镜像的是整棵未被忽略的树，Neovim 在你的笔记本上运行。
 
 其他今天不支持或比较粗糙的地方，见[已知问题](../known-issues.zh-CN.md)。
