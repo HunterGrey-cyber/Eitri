@@ -58,7 +58,7 @@ default-members = [
 # 1.0.0 and was reversed on 2026-09-29). Release candidates are
 # `0.2.0-rc.N`. "v1" stays the internal milestone name; this field only ever carries the public
 # SemVer.
-version = "0.3.0"
+version = "0.4.0"
 edition = "2021"
 publish = false
 

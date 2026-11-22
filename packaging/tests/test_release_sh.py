@@ -1323,8 +1323,8 @@ class StagesTheDesktopEntryAndIcons(unittest.TestCase):
         with open(os.path.join(_PACKAGING, "nfpm-public.yaml"), encoding="utf-8") as f:
             srcs = re.findall(rf"^\s*- src: \./((?:packaging/(?:icons/|{re.escape(rc.APP_ID)}(?:\.P(?:anel|age))?\.desktop)|nvim/eitri\.nvim/|gnome-extension/)\S*)\s*$",
                               f.read(), re.M)
-        # The desktop entry, the panel's and the page window's entries, nine icons, the plugin's six files and the extension's four.
-        self.assertEqual(len(srcs), 22, srcs)
+        # The desktop entry, the panel's and the page window's entries, nine icons, the plugin's ten files and the extension's four.
+        self.assertEqual(len(srcs), 26, srcs)
         for src in srcs:
             self.assertTrue(os.path.isfile(os.path.join(self.st, src)), src)
         # The staging dir also holds the legacy entry (for the tarball's own copy of it), which no

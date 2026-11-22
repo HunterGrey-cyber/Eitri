@@ -1,8 +1,7 @@
 -- Language servers of a remote project run on its server: `vim.lsp.start` is wrapped so that a server whose root is
 -- inside a recorded remote project is started as `eitri host lsp --root <root> -- <cmd...>`, the bridge that speaks LSP
--- on stdio to Neovim and to the helper on the server. One config serves local
--- and remote projects: a root outside every recorded project, a server pinned local, and a `cmd` that is a function are
--- left exactly as they are.
+-- on stdio to Neovim and to the helper on the server. One config serves local and remote projects: a root outside
+-- every recorded project, a server pinned local, and a `cmd` that is a function are left exactly as they are.
 --
 -- The idea of putting the server's command behind a wrapper that Neovim runs as its own `cmd` follows remote-ssh.nvim
 -- (MIT, b0fc5c8), whose licence notes ship with Eitri.

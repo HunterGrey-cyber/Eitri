@@ -219,8 +219,8 @@ eitri.keymap.set("plugin:markdown", "i", "edit.here")
 `mode.escape`, `visual.char`, `visual.line`, and the viewer's `viewer.open`, `viewer.close`, `viewer.zoom_in`,
 `viewer.zoom_out`, `viewer.actual`, `viewer.fit`, `viewer.fit_width` and `count` (the digits `1` to `9`). While the
 viewer is open it answers `cursor.down`, `cursor.up`, `cursor.left`, `cursor.right`, `cursor.line_start`,
-`cursor.line_end` and the page moves itself. If you changed these keys for a release candidate, rename an override
-of `scroll.half_down`, `scroll.half_up`, `scroll.page_down`, `scroll.page_up`, `scroll.top` or `scroll.bottom` to the
+`cursor.line_end` and the page moves itself. If you changed these keys in 0.3.0 or a release candidate, rename an
+override of `scroll.half_down`, `scroll.half_up`, `scroll.page_down`, `scroll.page_up`, `scroll.top` or `scroll.bottom` to the
 matching `cursor.` action (`cursor.half_down`, ..., `cursor.first`, `cursor.last`), and one of `viewer.left`,
 `viewer.right`, `viewer.left_edge` or `viewer.right_edge` to `cursor.left`, `cursor.right`, `cursor.line_start` or
 `cursor.line_end`: the preview no longer has those `scroll.` and `viewer.` actions, and ignores an override that

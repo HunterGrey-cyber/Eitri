@@ -116,11 +116,18 @@ lives on another Linux machine, over ssh (experimental, off by default). Your Ne
 - The session chooser (`<prefix> w`) of a remote window lists the sessions Claude Code recorded on the server for the
   project, those you started with `claude` in a terminal there included, and continues one with its history read
   from the server.
+- Eitri's helper keeps a tab's history on the server for two days after its agent ends there, and drops it sooner
+  when the helper's files pass 1 GiB or that disk has less than 1 GiB free. Reopening a tab whose missed history was
+  dropped offers, while Claude Code's transcript is still on the server, to rebuild the tab's history from it,
+  stopping the agent there first if it still runs.
 - Language servers run on the server, next to the project's toolchain, with no change to your Neovim configuration,
   and see your unsaved text as you type. A closed lid or a dropped connection does not stop them: the server keeps
   one for `remote_dev.lsp_grace` seconds (30 minutes by default) and Neovim reconnects to it, so nothing is indexed
   again. `gd` into a file that sync does not carry (the standard library, a dependency) opens it read-only from the
   server, and `eitri host exec` runs a formatter, a linter or `make` on the server and brings back what it changed.
+- None of that needs an Eitri window: a Neovim in an ordinary terminal with the `eitri.nvim` plugin gets the same
+  language servers, `gd` and exec wrappers, and `:checkhealth eitri` says what it found. `:EitriRemote term` opens a
+  shell on the server in a Neovim tab.
 - It is off by default: `eitri.config.set("remote_dev.enabled", true)` turns it on. You need key-based ssh, OpenSSH
   8.5 or later and Mutagen 0.18 or later on your computer (Eitri does not ship Mutagen), and `git` and `claude`,
   installed and set up, on the server. The guide's new "Remote development" page has the details.
@@ -166,7 +173,7 @@ lives on another Linux machine, over ssh (experimental, off by default). Your Ne
   a hidden renderer view with a four-second limit). Copying gives the fence's source, and a fence that fails to draw or
   is too large stays as code. Claude is told that the panel draws flowcharts, sequence and class diagrams.
 - A reply's separate text blocks keep their paragraph break instead of running together.
-- Tables in a reply stay readable in a narrow panel: code in a cell can break after `/` and `,`, a column of CJK
+- Tables in a reply stay readable in a narrow panel: code in a cell can break after `/` and after the `,` of a `{a,b}`, a column of CJK
   text is no longer squeezed to two characters, and a table that still does not fit is drawn as a list,
   one `Header: value` line per cell.
 - Reopening a project whose chat you were in shows the conversation's earlier messages within about a second, while
@@ -194,6 +201,10 @@ lives on another Linux machine, over ssh (experimental, off by default). Your Ne
 
 **The Markdown preview**
 
+- The preview's cursor is a block on one character, as in Neovim. `j`, `k`, `d`, `u`, `gg`, `G` and the page keys
+  move it and the page follows, `h`, `l`, `w`, `b`, `e`, `0` and `$` move it along the text, and `v` starts a selection
+  on its character. It takes the colours your `guicursor` gives Normal mode, and blinks only when that entry sets
+  blink times.
 - The preview's text is the editor's size by default (`font_size` overrides it), `{` and `}` jump by block, and a
   selection can take whole table rows. `o` on a diagram or image opens it in a viewer with zathura-like keys (`h j k
   l`, `+` and `-`, `=`, `a` to fit, `Enter` to edit); a diagram stays sharp at any size and redraws while you edit it.
@@ -234,6 +245,12 @@ lives on another Linux machine, over ssh (experimental, off by default). Your Ne
 
 **The editor**
 
+- On Wayland with GTK 4.24 or newer, unless the graphics driver is NVIDIA's, the editor hands its frames to the
+  compositor on a surface of its own, so typing is no longer a refresh behind native Neovide there: a typed letter
+  reached the screen 0.02 to 0.46 ms after native Neovide's at the median, on sway and Mutter at 60 and 165 Hz.
+  `editor.presentation = "gtk"` keeps the old way; if the compositor refuses the surface, the editor falls back to it
+  and prints why. The guide's "How the editor reaches the screen" has the details. It has not been tried on NVIDIA or
+  KWin.
 - The editor is now Neovide 0.17.1 (it was a snapshot from September, just after 0.16.2). Among the fixes that reach
   Eitri's editor: on Neovim 0.12, rows no longer stay blank after a `:split`, `:update` or `:close` under
   `'lazyredraw'`; a `guifont` that names a font you do not have no longer stops the editor from starting; a plugin that
@@ -325,7 +342,7 @@ lives on another Linux machine, over ssh (experimental, off by default). Your Ne
 - An idle Claude session's sidecar no longer grows. In 0.3.0 each one grew 30 to 47 MB an hour for as long as the tab
   stayed open. This release bundles sidecar 0.5.0, which carries the fix from sidecar 0.3.0: in the same 25-minute test
   of one idle session on sidecar 0.3.0, its memory held at 102.6 MB from the fifth minute, where Eitri 0.3.0's grew
-  22 MB an hour (the JavaScript heap 44 MB an hour, against 0.3). That test was not repeated on 0.5.0.
+  22 MB an hour (the JavaScript heap 44 MB an hour, against 0.3 MB an hour on sidecar 0.3.0). That test was not repeated on 0.5.0.
 - Answering a permission card no longer freezes the window while the reply is sent, and a mode that could not be saved
   says so. A key you hold down never answers a card or follows a link hint.
 - Fewer freezes and crashes: opening a path, reading a scratch draft and closing a window no longer wait on the disk on
@@ -366,8 +383,13 @@ lives on another Linux machine, over ssh (experimental, off by default). Your Ne
 - **A bare `/plan` no longer goes to Claude Code as a message.** It switches plan mode in Eitri.
 - **In companion mode on Hyprland, a key at a real edge now stops there.** Hyprland's own move picks a window even when
   nothing lies that way, so `Ctrl+k` and `Ctrl+j` could leave for the panel. Windows that overlap are still left to it.
-- **snacks.nvim's smooth scrolling is off in Eitri's editor.** Set `vim.g.snacks_scroll = true` in your Neovim
+- **snacks.nvim's smooth scrolling is off in the Neovim Eitri starts.** Set `vim.g.snacks_scroll = true` in your Neovim
   configuration to keep it.
+- **In the Markdown preview, `j`, `k`, `d`, `u`, `Ctrl+f`, `gg` and `G` move the cursor, which the page follows,**
+  where 0.3.0 scrolled the page; `Ctrl+e` and `Ctrl+y` still scroll. An `init.lua` override that names
+  `scroll.half_down`, `scroll.half_up`, `scroll.page_down`, `scroll.top` or `scroll.bottom` is now ignored: name
+  `cursor.half_down`, `cursor.half_up`, `cursor.page_down`, `cursor.first` or `cursor.last` instead. The 0.3.0 guide's
+  example put `edit.here` on `e`; if you copied it, `e` keeps doing that instead of moving to a word's end.
 
 ## What's new in 0.3.0
 
@@ -573,7 +595,7 @@ The agents guide's first section describes all of this.
 
 ## Upgrading from 0.2.2
 
-- **The agent backend is built again, once.** 0.3.0 pins a newer Verdandi (@VERDANDI_REV@), so `install.sh`
+- **The agent backend is built again, once.** 0.3.0 pins a newer Verdandi, so `install.sh`
   builds the new backend before it switches over, and after a `.deb`/`.rpm` upgrade you run `eitri setup` before
   your first turn. It downloads Node.js and the Claude Agent SDK from npm again (about 1.4 GiB of free disk while it builds).
 - A Claude Code conversation started in Eitri before 0.3.0 **keeps** its earlier, shorter instructions when you
@@ -654,10 +676,12 @@ repository).
 
 ## Performance, against native Neovide
 
-Measured on development builds shortly before 0.3.0, on an AMD desktop, and on an Intel laptop where it says so;
-not repeated for this release:
+Measured on development builds shortly before 0.3.0 unless a bullet says otherwise, on an AMD desktop, and on an
+Intel laptop where it says so; not repeated for this release:
 
-- **On GTK 4.24, typing is one refresh slower than native Neovide.** With the compositor feeding GTK a real
+- **Drawn the GTK way, typing on GTK 4.24 is one refresh slower than native Neovide.** That is no longer the default
+  there (the editor's own surface, above); it still applies on X11, with NVIDIA's driver and with
+  `editor.presentation = "gtk"`. With the compositor feeding GTK a real
   165 Hz period through presentation feedback, GTK 4.24.1 added 5.97 ms at the median; the same build with
   GTK 4.22.5 added 0.30 ms. With GTK's 60 Hz fallback clock, the addition was about 16.5 ms. A 156-line
   GTK-only reproduction also shows the delay on GTK's development branch (4.25.0,
@@ -665,15 +689,16 @@ not repeated for this release:
   latency, so none ships. The one measured at the real 165 Hz period (`render`) still added about 5.8 ms;
   the other two were measured only with the 60 Hz fallback clock. Settled idle was measured only with
   that fallback clock and stayed quiet.
-- **On GTK 4.24, scrolling with a held `j` at a 165 Hz output drops frames.** Native Neovide drew
+- **Drawn the GTK way on GTK 4.24, scrolling with a held `j` at a 165 Hz output drops frames.** Native Neovide drew
   165.5 changed frames a second, Eitri on GTK 4.24.1 140.6, and the same build on GTK 4.22.5 165.4.
   The 99th-percentile frame intervals were 6.1, 12.1 and 6.1 ms respectively. This separate scrolling run
   used stock presentation feedback, so GTK 4.24 still used its 60 Hz fallback clock; scrolling has not been
-  repeated with real-period feedback.
+  repeated with real-period feedback. With the editor's own surface, a held-key test did no worse than the GTK way.
 - **While a reply streams**, a key's redraw took 11.2 ms at the median with WebKitGTK 2.54 (a stand-in reply),
   against about 2.3 ms with WebKitGTK 2.52.
-- **Memory:** one tab used 253 to 283 MiB more than native Neovide, against a goal of 256 MiB, and each extra
-  chat view about 28 MB.
+- **Memory** (a development build after 0.3.0): an idle window with one tab used 232 MiB more than native Neovide
+  with the panel inside the window and 245 MiB more in compositor mode, against a goal of 256 MiB; on an integrated
+  GPU, 248 to 259 MiB more.
 - **Idle:** no frames drawn, about 13 ms of CPU a minute. **Startup:** 260 ms, against native's 253 ms.
 - **Under load at high refresh rates** the Intel laptop drew 86-93 % of native Neovide's frames at 165 Hz while
   other work kept it 17-28 % busy. That was measured before 0.2.0's typing-latency fix and not since.
@@ -686,7 +711,7 @@ or install `eitri_@VERSION@_amd64.deb` / `eitri-@VERSION@-1.x86_64.rpm` and run 
 once, or install from `eitri-@VERSION@-x86_64-linux.tar.gz` with
 `sh install.sh --tarball eitri-@VERSION@-x86_64-linux.tar.gz --sums SHA256SUMS --sig SHA256SUMS.sig`
 (or unpack it and run its own `bin/eitri setup` from inside the extracted directory). A `.deb`/`.rpm` upgrade
-from 0.2.2 needs that `eitri setup` again: it builds the new agent backend.
+from an earlier release needs that `eitri setup` again: it builds the new agent backend.
 
 Eitri needs `nvim` >= 0.11 somewhere it can find one -- either on `PATH`, or its own private copy
 under `XDG_DATA_HOME/eitri/nvim` (never placed on `PATH`; none of the packages depend on a system

@@ -320,7 +320,10 @@ mod tests {
         let launcher = agent::ssh::LocalExec {
             helper: dir.join("fixture"),
         };
-        for candidate in [daemon("0.3.0", 0), daemon("0.4.0", 0), daemon("junk", 0)] {
+        // Refused: this version on another protocol major, a newer version, an unorderable one.
+        let this = env!("CARGO_PKG_VERSION");
+        let other_major = agent::ssh::PROTOCOL_MAJOR + 1;
+        for candidate in [daemon(this, other_major), daemon("99.0.0", 0), daemon("junk", 0)] {
             assert!(stop_daemon_with(&launcher, &host, Some("current-absent"), &candidate, "install-run").is_err());
             assert!(!dir.join("current-present/stopped").exists());
         }

@@ -83,7 +83,7 @@ The longer answers, with links to each project's own docs, are on [eitri.cc](htt
 
 ## Status and limits
 
-<!-- At the release cut: "<date>: Eitri <version> is an early release, and the ..." and the caption above gets the version from the recording. -->Eitri is an early release, and the `init.lua` API and default keys may change during 0.x. It is not yet stable enough for everyday use: that waits for real hardware and a week of daily use, not for a version number.
+<!-- At the release cut: "<date>: Eitri <version> is an early release, and the ..." and the caption above gets the version from the recording. -->Eitri 0.4.0 is an early release and not yet stable: expect rough edges, and the `init.lua` API and default keys may change during 0.x.
 
 - It runs only on Linux x86_64 under Wayland; macOS is in progress.
 - It uses more memory than native Neovide. The [known issues](docs/known-issues.md) page has the measurements and is worth reading before you file a bug.

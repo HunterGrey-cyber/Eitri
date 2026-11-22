@@ -1,5 +1,5 @@
 [English](README.md) | 简体中文
-<!-- translated-from: README.md sha256=ab154ef04668b5640de940696d347c11e09b7dada4bc2ef5b137fe47cb416c78 -->
+<!-- translated-from: README.md sha256=109302877037351da3c7e559508b1c3f741299c97fdad286fe242512a0153ee0 -->
 
 <div align="center">
 
@@ -84,7 +84,7 @@ eitri ~/path/to/project
 
 ## 现状与限制
 
-<!-- 发布时改成「<日期>：Eitri <版本> 是早期版本，……」，上面的录像说明填录像的版本。 -->Eitri 还是早期版本，0.x 期间 `init.lua` 的 API 和默认按键都可能改。它还没稳定到可以日常使用：要等真实硬件上的测试和一周的日常使用，不是等某个版本号。
+<!-- 发布时改成「<日期>：Eitri <版本> 是早期版本，……」，上面的录像说明填录像的版本。 -->Eitri 0.4.0 是早期版本，还不稳定，会有粗糙的地方；0.x 期间 `init.lua` 的 API 和默认按键都可能改。
 
 - 只支持 x86_64 Linux 和 Wayland，macOS 版在做。
 - 内存占用比原生 Neovide 多，具体数字在[已知问题](docs/known-issues.zh-CN.md)里。提 bug 之前值得先看一眼那一页。

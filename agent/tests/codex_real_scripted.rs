@@ -2737,7 +2737,8 @@ fn developer_texts(model: &ScriptedModel, from: usize) -> Vec<String> {
 /// A user's own `developer_instructions` (the top level of `config.toml`) reach the
 /// model on the start and the resume Eitri sends, because Eitri sends no `developerInstructions` of its own. The
 /// control is why: a start that names the field reaches the model with that text and without the user's, so the field
-/// replaces the user's text (Codex takes the start's field before `config.toml`'s); Eitri would have to carry it itself.
+/// replaces the user's text (Codex takes the start's field before `config.toml`'s); Eitri would have to carry it
+/// itself.
 #[test]
 #[ignore = "runs the real codex (on PATH) against the scripted model; no login, no network"]
 fn developer_instructions_are_the_users_own_unless_a_start_replaces_them() {

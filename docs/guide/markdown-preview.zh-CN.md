@@ -1,5 +1,5 @@
 [English](markdown-preview.md) | 简体中文
-<!-- translated-from: markdown-preview.md sha256=ce32d37e3debd884489043236ce5bf028bcd29abe134c2ba938727227daee4d2 -->
+<!-- translated-from: markdown-preview.md sha256=0df4d3f1dc015a25a7d6878d49b41c0fa3831f42b1671602f2fa84452ae176fc -->
 
 # Markdown 预览
 
@@ -141,7 +141,7 @@ eitri.plugin.load("markdown", { auto = true })
 eitri.keymap.set("plugin:markdown", "i", "edit.here")
 ```
 
-焦点在预览上时，`<prefix> ?` 会在 Eitri 自己的按键列表里先列出它的按键。动作名是 `cursor.down`、`cursor.up`、`cursor.half_down`、`cursor.half_up`、`cursor.page_down`、`cursor.page_up`、`cursor.first`、`cursor.last`、`cursor.left`、`cursor.right`、`cursor.word_next`、`cursor.word_prev`、`cursor.word_end`、`cursor.line_start`、`cursor.line_end`、`block.next`、`block.prev`、`scroll.down`、`scroll.up`、`heading.next`、`heading.prev`、`scroll.left`、`scroll.right`、`find.start`、`find.next`、`find.prev`、`hint.start`、`block.yank`、`edit.here`、`history.back`、`history.forward`、`sheet.open`、`mode.escape`、`visual.char`、`visual.line`，以及查看器的 `viewer.open`、`viewer.close`、`viewer.zoom_in`、`viewer.zoom_out`、`viewer.actual`、`viewer.fit`、`viewer.fit_width` 和 `count`（数字 `1` 到 `9`）。查看器打开时，`cursor.down`、`cursor.up`、`cursor.left`、`cursor.right`、`cursor.line_start`、`cursor.line_end` 和翻页动作由它自己响应。如果你在候选版本里改过这些按键，把对 `scroll.half_down`、`scroll.half_up`、`scroll.page_down`、`scroll.page_up`、`scroll.top` 或 `scroll.bottom` 的修改改成对应的 `cursor.` 动作（`cursor.half_down`……`cursor.first`、`cursor.last`），把对 `viewer.left`、`viewer.right`、`viewer.left_edge` 或 `viewer.right_edge` 的修改改成 `cursor.left`、`cursor.right`、`cursor.line_start` 或 `cursor.line_end`：预览里已经没有这几个 `scroll.` 和 `viewer.` 动作了，仍写着它们的修改会被忽略。
+焦点在预览上时，`<prefix> ?` 会在 Eitri 自己的按键列表里先列出它的按键。动作名是 `cursor.down`、`cursor.up`、`cursor.half_down`、`cursor.half_up`、`cursor.page_down`、`cursor.page_up`、`cursor.first`、`cursor.last`、`cursor.left`、`cursor.right`、`cursor.word_next`、`cursor.word_prev`、`cursor.word_end`、`cursor.line_start`、`cursor.line_end`、`block.next`、`block.prev`、`scroll.down`、`scroll.up`、`heading.next`、`heading.prev`、`scroll.left`、`scroll.right`、`find.start`、`find.next`、`find.prev`、`hint.start`、`block.yank`、`edit.here`、`history.back`、`history.forward`、`sheet.open`、`mode.escape`、`visual.char`、`visual.line`，以及查看器的 `viewer.open`、`viewer.close`、`viewer.zoom_in`、`viewer.zoom_out`、`viewer.actual`、`viewer.fit`、`viewer.fit_width` 和 `count`（数字 `1` 到 `9`）。查看器打开时，`cursor.down`、`cursor.up`、`cursor.left`、`cursor.right`、`cursor.line_start`、`cursor.line_end` 和翻页动作由它自己响应。如果你在 0.3.0 或候选版本里改过这些按键，把对 `scroll.half_down`、`scroll.half_up`、`scroll.page_down`、`scroll.page_up`、`scroll.top` 或 `scroll.bottom` 的修改改成对应的 `cursor.` 动作（`cursor.half_down`……`cursor.first`、`cursor.last`），把对 `viewer.left`、`viewer.right`、`viewer.left_edge` 或 `viewer.right_edge` 的修改改成 `cursor.left`、`cursor.right`、`cursor.line_start` 或 `cursor.line_end`：预览里已经没有这几个 `scroll.` 和 `viewer.` 动作了，仍写着它们的修改会被忽略。
 
 一步滚动多远、滚动是否带动画、`g` 这样的键等多久、什么时候列出接下来的键、提示标签用哪些字母、搜索怎样处理大小写，这些是所有插件页面共用的设置：见[插件页面里的按键](configuration.zh-CN.md#keys-in-a-plugin-page)。
 

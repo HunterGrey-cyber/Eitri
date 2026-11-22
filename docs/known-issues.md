@@ -109,13 +109,13 @@ machine. The items below distinguish real refresh-period feedback from the fallb
   Claude tab adds about 85 MiB, its sidecar included (79 MiB of it), and each further tab about 63 MiB (about 55 of it
   its own sidecar). Each Claude session also runs the `claude` CLI you installed. That is your program, not part of
   Eitri: it used about 109 MiB per session once idle, more during a turn, on top of these figures.
-- **In 0.3.0 an idle session's sidecar keeps growing; the next release fixes it.** With seven sessions left idle,
+- **In 0.3.0 an idle session's sidecar keeps growing; 0.4.0 fixes it.** With seven sessions left idle,
   each sidecar grew 30 to 47 MB an hour, with no plateau in three hours. A forced garbage collection every five
   minutes did not slow it, so it is memory the sidecar still holds, not memory it has yet to collect. At that rate a
   window with five tabs left open for a week would reach about 30 GB (extrapolated, not run). Quitting the window
-  gives it back. The release after 0.3.0 bundles a sidecar that stays flat at rest: in the same 25-minute test of one
-  idle session, its memory held at 102.6 MB from the fifth minute, where 0.3.0's grew 22 MB an hour (its JavaScript
-  heap 44 MB an hour, against 0.3 for the new one). In a window on a development build after 0.3.0, four idle
+  gives it back. 0.4.0 bundles sidecar 0.5.0, which carries the fix first made in sidecar 0.3.0: in the same 25-minute
+  test of one idle session on sidecar 0.3.0, its memory held at 102.6 MB from the fifth minute, where Eitri 0.3.0's grew
+  22 MB an hour (its JavaScript heap 44 MB an hour, against 0.3 MB on sidecar 0.3.0). In a window on a development build after 0.3.0, four idle
   sessions' sidecars held 248 MiB between them for 30 minutes, each within 0.1 MiB. 0.3.0 cannot take the fix as a
   sidecar update.
 - **At high refresh rates under load the editor drops frames.** At 165 Hz on an Intel laptop, with other work

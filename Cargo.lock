@@ -35,7 +35,7 @@ checksum = "320119579fcad9c21884f5c4861d16174d0e06250625266f50fe6898340abefa"
 
 [[package]]
 name = "agent"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "agent",
  "base64",
@@ -942,7 +942,7 @@ checksum = "252afb9ae5eaa683babdc6a068b3f5726eb19e05070c731f9b2a23a7c3e8ed34"
 
 [[package]]
 name = "eitri-core"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "agent",
  "base64",
@@ -962,7 +962,7 @@ dependencies = [
 
 [[package]]
 name = "eitri-desk"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "agent",
  "eitri-core",
@@ -976,7 +976,7 @@ dependencies = [
 
 [[package]]
 name = "eitri-mac"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "agent",
  "block2 0.6.2",
@@ -998,7 +998,7 @@ dependencies = [
 
 [[package]]
 name = "eitri-panel"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "agent",
  "base64",
@@ -1012,7 +1012,7 @@ dependencies = [
 
 [[package]]
 name = "eitri-remote"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "agent",
  "eitri-core",
@@ -1026,7 +1026,7 @@ dependencies = [
 
 [[package]]
 name = "eitri-server"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "agent",
  "bytes",
@@ -1055,7 +1055,7 @@ dependencies = [
 
 [[package]]
 name = "eitri-server-proto"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "prost",
  "serde",
@@ -1066,7 +1066,7 @@ dependencies = [
 
 [[package]]
 name = "eitri-terminal"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "alacritty_terminal",
  "eitri-core",
@@ -2760,7 +2760,7 @@ dependencies = [
 
 [[package]]
 name = "neovide-editor"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "glib 0.22.9",
  "gtk4",
@@ -4286,7 +4286,7 @@ dependencies = [
 
 [[package]]
 name = "shell"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "agent",
  "alacritty_terminal",
@@ -4700,7 +4700,7 @@ dependencies = [
 
 [[package]]
 name = "terminal-frame"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "alacritty_terminal",
  "bitflags 2.13.1",
@@ -4709,7 +4709,7 @@ dependencies = [
 
 [[package]]
 name = "terminal-input"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "alacritty_terminal",
  "bitflags 2.13.1",
@@ -4719,7 +4719,7 @@ dependencies = [
 
 [[package]]
 name = "terminal-render"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "alacritty_terminal",
  "terminal-frame",
@@ -4727,7 +4727,7 @@ dependencies = [
 
 [[package]]
 name = "terminal-sync"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "alacritty_terminal",
  "libc",

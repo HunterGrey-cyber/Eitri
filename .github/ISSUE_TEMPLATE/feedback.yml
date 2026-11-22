@@ -52,7 +52,7 @@ body:
     id: version
     attributes:
       label: eitri --version
-      placeholder: "eitri 0.3.0 (commit ..., neovide fork ..., verdandi ...)"
+      placeholder: "eitri 0.4.0 (commit ..., neovide fork ..., verdandi ...)"
     validations:
       required: true
   - type: textarea
