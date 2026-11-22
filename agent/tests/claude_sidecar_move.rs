@@ -22,6 +22,7 @@ use agent::{
 use std::io::{Read, Write};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::net::{UnixListener, UnixStream};
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
@@ -544,7 +545,21 @@ fn a_moved_sidecar_survives_the_spawners_terminal_hangup_and_sigint() {
         "exec '{}' --exact spawner_helper --ignored --nocapture --test-threads=1",
         exe.display()
     );
-    let mut terminal = Command::new("script")
+    // The spawning window stands in for one a person started from a terminal, which a Ctrl+C or a hangup ends. A suite
+    // started in the background inherits both ignored (`nohup`, a script's `&`), and an ignored disposition survives
+    // exec: the window would outlive the test's signals, and the sidecar it spawns would survive them only by
+    // inheritance. So the terminal starts with both at their defaults.
+    let mut terminal = Command::new("script");
+    // SAFETY: runs in the forked child before exec and calls only `signal`, which is async-signal-safe.
+    unsafe {
+        terminal.pre_exec(|| {
+            for signal in [libc::SIGHUP, libc::SIGINT] {
+                libc::signal(signal, libc::SIG_DFL);
+            }
+            Ok(())
+        });
+    }
+    let mut terminal = terminal
         .args(["--quiet", "--command", &command, "/dev/null"])
         .env(HELPER_SOCKET, &socket)
         .stdin(Stdio::piped())

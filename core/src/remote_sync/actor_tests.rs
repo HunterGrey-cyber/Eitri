@@ -28,6 +28,8 @@ struct EngineState {
     root: PathBuf,
     /// Sessions created so far: each instance gets its own identifier, as Mutagen gives it.
     created: u64,
+    /// How long a create runs before its session exists: Mutagen's is a round trip to the server.
+    create_takes: Duration,
 }
 
 pub(crate) struct FakeEngine {
@@ -58,6 +60,7 @@ impl FakeEngine {
                 git_config_seen_at_git_create: None,
                 root: root.to_owned(),
                 created: 0,
+                create_takes: Duration::ZERO,
             }),
             log,
         })
@@ -164,6 +167,8 @@ impl SyncEngine for FakeEngine {
 
     fn create(&self, spec: &SessionSpec) -> Result<(), crate::remote_sync::SyncError> {
         self.log(format!("create {} {}", spec.name, spec.ignores.join(",")));
+        let takes = self.state.lock().unwrap().create_takes;
+        std::thread::sleep(takes);
         let mut state = self.state.lock().unwrap();
         if spec.role == Role::Tree {
             state.progress_at_create = state.progress_dir.as_ref().and_then(|dir| recreate::read_progress(dir));
@@ -290,8 +295,9 @@ struct HelperState {
     activity: wire::ProjectActivityResponse,
     mode_lines: Vec<ModeLine>,
     mode_lines_error: Option<String>,
-    /// WatchModes fails with this while set.
-    watch_modes_error: Option<String>,
+    /// How many more WatchModes fail, as a dropped link makes them. Counted down under the helper's own lock, so the
+    /// test decides exactly which send is the first one taken.
+    watch_modes_fails: u32,
     /// The host key the connection under the helper shows when it is not the project's.
     shown_key: Option<String>,
     /// The connection's key cannot be looked at (a master start under way) while set.
@@ -325,7 +331,7 @@ impl FakeHelper {
                 activity: wire::ProjectActivityResponse::default(),
                 mode_lines: vec![],
                 mode_lines_error: None,
-                watch_modes_error: None,
+                watch_modes_fails: 0,
                 shown_key: None,
                 watch_modes_settling: 0,
                 key_unknown: false,
@@ -514,8 +520,9 @@ impl SyncHelper for FakeHelper {
             .unwrap()
             .push(format!("watch_modes {on} {staging_name}"));
         let mut state = self.state.lock().unwrap();
-        if let Some(error) = state.watch_modes_error.clone() {
-            return Err(error);
+        if state.watch_modes_fails > 0 {
+            state.watch_modes_fails -= 1;
+            return Err("the link dropped".into());
         }
         let settling = state.watch_modes_settling > 0;
         state.watch_modes_settling = state.watch_modes_settling.saturating_sub(1);
@@ -805,18 +812,19 @@ fn sessions_are_created_tree_first_then_git() {
 #[test]
 fn a_failed_watch_modes_is_sent_again_at_a_recheck() {
     let lab = Lab::new();
-    lab.helper
-        .set(|h| h.watch_modes_error = Some("the link dropped".into()));
+    lab.helper.set(|h| h.watch_modes_fails = 2);
+    // The holder names the session in the record before it creates it, so the record alone does not say the session
+    // exists; a slow create holds that window open.
+    lab.engine.state.lock().unwrap().create_takes = Duration::from_millis(200);
     let mut config = lab.config(HolderKind::Window);
     config.recheck_every = Duration::from_millis(20);
     let (_actor, _events) = lab.attach_with(config, lab.engine.clone());
-    wait(|| lab.record().tree_session.is_some());
+    wait(|| lab.engine.status_of(&lab.tree()).is_some());
     let staging = || {
         let identifier = lab.engine.status_of(&lab.tree()).unwrap().identifier;
         format!("watch_modes true {}", sessions::staging_name(&identifier))
     };
-    wait(|| lab.calls().iter().filter(|c| **c == staging()).count() >= 2);
-    lab.helper.set(|h| h.watch_modes_error = None);
+    // The first two sends fail and each recheck sends again; the third is taken.
     wait(|| lab.calls().iter().filter(|c| **c == staging()).count() >= 3);
     let sent = lab.calls().iter().filter(|c| **c == staging()).count();
     std::thread::sleep(Duration::from_millis(200));
@@ -1285,12 +1293,19 @@ fn a_batch_finished_between_polls_is_reported_afterwards() {
     let lab = Lab::new();
     lab.engine.state.lock().unwrap().monitor_fails = true;
     lab.update_record(|record| record.tree_synced = true);
-    let (_actor, events) = lab.attach();
+    // The tree session exists before the holder has set up the git session and taken its first listing; a slow git
+    // step holds that window open.
+    lab.helper
+        .set(|h| h.on_git_config = Some(Box::new(|| std::thread::sleep(Duration::from_millis(300)))));
+    let (actor, events) = lab.attach();
     wait(|| lab.engine.status_of(&lab.tree()).is_some());
     let mut before = lab.watching(&lab.tree(), 1);
     before.laptop_bytes = 10 * MIB;
     lab.engine.push(before);
-    std::thread::sleep(Duration::from_millis(100));
+    // The tree's only watching status so far is `before`: a published phase that says the tree watches comes from the
+    // listing that carried it, which made it the baseline the next listing is compared with.
+    let port = actor.port();
+    wait(|| status_file_of(&port).is_ok_and(|s| s.phase == "history" || s.phase == "watching"));
     let mut after = lab.watching(&lab.tree(), 2);
     after.laptop_bytes = 110 * MIB;
     lab.engine.push(after);
@@ -2388,9 +2403,16 @@ fn a_git_dir_replaced_under_a_running_replica_stops_the_replica() {
     wait(|| lab.record().git_session.is_some());
     let git_dir = lab.root.join(".git");
     let aside = lab.root.with_extension("eitri-git");
+    // The swap takes several steps, and a holder step that looks in between finds no `.git` (it makes one, as for a
+    // deleted `.git`) or an empty one (which holds only what Eitri may keep): either way the replica goes on. This test
+    // is about a finished foreign `.git`, so it swaps while holding the action lock, as a CLI action does, which keeps
+    // the holder's look out until the swap is done; the pause between the steps holds that window open.
+    let lock = super::super::conflicts::action_lock(&lock_dir(&lab.state, &lab.root)).unwrap();
     std::fs::rename(&git_dir, &aside).unwrap();
+    std::thread::sleep(Duration::from_millis(100));
     std::fs::create_dir_all(git_dir.join("refs/heads")).unwrap();
     std::fs::write(git_dir.join("HEAD"), b"ref: refs/heads/mine\n").unwrap();
+    drop(lock);
     wait_line(&events, "has its own .git");
     wait(|| lab.engine.status_of(&lab.git()).is_none());
     assert!(!git_dir.join("config").exists());

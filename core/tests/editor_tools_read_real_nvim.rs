@@ -46,9 +46,15 @@ impl Drop for Nvim {
     }
 }
 
+/// A fresh directory for one test, `eto-read-<case>-<uuid>` under the test state root, resolved. The uuid keeps two
+/// cases that share a name out of each other's directory: the cases run on parallel threads, and each one removes its
+/// directory when it ends.
+fn scratch(case: &str) -> PathBuf {
+    agent::state_dirs::test_workspace_dir(&format!("eto-read-{case}"))
+}
+
 fn start(case: &str) -> Nvim {
-    let dir = std::env::temp_dir().join(format!("eto-read-{}-{case}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
+    let dir = scratch(case);
     let project = dir.join("project");
     std::fs::create_dir_all(&project).expect("project dir");
     let embed = Embed::start(&project, &[], &[]);
@@ -63,12 +69,9 @@ fn start(case: &str) -> Nvim {
 
 /// [`start`] with the feed loaded as the embedded editor loads it, in a scratch directory with every link resolved.
 fn start_fed(case: &str) -> Nvim {
-    agent::state_dirs::redirect_state_to_a_test_root();
-    let dir = std::env::temp_dir().join(format!("eto-read-{}-{case}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
+    let dir = scratch(case);
     std::fs::create_dir_all(dir.join("project")).expect("project dir");
     std::fs::create_dir_all(dir.join("beside")).expect("outside dir");
-    let dir = std::fs::canonicalize(&dir).expect("scratch dir");
     let project = dir.join("project");
     let feed = EditorContextFeed::new().expect("the feed must bind");
     let embed = Embed::start_fed(&project, &feed, &[]);
@@ -202,6 +205,21 @@ fn refusal_of(path: &Path, answer: &Value) -> String {
     let ToolResult { text, is_error } = result_of(path, None, answer);
     assert!(is_error, "{text}");
     text
+}
+
+/// Two cases share the name `new-file`; each must still get a directory of its own, or one removes the other's.
+#[test]
+fn one_case_name_twice_gives_two_directories() {
+    struct Removed(PathBuf);
+    impl Drop for Removed {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+    let first = Removed(scratch("twice"));
+    let second = Removed(scratch("twice"));
+    assert_ne!(first.0, second.0);
+    assert!(first.0.is_dir() && second.0.is_dir());
 }
 
 #[test]

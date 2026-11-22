@@ -5,9 +5,11 @@
 
 use eitri_core::scratch::{EditDone, ScratchDir};
 
+/// Runs `nvim --headless` in the scratch directory, so a relative name a command uses lands there.
 fn nvim(dir: &ScratchDir, commands: &[String]) {
     let xdg = dir.path().join("xdg");
     let mut command = std::process::Command::new("nvim");
+    command.current_dir(dir.path());
     command.args(["--headless", "--clean", "-i", "NONE"]);
     // Every XDG base under the scratch directory: nothing reads or writes the user's own nvim state.
     for (key, sub) in [
@@ -303,17 +305,16 @@ fn a_hostile_open_column_runs_nothing_and_places_nothing() {
 /// A file name is data. A newline in it must not end the command that opens it and start another:
 /// the line after it would run as Ex in the user's nvim. The payload has no space, quote, `|`,
 /// brace or bracket, so escaping the name for Ex does not defuse it; only never parsing it does.
+/// It names its marker relative to nvim's working directory, the scratch directory: the whole payload
+/// is one file name, at most 255 bytes, and an absolute marker spelled as byte codes takes about four
+/// bytes per byte of the temp dir's path.
 #[test]
 #[ignore = "needs a real nvim on PATH; spends no tokens and needs no display"]
 fn a_newline_in_an_opened_path_is_part_of_the_name_and_runs_nothing() {
     agent::state_dirs::redirect_state_to_a_test_root();
     let dir = ScratchDir::new().expect("a scratch directory");
     let marker = dir.path().join("injected");
-    let name = format!(
-        "notes\nlua(io.open)({},{})",
-        lua_bytes(&marker.to_string_lossy()),
-        lua_bytes("w")
-    );
+    let name = format!("notes\nlua(io.open)({},{})", lua_bytes("injected"), lua_bytes("w"));
     let hostile = dir.path().join(&name);
     std::fs::write(&hostile, "hostile\n").unwrap();
     let probe = dir.path().join("opened");
