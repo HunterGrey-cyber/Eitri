@@ -411,6 +411,13 @@ pub struct Snapshot {
     pub left_out: LeftOut,
 }
 
+/// The nested repositories one snapshot records, as [`Shadow::write_tree`] found them.
+struct Nested {
+    /// Each nested repository directory, relative to the work tree, with the commit it has checked
+    /// out (`None` when it has none the shadow can record). Every one is kept out of `git add`.
+    repos: Vec<(Vec<u8>, Option<String>)>,
+}
+
 /// What a path is in a snapshot, as [`Shadow::read_entry`] reads it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EntryKind {
@@ -1151,6 +1158,8 @@ impl Shadow {
         limits: &Limits,
         deadline: Instant,
     ) -> Result<(String, Vec<(PathBuf, Option<FilePrint>)>), ShadowError> {
+        // Edits the index: a gitlink whose directory is no longer a repository is taken out here.
+        let held_gitlinks = self.prune_gitlinks(index, deadline)?;
         let mut list = self.git(Some(index));
         list.args(["ls-files", "-z", "--others", "--cached", "--exclude-standard"]);
         let listed = self.run_ok("ls-files", list, None, deadline)?;
@@ -1171,18 +1180,14 @@ impl Shadow {
         let mut count = 0;
         let mut large: Vec<&[u8]> = Vec::new();
         let mut prints: Vec<FilePrint> = Vec::new();
-        let mut left_out: Vec<&[u8]> = Vec::new();
+        let mut untracked_repositories: Vec<&[u8]> = Vec::new();
         for entry in &entries {
             remaining(deadline)?;
             let path = self.work_tree.join(OsStr::from_bytes(entry));
             let Ok(meta) = path.symlink_metadata() else { continue };
             count += 1;
             if let Some(dir) = entry.strip_suffix(b"/") {
-                // An untracked nested repository: one gitlink entry, unless it has no commit yet,
-                // which git refuses to add at all.
-                if !self.nested_has_commit(dir, deadline)? {
-                    left_out.push(dir);
-                }
+                untracked_repositories.push(dir);
                 continue;
             }
             if meta.is_file() && meta.len() > limits.max_file_bytes {
@@ -1196,17 +1201,14 @@ impl Shadow {
                 max: limits.max_files,
             });
         }
+        let nested = self.nested_repositories(&untracked_repositories, &held_gitlinks, &entries, deadline)?;
 
         if !large.is_empty() {
-            let mut remove = self.git(Some(index));
-            remove.args(["update-index", "-z", "--force-remove", "--stdin"]);
-            self.run_ok("update-index", remove, Some(&nul_joined(&large)), deadline)?;
+            self.force_remove(index, &nul_joined(&large), deadline)?;
         }
 
         if !ignored.stdout.is_empty() {
-            let mut remove = self.git(Some(index));
-            remove.args(["update-index", "-z", "--force-remove", "--stdin"]);
-            self.run_ok("update-index", remove, Some(&ignored.stdout), deadline)?;
+            self.force_remove(index, &ignored.stdout, deadline)?;
         }
 
         // What the index holds before the add, so that what the add changed can be told apart. The
@@ -1219,7 +1221,8 @@ impl Shadow {
             add.args(["add", "-A"]);
             let exclusions: Vec<u8> = large
                 .iter()
-                .chain(left_out.iter())
+                .copied()
+                .chain(nested.repos.iter().map(|(dir, _)| dir.as_slice()))
                 .flat_map(|p| b":(top,exclude,literal)".iter().chain(p.iter()).chain(b"\0".iter()))
                 .copied()
                 .collect();
@@ -1229,6 +1232,7 @@ impl Shadow {
                 add.args(["--pathspec-from-file=-", "--pathspec-file-nul"]);
                 self.run_ok("add", add, Some(&exclusions), deadline)?;
             }
+            self.record_gitlinks(index, &nested, deadline)?;
             #[cfg(test)]
             if let Some(hook) = tests::AFTER_ADD.with(|hook| hook.borrow_mut().take()) {
                 hook()?;
@@ -1245,9 +1249,7 @@ impl Shadow {
                 .collect();
             let grown = self.blobs_over(&changed, limits.max_file_bytes, deadline)?;
             if !grown.is_empty() {
-                let mut remove = self.git(Some(index));
-                remove.args(["update-index", "-z", "--force-remove", "--stdin"]);
-                self.run_ok("update-index", remove, Some(&nul_joined(&grown)), deadline)?;
+                self.force_remove(index, &nul_joined(&grown), deadline)?;
             }
             Ok(grown.into_iter().map(<[u8]>::to_vec).collect())
         };
@@ -1346,14 +1348,124 @@ impl Shadow {
             .collect())
     }
 
-    /// Whether the nested repository at `dir` (relative to the work tree) has a commit checked out.
-    /// Read-only, and isolated like every other shadow git run, except that git reads that
-    /// repository's own config (the `git` module doc says why that is harmless).
-    fn nested_has_commit(&self, dir: &[u8], deadline: Instant) -> Result<bool, ShadowError> {
+    /// Takes out of `index` every gitlink whose directory is no longer a nested repository
+    /// ([`is_nested_repository`](Self::is_nested_repository)), and returns the others. `git add`
+    /// keeps a gitlink whose directory has lost its `.git`, and the listing does not look below it,
+    /// so without this the files now there would never be recorded; a link in its place is recorded
+    /// as a link, as `git add` records any other.
+    fn prune_gitlinks(&self, index: &Path, deadline: Instant) -> Result<Vec<Vec<u8>>, ShadowError> {
+        let mut list = self.git(Some(index));
+        list.args(["ls-files", "-z", "--stage"]);
+        let staged = self.run_ok("ls-files", list, None, deadline)?;
+        let (held, gone): (Vec<&[u8]>, Vec<&[u8]>) = nul_separated(&staged.stdout)
+            .filter_map(|entry| split_once_byte(entry, b'\t'))
+            .filter(|(meta, _)| meta.starts_with(b"160000 "))
+            .map(|(_, path)| path)
+            .partition(|path| self.is_nested_repository(path));
+        if !gone.is_empty() {
+            self.force_remove(index, &nul_joined(&gone), deadline)?;
+        }
+        Ok(held.into_iter().map(<[u8]>::to_vec).collect())
+    }
+
+    /// Whether `path` (relative to the work tree) is a real directory holding a `.git`, reached
+    /// without following a link: every component, the last included, must be a directory and not a
+    /// link. A gitlink under a directory since replaced by a link would otherwise name a repository
+    /// outside the project, and `git add` refuses an exclusion beyond a link. The `.git` itself may
+    /// still be a link or a `gitdir:` file naming a repository anywhere: the `git` module doc says
+    /// what reading it can do.
+    fn is_nested_repository(&self, path: &[u8]) -> bool {
+        let mut dir = self.work_tree.clone();
+        for part in path.split(|&b| b == b'/') {
+            dir.push(OsStr::from_bytes(part));
+            if !dir.symlink_metadata().is_ok_and(|meta| meta.is_dir()) {
+                return false;
+            }
+        }
+        dir.join(".git").symlink_metadata().is_ok()
+    }
+
+    /// The nested repositories of the work tree a snapshot records: the untracked ones the listing
+    /// named (`untracked`, each a directory holding a repository), and those of the gitlinks the index
+    /// held ([`prune_gitlinks`](Self::prune_gitlinks)) which the listing still names (`listed`: one
+    /// ignored since is removed with the other ignored entries, not recorded again). Each is kept out
+    /// of `git add`: its look at a gitlink it holds runs `git status` inside that repository, and so
+    /// that repository's hooks and clean filters. [`record_gitlinks`](Self::record_gitlinks) writes
+    /// them instead, from the commit each has checked out.
+    fn nested_repositories(
+        &self,
+        untracked: &[&[u8]],
+        held: &[Vec<u8>],
+        listed: &BTreeSet<&[u8]>,
+        deadline: Instant,
+    ) -> Result<Nested, ShadowError> {
+        let dirs: BTreeSet<Vec<u8>> = untracked
+            .iter()
+            .map(|dir| dir.to_vec())
+            .chain(held.iter().filter(|path| listed.contains(path.as_slice())).cloned())
+            .collect();
+        let mut repos = Vec::new();
+        for dir in dirs {
+            remaining(deadline)?;
+            let head = self.nested_head(&dir, deadline)?;
+            repos.push((dir, head));
+        }
+        Ok(Nested { repos })
+    }
+
+    /// Puts each nested repository with a commit into `index` as a gitlink to that commit (replacing
+    /// whatever the index held at or below its path), and takes out the gitlink of one with no commit,
+    /// which git cannot record. Nothing here looks inside a nested repository.
+    fn record_gitlinks(&self, index: &Path, nested: &Nested, deadline: Instant) -> Result<(), ShadowError> {
+        let headless: Vec<&[u8]> = nested
+            .repos
+            .iter()
+            .filter(|(_, head)| head.is_none())
+            .map(|(dir, _)| dir.as_slice())
+            .collect();
+        if !headless.is_empty() {
+            self.force_remove(index, &nul_joined(&headless), deadline)?;
+        }
+        let mut info = Vec::new();
+        for (dir, head) in &nested.repos {
+            if let Some(head) = head {
+                info.extend_from_slice(format!("160000 {head}\t").as_bytes());
+                info.extend_from_slice(dir);
+                info.push(0);
+            }
+        }
+        if !info.is_empty() {
+            let mut update = self.git(Some(index));
+            update.args(["update-index", "-z", "--add", "--replace", "--index-info"]);
+            self.run_ok("update-index", update, Some(&info), deadline)?;
+        }
+        Ok(())
+    }
+
+    /// The commit the nested repository at `dir` (relative to the work tree) has checked out, `None`
+    /// when it has none, when git cannot answer (whatever the reason short of the time running out,
+    /// so the repository is left out of the snapshot rather than failing it), or when the id is not of
+    /// the shadow's own hash (a SHA-256 repository's id would make `update-index` in the SHA-1 shadow
+    /// fail every snapshot; `git add` cut it short instead, which names no real commit). Read-only,
+    /// and isolated like every other shadow git run, except that git reads that repository's own
+    /// config (the `git` module doc says why that is harmless). Only the ref is read, as `git add`
+    /// reads it for a gitlink: peeling it to a commit would read the object, and a partial clone
+    /// missing that object fetches it, through a transport command that repository's config names.
+    fn nested_head(&self, dir: &[u8], deadline: Instant) -> Result<Option<String>, ShadowError> {
         let nested = self.work_tree.join(OsStr::from_bytes(dir));
         let mut cmd = git::command(&nested.join(".git"), &nested, None, None);
-        cmd.args(["rev-parse", "--verify", "-q", "HEAD^{commit}"]);
-        Ok(git::run(cmd, remaining(deadline)?)?.status.success())
+        cmd.args(["rev-parse", "--verify", "-q", "HEAD"]);
+        let output = git::run(cmd, remaining(deadline)?)?;
+        let head = String::from_utf8_lossy(git::trim_newline(&output.stdout)).into_owned();
+        Ok((output.status.success() && is_full_id(&head) && head.len() == SHADOW_ID_LEN).then_some(head))
+    }
+
+    /// Takes the NUL-separated `paths` out of `index`, whatever entry each is.
+    fn force_remove(&self, index: &Path, paths: &[u8], deadline: Instant) -> Result<(), ShadowError> {
+        let mut remove = self.git(Some(index));
+        remove.args(["update-index", "-z", "--force-remove", "--stdin"]);
+        self.run_ok("update-index", remove, Some(paths), deadline)?;
+        Ok(())
     }
 
     /// The bytes of `path` (relative to the work tree) in snapshot `commit`, exactly as they were on
@@ -2008,6 +2120,10 @@ fn wall_clock_ms() -> u64 {
 pub(super) fn is_hex_id(id: &str) -> bool {
     (4..=64).contains(&id.len()) && id.bytes().all(|b| b.is_ascii_hexdigit())
 }
+
+/// The length of an object id in the shadow store, which `git init` makes with git's default
+/// hash, SHA-1.
+const SHADOW_ID_LEN: usize = 40;
 
 /// A whole object id, SHA-1 or SHA-256, in lower-case hex as git prints it.
 pub(super) fn is_full_id(id: &str) -> bool {

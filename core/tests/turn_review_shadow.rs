@@ -1174,6 +1174,276 @@ fn a_nested_repository_is_one_entry() {
     assert!(entries.contains_key("top"));
 }
 
+/// A nested repository's gitlink names the commit it has checked out at each snapshot, written without
+/// `git add` looking inside it; one that stops being a repository is snapshotted as plain files.
+#[test]
+fn a_nested_repositorys_gitlink_follows_its_commit() {
+    let _env = environment();
+    let scratch = Scratch::new("nested-moves");
+    let project = scratch.project();
+    let nested = project.join("lib");
+    write(&nested.join("a.rs"), b"a\n");
+    tgit(&nested, &["init", "-q"]);
+    tgit(&nested, &["add", "a.rs"]);
+    tgit(&nested, &["commit", "-qm", "one"]);
+    let head = || {
+        String::from_utf8_lossy(&tgit(&nested, &["rev-parse", "HEAD"]).stdout)
+            .trim()
+            .to_owned()
+    };
+    let gitlink = |shadow: &Shadow, commit: &str| {
+        let out = sgit(shadow, &["ls-tree", commit, "--", "lib"]);
+        String::from_utf8_lossy(&out.stdout).trim().to_owned()
+    };
+    let shadow = scratch.shadow(&project);
+    let first = snap(&shadow, SESSION, 1, SnapshotKind::Base);
+    assert_eq!(
+        gitlink(&shadow, &first.commit),
+        format!("160000 commit {}\tlib", head())
+    );
+    write(&nested.join("a.rs"), b"b\n");
+    tgit(&nested, &["commit", "-qam", "two"]);
+    let second = snap(&shadow, SESSION, 1, SnapshotKind::End);
+    assert_eq!(
+        gitlink(&shadow, &second.commit),
+        format!("160000 commit {}\tlib", head())
+    );
+    std::fs::remove_dir_all(nested.join(".git")).unwrap();
+    let third = snap(&shadow, SESSION, 2, SnapshotKind::Base);
+    let entries = tree_entries(&shadow, &third.commit);
+    assert_eq!(
+        entries.get("lib/a.rs").map(String::as_str),
+        Some("100644"),
+        "{entries:?}"
+    );
+    assert!(!entries.contains_key("lib"), "{entries:?}");
+}
+
+/// The marker file the nested repository's hooks, fsmonitor and clean filter write to when they run, and a
+/// nested repository at `project/inner` set up with all of them and one commit.
+fn nested_repository_that_records(scratch: &Scratch, project: &Path) -> (PathBuf, PathBuf) {
+    let inner = project.join("inner");
+    std::fs::create_dir_all(&inner).unwrap();
+    tgit(&inner, &["init", "-q"]);
+    let marker = scratch.path("marker");
+    let script = scratch.path("record.sh");
+    std::fs::write(&script, format!("#!/bin/sh\necho \"$0\" >> '{}'\n", marker.display())).unwrap();
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    for hook in [
+        "pre-commit",
+        "post-commit",
+        "post-checkout",
+        "post-index-change",
+        "reference-transaction",
+        "pre-auto-gc",
+        "fsmonitor-watchman",
+    ] {
+        let path = inner.join(".git/hooks").join(hook);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::copy(&script, &path).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    tgit(&inner, &["config", "core.fsmonitor", script.to_str().unwrap()]);
+    // A clean filter runs whenever git there hashes a file whose stat changed.
+    let filter = format!("sh -c 'echo filter >> \"{}\"; cat'", marker.display());
+    tgit(&inner, &["config", "filter.record.clean", &filter]);
+    std::fs::write(inner.join(".gitattributes"), "* filter=record\n").unwrap();
+    std::fs::write(inner.join("lib.rs"), "one\n").unwrap();
+    tgit(&inner, &["add", "lib.rs", ".gitattributes"]);
+    tgit(&inner, &["commit", "-q", "-m", "one"]);
+    assert!(
+        marker.exists(),
+        "the nested repository's hooks and filter run when git works there"
+    );
+    std::fs::remove_file(&marker).unwrap();
+    (inner, marker)
+}
+
+/// No git runs in a nested repository while snapshots are taken of the project around it: none of its hooks,
+/// its fsmonitor or its clean filter, all of which a `git status` there would run. The second snapshot is the
+/// one that matters: its index already holds the nested repository's gitlink.
+#[test]
+fn no_git_runs_in_the_nested_repository() {
+    let _env = environment();
+    let scratch = Scratch::new("nested-quiet");
+    let project = scratch.project();
+    let (inner, marker) = nested_repository_that_records(&scratch, &project);
+    let ran = || std::fs::read_to_string(&marker).unwrap_or_default();
+
+    let shadow = scratch.shadow(&project);
+    snap(&shadow, SESSION, 1, SnapshotKind::Base);
+    assert_eq!(
+        ran(),
+        "",
+        "something ran in the nested repository at the first snapshot"
+    );
+    // A changed stat is what makes a `git status` there hash the file again, through the filter.
+    std::fs::write(inner.join("lib.rs"), "two\n").unwrap();
+    snap(&shadow, SESSION, 1, SnapshotKind::End);
+    assert_eq!(
+        ran(),
+        "",
+        "something ran in the nested repository at the second snapshot"
+    );
+    std::fs::write(inner.join("lib.rs"), "three\n").unwrap();
+    shadow.scratch_tree(&Limits::default()).unwrap();
+    assert_eq!(
+        ran(),
+        "",
+        "something ran in the nested repository for the files on disk"
+    );
+}
+
+/// A nested partial clone whose checked-out commit is missing fetches nothing when its gitlink is recorded: the
+/// transport command its config names (here `core.sshCommand`) never runs, and the gitlink names the commit its
+/// HEAD names, as `git add` would record it.
+#[test]
+fn a_nested_partial_clone_fetches_nothing() {
+    let _env = environment();
+    let scratch = Scratch::new("nested-lazy");
+    let project = scratch.project();
+    write(&project.join("top"), b"t\n");
+    let inner = project.join("inner");
+    std::fs::create_dir_all(&inner).unwrap();
+    tgit(&inner, &["init", "-q"]);
+    let marker = scratch.path("marker");
+    for (key, value) in [
+        ("core.repositoryformatversion", "1".to_owned()),
+        ("extensions.partialClone", "origin".to_owned()),
+        ("remote.origin.url", "ssh://nowhere.invalid/x".to_owned()),
+        ("remote.origin.promisor", "true".to_owned()),
+        ("protocol.allow", "always".to_owned()),
+        ("core.sshCommand", format!("echo ssh >> '{}'; false", marker.display())),
+    ] {
+        tgit(&inner, &["config", key, &value]);
+    }
+    let missing = "1234567890123456789012345678901234567890";
+    // A detached HEAD naming a commit the clone does not hold; update-ref would refuse to write it.
+    std::fs::write(inner.join(".git/HEAD"), format!("{missing}\n")).unwrap();
+    assert!(
+        !tgit_status(&inner, &["cat-file", "-e", missing]) && marker.exists(),
+        "reading the missing commit there fetches it through the configured command"
+    );
+    std::fs::remove_file(&marker).unwrap();
+
+    let shadow = scratch.shadow(&project);
+    let s = snap(&shadow, SESSION, 1, SnapshotKind::Base);
+    assert!(
+        !marker.exists(),
+        "a fetch ran in the nested repository: {}",
+        std::fs::read_to_string(&marker).unwrap_or_default()
+    );
+    let entries = tree_entries(&shadow, &s.commit);
+    assert_eq!(entries.get("inner").map(String::as_str), Some("160000"), "{entries:?}");
+    let listed = sgit(&shadow, &["ls-tree", &s.commit, "--", "inner"]);
+    assert_eq!(text(&listed).trim(), format!("160000 commit {missing}\tinner"));
+}
+
+/// A nested repository whose parent directory is replaced by a link to one elsewhere leaves the snapshot, and the
+/// link is recorded as a link: nothing is read from the repository the link now leads to.
+#[test]
+fn a_nested_repository_behind_a_new_link_leaves_the_snapshot() {
+    let _env = environment();
+    let scratch = Scratch::new("nested-link");
+    let project = scratch.project();
+    let nested = project.join("a/sub");
+    write(&nested.join("x.rs"), b"x\n");
+    tgit(&nested, &["init", "-q"]);
+    tgit(&nested, &["add", "x.rs"]);
+    tgit(&nested, &["commit", "-qm", "one"]);
+    let shadow = scratch.shadow(&project);
+    let first = snap(&shadow, SESSION, 1, SnapshotKind::Base);
+    assert_eq!(
+        tree_entries(&shadow, &first.commit).get("a/sub").map(String::as_str),
+        Some("160000")
+    );
+    let elsewhere = scratch.path("elsewhere");
+    std::fs::rename(project.join("a"), &elsewhere).unwrap();
+    std::os::unix::fs::symlink(&elsewhere, project.join("a")).unwrap();
+    let second = snap(&shadow, SESSION, 1, SnapshotKind::End);
+    let entries = tree_entries(&shadow, &second.commit);
+    assert_eq!(entries.get("a").map(String::as_str), Some("120000"), "{entries:?}");
+    assert!(!entries.keys().any(|p| p.starts_with("a/")), "{entries:?}");
+}
+
+/// A nested repository of another hash than the shadow's (SHA-256) is left out of the snapshot, which is still
+/// taken; the rest of the project is in it.
+#[test]
+fn a_sha256_nested_repository_is_left_out() {
+    let _env = environment();
+    let scratch = Scratch::new("nested-sha256");
+    let project = scratch.project();
+    write(&project.join("top"), b"t\n");
+    let nested = project.join("lib");
+    write(&nested.join("a.rs"), b"a\n");
+    tgit(&nested, &["init", "-q", "--object-format=sha256"]);
+    tgit(&nested, &["add", "a.rs"]);
+    tgit(&nested, &["commit", "-qm", "one"]);
+    let shadow = scratch.shadow(&project);
+    let s = snap(&shadow, SESSION, 1, SnapshotKind::Base);
+    let entries = tree_entries(&shadow, &s.commit);
+    assert!(entries.contains_key("top"), "{entries:?}");
+    assert!(
+        !entries.keys().any(|p| p == "lib" || p.starts_with("lib/")),
+        "{entries:?}"
+    );
+}
+
+/// A nested repository whose HEAD stops naming a commit (an orphan branch with nothing on it yet) leaves the
+/// snapshot, though the index still held its gitlink.
+#[test]
+fn a_nested_repository_that_loses_its_commit_leaves_the_snapshot() {
+    let _env = environment();
+    let scratch = Scratch::new("nested-headless");
+    let project = scratch.project();
+    let nested = project.join("lib");
+    write(&nested.join("a.rs"), b"a\n");
+    tgit(&nested, &["init", "-q"]);
+    tgit(&nested, &["add", "a.rs"]);
+    tgit(&nested, &["commit", "-qm", "one"]);
+    let shadow = scratch.shadow(&project);
+    let first = snap(&shadow, SESSION, 1, SnapshotKind::Base);
+    assert_eq!(
+        tree_entries(&shadow, &first.commit).get("lib").map(String::as_str),
+        Some("160000")
+    );
+    tgit(&nested, &["checkout", "-q", "--orphan", "fresh"]);
+    let second = snap(&shadow, SESSION, 1, SnapshotKind::End);
+    let entries = tree_entries(&shadow, &second.commit);
+    assert!(
+        !entries.keys().any(|p| p == "lib" || p.starts_with("lib/")),
+        "{entries:?}"
+    );
+}
+
+/// A nested repository that becomes ignored leaves the next snapshot, like any other ignored path, though the
+/// index still held its gitlink.
+#[test]
+fn an_ignored_nested_repository_leaves_the_snapshot() {
+    let _env = environment();
+    let scratch = Scratch::new("nested-ignored");
+    let project = scratch.project();
+    let nested = project.join("lib");
+    write(&nested.join("a.rs"), b"a\n");
+    tgit(&nested, &["init", "-q"]);
+    tgit(&nested, &["add", "a.rs"]);
+    tgit(&nested, &["commit", "-qm", "one"]);
+    let shadow = scratch.shadow(&project);
+    let first = snap(&shadow, SESSION, 1, SnapshotKind::Base);
+    assert_eq!(
+        tree_entries(&shadow, &first.commit).get("lib").map(String::as_str),
+        Some("160000")
+    );
+    write(&project.join(".gitignore"), b"lib\n");
+    let second = snap(&shadow, SESSION, 1, SnapshotKind::End);
+    let entries = tree_entries(&shadow, &second.commit);
+    assert!(
+        !entries.keys().any(|p| p == "lib" || p.starts_with("lib/")),
+        "{entries:?}"
+    );
+    assert!(entries.contains_key(".gitignore"), "{entries:?}");
+}
+
 #[test]
 fn the_global_excludes_file_is_honoured() {
     let _env = environment();

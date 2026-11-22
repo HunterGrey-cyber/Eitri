@@ -9,14 +9,23 @@
 //! names the git directory and the work tree explicitly, and never goes through a shell.
 //!
 //! One piece of a project's own configuration does reach it. git reads the repository-level config
-//! of whatever git directory it opens, and to tell whether a nested repository in the project has a
-//! commit checked out, turn review names that repository's own `.git`
-//! (`rev-parse --verify -q HEAD^{commit}`), so its `.git/config` is read; recording such a
-//! repository as a gitlink also has git look inside it. That is harmless: these runs start no hook,
-//! filter, pager or helper and write nothing into the nested repository, the `-c` overrides below
-//! still beat the file, and the most a hostile config can do is flip the answer, which leaves the
-//! nested repository out of the snapshot or makes the snapshot fail (git refuses to add a
-//! repository with no commit), never runs anything.
+//! of whatever git directory it opens, and to learn which commit a nested repository in the project
+//! has checked out, turn review names that repository's own `.git` (`rev-parse --verify -q HEAD`).
+//! The directory holding it is reached from the work tree without following a link, but the `.git`
+//! itself may be a link or a `gitdir:` file naming a repository anywhere (a worktree of the project's
+//! own repository reads the project's config through it), and git reads that repository's config.
+//! The run reads only the ref, never an object, so it starts no hook, filter, pager, helper or fetch
+//! and writes nothing there, and the `-c` overrides below still beat the file. A hostile config can
+//! change the answer, which records another commit or leaves the nested repository out of the
+//! snapshot, or hold the run (an `include.path` naming a FIFO) until its timeout, which leaves that
+//! snapshot unavailable; it runs nothing. Reading an object could: a partial clone fetches a missing
+//! one through the transport its config names. So every run here also has lazy fetching switched off
+//! (`GIT_NO_LAZY_FETCH`, which git reads from 2.44 on; an older git ignores it), and
+//! `protocol.allow=never` refuses every transport a config does not allow by name
+//! (`protocol.<name>.allow` wins over it). Both are a second guard: no run reads a nested object. The gitlink is then written with `update-index`;
+//! `git add` is kept away from every nested repository, since its look at a gitlink the index
+//! already holds runs `git status` inside that repository, and with it that repository's hooks and
+//! clean filters.
 //!
 //! Two read-only questions of turn review are asked of git in the user's own environment, because
 //! their answers live there: where the user's global excludes file is ([`user_excludes_file`]), and
@@ -90,16 +99,17 @@ impl GitError {
 /// to [`run`].
 ///
 /// - The environment is cleared and rebuilt from `PATH` and `HOME` (inherited), `LC_ALL=C`, the
-///   switches that turn the global and system config and the credential prompt off, the fixed
-///   identity, and `GIT_INDEX_FILE` when `index` is given. Nothing else of the caller's
-///   environment reaches git.
+///   switches that turn the global and system config, the credential prompt and a partial clone's
+///   fetch of a missing object off, the fixed identity, and `GIT_INDEX_FILE` when `index` is given.
+///   Nothing else of the caller's environment reaches git.
 /// - The git directory and the work tree are named on the command line, so nothing is discovered
 ///   from the current directory. The current directory is the work tree, so paths git prints and
 ///   pathspecs it reads are relative to its top.
 /// - `-c` settings make paths come out unquoted, keep conversions, fsmonitor and the global
-///   attributes file off even if the shadow's own config were damaged, silence advice, and pass
-///   the user's global excludes file explicitly ([`user_excludes_file`]) -- the one piece of the
-///   user's configuration a snapshot is meant to honour.
+///   attributes file off even if a config git reads says otherwise (the shadow's own, damaged, or a
+///   nested repository's), refuse every transport no config allows by name, silence advice, and
+///   pass the user's global excludes file explicitly ([`user_excludes_file`]) -- the one piece of
+///   the user's configuration a snapshot is meant to honour.
 /// - The child leads a process group of its own, so [`run`] can stop it together with anything it
 ///   started.
 pub fn command(git_dir: &Path, work_tree: &Path, index: Option<&Path>, excludes_file: Option<&Path>) -> Command {
@@ -113,7 +123,8 @@ pub fn command(git_dir: &Path, work_tree: &Path, index: Option<&Path>, excludes_
         .args(["-c", "core.autocrlf=false"])
         .args(["-c", "core.fsmonitor=false"])
         .args(["-c", "core.attributesFile=/dev/null"])
-        .args(["-c", "advice.addEmbeddedRepo=false"]);
+        .args(["-c", "advice.addEmbeddedRepo=false"])
+        .args(["-c", "protocol.allow=never"]);
     if let Some(excludes) = excludes_file {
         cmd.arg("-c").arg(prefixed("core.excludesFile=", excludes.as_os_str()));
     }
@@ -142,6 +153,7 @@ fn isolated(current_dir: &Path) -> Command {
         .env("GIT_CONFIG_GLOBAL", "/dev/null")
         .env("GIT_CONFIG_NOSYSTEM", "1")
         .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GIT_NO_LAZY_FETCH", "1")
         .env("GIT_AUTHOR_NAME", IDENTITY_NAME)
         .env("GIT_COMMITTER_NAME", IDENTITY_NAME)
         .env("GIT_AUTHOR_EMAIL", IDENTITY_EMAIL)
@@ -505,6 +517,7 @@ mod tests {
             "GIT_CONFIG_GLOBAL",
             "GIT_CONFIG_NOSYSTEM",
             "GIT_INDEX_FILE",
+            "GIT_NO_LAZY_FETCH",
             "GIT_TERMINAL_PROMPT",
             "LC_ALL",
         ]
@@ -523,6 +536,7 @@ mod tests {
         assert_eq!(args[1], "--work-tree=/w");
         assert!(args.windows(2).any(|w| w == ["-c", "core.quotepath=false"]));
         assert!(args.windows(2).any(|w| w == ["-c", "core.excludesFile=/x"]));
+        assert!(args.windows(2).any(|w| w == ["-c", "protocol.allow=never"]));
     }
 
     /// A run that floods standard error keeps its start and still ends: the rest is read and dropped, never held. Run

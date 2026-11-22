@@ -360,6 +360,7 @@ lives on another Linux machine, over ssh (experimental, off by default). Your Ne
   inner corners show its own colour instead of the desktop. In compositor mode, a burst of window closes keeps a
   group's tabs.
 - Neovim's snippet and socket directories live only where no other user can swap them.
+- Turn review no longer runs a nested repository's git hooks or filters when it takes its snapshot.
 
 **What this can break:**
 
