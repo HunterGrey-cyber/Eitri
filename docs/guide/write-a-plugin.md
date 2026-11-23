@@ -481,8 +481,7 @@ message naming it, so an older Eitri never half-loads a newer plugin.
 
 A module that lists the agents waiting for you, oldest first, from every window: `j` and `k` move through the list,
 `Enter` (or a click) goes to that agent's chat with its card in front, and `q` gives the keys back to the editor.
-The same four files are in Eitri's source tree under `examples/plugins/waiting-list/`, and Eitri's tests load them
-there.
+The same four files are in Eitri's source tree under `examples/plugins/waiting-list/`.
 
 ```text
 ~/.local/share/eitri/plugins/waiting-list/

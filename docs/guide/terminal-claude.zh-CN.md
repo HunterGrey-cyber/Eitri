@@ -1,5 +1,5 @@
 [English](terminal-claude.md) | 简体中文
-<!-- translated-from: terminal-claude.md sha256=dba9d8ef81db37b142df597845e1cb3ac23bf6ba088f8efd998d4834597cb461 -->
+<!-- translated-from: terminal-claude.md sha256=8d2e02e16f5d618a71cc80ef9153bf8d1f14e09abbda0d1821c383158dd6c2fb -->
 
 # 终端里的 `claude`
 
@@ -7,7 +7,7 @@
 
 这个 `claude` 不是 Eitri 的标签页。它在 agent 面板里没有行，没有 Eitri 的权限卡片、模式或已保存的规则，也没有回合审阅；它保留自己的提示、模式和配置。Eitri 只是给它一条通向你的编辑器的路。
 
-这是按 Claude Code 2.1.311 的协议做的，并用一个说同样协议的替身客户端测试过。它还没有和真正的交互式 `claude` 一起运行过，所以请当作未经试用：这里没有任何一句话保证你的 `claude` 会连上或按所述工作。
+这是按 Claude Code 2.1.311 的协议做的。它还没有和交互式的 `claude` 一起试过，所以请当作未经试用：这里没有任何一句话保证你的 `claude` 会连上或按所述工作。
 
 ## 打开它
 

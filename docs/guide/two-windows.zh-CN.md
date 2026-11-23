@@ -1,5 +1,5 @@
 [English](two-windows.md) | 简体中文
-<!-- translated-from: two-windows.md sha256=bbb98be2dbc2e2ef5cfc7d946fe4cdddc4384d801786affc67dcc8a7a0f9e8fc -->
+<!-- translated-from: two-windows.md sha256=859b00e49525a7e96018ccc5cbdea9d970c804a6a72280d6d9fc9629780a9cef -->
 
 # 两个窗口
 
@@ -76,4 +76,4 @@ k.set("prefix", "F8", "workspace.to-window")
 
 ## 试过什么
 
-两个窗口在 sway 上跑过，有两个输出，用一个替身模型：移动、跨边缘的按键、一个窗口结束又回来、在记住的显示器上重启，以及上面的内存数字。Markdown 预览和一个被移动的聊天都看到过正常到达。GNOME 的令牌式切到前台在一次探测里试过，没有配合这对窗口试。在 Hyprland 0.57 和 0.56.2 上，只试过边缘处的按键，一个输出和两个输出都试了。niri 和 KDE 都还没有试过；欢迎反馈。其余的见[已知问题](../known-issues.zh-CN.md)。
+两个窗口在 sway 上试过，有两个输出：移动、跨边缘的按键、一个窗口结束又回来、在记住的显示器上重启，以及上面的内存数字。Markdown 预览和一个被移动的聊天都看到过正常到达。GNOME 的令牌式切到前台还没有配合这对窗口试过。在 Hyprland 0.57 和 0.56.2 上，只试过边缘处的按键，一个输出和两个输出都试了。niri 和 KDE 都还没有试过；欢迎反馈。其余的见[已知问题](../known-issues.zh-CN.md)。

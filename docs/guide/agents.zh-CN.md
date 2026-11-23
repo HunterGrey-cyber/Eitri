@@ -1,5 +1,5 @@
 [English](agents.md) | 简体中文
-<!-- translated-from: agents.md sha256=820a585793f1411c4bbbb09f0e5754dfc2a01e5e059b512d0ede36f34ceaafba -->
+<!-- translated-from: agents.md sha256=09636381d47552a537ea3ddb728ab7b73b5e6ba8ceb86b6f910aca118468a9d4 -->
 
 # Codex 与其他 agent
 
@@ -143,7 +143,7 @@ Claude Code 终端里把正在运行的前台命令移到后台的 `Ctrl+B`，�
 ### 需要什么
 
 - `codex` 命令，已经安装并配置好（`codex login`）。没配置好时，标签页会说 “Codex is not signed in: run `codex login` in a terminal”。
-- Codex 0.160.0 或更新。Eitri 的 Codex 测试跑过从 0.160.0 到 0.166.0 的每个版本；标签页的 `agent` 一行会这么写。更新的 Codex 仍然能运行，这一行会写 “untested Codex”，后面跟着它的版本和试过的最新版本。更旧的会被拒绝，并提示 “update Codex”。
+- Codex 0.160.0 或更新。Eitri 在从 0.160.0 到 0.166.0 的每个版本上试过；标签页的 `agent` 一行会这么写。更新的 Codex 仍然能运行，这一行会写 “untested Codex”，后面跟着它的版本和试过的最新版本。更旧的会被拒绝，并提示 “update Codex”。
 
 Eitri 按这个顺序挑选程序：环境变量 `EITRI_CODEX`（一个文件的绝对路径），然后是 `init.lua` 里的 `agent.codex.command`（绝对路径，或在 `PATH` 里查找的裸命令名），然后是 `PATH` 上的 `codex`，`PATH` 上没有时再去 Codex 的安装程序放它的地方找（从桌面启动器打开的窗口常常没有 `~/.local/bin`）：先是 `~/.local/bin/codex`（独立安装程序），再是你自己设过的 npm 全局前缀下的 `bin` 目录（`NPM_CONFIG_PREFIX`，或 `~/.npmrc` 里的 `prefix`）；每一个都只在它是你能运行的普通文件、属于你或 root、而且它本身和通往它的每一个目录都不能被其他用户写入时才会用。`EITRI_CODEX` 不是一个现有文件的绝对路径，Eitri 会在启动时停下并点出这个变量；`agent.codex.command` 是带目录部分的相对路径时也一样。其他找不到 `codex` 的情况只让 Codex 标签页的启动失败：哪里都没找到时，消息是 “codex not found in PATH, ~/.local/bin, npm's global bin: install it and run `codex login`, or set EITRI_CODEX”，而 `agent.codex.command` 指向的文件不存在时，消息会点出它的名字。`PATH` 里为空或相对的条目会被跳过，因为 agent 是在你的项目目录里运行的，这样的条目会指向项目自己放的文件。
 
@@ -329,4 +329,4 @@ agent 面板，或者任何一个[聊天视图](#chat-views)，可以放在一�
 - **你的钩子可能抢先回答。** 你自己的 Codex 配置里的 `PermissionRequest` 钩子，可能在 Eitri 看到请求之前就回答了它。钩子能否在你批准之后改写命令，还没有测过。
 - **Codex 的沙箱能读到你能读到的任何地方。** 它不是保护机密的边界。
 - **这些 agent 没有 Eitri 一侧的分类器或保存的规则。** Claude 标签页的权限检查是 Claude 独有的。
-- **这些标签页是新的。** 这里描述的大部分内容是拿替身试过的，并没有在每一种环境上试过；[已知问题](../known-issues.zh-CN.md#codex-and-acp-tabs)列出了还没解决的。
+- **这些标签页是新的。** 它们只和 Codex 本身以及 `codex-acp` 适配器一起试过几次，也没有在每一种环境上试过；[已知问题](../known-issues.zh-CN.md#codex-and-acp-tabs)列出了还没解决的。

@@ -1,5 +1,5 @@
 [English](many-agents.md) | 简体中文
-<!-- translated-from: many-agents.md sha256=79a25f415bcd6a1f6b9cba7eaea5380a7a5920e8ce27fbfec449e49315bbf9e1 -->
+<!-- translated-from: many-agents.md sha256=e31440e6195db79cd262592eac07c05dc8809f3c3bdfe5c0f81c490c265cadce -->
 
 # 同时用很多 agent
 
@@ -193,7 +193,7 @@ done
 
 它发出去的那一行里有项目的文件夹名，这个名字因此会离开这台机器，发到你的服务器；标签来自你的提示词，不在其中。运行方式是 `NTFY_URL=https://ntfy.example.com/my-agents eitri-ntfy`，换成你服务器的地址和一个别人猜不到的主题名。
 
-本页的五个脚本在 Eitri 源码树的 `examples/agents/` 下，附有测试用的录制好的行。
+本页的五个脚本在 Eitri 源码树的 `examples/agents/` 下，录制好的示例行在 `examples/agents/fixtures/` 里。
 
 <a id="write-your-own-page"></a>
 ## 写你自己的页面

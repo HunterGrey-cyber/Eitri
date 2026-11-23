@@ -11,9 +11,8 @@ That `claude` is not an Eitri tab. It has no row in the agent panel, none of Eit
 rules, and no turn review; it keeps its own prompts, modes and configuration. Eitri only gives it a way to reach your
 editor.
 
-This was built against the protocol of Claude Code 2.1.311 and tested with a stand-in client that speaks it. It has
-not yet been run with a real interactive `claude`, so treat it as untried: nothing here promises that your `claude`
-attaches or behaves as described.
+This was built against the protocol of Claude Code 2.1.311. It has not yet been tried with an interactive
+`claude`, so treat it as untried: nothing here promises that your `claude` attaches or behaves as described.
 
 ## Turn it on
 

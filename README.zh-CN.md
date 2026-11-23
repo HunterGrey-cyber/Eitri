@@ -1,5 +1,5 @@
 [English](README.md) | 简体中文
-<!-- translated-from: README.md sha256=109302877037351da3c7e559508b1c3f741299c97fdad286fe242512a0153ee0 -->
+<!-- translated-from: README.md sha256=27aa1ce2b483267325ddd55b49c64406d4d51ff49ef85e0ad6f7b41accc8e63d -->
 
 <div align="center">
 
@@ -111,6 +111,6 @@ Logo 的蓝绿两色取自 Jason Long 设计的 [Neovim logo](https://neovim.io)
 
 ## Eitri 是怎么做出来的
 
-Eitri 的大部分代码由编程 agent（Claude Code 和 Codex）编写。Hunter Grey 定方向，在几种设计之间做选择，在出错代价最大的地方仔细看，发现不对就介入。改动带着测试一起写，分支合并之前跑完整的测试套件。
+Eitri 的大部分代码由编程 agent（Claude Code 和 Codex）编写。Hunter Grey 定方向，在几种设计之间做选择，在出错代价最大的地方仔细看，发现不对就介入。改动带着测试一起写。
 
 Eitri 就是为这种工作方式做的。agent 在编辑器旁边的标签页里干活；你在要紧的地方看它改了什么，它跑偏了就把它拉回来。

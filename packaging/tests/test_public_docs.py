@@ -725,6 +725,105 @@ class KnownIssuesAnchorsTests(unittest.TestCase):
             self.assertIn("../known-issues.zh-CN.md#codex-and-acp-tabs", stream.read())
 
 
+#
+# What readers see says what has been tried and what has not, never how: no word about headless or automated runs,
+# scripted or stand-in models, harnesses, rows or suites that passed, or a test account. Product features that use
+# such words (the Codex self-check's scripted conversation, a tmux stand-in, scripted launches) are the allow list,
+# phrase by phrase and page by page. Text is matched with its line breaks folded into spaces, so a phrase wrapped
+# across two lines is still found.
+_METHOD_WORDING = [re.compile(p, re.IGNORECASE) for p in (
+    r"\bhead-?less\b",
+    r"\bautomat(?:ed|ion)\b",
+    r"\bscripted\b",
+    r"\bstand-?ins?\b",
+    r"\bxvfb\b",
+    r"\bharness(?:es)?\b",
+    r"\btest accounts?\b",
+    r"\bsandbox(?:ed)? (?:pass|run)(?:es)?\b",
+    r"\b(?:machine|screen|window) checks?\b",
+    r"\bfake (?:language servers?|models?|clients?|agents?)\b",
+    r"\bsuites?\b",
+    r"\b(?:all|every) (?:\d+ )?rows? of\b",
+    r"\b\d+ of \d+ (?:rows|checks)\b",
+    r"\bpass(?:ed|es)? (?:all |every |their |its )?(?:\d+ )?(?:of \d+ )?(?:rows|checks)\b",
+    r"无头", r"自动化", r"脚本化", r"替身", r"测试账号", r"测试套件", r"窗口检查", r"通过了[^。；]{0,8}检查",
+    r"假的?语言服务器",
+)]
+_METHOD_WORDING_ALLOWED = {
+    "CONTRIBUTING.md": ("a green test suite",),
+    "docs/guide/agents.md": ("runs a short scripted conversation", "against a stand-in model on your own machine"),
+    "docs/guide/agents.zh-CN.md": ("对一个替身模型跑一段几秒钟的脚本化对话",),
+    "docs/guide/configuration.md": ("scripted launches",),
+    "docs/guide/configuration.zh-CN.md": ("脚本化的启动",),
+    "docs/guide/takeover.md": ("its own stand-in", "reaches that stand-in"),
+    "docs/guide/takeover.zh-CN.md": ("它自己的替身", "到达的是那个替身"),
+}
+
+
+def _fold(text):
+    return re.sub(r"\s+", " ", text)
+
+
+def method_wording_hits(text, allowed=()):
+    """Every phrase in `text` that tells how Eitri was tested, with the `allowed` phrases taken out first."""
+    folded = _fold(text)
+    for phrase in allowed:
+        folded = folded.replace(_fold(phrase), " ")
+    hits = []
+    for pattern in _METHOD_WORDING:
+        for m in pattern.finditer(folded):
+            hits.append(folded[max(0, m.start() - 40):m.end() + 40].strip())
+    return hits
+
+
+def _reader_pages():
+    """The pages readers see, as paths relative to public_docs_dir(): the top level, docs/, docs/guide/ and
+    docs/releases/ (in the public tree, other directories under docs/ are exported repository files)."""
+    pages = []
+    for sub in ("", "docs", "docs/guide", "docs/releases"):
+        directory = os.path.join(_PUBLISH_FILES, sub)
+        pages.extend(os.path.join(sub, n) if sub else n for n in sorted(os.listdir(directory)) if n.endswith(".md"))
+    return pages
+
+
+class NoTestingMethodInPublicTextTests(unittest.TestCase):
+    """The public pages and the release body (packaging/release-notes.md.in) carry no testing-method wording."""
+
+    def test_the_public_pages_say_nothing_about_how_eitri_was_tested(self):
+        problems = []
+        pages = _reader_pages()
+        self.assertIn("docs/known-issues.md", pages)
+        for page in pages:
+            with open(os.path.join(_PUBLISH_FILES, page), encoding="utf-8") as f:
+                text = f.read()
+            problems.extend(f"{page}: ...{hit}..." for hit in method_wording_hits(text, _METHOD_WORDING_ALLOWED.get(page, ())))
+        self.assertEqual(problems, [], "\n" + "\n".join(problems))
+
+    def test_the_release_body_says_nothing_about_how_eitri_was_tested(self):
+        with open(_RELEASE_NOTES_IN, encoding="utf-8") as f:
+            hits = method_wording_hits(f.read())
+        self.assertEqual(hits, [], "\npackaging/release-notes.md.in: " + "\n".join(hits))
+
+    def test_every_allowed_phrase_is_still_on_its_page(self):
+        for page, phrases in _METHOD_WORDING_ALLOWED.items():
+            with open(os.path.join(_PUBLISH_FILES, page), encoding="utf-8") as f:
+                folded = _fold(f.read())
+            for phrase in phrases:
+                self.assertIn(_fold(phrase), folded, f"{page}: the allowed phrase {phrase!r} is gone; drop it here")
+
+    def test_the_patterns_catch_testing_method_and_spare_product_text(self):
+        for text in ("tests ran headless", "Everything new has automated tests.", "passed their scripted\nsuites",
+                     "against a local stand-in", "the test account reached the model service's rate limit",
+                     "passed every row of their checks", "passed 60 of 60 checks", "passed all 17 rows of its",
+                     "ran against a fake language server", "Live review passed the machine checks",
+                     "对真实 Claude Code 的自动化运行", "用脚本化的模型服务检查的", "拿替身模型试过", "通过了全部 17 行窗口检查"):
+            self.assertTrue(method_wording_hits(text), text)
+        for text in ("Not tried yet: GNOME's raise.", "the checks below pass", "an automatic restore",
+                     "It probes the server", "a row of titles above it", "A newer Codex runs and is marked untested."):
+            self.assertEqual(method_wording_hits(text), [], text)
+        self.assertEqual(method_wording_hits("it runs a short\nscripted conversation", ("runs a short scripted conversation",)), [])
+
+
 class PublicTreeLayoutTests(unittest.TestCase):
     """This suite ships in the public tree (publish/manifest.txt's `include packaging/*`) and must pass
     there too, where there is no publish/ at all and publish/files/ has been copied over the root by

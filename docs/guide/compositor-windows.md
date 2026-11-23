@@ -264,13 +264,11 @@ compositors too.
 
 ## What has been tried
 
-All of this ran with a stand-in model:
-
-- **sway 1.12**: every row of the pass, including an output that returns after the start.
+- **sway 1.12**: windows, rules, focus moves, outputs (including one that returns after the start), restart, the off
+  keys and the edge keys.
 - **Hyprland 0.57** with a Lua config, and **0.56.2** with `hyprland.conf` and with a Lua config:
-  windows, rules, restart on two outputs, the off keys and the edge keys pass.
-- **niri 26.04**: windows, rules and focus moves pass. Its outputs,
-  restart and the off keys were not run.
+  windows, rules, restart on two outputs, the off keys and the edge keys.
+- **niri 26.04**: windows, rules and focus moves. Its outputs, restart and the off keys have not been tried.
 
-GNOME, KDE and a real `claude` or `codex` in these windows have not been tried. Reports are welcome. The
+GNOME, KDE, and Claude Code or Codex at work in these windows have not been tried. Reports are welcome. The
 [known issues](../known-issues.md) list the rest.

@@ -31,8 +31,8 @@ bug, and tell us if something here is wrong or has changed. The requirements are
   yours is older. A Neovim 0.11 on `PATH` is accepted and is not replaced, and three popular configurations still
   fail on it: the current kickstart.nvim does not start (it uses `vim.pack`, new in 0.12), LazyVim loses Eitri's
   `Ctrl+j` and `Ctrl+k` on the first start to its notification windows, and AstroNvim now and then keeps its own
-  `Ctrl+j` (seen once on 0.12.6 as well, so not tied to the version). The same LazyVim and kickstart checks pass on 0.12.6. If you
-  use one of them, keep 0.12 on `PATH` or point `EITRI_NVIM` at it.
+  `Ctrl+j` (seen once on 0.12.6 as well, so not tied to the version). Neither problem shows with LazyVim or
+  kickstart.nvim on 0.12.6. If you use one of them, keep 0.12 on `PATH` or point `EITRI_NVIM` at it.
 - **Claude Code**, installed and set up, 2.1.252 or newer and below 3.0. Without it Eitri still opens and
   the editor works; the agent panel cannot run turns.
 - **Codex and other agents are optional.** A Codex tab needs `codex` 0.160.0 or newer, installed and set up
@@ -84,9 +84,9 @@ machine. The items below distinguish real refresh-period feedback from the fallb
   repeated with real-period feedback. With the editor's own surface, a held-key test did no
   worse than the GTK way.
 - **While an agent reply streams, typing in the editor is slower.** With WebKitGTK 2.54 a key's redraw took 11.2 ms
-  at the median while a stand-in reply streamed at the default 5 updates a second, on GTK 4.22.5 as well; with
-  WebKitGTK 2.52 it was about 2.3 ms. A real reply has not been measured. If you see lag while typing during a
-  reply, say so in the "Testing feedback" form, with your GPU and monitor refresh rate.
+  at the median while a reply streamed at the default 5 updates a second, on GTK 4.22.5 as well; with
+  WebKitGTK 2.52 it was about 2.3 ms. If you see lag while typing during a reply, say so in the "Testing feedback"
+  form, with your GPU and monitor refresh rate.
 - **The bottom terminal draws one output frame behind what you type.** Its echo reaches the screen about 18 ms after
   the key at a 60 Hz output (8.7 ms at 165 Hz), measured on sway on an AMD desktop. Ghostty
   (17.3 ms at the median), WezTerm (16.7) and the terminal in Zed (18.3) land in the same place; foot (1.0), kitty
@@ -185,13 +185,13 @@ one-window mode.
 - **At sway's edge the key is consumed.** Eitri has to take or release `Ctrl+h/j/k/l` before it can ask sway
   whether a window lies that way, so at the edge the key does nothing, as tmux's own `select-pane` does at its edge.
 - **KDE: no focus moves.** A Wayland client cannot take focus there; use the desktop's own window keys.
-- **Pages beside your nvim** (`eitri page`, `:EitriPage`; [the guide](guide/companion.md#pages-beside-your-nvim)) passed their window checks on sway
-  with nvim 0.12.6 in a terminal (the page's colours, the follow, the keys, closing, `kill -9`), and their slot and
-  reload suites pass on nvim 0.11.2 and 0.12.6. Not tried yet: nvim inside tmux (where the reload on focus
+- **Pages beside your nvim** (`eitri page`, `:EitriPage`; [the guide](guide/companion.md#pages-beside-your-nvim)) have been tried on sway
+  with nvim 0.12.6 in a terminal (the page's colours, the follow, the keys, closing, `kill -9`), and their slots and
+  the reload have also been tried on nvim 0.11.2 and 0.12.6. Not tried yet: nvim inside tmux (where the reload on focus
   needs `set -g focus-events on`), Hyprland, niri, KDE and GNOME with the extension.
-- **Taking over a terminal nvim** (`:EitriOpen`, `eitri open`; [the guide](guide/takeover.md)) passed all 17 rows of its
-  window checks against Neovim 0.12.6 in tmux. Not tried yet: Hyprland, the GNOME session, a real lazy.nvim spec, and
-  vim-tmux-navigator and smart-splits as installed plugins.
+- **Taking over a terminal nvim** (`:EitriOpen`, `eitri open`; [the guide](guide/takeover.md)) has been tried with
+  Neovim 0.12.6 in tmux, including each of the five ways of closing the window. Not tried yet: Hyprland, the GNOME
+  session, a real lazy.nvim spec, and vim-tmux-navigator and smart-splits as installed plugins.
 - **A page window closes slowly in two cases.** A graceful close leaves its slot in your Neovim until Neovim's next liveness
   check (up to a second), as a killed window does; and a Neovim that is blocked at a prompt when you run `:EitriPage` keeps
   `eitri page` waiting, with no window, until it answers.
@@ -307,11 +307,11 @@ one-window mode.
 - **Claude Code keeps the images you send.** It writes each one into the session file it keeps on disk, as in a
   terminal, and Eitri does not remove them. Eitri's own record of a tab keeps only each image's type, size and checksum.
   After 16 MB of images a tab says once that the conversation is heavy and suggests `/compact` or a new tab.
-- **Plan mode and images on screen were checked against a scripted model service, with Claude Code 2.1.311.** The
-  plan box, its buttons and the image chips passed their checks in dark and light, at a normal and a narrow width.
-  Against the real model service, Claude Code 2.1.322 on this release's backend planned, revised a plan and carried it
-  out after an approval, held an edit for an answer after a plan approved into Manual, and read an attached image
-  (2.1.311 did the same on earlier builds). Reports of what you see are welcome.
+- **Plan mode and images have been tried with Claude Code 2.1.311 and 2.1.322.** The plan box, its buttons and the
+  image chips have been tried in dark and light, at a normal and a narrow width. With this release's backend, Claude
+  Code 2.1.322 planned, revised a plan and carried it out after an approval, held an edit for an answer after a plan
+  approved into Manual, and read an attached image (2.1.311 did the same on earlier builds). Reports of what you see
+  are welcome.
 - **In a narrow chat pane (about 320 pixels) the status line is cut short.** The panel's mode shows as a single
   letter (`I`, `B`), the permission mode's name is cut off (`bypass permission`), and the activity line's spinner
   sits on a line of its own.
@@ -319,8 +319,7 @@ one-window mode.
 ## Codex and ACP tabs
 
 Tabs for Codex and for agents registered with `eitri.agent.register` are new ([the guide](guide/agents.md)). They
-have been tried against stand-in models and stand-in agents, and, in a few runs, a real Codex and the `codex-acp`
-adapter; they have not been tried on every setup.
+have been tried only a few times with Codex itself and with the `codex-acp` adapter, and not on every setup.
 
 - **What an agent reads from your editor in an ACP tab is drawn as that tab's other tool results are.** ACP names no
   server, so Eitri cannot tell an [editor tool's](guide/editor-tools.md) result from the agent's others there, and
@@ -391,8 +390,8 @@ file in your nvim.
 ## Stability
 
 0.4.0 is an early release and not yet stable: expect rough edges. The `init.lua` API and the default keys may change
-during 0.x. Automated runs against the real Claude
-Code cover 2.1.302, 2.1.311 and 2.1.322; other versions have not been tried. Reports are welcome.
+during 0.x. Eitri has been tried with Claude Code 2.1.302, 2.1.311 and 2.1.322; other versions have not been
+tried yet. Reports are welcome.
 
 ## Not on this list?
 

@@ -118,7 +118,7 @@ The logo's blue and green come from the [Neovim logo](https://neovim.io) by Jaso
 
 Most of Eitri's code is written by coding agents, Claude Code and Codex. Hunter Grey sets the direction, chooses
 between designs, reads closely where a mistake would cost the most, and steps in when something is off. Changes come
-with their tests, and the full test suites run before a branch is merged.
+with their tests.
 
 Eitri is built for working this way. An agent works in a tab beside your editor; you read its changes where they
 matter and steer it when it drifts.

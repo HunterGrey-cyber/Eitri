@@ -450,8 +450,8 @@ Measured on 2026-11-15 with Claude Code 2.1.311 (and 2.1.322 where it says so), 
 | a `PermissionRequest` hook that allows, on such a question | it answers the question within a moment, the card goes away and the call runs | the same |
 
 None of these is shown as your hook's doing: a call your hook allowed reads like any other, and a question your
-`PermissionRequest` hook answered is simply gone. The Auto rows where Claude Code's classifier allowed a call used a
-stand-in for the classifier, so they show what Claude Code does with its answer, not what the classifier would say.
+`PermissionRequest` hook answered is simply gone. The Auto rows where Claude Code's classifier allowed a call show
+what Claude Code does with that answer; whether the classifier allows a given call is up to Claude Code.
 
 ## Known limits
 

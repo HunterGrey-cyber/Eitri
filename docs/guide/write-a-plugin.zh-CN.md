@@ -1,5 +1,5 @@
 [English](write-a-plugin.md) | 简体中文
-<!-- translated-from: write-a-plugin.md sha256=f357f1d5b0d4ab27390c0d394b5ffc82e4e1b66c8a048af48bd82a11180ff006 -->
+<!-- translated-from: write-a-plugin.md sha256=16f3ecb5e79fc5e50fbd163ea72b581bbe71e0cfbbf7259ab96b36fcd609fde8 -->
 
 # 写一个插件
 
@@ -352,7 +352,7 @@ try {
 <a id="a-complete-example-who-waits"></a>
 ## 一个完整的例子：谁在等
 
-一个列出在等你的 agent 的模块，来自每个窗口，最早的在前：`j` 和 `k` 在列表里移动，`Enter`（或一次点击）去到那个 agent 的聊天，卡片摆在最前，`q` 把按键还给编辑器。同样的四个文件在 Eitri 源码树的 `examples/plugins/waiting-list/` 下，Eitri 的测试会从那里加载它们。
+一个列出在等你的 agent 的模块，来自每个窗口，最早的在前：`j` 和 `k` 在列表里移动，`Enter`（或一次点击）去到那个 agent 的聊天，卡片摆在最前，`q` 把按键还给编辑器。同样的四个文件在 Eitri 源码树的 `examples/plugins/waiting-list/` 下。
 
 ```text
 ~/.local/share/eitri/plugins/waiting-list/

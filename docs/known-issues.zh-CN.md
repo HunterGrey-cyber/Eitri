@@ -1,5 +1,5 @@
 [English](known-issues.md) | 简体中文
-<!-- translated-from: known-issues.md sha256=eb0b8f804dee43de80ce1f4468f436940642680218fcf9fb9d633f053bf6802a -->
+<!-- translated-from: known-issues.md sha256=2ab7a515516e6a9184dc403a57b64c922ddbff6648e7a761091148e3db2afae6 -->
 
 # 已知问题与限制
 
@@ -12,7 +12,7 @@
 - **[合成器窗口](guide/compositor-windows.zh-CN.md)**是 Hyprland、sway 和 niri 上的默认行为，还很新，有一些地方不符合预期：见指南里的[已知缺口](guide/compositor-windows.zh-CN.md#known-gaps)。
 - **[远程开发](guide/remote-development.zh-CN.md)是实验性功能，默认关闭**（`remote_dev.enabled`）。笔记本需要是 Linux（macOS 默认不区分大小写的文件系统还没有处理），并且要自己装好 Mutagen。远程标签页还不能用回合审阅。其余限制见指南里的[这个版本里没有的](guide/remote-development.zh-CN.md#what-is-not-in-this-version)。
 - **需要 WebKitGTK 2.40 或更新**（`webkitgtk-6.0` API）。预构建二进制按 glibc 2.39 和 GTK 4.14 构建，更旧的版本没有测试过。Ubuntu 24.04、Debian 13、Fedora 40+、RHEL 10 和 Arch 满足要求；Ubuntu 22.04 和 Debian 12 不满足。
-- **Neovim 0.11 或更新**：用你自己 `PATH` 里的，或者让安装脚本在你的版本更旧时为 Eitri 单独下载一份私有副本（0.12.6）。`PATH` 里的 Neovim 0.11 会被接受，也不会被替换，但有三个常见配置在它上面仍有问题：当前的 kickstart.nvim 无法启动（它用了 0.12 才有的 `vim.pack`）；LazyVim 在第一次启动时，`Ctrl+j` 和 `Ctrl+k` 会被它的通知浮窗抢走，Eitri 收不到；AstroNvim 偶尔会保留它自己的 `Ctrl+j`（在 0.12.6 上也出现过一次，所以和版本无关）。LazyVim 和 kickstart 的这两项在 0.12.6 上都通过。如果你用其中之一，请让 `PATH` 里是 0.12，或者用 `EITRI_NVIM` 指向它。
+- **Neovim 0.11 或更新**：用你自己 `PATH` 里的，或者让安装脚本在你的版本更旧时为 Eitri 单独下载一份私有副本（0.12.6）。`PATH` 里的 Neovim 0.11 会被接受，也不会被替换，但有三个常见配置在它上面仍有问题：当前的 kickstart.nvim 无法启动（它用了 0.12 才有的 `vim.pack`）；LazyVim 在第一次启动时，`Ctrl+j` 和 `Ctrl+k` 会被它的通知浮窗抢走，Eitri 收不到；AstroNvim 偶尔会保留它自己的 `Ctrl+j`（在 0.12.6 上也出现过一次，所以和版本无关）。在 0.12.6 上，LazyVim 和 kickstart.nvim 都没有这两个问题。如果你用其中之一，请让 `PATH` 里是 0.12，或者用 `EITRI_NVIM` 指向它。
 - **Claude Code**，已安装并配置好，2.1.252 或更新，低于 3.0。没有它时 Eitri 照样能打开，编辑器可以用；agent 面板没法运行对话。
 - **Codex 和其他 agent 是可选的。** Codex 标签页需要 0.160.0 或更新的 `codex`，已安装并配置好（测试过从 0.160.0 到 0.166.0 的每个版本）；其他 agent 的标签页需要一个通过标准输入输出说 ACP 第 1 版的 agent。见 [Codex 与其他 agent](guide/agents.zh-CN.md)。
 
@@ -31,7 +31,7 @@
 
 - **用 GTK 的方式绘制时，编辑器在 GTK 4.24 上慢一个刷新周期。** 默认情况下那里不用这种方式：在 Wayland 上、GTK 4.24 或更新、显卡驱动不是 NVIDIA 的时候，编辑器把它的帧放在自己的一个表面上直接交给合成器（[编辑器怎样到达屏幕](guide/editor-presentation.zh-CN.md)），在 sway 和 Mutter 上、60 和 165 Hz 下，打出的字母到达屏幕的时间中位数只比原生 Neovide 晚 0.02 到 0.46 ms。X11、NVIDIA 的驱动、`editor.presentation = "gtk"`，以及回退之后（编辑器会打印原因），仍然用 GTK 的方式。在那种情况下，合成器向 GTK 提供真实的 165 Hz 周期时，GTK 4.24.1 的打字中位数多 5.97 ms，同一个构建用 GTK 4.22.5 时只多 0.30 ms；GTK 使用 60 Hz 回退时钟时，约多 16.5 ms。一个 156 行的纯 GTK 复现程序在 GTK 开发分支（4.25.0，提交 c36202f6，2026-10-25）上也测到了这个延迟。编辑器自己的表面还没有在 NVIDIA 或 KWin 上试过。
 - **用 GTK 的方式绘制时，在 GTK 4.24、165 Hz 的输出上按住 `j` 滚动会掉帧。** 原生 Neovide 每秒画出 165.5 个有变化的帧，Eitri 用 GTK 4.24.1 时为 140.6，同一个构建用 GTK 4.22.5 时为 165.4。第 99 百分位的帧间隔依次为 6.1、12.1 和 6.1 ms。这是另一次滚动测量，使用原样的呈现反馈，因此 GTK 4.24 仍使用 60 Hz 回退时钟；滚动还没有用真实周期反馈重测。用编辑器自己的表面时，一项按住键的测试不比 GTK 的方式差。
-- **agent 回复流式输出时，在编辑器里打字会变慢。** 在 WebKitGTK 2.54 上，替身回复按默认每秒 5 次更新输出时，一次按键的重绘中位数是 11.2 ms，GTK 4.22.5 上也一样；在 WebKitGTK 2.52 上约为 2.3 ms。真实的回复还没有测过。如果你在回复期间打字时觉得卡，请在「Testing feedback」表单里告诉我们，并附上你的 GPU 和显示器刷新率。
+- **agent 回复流式输出时，在编辑器里打字会变慢。** 在 WebKitGTK 2.54 上，回复按默认每秒 5 次更新输出时，一次按键的重绘中位数是 11.2 ms，GTK 4.22.5 上也一样；在 WebKitGTK 2.52 上约为 2.3 ms。如果你在回复期间打字时觉得卡，请在「Testing feedback」表单里告诉我们，并附上你的 GPU 和显示器刷新率。
 - **底部终端比你的按键晚画一个输出帧。** 在 60 Hz 的输出上，回显要在按键后约 18 ms 才出现在屏幕上（165 Hz 时是 8.7 ms），这是在 AMD 台式机上的 sway 里测的。Ghostty（中位数 17.3 ms）、WezTerm（16.7）和 Zed 里的终端（18.3）落在同一个位置；foot（1.0）、kitty（0.7）和 alacritty（0.7）则立刻画出来。原因是 GTK 4.24 每按一个键会对窗口提交两次，合成器要晚一个刷新周期才显示第二次；终端在 GTK 的帧时钟里绘制，而编辑器不是。我们试过去掉第一次提交，结果打字更慢了（两种刷新率下都约 20 ms），所以没有发布。想要最低的延迟，就在编辑器里运行 Neovim 自己的 `:terminal`，它和编辑器用同一种方式绘制（同一轮测试里，在缓冲区里打字的中位数是 1.7 ms）。`:terminal` 缓冲区本身的延迟没有测过。
 - **内存：** 只开一个标签页的闲置窗口，面板在窗口里面时比原生 Neovide 多用 232 MiB；在合成器模式下（面板是一个单独的窗口，平铺式合成器上的默认方式）多用 245 MiB。两者都在我们定的 256 MiB 以内。这是 0.3.0 之后的开发版本在一块 AMD Radeon RX 9070 上测的；换成与它同机的集成显卡，窗口多用 248 到 259 MiB。第一个 Claude 标签页约多用 85 MiB，其中包括它的 sidecar（占 79 MiB）；之后每多一个标签页约多 63 MiB（其中约 55 MiB 是它自己的 sidecar）。每个 Claude 会话还会运行你自己安装的 `claude` CLI。那是你的程序，不是 Eitri 的一部分：闲置时每个会话约 109 MiB，回合进行时更多，不算在上面这些数字里。
 - **0.3.0 里，闲置会话的 sidecar 会一直涨；0.4.0 修好了。** 七个会话闲置时，每个 sidecar 每小时涨 30 到 47 MB，三小时内没有停下来的迹象。每五分钟强制一次垃圾回收也没有让它变慢，所以这是 sidecar 仍然握着的内存，不是还没来得及回收的内存。按这个速度，开着五个标签页放一周的窗口会涨到约 30 GB（外推得出，没有实际跑过）。退出窗口就会还回去。0.4.0 自带 sidecar 0.5.0，其中包含 sidecar 0.3.0 首次做的修复：在同一个 25 分钟、单个闲置会话的测试里，sidecar 0.3.0 的内存从第五分钟起一直是 102.6 MB，而 Eitri 0.3.0 的每小时涨 22 MB（其中 JavaScript 堆每小时涨 44 MB，sidecar 0.3.0 只有 0.3 MB）。在 0.3.0 之后的开发版本上，一个窗口里四个闲置会话的 sidecar 30 分钟里合计一直是 248 MiB，每个的变化都在 0.1 MiB 以内。0.3.0 无法通过 sidecar 更新拿到这个修复。
@@ -71,8 +71,8 @@ Companion 模式是把 agent 面板作为一个独立窗口，开在你自己的
 - **`foot --server` 的客户端共用同一个 pid**，所以按进程把编辑器提到前面时，可能提起同一个 server 的另一个 foot 窗口，而不是装着你那个 nvim 的窗口。
 - **在 sway 的边缘，这个按键会被吞掉。** Eitri 必须先接管或放行 `Ctrl+h/j/k/l`，才能去问 sway 那个方向上有没有窗口，所以在边缘上这个按键什么也不做，和 tmux 自己的 `select-pane` 在它的边缘上一样。
 - **KDE：不移动焦点。** 在那里 Wayland 客户端没法抢到焦点；请用桌面自己的窗口键。
-- **开在你 nvim 旁边的页面**（`eitri page`、`:EitriPage`；[使用指南](guide/companion.zh-CN.md#pages-beside-your-nvim)）在 sway 上配合终端里的 nvim 0.12.6 通过了窗口检查（页面的配色、跟随、按键、关闭、`kill -9`），它的槽位和重新加载测试在 nvim 0.11.2 和 0.12.6 上都通过。还没有试过：tmux 里的 nvim（那里聚焦时的重新加载需要 `set -g focus-events on`）、Hyprland、niri、KDE 和启用了扩展的 GNOME。
-- **接管终端里的 nvim**（`:EitriOpen`、`eitri open`；[指南](guide/takeover.zh-CN.md)）在 tmux 里的 Neovim 0.12.6 上通过了全部 17 行窗口检查。还没有试过：Hyprland 和 GNOME 会话、真实的 lazy.nvim 配置，以及作为已安装插件的 vim-tmux-navigator 和 smart-splits。
+- **开在你 nvim 旁边的页面**（`eitri page`、`:EitriPage`；[使用指南](guide/companion.zh-CN.md#pages-beside-your-nvim)）在 sway 上配合终端里的 nvim 0.12.6 试过（页面的配色、跟随、按键、关闭、`kill -9`），它的槽位和重新加载在 nvim 0.11.2 和 0.12.6 上也试过。还没有试过：tmux 里的 nvim（那里聚焦时的重新加载需要 `set -g focus-events on`）、Hyprland、niri、KDE 和启用了扩展的 GNOME。
+- **接管终端里的 nvim**（`:EitriOpen`、`eitri open`；[指南](guide/takeover.zh-CN.md)）在 tmux 里的 Neovim 0.12.6 上试过，关掉窗口的五种方式都在内。还没有试过：Hyprland 和 GNOME 会话、真实的 lazy.nvim 配置，以及作为已安装插件的 vim-tmux-navigator 和 smart-splits。
 - **页面窗口在两种情况下关得慢。** 正常关闭会把它的槽位留在你的 Neovim 里，直到 Neovim 下一次存活检查（最多一秒），被杀掉的窗口也一样；你运行 `:EitriPage` 时如果 Neovim 正卡在一个提示上，`eitri page` 会一直等着、不开窗口，直到它响应。
 - **GNOME 需要 Eitri GNOME Shell 扩展**才能移动焦点：由你自己启用，下次登录时生效（见[使用指南](guide/companion.zh-CN.md#gnome-the-extension)）。有了它：移动只在拥有焦点的窗口所在的显示器上进行；X11 或 XWayland 窗口永远不算数；在上一次移动之后大约三分之一秒内再移回去会被拒绝；所有窗口都跑在同一个进程里的终端（GNOME Terminal、Ptyxis）在交回焦点时会落到它最近使用的窗口，那未必是 nvim 所在的窗口；被转发的 `eitri split` 不会把面板带到前面。
 
@@ -112,13 +112,13 @@ Companion 模式是把 agent 面板作为一个独立窗口，开在你自己的
 - **有些关于后台任务的报告只显示 Claude Code 的原话。** Claude Code 用 Eitri 还不认识的方式报告一个任务时（停掉的 shell、工作流里的 agent），那一行只显示 Claude Code 发来的文字，往往只是任务的描述，不说这个任务怎么样了。
 - **刚执行完 `/clear` 时，空白的视图中间可能留着一块空的高亮区域。** 下一个回合画出来后它就消失了。
 - **Claude Code 会留着你发的图片。** 它把每张图片都写进它存在磁盘上的会话文件，和在终端里一样，Eitri 不会删除它们。Eitri 自己对标签页的记录只保留每张图片的类型、尺寸和校验和。一个标签页发出的图片超过 16 MB 之后，它会提醒一次对话已经很重，并建议 `/compact` 或开一个新标签页。
-- **plan 模式和图片的界面是用 Claude Code 2.1.311 和脚本化的模型服务检查的。** 计划框、它的按钮和图片小块在深色和浅色、正常宽度和窄宽度下都通过了检查。对着真实的模型服务，本版本后端上的 Claude Code 2.1.322 做了计划、改了一版计划并在批准后执行，在计划批准进 Manual 之后让编辑停下来等回答，也读出了附上的图片（2.1.311 在更早的构建上也一样）。欢迎报告你看到的情况。
+- **plan 模式和图片在 Claude Code 2.1.311 和 2.1.322 上试过。** 计划框、它的按钮和图片小块在深色和浅色、正常宽度和窄宽度下都试过。在本版本的后端上，Claude Code 2.1.322 做了计划、改了一版计划并在批准后执行，在计划批准进 Manual 之后让编辑停下来等回答，也读出了附上的图片（2.1.311 在更早的构建上也一样）。欢迎报告你看到的情况。
 - **聊天面板很窄时（大约 320 像素），状态行会被截断。** 面板的模式只显示一个字母（`I`、`B`），权限模式的名字被截掉（`bypass permission`），活动行的转圈图标单独占一行。
 
 <a id="codex-and-acp-tabs"></a>
 ## Codex 与 ACP 标签页
 
-Codex 的标签页，以及用 `eitri.agent.register` 注册的 agent 的标签页都是新的（[指南](guide/agents.zh-CN.md)）。它们拿替身模型和替身 agent 试过，也在少数几次运行里用过真实的 Codex 和 `codex-acp` 适配器；没有在每一种环境上试过。
+Codex 的标签页，以及用 `eitri.agent.register` 注册的 agent 的标签页都是新的（[指南](guide/agents.zh-CN.md)）。它们只和 Codex 本身以及 `codex-acp` 适配器一起试过几次，也没有在每一种环境上试过。
 
 - **ACP 标签页里 agent 从你的编辑器读到的内容，和这个标签页别的工具结果一样绘制。** ACP 不说明工具属于哪个服务，所以 Eitri 分不清那里哪个结果来自[编辑器工具](guide/editor-tools.zh-CN.md)，其中的隐藏字符不会像在 Claude 和 Codex 标签页里那样显示出来。
 - **第一次用一个 Eitri 没检查过的 `codex` 启动时，会运行一次简短的自检，通过之前每一次 Codex 启动都会被拒绝。** 它要几秒钟，按程序（路径、大小、修改时间和版本）记住，更新之后会再运行。如果状态目录在 `/tmp` 或 `$TMPDIR` 之下，而 `XDG_RUNTIME_DIR` 和缓存目录又都不在别处，它会失败，并点出 `XDG_STATE_HOME`。比试过的范围更新的 Codex 能运行，并被标为未测试。
@@ -148,7 +148,7 @@ agent 的一个回合结束后，在面板的 BROWSE 模式里按 `c`，会列�
 
 ## 稳定性
 
-0.4.0 是早期版本，还不稳定：会有粗糙的地方。0.x 期间 `init.lua` 的 API 和默认按键还可能改动。对真实 Claude Code 的自动化运行覆盖了 2.1.302、2.1.311 和 2.1.322，其他版本没有试过。欢迎反馈。
+0.4.0 是早期版本，还不稳定：会有粗糙的地方。0.x 期间 `init.lua` 的 API 和默认按键还可能改动。Eitri 在 Claude Code 2.1.302、2.1.311 和 2.1.322 上试过，其他版本还没有试过。欢迎反馈。
 
 ## 这里没有你遇到的问题？
 

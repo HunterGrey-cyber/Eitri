@@ -14,8 +14,8 @@ the `init.lua` and a short README saying who it is for and what it sets up.
 | [`many-agents`](../../examples/environments/many-agents/README.md) | several agents work for you at once | the Strips rail, The pass and the table; new chat views to the right of the module with the keys; a card brings its chat back |
 | [`beside-nvim`](../../examples/environments/beside-nvim/README.md) | you keep Neovim in a terminal | the agent panel and the Markdown preview as windows beside your own Neovim |
 
-Every call in them is one that [Configuration](configuration.md) documents, and Eitri's tests run each file as an
-`init.lua` and fail on any startup problem it would cause.
+Every call in them is one that [Configuration](configuration.md) documents, and each file starts cleanly as an
+`init.lua`.
 
 ## Making one your own
 

@@ -144,8 +144,8 @@ unseen by the other window's revert check until Eitri has read its first event.
 
 ## What has been tried
 
-Two windows have been run on sway with two outputs and a stand-in model: the
+Two windows have been tried on sway with two outputs: the
 moves, the keys across the edge, a window ending and coming back, a restart on remembered monitors and the memory
-figure above. The Markdown preview and a moved chat were seen arriving. GNOME's token raise was tried in a probe, not
+figure above. The Markdown preview and a moved chat were seen arriving. GNOME's token raise has not been tried
 with the pair. On Hyprland 0.57 and 0.56.2 only the keys at the edge were tried, on one output and
 on two. niri and KDE have not been tried; reports are welcome. The [known issues](../known-issues.md) list the rest.

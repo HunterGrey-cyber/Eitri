@@ -1,5 +1,5 @@
 [English](environments.md) | 简体中文
-<!-- translated-from: environments.md sha256=69da87f6a939e368c413e50b4331e1fa02cfe32dae85535147a39db73e6cf33d -->
+<!-- translated-from: environments.md sha256=49693c9cf5e34c4cc827f6653b9c46b653b4e0d14d6e02e085f6942610ee8247 -->
 
 # 工作环境
 
@@ -13,7 +13,7 @@ Eitri 自己做的事不多，直到你告诉它你怎么工作。这里是几�
 | [`many-agents`](../../examples/environments/many-agents/README.zh-CN.md) | 有好几个 agent 同时为你工作 | Strips 栏、The pass 和表格；新的聊天视图开在拿着按键的模块右边；一张卡片把它的聊天带回来 |
 | [`beside-nvim`](../../examples/environments/beside-nvim/README.zh-CN.md) | 你把 Neovim 放在终端里 | agent 面板和 Markdown 预览作为窗口开在你自己的 Neovim 旁边 |
 
-它们里面的每个调用，都是[配置](configuration.zh-CN.md)里有文档的，Eitri 的测试会把每个文件当作 `init.lua` 来运行，只要它会造成任何启动问题就失败。
+它们里面的每个调用，都是[配置](configuration.zh-CN.md)里有文档的，每个文件都能作为 `init.lua` 顺利启动。
 
 <a id="making-one-your-own"></a>
 ## 把一份变成你自己的

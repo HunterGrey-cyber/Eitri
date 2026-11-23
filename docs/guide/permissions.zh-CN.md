@@ -1,5 +1,5 @@
 [English](permissions.md) | 简体中文
-<!-- translated-from: permissions.md sha256=5567f5165f6ea0c2d386d7ec82dcc32f3abd7d49c444cfc2e92c84d520ca1024 -->
+<!-- translated-from: permissions.md sha256=88ecbcea7bd6bace2a16e9d39d0c7cbd3a5f962221e846ef7459d85cb55e1487 -->
 
 # 权限与信任
 
@@ -231,7 +231,7 @@ eitri.config.set("agent.user_settings", false)    -- true (the default) or false
 | 一条 `permissions.ask` 规则 | 你批准 Eitri 的卡片之后，Claude Code 也会问：第二张卡片 | Claude Code 会问：一张卡片 |
 | 对这样的问题回答允许的 `PermissionRequest` hook | 它片刻之内就回答了问题，卡片消失，调用运行 | 一样 |
 
-这些都不会显示成是你的 hook 做的：你的 hook 允许的调用看起来和别的调用一样，你的 `PermissionRequest` hook 回答了的问题就这样消失了。Auto 那一列里由 Claude Code 的分类器放行的几行，用的是分类器的替身，所以它们说明的是 Claude Code 怎样处理分类器的答案，而不是分类器本身会怎么说。
+这些都不会显示成是你的 hook 做的：你的 hook 允许的调用看起来和别的调用一样，你的 `PermissionRequest` hook 回答了的问题就这样消失了。Auto 那一列里由 Claude Code 的分类器放行的几行，说明的是 Claude Code 怎样处理这个答案；分类器会不会放行某个调用，由 Claude Code 自己决定。
 
 <a id="known-limits"></a>
 ## 已知限制

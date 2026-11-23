@@ -243,7 +243,7 @@ The line it posts holds the project's folder name, which then leaves this machin
 comes from your prompt, stays out of it. Run it as `NTFY_URL=https://ntfy.example.com/my-agents eitri-ntfy`, with
 your server's address and a topic name nobody else would guess.
 
-The five scripts on this page are in Eitri's source tree under `examples/agents/`, with the recorded rows they are tested against.
+The five scripts on this page are in Eitri's source tree under `examples/agents/`, with recorded sample rows in `examples/agents/fixtures/`.
 
 ## Write your own page
 
