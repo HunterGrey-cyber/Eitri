@@ -2,40 +2,25 @@ English | [简体中文](getting-started.zh-CN.md)
 
 # Getting started
 
+Open a project, send a prompt, answer the card when the agent asks, and press `c` after the turn to see what it changed.
 
-This page takes you from the command to a first finished turn: opening a project, sending a prompt,
-answering the cards Eitri shows, working with several sessions, and what the panel says when a turn does not
-end well.
-
-Before you start, [install](../../INSTALL.md) Eitri and set up the `claude` command. Eitri does not ship Claude Code;
-it runs the one you installed. If it cannot find it, see [Where Eitri looks for `claude`](#where-eitri-looks-for-claude)
-at the end of this page.
-
-Keys are written for the default setup:
-
-- The **prefix** is `Ctrl+b`. `<prefix> x` means press `Ctrl+b`, let go, then press `x`, as in tmux.
-- The **leader** is `Space`, unless your Neovim configuration sets another `mapleader` of a single key the panel can use
-  (a longer or reserved one falls back to `Space`).
-
-The full list is in [Keys](keys.md), and `F1` in the panel shows it too. If you have never used tmux, start with
+[Install](../../INSTALL.md) Eitri and set up `claude` first: Eitri runs the Claude Code you installed, and
+[Where Eitri looks for `claude`](#where-eitri-looks-for-claude) says what to do when it cannot find it. Keys here are
+the defaults. The prefix is `Ctrl+b`, so `<prefix> x` means `Ctrl+b`, let go, then `x`, as in tmux. The leader is
+`Space`. [Keys](keys.md) has the full list, and `F1` in the panel shows it. If you have never used tmux, start with
 [these 6 keys](tmux-6-keys.md).
 
 ## The first launch
 
-If you have no `init.lua` yet, the first window opens a short setup screen before anything else. It lists what it
-found on your computer (a tmux configuration and its prefix, your desktop, the Neovim mappings that could collide
-with Eitri's keys, a running input method) and asks how the window's keys should work. On Hyprland, sway or niri it
-also offers, and selects, a preset where your window manager arranges chats and pages
-([Compositor windows](compositor-windows.md)):
+With no `init.lua` yet, the first window opens a setup screen. It lists what it found on your computer, such as your tmux
+prefix and Neovim mappings that could collide with Eitri's keys, and asks how the window's keys should work. On Hyprland, sway and niri it also offers, and selects, a preset in which your window manager arranges chats and pages ([Compositor windows](compositor-windows.md)).
 
-- `j` and `k`, or the number of a preset, choose; `Enter` goes on to a review that shows the lines it would write.
-- `Enter` on the review writes `~/.config/eitri/init.lua` (once, and never over a file that exists); `Backspace`
-  goes back. The new keys, and any `window.tiling` line, apply from the next start. After writing, `t` opens `:EitriTutor` and `Enter` closes.
-- `Esc` is "not now": nothing is written, and the screen asks once more at the next start. `d` stops it for good.
-  `:Eitri setup` brings it back later.
+- `j` and `k`, or a preset's number, choose; `Enter` shows the lines it would write.
+- `Enter` on that review writes `~/.config/eitri/init.lua`, never over an existing file; `Backspace` goes back. The new keys, and any `window.tiling` line, apply from the next start. After writing, `t` opens `:EitriTutor`.
+- `Esc` means not now, and the screen asks once more at the next start. `d` stops it for good, and `:Eitri setup`
+  brings it back.
 
-If you would rather write the file yourself, press `Esc` twice or `d`; everything the screen offers is in
-[Keys](keys.md) and [Configuration](configuration.md#first-start).
+To write the file yourself, press `Esc` twice or `d`. [Configuration](configuration.md#first-start) lists what the screen offers.
 
 ## Open a project
 
@@ -43,344 +28,143 @@ If you would rather write the file yourself, press `Esc` twice or `d`; everythin
 eitri [DIR]
 ```
 
-`DIR` is the project directory. Without it Eitri uses `$EITRI_PROJECT_DIR` when that is set, and otherwise the
-directory you ran the command in. A mistyped path stops the launch with a message; the rules for odd names are in
-[Directory arguments](#directory-arguments). To open a file instead of a directory, see [Open a file](#open-a-file).
+`DIR` is the project directory. Without it Eitri uses `$EITRI_PROJECT_DIR`, then the directory you ran the command in.
+From a terminal, `eitri` gives the prompt back once the window is up; the window runs on its own, and
+[Starting from a terminal](#starting-from-a-terminal) covers its output and closing the terminal.
 
-Started from a terminal, `eitri` gives you the prompt back as soon as the window is up and prints nothing: the
-window runs on its own, so closing that terminal, `exit`, a tmux pane you kill or an ssh session that drops leave it
-running, and its output goes to its log (`~/.local/state/eitri/log/`). If the window ends before it is up, the
-command says so, shows what it printed and exits with its code. `eitri --no-fork DIR` keeps the old way: the window
-in the foreground, its output in the terminal, and it ends with the terminal. Commands that are not a window
-(`eitri agents`, `eitri sidecar ...`, `eitri setup`, `eitri panel`, `eitri page`, `eitri split`, `eitri open`)
-always stay in the terminal.
-
-Each directory you open is its own window with its own Neovim, its own sessions and its own project root, so you can
-have several projects open at once. The window's title names the project (`myproject — Eitri`, and with two workspaces
-the one on screen: `myproject — Eitri · docs`), which is what a window switcher or a compositor's window rule reads.
-
-The window holds your editor on one side and the agent panel on the other. The editor is your own Neovim, with
-your configuration and plugins. The panel starts on an empty tab that shows the project directory, the Claude
-account when one is configured, and a short menu:
+Each directory is its own window with its own Neovim, sessions and project root, so several projects can be open at
+once. A window holds your editor on one side and the agent panel on the other, and `Ctrl+h` and `Ctrl+l` move the keys
+between them. The panel starts on an empty tab with a menu:
 
 | key | what it does |
 |---|---|
 | `i` | start a new session by typing |
-| `s` | restore the tabs the last window on this project had open (shown only when there are some) |
-| `r` | resume the most recent saved conversation (shown only when there is one) |
+| `s` | restore the tabs the last window on this project had open, when there are some |
+| `r` | resume the most recent saved conversation, when there is one |
 | `w` | choose among every saved session |
-| `p` | open another project (the list of your other projects; [Keys](keys.md#the-prefix)) |
-| `Shift+Tab` | cycle the mode (Manual, Auto, Bypass) before you start (the mode is shown at the bottom of the panel) |
+| `p` | open another project |
+| `Shift+Tab` | cycle the mode (Manual, Auto, Bypass) before you start |
 | `?` | list all the keys |
 
-Under the menu, **Pages** lists the pages that ship with Eitri and are not loaded in this window (the agents
-pages and the Markdown preview, each with one line of what it is). `j`/`k` reach them; `Enter` loads one for this run
-and shows it, and `o` opens the `init.lua` line that loads it every time in a scratch buffer in Neovim, for you to
-copy (Eitri does not write your `init.lua`). See [Plugins](configuration.md#plugins).
 
-`Ctrl+h` and `Ctrl+l` move the keys between the editor and the panel.
 
-Two options are worth knowing. `eitri --version` prints the version and exits. `eitri --clean` starts the
-editor's Neovim with `nvim --clean`, that is without your configuration and plugins, which is the quickest way
-to tell whether a problem comes from your own setup.
+`<prefix> O` in any window lists the projects you opened before, newest first. One that has a window comes forward,
+and any other opens in a new window ([More on projects](#more-on-projects)). Started from the desktop icon with no folder, Eitri shows this list in a small window first; [`window.desktop_start`](configuration.md#settings) changes that.
 
-**Another project.** Press `<prefix> O` in any window (or `p` on an empty tab, or click the project's name in the top bar) to
-see the projects you opened before, newest first, and go to one: a project that already has a window comes forward, any
-other opens in a new window. You can filter the list or type a path (`~/src/app`; `Tab` completes it). To look for a
-project that is not in the list, and what the keys do there, see [More on projects](#more-on-projects).
-
-**From the desktop icon.** Starting Eitri from the desktop with no file or folder does not open your home folder. It shows
-the same list in a small window of its own before anything starts: no Neovim, no question about trusting a folder.
-Choosing a project opens its window and the small one goes; `Esc` closes it and leaves nothing running. The first time
-there is nothing in the list, so the window offers `Browse folders…` and `Home folder`, and the first-start screen then
-opens in the window you chose. [`window.desktop_start`](configuration.md#settings) changes this: `"last"` opens the project
-you used most recently without showing the list, and `"cwd"` brings back the old behaviour, the directory the launcher ran
-in. Running `eitri` in a terminal is unchanged.
+To open a file instead of a directory, see [Open a file](#open-a-file); for odd names, [Directory arguments](#directory-arguments). `eitri --clean` starts the editor's Neovim without your configuration, which shows whether a problem is yours.
 
 ## Your first turn
 
-Press `Ctrl+l` to focus the panel, then `i` (or `Ctrl+j`) to type your prompt. If your module-focus key is remapped,
-use that key instead of `Ctrl+l`.
+Press `Ctrl+l` to focus the panel, then `i` to type. `Enter` sends and `Shift+Enter` starts a new line. The session
+starts with your first message. In a project that ships its own Claude Code configuration (`.claude/`, `.mcp.json` or
+`CLAUDE.md`), Eitri first asks whether to trust it: `y` loads it, `n` starts without it, and `Esc` takes your text back
+([Trusting a project](permissions.md#trusting-a-project)).
 
-- `Enter` sends the prompt; `Shift+Enter` starts a new line, and so do `Alt+Enter` and a backslash followed by `Enter`.
-- The session starts when you send the first message, not before.
-- In a project that ships its own Claude Code configuration (`.claude/`, `.mcp.json` or `CLAUDE.md`), the session also
-  waits until you have answered a question: Eitri holds the start and asks whether to trust that configuration. `y`
-  loads it, `n` starts the session without it, and `Esc` puts the start off and gives your text back. Until you
-  answer, the panel says "Waiting for your answer to the trust question — nothing has started". What the question shows
-  and what each answer means is in [Trusting a project](permissions.md#trusting-a-project).
+Each message carries the name of the open file, or the lines you selected in Visual mode. Select the function before you
+say "fix this function"; a cursor position alone is not sent. With lines selected, `<leader>ae` in the editor moves the
+keys to the panel with `Edit the selection: ` in the box ([Keys](keys.md#editing-the-selection-from-neovim)).
 
-Each message also carries the name of the file open in the editor, or the lines you had selected there in Visual mode.
-A selection is what points the agent at a particular piece of code, so select the function in the editor first when you
-say "fix this function"; a cursor position alone is not sent. With lines selected, `<leader>ae` in the editor does the
-first step for you: the keys go to the panel with the box open and `Edit the selection: ` in it, and what you type after
-it is an ordinary message ([Keys](keys.md#editing-the-selection-from-neovim) has the details).
+The reply renders as Markdown while it streams. Each tool call is a quiet line marked `✓` when it finished, `✗` when it
+failed and `◐` while it runs. Each file edit is a card with its diff.
 
-While Claude answers, the reply appears as rendered markdown as it streams in. Each tool the agent runs is a
-quiet line of its own, with a mark in front saying whether it finished (`✓`), failed (`✗`) or is still running
-(`◐`): a command, a file it read, a search. Each file edit is a small card naming the file and the lines it adds
-and removes, with the diff inside it.
+- `Esc` leaves the box and browses the conversation: `j` and `k` step by row, `Enter` shows a tool's result, `yy` copies the row, and `F1` lists all the keys.
+- `Ctrl+c` interrupts the turn.
+- `Enter` on a message typed while a turn runs puts it into that turn. It shows above the box as `↪ <message>` until
+  the agent reads it at its next step. A tab whose agent cannot take messages mid-turn, such as an ACP tab, holds it as
+  `⧗ <message>` and sends it when the turn ends. `Ctrl+Enter` sends now, interrupting the turn.
+- `Ctrl+g` edits your draft in Neovim, and `:wq` brings it back.
 
-- `Esc` leaves the box and goes back to browsing the conversation. In browsing, `j` and `k` step from row to
-  row, `Enter` shows or hides a tool's result, `zi` shows the detailed view (every result, with longer excerpts), `yy` copies the row (to the
-  clipboard and the primary selection, so a middle-click pastes it too; `y` with an object copies part of a row) and `F1` lists all the keys.
-- `Ctrl+c` interrupts the turn that is running.
-- `Enter` on a message you type while a turn is running puts it into that turn without stopping it, as in
-  Claude Code and Codex: the agent reads it at its next step, and it shows above the box as `↪ <message>` until
-  then, when it appears in the conversation where the agent read it. A tab whose agent cannot take messages
-  mid-turn holds it instead, as `⧗ <message>`, and sends it when the turn ends; the empty box says which one
-  Enter does in that tab. Claude and Codex tabs take messages mid-turn; ACP tabs hold them. A message the
-  agent did not read before the turn ended (an interrupt, for one) is held again with a line saying why.
-  `Ctrl+Enter` sends now: it interrupts the running turn, then sends what is held and this message. `Ctrl+x`, then
-  `Enter`, sends after the turn instead: the message waits until the turn ends and is not put into it.
-- `Ctrl+g` in the box edits your draft in Neovim; `:wq` brings it back.
-
-After a turn that edited files, `c` in browsing shows what changed on disk during it; see
-[Turn review](turn-review.md).
+After a turn that edited files, `c` in browsing shows what changed on disk: [Turn review](turn-review.md).
 
 ## Arranging the window
 
-Try arranging the modules after your first turn. Here `<prefix>` means press `Ctrl+b`, let go, then press
-the next key or chord, as in tmux. These are the defaults; if Eitri has picked up your tmux bindings, see
-[Your tmux keys](keys.md#your-tmux-keys), and for the whole move from tmux,
-[Coming from tmux](migrate-from-tmux.md).
+Try a few layout keys after your first turn. If Eitri picked up your tmux bindings, see
+[Your tmux keys](keys.md#your-tmux-keys) and [Coming from tmux](migrate-from-tmux.md).
 
-1. With the keys in the agent panel, press `<prefix> "`, then `t`: the bottom terminal opens below it and
-   takes the keys. `<prefix> %` splits to the right instead; either split waits for a module to open or move there.
-2. Press `<prefix> o` to move the keys to the next module on screen, and again until they are back in the
-   terminal. `<prefix> Left`, `Right`, `Up` and `Down` go to the module on that side.
-3. In the terminal, press `<prefix> Alt+Enter` to open a second terminal to its right, with its own shell
-   in the project root.
-4. With the second terminal focused, press `<prefix> F` to float it. Then `<prefix> _`
-   stows it in the scratchpad. `<prefix> S` calls it back; press that sequence again to stow it again.
-5. Press `<prefix> s`, then `c` to create a second workspace as a copy of this arrangement and switch to it.
-   `<prefix> L` returns to the previous workspace. The modules are shared; each workspace keeps its own arrangement.
-6. Move to the base agent panel. Press `<prefix> c` to add a second chat tab, then `<prefix> !` to break that
-   tab into its own view beside the panel. The base view must keep at least one tab. In the new view,
-   `<prefix> !` joins the tab back.
-7. To make a starting layout for projects without a saved one, put `eitri.layout.default(...)` in
-   `$XDG_CONFIG_HOME/eitri/init.lua` (default `~/.config/eitri/init.lua`). Once the window is running,
-   `eitri.layout.export()` returns the layout calls to paste there, including workspaces and floats;
-   [Configuration](configuration.md#layout-from-lua) shows how to save that text from a Lua command. Numbered chat
-   views are left out of the export: they need a saved tab to survive startup, so use [open
-   rules](configuration.md#where-a-new-module-opens) to place new views.
+1. In the panel, `<prefix> "` then `t` opens the bottom terminal below it and moves the keys there. `<prefix> %`
+   splits to the right instead.
+2. `<prefix> o` moves the keys to the next module, and `<prefix>` with an arrow key goes to the module on that side.
+3. In the terminal, `<prefix> Alt+Enter` opens a second terminal to its right, in the project root.
+4. `<prefix> F` floats the focused module, `<prefix> _` stows it in the scratchpad, and `<prefix> S` calls it back.
+5. `<prefix> s` then `c` copies this arrangement into a new workspace and switches to it; `<prefix> L` returns to the
+   previous workspace.
+6. In the base panel, `<prefix> c` adds a chat tab and `<prefix> !` breaks it into its own view. `<prefix> !` in that view joins it back. The base view keeps at least one tab.
 
-See [Keys](keys.md#the-prefix) for tabbed and stacked containers, resizing and the rest of the layout keys.
+To start every project from one layout, put `eitri.layout.default(...)` in `~/.config/eitri/init.lua`;
+[Configuration](configuration.md#layout-from-lua) shows how to export the layout you have. The other layout keys are in [Keys](keys.md#the-prefix).
 
 ## When Eitri asks
 
-Some tool calls wait for you. Eitri draws a permission card in the conversation, next to the call it gates,
-with an **Approve** and a **Deny** button, and for many commands a third button between them, "Always allow ... in this
-project", which saves a rule that approves such commands without a card from then on. A rule does not answer
-the questions Claude Code raises itself, so a command it still asks about gets a card even then; see
-[When Claude Code itself asks](permissions.md#when-claude-code-itself-asks).
+Some tool calls wait for you. Eitri draws a permission card beside the call, with **Approve** and **Deny**. For many
+commands a button between them, "Always allow ... in this project", saves a rule so such commands pass without a card.
+You answer in card mode:
 
-You answer a card in **card mode**, which the card holds until you answer or leave. Press `Alt-n` (from the box too) to
-take the next waiting card in this tab, or `Enter` on the card's own row; when a card arrives, the band says so.
+- `Alt-n`, from the box too, takes the next waiting card in this tab. `Enter` on a card's row does the same.
+- `1` approves and `2` denies. On a card with the "Always allow" button, `2` approves and saves the rule, and `3` denies.
+- `h`, `l` and `Enter` walk to a button, and `Tab` opens a box for a reason on a Claude card.
+- `Esc` leaves card mode with the card still waiting.
 
-- The digits follow the buttons, in Claude Code's order: `1` approves and `2` denies; on a card that offers the
-  "Always allow" rule, `2` approves and saves it and `3` denies.
-- `h` and `l`, then `Enter`, work the buttons for you if you prefer to walk to one.
-- `Tab` opens a box for a reason on a Claude card; `Enter` in it sends the denial with that reason.
-- `Esc` leaves card mode with the card still waiting, and you are back where you were. It never moves on to the next
-  card by itself.
+No letter answers a card, so the first letters of a sentence you are typing cannot answer one by accident
+([Keys](keys.md#answering-a-card)).
 
-No letter answers a card: `a`, `d` and `D` do nothing, and neither does anything in the box. A digit answers only once
-card mode has settled (the digits turn from dim to bright after about a third of a second), and not if another key
-follows it within about a quarter of a second, so the first letters of a sentence you are typing cannot answer a card by
-accident. [Keys](keys.md#answering-a-card) has the whole list.
-
-**Manual, auto and bypass.** Every tab is in one of three modes, and `Shift+Tab` (or `<leader>m`) cycles them
-in Claude Code's order: manual, auto, bypass, then manual again.
-
-- **Manual** is the strictest. Eitri's own rules answer every call: reading inside the project and read-only
-  commands run, your saved rules still apply, and everything else is a card, every file edit and write
-  included. Nothing is left to Claude Code's own auto mode. Set `agent.default_mode` to `"manual"` in your
-  `init.lua` to start every tab in it.
-
-- **Auto** is the default. Eitri still sees every call. A call that one of your saved rules allows is approved
-  at once. Everything else is left to Claude Code's own auto mode, which decides without a card; when it refuses
-  a call the tool's row says `blocked by auto: <reason>`, and after repeated refusals Claude Code asks you
-  itself, on a card. When your Claude Code cannot run its auto mode, Eitri's own rules decide which calls need
-  a card instead.
-- **Bypass** makes Eitri approve every tool call itself, without a card: its own checks and Claude Code's own
-  questions alike, including those a `permissions.ask` rule of yours forces. Because bypass is a lot of trust,
-  `Shift+Tab` into it asks first (a `y/n` question whose wording says what else changes, for instance how many
-  waiting cards it would approve), and the `y` counts only when it is pressed alone and a moment after the
-  question appears. Bypass is entered only from auto; leaving it needs no question and lands in manual.
-
-Exactly what each mode lets through, the saved rules, and how a project's own Claude Code configuration is
-trusted are in [Permissions](permissions.md).
+Every tab is in one of three modes, and `Shift+Tab` (or `<leader>m`) cycles them: manual, auto, bypass. Manual turns everything except reads inside the project, read-only commands and your saved rules into a card. Auto, the default, leaves the rest to
+Claude Code's own auto mode. Bypass approves every call without a card and asks before you enter it.
+[Permissions](permissions.md) says what each mode lets through, and covers saved rules and trusting a project.
 
 ## Tabs and sessions
 
-Each conversation is a tab. The tab bar appears once there are two or more.
+Each conversation is a tab, and the tab bar appears once there are two or more.
 
 | keys | what they do |
 |---|---|
-| `<prefix> c` | a new tab (an empty one, with the menu above) |
+| `<prefix> c` | a new, empty tab |
 | `<prefix> n` / `<prefix> p` | the next / the previous tab |
 | `<prefix> 1` ... `9` | that tab by number |
 | `<prefix> l` | the tab you were on before |
 | `<prefix> ,` | rename the tab |
-| `<prefix> &` | close the tab (asks first, and says so when a turn is running and will be interrupted) |
+| `<prefix> &` | close the tab; it asks first |
 | `<prefix> w` | a list of the open tabs and the saved sessions, to switch or resume |
-| `<prefix> i` | details of this tab: name, mode, model, session ids, the settings it loaded and whether its project is trusted |
+| `<prefix> i` | details of this tab: mode, model, session ids and project trust |
 
-In the panel, `H` and `L` (or `gT` and `gt`) also go to the previous and the next tab. Each tab runs one agent, Claude by default; `:tabnew codex` opens a tab for Codex, and an agent you register
-can have tabs too. See [Codex and other agents](agents.md). Tabs run side by side: a
-background tab keeps streaming, and its label in the tab bar shows what it needs (`⚑` for a waiting card, `•`
-for a turn that finished while you were elsewhere, `✕` for a session that ended badly).
+`H` and `L` in the panel also move between tabs. A tab runs one agent, Claude by default.
+`:tabnew codex` opens a Codex tab, and an agent you register can have tabs too ([Codex and other agents](agents.md)).
+Background tabs keep streaming, and the tab bar marks what they need: `⚑` for a waiting card, `•` for a turn that
+finished while you were elsewhere, `✕` for a session that ended badly.
 
-**Resuming a conversation.** Closing a tab does not delete its conversation. `r` on an empty tab resumes the
-most recent saved session, and `<prefix> w` (or `w` on an empty tab) lists them, newest first, each with its name or
-title; a session another window currently holds is shown but cannot be chosen. A project keeps its 200 newest
-sessions: once it holds that many the list says `only the newest 200 are kept`, and the next new session drops the
-oldest one from it (its conversation stays in Claude Code's own `claude --resume`).
-
-**Restoring the last tabs.** Eitri remembers which tabs the last window on a project had open: their order,
-names and modes, and which one was on screen. By default the empty tab offers them as `Restore last session`
-(`s` in the panel). The keys start in the editor, where `s` is nvim's, and while they are there the empty tab says
-which key brings them to the panel (`Ctrl+l to use these keys`); from the editor `<prefix> w` also opens the session list
-with the cursor on a `Restore last session` row, and `Enter` takes it. Setting `agent.restore` to `"auto"` in your `init.lua` brings them back at launch with no key pressed,
-and `"off"` neither offers nor remembers; see [Configuration](configuration.md). A tab is skipped, and named
-in a short message, when its saved conversation is gone or another window holds it. A tab that was in bypass
-does not come back in bypass unasked: `s` asks (`n` brings it back in Auto), and an automatic restore brings
-it back in Auto and says so. A tab that was in manual comes back in manual. The one exception is your own answer in advance: with `agent.default_mode` set to
-`"bypass"` in your `init.lua`, saved bypass tabs come back in bypass without a question.
-
-A tab's unsent text is saved with it and comes back in its composer with `s`, at most 256 KiB of it. Text that would
-not come back, in a tab with no session yet or too long to keep, is counted by the window's close question:
-`close window? 1 unsent draft (y/n)`. Starting something new in place of `s` replaces what was saved, the unsent text
-with it.
-
-**Continuing in a real terminal.** Press `<leader>t` (or open `<prefix> i` and choose `Continue in a
-terminal...`). Eitri explains that it will close this conversation in the panel first, and then, when you
-confirm, shows the `claude --resume ...` command that continues it in your own terminal; `y` copies it. Eitri
-does not start that terminal for you and takes no lock on the session, so do not keep it open in two places at
-once. That terminal runs a plain `claude` with your own Claude Code settings, not Eitri's permission gate, so
-its tool calls do not appear as cards. A session that has not had its first turn yet has nothing to continue, and neither does one with a
-turn still running.
+Closing a tab keeps its conversation. `r` on an empty tab resumes the most recent session, `<prefix> w` lists them all,
+and `s` brings back the tabs the last window had open. To carry a conversation into a real terminal: [Resume, restore and continue](#resume-restore-and-continue).
 
 ## When you start again
 
-Close Eitri (`:qa` in the editor closes it as it closes Neovim, and so does closing the window; either asks first only
-when something would be interrupted, such as a running turn), or lose it to a crash or a reboot, and the next start in
-the same project opens the editor where you left it. The files you had in windows come back split the way they were, in the same tab pages, each window at the line and
-scroll position it had, with the same window holding the cursor. Files you had listed but not on screen are back in
-`:ls`. A split keeps its proportions, so a 30/70 split is still 30/70 on a narrower pane. When everything came back,
-Eitri says nothing.
+Close Eitri, or lose it to a crash, and the next start in the same project reopens the editor as you left it: the files
+in their splits and tab pages, each window at its line and scroll position. When everything came back, Eitri says nothing. More: [What comes back, and what does not](#what-comes-back-and-what-does-not).
 
-Eitri keeps a small file of what is open in its state directory, updated every 30 seconds, when the window loses focus
-and when the editor exits (a `:qa`, a window close, SIGTERM). If Eitri is killed outright, the next start
-has the record from the last update: normally the last 30 seconds of window moves and cursor travel are lost, more if
-the editor was busy and had not answered. The record holds file names and positions, never text. Unsaved text is
-only as safe as it is in plain Neovim: it survives in a swap file when your configuration leaves swap on and Neovim
-has written it (by default after 200 typed characters or 4 seconds without typing), and not at all with `noswapfile`.
+## When something goes wrong
 
-What does not come back:
+A turn that stops early leaves a muted row saying why, and the status line repeats it until your next prompt.
+[When something ends](#when-something-ends) lists the rows. [When Eitri itself crashes](#when-eitri-itself-crashes)
+says where the crash record goes and what it holds.
 
-- folds, and window and buffer options (`wrap`, `spell`, `number`: your own configuration sets those);
-- working directories, including a window-local or tab-local one;
-- the jump list, marks, registers, command history and undo, which Neovim keeps itself and Eitri leaves alone;
-- terminal buffers, help, quickfix and location lists, floating windows and unnamed buffers;
-- a file that was never written to disk, and a file that is gone or no longer a regular file by the next start;
-- Eitri's own views: a plugin's diff tab and the buffers of a turn review.
+## Limits
 
-When something could not come back, one short line says what: `2 files from last time are gone: src/old.rs and 1 more`,
-`could not reopen src/x.rs`, or `3 files from last time did not fit on screen; they are in :ls`. A file that has unsaved
-changes in a swap file from an editor that died opens read-only, and the usual line about unsaved changes follows (`:e`
-the file, then `r` recovers them). If the last restore never finished, because Neovim crashed or hung while opening
-files, the next start opens nothing, says so once, and tries again after a record is written.
+- Folds, window and buffer options, working directories, terminal buffers, help, quickfix and location lists, floating windows, unnamed buffers, files never written, and a plugin's diff tab or a turn review's buffers do not reopen. Marks, registers, the jump list, command history and undo stay Neovim's own.
+- A session plugin that Eitri does not recognise restores beside Eitri and opens your files twice. Set
+  [`editor.restore`](configuration.md#settings) to `false`.
+- A bare `autocmd!` at the top of your configuration removes Eitri's reopening for that run. Put `autocmd!` inside the
+  `augroup` it belongs to.
+- Unsaved text is as safe as in plain Neovim: a swap file keeps it, and `noswapfile` does not. If Eitri is killed
+  outright, the last 30 seconds of window moves are lost, more if the editor was busy.
+- A crash inside a native library (GTK, WebKit, a graphics driver) writes no record. The window log has what it
+  printed.
+- On GNOME, `eitri FILE` typed in a terminal may show a "window is ready" notice instead of raising the window.
 
-**When Eitri stands aside.** If you use a session plugin, Eitri leaves reopening to it: it restores nothing, writes
-nothing, and says nothing. It recognises `persistence.nvim` (LazyVim's), `auto-session`, `resession.nvim` (AstroNvim's),
-`possession.nvim`, `nvim-possession`, `neovim-session-manager`, `persisted.nvim`, `mini.sessions`, vim-startify with
-`g:startify_session_autoload` set, vim-prosession, and a session your configuration has already loaded. It only looks at
-what is loaded or declared and never loads or sets up anything of yours. A session tool that is not on this list restores
-beside Eitri and your files open twice; set `editor.restore` to `false` (see [Configuration](configuration.md#settings))
-to turn Eitri's side off. Eitri also does nothing when you start it with files (`eitri FILE`), when your configuration
-has already opened a file before the editor shows, with `eitri --clean`, in window 2, and in a [companion](companion.md)
-window, where the Neovim is yours. A second window on the same project that is not paired with the first keeps its
-own record and never opens the first window's.
-
-**`autocmd!` at the top of your configuration.** Eitri's reopening hangs on autocommands that are made before your
-`init.lua` runs. A bare `autocmd!` at the top level of your configuration removes every group's autocommands, Eitri's
-included: nothing reopens and nothing is saved in that run, and the file from the last good run stays as it was. Put
-`autocmd!` inside the `augroup` it belongs to, where it clears only that group.
-
-## When something ends
-
-A turn that does not finish normally no longer looks like one that did. A muted row in italics appears where
-it stopped, and the status line at the bottom of the panel says it in a few words until you send the next
-prompt:
-
-| what happened | the row says | the status line says |
-|---|---|---|
-| you pressed `Ctrl+c` | `interrupted` | `interrupted` |
-| a failure | `the turn ended with an error (...)`, then Claude Code's own words | `turn failed` |
-| a rate or usage limit (HTTP 429) | `rate or usage limit reached (HTTP 429)`, then Claude Code's words | `rate limited` |
-| the turn limit or a spending limit | `stopped at the turn limit` or `stopped at the spending limit` | `turn limit` or `spending limit` |
-| the conversation no longer fits | `stopped: the context is full` | `context full` |
-| a hook of yours stopped it | `stopped by a hook` | `stopped by a hook` |
-| the session ended under it | `the turn did not finish: the session ended` | `turn did not finish` |
-
-The text after a colon on a row is Claude Code's own message, shown as it came, so a limit's reset time appears
-only if Claude Code wrote one. A row stays in the conversation, survives a panel reload (`<prefix> r`) and a
-tab switch, and can be copied with `yy` like any other row.
-
-When the session itself is gone, the conversation says so. A red `This session was lost` banner means the
-connection broke and what is shown above may be incomplete; a quiet `This session has ended (<reason>)` means
-it closed. Either way, press `r` in browsing to start a new session in that tab. A message held while a turn
-ran is still sent when that turn ends, even when it ended at a limit.
-
-If nvim itself goes without being asked, killed or crashed, the window stays and says so:
-`nvim stopped unexpectedly — <prefix> e starts it again and says what can be recovered`. `:q` of the last buffer still
-closes the window, as it does in plain Neovim. The exception is a quit from a start screen (the buffer is a
-LazyVim dashboard, `alpha`, `dashboard`, `ministarter` or `starter`) in a window that also holds a chat, the terminal or
-a page: that asks `close Eitri? (y/n)` first, because a second `q` pressed in a plugin's float (Lazy's update screen,
-say) quits through the dashboard behind it. `n` ends the editor in place, the window stays, and the editor's key starts
-nvim again; `y` closes. `:qa`, `:wqa` and `ZZ` from a real buffer still close at once. When a start finds this project's files with unsaved changes in swap
-files, it says so once: `unsaved changes kept for long.txt — :e the file, then r recovers them or d deletes them`.
-Nothing is recovered unless you do that, and the line comes back at each start until the swap file is gone.
-
-If what Eitri keeps can no longer be written, the window says so once per kind until it works again, with what is not
-being kept: `could not save the open tabs`, `could not record this session` or `could not store the history`, usually
-`the disk is full`. Turns go on running. Once there is room the saves catch up by themselves.
-
-When Claude Code has updated itself and the panel misbehaves, the sidecar behind it may need an update of its own.
-`eitri sidecar check` asks whether one exists, `eitri sidecar update` takes it, and `eitri sidecar use bundled` goes
-back. Nothing checks by itself, and open tabs keep the sidecar they started with. Eitri 0.3.0 has no `eitri sidecar`
-command (it answers `eitri: no such directory`); take the release after it first.
-[Updating the sidecar](../../INSTALL.md#updating-the-sidecar) has the details.
-
-## When Eitri itself crashes
-
-A crash writes a record to `~/.local/state/eitri/log/crash-<time>-<pid>.log` (under `$XDG_STATE_HOME` if you set
-it), readable only by you. The next start says so once, in one line with the file's path. To report it, attach
-that file to a [bug report](https://github.com/HunterGrey-cyber/eitri/issues/new?template=bug_report.yml). Nothing
-leaves your machine unless you attach it: Eitri sends nothing anywhere.
-
-The record is plain text: the version, the build, the kernel, the thread, where the code stopped, a backtrace and
-the last lines the window printed. It holds no prompt, conversation or tool output, and a crash's own message is
-left out when it could quote one. Paths are there, with your home shown as `~`, so read it before you attach it.
-
-A window started from the desktop, from the project list, or normally from a terminal keeps what it prints in
-`main-<16 hex>.log` in the same directory, one name per project; at 2 MiB the file moves to `.log.1`, and so does
-the last run's when a new one starts. Only `eitri --no-fork` keeps the window in the foreground, printing to that terminal instead of keeping a
-window log. When the disk is full the lines are dropped and the window goes on.
-`EITRI_WINDOW_LOG=off` turns the log and the records off.
-
-A crash inside a native library (GTK, WebKit, a graphics driver) writes no record. What the window printed up to
-that point is in the log.
-
-Known rough edges are listed in [Known issues](../known-issues.md).
+More in [Known issues](../known-issues.md).
 
 ---
 
 ## Details
 
-The longer passages that the main line above leaves out.
+
 
 ### Where Eitri looks for `claude`
 
@@ -410,13 +194,25 @@ window keeps the `PATH` it was given and its log says why. To skip this, set `EI
 to give every program you start from the desktop the same `PATH` is a file in `~/.config/environment.d/` (for
 example `PATH=$HOME/.local/bin:$PATH` in `10-path.conf`), which systemd's user session reads at login.
 
+### Starting from a terminal
+
+Started from a terminal, `eitri` gives you the prompt back as soon as the window is up and prints nothing. The window
+runs on its own, so closing that terminal, `exit`, a tmux pane you kill or an ssh session that drops leave it running,
+and its output goes to its log (`~/.local/state/eitri/log/`). If the window ends before it is up, the command says so,
+shows what it printed and exits with its code. `eitri --no-fork DIR` keeps the window in the foreground, with its
+output in the terminal, and it ends with the terminal. Commands that are not a window (`eitri agents`,
+`eitri sidecar ...`, `eitri setup`, `eitri panel`, `eitri page`, `eitri split`, `eitri open`) always stay in the
+terminal.
+
+The window's title names the project (`myproject — Eitri`, and with two workspaces the one on screen:
+`myproject — Eitri · docs`), which is what a window switcher or a compositor's window rule reads.
+
 ### Directory arguments
 
 A path in a folder that does not exist, or an option Eitri does not know, stops the launch with a message instead of
 opening some other directory; to open a directory whose name starts with `-`, put `--` before it (`eitri -- -notes`).
 A name that does not exist in a folder that does is a new file, so a mistyped directory name opens an empty buffer of
 that name.
-
 
 ### Open a file
 
@@ -463,10 +259,6 @@ and so it does when the window cannot take the file just now, for instance one s
 unsaved buffer.
 When the buffer in the editor has unsaved changes, the file opens in a split and that buffer stays.
 
-On GNOME a window can be raised only by a launch that carries an activation token, which a command typed in a
-terminal does not have: there GNOME may show a "window is ready" notice instead of raising the window. Sway, Hyprland
-and niri are expected to focus the window through the compositor. Only sway has been tried.
-
 **A file with no project of its own.** `eitri ~/notes.md`, `eitri /etc/hosts` and `eitri /tmp/x.py` open too, in the
 file's folder. When that folder cannot serve as a boundary for the agent (your home directory, a folder you do not
 own, a folder other users can write to, the filesystem root), the panel shows a note on every tab page:
@@ -489,3 +281,128 @@ network share that does not answer says so instead of making the window wait. Th
 you chose it from a window or a desktop entry on another account; `eitri --account <name> --new-window <dir>` gives the
 project a second window on that account. When a new window cannot start, a short message says the folder is not there, or
 sends you to that project's window log, described in [When Eitri itself crashes](#when-eitri-itself-crashes).
+
+### Resume, restore and continue
+
+**Resuming a conversation.** Closing a tab does not delete its conversation. `r` on an empty tab resumes the
+most recent saved session, and `<prefix> w` (or `w` on an empty tab) lists them, newest first, each with its name or
+title; a session another window currently holds is shown but cannot be chosen. A project keeps its 200 newest
+sessions: once it holds that many the list says `only the newest 200 are kept`, and the next new session drops the
+oldest one from it (its conversation stays in Claude Code's own `claude --resume`).
+
+**Restoring the last tabs.** Eitri remembers which tabs the last window on a project had open: their order,
+names and modes, and which one was on screen. By default the empty tab offers them as `Restore last session`
+(`s` in the panel). The keys start in the editor, where `s` is nvim's, and while they are there the empty tab says
+which key brings them to the panel (`Ctrl+l to use these keys`); from the editor `<prefix> w` also opens the session list
+with the cursor on a `Restore last session` row, and `Enter` takes it. Setting `agent.restore` to `"auto"` in your `init.lua` brings them back at launch with no key pressed,
+and `"off"` neither offers nor remembers; see [Configuration](configuration.md). A tab is skipped, and named
+in a short message, when its saved conversation is gone or another window holds it. A tab that was in bypass
+does not come back in bypass unasked: `s` asks (`n` brings it back in Auto), and an automatic restore brings
+it back in Auto and says so. A tab that was in manual comes back in manual. The one exception is your own answer in advance: with `agent.default_mode` set to
+`"bypass"` in your `init.lua`, saved bypass tabs come back in bypass without a question.
+
+A tab's unsent text is saved with it and comes back in its composer with `s`, at most 256 KiB of it. Text that would
+not come back, in a tab with no session yet or too long to keep, is counted by the window's close question:
+`close window? 1 unsent draft (y/n)`. Starting something new in place of `s` replaces what was saved, the unsent text
+with it.
+
+**Continuing in a real terminal.** Press `<leader>t` (or open `<prefix> i` and choose `Continue in a
+terminal...`). Eitri explains that it will close this conversation in the panel first, and then, when you
+confirm, shows the `claude --resume ...` command that continues it in your own terminal; `y` copies it. Eitri
+does not start that terminal for you and takes no lock on the session, so do not keep it open in two places at
+once. That terminal runs a plain `claude` with your own Claude Code settings, not Eitri's permission gate, so
+its tool calls do not appear as cards. A session that has not had its first turn yet has nothing to continue, and neither does one with a
+turn still running.
+
+### What comes back, and what does not
+
+Close Eitri (`:qa` in the editor closes it as it closes Neovim, and so does closing the window; either asks first only
+when something would be interrupted, such as a running turn), or lose it to a crash or a reboot, and the next start in
+the same project opens the editor where you left it. The files you had in windows come back split the way they were, in the same tab pages, each window at the line and
+scroll position it had, with the same window holding the cursor. Files you had listed but not on screen are back in
+`:ls`. A split keeps its proportions, so a 30/70 split is still 30/70 on a narrower pane. When everything came back,
+Eitri says nothing.
+
+Eitri keeps a small file of what is open in its state directory, updated every 30 seconds, when the window loses focus
+and when the editor exits (a `:qa`, a window close, SIGTERM). If Eitri is killed outright, the next start has the
+record from the last update. The record holds file names and positions, never text. Neovim writes a swap file by default
+after 200 typed characters or 4 seconds without typing.
+
+What comes back and what does not (folds, window options, terminal buffers and the rest) is under Limits above.
+When something could not come back, one short line says what: `2 files from last time are gone: src/old.rs and 1 more`,
+`could not reopen src/x.rs`, or `3 files from last time did not fit on screen; they are in :ls`. A file that has unsaved
+changes in a swap file from an editor that died opens read-only, and the usual line about unsaved changes follows (`:e`
+the file, then `r` recovers them). If the last restore never finished, because Neovim crashed or hung while opening
+files, the next start opens nothing, says so once, and tries again after a record is written.
+
+**When Eitri stands aside.** If you use a session plugin, Eitri leaves reopening to it: it restores nothing, writes
+nothing, and says nothing. It recognises `persistence.nvim` (LazyVim's), `auto-session`, `resession.nvim` (AstroNvim's),
+`possession.nvim`, `nvim-possession`, `neovim-session-manager`, `persisted.nvim`, `mini.sessions`, vim-startify with
+`g:startify_session_autoload` set, vim-prosession, and a session your configuration has already loaded. It only looks at
+what is loaded or declared and never loads or sets up anything of yours. Eitri also does nothing when you start it with
+files (`eitri FILE`), when your configuration has already opened a file before the editor shows, with `eitri --clean`,
+in window 2, and in a [companion](companion.md) window, where the Neovim is yours. A second window on the same project
+that is not paired with the first keeps its own record and never opens the first window's.
+
+### When something ends
+
+A turn that does not finish normally leaves a muted row in italics where
+it stopped, and the status line at the bottom of the panel says it in a few words until you send the next
+prompt:
+
+| what happened | the row says | the status line says |
+|---|---|---|
+| you pressed `Ctrl+c` | `interrupted` | `interrupted` |
+| a failure | `the turn ended with an error (...)`, then Claude Code's own words | `turn failed` |
+| a rate or usage limit (HTTP 429) | `rate or usage limit reached (HTTP 429)`, then Claude Code's words | `rate limited` |
+| the turn limit or a spending limit | `stopped at the turn limit` or `stopped at the spending limit` | `turn limit` or `spending limit` |
+| the conversation no longer fits | `stopped: the context is full` | `context full` |
+| a hook of yours stopped it | `stopped by a hook` | `stopped by a hook` |
+| the session ended under it | `the turn did not finish: the session ended` | `turn did not finish` |
+
+The text after a colon on a row is Claude Code's own message, shown as it came, so a limit's reset time appears
+only if Claude Code wrote one. A row stays in the conversation, survives a panel reload (`<prefix> r`) and a
+tab switch, and can be copied with `yy` like any other row.
+
+When the session itself is gone, the conversation says so. A red `This session was lost` banner means the
+connection broke and what is shown above may be incomplete; a quiet `This session has ended (<reason>)` means
+it closed. Either way, press `r` in browsing to start a new session in that tab. A message held while a turn
+ran is still sent when that turn ends, even when it ended at a limit.
+
+If nvim itself goes without being asked, killed or crashed, the window stays and says so:
+`nvim stopped unexpectedly — <prefix> e starts it again and says what can be recovered`. `:q` of the last buffer still
+closes the window, as it does in plain Neovim. The exception is a quit from a start screen (the buffer is a
+LazyVim dashboard, `alpha`, `dashboard`, `ministarter` or `starter`) in a window that also holds a chat, the terminal or
+a page: that asks `close Eitri? (y/n)` first, because a second `q` pressed in a plugin's float (Lazy's update screen,
+say) quits through the dashboard behind it. `n` ends the editor in place, the window stays, and the editor's key starts
+nvim again; `y` closes. `:qa`, `:wqa` and `ZZ` from a real buffer still close at once. When a start finds this project's files with unsaved changes in swap
+files, it says so once: `unsaved changes kept for long.txt — :e the file, then r recovers them or d deletes them`.
+Nothing is recovered unless you do that, and the line comes back at each start until the swap file is gone.
+
+If what Eitri keeps can no longer be written, the window says so once per kind until it works again, with what is not
+being kept: `could not save the open tabs`, `could not record this session` or `could not store the history`, usually
+`the disk is full`. Turns go on running. Once there is room the saves catch up by themselves.
+
+When Claude Code has updated itself and the panel misbehaves, the sidecar behind it may need an update of its own.
+`eitri sidecar check` asks whether one exists, `eitri sidecar update` takes it, and `eitri sidecar use bundled` goes
+back. Nothing checks by itself, and open tabs keep the sidecar they started with.
+[Updating the sidecar](../../INSTALL.md#updating-the-sidecar) has the details.
+
+### When Eitri itself crashes
+
+A crash writes a record to `~/.local/state/eitri/log/crash-<time>-<pid>.log` (under `$XDG_STATE_HOME` if you set
+it), readable only by you. The next start says so once, in one line with the file's path. To report it, attach
+that file to a [bug report](https://github.com/HunterGrey-cyber/eitri/issues/new?template=bug_report.yml). Nothing
+leaves your machine unless you attach it: Eitri sends nothing anywhere.
+
+The record is plain text: the version, the build, the kernel, the thread, where the code stopped, a backtrace and
+the last lines the window printed. It holds no prompt, conversation or tool output, and a crash's own message is
+left out when it could quote one. Paths are there, with your home shown as `~`, so read it before you attach it.
+
+A window started from the desktop, from the project list, or normally from a terminal keeps what it prints in
+`main-<16 hex>.log` in the same directory, one name per project; at 2 MiB the file moves to `.log.1`, and so does
+the last run's when a new one starts. Only `eitri --no-fork` keeps the window in the foreground, printing to that terminal instead of keeping a
+window log. When the disk is full the lines are dropped and the window goes on.
+`EITRI_WINDOW_LOG=off` turns the log and the records off.
+
+Known rough edges are listed in [Known issues](../known-issues.md).

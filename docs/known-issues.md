@@ -65,57 +65,7 @@ bug, and tell us if something here is wrong or has changed. The requirements are
 
 ## Speed and drawing
 
-These were measured on development builds shortly before 0.3.0, on an AMD desktop unless a bullet names another
-machine. The items below distinguish real refresh-period feedback from the fallback clock.
-
-- **Drawn the GTK way, the editor is one refresh slower on GTK 4.24.** By default it is not drawn that way there: on
-  Wayland with GTK 4.24 or newer, unless the graphics driver is NVIDIA's, the editor hands its frames to the
-  compositor on a surface of its own ([How the editor reaches the screen](guide/editor-presentation.md)), and a typed
-  letter reached the screen 0.02 to 0.46 ms after native Neovide's at the median, on sway and Mutter at 60 and
-  165 Hz. The GTK way is still used on X11, with NVIDIA's driver, with `editor.presentation = "gtk"`, and after a
-  fallback (the editor prints why). There, with the compositor feeding GTK a real 165 Hz period, GTK 4.24.1 added
-  5.97 ms at the median, where the same build with GTK 4.22.5 added 0.30 ms; with GTK's 60 Hz fallback clock the
-  addition was about 16.5 ms. A 156-line GTK-only reproduction also shows the delay on GTK's development branch
-  (4.25.0, commit c36202f6, 2026-10-25). The editor's own surface has not been tried on NVIDIA or KWin.
-- **Drawn the GTK way on GTK 4.24, scrolling with a held `j` at a 165 Hz output drops frames.** Native Neovide drew
-  165.5 changed frames a second, Eitri on GTK 4.24.1 140.6, and the same build on GTK 4.22.5 165.4.
-  The 99th-percentile frame intervals were 6.1, 12.1 and 6.1 ms respectively. This separate scrolling run
-  used stock presentation feedback, so GTK 4.24 still used its 60 Hz fallback clock; scrolling has not been
-  repeated with real-period feedback. With the editor's own surface, a held-key test did no
-  worse than the GTK way.
-- **While an agent reply streams, typing in the editor is slower.** With WebKitGTK 2.54 a key's redraw took 11.2 ms
-  at the median while a reply streamed at the default 5 updates a second, on GTK 4.22.5 as well; with
-  WebKitGTK 2.52 it was about 2.3 ms. If you see lag while typing during a reply, say so in the "Testing feedback"
-  form, with your GPU and monitor refresh rate.
-- **The bottom terminal draws one output frame behind what you type.** Its echo reaches the screen about 18 ms after
-  the key at a 60 Hz output (8.7 ms at 165 Hz), measured on sway on an AMD desktop. Ghostty
-  (17.3 ms at the median), WezTerm (16.7) and the terminal in Zed (18.3) land in the same place; foot (1.0), kitty
-  (0.7) and alacritty (0.7) draw at once. The cause is that GTK 4.24 makes two commits of the window for each key and
-  the compositor shows the second one a refresh later; the terminal draws inside GTK's frame clock, which the editor
-  does not. We tried to remove the first commit and typing got slower (about 20 ms at either rate), so nothing ships.
-  If you want the lowest latency, run Neovim's own `:terminal` in the editor, which is drawn the way the editor is
-  (typing in a buffer took 1.7 ms at the median in the same run). A `:terminal` buffer's own latency has not been
-  measured.
-- **Memory:** an idle window with one tab uses 232 MiB more than native Neovide when the panel is inside the
-  window, and 245 MiB more in compositor mode, where the panel is a window of its own (the default on a tiling
-  compositor). Both are under the 256 MiB we aim for. That was measured on a development build after 0.3.0, on an
-  AMD Radeon RX 9070; on the integrated GPU beside it the window used 248 to 259 MiB more. The first
-  Claude tab adds about 85 MiB, its sidecar included (79 MiB of it), and each further tab about 63 MiB (about 55 of it
-  its own sidecar). Each Claude session also runs the `claude` CLI you installed. That is your program, not part of
-  Eitri: it used about 109 MiB per session once idle, more during a turn, on top of these figures.
-- **In 0.3.0 an idle session's sidecar keeps growing; 0.4.0 fixes it.** With seven sessions left idle,
-  each sidecar grew 30 to 47 MB an hour, with no plateau in three hours. A forced garbage collection every five
-  minutes did not slow it, so it is memory the sidecar still holds, not memory it has yet to collect. At that rate a
-  window with five tabs left open for a week would reach about 30 GB (extrapolated, not run). Quitting the window
-  gives it back. 0.4.0 bundles sidecar 0.5.0, which carries the fix first made in sidecar 0.3.0: in the same 25-minute
-  test of one idle session on sidecar 0.3.0, its memory held at 102.6 MB from the fifth minute, where Eitri 0.3.0's grew
-  22 MB an hour (its JavaScript heap 44 MB an hour, against 0.3 MB on sidecar 0.3.0). In a window on a development build after 0.3.0, four idle
-  sessions' sidecars held 248 MiB between them for 30 minutes, each within 0.1 MiB. 0.3.0 cannot take the fix as a
-  sidecar update.
-- **At high refresh rates under load the editor drops frames.** At 165 Hz on an Intel laptop, with other work
-  keeping the machine 17-28 % busy, it drew 137-149 frames a second where native Neovide drew 160, and 111 at 34 %
-  busy, with one 83.6 ms frame in four runs. That was measured before 0.2.0's typing-latency fix and not since.
-- Below GTK 4.16 the editor draws another way, and its typing latency has not been measured there.
+Typing, scrolling, terminal and memory figures: [Performance](guide/performance.md).
 
 ## The window
 

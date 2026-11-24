@@ -486,7 +486,7 @@ _GUIDE_DIR = os.path.join(_PUBLISH_FILES, "docs", "guide")
 # check that every one of them (and its twin) exists runs on the merged tree (GuideCompleteTests).
 _GUIDE_PAGE_NAMES = ("README", "getting-started", "migrate-from-tmux", "keys", "configuration", "companion", "turn-review", "permissions", "markdown-preview",
                      "agents", "editor-tools", "pages", "compositor-windows", "write-a-plugin", "environments",
-                     "remote-development")
+                     "remote-development", "performance")
 _FENCE_RE = re.compile(r"^\s*(```|~~~)")
 _LINK_RE = re.compile(r"\]\(([^)\s]+)(?:\s+\"[^\"]*\")?\)")
 
@@ -824,6 +824,242 @@ class NoTestingMethodInPublicTextTests(unittest.TestCase):
         self.assertEqual(method_wording_hits("it runs a short\nscripted conversation", ("runs a short scripted conversation",)), [])
 
 
+#
+# The prose counter the budgets below use: the prose size of a public Markdown text.
+#
+# - Prose only. Fenced code blocks (``` or ~~~), HTML comments, HTML tags and their attributes, link targets, image
+#   markup (including a linked badge) and the language-switch line do not count.
+# - Link text counts. Inline code counts as one word each, however long it is.
+# - A text has two sizes, counted separately because a Chinese twin has its own budget for each: words (runs of Latin
+#   letters or digits, so `v0.4.0` and `init.lua` are one word each) and CJK ideographs. Punctuation, Chinese or
+#   Latin, counts for neither.
+#
+# Where a budget measures: prose_lead (between the H1 and the first `## `; for a README, which has no plain H1 line,
+# the text above the first `## `), prose_section (the body of one `## ` section), prose_before (everything above one
+# `## ` heading) and prose_bullets (the list items of a body, each with its continuation lines).
+#
+#     python3 packaging/tests/test_public_docs.py --count FILE...   # words and CJK characters, whole file and lead
+_CJK = "\u3400-\u9fff"
+_WORD_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9'’.+-]*")
+
+
+def prose_text(text):
+    """`text` with everything that does not count taken out (inline code left as the single word `X`)."""
+    text = "\n".join(line for _, line in _outside_fences(text))
+    text = re.sub(r"<!--.*?-->", " ", text, flags=re.S)
+    text = re.sub(r"<(script|style|pre|code)\b[^>]*>.*?</\1>", " ", text, flags=re.S)
+    text = re.sub(r"\[!\[[^\]]*\]\([^)]*\)\]\([^)]*\)", " ", text)  # a linked badge
+    text = re.sub(r"!\[[^\]]*\]\([^)]*\)", " ", text)
+    text = re.sub(r"\[([^\]]*)\]\([^)]*\)", r"\1", text)
+    text = re.sub(r"<[^>]+>", " ", text)
+    text = re.sub(r"^(English \| .*|\[English\]\(.*)$", " ", text, flags=re.M)
+    text = text.replace("&amp;", "&").replace("&nbsp;", " ").replace("&middot;", " ")
+    return re.sub(r"`[^`\n]*`", " X ", text)
+
+
+def prose_size(text):
+    """(words, cjk characters) of the prose in `text`."""
+    plain = prose_text(text)
+    cjk = len(re.findall(f"[{_CJK}]", plain))
+    return len(_WORD_RE.findall(re.sub(f"[{_CJK}]", " ", plain))), cjk
+
+
+def _prose_h2_positions(text):
+    inside = False
+    pos = 0
+    for line in text.splitlines(keepends=True):
+        if _FENCE_RE.match(line):
+            inside = not inside
+        elif not inside and line.startswith("## "):
+            yield pos, line[3:].strip()
+        pos += len(line)
+
+
+def prose_headings(text):
+    """The `## ` headings of `text`, outside code blocks, in order."""
+    return [h for _, h in _prose_h2_positions(text)]
+
+
+def prose_before(text, heading=None):
+    """Everything above the `## <heading>` line, or above the first `## ` line when `heading` is None."""
+    for pos, h in _prose_h2_positions(text):
+        if heading is None or h == heading:
+            return text[:pos]
+    return text
+
+
+def prose_lead(text):
+    """The text between the H1 and the first `## ` heading (the whole top of a page with no H1 line)."""
+    top = prose_before(text)
+    m = re.search(r"^# .*$", top, flags=re.M)
+    return top[m.end():] if m else top
+
+
+def prose_section(text, heading):
+    """The body of the `## <heading>` section, or None when there is none."""
+    spans = list(_prose_h2_positions(text))
+    for i, (pos, h) in enumerate(spans):
+        if h == heading:
+            start = text.index("\n", pos) + 1 if "\n" in text[pos:] else len(text)
+            end = spans[i + 1][0] if i + 1 < len(spans) else len(text)
+            return text[start:end]
+    return None
+
+
+def prose_bullets(body):
+    """The list items of `body` (lines starting `- `), each with its continuation lines, outside code blocks."""
+    items = []
+    for _, line in _outside_fences(body):
+        if re.match(r"^[-*] ", line):
+            items.append(line)
+        elif items and line.startswith("  ") and line.strip():
+            items[-1] += "\n" + line
+        elif not line.strip():
+            continue
+        else:
+            items.append(None)
+    return [i for i in items if i]
+
+
+def _count_main(paths):
+    for path in paths:
+        with open(path, encoding="utf-8") as stream:
+            text = stream.read()
+        words, cjk = prose_size(text)
+        lead_words, lead_cjk = prose_size(prose_before(text) if "README." in path else prose_lead(text))
+        print(f"{path}\twords={words}\tcjk={cjk}\tlead_words={lead_words}\tlead_cjk={lead_cjk}")
+    return 0
+
+
+#
+# Budgets: how long each layer of a public text may be, counted by the prose counter above. A Chinese twin gets two CJK
+# characters for each word of its English budget, and its own small budget for the Latin words (keys, commands) that
+# stay in it. A budget goes up only together with a written reason for the change.
+_README_FIRST_SCREEN_WORDS = 100
+_README_WORDS = 520
+_README_L1_WORDS = 220
+_L1_BULLET_WORDS = 30
+_README_ZH_FIRST_SCREEN_LATIN = 40
+_GUIDE_LEAD_WORDS = 120
+_GUIDE_LEAD_ZH_LATIN = 60
+_RELEASE_PAGE_WORDS = 450
+# The guide pages that conform to the layers, with the budget for their task part (the text above `## Limits`).
+# Each stage's commits add the pages they rewrite; a page is never taken off.
+_DISCLOSURE_PAGES = {"getting-started": 1500, "performance": 900}
+_LIMITS_HEADING = {"": "Limits", ".zh-CN": "限制"}
+_README_L1_HEADING = {"": "Why try it", ".zh-CN": "为什么试试"}
+_FULL_LIST_HEADING = {"": "The full list", ".zh-CN": "完整清单"}
+
+
+def _public_text(rel):
+    with open(os.path.join(_PUBLISH_FILES, rel), encoding="utf-8") as f:
+        return f.read()
+
+
+def _heading_shape(text):
+    """The levels of the headings outside code blocks, in order: what a twin must repeat."""
+    return [len(m.group(1)) for _, line in _outside_fences(text) if (m := re.match(r"^(#{1,6}) ", line))]
+
+
+class DisclosureBudgets(unittest.TestCase):
+    def test_the_counter_counts_prose_and_nothing_else(self):
+        text = ("English | [简体中文](x.zh-CN.md)\n# T\n<!-- a long comment here -->\n"
+                "Use [the guide](../some/long/target.md) and `a --long --flag` now.\n"
+                "```sh\nfenced code is not prose\n```\n"
+                "<img src=\"a.png\" alt=\"a picture of words\">![alt words](b.png)\n"
+                "[![Badge](https://x/y.svg)](https://x)\n中文四个字。\n")
+        self.assertEqual(prose_size(text), (7, 5))  # T; Use the guide and X now; five CJK characters
+        self.assertEqual(prose_size("v0.4.0 and init.lua"), (3, 0))
+
+    def test_the_counter_finds_the_leads_sections_and_bullets(self):
+        text = "# T\nlead words\n## A\n- one two\n  three\n- four\n```\n## not a heading\n```\n## B\nend\n"
+        self.assertEqual(prose_headings(text), ["A", "B"])
+        self.assertEqual(prose_size(prose_lead(text)), (2, 0))
+        self.assertEqual(prose_size(prose_before(text, "B"))[0], 8)
+        self.assertEqual([prose_size(b)[0] for b in prose_bullets(prose_section(text, "A"))], [3, 1])
+        self.assertIsNone(prose_section(text, "C"))
+
+    def test_the_readme_first_screen_is_short(self):
+        words, _ = prose_size(prose_before(_public_text("README.md")))
+        self.assertLessEqual(words, _README_FIRST_SCREEN_WORDS, "README.md: prose above the first ## heading")
+        cjk, latin = prose_size(prose_before(_public_text("README.zh-CN.md")))[1], prose_size(prose_before(_public_text("README.zh-CN.md")))[0]
+        self.assertLessEqual(cjk, 2 * _README_FIRST_SCREEN_WORDS, "README.zh-CN.md: CJK characters above the first ##")
+        self.assertLessEqual(latin, _README_ZH_FIRST_SCREEN_LATIN, "README.zh-CN.md: Latin words above the first ##")
+
+    def test_the_readme_is_short(self):
+        self.assertLessEqual(prose_size(_public_text("README.md"))[0], _README_WORDS, "README.md: words")
+        self.assertLessEqual(prose_size(_public_text("README.zh-CN.md"))[1], 2 * _README_WORDS, "README.zh-CN.md: CJK characters")
+
+    def test_each_readme_point_is_one_short_sentence_without_a_parenthesis(self):
+        for suffix, limit in (("", _L1_BULLET_WORDS), (".zh-CN", 2 * _L1_BULLET_WORDS)):
+            text = _public_text(f"README{suffix}.md")
+            body = prose_section(text, _README_L1_HEADING[suffix])
+            self.assertIsNotNone(body, f"README{suffix}.md: no '## {_README_L1_HEADING[suffix]}' section")
+            items = prose_bullets(body)
+            self.assertTrue(5 <= len(items) <= 7, f"README{suffix}.md: {len(items)} points, want 5 to 7")
+            for item in items:
+                size = prose_size(item)[1 if suffix else 0]
+                self.assertLessEqual(size, limit, f"README{suffix}.md: {item!r}")
+                self.assertNotRegex(item, r"[(（]", f"README{suffix}.md: a parenthesis in {item!r}")
+            if suffix == "":
+                self.assertLessEqual(prose_size(body)[0], _README_L1_WORDS, "README.md: the points together")
+
+    def test_the_readme_carries_no_maintainer_comment_and_no_how_it_differs(self):
+        en = _public_text("README.md")
+        self.assertNotIn("<!--", en, "README.md: an HTML comment ships in the raw file")
+        self.assertEqual(_public_text("README.zh-CN.md").count("<!--"), 1, "README.zh-CN.md: only the translated-from marker")
+        self.assertNotIn("How it differs", prose_headings(en))
+        self.assertIn("https://eitri.cc/#differs", en)
+        self.assertIn("https://eitri.cc/zh/#differs", _public_text("README.zh-CN.md"))
+
+    def test_a_readme_twin_repeats_its_original_structure(self):
+        self.assertEqual(_heading_shape(_public_text("README.md")), _heading_shape(_public_text("README.zh-CN.md")))
+
+    def test_each_conforming_guide_page_has_a_short_lead_one_limits_and_a_short_task_part(self):
+        for name, budget in sorted(_DISCLOSURE_PAGES.items()):
+            for suffix in ("", ".zh-CN"):
+                rel = f"docs/guide/{name}{suffix}.md"
+                text = _public_text(rel)
+                limits = prose_headings(text).count(_LIMITS_HEADING[suffix])
+                self.assertEqual(limits, 1, f"{rel}: {limits} '## {_LIMITS_HEADING[suffix]}' sections, want exactly one")
+                lead_words, lead_cjk = prose_size(prose_lead(text))
+                task_words, task_cjk = prose_size(prose_before(text, _LIMITS_HEADING[suffix]))
+                if suffix:
+                    self.assertLessEqual(lead_cjk, 2 * _GUIDE_LEAD_WORDS, f"{rel}: lead, CJK characters")
+                    self.assertLessEqual(lead_words, _GUIDE_LEAD_ZH_LATIN, f"{rel}: lead, Latin words")
+                    self.assertLessEqual(task_cjk, 2 * budget, f"{rel}: the part above Limits, CJK characters")
+                else:
+                    self.assertLessEqual(lead_words, _GUIDE_LEAD_WORDS, f"{rel}: lead")
+                    self.assertLessEqual(task_words, budget, f"{rel}: the part above Limits")
+
+    def test_a_conforming_page_and_its_twin_have_the_same_headings_in_the_same_order(self):
+        for name in sorted(_DISCLOSURE_PAGES):
+            en = _public_text(f"docs/guide/{name}.md")
+            zh = _public_text(f"docs/guide/{name}.zh-CN.md")
+            self.assertEqual(_heading_shape(en), _heading_shape(zh), name)
+
+    def test_a_conforming_page_names_no_other_page_in_its_first_sentence_as_a_table_of_contents(self):
+        for name in sorted(_DISCLOSURE_PAGES):
+            lead = prose_lead(_public_text(f"docs/guide/{name}.md")).strip()
+            self.assertNotRegex(lead.split("\n", 1)[0], r"(?i)^this page (takes|covers|shows|walks)", name)
+
+    def test_each_release_page_is_short_above_its_full_list(self):
+        seen = 0
+        for name in _release_pages():
+            for suffix in ("", ".zh-CN"):
+                text = _public_text(f"docs/releases/{name[:-3]}{suffix}.md")
+                heading = _FULL_LIST_HEADING[suffix]
+                if heading not in prose_headings(text):
+                    continue
+                seen += 1
+                words, cjk = prose_size(prose_before(text, heading))
+                if suffix:
+                    self.assertLessEqual(cjk, 2 * _RELEASE_PAGE_WORDS, f"{name[:-3]}{suffix}.md: CJK characters above the full list")
+                else:
+                    self.assertLessEqual(words, _RELEASE_PAGE_WORDS, f"{name}: words above the full list")
+        self.assertGreater(seen, 0)
+
+
 class PublicTreeLayoutTests(unittest.TestCase):
     """This suite ships in the public tree (publish/manifest.txt's `include packaging/*`) and must pass
     there too, where there is no publish/ at all and publish/files/ has been copied over the root by
@@ -904,4 +1140,6 @@ class PublicTreeLayoutTests(unittest.TestCase):
 
 
 if __name__ == "__main__":
+    if sys.argv[1:2] == ["--count"]:
+        sys.exit(_count_main(sys.argv[2:]))
     unittest.main()
