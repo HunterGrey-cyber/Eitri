@@ -1,5 +1,5 @@
 [English](README.md) | 简体中文
-<!-- translated-from: README.md sha256=1acc3961b674a7e6fd24ffff85dcde4b468e97864917cecb0c012ba7d3c91087 -->
+<!-- translated-from: README.md sha256=36d1d0e68abed9e4fa4aeed9b580d1be9ef2d5346e36e5a34768621332b47b95 -->
 
 <div align="center">
 
@@ -7,8 +7,8 @@
 
 <h1>Eitri</h1>
 
-<p><b>受够了在终端里读 agent 回复和 Markdown？在一个能把它们渲染出来的图形窗口里，跑你自己的 Neovim。</b></p>
-<p>按你的工作方式摆：你自己的 init.lua、你的 tmux 按键、你自己做的面板。</p>
+<p><b>你自己的 Neovim，像 tmux 一样平铺，放在一个能渲染的图形窗口里。</b></p>
+<p>Neovim、编程 agent、渲染好的 Markdown、终端，还有你自己做的网页面板，平铺在一个窗口里，用 vim 和 tmux 的键来操作。</p>
 
 <p>
 <a href="https://eitri.cc/zh/">官网</a> ·

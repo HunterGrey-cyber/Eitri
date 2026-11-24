@@ -6,8 +6,8 @@ English | [简体中文](README.zh-CN.md)
 
 <h1>Eitri</h1>
 
-<p><b>Sick of reading agent replies and Markdown in a terminal? Run your own Neovim in a GUI that renders them.</b></p>
-<p>Arrange it the way you work: your own init.lua, your tmux keys, panels you build yourself.</p>
+<p><b>Your own Neovim, tiled like tmux, in a GUI that renders.</b></p>
+<p>Neovim, coding agents, rendered Markdown, terminals and web pages you build yourself, tiled in one window and driven by vim and tmux keys.</p>
 
 <p>
 <a href="https://eitri.cc">Website</a> ·

@@ -2,7 +2,7 @@ English | [简体中文](README.zh-CN.md)
 
 # Eitri documentation
 
-A workspace for your own Neovim: coding agents, rendered Markdown and terminals, tiled in one window. Eitri is a
+Your own Neovim, tiled with coding agents, rendered Markdown, terminals and web pages. For terminal folks. Eitri is a
 Neovim GUI for Linux that also puts terminals and the web pages you build beside your editor, tiled in one window or, on Hyprland, sway and niri, as windows of your window manager. It is a desktop window around your own Neovim configuration and the agents you have installed: Neovim is
 drawn by a fork of Neovide's GPU renderer, and the agent's replies appear as rendered markdown, diffs and permission
 cards in a panel next to it, all driven from the keyboard.

@@ -1,9 +1,9 @@
 [English](README.md) | 简体中文
-<!-- translated-from: README.md sha256=a9b1f490976ea65ffc0375a637bd60afa3af790d128dfee9c0ab4f9ef370cc87 -->
+<!-- translated-from: README.md sha256=617c4c95ece84e917ce022f5d657b69ec9fcd551e09b7547dcda3457bfa1cb8b -->
 
 # Eitri 文档
 
-给你自己的 Neovim 一个工作环境：编程 agent、渲染好的 Markdown 和终端，平铺在一个窗口里。Eitri 是一个面向 Linux 的 Neovim 图形前端，还能把终端和你自己做的网页放在编辑器旁边，平铺在一个窗口里；在 Hyprland、sway 和 niri 上，则作为窗口管理器的窗口。它是一个围绕你自己的 Neovim 配置和你已经装好的 agent 的桌面窗口：Neovim 由 Neovide 的 GPU 渲染器的一个 fork 绘制，agent 的回复则以渲染好的 markdown、diff 和权限卡片的形式出现在旁边的面板里，一切都靠键盘驱动。
+你自己的 Neovim，和编程 agent、渲染好的 Markdown、终端、网页平铺在一起。给终端党用的。Eitri 是一个面向 Linux 的 Neovim 图形前端，还能把终端和你自己做的网页放在编辑器旁边，平铺在一个窗口里；在 Hyprland、sway 和 niri 上，则作为窗口管理器的窗口。它是一个围绕你自己的 Neovim 配置和你已经装好的 agent 的桌面窗口：Neovim 由 Neovide 的 GPU 渲染器的一个 fork 绘制，agent 的回复则以渲染好的 markdown、diff 和权限卡片的形式出现在旁边的面板里，一切都靠键盘驱动。
 
 ## 窗口
 
